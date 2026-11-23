@@ -28,7 +28,7 @@ from .helpers import (
     POOL_SNAPSHOT_FIELDS,
     ROOTS,
     assert_valid,
-    two_settlements,
+    loser_then_crown,
     with_snapshots,
 )
 
@@ -41,17 +41,17 @@ def scratch(tmp_path_factory):
 
 def _older(scratch) -> dict:
     """Snapshot 1 as an older member of BOUNDARY_2's union."""
-    p1 = two_settlements(scratch)["s1"].report["pool"]
+    p1 = loser_then_crown(scratch)["s1"].report["pool"]
     return {"snapshot": p1["snapshot"], "sha256": p1["sha256"],
             "first_seen_roots": list(ROOTS[1])}
 
 
 def _one(scratch) -> dict:
-    return with_snapshots(two_settlements(scratch)["s2"].report)
+    return with_snapshots(loser_then_crown(scratch)["s2"].report)
 
 
 def _two(scratch) -> dict:
-    return with_snapshots(two_settlements(scratch)["s2"].report, older=_older(scratch))
+    return with_snapshots(loser_then_crown(scratch)["s2"].report, older=_older(scratch))
 
 
 def _refused(report, code, field):
@@ -67,7 +67,7 @@ def _refused(report, code, field):
 
 
 def test_e2e_report_lists_its_snapshots_and_each_windows_version(scratch):
-    built = two_settlements(scratch)
+    built = loser_then_crown(scratch)
     for s in (built["s1"], built["s2"]):
         pool = s.report["pool"]
         snaps = pool.get("snapshots")

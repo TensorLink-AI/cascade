@@ -3,25 +3,27 @@
 from signed fields; W5e README "Fail closed": "The audit must refuse it
 too").
 
-Once W5e wires the gate into `settle_lane_d`, a cleared confirmation is no
-longer always `confirmed` / `crowned`: the gate decides. The audit
-(`cascade/audit/lane_d.py`, in W7a's PATHS) must therefore read the signed
-`gate` record and re-derive, from the report and the config alone
-(invariant 12: never importing `cascade.validator.lane_d*`):
+rev6.11 (b): the confirmation duel is DROPPED. A crown is decided at the
+FIRST verdict: first clear (max-T LCB vs KING_D) ∧ A10 ∧ the §1.3b gate. The
+audit (`cascade/audit/lane_d.py`, in W7a's PATHS) reads the signed `gate`
+record and re-derives, from the report and the config alone (invariant 12:
+never importing `cascade.validator.lane_d*`):
 
 * the draw: `gate.block == boundary`, `gate.eligible` and `gate.suite` are
   `gate_suite_for(gate.block_hash, gate_suites, gate_weights, gate.sentinel)`;
 * each result's outcome from its own LCBs: `pass` iff all four LCBs
   (`king_d`/`house` x `crps`/`mase`) are `>= -tau_public`, `gate_regression`
   iff one is below, with `blocked_by` the refs that fall below;
-* the verdict each gate outcome implies: `pass` -> eligible to crown,
-  `gate_regression` / `checkpoint_fault` -> `lost`, `bench_hold` -> confirmed
-  and not crowned; without a gate record (the gate could not run) a cleared
-  confirmation is held, never crowned;
-* the crown: the highest-LCB cleared confirmation whose gate result is
-  `pass`, or a held candidate re-gated `pass` with no verdict in the report.
-  A crowned report without a `gate` dict, or whose results hold no `pass`
-  for the crowned digest, FAILs.
+* the verdict each gate outcome implies for a cleared first verdict: `pass`
+  -> eligible to crown, `gate_regression` / `checkpoint_fault` -> `lost`,
+  `bench_hold` -> held (neither crowned nor lost); without a gate record
+  (the gate could not run) a cleared verdict is held, never crowned;
+* the crown: the highest-LCB cleared verdict whose gate result is `pass`,
+  or a held candidate re-gated `pass` with no verdict in the report. A
+  crowned report without a `gate` dict, or whose results hold no `pass`
+  for the crowned digest, FAILs;
+* a report carrying a confirm stage (`stage: "confirm"` on a cohort or a
+  verdict) FAILs.
 
 Every report here comes from a real `settle_lane_d` with the W5e gate inputs
 (W5e's fixtures, `tests/accept/w5e/helpers.py`: synthetic chain, recorded
@@ -29,14 +31,9 @@ bench rows through a real `SweepSession`, no torch). A doctored report is
 re-signed by the validator's own key, so only the audit's re-derivation can
 catch it.
 
-On main (W5e built, this audit not yet gate-aware) the PASS cases for the
-gated outcomes fail on an `assert`: the audit expects every cleared
-confirmation to read `confirmed` / `crowned` and crowns the highest LCB
-regardless of the gate. Every doctored case first requires the audit to
-PASS the honest report it starts from, so it fails on an `assert` too:
-either that precheck FAILs (a gated outcome) or the audit, ignoring `gate`,
-PASSes the doctored crown. The honest gate-pass crowns, W7a's own gated
-chain and the ungated no-crown reports pass on main.
+On main (W5e still has the confirm stage) a first clear is
+`confirm_pending` and never gated, so the scenario fixtures and the honest
+PASS cases fail on an `assert`.
 """
 
 from __future__ import annotations
@@ -71,36 +68,37 @@ def _entry(report, dg) -> dict:
 
 
 def _result(report, dg) -> dict:
-    (r,) = [r for r in report["gate"]["results"] if r["digest"] == dg]
-    return r
+    gate = report.get("gate")
+    assert isinstance(gate, dict), f"the report carries no gate record (gate={gate!r})"
+    rs = [r for r in gate["results"] if r["digest"] == dg]
+    assert len(rs) == 1, f"want one gate result for {dg[:12]}; got {len(rs)}"
+    return rs[0]
 
 
-def _single(tmp, spec2, *, sentinel=None, gated=True) -> dict:
-    """X first clears against the genesis house H0 at boundary(1), then
-    confirms at boundary(2) where the bench (``spec2``: `bench_table` spec
-    over X and H0) decides the gate. ``gated=False`` makes both calls the
-    legacy (ungated) call."""
+def _single(tmp, spec1, *, sentinel=None, gated=True) -> dict:
+    """rev6.11 (b): X clears against the genesis house H0 at its FIRST
+    verdict, boundary(1), where the bench (``spec1``: `bench_table` spec
+    over X and H0) decides the gate. ``gated=False`` makes the legacy
+    (ungated) call."""
     h = _h()
     cfg = h.lane_d_cfg()
     h0, x = h.house(), h.entry("x", reveal_ts=h.T_X)
     path = tmp / "state" / "lane_d_state.json"
     models = {h0["digest"]: ("bad", "house-0"), x["digest"]: ("sharp", "x")}
     out = {"cfg": cfg, "h0": h0, "x": x, "path": path, "models": models}
-    for n in (1, 2):
-        pool, recs = h.snapshot(tmp, n)
-        args = (cfg, h.boundary(n), pool, [x], h0, _fc(recs, models), h.uids(x), path)
-        if not gated:
-            s = h.settle(*args)
-        else:
-            table = ({x["digest"]: 1.0, h0["digest"]: 1.0} if n == 1
-                     else spec2(x["digest"], h0["digest"]))
-            s = h.settle_gated(*args, hash_=h.block_hash(f"b{n}"), sentinel=sentinel,
-                               bench=h.bench_session(h.BenchHost(h.bench_table(table)),
-                                                     f"sess-{n}"))
-        out[f"s{n}"], out[f"pool{n}"], out[f"recs{n}"] = s.report, pool, recs
-    v = _verdict(out["s2"], x["digest"])
-    assert v is not None and v["stage"] == "confirm" and v["cleared"] is True, \
-        f"fixture: X did not clear its confirmation duel: {v}"
+    pool, recs = h.snapshot(tmp, 1)
+    args = (cfg, h.boundary(1), pool, [x], h0, _fc(recs, models), h.uids(x), path)
+    if not gated:
+        s = h.settle(*args)
+    else:
+        s = h.settle_gated(*args, hash_=h.block_hash("b1"), sentinel=sentinel,
+                           bench=h.bench_session(
+                               h.BenchHost(h.bench_table(spec1(x["digest"], h0["digest"]))),
+                               "sess-1"))
+    out["s1"], out["pool1"], out["recs1"] = s.report, pool, recs
+    v = _verdict(out["s1"], x["digest"])
+    assert v is not None and v.get("stage", "first") == "first" and v["cleared"] is True, \
+        f"fixture: X did not clear at its first verdict: {v}"
     return out
 
 
@@ -108,6 +106,28 @@ SENTINEL = "boom"
 
 
 def _build(name: str, tmp):
+    """One scenario, checked for its rev6.11 shape (an `assert`, so a main
+    without the change fails here for a right reason)."""
+    run = _build_raw(name, tmp)
+    for key in ("s1", "s2"):
+        r = run.get(key)
+        if r is None:
+            continue
+        if name not in ("legacy", "losers"):
+            assert isinstance(r.get("gate"), dict), \
+                f"fixture {name}.{key}: no gate record (the first clear must be gated)"
+    if name in ("pass", "sentinel"):
+        assert run["s1"]["crowned"] == run["x"]["digest"], \
+            f"fixture {name}: X is not crowned at its first verdict"
+    if name == "hold":
+        assert run["s2"]["crowned"] == run["x"]["digest"], "fixture hold: no re-gated crown"
+    if name == "legacy":
+        e = _entry(run["s1"], run["x"]["digest"])
+        assert (e["status"], e["reason"]) == ("hold", "bench_hold"), f"fixture legacy: {e}"
+    return run
+
+
+def _build_raw(name: str, tmp):
     h = _h()
     if name == "pass":
         return _single(tmp, lambda x, h0: {x: 0.9, h0: 1.0})
@@ -121,14 +141,14 @@ def _build(name: str, tmp):
         return _single(tmp, lambda x, h0: {x: {s: "nan" for s in h.GATE_SUITES}, h0: 1.0})
     if name == "hold":
         run = _single(tmp, lambda x, h0: {x: 0.9, h0: {s: "nan" for s in h.GATE_SUITES}})
-        # boundary(3): the bench is back, no fresh window: X is re-gated
-        # (a new draw) and crowned without a duel (no verdict, no rows).
+        # boundary(2): the bench is back, no fresh window: X's held first clear
+        # is re-gated (a new draw) and crowned without a duel (no verdict, no rows).
         x, h0 = run["x"], run["h0"]
         host = h.BenchHost(h.bench_table({x["digest"]: 0.9, h0["digest"]: 1.0}))
-        s3 = h.settle_gated(run["cfg"], h.boundary(3), run["pool2"], [x], h0,
-                            _fc(run["recs2"], run["models"]), h.uids(x), run["path"],
-                            hash_=h.block_hash("b3"), bench=h.bench_session(host, "sess-3"))
-        run["s3"] = s3.report
+        s2 = h.settle_gated(run["cfg"], h.boundary(2), run["pool1"], [x], h0,
+                            _fc(run["recs1"], run["models"]), h.uids(x), run["path"],
+                            hash_=h.block_hash("b2"), bench=h.bench_session(host, "sess-2"))
+        run["s2"] = s2.report
         return run
     if name == "legacy":
         return _single(tmp, None, gated=False)
@@ -140,31 +160,28 @@ def _build(name: str, tmp):
         models = {h0["digest"]: ("bad", "house-0"), x1["digest"]: ("sharp", "x1"),
                   x2["digest"]: ("good", "x2")}
         out = {"cfg": cfg, "h0": h0, "x1": x1, "x2": x2}
-        specs = {1: {}, 2: {x1["digest"]: 1.10, x2["digest"]: 0.9, h0["digest"]: 1.0}}
-        for n in (1, 2):
-            pool, recs = h.snapshot(tmp, n)
-            s = h.settle_gated(cfg, h.boundary(n), pool, [x1, x2], h0, _fc(recs, models),
-                               h.uids(x1, x2), path, hash_=h.block_hash(f"b{n}"),
-                               bench=h.bench_session(h.BenchHost(h.bench_table(specs[n])),
-                                                     f"sess-{n}"))
-            out[f"s{n}"] = s.report
-        v1, v2 = _verdict(out["s2"], x1["digest"]), _verdict(out["s2"], x2["digest"])
-        assert v1["stage"] == v2["stage"] == "confirm" and v1["cleared"] and v2["cleared"], \
-            f"fixture: {v1} {v2}"
+        spec = {x1["digest"]: 1.10, x2["digest"]: 0.9, h0["digest"]: 1.0}
+        pool, recs = h.snapshot(tmp, 1)
+        s = h.settle_gated(cfg, h.boundary(1), pool, [x1, x2], h0, _fc(recs, models),
+                           h.uids(x1, x2), path, hash_=h.block_hash("b1"),
+                           bench=h.bench_session(h.BenchHost(h.bench_table(spec)), "sess-1"))
+        out["s1"] = s.report
+        v1, v2 = _verdict(out["s1"], x1["digest"]), _verdict(out["s1"], x2["digest"])
+        assert v1["cleared"] and v2["cleared"], f"fixture: {v1} {v2}"
         assert v1["lcb"] > v2["lcb"], "fixture: x1 must be the max-T best"
         return out
     if name == "losers":
-        # Legacy (ungated) calls with nothing to gate: X first clears, Z loses.
+        # Legacy (ungated) call with nothing to gate: Z and W both lose.
         cfg = h.lane_d_cfg()
         h0 = h.house()
-        x, z = h.entry("x", reveal_ts=h.T_X), h.entry("z", reveal_ts=h.T_X)
+        z, w = h.entry("z", reveal_ts=h.T_X), h.entry("w", reveal_ts=h.T_X)
         path = tmp / "state" / "lane_d_state.json"
-        models = {h0["digest"]: ("bad", "house-0"), x["digest"]: ("sharp", "x"),
-                  z["digest"]: ("bad", "z")}
+        models = {h0["digest"]: ("fair", "house-0"), z["digest"]: ("bad", "z"),
+                  w["digest"]: ("bad", "w")}
         pool, recs = h.snapshot(tmp, 1)
-        s1 = h.settle(cfg, h.boundary(1), pool, [x, z], h0, _fc(recs, models), h.uids(x, z),
+        s1 = h.settle(cfg, h.boundary(1), pool, [z, w], h0, _fc(recs, models), h.uids(z, w),
                       path)
-        return {"cfg": cfg, "h0": h0, "x": x, "z": z, "s1": s1.report}
+        return {"cfg": cfg, "h0": h0, "z": z, "w": w, "s1": s1.report}
     raise KeyError(name)
 
 
@@ -224,56 +241,56 @@ def _tau(cfg) -> float:
 
 def test_a_gate_pass_crown_passes_the_audit(runs):
     run = runs("pass")
-    r, x = run["s2"], run["x"]["digest"]
+    r, x = run["s1"], run["x"]["digest"]
     assert r["crowned"] == x and _result(r, x)["outcome"] == "pass"
-    _passes(run["s1"], run["cfg"], "the first clear (no gate)")
-    _passes(r, run["cfg"], "a crown through a gate pass")
+    assert _verdict(r, x)["outcome"] == "crowned"
+    _passes(r, run["cfg"], "a first-verdict crown through a gate pass")
 
 
 def test_a_gate_pass_crown_with_the_sentinel_recorded_passes_the_audit(runs):
     run = runs("sentinel")
-    r, x = run["s2"], run["x"]["digest"]
+    r, x = run["s1"], run["x"]["digest"]
     assert r["gate"]["sentinel"] == SENTINEL and r["gate"]["suite"] != SENTINEL
     assert SENTINEL not in r["gate"]["eligible"]
     assert r["crowned"] == x
     _passes(r, run["cfg"], "a crown with the era's sentinel recorded (a sentinel loss)")
 
 
-def test_a_cleared_confirmation_lost_to_gate_regression_passes_the_audit(runs):
+def test_a_cleared_first_verdict_lost_to_gate_regression_passes_the_audit(runs):
     run = runs("regression")
-    r, x = run["s2"], run["x"]["digest"]
+    r, x = run["s1"], run["x"]["digest"]
     assert r["crowned"] is None
     assert _result(r, x)["outcome"] == "gate_regression" and _result(r, x)["blocked_by"]
     v = _verdict(r, x)
     assert v["cleared"] is True and v["outcome"] == "lost"
     assert (_entry(r, x)["status"], _entry(r, x)["reason"]) == ("lost", "gate_regression")
-    _passes(r, run["cfg"], "a cleared confirmation lost via gate_regression")
+    _passes(r, run["cfg"], "a cleared first verdict lost via gate_regression")
 
 
-def test_a_cleared_confirmation_closed_on_checkpoint_fault_passes_the_audit(runs):
+def test_a_cleared_first_verdict_closed_on_checkpoint_fault_passes_the_audit(runs):
     run = runs("fault")
-    r, x = run["s2"], run["x"]["digest"]
+    r, x = run["s1"], run["x"]["digest"]
     assert r["crowned"] is None
     assert _result(r, x)["outcome"] == "checkpoint_fault" and _result(r, x)["lcb"] is None
     assert _verdict(r, x)["cleared"] is True and _verdict(r, x)["outcome"] != "crowned"
     assert (_entry(r, x)["status"], _entry(r, x)["reason"]) == ("closed", "checkpoint_fault")
-    _passes(r, run["cfg"], "a cleared confirmation closed via checkpoint_fault")
+    _passes(r, run["cfg"], "a cleared first verdict closed via checkpoint_fault")
 
 
-def test_a_bench_hold_is_confirmed_not_crowned_and_passes_the_audit(runs):
+def test_a_bench_hold_is_held_not_crowned_and_passes_the_audit(runs):
     run = runs("hold")
-    r, x = run["s2"], run["x"]["digest"]
+    r, x = run["s1"], run["x"]["digest"]
     assert r["crowned"] is None and r["king_after"]["digest"] == r["king_before"]["digest"]
     assert _result(r, x)["outcome"] == "bench_hold"
     v = _verdict(r, x)
     assert v["cleared"] is True and v["outcome"] not in ("crowned", "lost")
-    assert _entry(r, x)["reason"] == "bench_hold"
-    _passes(r, run["cfg"], "a cleared confirmation held via bench_hold (confirmed, not crowned)")
+    assert (_entry(r, x)["status"], _entry(r, x)["reason"]) == ("hold", "bench_hold")
+    _passes(r, run["cfg"], "a cleared first verdict held via bench_hold (not crowned)")
 
 
 def test_a_held_candidate_regated_and_crowned_without_a_verdict_passes_the_audit(runs):
     run = runs("hold")
-    r, x = run["s3"], run["x"]["digest"]
+    r, x = run["s2"], run["x"]["digest"]
     assert r["crowned"] == x
     assert _verdict(r, x) is None and not [row for row in r["rows"] if row["digest"] == x]
     assert _result(r, x)["outcome"] == "pass"
@@ -282,7 +299,7 @@ def test_a_held_candidate_regated_and_crowned_without_a_verdict_passes_the_audit
 
 def test_a_passing_runner_up_crowned_over_a_regressing_best_passes_the_audit(runs):
     run = runs("runner_up")
-    r, x1, x2 = run["s2"], run["x1"]["digest"], run["x2"]["digest"]
+    r, x1, x2 = run["s1"], run["x1"]["digest"], run["x2"]["digest"]
     assert _result(r, x1)["outcome"] == "gate_regression"
     assert _result(r, x2)["outcome"] == "pass"
     assert r["crowned"] == x2 and _verdict(r, x1)["outcome"] == "lost"
@@ -290,11 +307,11 @@ def test_a_passing_runner_up_crowned_over_a_regressing_best_passes_the_audit(run
 
 
 def test_the_w7a_settlements_with_gate_inputs_pass_the_audit(tmp_path):
-    """W7a's own two-settlement chain (`helpers.two_settlements`, a healthy
-    bench through `helpers.settle`): the first clear and the gated crown."""
+    """W7a's own two-settlement chain (`helpers.loser_then_crown`, a healthy
+    bench through `helpers.settle`): a loser, then the gated first-verdict crown."""
     from . import helpers as w7a
 
-    built = w7a.two_settlements(tmp_path)
+    built = w7a.loser_then_crown(tmp_path)
     s2 = built["s2"].report
     assert s2["crowned"] == built["entry"]["digest"]
     assert isinstance(s2.get("gate"), dict), "fixture: W5e wrote no gate record"
@@ -309,22 +326,21 @@ def test_ungated_reports_without_a_crowning_candidate_pass_the_audit(runs):
     run = runs("losers")
     r = run["s1"]
     assert "gate" not in r and r["crowned"] is None
-    assert _verdict(r, run["x"]["digest"])["outcome"] == "confirm_pending"
     assert _verdict(r, run["z"]["digest"])["outcome"] == "lost"
-    _passes(r, run["cfg"], "an ungated first clear and a loser")
+    assert _verdict(r, run["w"]["digest"])["outcome"] == "lost"
+    _passes(r, run["cfg"], "an ungated report with two losers")
 
 
 def test_an_ungated_armed_crowning_candidate_is_held_and_passes_the_audit(runs):
     """The legacy call (no bench, no block hash) fails closed: the cleared
-    confirmation is `bench_hold`, nothing crowns and no gate record is
+    first verdict is `bench_hold`, nothing crowns and no gate record is
     written (W5e "Fail closed")."""
     run = runs("legacy")
-    r, x = run["s2"], run["x"]["digest"]
+    r, x = run["s1"], run["x"]["digest"]
     assert "gate" not in r and r["crowned"] is None
     assert _verdict(r, x)["outcome"] not in ("crowned", "lost")
-    assert _entry(r, x)["reason"] == "bench_hold"
-    _passes(run["s1"], run["cfg"], "the ungated first clear")
-    _passes(r, run["cfg"], "an ungated cleared confirmation held (fail closed)")
+    assert (_entry(r, x)["status"], _entry(r, x)["reason"]) == ("hold", "bench_hold")
+    _passes(r, run["cfg"], "an ungated cleared first verdict held (fail closed)")
 
 
 # ── (a) crowned reports the gate does not support FAIL ──────────────────────
@@ -378,14 +394,14 @@ CROWNED_DOCTORINGS = ("gate_absent", "gate_null", "no_result_for_crowned",
 @pytest.mark.parametrize("how", CROWNED_DOCTORINGS)
 def test_a_crowned_report_the_gate_does_not_support_fails_the_audit(runs, how):
     run = runs("pass")
-    r = run["s2"]
+    r = run["s1"]
     _passes(r, run["cfg"], "the honest crowned report")
     _fails(_doctor_crowned_pass(r, how, run["cfg"]), run["cfg"], f"crowned, {how}")
 
 
 def test_a_crowned_report_with_a_sentinel_drawn_as_the_suite_fails_the_audit(runs):
     run = runs("sentinel")
-    r = copy.deepcopy(run["s2"])
+    r = copy.deepcopy(run["s1"])
     _passes(r, run["cfg"], "the honest sentinel crown")
     r["gate"]["suite"] = SENTINEL
     _fails(_resign(r), run["cfg"], "the sentinel stated as the drawn suite")
@@ -393,12 +409,12 @@ def test_a_crowned_report_with_a_sentinel_drawn_as_the_suite_fails_the_audit(run
 
 def test_a_held_regate_crown_without_its_pass_fails_the_audit(runs):
     run = runs("hold")
-    r = copy.deepcopy(run["s3"])
+    r = copy.deepcopy(run["s2"])
     _passes(r, run["cfg"], "the honest report the doctoring starts from")
     res = _result(r, r["crowned"])
     res.update(outcome="bench_hold", lcb=None, blocked_by=[])
     _fails(_resign(r), run["cfg"], "a re-gated crown whose result is bench_hold")
-    r2 = copy.deepcopy(run["s3"])
+    r2 = copy.deepcopy(run["s2"])
     r2.pop("gate")
     _fails(_resign(r2), run["cfg"], "a re-gated crown with no gate record")
 
@@ -408,7 +424,7 @@ def test_a_held_regate_crown_without_its_pass_fails_the_audit(runs):
 
 def test_a_regression_whose_lcbs_all_clear_tau_fails_the_audit(runs):
     run = runs("regression")
-    r = copy.deepcopy(run["s2"])
+    r = copy.deepcopy(run["s1"])
     _passes(r, run["cfg"], "the honest report the doctoring starts from")
     res = _result(r, run["x"]["digest"])
     res["lcb"] = {ref: {m: 0.0 for m in ("crps", "mase")} for ref in ("king_d", "house")}
@@ -417,7 +433,7 @@ def test_a_regression_whose_lcbs_all_clear_tau_fails_the_audit(runs):
 
 def test_a_regression_blocked_by_the_wrong_reference_fails_the_audit(runs):
     run = runs("regression")
-    r = copy.deepcopy(run["s2"])
+    r = copy.deepcopy(run["s1"])
     _passes(r, run["cfg"], "the honest report the doctoring starts from")
     res = _result(r, run["x"]["digest"])
     tau = _tau(run["cfg"])
@@ -431,19 +447,20 @@ def test_a_regression_blocked_by_the_wrong_reference_fails_the_audit(runs):
     _fails(_resign(r), run["cfg"], "blocked_by naming refs the LCBs do not block")
 
 
-def test_a_regressed_confirmation_stated_confirmed_fails_the_audit(runs):
+def test_a_regressed_verdict_stated_held_fails_the_audit(runs):
     run = runs("regression")
-    r = copy.deepcopy(run["s2"])
+    r = copy.deepcopy(run["s1"])
     _passes(r, run["cfg"], "the honest report the doctoring starts from")
-    _verdict(r, run["x"]["digest"])["outcome"] = "confirmed"
-    _fails(_resign(r), run["cfg"], "a gate_regression verdict left confirmed")
+    held = next(v["outcome"] for v in runs("hold")["s1"]["verdicts"])
+    _verdict(r, run["x"]["digest"])["outcome"] = held
+    _fails(_resign(r), run["cfg"], "a gate_regression verdict left held")
 
 
 def test_a_passing_result_that_is_not_crowned_fails_the_audit(runs):
     """A held report doctored to a gate `pass` for its only candidate, still
     uncrowned: the audit re-derives the crown from the gate."""
     run = runs("hold")
-    r = copy.deepcopy(run["s2"])
+    r = copy.deepcopy(run["s1"])
     _passes(r, run["cfg"], "the honest report the doctoring starts from")
     res = _result(r, run["x"]["digest"])
     res.update(outcome="pass", blocked_by=[],
@@ -455,7 +472,7 @@ def test_a_pass_doctored_onto_the_regressing_best_fails_the_audit(runs):
     """In the runner-up report the max-T best regressed. Doctored to a
     consistent `pass`, the re-derived crown is the best, not the runner-up."""
     run = runs("runner_up")
-    r = copy.deepcopy(run["s2"])
+    r = copy.deepcopy(run["s1"])
     _passes(r, run["cfg"], "the honest report the doctoring starts from")
     res = _result(r, run["x1"]["digest"])
     res.update(outcome="pass", blocked_by=[],
@@ -463,20 +480,20 @@ def test_a_pass_doctored_onto_the_regressing_best_fails_the_audit(runs):
     _fails(_resign(r), run["cfg"], "the crown went to the runner-up over a passing best")
 
 
-def test_a_cleared_confirmation_missing_from_the_gate_fails_the_audit(runs):
+def test_a_cleared_verdict_missing_from_the_gate_fails_the_audit(runs):
     run = runs("runner_up")
-    r = copy.deepcopy(run["s2"])
+    r = copy.deepcopy(run["s1"])
     _passes(r, run["cfg"], "the honest report the doctoring starts from")
     x1 = run["x1"]["digest"]
     r["gate"]["results"] = [g for g in r["gate"]["results"] if g["digest"] != x1]
-    _fails(_resign(r), run["cfg"], "a cleared confirmation lost with no gate result")
+    _fails(_resign(r), run["cfg"], "a cleared verdict lost with no gate result")
 
 
-def test_an_ungated_cleared_confirmation_stated_crowned_fails_the_audit(runs):
+def test_an_ungated_cleared_verdict_stated_crowned_fails_the_audit(runs):
     """The legacy (fail-closed) report doctored into a crown: no gate record,
     so nothing may crown."""
     run = runs("legacy")
-    r = copy.deepcopy(run["s2"])
+    r = copy.deepcopy(run["s1"])
     _passes(r, run["cfg"], "the honest report the doctoring starts from")
     x = run["x"]["digest"]
     _verdict(r, x)["outcome"] = "crowned"
@@ -487,3 +504,21 @@ def test_an_ungated_cleared_confirmation_stated_crowned_fails_the_audit(runs):
     if court:
         court[0] = {**court[0], "digest": x, "hotkey": run["x"]["hotkey"]}
     _fails(_resign(r), run["cfg"], "an ungated crown")
+
+
+# ── rev6.11 (b): a confirm stage is refused ─────────────────────────────────
+
+
+@pytest.mark.parametrize("where", ["cohort", "verdict"])
+def test_a_report_carrying_a_confirm_stage_fails_the_audit(runs, where):
+    """No confirmation stage exists: a crowned report relabelled with
+    `stage: "confirm"` (on its cohort or its verdict) is refused, even
+    re-signed."""
+    run = runs("pass")
+    r = copy.deepcopy(run["s1"])
+    _passes(r, run["cfg"], "the honest report the doctoring starts from")
+    if where == "cohort":
+        r["cohorts"][0]["stage"] = "confirm"
+    else:
+        _verdict(r, run["x"]["digest"])["stage"] = "confirm"
+    _fails(_resign(r), run["cfg"], f"a confirm stage on the {where}")
