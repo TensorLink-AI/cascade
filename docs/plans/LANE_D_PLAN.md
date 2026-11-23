@@ -1,10 +1,25 @@
 # Plan: lane D "open weights" (anything goes on our architecture), with lane E and lane A flexibility — v3
 
-Status: **PLAN v3, ~~rev6.12~~ ~~rev6.14~~ rev6.15 (proposed 2026-11-22; ~~rev6.12~~ ~~rev6.14~~ rev6.15 2026-11-23)**: v2's design, made buildable by an
+Status: **PLAN v3, ~~rev6.12~~ ~~rev6.14~~ ~~rev6.15~~ rev6.16 (proposed 2026-11-22; ~~rev6.12~~ ~~rev6.14~~ ~~rev6.15~~ rev6.16 2026-11-23)**: v2's design, made buildable by an
 autonomous loop. A work package is done **only when its Accept command exits
 0**; **(rev6)** its level is only what `scripts/laned/status` computes (§17),
 never a claim. Owner decisions are marked **[DECIDE]**. Nothing is armed. **No calendar
 dates**: stages are gated (§5).
+
+## rev6.16 (owner 2026-11-23; main @ 65bcb4b): partial WB19 evidence
+
+One owner decision. Plan text only. The changed row is marked **(rev6.16)**.
+
+**The problem.** WB19's `combine` fails its `coverage` check unless every
+`[lane_b] funded_pod_skus` type and every OA8 type has an expert run. The
+step-rate reader refuses any evidence whose `passed` is not true. Only 8×H200
+(before WB25, single-GPU path) and 8×RTX4090 (with WB25) are measured, so
+every lane B type was refused `gpu_rate_unmeasured`, including the two that
+were measured.
+
+| Item | Decision | Landed in |
+|---|---|---|
+| (a) | **Allow partial WB19 evidence (owner 2026-11-23, DECIDED, verbatim choice: "Allow partial").** A `laned_wb19/1` file whose **only** failing check is `coverage` still loads, and its measured rows are usable. Every type with no row (from the lane B list or from OA8) stays `gpu_rate_unmeasured`. Any other failing check (`memory`, `full_leg`), malformed checks, a missing or mismatched body hash refuses the whole file. `passed` stays the honest conjunction of the checks. `combine --note SKU=TEXT` marks a row measured on a superseded path. The 8×H200 row is marked pre-WB25 single-GPU: it understates a multi-GPU leg. Rates are never invented for unmeasured types | WB19 row; WB22 row; WB19 / WB22 tests-correction and WB19 code PR (`cascade/funding/step_rates.py`, `scripts/laned_wb19_measure.py`) |
 
 ## rev6.15 (owner 2026-11-23; main @ 9888c1a)
 
@@ -3055,7 +3070,7 @@ Every new `[lane_b]` key below ships with:
 | WB16 | Router-row decision (D40): (a) the frozen path is today's backend, with a test that it stays frozen; if (b): unfreeze the declared router rows, router byte-check, `traffic_steal_bound` guard. **(rev5)** (b) is a worker-image change (shared with lane A): 5-pin repin + wall gate + DEC-CA-0067 qualification, after the scored EMA constant is fixed  **(rev5)** Depends on W-EMA. | receipt field `traffic_share_delta` (b only) | WB14 | ci + pod | `scripts/laned/accept WB16` (TB14) |
 | WB17 | Opening rule (D41, LB4): `open_rule` implementation; driver state records the rule and the satisfying evidence | `lane_b_driver` state `gate_rule`, `gate_evidence` | WB10 | ci + testnet | `scripts/laned/accept WB17` (TB17–TB18) |
 | WB18 | Sentinel interaction (D35/LB5): suite-target deferral, `sentinel_max_defer_eras`, no charge on deferral. **(rev6.2, owner 2026-11-22) Follow-up WP note:** while a funded entry is deferred (`sentinel_target` or `rows_held`), its payer key in `PayerKeyVault` (`cascade/funding/vault.py`) has its TTL refreshed on each deferred tick, the same rule as the entry (RV6, #629/#633), so a deferral never outlives the key the leg rents on. No WP owns the vault; the follow-up adds the vault hook and its own test (flagged, not pinned, in `tests/accept/wb18/README.md`) | `status/lane_b.json` `deferred: sentinel_target` | W-S1, WB10 | ci | `scripts/laned/accept WB18` (TB19–TB20, TS4) |
-| WB19 | **(rev5)** Expert-leg measurement (LB6), **per candidate GPU type**: expert-only step rate, leg overhead split from training, peak memory at contract micro-batching, image qualification; ~~plus one full lane A leg on 8×H100 (is 13,600 s training-only?)~~ **(rev6.5) full lane A leg skipped, owner 2026-11-23** | `evidence/wb19.json` per-GPU table | — | pod (owner yes, OA8) | `scripts/laned/accept WB19 --evidence evidence/wb19.json` |
+| WB19 | **(rev5)** Expert-leg measurement (LB6), **per candidate GPU type**: expert-only step rate, leg overhead split from training, peak memory at contract micro-batching, image qualification; ~~plus one full lane A leg on 8×H100 (is 13,600 s training-only?)~~ **(rev6.5) full lane A leg skipped, owner 2026-11-23**. **(rev6.16) Partial evidence allowed (owner 2026-11-23):** coverage may be the only failing check; measured rows are usable, unmeasured types stay `gpu_rate_unmeasured` (WB22) | `evidence/wb19.json` per-GPU table | — | pod (owner yes, OA8) | `scripts/laned/accept WB19 --evidence evidence/wb19.json` |
 | WB22 | **(rev5)** Lane B GPU list (D42): `[lane_b] funded_pod_skus` separate from `[round]`; `GpuChoice` reads it for lane B legs only; trainer-side per-GPU step-rate table from WB19; audit re-derivation pinned to the recorded `gpu_name` | loader parse + round-trip + mutation test; lane A choice unchanged | WB10, WB19 | ci | `scripts/laned/accept WB22` (TB23, TB24) |
 | WB23 | **(rev5)** Miner-chosen leg length (D42, D42b): `train_hours` on the funding request (0.5–`max_leg_hours`, 0.5 h steps); steps fixed at admission and signed in the leg record; guard = `train_hours × guard_factor` + overhead, capped at `[lane_b] max_leg_seconds` (lane B contract derivation; `[training] max_train_seconds` untouched); expected landing boundary returned to the miner; validator check of recorded steps and guard | keys `max_leg_hours`, `max_leg_seconds`, `guard_factor`; `status/lane_b.json` shows steps, GPU and landing boundary | WB10, WB22 | ci | `scripts/laned/accept WB23` (TB25–TB27) |
 | WB24 | **(rev6.3, proposed)** Lane B miner CLI. Today `cascade lane-b fund` / `lane-b status` (`cascade/miner/lane_b.py`) do not send the declared-rows header, so the WB20 docs have miners hand-build that request. `cascade lane-b fund` gains `--declared-rows <file>` (builds and signs the WB14 `X-Lane-B-Declared-Rows` header and its signed `rows=` tag; refuses locally with the same `DECLARED_ROWS_CODES` the intake uses), `--target suite:<s>` (suite targets, WB18) and `--train-hours` (WB23, once built). `cascade lane-b status` shows the new deferral and refusal reasons (`rows_held`, `sentinel_target`, the `gate_closed_reason` values, the WB13 contamination codes incl. `contamination_budget_exceeded`) from `status/lane_b.json` and the intake replies. New `cascade lane-b verify-repo <dir>` runs the WB13 scan (`scan_repo`) locally against the pinned hash set (no upload; never executes the repo) so a miner can check before funding. Never prints keys; unarmed defaults unchanged | CLI flags `--declared-rows`, `--target suite:<s>`, `--train-hours`; subcommand `verify-repo` | WB13, WB14, WB15, WB17, WB18 (WB23 for `--train-hours`) | ci | `scripts/laned/accept WB24` |
