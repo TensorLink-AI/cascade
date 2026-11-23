@@ -378,6 +378,8 @@ _GATE_KEYS = {"suite", "block", "block_hash", "sentinel", "eligible", "results"}
 _RESULT_KEYS = {"digest", "outcome", "lcb", "blocked_by", "session"}
 # RV7 B2: a held candidate's result also names its hold (optional key).
 _HELD_KEYS = {"boundary", "report_sha256", "set_sha256", "lcb", "king_d"}
+# W3b6b: the optional bound bench records of a gate result.
+_ROWS_ROLES = {"candidate", "king_d", "house"}
 
 
 def _gate_weights(cfg, suites: list[str]) -> dict[str, Fraction]:
@@ -421,9 +423,16 @@ def _finite(x) -> bool:
 def _result_problem(i: int, res, tau: float) -> str | None:
     """Why ``gate.results[i]`` disagrees with W3b2's ``paired_gate`` rule
     re-derived from its own LCBs, or ``None``."""
-    if not isinstance(res, dict) or set(res) - {"held_from"} != _RESULT_KEYS:
+    if not isinstance(res, dict) or set(res) - {"held_from", "rows"} != _RESULT_KEYS:
         keys = sorted(res) if isinstance(res, dict) else type(res).__name__
         return f"gate result {i}: keys {keys}"
+    if "rows" in res:
+        # W3b6b: the bound bench records, three sha256 (verified by W7d's
+        # replay against the published bytes).
+        rows = res["rows"]
+        if not isinstance(rows, dict) or set(rows) != _ROWS_ROLES or not all(
+                isinstance(v, str) and len(v) == 64 and set(v) <= _HEX for v in rows.values()):
+            return f"gate result {i}: rows is not three sha256 digests"
     dg, outcome = str(res["digest"])[:12], res["outcome"]
     if outcome not in GATE_OUTCOMES:
         return f"gate result {i} ({dg}): outcome {outcome!r} not in {GATE_OUTCOMES}"
