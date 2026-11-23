@@ -1,20 +1,16 @@
 """W5e through `settle_lane_d`: the verdict (paired cluster bootstrap,
-`d_margin`, max-T), the mandatory confirmation duel on the next disjoint set,
-the D20 king-change rule and `rows_sha256` (plan rev6 §1.3 Verdict, §1.5,
-D20, T9b). README.md has the contract.
+`d_margin`, max-T), crown at the FIRST verdict, `rows_sha256` (plan rev6
+§1.3 Verdict, §1.5; rev6.11 (b): the confirmation duel is dropped). README.md
+has the contract.
 
-Every state comes from real settlements: X first clears against the genesis
-house H0 on snapshot 1 at boundary(1) and confirms on snapshot 2 at
-boundary(2). Most of these rules are already on main (W5b/W5c built them);
-W5e owns them as its assertions. The D20 `"original"` rule after a house
-refresh fails on main: the first-clear king is no longer known to the state,
-so the confirmation is skipped as `king_unscored`.
+Every state comes from real settlements: X clears against the genesis house
+H0 on snapshot 1 at boundary(1) and, with a passing §1.3b gate, is crowned
+there. There is no confirmation stage, no `confirm_pending` state and no D20
+king-change rule; `confirm_on_king_change` is parsed and ignored.
 
-RV5: an armed crowning fails closed without the gate inputs, so every
-settlement here that may crown goes through `helpers.settle_crowning` (a
-passing bench and a block hash); on main those fail on the AssertionError in
-`helpers.settle_gated`. Settlements without a confirming clear keep the
-legacy call.
+On main a first clear goes `confirm_pending` and waits for a second set, so
+the crown tests fail on an AssertionError. The non-crowning verdict tests
+(W5b/W5c built them) pass on main.
 """
 
 from __future__ import annotations
@@ -59,107 +55,115 @@ def _fc(recs, models: dict) -> dict:
     return {dg: model_forecasts(recs, q, name) for dg, (q, name) in models.items()}
 
 
-def _first_clear(tmp_path, cfg=None, *, x_quality="sharp", house_quality="bad"):
+def _first_verdict(tmp_path, cfg=None, *, x_quality="sharp", house_quality="bad", gated=True):
+    """X judged at its first freeze (boundary 1). `gated` passes a healthy
+    bench and a block hash (a clear may crown); otherwise the legacy call,
+    only for a fixture in which X does not clear."""
     cfg = cfg or lane_d_cfg()
     h0 = house()
     x = entry("x", reveal_ts=T_X)
     path = tmp_path / "state" / "lane_d_state.json"
     pool1, recs1 = snapshot(tmp_path, 1)
     fc = _fc(recs1, {h0["digest"]: (house_quality, "house-0"), x["digest"]: (x_quality, "x")})
-    s1 = settle(cfg, boundary(1), pool1, [x], h0, fc, uids(x), path)
+    if gated:
+        s1 = settle_crowning(cfg, boundary(1), pool1, [x], h0, fc, uids(x), path,
+                             candidates=[x["digest"]], references=[h0["digest"]], tag="b1")
+    else:
+        s1 = settle(cfg, boundary(1), pool1, [x], h0, fc, uids(x), path)
     return cfg, h0, x, path, (pool1, recs1), s1
 
 
-def test_a_first_clear_is_not_crowned_and_goes_confirm_pending(tmp_path):
-    cfg, h0, x, path, (_, recs1), s1 = _first_clear(tmp_path)
+def _stage_is_first(obj) -> bool:
+    """rev6.11 / W7a: a verdict's or cohort's `stage` is fixed to `first`, or
+    dropped."""
+    return obj.get("stage", "first") == "first"
+
+
+def test_a_first_clear_is_crowned_at_the_first_verdict(tmp_path):
+    cfg, h0, x, path, (_, recs1), s1 = _first_verdict(tmp_path)
     v = verdict_of(s1.report, x["digest"])
     assert v is not None, "X was not judged at its first freeze"
-    assert v["stage"] == "first" and v["cleared"] is True, v
-    assert v["outcome"] == "confirm_pending", "a first clear must not crown"
-    assert s1.report["crowned"] is None
-    assert s1.report["king_after"]["digest"] == h0["digest"]
-    assert s1.pay["court_uids"][0] is None, "the house still holds KING_D (its slot burns)"
+    assert _stage_is_first(v) and v["cleared"] is True, v
+    assert v["outcome"] == "crowned", \
+        f"rev6.11 (b): a first clear that passes A10 and the gate is crowned; got {v['outcome']}"
+    assert v.get("confirmation") is None, "the confirmation block is removed (rev6.11 (b))"
+    assert s1.report["crowned"] == x["digest"]
+    assert s1.report["king_after"]["digest"] == x["digest"]
     (cohort,) = s1.report["cohorts"]
+    assert _stage_is_first(cohort)
     assert cohort["set_sha256"] == set_sha(wids(recs1))
-    rec = read_state(path)["entries"][x["digest"]]
-    assert (rec["status"], rec["reason"]) == ("confirm_pending", "confirm_pending")
-    conf = rec["confirm"]
-    assert conf["first_set_sha256"] == cohort["set_sha256"]
-    assert conf["king_digest"] == h0["digest"]
-    assert conf["rule"] == "restart"
-    assert conf["boundary"] == boundary(1)
-    assert sorted(rec["used_windows"]) == wids(recs1)
-    e = entry_of(s1.report, x["digest"])
-    assert (e["status"], e["reason"]) == ("confirm_pending", "confirm_pending")
-
-
-def test_confirmation_runs_on_the_next_disjoint_set_and_crowns(tmp_path):
-    cfg, h0, x, path, (pool1, recs1), s1 = _first_clear(tmp_path)
-    pool2, recs2 = snapshot(tmp_path, 2)
-    fc = _fc(recs1 + recs2, {h0["digest"]: ("bad", "house-0"), x["digest"]: ("sharp", "x")})
-    # Snapshot 1 is still retained: its windows are eligible for X but already
-    # used, so the confirmation set must be snapshot 2's windows alone.
-    s2 = settle_crowning(cfg, boundary(2), pool2, [x], h0, fc, uids(x), path, prior=[pool1],
-                         candidates=[x["digest"]], references=[h0["digest"]], tag="b2")
-    v = verdict_of(s2.report, x["digest"])
-    assert v is not None, "X was not judged on its confirmation set"
-    assert v["stage"] == "confirm" and v["cleared"] is True, v
-    (cohort,) = [c for c in s2.report["cohorts"] if x["digest"] in c["members"]]
-    assert sorted(cohort["window_ids"]) == wids(recs2)
-    assert not set(cohort["window_ids"]) & set(wids(recs1)), \
-        "the confirmation set shares a window with the first-clear set"
-    assert rows_of(s2.report, x["digest"]) == set(wids(recs2))
-    assert v["confirmation"]["stage"] == "confirm"
-    assert v["confirmation"]["first_set_sha256"] == s1.report["cohorts"][0]["set_sha256"]
-    assert v["confirmation"]["first_king_digest"] == h0["digest"]
-    assert v["outcome"] == "crowned"
-    assert s2.report["crowned"] == x["digest"]
     state = read_state(path)
     assert state["king"]["digest"] == x["digest"] and not state["king"]["house"]
-    assert state["entries"][x["digest"]]["status"] == "crowned"
-    assert s2.pay["court_uids"][0] == uids(x)[x["hotkey"]]
+    rec = state["entries"][x["digest"]]
+    assert rec["status"] == "crowned"
+    assert rec.get("confirm") is None, "no `confirm` record (rev6.11 (b))"
+    assert sorted(rec["used_windows"]) == wids(recs1)
+    assert entry_of(s1.report, x["digest"])["status"] == "crowned"
+    assert s1.pay["court_uids"][0] == uids(x)[x["hotkey"]]
 
 
-def test_a_clear_on_the_confirmation_set_fails_and_is_lost_confirmation(tmp_path):
-    cfg, h0, x, path, _, _ = _first_clear(tmp_path)
+def test_no_confirm_stage_or_status_exists(tmp_path):
+    """`confirm_pending` leaves every open-status tuple, and no report or
+    state the settlement writes names a confirm stage."""
+    from cascade.validator import lane_d, lane_d_queue, lane_d_status
+
+    for mod in (lane_d, lane_d_queue, lane_d_status):
+        assert "confirm_pending" not in tuple(mod.OPEN_STATUSES), \
+            f"{mod.__name__}.OPEN_STATUSES still holds confirm_pending"
+    cfg, h0, x, path, _, s1 = _first_verdict(tmp_path)
+    text = json.dumps(s1.report) + Path(path).read_text()
+    for word in ("confirm_pending", "lost_confirmation"):
+        assert word not in text, f"the settlement still writes {word}"
+
+
+def test_the_crowned_king_is_not_judged_again_on_a_second_set(tmp_path):
+    cfg, h0, x, path, (pool1, recs1), s1 = _first_verdict(tmp_path)
+    assert s1.report["crowned"] == x["digest"], "fixture: X was not crowned"
     pool2, recs2 = snapshot(tmp_path, 2)
-    fc = _fc(recs2, {h0["digest"]: ("fair", "house-0"), x["digest"]: ("bad", "x")})
-    s2 = settle(cfg, boundary(2), pool2, [x], h0, fc, uids(x), path)
-    v = verdict_of(s2.report, x["digest"])
-    assert v is not None and v["stage"] == "confirm"
+    fc = _fc(recs1 + recs2, {h0["digest"]: ("bad", "house-0"), x["digest"]: ("sharp", "x")})
+    s2 = settle(cfg, boundary(2), pool2, [x], h0, fc, uids(x), path, prior=[pool1])
+    assert verdict_of(s2.report, x["digest"]) is None, "the crowned king was judged again"
+    assert s2.report["crowned"] is None
+    assert read_state(path)["king"]["digest"] == x["digest"]
+    assert all(_stage_is_first(c) for c in s2.report["cohorts"])
+
+
+def test_a_failed_first_verdict_is_lost_duel(tmp_path):
+    cfg, h0, x, path, _, s1 = _first_verdict(tmp_path, x_quality="bad",
+                                             house_quality="fair", gated=False)
+    v = verdict_of(s1.report, x["digest"])
+    assert v is not None and _stage_is_first(v)
     assert v["cleared"] is False and v["outcome"] == "lost"
     rec = read_state(path)["entries"][x["digest"]]
-    assert (rec["status"], rec["reason"]) == ("lost", "lost_confirmation")
-    assert s2.report["crowned"] is None
+    assert (rec["status"], rec["reason"]) == ("lost", "lost_duel")
+    assert s1.report["crowned"] is None
     assert read_state(path)["king"]["digest"] == h0["digest"]
 
 
-def test_confirm_pending_persists_until_a_fresh_set_freezes_and_across_restarts(tmp_path):
-    cfg, h0, x, path, (pool1, recs1), s1 = _first_clear(tmp_path)
-    conf1 = read_state(path)["entries"][x["digest"]]["confirm"]
-    # boundary(2): no new snapshot, so no fresh window: X is not judged and
-    # keeps its first clear.
-    fc1 = _fc(recs1, {h0["digest"]: ("bad", "house-0"), x["digest"]: ("sharp", "x")})
-    s2 = settle(cfg, boundary(2), pool1, [x], h0, fc1, uids(x), path)
-    assert verdict_of(s2.report, x["digest"]) is None, "X was re-judged on used windows"
-    rec = read_state(path)["entries"][x["digest"]]
-    assert rec["status"] == "confirm_pending"
-    assert rec["confirm"] == conf1, "the first clear was lost while waiting for a fresh set"
-    # A restart: a new process reads the persisted state file.
+def test_the_first_verdict_is_restart_safe(tmp_path):
+    """A restart (a fresh call on a copy of the prior state file) gives the
+    same verdict, crown and `rows_sha256`."""
+    cfg = lane_d_cfg()
+    h0 = house()
+    z = entry("z", reveal_ts=T_X)
+    path = tmp_path / "state" / "lane_d_state.json"
+    pool1, recs1 = snapshot(tmp_path, 1)
+    models = {h0["digest"]: ("fair", "house-0"), z["digest"]: ("bad", "z")}
+    settle(cfg, boundary(1), pool1, [z], h0, _fc(recs1, models), uids(z), path)
     restarted = tmp_path / "restarted" / "lane_d_state.json"
     restarted.parent.mkdir()
     shutil.copyfile(path, restarted)
     pool2, recs2 = snapshot(tmp_path, 2)
-    fc = _fc(recs1 + recs2, {h0["digest"]: ("bad", "house-0"), x["digest"]: ("sharp", "x")})
-    gate = {"candidates": [x["digest"]], "references": [h0["digest"]], "tag": "b3"}
-    a = settle_crowning(cfg, boundary(3), pool2, [x], h0, fc, uids(x), path, prior=[pool1],
-                        **gate)
-    b = settle_crowning(cfg, boundary(3), pool2, [x], h0, fc, uids(x), restarted,
-                        prior=[pool1], **gate)
+    x = entry("x", reveal_ts=T_X, after=1)
+    models = {h0["digest"]: ("bad", "house-0"), x["digest"]: ("sharp", "x")}
+    gate = {"candidates": [x["digest"]], "references": [h0["digest"]], "tag": "b2"}
+    a = settle_crowning(cfg, boundary(2), pool2, [z, x], h0, _fc(recs2, models), uids(z, x),
+                        path, **gate)
+    b = settle_crowning(cfg, boundary(2), pool2, [z, x], h0, _fc(recs2, models), uids(z, x),
+                        restarted, **gate)
     for s in (a, b):
         v = verdict_of(s.report, x["digest"])
-        assert v is not None and v["stage"] == "confirm", v
-        assert v["confirmation"]["first_set_sha256"] == conf1["first_set_sha256"]
+        assert v is not None and _stage_is_first(v) and v["cleared"], v
         assert s.report["crowned"] == x["digest"]
     assert a.report["rows_sha256"] == b.report["rows_sha256"]
     assert a.report["verdicts"] == b.report["verdicts"]
@@ -183,16 +187,16 @@ def _verdict_recompute(report, cohort, cfg):
 
 
 def test_d_margin_is_an_inclusive_bar_on_the_lcb(tmp_path):
-    _, _, x, _, _, s1 = _first_clear(tmp_path / "probe")
+    _, _, x, _, _, s1 = _first_verdict(tmp_path / "probe")
     lcb = verdict_of(s1.report, x["digest"])["lcb"]
     assert 0.0 < lcb < 1.0, f"fixture: X's LCB {lcb} is not inside (0, 1)"
     at = lane_d_cfg(d_margin=lcb)
-    _, _, x, path, _, s = _first_clear(tmp_path / "at", at)
+    _, _, x, path, _, s = _first_verdict(tmp_path / "at", at)
     v = verdict_of(s.report, x["digest"])
     assert v["lcb"] == lcb, "the LCB must not depend on d_margin"
     assert v["cleared"] is True, "LCB == d_margin must clear (LCB_α ≥ d_margin)"
     above = lane_d_cfg(d_margin=math.nextafter(lcb, 1.0))
-    _, _, x, path, _, s = _first_clear(tmp_path / "above", above)
+    _, _, x, path, _, s = _first_verdict(tmp_path / "above", above)
     v = verdict_of(s.report, x["digest"])
     assert v["cleared"] is False and v["outcome"] == "lost"
     rec = read_state(path)["entries"][x["digest"]]
@@ -200,7 +204,7 @@ def test_d_margin_is_an_inclusive_bar_on_the_lcb(tmp_path):
     assert s.report["params"]["d_margin"] == above.d_margin
 
 
-def _two_entry_first(tmp_path, order=(0, 1)):
+def _two_entry_first(tmp_path, order=(0, 1), *, gated=False):
     cfg = lane_d_cfg()
     h0 = house()
     x1 = entry("x1", reveal_ts=T_X)
@@ -211,30 +215,28 @@ def _two_entry_first(tmp_path, order=(0, 1)):
               x2["digest"]: ("good", "x2")}
     ents = [x1, x2]
     ents = [ents[i] for i in order]
-    s1 = settle(cfg, boundary(1), pool1, ents, h0, _fc(recs1, models), uids(x1, x2), path)
+    if gated:
+        s1 = settle_crowning(cfg, boundary(1), pool1, ents, h0, _fc(recs1, models),
+                             uids(x1, x2), path, candidates=[x1["digest"], x2["digest"]],
+                             references=[h0["digest"]], tag="b1")
+    else:
+        s1 = settle(cfg, boundary(1), pool1, ents, h0, _fc(recs1, models), uids(x1, x2), path)
     return cfg, h0, (x1, x2), path, models, s1
 
 
-def test_max_t_crowns_the_best_of_a_confirming_cohort(tmp_path):
-    cfg, h0, (x1, x2), path, models, s1 = _two_entry_first(tmp_path)
-    for x in (x1, x2):
-        v = verdict_of(s1.report, x["digest"])
-        assert v is not None and v["cleared"] is True, f"fixture: {v}"
-    pool2, recs2 = snapshot(tmp_path, 2)
-    s2 = settle_crowning(cfg, boundary(2), pool2, [x1, x2], h0, _fc(recs2, models),
-                         uids(x1, x2), path, candidates=[x1["digest"], x2["digest"]],
-                         references=[h0["digest"]], tag="b2")
-    (cohort,) = s2.report["cohorts"]
-    assert cohort["stage"] == "confirm" and len(cohort["members"]) == 2
-    vs = {x["digest"]: verdict_of(s2.report, x["digest"]) for x in (x1, x2)}
-    assert all(v["cleared"] for v in vs.values()), vs
+def test_max_t_crowns_the_best_of_a_clearing_cohort_at_the_first_verdict(tmp_path):
+    cfg, h0, (x1, x2), path, models, s1 = _two_entry_first(tmp_path, gated=True)
+    (cohort,) = s1.report["cohorts"]
+    assert _stage_is_first(cohort) and len(cohort["members"]) == 2
+    vs = {x["digest"]: verdict_of(s1.report, x["digest"]) for x in (x1, x2)}
+    assert all(v["cleared"] for v in vs.values()), f"fixture: {vs}"
     # The verdict is the cohort's max-T judgment against KING_D on its set.
-    again = _verdict_recompute(s2.report, cohort, cfg)
+    again = _verdict_recompute(s1.report, cohort, cfg)
     for m, r in zip(cohort["members"], again, strict=True):
         for k in ("lcb", "gain", "cleared"):
             assert vs[m][k] == r[k], (m, k)
     best = max(vs, key=lambda d: vs[d]["lcb"])
-    assert s2.report["crowned"] == best
+    assert s1.report["crowned"] == best
     assert read_state(path)["king"]["digest"] == best
     other = next(d for d in vs if d != best)
     assert vs[other]["outcome"] != "crowned"
@@ -248,57 +250,40 @@ def test_every_verdict_clears_iff_lcb_reaches_d_margin_and_gain_is_positive(tmp_
         assert v["cleared"] == (v["lcb"] >= cfg.d_margin and v["gain"] > 0.0), v
 
 
-def test_t9b_d20_restart_house_refresh_discards_the_first_clear(tmp_path):
-    cfg, h0, x, path, _, s1 = _first_clear(tmp_path)
-    assert cfg.confirm_on_king_change == "restart"
+def test_confirm_on_king_change_is_parsed_and_ignored(tmp_path):
+    """rev6.11 (b): `confirm_on_king_change` is a legacy key, parsed and
+    ignored. Both values give the same settlement, and it leaves the
+    report's config echo."""
+    reps = {}
+    for rule in ("restart", "original"):
+        cfg = lane_d_cfg(confirm_on_king_change=rule)
+        *_, s1 = _first_verdict(tmp_path / rule, cfg)
+        reps[rule] = s1.report
+        assert "confirm_on_king_change" not in s1.report["params"], \
+            "confirm_on_king_change must leave the config echo (rev6.11 (b))"
+    a, b = reps["restart"], reps["original"]
+    for k in ("cohorts", "verdicts", "rows_sha256", "entries", "crowned", "params"):
+        assert a[k] == b[k], f"{k} depends on the ignored confirm_on_king_change"
+
+
+def test_a_house_refresh_never_discards_or_restarts_a_crown(tmp_path):
+    """No D20: a house refresh after X's first-verdict crown leaves X king
+    (a new house enters as a challenger, W5f), and X is not re-judged."""
+    cfg, h0, x, path, (pool1, recs1), s1 = _first_verdict(tmp_path)
+    assert s1.report["crowned"] == x["digest"], "fixture: X was not crowned"
     h1 = house("house-1", reveal_ts=HOUSE_T + HOUR)
     pool2, recs2 = snapshot(tmp_path, 2)
     fc = _fc(recs2, {h0["digest"]: ("bad", "house-0"), h1["digest"]: ("bad", "house-1"),
                      x["digest"]: ("sharp", "x")})
     s2 = settle(cfg, boundary(2), pool2, [x], h1, fc, uids(x), path)
-    v = verdict_of(s2.report, x["digest"])
-    assert v is not None, "X was not re-judged against the new king"
-    assert v["stage"] == "first", "the first clear against H0 must be discarded (restart)"
-    assert v["king_digest"] == h1["digest"]
-    assert v["confirmation"]["stage"] == "first"
-    assert v["confirmation"]["first_set_sha256"] is None
-    assert v["cleared"] is True and v["outcome"] == "confirm_pending"
-    assert s2.report["crowned"] is None, "a restarted duel crowned without a confirmation"
-    rec = read_state(path)["entries"][x["digest"]]
-    assert rec["status"] == "confirm_pending"
-    assert rec["confirm"]["king_digest"] == h1["digest"]
-    assert rec["confirm"]["boundary"] == boundary(2)
-    assert rec["confirm"]["first_set_sha256"] == set_sha(wids(recs2))
-    assert rows_of(s2.report, x["digest"]) == set(wids(recs2))
-
-
-def test_t9b_d20_original_confirms_against_the_king_of_the_first_clear(tmp_path):
-    cfg = lane_d_cfg(confirm_on_king_change="original")
-    cfg, h0, x, path, _, s1 = _first_clear(tmp_path, cfg)
-    h1 = house("house-1", reveal_ts=HOUSE_T + HOUR)
-    pool2, recs2 = snapshot(tmp_path, 2)
-    fc = _fc(recs2, {h0["digest"]: ("bad", "house-0"), h1["digest"]: ("bad", "house-1"),
-                     x["digest"]: ("sharp", "x")})
-    s2 = settle_crowning(cfg, boundary(2), pool2, [x], h1, fc, uids(x), path,
-                         candidates=[x["digest"]], references=[h0["digest"], h1["digest"]],
-                         tag="b2")
-    v = verdict_of(s2.report, x["digest"])
-    skips = [k["reason"] for k in s2.report["skipped"] if k["digest"] == x["digest"]]
-    # The D20 "original" bug on main: H0 is no longer the king, the house or a
-    # prior king, so its T is unknown and the confirmation is skipped.
-    assert "king_unscored" not in skips, \
-        "D20 original: the confirmation against the first-clear king was skipped as king_unscored"
-    assert v is not None, f"X's confirmation against H0 did not run (skipped: {skips})"
-    assert v["stage"] == "confirm" and v["king_digest"] == h0["digest"]
-    assert v["confirmation"]["rule"] == "original"
-    assert v["confirmation"]["first_king_digest"] == h0["digest"]
-    assert v["cleared"] is True
-    assert s2.report["crowned"] == x["digest"]
     assert read_state(path)["king"]["digest"] == x["digest"]
+    assert s2.report["crowned"] is None
+    v = verdict_of(s2.report, x["digest"])
+    assert v is None, f"the crowned king was re-judged after a house refresh: {v}"
 
 
 def test_rows_sha256_is_the_canonical_digest_of_the_ordered_rows(tmp_path):
-    cfg, h0, (x1, x2), path, _, s1 = _two_entry_first(tmp_path)
+    cfg, h0, (x1, x2), path, _, s1 = _two_entry_first(tmp_path, gated=True)
     rep = s1.report
     canon = json.dumps(rep["rows"], sort_keys=True, separators=(",", ":"),
                        allow_nan=False).encode("utf-8")
@@ -323,6 +308,7 @@ def test_rows_sha256_is_the_canonical_digest_of_the_ordered_rows(tmp_path):
 
     assert rows_sha256(tampered) != rep["rows_sha256"]
     assert rows_sha256(rep["rows"]) == rep["rows_sha256"]
+    assert rows_of(rep, x1["digest"]) == set(cohort["window_ids"])
 
 
 def _fingerprint(report) -> dict:
@@ -331,8 +317,8 @@ def _fingerprint(report) -> dict:
 
 
 def test_verdicts_are_deterministic_in_entry_input_order(tmp_path):
-    *_, a = _two_entry_first(tmp_path / "a", order=(0, 1))
-    *_, b = _two_entry_first(tmp_path / "b", order=(1, 0))
+    *_, a = _two_entry_first(tmp_path / "a", order=(0, 1), gated=True)
+    *_, b = _two_entry_first(tmp_path / "b", order=(1, 0), gated=True)
     assert _fingerprint(a.report) == _fingerprint(b.report)
 
 
@@ -340,7 +326,7 @@ HASHSEED_SCRIPT = r"""
 import json, sys
 from pathlib import Path
 from tests.accept.w5e import test_w5e_verdict as t
-*_, s = t._two_entry_first(Path(sys.argv[1]))
+*_, s = t._two_entry_first(Path(sys.argv[1]), gated=True)
 print(json.dumps(t._fingerprint(s.report), sort_keys=True))
 """
 

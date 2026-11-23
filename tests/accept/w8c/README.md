@@ -182,6 +182,70 @@ Unarmed, `build_lane_d_inputs` returns `None` and `build_lane_d_step`
 returns `None`. Handling a `None` source when building `bench` is the
 builder's job.
 
+### Armed contexts (rev6.6; tests-correction 2026-11-23, `test_w8c_armed.py`)
+
+The plan's rev6.6 section and §1.1 context bullet: "The main validator
+computes the armed set per settlement and records it, with the evidence it
+used, in the signed report". W5d (`armed_record`, `effective_context`, #744)
+and W7a (`settle_lane_d(..., armed=)`, `check_armed`) are merged; this
+source is what computes the set in production. Until this correction the
+source treated `cfg.lane_d.contexts` (the DECLARABLE set) as armed and never
+passed `armed=`, so no production report carried `armed_contexts`.
+
+```
+build_lane_d_inputs(cfg, *, ..., readiness, t7) -> source | None   # both REQUIRED keyword-only
+readiness() -> bytes      # the pinned laned_readiness/1 document's bytes, read at every call
+t7() -> bytes             # the pinned laned_t7/1 document's bytes, read at every call
+LaneDInputs.armed         # new field on W8b's dataclass, default None (W8b unchanged)
+DocumentFile(path)        # production source: () -> the file's bytes, re-read at every call
+SSHEvalHost.set_armed(contexts)   # the request's "contexts" becomes the armed set
+```
+
+- **Unarmed / at build:** neither document source is called.
+- **`source(boundary)`** reads both documents once, on the calling thread,
+  after the pools and before the eval host is contacted, and computes
+  `armed = lane_d_scorer.armed_record(cfg.lane_d.contexts, readiness=<bytes>,
+  t7=<bytes>, min_long_series=cfg.lane_d.min_long_series)`. The returned
+  `LaneDInputs.armed` is exactly that record; W8b's step passes it to
+  `settle_lane_d(..., armed=inputs.armed)` (`getattr(inputs, "armed", None)`,
+  so an inputs object without the field settles as before), and the signed
+  report then carries `armed_contexts` / `armed_evidence` (W7a).
+- **Forecast contexts:** each digest is forecast at
+  `effective_context(declared, armed["armed_contexts"])`: an entry or a
+  miner KING_D at its declared context when armed, else the highest armed
+  variant below it, else the lowest armed one; the house (and a house
+  KING_D) as declared 4096 (the trained length). The entry rows keep their
+  declared `context` (settle_lane_d records it). An entry whose declared
+  context is not in `cfg.lane_d.contexts` is not forecast (settle_lane_d
+  closes it at registration, `context_not_armed`).
+- **The eval host:** when it has `set_armed`, the source calls
+  `set_armed(armed_contexts)` once per settlement, after the handshake and
+  before the first forecast. `SSHEvalHost` then sends that list as the
+  request's `contexts` (the eval host's `declared_context` gate); before any
+  `set_armed` it sends `cfg.lane_d.contexts` as today.
+- **The inputs TOML** gains two required keys, `readiness` and `t7` (absolute
+  paths of the two documents); `load_inputs_services` returns
+  `readiness=DocumentFile(...)`, `t7=DocumentFile(...)`. The documents are
+  re-read per settlement, so a readiness update arms a variant at the next
+  settlement without a restart; the report pins the bytes used by sha256.
+
+**Fail closed** (each a `LaneDInputsError`, nothing written, no hello and no
+forecast; W8b reports `inputs_unavailable` with it as `__cause__`):
+
+| Input | Code |
+|---|---|
+| `readiness()` raises (absent, unreadable) | `readiness_unavailable` |
+| `t7()` raises (absent, unreadable) | `t7_unavailable` |
+| `armed_record` refuses a document (not JSON, wrong schema, bad counts, a T7 row whose stated `fits` disagrees with its numbers) | `armed_invalid` |
+| no variant passes both gates (nothing can be scored) | `no_armed_context` |
+
+Consensus: deterministic in (boundary, sources, document bytes); lane A is
+untouched; unarmed is byte-identical. Satellites verify the recorded record
+(W7d `armed_*` checks) and do not re-read the documents.
+
+Builder PATHS: `cascade/validator/lane_d_wiring.py` is added (the
+`LaneDInputs.armed` field and the `armed=` pass-through only).
+
 ### Invariants
 
 - **1:** above (unarmed: `None`, nothing used, nothing created).

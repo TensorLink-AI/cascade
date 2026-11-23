@@ -16,6 +16,8 @@ import pytest
 from .helpers import (
     ENUM_DEFS,
     JSON_SCHEMA_DIALECT,
+    REMOVED_OUTCOMES,
+    REMOVED_STAGE,
     SCHEMA_ERROR_CODES,
     SCHEMA_FILE,
     TOP_LEVEL_OPTIONAL,
@@ -99,3 +101,24 @@ def test_schema_error_type_and_codes():
 
     assert issubclass(ReportSchemaError, ValueError)
     assert sorted(map(str, codes)) == sorted(SCHEMA_ERROR_CODES)
+
+
+def test_rev6_11_no_confirmation_enums_remain():
+    """rev6.11 (b): the confirm stage, its rule and the confirm outcomes are
+    removed. `confirmation_stage`, if kept, is exactly ["first"];
+    `confirm_rule` and the module's `CONFIRM_RULES` are gone;
+    `verdict_outcome` equals the module tuple, holds `lost` and `crowned`
+    and none of `confirm_pending` / `confirmed`."""
+    from cascade.validator import lane_d_report
+
+    defs = _schema().get("$defs") or {}
+    assert "confirm_rule" not in defs, "$defs.confirm_rule must be removed"
+    assert not hasattr(lane_d_report, "CONFIRM_RULES"), "CONFIRM_RULES must be removed"
+    stages = (defs.get("confirmation_stage") or {}).get("enum")
+    assert stages in (None, ["first"]), f"$defs.confirmation_stage: {stages}"
+    assert REMOVED_STAGE not in tuple(getattr(lane_d_report, "CONFIRMATION_STAGES", ()))
+    assert "confirmation" not in defs, "$defs.confirmation (the block) must be removed"
+    outcomes = (defs.get("verdict_outcome") or {}).get("enum") or []
+    assert {"lost", "crowned"} <= set(outcomes), outcomes
+    assert not set(outcomes) & set(REMOVED_OUTCOMES), outcomes
+    assert sorted(map(str, lane_d_report.VERDICT_OUTCOMES)) == sorted(outcomes)

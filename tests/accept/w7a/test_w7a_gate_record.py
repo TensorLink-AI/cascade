@@ -33,8 +33,8 @@ from .helpers import (
     SCHEMA_FILE,
     assert_valid,
     build_gate,
+    loser_then_crown,
     text_digest,
-    two_settlements,
 )
 
 FAULTY = text_digest("w7a gate faulty candidate")
@@ -55,7 +55,7 @@ def _gated(scratch) -> dict:
     """The crowning settlement's report (BOUNDARY_2) carrying a gate record
     with one result per outcome: the crowned digest passes, the others
     regress, fault and are held."""
-    built = two_settlements(scratch)
+    built = loser_then_crown(scratch)
     key = str(scratch)
     if key not in _GATE:
         crowned = built["entry"]["digest"]
@@ -101,7 +101,7 @@ def test_fixture_gate_is_the_w3b1_draw_and_the_w3b2_outcomes(scratch):
     g = r["gate"]
     assert g["block"] == r["boundary"] == BOUNDARY_2
     assert g["sentinel"] == GATE_SENTINEL and GATE_SENTINEL not in g["eligible"]
-    cfg = two_settlements(scratch)["cfg"]
+    cfg = loser_then_crown(scratch)["cfg"]
     assert g["suite"] == gate_suite_for(g["block_hash"], gate_suites=cfg.gate_suites,
                                         gate_weights=cfg.gate_weights, sentinel=g["sentinel"])
     assert sorted(x["outcome"] for x in g["results"]) == sorted(GATE_OUTCOMES)
@@ -122,8 +122,8 @@ def _uncrowned(scratch) -> list[dict]:
     """Uncrowned reports: the first clear (BOUNDARY_1) and both settlements
     of the W1.5-format chain (nothing judged). W5e (RV5) makes a gate record
     required on a CROWNED report, so the no-gate cases use these."""
-    built = two_settlements(scratch)
-    legacy = two_settlements(scratch / "legacy", rich=False)
+    built = loser_then_crown(scratch)
+    legacy = loser_then_crown(scratch / "legacy", rich=False)
     out = [copy.deepcopy(s.report) for s in (built["s1"], legacy["s1"], legacy["s2"])]
     assert all(r["crowned"] is None for r in out), "fixture: an uncrowned report crowned"
     return out
@@ -139,7 +139,7 @@ def test_no_gated_candidate_means_no_gate_key(scratch):
     """A W1.5-format pool judges nothing (every window `unlisted_feed`), so no
     candidate reaches the gate and the report carries no `gate` key. `null`
     is not a second way of saying so: one canonical form for a signed body."""
-    legacy = two_settlements(scratch / "legacy", rich=False)
+    legacy = loser_then_crown(scratch / "legacy", rich=False)
     for s in (legacy["s1"], legacy["s2"]):
         assert s.report["judged"] == [] and "gate" not in s.report
     for r in _uncrowned(scratch):
