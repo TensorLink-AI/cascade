@@ -140,3 +140,13 @@ implementation lands every fixture window would be refused. Every fixture
 feed now pins `embargo_hours: 0.0` (e = 0, the rev3 rule byte for byte, so
 every verdict is unchanged); on main the key is ignored. No assertion
 changed; every test passes on main and with the W5a implementation.
+
+## Correction (plan rev6.11 (b)): crown at the first verdict
+
+The confirmation duel is dropped (owner 2026-11-23): a crown is decided at
+the first verdict, first clear (max-T LCB vs KING_D) ∧ A10 ∧ the §1.3b gate.
+There is no `confirm` stage, no `confirm_pending` status or reason and no
+`lost_confirmation`; a held first clear is `hold` / `bench_hold`. This WP's
+crowning chains move to that rule with nothing weakened. The nested-field signature test mutates `verdicts[0].lowfreq.result` instead of the removed `verdicts[0].confirmation.rule`. On main the
+old code still runs the confirmation stage, so the changed tests fail on an
+assertion until the W5e implementation lands.

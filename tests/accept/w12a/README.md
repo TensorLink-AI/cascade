@@ -144,3 +144,13 @@ green.
 
 A scratch `LANE_D.md` written to the contract passed all 29 LANE_D.md tests,
 which checks the parsers.
+
+## Correction (plan rev6.11 (b)): crown at the first verdict
+
+The confirmation duel is dropped (owner 2026-11-23): a crown is decided at
+the first verdict, first clear (max-T LCB vs KING_D) ∧ A10 ∧ the §1.3b gate.
+There is no `confirm` stage, no `confirm_pending` status or reason and no
+`lost_confirmation`; a held first clear is `hold` / `bench_hold`. This WP's
+crowning chains move to that rule with nothing weakened. The VALIDATOR guide check no longer requires the removed `confirmation` report field (W7a makes a verdict carrying it `unknown_field`). On main the
+old code still runs the confirmation stage, so the changed tests fail on an
+assertion until the W5e implementation lands.

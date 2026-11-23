@@ -83,10 +83,11 @@ class HouseChain(w5f.Chain):
 
 
 def chain_house_loses(root: Path) -> HouseChain:
-    """b1/b2 X crowned over H0; b3 the pointer swaps to a WEAK H1w while X
-    holds KING_D: H1w is judged alone against X and does not clear (lost),
-    and Y first-clears against X with H1w as the second bar; b4 Y confirms
-    and is crowned (the lost house is not judged again)."""
+    """b1 X crowned over H0 (b2 judges nothing); b3 the pointer swaps to a
+    WEAK H1w while X holds KING_D: H1w is judged alone against X and does not
+    clear (lost), and Y clears against X with H1w as the second bar and is
+    crowned at that first verdict (plan rev6.11 (b)); b4 judges nothing (the
+    lost house is not judged again)."""
     c = HouseChain(root)
     w5f.crown_x(c)
     c.model(H1W["digest"], "bad", "house-1w")
@@ -99,10 +100,11 @@ def chain_house_loses(root: Path) -> HouseChain:
 
 def chain_house_retakes(root: Path) -> HouseChain:
     """T10 then a miner dethrones the house: b1..b4 X then Y crowned (court
-    [Y, X]); b5 the pointer swaps to a sharp H1, which first-clears against
-    Y; b6 H1 confirms and retakes KING_D (Y the newest prior king, the slot
-    burns, `crowned` null); b7 Z (sharper) first-clears against the house;
-    b8 Z confirms and is crowned over the house (prior kings unchanged)."""
+    [Y, X]); b5 the pointer swaps to a sharp H1, which clears against Y and
+    retakes KING_D at its first verdict (rev6.11 (b); Y the newest prior
+    king, the slot burns, `crowned` null); b6 judges nothing; b7 Z (sharper)
+    clears against the house and is crowned over it (prior kings unchanged);
+    b8 judges nothing."""
     c = HouseChain(root)
     w5f.miner_court(c)
     c.model(H1["digest"], "sharp", "house-1")
@@ -117,10 +119,10 @@ def chain_house_retakes(root: Path) -> HouseChain:
 
 
 def chain_copy_at_swap(root: Path) -> HouseChain:
-    """b1/b2 X crowned over H0; b3 the pointer swaps to a sharp H1 and a
-    miner submits H1's digest (closed `duplicate_digest` at registration)
-    while H1 first-clears against X; b4 H1 confirms and retakes (X the
-    newest prior king)."""
+    """b1 X crowned over H0; b3 the pointer swaps to a sharp H1 and a miner
+    submits H1's digest (closed `duplicate_digest` at registration) while H1
+    clears against X and retakes at its first verdict (X the newest prior
+    king); b4 judges nothing."""
     c = HouseChain(root)
     w5f.crown_x(c)
     c.model(H1["digest"], "sharp", "house-1")
@@ -131,11 +133,11 @@ def chain_copy_at_swap(root: Path) -> HouseChain:
 
 
 def chain_open_copy(root: Path) -> HouseChain:
-    """b1/b2 X crowned over H0; b3 C (H1's digest, sharp) first-clears
-    against X with H0 as the second bar; b4 the pointer swaps to H1: the open
-    entry C is a copy of the house (closed `duplicate_digest`) and the house
-    enters afresh at stage first (C's first clear is not the house's); b5
-    the house confirms and retakes."""
+    """b1 X crowned over H0; b3 C (H1's digest, sharp) clears against X with
+    H0 as the second bar, held (no gate inputs); b4 the pointer swaps to H1:
+    the open entry C is a copy of the house (closed `duplicate_digest`, its
+    hold dropped) and the house enters afresh at stage first (C's clear is
+    not the house's) and retakes at that first verdict; b5 judges nothing."""
     c = HouseChain(root)
     w5f.crown_x(c)
     c.model(H1["digest"], "sharp", "house-1")

@@ -55,7 +55,7 @@ class One:
     """One settlement at boundary(n) on snapshot 1 with a healthy bench."""
 
     def __init__(self, tmp_path, entries, *, cfg=None, models=None, uid_of=None, fc_edit=None,
-                 n=1):
+                 n=1, armed=None):
         self.cfg = cfg or lane_d_cfg()
         self.h0 = house()
         self.path = tmp_path / "state" / "lane_d_state.json"
@@ -70,7 +70,7 @@ class One:
         hash_, bench, _ = gate_inputs("pass", entries[0]["digest"], self.h0["digest"], "b1")
         self.report = settle(self.cfg, boundary(n), pool1, entries, self.h0, fc,
                              uids(*entries) if uid_of is None else uid_of, self.path,
-                             hash_=hash_, bench=bench).report
+                             hash_=hash_, bench=bench, armed=armed).report
 
 
 def _x(**over):
@@ -133,6 +133,27 @@ def case_hotkey_has_open_entry(tmp_path):
 def case_context_not_armed(tmp_path):
     x = _x(context=1234)
     r = One(tmp_path, [x])
+    return r.path, r.report, x["digest"]
+
+
+def _armed_record(armed, contexts=(4096, 8192, 16384), mls=300) -> dict:
+    """A consistent W5d armed record (written by hand, no W5d import): armed
+    variants pass both gates, the others fail the readiness gate."""
+    variants = [{"context": c, "series": 4633 if c in armed else 12,
+                 "sources": 42 if c in armed else 3, "t7_fits": True, "armed": c in armed}
+                for c in contexts]
+    return {"armed_contexts": [c for c in contexts if c in armed],
+            "evidence": {"min_long_series": mls, "min_sources": 20,
+                         "readiness_sha256": "a1" * 32, "t7_sha256": "b2" * 32,
+                         "variants": variants}}
+
+
+def case_context_below_armed(tmp_path):
+    """Plan rev6.15 (owner 2026-11-23, "Highest ≤ declared, else skip"):
+    declared 4096 with only 8192 and 16384 armed. The entry is not judged and
+    stays pending (W7a owns the producer side; this is the reason's case)."""
+    x = _x(context=4096)
+    r = One(tmp_path, [x], armed=_armed_record((8192, 16384)))
     return r.path, r.report, x["digest"]
 
 
@@ -247,6 +268,7 @@ CASES = {
     "hotkey_has_open_entry": (case_hotkey_has_open_entry, "hotkey_has_open_entry",
                               "closed", True),
     "context_not_armed": (case_context_not_armed, "context_not_armed", "closed", True),
+    "context_below_armed": (case_context_below_armed, "context_below_armed", "pending", True),
     "checkpoint_fault_forecasts": (case_checkpoint_fault_forecasts, "checkpoint_fault",
                                    "closed", True),
     "checkpoint_fault_gate": (case_checkpoint_fault_gate, "checkpoint_fault", "closed", False),
