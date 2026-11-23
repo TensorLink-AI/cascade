@@ -1,5 +1,5 @@
-"""W9: the confirmation rule and the recorded inputs, end to end in chain mode
-(plan rev6 §1.3 "Mandatory confirmation duel" and D20, §1.2 "record the
+"""W9: the crown chain and the recorded inputs, end to end in chain mode
+(plan rev6.11 (b): the crown at the first verdict, no confirmation duel; §1.2 "record the
 coldkey early and carry it in the signed report", §1.5 "`checks.
 derive_weights` and `check_lane_d` re-derive the lane D weights from the
 receipt chain"; README "Chain mode").
@@ -42,16 +42,20 @@ def test_honest_chain_passes_in_chain_mode(run):
                   prior=[r["s2"], r["s1"]])
 
 
+def test_the_crown_chain_crowns_at_the_first_verdict(run):
+    """rev6.11 (b): X is crowned at b1, its first verdict (no confirmation
+    duel); b2 and b3 judge nothing. On main X first-clears at b1
+    (`confirm_pending`) and is crowned at b2."""
+    h.check_crown_chain_shape(run)
+
+
 def test_a_settlement_that_undoes_the_crown_fails(run):
-    """b3 restated as if b2 never crowned X: KING_D the house before and
+    """b3 restated as if b1 never crowned X: KING_D the house before and
     after, no prior kings, the house slot unpaid (0.25 burns instead of
     paying X). Its verdict-free body is a no-crown report; b2's signed
     `king_after` (X) refutes it."""
     r = _reports(run)
-    forged = copy.deepcopy(r["s3"])
-    for key in ("king_before", "king_after", "prior_kings", "pay"):
-        forged[key] = copy.deepcopy(r["s1"][key])
-    forged = h.resign(forged)
+    forged = h.resign(h.undo_crown(r["s3"], r["s1"]))
     h.assert_fail(forged, run["cfg"], "b3's king_before is not b2's king_after",
                   prior=[r["s1"], r["s2"]])
 
@@ -77,14 +81,15 @@ def test_an_entrys_recorded_inputs_never_change_between_reports(run, field, valu
 
 
 def test_the_house_and_its_t_carry_over_unless_refreshed(run):
-    """b2 restates the house H0's T (and every copy of it: `house`,
-    `king_before`, the confirm cohort's king T) a day earlier. The house
-    digest did not change, so its T is b1's."""
+    """b2 restates the house H0's T (and every copy of it: `house`, and
+    `king_before` and any cohort's king T where they name the house) a day
+    earlier. The house digest did not change, so its T is b1's."""
     r = _reports(run)
     forged = copy.deepcopy(r["s2"])
     t = h.HOUSE_T - 86_400
     forged["house"]["reveal_ts"] = t
-    forged["king_before"]["reveal_ts"] = t
+    if forged["king_before"]["digest"] == forged["house"]["digest"]:
+        forged["king_before"]["reveal_ts"] = t
     for c in forged["cohorts"]:
         if c["king_digest"] == forged["house"]["digest"]:
             c["king_reveal_ts"] = t
