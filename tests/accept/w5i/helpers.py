@@ -1,6 +1,7 @@
 """Spec, fixtures and the reference draw (with backtest cells) for the W5i
 tests. Copied from docs/plans/LANE_D_PLAN.md rev6.9 (a) and the W5i row, on
-top of rev6.10 (b) / W5j. README.md states the contract.
+top of rev6.10 (b) / W5j. README.md states the contract. `lane_d_cfg` pins
+`backtest_weight_cap` = 0.05, the shipped default (owner 2026-11-23, W2e).
 
 Nothing here imports a module in PATHS at import time.
 """
