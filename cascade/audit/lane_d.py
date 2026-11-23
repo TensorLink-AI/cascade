@@ -16,7 +16,11 @@ verifier. Checks, in order (the first failure is the verdict):
 6. per cohort: the max-T LCBs, gains, clears and outcomes re-derived from
    the rows; when a miner holds KING_D the house is a second bar, and its
    judgement (``cohorts[].house_digest``, ``verdicts[].house``) is
-   re-derived the same way and must be present exactly then;
+   re-derived the same way and must be present exactly then. W5f: a new
+   house challenges a miner KING_D alone in its own cohort (its T is the
+   report's house record's) with KING_D as its only bar, and a confirmed,
+   passing house retakes KING_D (``king_after`` the house record,
+   ``crowned`` null);
 7. the §1.3b gate (W5e): the signed ``gate`` record's draw (``block`` is
    the boundary; ``suite`` / ``eligible`` re-drawn from ``block_hash``, the
    config's ``gate_suites`` / ``gate_weights`` and the stated sentinel),
@@ -165,6 +169,13 @@ def _judge(report: dict, cfg, scores: dict, bar: str, members: list[str],
     return out
 
 
+def _bars(kd: str, hd: str, members) -> list[str]:
+    """The bars a cohort is judged against: KING_D, plus the house as a
+    second bar when a miner holds KING_D and the house is not the
+    challenger (W5f: the house is never its own second bar)."""
+    return [kd] if kd == hd or hd in members else [kd, hd]
+
+
 def _house_problems(idx: int, m: str, hv, hd: str, want: tuple[float, float, bool]
                     ) -> list[str]:
     """The verdict's ``house`` judgement against the one re-derived from the rows."""
@@ -245,8 +256,18 @@ def _cohort_problems(report: dict, cfg, cohort: dict, rows_by: dict, windows: di
     out = []
     idx = int(cohort["index"])
     kd, members, wids = cohort["king_digest"], list(cohort["members"]), list(cohort["window_ids"])
+    hd = str(report["house"]["digest"])
+    # W5f: the house challenges a miner KING_D in its own cohort, with its T
+    # from the report's house record (it is not a listed entry).
+    house_challenger = hd in members
+    if house_challenger and (members != [hd] or kd == hd):
+        return [f"cohort {idx}: the house {hd[:12]} is a member, but not alone against a "
+                f"miner KING_D"]
     ts = [int(cohort["king_reveal_ts"])]
     for m in members:
+        if house_challenger:
+            ts.append(int(report["house"]["reveal_ts"]))
+            continue
         if m not in entries:
             return [f"cohort {idx}: member {m[:12]} is not a listed entry"]
         ts.append(int(entries[m]["reveal_ts"]))
@@ -272,12 +293,13 @@ def _cohort_problems(report: dict, cfg, cohort: dict, rows_by: dict, windows: di
         return out
     # W5c change 3 (RV5): with a miner holding KING_D, the report's house is
     # a second bar. Whether it applies is re-derived, never read from the
-    # house keys, so an omitted judgement cannot hide the bar.
-    hd = str(report["house"]["digest"])
-    bars = [kd] if kd == hd else [kd, hd]
+    # house keys, so an omitted judgement cannot hide the bar. The house is
+    # never its own second bar (W5f).
+    bars = _bars(kd, hd, members)
     if len(bars) == 1:
         if "house_digest" in cohort:
-            return [f"cohort {idx}: house_digest where the house holds KING_D"]
+            return [f"cohort {idx}: house_digest where the house holds KING_D or is the "
+                    f"challenger"]
     elif cohort.get("house_digest") != hd:
         return [f"cohort {idx}: house_digest {cohort.get('house_digest')!r} is not the "
                 f"report's house {hd[:12]} (a miner holds KING_D)"]
@@ -307,7 +329,7 @@ def _cohort_problems(report: dict, cfg, cohort: dict, rows_by: dict, windows: di
         if len(bars) == 1:
             if "house" in v:
                 out.append(f"cohort {idx}: {m[:12]} carries a house judgement where the "
-                           f"house holds KING_D")
+                           f"house holds KING_D or is the challenger")
         else:
             out += _house_problems(idx, m, v.get("house"), hd, judged[hd][i])
             cleared = bool(cleared and judged[hd][i][2])
@@ -510,6 +532,12 @@ def _crown_problems(report: dict, cfg, boundary: int, confirms: dict, entries: d
         return None, out
     gated = "gate" in report
     verdicts = {v["digest"]: v for v in report.get("verdicts") or []}
+    house = report["house"]
+
+    def reveal_ts(dg: str) -> int:
+        # W5f: the house challenger's T is the report's house record's.
+        return int(house["reveal_ts"]) if dg == house["digest"] else int(entries[dg]["reveal_ts"])
+
     for dg in confirms:
         if gated and dg not in outcomes:
             out.append(f"cleared confirmation {dg[:12]} has no gate result")
@@ -520,8 +548,9 @@ def _crown_problems(report: dict, cfg, boundary: int, confirms: dict, entries: d
         if dg in verdicts:
             out.append(f"gate result for {str(dg)[:12]}, whose verdict is not a cleared "
                        f"confirmation")
-        elif dg not in entries:
-            out.append(f"gate result for {str(dg)[:12]}, neither a verdict nor a listed entry")
+        elif dg not in entries and dg != house["digest"]:
+            out.append(f"gate result for {str(dg)[:12]}, neither a verdict, a listed entry "
+                       f"nor the house")
         else:
             held.append(dg)
     results = {r["digest"]: r for r in report["gate"]["results"]} if gated else {}
@@ -535,13 +564,17 @@ def _crown_problems(report: dict, cfg, boundary: int, confirms: dict, entries: d
     if out:
         return None, out
     passing = sorted((v for dg, v in confirms.items() if outcomes.get(dg) == "pass"),
-                     key=lambda v: (-float(v["lcb"]), int(entries[v["digest"]]["reveal_ts"]),
-                                    v["digest"]))
+                     key=lambda v: (-float(v["lcb"]), reveal_ts(v["digest"]), v["digest"]))
     # A held candidate's clear (its LCB) is not in this report, so when one
     # passes the crown is the best passing confirmation or that candidate.
     allowed = [v["digest"] for v in passing[:1]] + [dg for dg in held if outcomes[dg] == "pass"]
     stated = report.get("crowned")
-    crown = stated if stated in allowed else (allowed[0] if allowed else None)
+    if stated is None and house["digest"] in allowed and report["king_after"].get("house") \
+            and report["king_after"]["digest"] == house["digest"]:
+        # W5f: a house retake names no miner crown (``crowned`` is null).
+        crown = house["digest"]
+    else:
+        crown = stated if stated in allowed else (allowed[0] if allowed else None)
     for dg, v in confirms.items():
         o = outcomes.get(dg)
         if o in (None, "bench_hold"):
@@ -732,6 +765,7 @@ def _judged_set_problems(report: dict, cfg, entries: dict) -> list[str]:
         return [f"the verdicts {sorted(judged)} are not exactly the cohort members "
                 f"{sorted(members)}"]
     judged_set = set(judged)
+    house = report["house"]["digest"]
     skipped = report.get("skipped")
     if not isinstance(skipped, list):
         return [f"skipped is {type(skipped).__name__}, not a list"]
@@ -744,7 +778,9 @@ def _judged_set_problems(report: dict, cfg, entries: dict) -> list[str]:
             return [f"skipped {str(dg)[:12]} is not a listed entry"]
         if dg in skip_of:
             return [f"skipped {str(dg)[:12]} appears twice"]
-        if dg in judged_set:
+        if dg in judged_set and not (dg == house and s["reason"] == "duplicate_digest"):
+            # W5f: a miner copy of the house is refused at dedup while the
+            # house itself (same digest, not an entry) is judged.
             return [f"{str(dg)[:12]} is both judged and skipped"]
         if entries[dg].get("reason") != s["reason"]:
             return [f"skipped {str(dg)[:12]} reason {s['reason']!r} != its entry's reason "
@@ -761,7 +797,9 @@ def _judged_set_problems(report: dict, cfg, entries: dict) -> list[str]:
     if out:
         return out
     held = gated - judged_set
-    cands = [dg for dg in judged if dg not in held]
+    # W5f: the house challenger is not a listed entry and is never selected
+    # under the caps (it has no coldkey); only miner entries are candidates.
+    cands = [dg for dg in judged if dg not in held and dg != house]
     cands += [dg for dg, why in skip_of.items()
               if why in (_CAP_SKIP, *_SELECTED_SKIPS) and dg not in held]
     for dg in cands:
@@ -1053,7 +1091,8 @@ def check_lane_d(report: dict, cfg, *, signer_hotkey: str, prior_reports=None,
         # bar (a miner holds KING_D), and every member.
         house = report["house"]["digest"]
         expected_rows = sum(len(c["window_ids"])
-                            * ((1 if c["king_digest"] == house else 2) + len(c["members"]))
+                            * (len(_bars(c["king_digest"], house, c["members"]))
+                               + len(c["members"]))
                             for c in cohorts)
         if expected_rows != len(rows):
             return _fail(NAME, f"{len(rows)} rows; the cohorts account for {expected_rows}")
@@ -1077,7 +1116,16 @@ def check_lane_d(report: dict, cfg, *, signer_hotkey: str, prior_reports=None,
         if problems:
             return _fail(NAME, "; ".join(problems[:5]))
         before, after = report["king_before"], report["king_after"]
-        if crown is not None:
+        if crown is not None and crown == report["house"]["digest"]:
+            # W5f (§2 item 2, T10): the house retakes KING_D from a miner.
+            if (report.get("crowned") is not None or after["digest"] != crown
+                    or not after["house"] or after.get("hotkey") is not None
+                    or before["house"]):
+                return _fail(NAME, f"house retake {crown[:12]}: crowned "
+                                   f"{report.get('crowned')!r}, king_after "
+                                   f"{str(after['digest'])[:12]} (house={after['house']}), "
+                                   f"king_before house={before['house']}")
+        elif crown is not None:
             if report.get("crowned") != crown or after["digest"] != crown or after["house"]:
                 return _fail(NAME, f"crowned {report.get('crowned')!r}; re-derived {crown!r}")
         elif report.get("crowned") is not None or after["digest"] != before["digest"]:
