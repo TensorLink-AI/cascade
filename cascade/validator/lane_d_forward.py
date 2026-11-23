@@ -37,6 +37,16 @@ whose ``frontier`` is absent or ``null`` has no evidence of being in S0
 entry is ``unlisted_feed``, never "lag unmeasured". Missing metadata never
 switches a rule off.
 
+Embargo (rev6.10 (a), rev6.12 (a)/(b)): per series, for every ``freq``,
+``e = min(feeds[feed].embargo_hours, cfg.embargo_hours)``; rules 4-6 are
+judged at the feed bound ``bound - 3600 * e`` (``first_seen + e > b`` and
+``data_ts > b - e`` for every target point; S0 and backfill at ``b - e``). A
+listed feed whose ``embargo_hours`` is missing or not a non-negative number
+fails closed as ``unlisted_feed``. ``e = 0`` is the rev3 rule byte for byte.
+An eligible window is **fresh** when it also passes at e = 0, else an
+**embargo** window (``WindowVerdict.embargo_window``), for W5j's fresh-first
+draw and ``min_fresh_window_share``.
+
 Only ``max(T_E, T_K)`` enters the rule, so swapping the two T values yields
 identical verdicts. The snapshot-absence rule of the v2 plan is not used
 here: it survives only as W1's report-only upper bound.
@@ -46,6 +56,7 @@ Light imports only: this module is on the validator package's import path.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterator
 from dataclasses import dataclass
 from enum import StrEnum
@@ -70,12 +81,19 @@ REFUSAL_REASONS: tuple[RefusalReason, ...] = tuple(RefusalReason)
 
 @dataclass(frozen=True)
 class WindowVerdict:
-    """One pool window's §1.3 verdict: ``reason`` is ``None`` iff eligible."""
+    """One pool window's §1.3 verdict: ``reason`` is ``None`` iff eligible.
+
+    ``embargo_hours`` is the series' effective embargo e (rev6.10 (a)) and
+    ``embargo_window`` its rev6.12 class: ``False`` = fresh (the window also
+    passes the e = 0 rule on every point), ``True`` = embargo window (a mixed
+    target included). Both are meaningful on an eligible verdict only."""
 
     window_id: str
     eligible: bool
     reason: RefusalReason | None
     bound: float
+    embargo_hours: float = 0.0
+    embargo_window: bool = False
 
 
 def forward_bound(t_entry: int, t_king: int, cfg) -> float:
@@ -95,13 +113,35 @@ def _s0_end(frontier, bound: float) -> float | None:
     return after[0][1] if after else None
 
 
-def window_reason(w: dict, feeds: dict, bound: float, cfg) -> RefusalReason | None:
-    """The first failing §1.3 rule for window ``w`` at ``bound``, or ``None``."""
+def feed_embargo_hours(feed: dict, cfg) -> float | None:
+    """rev6.10 (a), rev6.12 (a): ``e = min(feeds[feed].embargo_hours, [lane_d]
+    embargo_hours)`` for every ``freq``. ``None`` (fail closed) when the listed
+    feed's value is missing, ``null``, a bool, a string, negative or not
+    finite."""
+    v = feed.get("embargo_hours")
+    if isinstance(v, bool) or not isinstance(v, int | float) or not math.isfinite(v) or v < 0:
+        return None
+    return min(float(v), float(getattr(cfg, "embargo_hours", 0.0)))
+
+
+def window_reason(w: dict, feeds: dict, bound: float, cfg, *,
+                  embargo: bool = False) -> RefusalReason | None:
+    """The first failing §1.3 rule for window ``w`` at ``bound``, or ``None``.
+
+    With ``embargo`` (the settlement path) the clock, S0 and backfill rules
+    are judged at the feed bound ``bound - 3600 * e`` and a listed feed without
+    a valid ``embargo_hours`` is ``unlisted_feed``; without it (e = 0) this is
+    the rev3 rule byte for byte."""
     if not _clocks_recorded(w, int(cfg.horizon)):
         return RefusalReason.MISSING_CLOCK
     feed = feeds.get(w.get("feed") or w["source"])
     if not isinstance(feed, dict):
         return RefusalReason.UNLISTED_FEED
+    if embargo:
+        e = feed_embargo_hours(feed, cfg)
+        if e is None:
+            return RefusalReason.UNLISTED_FEED
+        bound = bound - 3600.0 * e
     if bool(feed.get("forecast_product", False)):
         return RefusalReason.FORECAST_PRODUCT
     lag = feed.get("mirror_lag_hours")
@@ -135,9 +175,13 @@ def eligible_windows(pool: dict, *, t_entry: int, t_king: int, cfg) -> Iterator[
     bound = forward_bound(t_entry, t_king, cfg)
     feeds = pool.get("feeds") or {}
     for w in pool["windows"]:
-        reason = window_reason(w, feeds, bound, cfg)
+        reason = window_reason(w, feeds, bound, cfg, embargo=True)
+        e, emb = 0.0, False
+        if reason is None:
+            e = feed_embargo_hours(feeds[w.get("feed") or w["source"]], cfg) or 0.0
+            emb = e > 0.0 and window_reason(w, feeds, bound, cfg) is not None
         yield WindowVerdict(window_id=str(w["window_id"]), eligible=reason is None,
-                            reason=reason, bound=bound)
+                            reason=reason, bound=bound, embargo_hours=e, embargo_window=emb)
 
 
 __all__ = ["REFUSAL_REASONS", "RefusalReason", "WindowVerdict", "eligible_windows",
