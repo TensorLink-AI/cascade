@@ -108,32 +108,51 @@ def skip_copula_draws(gen, n: int, c: int, p: int, ps: int, groups, device) -> N
 class Gang:
     """Rank 0's handle on the helper ranks (see the module doc)."""
 
-    def __init__(self, world: int, cfg, *, deterministic: bool, seed: int) -> None:
+    def __init__(self, world: int, cfg, *, deterministic: bool, seed: int, device="cuda",
+                 expert_selection=None, slices=None) -> None:
+        """``device``: the trainer's device. CUDA = NCCL with :data:`NCCL_PIN`,
+        rank ``r`` on ``cuda:r`` (unchanged); CPU = every rank on CPU with
+        gloo (the CI seam). ``expert_selection`` / ``slices``: a lane-B leg's
+        selection and rank 0's :class:`~.expert_training.ExpertSlices`; the
+        helper ranks build the same leaves, and only those leaves are
+        reduced, sharded and synced (router, routing bias and every other
+        tensor stay frozen)."""
         import torch.distributed as dist
         import torch.multiprocessing as mp
 
+        if (expert_selection is None) != (slices is None):
+            raise ValueError("an expert gang needs both the selection and rank 0's slices")
+        cuda = torch.device(device).type == "cuda"
         self.world, self.rank = int(world), 0
-        self.device = torch.device("cuda", 0)
+        self.device = torch.device("cuda", 0) if cuda else torch.device("cpu")
+        self.slices = slices
+        selection = None if expert_selection is None else {
+            int(k): sorted(int(r) for r in v) for k, v in dict(expert_selection).items()}
         with socket.socket() as s:
             s.bind(("127.0.0.1", 0))
             port = s.getsockname()[1]
-        # before the spawn, so every helper inherits it (it pins again itself)
-        pin_nccl_env()
+        if cuda:
+            # before the spawn, so every helper inherits it (it pins again itself)
+            pin_nccl_env()
         ctx = mp.get_context("spawn")
         self.errors = ctx.Queue()
         self.procs = [ctx.Process(target=_follower, daemon=True,
                                   args=(r, self.world, port, cfg.to_dict(), deterministic,
-                                        seed, self.errors))
+                                        seed, self.errors),
+                                  kwargs={"cuda": cuda, "expert_selection": selection})
                       for r in range(1, self.world)]
         for p in self.procs:
             p.start()
-        torch.cuda.set_device(0)
+        if cuda:
+            torch.cuda.set_device(0)
         bound_cpu_threads(self.world)
-        dist.init_process_group("nccl", init_method=f"tcp://127.0.0.1:{port}", rank=0,
+        dist.init_process_group("nccl" if cuda else "gloo",
+                                init_method=f"tcp://127.0.0.1:{port}", rank=0,
                                 world_size=self.world, timeout=_TIMEOUT)
         self.dist = dist
         self.synced = False
-        log.info("pyramid: training on %d GPUs (micro-batches dealt round-robin)", self.world)
+        log.info("pyramid: training on %d %s (micro-batches dealt round-robin%s)", self.world,
+                 "GPUs" if cuda else "CPU ranks", "" if slices is None else ", selected experts")
 
     # ── collectives ──────────────────────────────────────────────────────────
 
@@ -165,11 +184,17 @@ class Gang:
         optimizer.muon_owner = assign_muon_owners(optimizer.muon_params, self.world)
         optimizer.rank = 0
         self.optimizer = optimizer
-        self._sources = state_sources(model, optimizer)
+        self._sources = (state_sources(model, optimizer) if self.slices is None
+                         else leaf_sources(self.slices, optimizer))
 
     def sync_after_step(self, model) -> None:
         """Every rank's weights after a sharded step: each muon param from its
-        owner, everything else (AdamW params, buffers) from rank 0."""
+        owner, everything else (AdamW params, buffers) from rank 0. An expert
+        gang syncs only the selected leaves (from their owners) and writes
+        them into the canonical expert tensors; nothing else ever changes."""
+        if self.slices is not None:
+            sync_leaves(self.dist, self.slices, self._sources, self.device)
+            return
         broadcast_from_sources(self.dist, list(model.state_dict().values()), self._sources,
                                self.device)
 
@@ -240,6 +265,29 @@ def state_sources(model, optimizer) -> list[int]:
     owner = {name: optimizer.muon_owner[index[id(p)]]
              for name, p in model.named_parameters() if id(p) in index}
     return [owner.get(name, 0) for name in model.state_dict()]
+
+
+def leaf_sources(slices, optimizer) -> list[int]:
+    """The broadcast source rank of each selected leaf of an expert leg, in
+    ``slices.parameters()`` order: its muon owner, else rank 0."""
+    index = {id(p): i for i, p in enumerate(optimizer.muon_params)}
+    return [optimizer.muon_owner[index[id(p)]] if id(p) in index else 0
+            for p in slices.parameters()]
+
+
+def sync_leaves(dist, slices, sources, device) -> None:
+    """Every rank's selected leaves from their owners, then into the
+    canonical expert rows (``ExpertSlices.sync``). Identical on every rank."""
+    broadcast_from_sources(dist, list(slices.parameters()), sources, device)
+    slices.sync()
+
+
+@torch.no_grad()
+def refresh_leaves(slices) -> None:
+    """A helper's leaves from its canonical expert rows, just received from
+    rank 0 (where every leaf equals its rows after ``sync``)."""
+    for name, leaf in slices.named_parameters():
+        leaf.copy_(slices.weights[name].index_select(0, slices.rows[name]))
 
 
 def exchange_muon_state(dist, optimizer, device, *, to_root: bool) -> None:
@@ -497,8 +545,13 @@ def _host_losses(marginal, joint) -> tuple[float, float]:
     return m, j
 
 
-def _follower(rank, world, port, cfg_dict, deterministic, seed, errors) -> None:
-    """Helper rank: hold the model, run owned micro-batches, take weights."""
+def _follower(rank, world, port, cfg_dict, deterministic, seed, errors, *, cuda=True,
+              expert_selection=None) -> None:
+    """Helper rank: hold the model, run owned micro-batches, take weights.
+
+    ``cuda``: NCCL on ``cuda:rank`` (else gloo on CPU). ``expert_selection``:
+    a lane-B leg; the helper builds the same :class:`ExpertSlices` leaves as
+    rank 0 and, like rank 0, binds the fast kernels only for lane A."""
     import types
 
     import torch.distributed as dist
@@ -507,21 +560,32 @@ def _follower(rank, world, port, cfg_dict, deterministic, seed, errors) -> None:
     from .toto2_trainer import Toto2Trainer
 
     try:
-        torch.cuda.set_device(rank)
+        if cuda:
+            torch.cuda.set_device(rank)
         bound_cpu_threads(world)
-        device = torch.device("cuda", rank)
-        pin_nccl_env()
-        dist.init_process_group("nccl", init_method=f"tcp://127.0.0.1:{port}", rank=rank,
+        device = torch.device("cuda", rank) if cuda else torch.device("cpu")
+        if cuda:
+            pin_nccl_env()
+        dist.init_process_group("nccl" if cuda else "gloo",
+                                init_method=f"tcp://127.0.0.1:{port}", rank=rank,
                                 world_size=world, timeout=_TIMEOUT)
         torch.manual_seed(seed)
         Toto2Trainer._enable_determinism(types.SimpleNamespace(deterministic=deterministic),
                                          torch, seed)
         model = CascadeMoEModel(CascadeMoEConfig.from_dict(cfg_dict)).to(device)
         model.train()
-        from .pyramid_fast import accelerate
+        slices = None
+        if expert_selection is None:
+            from .pyramid_fast import accelerate
 
-        accelerate(model)               # the gang only trains lane A (no slices)
-        params = list(model.parameters())
+            accelerate(model)           # lane A only, exactly as rank 0
+        else:
+            from .expert_training import ExpertSlices
+
+            # the leaves are refreshed from rank 0's weights once they arrive
+            slices = ExpertSlices(model, expert_selection)
+        source = model if slices is None else slices
+        params = list(source.parameters())
         gen = torch.Generator(device=device)
         gang = types.SimpleNamespace(rank=rank, dist=dist, device=device)
         gang.sum_ = lambda ts: [dist.all_reduce(t, op=dist.ReduceOp.SUM) for t in ts]
@@ -535,12 +599,15 @@ def _follower(rank, world, port, cfg_dict, deterministic, seed, errors) -> None:
         from .pyramid_optimizer import assign_muon_owners, build_optimizer
         from .pyramid_trainer import combine_gradients
 
-        optimizer = build_optimizer(model, model.cfg.d_model)
+        optimizer = build_optimizer(source, model.cfg.d_model)
         optimizer.muon_owner = assign_muon_owners(optimizer.muon_params, world)
         optimizer.rank = rank
-        sources = state_sources(model, optimizer)
+        sources = (state_sources(model, optimizer) if slices is None
+                   else leaf_sources(slices, optimizer))
         for t in model.state_dict().values():
             dist.broadcast(t, src=0)
+        if slices is not None:
+            refresh_leaves(slices)
         while True:
             header = torch.zeros(6, device=device, dtype=torch.int64)
             dist.broadcast(header, src=0)
@@ -580,7 +647,10 @@ def _follower(rank, world, port, cfg_dict, deterministic, seed, errors) -> None:
             del reference
             for p in params:
                 p.grad = None
-            broadcast_from_sources(dist, list(model.state_dict().values()), sources, device)
+            if slices is not None:
+                sync_leaves(dist, slices, sources, device)
+            else:
+                broadcast_from_sources(dist, list(model.state_dict().values()), sources, device)
     except BaseException as e:  # noqa: BLE001 — rank 0 re-raises it by type
         with contextlib.suppress(Exception):
             errors.put((type(e).__name__, str(e)[:500]))
