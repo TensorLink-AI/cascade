@@ -197,6 +197,52 @@ to W5e and W5g.
 separators=(",", ":"), allow_nan=False)` (A9). The tests re-derive it
 independently.
 
+## Armed contexts (rev6.6, owner 2026-11-23): `test_w7a_armed.py`
+
+Plan rev6.6 §1.1: "The main validator records the armed set and its evidence
+in the signed report", so satellites verify it (W7d) instead of re-deriving it
+from `cfg.contexts`. `params.contexts` stays the **declarable** set.
+
+- `settle_lane_d(..., armed=None)` is keyword-only. `armed` is the W5d
+  `armed_record` result `{"armed_contexts": [...], "evidence": {...}}`. With
+  it, the report carries the top-level `armed_contexts` (the record's list) and
+  `armed_evidence` (the record's `evidence`, verbatim), and both are inside the
+  signed body. Without it (the legacy call) neither field is present, and the
+  report is exactly what it was before rev6.6.
+- Registration is unchanged. An entry whose context is in `cfg.contexts`
+  opens whether or not the variant is armed (the eval host scores it at W5d's
+  `effective_context`). A context outside `cfg.contexts` is closed
+  `context_not_armed`.
+- A bad record is refused with `LaneDArmedError` (a `ValueError` whose `.code`
+  is `no_armed_context` or `armed_invalid`) **before** any state, pool or
+  report is read or written. Writing nothing is pinned by an empty state dir.
+  - `no_armed_context`: `armed_contexts` is empty. Nothing armed means nothing
+    can be scored.
+  - `armed_invalid`: anything else. Examples: not an object; a key other than
+    the two; an evidence key other than `min_long_series`, `min_sources`,
+    `readiness_sha256`, `t7_sha256` and `variants`; `variants` not exactly
+    `cfg.contexts` ascending, each `{context, series, sources, t7_fits,
+    armed}` with non-negative ints and bools; `armed` not equal to
+    `series >= min_long_series and sources >= min_sources and t7_fits`;
+    `armed_contexts` not equal to the armed variants ascending;
+    `min_long_series` not equal to `cfg.min_long_series`; `min_sources` not 20;
+    a sha256 that is neither 64 lower-case hex nor `null`.
+- Schema: `armed_contexts` (an array of ints, `minItems` 1) and
+  `armed_evidence` (closed objects) are optional top-level properties.
+  `validate_report` adds the cross-field rules:
+  - one without the other is `missing_field` at the absent one;
+  - `null` is `bad_type`;
+  - an empty set, a value outside `params.contexts`, evidence that doesn't
+    support the set, a recomputed `armed` flag that disagrees, `variants` not
+    covering `params.contexts`, or `min_long_series` not equal to
+    `params.min_long_series` is `bad_value` at an `armed_*` path;
+  - an unknown key is `unknown_field`.
+- On main, `settle_lane_d` has no `armed` keyword. The settle tests fail on
+  the `_settle_takes_armed` assertion (never a `TypeError`, never a fixture
+  error), and the schema test fails on its assertion.
+  `test_schema_file_top_level_fields_are_exact_and_closed` fails on the new
+  `TOP_LEVEL_OPTIONAL`.
+
 ## Enums (exact sets)
 
 | name | values |
