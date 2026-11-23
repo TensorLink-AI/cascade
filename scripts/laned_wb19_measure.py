@@ -72,6 +72,7 @@ RUN_REFUSALS = frozenset({
 })
 COMBINE_REFUSALS = frozenset({
     "bad_run", "not_pod", "wrong_image", "wrong_contract", "mixed_block", "duplicate_sku",
+    "bad_note",
 })
 PROD_MARKERS = (
     "etc/cascade-ops.env",
@@ -785,10 +786,34 @@ def _check(name: str, passed: bool, detail: str) -> dict:
     return {"name": name, "passed": bool(passed), "detail": detail}
 
 
+NOTE_MAX = 200
+
+
+def _parse_notes(notes: Sequence[str], skus: Sequence[str]) -> dict[str, str]:
+    """``SKU=TEXT`` notes keyed by the recorded SKU spelling (rev6.16)."""
+    by_lower = {s.lower(): s for s in skus}
+    out: dict[str, str] = {}
+    for raw in notes:
+        sku, sep, text = str(raw).partition("=")
+        sku = sku.strip()
+        if not sep or not sku:
+            raise MeasureRefused("bad_note", f"--note {raw!r} is not SKU=TEXT")
+        if sku.lower() not in by_lower:
+            raise MeasureRefused("bad_note", f"--note {sku}: no expert run for that SKU")
+        if not text.strip() or len(text) > NOTE_MAX:
+            raise MeasureRefused("bad_note", f"--note {sku}: the text must be 1..{NOTE_MAX} "
+                                             "characters")
+        out[by_lower[sku.lower()]] = text
+    return out
+
+
 def combine(cfg, runs: list[dict], *, oa8_types: Sequence[str],
-            oa8_sha256: str | None) -> dict:
+            oa8_sha256: str | None, notes: Sequence[str] = ()) -> dict:
     """The ``laned_wb19/1`` evidence from pod run records. Raises
-    MeasureRefused (a :data:`COMBINE_REFUSALS` code)."""
+    MeasureRefused (a :data:`COMBINE_REFUSALS` code). ``notes`` (``SKU=TEXT``)
+    annotate measured rows; they never change a rate. Coverage may fail and
+    the evidence is still usable (partial evidence, owner 2026-11-23, plan
+    rev6.16): the reader loads it when coverage is the only failing check."""
     for r in runs:
         if r["source"] != "pod":
             raise MeasureRefused("not_pod", f"{r['sku']}/{r['mode']}: a {r['source']!r} "
@@ -852,6 +877,8 @@ def combine(cfg, runs: list[dict], *, oa8_types: Sequence[str],
                        "peak_memory_bytes": r["peak_memory_bytes"],
                        "memory_total_bytes": r["gpu"]["memory_total_bytes"],
                        "run_body_sha256": r["body_sha256"]} for r in expert}
+    for sku, text in _parse_notes(notes, [r["sku"] for r in expert]).items():
+        rows[sku]["note"] = text
     table = {"schema": TABLE_SCHEMA, "image_digest": pinned,
              "contract_digest": contracts["expert"][1], "contract_block": block, "rows": rows}
     lane_a = None
@@ -878,7 +905,8 @@ def _cmd_combine(args, parser) -> int:
     except (OSError, ValueError) as e:
         parser.error(f"--candidates unreadable: {e}")
     runs = [_load_run(p) for p in args.runs]
-    ev = combine(cfg, runs, oa8_types=oa8_types, oa8_sha256=oa8_sha)
+    ev = combine(cfg, runs, oa8_types=oa8_types, oa8_sha256=oa8_sha,
+                 notes=tuple(args.note or ()))
     _write_atomic(args.out, ev)
     if args.table_out is not None:
         _write_atomic(args.table_out, ev["table"])
@@ -925,6 +953,8 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--out", type=Path, required=True)
     c.add_argument("--candidates", type=Path, default=None)
     c.add_argument("--table-out", type=Path, default=None)
+    c.add_argument("--note", action="append", default=None, metavar="SKU=TEXT",
+                   help="annotate a measured row (e.g. a superseded path); repeatable")
     return p
 
 
