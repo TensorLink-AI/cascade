@@ -52,7 +52,8 @@ both of ``--snapshots-dir`` / ``--forge-dir``): the ``forge_mirror`` key holds,
 per cadence bucket (10s, 1min, 5min, 10min, 15min, 30min, hourly, daily,
 slower), sources, series and the first-seen-proxy latency; for commit times T
 swept over the mirror's last ``--sweep-days`` the fresh and embargo window
-counts (b = T + margin, embargo e = ``--embargo-hours``) at the clocks T+6 h,
+counts (b = T + ``--forward-margin-hours`` (0, rev6.14), embargo e =
+``--embargo-hours``; judging from T + ``--eval-delay-hours`` (6)) at the clocks T+6 h,
 T+9 h, T+12 h, T+24 h, the rev6.12 (b) set rule (fresh first, embargo trimmed
 to the minimum fresh share, ``--max-windows`` cap, floors) and its median/min
 over T; and the long-history inventory per context 4096…131072 (+ horizon)
@@ -453,6 +454,8 @@ FORGE_LABEL = "measured from forge mirror"
 FORGE_NOTE = ("first-seen is a PROXY (partition date / mirror object time), not the W6fs "
               "record; eligibility uses the conservative side of the bracket")
 DEFAULT_EMBARGO_HOURS = 48.0
+DEFAULT_FORWARD_MARGIN_HOURS = 0.0   # plan rev6.14: fresh = data time and first-seen > T + 0
+DEFAULT_EVAL_DELAY_HOURS = 6.0       # plan rev6.14: judging starts at T + 6 h
 DEFAULT_MIN_FRESH_SHARE = 0.5
 DEFAULT_MAX_WINDOWS = 5000
 DEFAULT_SWEEP_DAYS = 3.0
@@ -696,7 +699,7 @@ def load_forge(forge_dir: Path | str, *, horizon: int, clock: str = "min",
 def _windows(s: dict, *, b: float, e: float, clock_ts: float, horizon: int,
              min_context: int) -> tuple[int, int]:
     """(fresh, embargo) DISJOINT target windows of one series for commit
-    boundary ``b`` (= T + margin) seen at ``clock_ts``. A target point is
+    boundary ``b`` (= T + forward margin) seen at ``clock_ts``. A target point is
     eligible iff ``data_ts > b − e``, ``first_seen + e > b`` (proxy lower
     bound) and it was available by the clock (proxy upper bound ≤ clock), and
     it has ≥ ``min_context`` points of history before it. Each maximal run of
@@ -756,11 +759,17 @@ def forge_sweep_times(mirror_end: float, *, sweep_days: float, step_h: float) ->
 
 
 def forge_measure(mirror: dict, *, commit_times: list[float] | None, sweep_days: float,
-                  step_h: float, margin_h: float, embargo_h: float, horizon: int,
+                  step_h: float, forward_margin_h: float, eval_delay_h: float,
+                  embargo_h: float, horizon: int,
                   min_context: int, min_windows: int, min_clusters: int,
                   min_fresh_share: float, max_windows: int, min_long_series: int,
                   min_sources: int) -> dict:
-    """The ``forge_mirror`` block of w1.json (label: measured from forge mirror)."""
+    """The ``forge_mirror`` block of w1.json (label: measured from forge mirror).
+
+    Plan rev6.14: the boundary is ``b = T + forward_margin`` (default 0, so a
+    fresh target is entirely after T, data time and first-seen), and judging
+    starts at ``T + eval_delay`` (default 6 h): a clock before that is not
+    counted."""
     feeds = mirror["feeds"]
     end = mirror["mirror_end_ts"]
     # ── per-freq inventory + latency ─────────────────────────────────────────
@@ -816,7 +825,7 @@ def forge_measure(mirror: dict, *, commit_times: list[float] | None, sweep_days:
         times = sorted(commit_times) if commit_times else forge_sweep_times(
             end, sweep_days=sweep_days, step_h=step_h)
         sweep = []
-    margin_s, e_s = margin_h * 3600.0, embargo_h * 3600.0
+    margin_s, e_s = forward_margin_h * 3600.0, embargo_h * 3600.0
     rule = dict(min_share=min_fresh_share, max_windows=max_windows,
                 min_windows=min_windows, min_clusters=min_clusters)
     if times:
@@ -838,6 +847,10 @@ def forge_measure(mirror: dict, *, commit_times: list[float] | None, sweep_days:
         for ch in CLOCK_HOURS:
             clock_ts = T + ch * 3600.0
             key = f"T+{ch}h"
+            if ch < eval_delay_h:
+                clocks[key] = (f"not run: clock T+{ch}h is before judging starts "
+                               f"(T + eval_delay {eval_delay_h:g} h)")
+                continue
             if clock_ts > end:
                 clocks[key] = f"not run: clock {iso(clock_ts)} is after the mirror's end {iso(end)}"
                 continue
@@ -869,7 +882,8 @@ def forge_measure(mirror: dict, *, commit_times: list[float] | None, sweep_days:
                 "set": _set_rule(tot["fresh"], tot["embargo"], len(tot["src_fresh"]),
                                  len(tot["src_any"]), **rule)}
         sweep.append({"commit_time": iso(T), "boundary_b": iso(b),
-                      "embargo_from": iso(b - e_s), "clocks": clocks})
+                      "embargo_from": iso(b - e_s),
+                      "judging_from": iso(T + eval_delay_h * 3600.0), "clocks": clocks})
     summary = {}
     if isinstance(sweep, list):
         for ch in CLOCK_HOURS:
@@ -978,6 +992,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--forge-dir", default=None,
                     help="synced forge mirror (sources.yaml + data/): the measured block")
     ap.add_argument("--embargo-hours", type=float, default=DEFAULT_EMBARGO_HOURS)
+    ap.add_argument("--forward-margin-hours", type=float, default=DEFAULT_FORWARD_MARGIN_HOURS,
+                    help="forge: b = T + this (plan rev6.14; --margin-hours stays the "
+                         "snapshot-diff bound's)")
+    ap.add_argument("--eval-delay-hours", type=float, default=DEFAULT_EVAL_DELAY_HOURS,
+                    help="forge: judging starts at T + this; earlier clocks are not counted")
     ap.add_argument("--min-fresh-share", type=float, default=DEFAULT_MIN_FRESH_SHARE)
     ap.add_argument("--max-windows", type=int, default=DEFAULT_MAX_WINDOWS)
     ap.add_argument("--min-long-series", type=int, default=None,
@@ -1035,12 +1054,14 @@ def main(argv: list[str] | None = None) -> int:
                             max_series_per_source=args.max_series_per_source)
         body["forge_mirror"] = forge_measure(
             mirror, commit_times=commit_times, sweep_days=args.sweep_days,
-            step_h=args.t_step_hours, margin_h=args.margin_hours,
-            embargo_h=args.embargo_hours, horizon=args.horizon, min_context=args.min_context,
+            step_h=args.t_step_hours, forward_margin_h=args.forward_margin_hours,
+            eval_delay_h=args.eval_delay_hours, embargo_h=args.embargo_hours, horizon=args.horizon, min_context=args.min_context,
             min_windows=args.min_windows, min_clusters=args.min_clusters,
             min_fresh_share=args.min_fresh_share, max_windows=args.max_windows,
             min_long_series=gate["min_long_series"], min_sources=gate["min_sources"])
         forge_params = {"embargo_hours": args.embargo_hours,
+                        "forward_margin_hours": args.forward_margin_hours,
+                        "eval_delay_hours": args.eval_delay_hours,
                         "min_fresh_share": args.min_fresh_share,
                         "max_windows": args.max_windows, "sweep_days": args.sweep_days,
                         "clocks_hours": list(CLOCK_HOURS),

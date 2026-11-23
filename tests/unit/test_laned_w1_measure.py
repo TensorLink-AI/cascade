@@ -338,6 +338,36 @@ def test_forge_cli_report(tmp_path):
     assert json.loads(out2.read_text())["forge_mirror"] == fm
 
 
+def test_forward_margin_and_eval_delay(tmp_path):
+    """Plan rev6.14: b = T + forward_margin (default 0, fresh counted from T);
+    judging starts at T + eval_delay (default 6 h), earlier clocks not run."""
+    forge = _mirror(tmp_path / "f")
+
+    def run(name, *extra):
+        out = tmp_path / name
+        assert w1.main(["--forge-dir", str(forge), "--out", str(out), "--min-windows", "10",
+                        "--min-clusters", "1", *extra]) == 0
+        return json.loads(out.read_text())
+
+    d0 = run("m0.json")
+    assert d0["forge_params"]["forward_margin_hours"] == 0
+    assert d0["forge_params"]["eval_delay_hours"] == 6
+    for row in d0["forge_mirror"]["windows"]["sweep"]:
+        assert row["boundary_b"] == row["commit_time"]
+        assert row["judging_from"] == w1.iso(w1.parse_time(row["commit_time"]) + 6 * 3600)
+        assert isinstance(row["clocks"]["T+6h"], dict)
+    d6 = run("m6.json", "--forward-margin-hours", "6")
+    r6 = d6["forge_mirror"]["windows"]["sweep"][-1]
+    assert r6["boundary_b"] == w1.iso(w1.parse_time(r6["commit_time"]) + 6 * 3600)
+    s0, s6 = (d["forge_mirror"]["windows"]["summary"]["T+24h"] for d in (d0, d6))
+    assert s0["fresh"]["median"] > s6["fresh"]["median"]     # 6 h more fresh data from T
+    d9 = run("m9.json", "--eval-delay-hours", "9")
+    for row in d9["forge_mirror"]["windows"]["sweep"]:
+        assert row["clocks"]["T+6h"].startswith("not run: clock T+6h is before judging")
+        assert isinstance(row["clocks"]["T+9h"], dict)
+    assert d9["forge_mirror"]["windows"]["summary"]["T+6h"].startswith("not run")
+
+
 def test_forge_and_snapshots_together(tmp_path):
     forge = _mirror(tmp_path / "f")
     full = {f"s{i}": _walk(600, 40 + i) for i in range(2)}
