@@ -1,0 +1,428 @@
+"""Lane D production wiring (LANE_D_PLAN W8b; tests/accept/w8b/README.md).
+
+:func:`build_lane_d_step` builds the step the validator's W19 worker
+(:class:`~cascade.validator.offthread_worker.LaneDWorker`) runs off the
+weight/poll thread at each armed lane D settlement boundary. One call of the
+step, in order:
+
+1. a boundary where ``[lane_d]`` is not active touches nothing;
+2. the boundary block hash, through the step's OWN read-only chain reader
+   (``chain_factory()``, built lazily on the step's thread, never the poll
+   thread's client);
+3. with W-S1 armed for the boundary's era, the era-start block hash and the
+   era's sentinel drawn from it;
+4. the last published lane D receipt (``RECEIPT_LATEST_KEY``), which binds
+   the local state (``expect_prior_sha256``, W7c);
+5. the settlement inputs (``inputs(boundary)``: pool snapshots, revealed
+   entries, forecasts, metagraph, house);
+6. :func:`~cascade.validator.lane_d.settle_lane_d` with the boundary's bench
+   session (the W3b5 low-frequency check, the W5e gate and the W7c
+   state/receipt are inside it);
+7. for a new king with W-S1 armed, the W3b3 sentinel sweep (never gating);
+8. the persisted signed report byte for byte, then its receipt record, then
+   the latest-receipt pointer;
+9. ``status/lane_d.json`` (W17, which embeds the W-S3 sentinel board).
+
+FAIL CLOSED: any unreadable input in 2-6 raises :class:`LaneDWiringError`
+before anything is written, published or swept; the W19 worker retries the
+boundary at a later tick. Lane D pay reaches the weights only through
+:meth:`LaneDStep.court_for`, which answers from the settlements this step has
+PUBLISHED (memory only, no I/O). A status failure never withholds pay.
+
+RESTART-SAFE (W7c): a re-call at a settled boundary re-scores nothing and
+calls no bench; a settlement saved but not yet published is published on the
+next call (also when that call is for a later boundary, before it settles);
+a report persisted without its state is adopted, never re-swept.
+
+Imported only by the ``cascade-validator`` entry point
+(:mod:`cascade.validator.main`): the audit's static import closure reaches
+``loop.py`` and ``weights.py`` and must load no ``cascade.validator.lane_d*``
+module (W9 invariant 12). Unarmed (``[lane_d] from_block = 0``)
+:func:`build_lane_d_step` returns ``None`` and nothing here runs
+(invariant 1).
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+import threading
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from ..shared.hippius import ObjectNotFound
+from ..shared.sentinel import sentinel_armed, sentinel_for_era, settlement_era_start
+from .lane_d import LaneDSettlement, settle_lane_d
+from .lane_d_report import canonical_json
+from .lane_d_sentinel import sweep_and_publish
+from .lane_d_state import (
+    LaneDReceiptError,
+    LaneDStateError,
+    load_state,
+    report_path,
+    verify_receipt_chain,
+)
+from .lane_d_status import build_lane_d_status, publish_lane_d_status
+
+log = logging.getLogger("cascade.validator.lane_d")
+
+STATE_FILE = "lane_d_state.json"
+KEY_PREFIX = "lane-d"
+REPORT_PREFIX = f"{KEY_PREFIX}/reports"
+RECEIPT_PREFIX = f"{KEY_PREFIX}/receipts"
+# The last published lane D receipt: the prior every later settlement binds.
+RECEIPT_LATEST_KEY = f"{RECEIPT_PREFIX}/latest.json"
+CONTENT_TYPE = "application/json"
+PUBLIC_ACL = "public-read"
+
+WIRING_ERROR_CODES = (
+    "block_hash_unreadable",   # the boundary hash (or the chain reader) is unreadable
+    "era_hash_unreadable",     # W-S1 armed and the era-start hash is unreadable
+    "inputs_unavailable",      # no inputs source, or it raised
+    "receipt_unreadable",      # the last published receipt is unreadable or malformed
+    "settle_refused",          # settle_lane_d (or the W7c binding) refused the settlement
+    "publish_failed",          # the report, receipt or latest pointer put failed
+    "signer_unavailable",      # armed without a signing hotkey
+)
+
+_BLOCK_HASH = re.compile(r"0x[0-9a-f]{64}")
+
+
+class LaneDWiringError(RuntimeError):
+    """A lane D tick that did not settle; ``code`` is in :data:`WIRING_ERROR_CODES`.
+    The underlying error, if any, is chained as ``__cause__``."""
+
+    def __init__(self, code: str, message: str):
+        if code not in WIRING_ERROR_CODES:
+            raise ValueError(f"LaneDWiringError: unknown code {code!r}")
+        super().__init__(f"{code}: {message}")
+        self.code = code
+
+
+@dataclass(frozen=True)
+class LaneDInputs:
+    """One settlement's inputs: ``pool_dir`` the newest ``pool_d`` snapshot
+    (``prior_pool_dirs`` the earlier retained ones), the revealed
+    ``entries``, the eval host's ``forecasts``, the metagraph ``uid_of``
+    (``{hotkey: uid}``) and the ``house`` pointer record."""
+
+    pool_dir: Any
+    entries: list
+    forecasts: Any
+    uid_of: Mapping
+    house: Mapping
+    prior_pool_dirs: tuple = ()
+
+
+def report_key(boundary: int) -> str:
+    """The published signed report of the settlement at ``boundary``."""
+    return f"{REPORT_PREFIX}/lane_d_report_{int(boundary)}.json"
+
+
+def receipt_key(boundary: int) -> str:
+    """The published W7c receipt record of the settlement at ``boundary``."""
+    return f"{RECEIPT_PREFIX}/lane_d_receipt_{int(boundary)}.json"
+
+
+def receipt_text(receipt: Mapping) -> str:
+    """A receipt record's published text (canonical JSON, ASCII)."""
+    return canonical_json(dict(receipt)).decode("ascii")
+
+
+def _court_uids(report: Mapping) -> list[int | None]:
+    return [s["uid"] for s in report["pay"]["court"]]
+
+
+class LaneDStep:
+    """The production lane D step (see the module docstring). ``step(boundary)``
+    runs one settlement tick; :meth:`court_for` is the weight fold's only
+    read of lane D."""
+
+    def __init__(self, cfg: Any, *, state_dir: str | Path, signer: Any,
+                 chain_factory: Callable[[], Any], store: Any,
+                 inputs: Callable[[int], LaneDInputs] | None = None,
+                 bench: Callable[[int], Any] | None = None):
+        self.cfg = cfg
+        self.state_path = Path(state_dir) / STATE_FILE
+        self.signer = signer
+        self.store = store
+        self._chain_factory = chain_factory
+        self._inputs = inputs
+        self._bench = bench
+        # {thread ident: reader}: a reader is used only on the thread that
+        # built it (a websocket is never shared across threads).
+        self._readers: dict[int, Any] = {}
+        self._courts: dict[int, list[int | None]] = {}
+        self._lock = threading.Lock()
+
+    # ── the weight fold's read ──────────────────────────────────────────────
+
+    def court_for(self, boundary: int) -> list[int | None] | None:
+        """The court uids of the latest settlement this step PUBLISHED at a
+        boundary ``<= boundary`` (``None`` before any). Memory only; never
+        raises."""
+        try:
+            b = int(boundary)
+            with self._lock:
+                done = [k for k in self._courts if k <= b]
+                return list(self._courts[max(done)]) if done else None
+        except Exception as e:  # noqa: BLE001 — the weight loop never sees a lane D error
+            log.warning("lane D court_for(%r) failed: %s", boundary, e)
+            return None
+
+    def _set_court(self, boundary: int, report: Mapping) -> None:
+        court = _court_uids(report)
+        with self._lock:
+            self._courts[int(boundary)] = court
+        log.info("lane D settlement %d published: court %s", boundary, court)
+
+    # ── inputs ──────────────────────────────────────────────────────────────
+
+    def _reader(self) -> Any:
+        tid = threading.get_ident()
+        reader = self._readers.get(tid)
+        if reader is None:
+            try:
+                reader = self._chain_factory()
+            except Exception as e:  # noqa: BLE001 — no endpoint: no settlement this tick
+                raise LaneDWiringError("block_hash_unreadable",
+                                       f"cannot open the lane D chain reader ({e})") from e
+            self._readers = {tid: reader}
+        return reader
+
+    def _block_hash(self, block: int, code: str) -> str:
+        reader = self._reader()
+        try:
+            value = reader.block_hash(int(block))
+        except Exception as e:  # noqa: BLE001 — reconnect on the next tick
+            self._readers.pop(threading.get_ident(), None)
+            raise LaneDWiringError(code, f"block {block} hash unreadable ({e})") from e
+        if not isinstance(value, str) or not _BLOCK_HASH.fullmatch(value):
+            raise LaneDWiringError(code, f"block {block} hash {value!r} is not 0x + 64 "
+                                   "lower-case hex")
+        return value
+
+    def _latest_receipt(self) -> dict | None:
+        try:
+            text = self.store.get_text(RECEIPT_LATEST_KEY)
+        except ObjectNotFound:
+            return None
+        except Exception as e:  # noqa: BLE001 — StorageError or a transport error
+            raise LaneDWiringError("receipt_unreadable",
+                                   f"{RECEIPT_LATEST_KEY}: {e}") from e
+        try:
+            receipt = json.loads(text)
+            verify_receipt_chain([receipt])
+        except (ValueError, TypeError, LaneDReceiptError) as e:
+            raise LaneDWiringError("receipt_unreadable",
+                                   f"{RECEIPT_LATEST_KEY} is not a lane D receipt ({e})") from e
+        return receipt
+
+    def _read_inputs(self, boundary: int) -> LaneDInputs:
+        if self._inputs is None:
+            raise LaneDWiringError("inputs_unavailable",
+                                   "no lane D inputs source is configured")
+        try:
+            return self._inputs(boundary)
+        except Exception as e:  # noqa: BLE001 — never a guessed input
+            raise LaneDWiringError("inputs_unavailable",
+                                   f"settlement {boundary} inputs unreadable ({e})") from e
+
+    def _bench_session(self, boundary: int) -> Any:
+        """The boundary's bench session, or ``None``: settle_lane_d then holds
+        every crowning candidate (``bench_hold``), it never crowns ungated."""
+        if self._bench is None:
+            return None
+        try:
+            return self._bench(boundary)
+        except Exception as e:  # noqa: BLE001 — a crown without its gate is a hold
+            log.warning("lane D settlement %d: bench host unavailable (%s); a crowning "
+                        "candidate is held", boundary, e)
+            return None
+
+    def _local_state(self, house: Mapping) -> dict:
+        try:
+            return load_state(self.state_path, dict(house))
+        except LaneDStateError as e:
+            raise LaneDWiringError("settle_refused", f"lane D state refused ({e})") from e
+        except (KeyError, TypeError, ValueError) as e:
+            raise LaneDWiringError("inputs_unavailable", f"malformed house record ({e})") from e
+
+    # ── settle and publish ──────────────────────────────────────────────────
+
+    def _settle(self, boundary: int, inp: LaneDInputs, *, expect: str | None,
+                block_hash: str | None, sentinel: str | None, bench: Any) -> LaneDSettlement:
+        try:
+            s = settle_lane_d(cfg=self.cfg.lane_d, boundary=int(boundary),
+                              pool_dir=inp.pool_dir, entries=list(inp.entries),
+                              house=dict(inp.house), forecasts=inp.forecasts,
+                              uid_of=dict(inp.uid_of), state_path=self.state_path,
+                              signer=self.signer, prior_pool_dirs=tuple(inp.prior_pool_dirs),
+                              expect_prior_sha256=expect, boundary_block_hash=block_hash,
+                              sentinel=sentinel, bench=bench)
+        except Exception as e:  # noqa: BLE001 — LaneDStateError, schema, pool or crash
+            raise LaneDWiringError("settle_refused",
+                                   f"settlement {boundary} refused ({e})") from e
+        if s.report is None or s.receipt is None:
+            raise LaneDWiringError("settle_refused",
+                                   f"settlement {boundary} returned no report")
+        return s
+
+    @staticmethod
+    def _check_prior(s: LaneDSettlement, latest: dict | None) -> None:
+        """A re-called settlement must extend the last published receipt."""
+        if latest is None or s.receipt["prior_state_sha256"] == latest["posterior_state_sha256"]:
+            return
+        cause = LaneDStateError(
+            "state_digest_mismatch",
+            f"settlement {s.receipt['boundary']} ran from state "
+            f"{s.receipt['prior_state_sha256']}, the last published posterior is "
+            f"{latest['posterior_state_sha256']}")
+        raise LaneDWiringError("settle_refused", str(cause)) from cause
+
+    def _put(self, key: str, text: str) -> None:
+        try:
+            self.store.put_text(key, text, content_type=CONTENT_TYPE, acl=PUBLIC_ACL)
+        except Exception as e:  # noqa: BLE001 — StorageError or a transport error
+            raise LaneDWiringError("publish_failed", f"PUT {key} failed ({e})") from e
+
+    def _publish(self, boundary: int, s: LaneDSettlement) -> None:
+        """The persisted report byte for byte, its receipt, then the latest
+        pointer; the court moves only once all three landed."""
+        try:
+            report = report_path(self.state_path, boundary).read_text(encoding="ascii")
+        except OSError as e:
+            raise LaneDWiringError("publish_failed",
+                                   f"settlement {boundary}: persisted report unreadable "
+                                   f"({e})") from e
+        text = receipt_text(s.receipt)
+        self._put(report_key(boundary), report)
+        self._put(receipt_key(boundary), text)
+        self._put(RECEIPT_LATEST_KEY, text)
+        self._set_court(boundary, s.report)
+
+    def _sentinel_sweep(self, s: LaneDSettlement, *, era: int, era_hash: str,
+                        bench: Any) -> None:
+        """W3b3: the era's sentinel for a new king. Never gates, never raises."""
+        try:
+            out = sweep_and_publish(s.report, era_block=era, era_block_hash=era_hash,
+                                    sentinel_suites=self.cfg.v2.sentinel_suites,
+                                    gate_suite=s.report["gate"]["suite"], bench=bench,
+                                    store=self.store)
+        except Exception as e:  # noqa: BLE001 — the sentinel is recorded, never gating
+            log.warning("lane D settlement %s: sentinel sweep failed (%s); the crown and "
+                        "pay stand", s.report.get("boundary"), e)
+            return
+        if out is not None and not out["published"]:
+            log.warning("lane D settlement %s: sentinel record %s not published",
+                        s.report.get("boundary"), out["key"])
+
+    def _publish_status(self, boundary: int, s: LaneDSettlement, house: Mapping, *,
+                        era: int, era_hash: str | None) -> None:
+        """W17 ``status/lane_d.json`` (embedding the W-S3 board while W-S1 is
+        armed). Telemetry: a failure is logged and never withholds pay."""
+        try:
+            state = load_state(self.state_path, dict(house))
+            doc = build_lane_d_status(self.cfg, state=state, report=s.report,
+                                      block=int(boundary), era_block=era,
+                                      era_block_hash=era_hash, store=self.store)
+            publish_lane_d_status(self.store, doc)
+        except Exception as e:  # noqa: BLE001 — status never gates pay
+            log.warning("lane D settlement %d: status/lane_d.json not published (%s)",
+                        boundary, e)
+
+    def _catch_up(self, settled: int, inp: LaneDInputs, latest: dict | None) -> dict:
+        """A settlement saved at ``settled`` but never published (its publish
+        failed and the tick moved on): publish it now, re-scoring nothing.
+        Returns its receipt, the new last published one."""
+        log.warning("lane D: settlement %d is saved but unpublished; publishing it first",
+                    settled)
+        s = self._settle(settled, inp, expect=None, block_hash=None, sentinel=None,
+                         bench=None)
+        self._check_prior(s, latest)
+        self._publish(settled, s)
+        return s.receipt
+
+    def __call__(self, boundary: int) -> LaneDSettlement | None:
+        b = int(boundary)
+        if not self.cfg.lane_d.active(b):
+            return None
+        if self.signer is None:
+            raise LaneDWiringError("signer_unavailable",
+                                   "lane D is armed but no validator hotkey signs its reports")
+        if self._inputs is None:
+            raise LaneDWiringError("inputs_unavailable",
+                                   "no lane D inputs source is configured")
+        block_hash = self._block_hash(b, "block_hash_unreadable")
+        era = settlement_era_start(self.cfg, b)
+        era_hash = sentinel = None
+        if sentinel_armed(self.cfg, era):
+            era_hash = self._block_hash(era, "era_hash_unreadable")
+            try:
+                sentinel = sentinel_for_era(era_hash, self.cfg.v2.sentinel_suites)
+            except (TypeError, ValueError) as e:
+                raise LaneDWiringError("settle_refused",
+                                       f"era {era}: no sentinel draw ({e})") from e
+        latest = self._latest_receipt()
+        inp = self._read_inputs(b)
+        state = self._local_state(inp.house)
+        settled = int(state["boundary"])
+        latest_b = None if latest is None else int(latest["boundary"])
+        if latest_b is not None and latest_b > b:
+            cause = LaneDStateError("stale_boundary", f"lane D is published through "
+                                    f"{latest_b}; got {b}")
+            raise LaneDWiringError("settle_refused", str(cause)) from cause
+        if (0 < settled < b and "last_report" in state
+                and (latest_b is None or settled > latest_b)):
+            latest = self._catch_up(settled, inp, latest)
+            latest_b = settled
+        if settled == b and "last_report" in state:
+            # A re-call at a settled boundary: nothing re-scored, no bench.
+            published = latest_b == b
+            s = self._settle(b, inp,
+                             expect=latest["posterior_state_sha256"] if published else None,
+                             block_hash=block_hash, sentinel=sentinel, bench=None)
+            if published:
+                if s.receipt != latest:
+                    cause = LaneDStateError("state_digest_mismatch",
+                                            f"settlement {b}: the local receipt is not the "
+                                            "published one")
+                    raise LaneDWiringError("settle_refused", str(cause)) from cause
+                self._set_court(b, s.report)
+                return s
+            self._check_prior(s, latest)
+            self._publish(b, s)
+            self._publish_status(b, s, inp.house, era=era, era_hash=era_hash)
+            return s
+        session = self._bench_session(b)
+        s = self._settle(b, inp,
+                         expect=None if latest is None else latest["posterior_state_sha256"],
+                         block_hash=block_hash, sentinel=sentinel, bench=session)
+        if s.report.get("crowned") is not None and era_hash is not None and session is not None:
+            self._sentinel_sweep(s, era=era, era_hash=era_hash, bench=session)
+        self._publish(b, s)
+        self._publish_status(b, s, inp.house, era=era, era_hash=era_hash)
+        return s
+
+
+def build_lane_d_step(cfg: Any, *, state_dir: str | Path, signer: Any,
+                      chain_factory: Callable[[], Any], store: Any,
+                      inputs: Callable[[int], LaneDInputs] | None = None,
+                      bench: Callable[[int], Any] | None = None) -> LaneDStep | None:
+    """The lane D step for ``cfg`` (the full ``ChainConfig``), or ``None``
+    while ``[lane_d] from_block = 0`` (nothing is built, read or called).
+    ``chain_factory()`` builds the step's own read-only chain reader
+    (``block_hash(block) -> str``) on the step's thread, at its first armed
+    call; ``store`` is the bucket the report, receipt and status go to."""
+    if int(getattr(getattr(cfg, "lane_d", None), "from_block", 0) or 0) <= 0:
+        return None
+    return LaneDStep(cfg, state_dir=state_dir, signer=signer, chain_factory=chain_factory,
+                     store=store, inputs=inputs, bench=bench)
+
+
+__all__ = ["RECEIPT_LATEST_KEY", "WIRING_ERROR_CODES", "LaneDInputs", "LaneDStep",
+           "LaneDWiringError", "build_lane_d_step", "receipt_key", "receipt_text",
+           "report_key"]

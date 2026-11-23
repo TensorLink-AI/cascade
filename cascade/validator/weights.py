@@ -447,7 +447,16 @@ class WeightsMixin:
                         if self.cfg.lane_c.from_block else None)
             lane_c_on = (lc_block is not None and self.cfg.lane_c.active(lc_block)
                          and not self.cfg.validator.force_burn)
-            if lane_c_on:
+            # W8b (LANE_D_PLAN W8): lane D pays at the vector's boundary ⇒ its
+            # PUBLISHED court, read only through the injected step's court_for
+            # (this module imports no lane D producer: W9 invariant 12). Not
+            # active there, or force_burn ⇒ None: today's vector, byte for byte.
+            lane_d = getattr(self.cfg, "lane_d", None)
+            d_court = (self._lane_d_court(int(boundary))
+                       if boundary is not None and lane_d is not None
+                       and lane_d.active(int(boundary)) and not self.cfg.validator.force_burn
+                       else None)
+            if lane_c_on or d_court is not None:
                 from ..shared.emission import EmissionPolicy
 
                 if boundary is None:
@@ -455,7 +464,8 @@ class WeightsMixin:
                 return self._set_policy_vector(client, round_id, reward_uids, n_uids,
                                                policy or EmissionPolicy(), int(boundary),
                                                lb_block if lane_b_on else None,
-                                               lc_block=int(lc_block))
+                                               lc_block=int(lc_block) if lane_c_on else None,
+                                               d_court=d_court)
             if policy is not None:
                 # DEC-CA-0055: the lanes kept apart, the policy shapes lane A
                 # only, lane B rides through untouched (cascade.shared.emission)
@@ -492,7 +502,8 @@ class WeightsMixin:
 
     def _set_policy_vector(self, client: object, round_id: str, reward_uids: list[int],
                            n_uids: int, policy, boundary: int,
-                           lb_block: int | None, *, lc_block: int | None = None
+                           lb_block: int | None, *, lc_block: int | None = None,
+                           d_court: list[int | None] | None = None
                            ) -> tuple[float, ...]:
         """Build, push and record a DEC-CA-0055 vector. The receipt's
         ``emission`` record (+ ``lane_b_pay`` when lane B is live, +
@@ -519,9 +530,14 @@ class WeightsMixin:
                           wins=wins,
                           lane_c_cfg=(self.cfg.lane_c if pay_c is not None else None),
                           c_wins=(pay_wins(pay_c) if pay_c is not None else ()),
-                          c_slot_frac=(dict(pay_c["slot_frac"]) if pay_c is not None else None))
-        vec = tuple(emission_vector(a, b if (pay is not None or pay_c is not None) else None,
-                                    policy, burn_uid=burn, lane_a_uids=reward_uids))
+                          c_slot_frac=(dict(pay_c["slot_frac"]) if pay_c is not None else None),
+                          lane_d_cfg=(self.cfg.lane_d if d_court is not None else None),
+                          d_court_uids=(list(d_court) if d_court is not None else ()))
+        # Lane D's part always rides in the second argument, even with lanes B
+        # and C off (RV3 note 10): the policy shapes lane A only.
+        vec = tuple(emission_vector(
+            a, b if (pay is not None or pay_c is not None or d_court is not None) else None,
+            policy, burn_uid=burn, lane_a_uids=reward_uids))
         # The emission record (policy + this settlement's ladder step, incl. the
         # reign clock a king check was judged from) describes what the round
         # DECIDED, not whether the chain took the push — so it is stamped
@@ -541,9 +557,30 @@ class WeightsMixin:
         self._last_lane_c_pay = pay_c
         log.info("round=%s weights set under the DEC-CA-0055 policy %s: %s", round_id,
                  policy.as_record(), {u: round(w, 4) for u, w in enumerate(vec) if w > 0})
+        if d_court is not None:
+            log.info("round=%s lane D court at boundary %d: %s", round_id, boundary,
+                     d_court or "none published (lane D share burns)")
         with contextlib.suppress(Exception):
             self._last_weight_block = int(client.current_block())  # type: ignore[attr-defined]
         return vec
+
+    def _lane_d_court(self, boundary: int) -> list[int | None]:
+        """W8b: lane D's court for a vector at ``boundary``, read ONLY through
+        the injected ``lane_d_step.court_for`` (the settlement it published).
+        No step, a step without ``court_for``, ``None`` or a raising read ⇒
+        the empty court: lane D's whole share burns (lanes A/B/C unchanged)."""
+        court_for = getattr(getattr(self, "lane_d_step", None), "court_for", None)
+        if not callable(court_for):
+            return []
+        try:
+            court = court_for(int(boundary))
+        except Exception as e:  # noqa: BLE001 — lane D never reaches the weight push
+            log.warning("lane D court unreadable at boundary %d (%s); its share burns",
+                        boundary, e)
+            return []
+        if court is None:
+            return []
+        return [None if u is None else int(u) for u in court]
 
     @staticmethod
     def _weights_not_set(round_id: str) -> tuple[float, ...]:
