@@ -462,15 +462,37 @@ class _MemorySampler:
         self._thread.join(timeout=60)
 
 
-def _example_generator(work: Path, contract) -> Path:
+# The reference generator's own channel limit (scripts/example_generator/generator.py).
+EXAMPLE_GENERATOR_CHANNELS = (8, 32)
+
+
+def _example_channels(gen_cfg) -> int:
+    """The channel count the reference generator must emit: the contract's
+    ``max_channels``, refused unless it lies inside both the contract's
+    ``[min_channels, max_channels]`` and the generator's own limit."""
+    lo, hi = int(gen_cfg.min_channels), int(gen_cfg.max_channels)
+    channels = hi
+    ex_lo, ex_hi = EXAMPLE_GENERATOR_CHANNELS
+    if not (lo <= channels <= hi and ex_lo <= channels <= ex_hi):
+        raise RuntimeError(
+            f"the contract's generator channels [{lo}, {hi}] admit no count the reference "
+            f"generator can emit ([{ex_lo}, {ex_hi}]); refusing to build a corpus that "
+            f"would fault every series")
+    return channels
+
+
+def _example_generator(work: Path, contract, gen_cfg) -> Path:
     """The repo's reference generator (owner code, still run sandboxed) set to
-    full-context series, so every batch is the contract's ``batch_size ×
-    context_length`` points."""
+    full-context series at the contract's channel count, so every batch is the
+    contract's ``batch_size × context_length`` points and every series passes
+    the ``[min_channels, max_channels]`` check."""
+    channels = _example_channels(gen_cfg)
     repo = work / "generator"
     shutil.copytree(EXAMPLE_GENERATOR, repo, dirs_exist_ok=True)
     conf_path = repo / "config.json"
     conf = json.loads(conf_path.read_text(encoding="utf-8"))
     conf["min_length"] = conf["max_length"] = int(contract.context_length)
+    conf["channels"] = channels
     conf_path.write_text(json.dumps(conf, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return repo
 
@@ -554,7 +576,7 @@ def _train_leg(plan: dict, *, cfg, contract, selection: dict | None, work_root: 
     steps = int(plan["steps"])
     points = max(int(contract.train_tokens) if plan["mode"] == "full" else 0,
                  steps * int(contract.batch_size) * int(contract.context_length))
-    repo = _example_generator(work, contract)
+    repo = _example_generator(work, contract, cfg.generator_for_contract(contract))
     if contract.corpus_mode == "shards" and corpus_dir is None:
         corpus_dir = _materialise_corpus(cfg, contract, seeds, repo, work / "corpus",
                                          int(points * 1.05))
