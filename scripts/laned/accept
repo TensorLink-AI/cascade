@@ -141,6 +141,24 @@ commit: lanedlib.impl_commit_index also takes a commit whose files are each
 matched exactly once by the WP's own PATHS and at most 2 other WPs' PATHS (at
 the ref), each matching some (lanedlib.is_batch_impl_commit).
 
+COUPLED rule (orchestrator decision 2026-11-23, lane D rev6.10-rev6.12): a
+declared coupled set (one line of scripts/laned/coupled_batches, read at BASE
+only; scripts/laned/ is W0c-only, so a PR can never declare its own set) is
+WPs whose producer, audit and replay must change together and whose PATHS
+overlap. When --pr-wps is EXACTLY such a set (no subset, no superset) the
+BATCH IMPLEMENTATION rule applies without its size cap, its dependency check
+(2) and its disjoint-PATHS check (1). Everything else holds: laned:<WP>
+labels only, no duplicate dir, every member's tests on BASE (no-tests), every
+changed file inside some member's PATHS (a file in several is owned by each;
+none, PROTECTED or a non-W0c scripts/laned/ file -> `FAIL paths:
+batch-out-of-scope`), every member owning a changed file
+(label-without-changes). It prints `COUPLED <WPs>` before the BATCH / SCOPE /
+MODE lines, and the PR job runs every member's full Accept, ledger row and
+CROSS as for any batch. Any other overlap is refused as before. On main the
+squash merge is each member's L2 commit (lanedlib.is_coupled_impl_commit:
+no tests/accept/ file, every file in the members' PATHS union, every member's
+PATHS matching a file).
+
 CROSS rule (the PR job runs it after the PR's own WP steps, every mode but
 review): a WP other than the PR's own WP(s) is re-accepted when
     (a) it is built on BASE: tests/accept/<wp>/PATHS exists at BASE and either
@@ -637,6 +655,36 @@ def entries_overlap(a: str, b: str) -> bool:
     return False
 
 
+def _coupled_scope(root: Path, pr_wps: list[str], sets: dict[str, list[str]],
+                   diff: list[str], refuse) -> int:
+    """Scope of a declared coupled batch (COUPLED rule): every changed file in
+    at least one member's PATHS (a file in several is owned by each), no
+    PROTECTED file and no scripts/laned/ file unless W0c owns it, and every
+    member owns a changed file."""
+    outside: list[str] = []
+    owned: dict[str, list[str]] = {w: [] for w in pr_wps}
+    for p in diff:
+        owners = [w for w in pr_wps if lanedlib.path_matches(p, sets[w])]
+        if p in PROTECTED or (p.startswith("scripts/laned/") and TOOLING_WP not in owners) or not owners:
+            outside.append(p)
+            continue
+        for w in owners:
+            owned[w].append(p)
+    if outside:
+        return refuse("out-of-scope", "outside every coupled WP's PATHS: " + " ".join(sorted(outside)),
+                      "paths")
+    idle = [w for w in pr_wps if not owned[w]]
+    if idle:
+        return refuse("label-without-changes", "label(s) none of whose PATHS the diff touches: "
+                      + " ".join(f"laned:{w}" for w in idle))
+    print("COUPLED " + " ".join(pr_wps))
+    print("BATCH " + " ".join(pr_wps))
+    for w in pr_wps:
+        print(f"SCOPE {w} {len(owned[w])} file(s)")
+    print("MODE implementation")
+    return 0
+
+
 def cmd_check_pr_impl_batch(root: Path, pr_wps: list[str], base: str, head: str,
                             diff: list[str]) -> int:
     """BATCH IMPLEMENTATION rule (module docstring; plan rev6.3 (b)): one
@@ -646,7 +694,10 @@ def cmd_check_pr_impl_batch(root: Path, pr_wps: list[str], base: str, head: str,
     def refuse(reason: str, detail: str, step: str = "rule1") -> int:
         return fail(step, f"batch-{reason}: {detail}")
 
-    if len(pr_wps) > lanedlib.BATCH_IMPL_MAX:
+    # COUPLED rule: the exact set of a declared coupled batch (read at BASE)
+    # skips the size, dependency and disjoint-PATHS checks; nothing else.
+    coupled = lanedlib.coupled_set_of(pr_wps, lanedlib.coupled_batches_at(root, base))
+    if coupled is None and len(pr_wps) > lanedlib.BATCH_IMPL_MAX:
         return refuse("too-many", f"{len(pr_wps)} WPs ({' '.join(pr_wps)}); an implementation PR "
                       f"batches at most {lanedlib.BATCH_IMPL_MAX}")
     non_wp = [w for w in pr_wps if REVIEW_WP.match(w)]
@@ -674,6 +725,8 @@ def cmd_check_pr_impl_batch(root: Path, pr_wps: list[str], base: str, head: str,
     if no_tests:
         return refuse("no-tests", f"{' '.join(no_tests)} has no tests/accept/<wp>/ (PATHS and a test file) "
                       f"on {base}: its tests PR merges first")
+    if coupled is not None:
+        return _coupled_scope(root, pr_wps, sets, diff, refuse)
     # (2) no WP of the batch depends on another (plan §3.0 Depends at BASE, transitive)
     plan = plan_at(root, base)
     deps = lanedlib.plan_wp_depends(plan) if plan else {}
@@ -794,8 +847,11 @@ def built_on(root: Path, ref: str, wp: str) -> bool:
     if proc.returncode != 0:
         return False
     history = lanedlib.first_parent_history(root, ref)
-    others = lanedlib.other_paths(lanedlib.paths_sets_at(root, ref), wp)
-    return lanedlib.impl_commit_index(history, wp, lanedlib.parse_paths(proc.stdout), others) is not None
+    sets = lanedlib.paths_sets_at(root, ref)
+    others = lanedlib.other_paths(sets, wp)
+    coupled = lanedlib.coupled_paths(lanedlib.coupled_batches_at(root, ref), sets, wp)
+    return lanedlib.impl_commit_index(history, wp, lanedlib.parse_paths(proc.stdout), others,
+                                      coupled) is not None
 
 
 def is_test_file(rel: str) -> bool:
@@ -1007,6 +1063,7 @@ def built_wps_at(root: Path, ref: str) -> list[tuple[str, list[str]]]:
     history = lanedlib.first_parent_history(root, ref)
     verification = lanedlib.verification_wps_at(root, ref)
     sets = lanedlib.paths_sets_at(root, ref)
+    coupled = lanedlib.coupled_batches_at(root, ref)
     built: list[tuple[str, list[str]]] = []
     for d in sorted(out):
         proc = lanedlib.git(root, "show", f"{ref}:tests/accept/{d}/PATHS", check=False)
@@ -1014,7 +1071,8 @@ def built_wps_at(root: Path, ref: str) -> list[tuple[str, list[str]]]:
             continue
         wp = ids.get(d, d)
         paths = lanedlib.parse_paths(proc.stdout)
-        if lanedlib.impl_commit_index(history, wp, paths, lanedlib.other_paths(sets, d)) is not None or (
+        if lanedlib.impl_commit_index(history, wp, paths, lanedlib.other_paths(sets, d),
+                                      lanedlib.coupled_paths(coupled, sets, wp)) is not None or (
                 wp in verification and not lanedlib.missing_paths_at(root, ref, paths)):
             built.append((wp, paths))
     return built
@@ -2250,6 +2308,146 @@ def selftest_batch_impl(ident: tuple[str, ...]) -> list[str]:
     return failures
 
 
+SELFTEST_COUPLED_PLAN = """# selftest plan
+
+| WP | What | Depends | Runs in | Accept |
+|---|---|---|---|---|
+| C1 | producer | — | ci | `scripts/laned/accept C1` |
+| C2 | draw | C1 | ci | `scripts/laned/accept C2` |
+| C3 | report | — | ci | `scripts/laned/accept C3` |
+| C4 | replay | C3 | ci | `scripts/laned/accept C4` |
+| E1 | elsewhere | — | ci | `scripts/laned/accept E1` |
+"""
+
+
+def selftest_coupled(ident: tuple[str, ...]) -> list[str]:
+    """The COUPLED rule of --check-pr (scripts/laned/coupled_batches at BASE),
+    each member's Accept on the coupled head, the squash merge as each
+    member's L2 commit (built_on), and every refusal the rule keeps, on a
+    real git repo."""
+    failures: list[str] = []
+    saved = os.environ.get("LANED_PYTEST_CMD")
+    os.environ["LANED_PYTEST_CMD"] = shlex.join([sys.executable, "-m", "pytest", "-p", "no:cacheprovider"])
+    # C1, C2 and C4 share pkg/core.py (overlapping PATHS); C2 depends on C1
+    # and C4 on C3; four WPs exceed BATCH_IMPL_MAX.
+    wps = {"C1": ("pkg/core.py\npkg/c1.py\n", "pkg.c1"),
+           "C2": ("pkg/core.py\npkg/c2.py\n", "pkg.c2"),
+           "C3": ("pkg/c3.py\n", "pkg.c3"),
+           "C4": ("pkg/core.py\npkg/c4.py\n", "pkg.c4"),
+           "E1": ("pkg/e1.py\n", "pkg.e1")}
+    code = {f"pkg/{w.lower()}.py": "from pkg.core import VALUE  # noqa: F401\n" for w in wps}
+    code["pkg/core.py"] = "VALUE = 1\n"
+    members = ["C1", "C2", "C3", "C4"]
+    declared = "# selftest\nC1 C2 C3 C4  # the coupled set\nE1\n"
+    try:
+        with tempfile.TemporaryDirectory(prefix="laned-accept-selftest-coupled-") as tmp:
+            root = Path(tmp) / "repo"
+            root.mkdir()
+
+            def commit(files: dict[str, str], msg: str) -> str:
+                for rel, text in files.items():
+                    (root / rel).parent.mkdir(parents=True, exist_ok=True)
+                    (root / rel).write_text(text)
+                lanedlib.git(root, "add", "-A")
+                lanedlib.git(root, *ident, "commit", "-q", "-m", msg)
+                return lanedlib.git(root, "rev-parse", "HEAD").stdout.strip()
+
+            lanedlib.git(root, "init", "-q")
+            lanedlib.git(root, "checkout", "-q", "-b", "main")
+            commit({lanedlib.PLAN_PATH: SELFTEST_COUPLED_PLAN, ".gitignore": "__pycache__/\n",
+                    "README.md": "x\n", "pkg/__init__.py": ""}, "plan")
+            for w, (paths, mod) in wps.items():
+                d = lanedlib.wp_dir(w)
+                commit({f"tests/accept/{d}/PATHS": paths,
+                        f"tests/accept/{d}/test_{d}.py": f"import {mod}\n\n\ndef test_{d}():\n"
+                                                         f"    assert {mod}.VALUE == 1\n"}, f"tests {w}")
+            undeclared = lanedlib.git(root, "rev-parse", "HEAD").stdout.strip()
+            base = commit({lanedlib.COUPLED_BATCHES_PATH: declared}, "W0c: declare C1-C4 coupled")
+
+            def impl(*names: str) -> dict[str, str]:
+                out = {"pkg/core.py": code["pkg/core.py"]}
+                out.update({f"pkg/{n.lower()}.py": code[f"pkg/{n.lower()}.py"] for n in names})
+                return out
+
+            def check(name: str, files: dict[str, str], labels: list[str], wp: str,
+                      start: str) -> tuple[int, str, str]:
+                lanedlib.git(root, "checkout", "-q", "-B", name, start)
+                head = commit(files, name)
+                with contextlib.redirect_stdout(io.StringIO()) as buf:
+                    rc = cmd_check_pr(root, wp, start, head, labels)
+                return rc, buf.getvalue(), head
+
+            def want_refused(name: str, files: dict[str, str], labels: list[str], want: str,
+                             start: str = base) -> None:
+                for wp in labels:
+                    rc, out, _ = check(f"{name}-{wp}", files, labels, wp, start)
+                    if rc == 0 or want not in out or "MODE " in out or "COUPLED " in out:
+                        failures.append(f"coupled {name}: {wp} rc={rc}, want {want}: {out.strip()}")
+
+            # the exact declared set: size, dependency and overlap are allowed
+            head = ""
+            order = ["C3", "C1", "C4", "C2"]          # label order is free
+            for wp in order:
+                rc, out, head = check(f"coupled-{wp}", impl(*members), order, wp, base)
+                lines = [ln for ln in out.splitlines() if ln.startswith(("COUPLED ", "BATCH ", "MODE "))]
+                want = ["COUPLED " + " ".join(order), "BATCH " + " ".join(order), "MODE implementation"]
+                scopes = sorted(ln for ln in out.splitlines() if ln.startswith("SCOPE "))
+                if rc != 0 or lines != want or scopes != sorted(
+                        ["SCOPE C1 2 file(s)", "SCOPE C2 2 file(s)", "SCOPE C3 1 file(s)",
+                         "SCOPE C4 2 file(s)"]):
+                    failures.append(f"coupled exact-set: {wp} rc={rc}: {out.strip()}")
+            # every member's own Accept passes on the coupled head
+            lanedlib.git(root, "checkout", "-q", head)
+            for wp in members:
+                with contextlib.redirect_stdout(io.StringIO()) as buf, \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    rc = cmd_accept(root, wp, None)
+                if rc != 0:
+                    failures.append(f"coupled accept {wp} failed: {buf.getvalue().strip()[-1500:]}")
+            # the rule keeps every other refusal
+            want_refused("subset", impl("C1", "C2"), ["C1", "C2"], "FAIL rule1: batch-dependency")
+            want_refused("subset-overlap", impl("C1", "C4"), ["C1", "C4"],
+                         "FAIL rule1: batch-overlapping-paths")
+            want_refused("superset", {**impl(*members), "pkg/e1.py": code["pkg/e1.py"]},
+                         [*members, "E1"], "FAIL rule1: batch-too-many")
+            want_refused("undeclared", impl(*members), members, "FAIL rule1: batch-too-many", undeclared)
+            want_refused("out-of-scope", {**impl(*members), "README.md": "y\n"}, members,
+                         "FAIL paths: batch-out-of-scope: outside every coupled WP's PATHS: README.md")
+            want_refused("tooling", {**impl(*members), "scripts/laned/x.py": "X = 1\n"}, members,
+                         "FAIL paths: batch-out-of-scope")
+            want_refused("idle-member", impl("C1", "C2", "C4"), members,
+                         "FAIL rule1: batch-label-without-changes: label(s) none of whose PATHS "
+                         "the diff touches: laned:C3")
+            want_refused("with-tests", {**impl(*members), "tests/accept/c1/test_more.py": SELFTEST_PASSING},
+                         members, "FAIL rule1: tests/accept/ edited together with")
+            # a PR cannot declare its own set: the file is read at BASE
+            want_refused("self-declared", {**impl(*members), lanedlib.COUPLED_BATCHES_PATH: declared},
+                         members, "FAIL rule1: batch-too-many", undeclared)
+            # the squash merge is each member's L2 commit; a partial one is not
+            lanedlib.git(root, "checkout", "-q", "main")
+            lanedlib.git(root, "merge", "-q", "--squash", head)
+            merged = commit({}, "feat: C1 C2 C3 C4 (#9)")
+            built = [w for w in (*members, "E1") if built_on(root, merged, w)]
+            if built != members:
+                failures.append(f"coupled squash: built {built}, want {members}")
+            lanedlib.git(root, "checkout", "-q", "-B", "partial", base)
+            partial = commit({"pkg/core.py": "VALUE = 1\n", "pkg/c2.py": code["pkg/c2.py"],
+                              "pkg/c4.py": code["pkg/c4.py"]}, "partial")
+            if any(built_on(root, partial, w) for w in ("C1", "C3")):
+                failures.append("coupled: a merge missing members counted as their L2")
+            if lanedlib.parse_coupled_batches(declared) != [("C1", "C2", "C3", "C4")]:
+                failures.append(f"coupled parse: {lanedlib.parse_coupled_batches(declared)}")
+            if lanedlib.coupled_set_of(["C4", "C3", "C2", "C1"], [("C1", "C2", "C3", "C4")]) is None \
+                    or lanedlib.coupled_set_of(["C1", "C2"], [("C1", "C2", "C3", "C4")]) is not None:
+                failures.append("coupled_set_of: only the exact set is coupled")
+    finally:
+        if saved is None:
+            os.environ.pop("LANED_PYTEST_CMD", None)
+        else:
+            os.environ["LANED_PYTEST_CMD"] = saved
+    return failures
+
+
 def cmd_selftest() -> int:
     """Offline check of the RV<n> review mode of --check-pr and of the
     tests-only / tests-correction MODE rules."""
@@ -2302,6 +2500,7 @@ def cmd_selftest() -> int:
     failures += selftest_freshness(ident)
     failures += selftest_batch(ident)
     failures += selftest_batch_impl(ident)
+    failures += selftest_coupled(ident)
     for f in failures:
         print(f"accept selftest: FAIL {f}", file=sys.stderr)
     if failures:
