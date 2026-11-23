@@ -6,12 +6,14 @@ by the old code may hold an entry in `confirm_pending` (a first clear
 waiting for its confirmation duel). On load at the first settlement after
 the release:
 
-- if the entry's `confirm.king_digest` still equals KING_D, it becomes a
-  **crown candidate on its first-clear set**: A10 and the §1.3b gate decide
-  it, with no second duel;
-- otherwise it is `pending` / `pending_floor`: the first clear is discarded
-  (the old D20 (a) outcome) and the windows it was judged on stay used, so
-  it is never re-judged on them.
+- (orchestrator decision 2026-11-23, replacing the crown-candidate reading:
+  the legacy `confirm` record carries no first-clear LCB, so the entry
+  cannot be ranked or gated as a candidate) whatever `confirm.king_digest`
+  names, the entry becomes `pending` / `pending_floor`: the first clear is
+  discarded and the windows it was judged on stay used, so it is never
+  re-judged on them; it is judged afresh under the first-verdict rule once
+  fresh windows meet the floors. Lane D was never armed on mainnet, so
+  this touches testnet state only.
 
 Either way the migration is tagged `confirm_state_migrated` in the signed
 report of that settlement (and only that one), and the receipt's prior /
@@ -105,28 +107,41 @@ def _binds(settlement, legacy: dict, path) -> None:
     verify_receipt(rec, report=settlement.report, state=json.loads(path.read_bytes()))
 
 
-def test_rev611_confirm_pending_against_the_current_king_is_crowned_on_its_first_clear(tmp_path):
+def test_rev611_confirm_pending_against_the_current_king_returns_to_pending_floor(tmp_path):
+    """Orchestrator decision 2026-11-23: the legacy `confirm` record carries
+    no first-clear LCB, so even when its king is still KING_D the entry is
+    not a crown candidate: it is `pending` / `pending_floor`, its first clear
+    discarded, its first-clear windows still used. Snapshot 2 alone is below
+    the floors, so nothing is judged, gated or crowned at the migration."""
     chain = W7cChain(tmp_path)
     path = chain.state_path("legacy")
     legacy = _legacy_state(chain, path, king_matches=True)
     x = chain.x["digest"]
+    king = legacy["king"]["digest"]
     hosts = len(chain.hosts)
 
     s2 = _settle_b2(chain, path, legacy)
-    assert s2.report["crowned"] == x, (
-        "a confirm_pending entry whose first-clear king is still KING_D is a crown "
-        "candidate on its first-clear set (A10 + gate, no second duel)")
-    assert any(h.calls for h in chain.hosts[hosts:]), "the §1.3b gate decides the candidate"
+    assert s2.report["crowned"] is None, \
+        "a migrated confirm_pending entry is never crowned on its discarded first clear"
+    assert not any(h.calls for h in chain.hosts[hosts:]), \
+        "no gate runs for a migrated entry (it is not a candidate)"
+    assert not any(v.get("digest") == x for v in s2.report.get("verdicts") or []), \
+        "below the floors on fresh windows, the migrated entry is not judged at b2"
     state = json.loads(path.read_bytes())
-    assert state["king"]["digest"] == x and state["entries"][x]["status"] == "crowned"
+    assert state["king"]["digest"] == king, "KING_D is unchanged by the migration"
+    rec = state["entries"][x]
+    assert (rec["status"], rec["reason"]) == ("pending", "pending_floor"), \
+        (rec["status"], rec["reason"])
+    assert set(_first_clear_ids(chain)) <= set(rec["used_windows"]), \
+        "the windows of the discarded first clear stay used (never re-judged)"
     assert "confirm_pending" not in canonical(state).decode(), \
         "no confirm_pending survives the migration"
     assert _tag_paths(s2.report), f"the signed report tags the migration ({TAG})"
     _binds(s2, legacy, path)
 
     s3 = chain.settle(3, path)
-    assert s3.report["king_before"]["digest"] == x and s3.report["crowned"] is None
     assert not _tag_paths(s3.report), "the migration runs once"
+    assert "confirm_pending" not in path.read_text()
 
 
 def test_rev611_confirm_pending_against_another_king_returns_to_pending_floor(tmp_path):
