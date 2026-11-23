@@ -14,6 +14,9 @@ Copied from docs/plans/LANE_D_PLAN.md (rev6):
   weights." Item 4: "Structured comparisons only."
 - §1.5: "`checks.derive_weights` and `check_lane_d` re-derive the lane D
   weights from the receipt chain."
+- rev6.11 (b): every crown is decided at the first verdict (first clear ∧
+  A10 ∧ gate); the replay re-derives no confirmation stage, record or D20
+  rule, and a held first clear is `hold` / `bench_hold`.
 
 Every honest chain is a sequence of real `settle_lane_d` runs on a synthetic
 pool (numpy only, no torch), published the way W7c persists it: the signed

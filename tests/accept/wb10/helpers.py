@@ -61,6 +61,14 @@ WB10_DEFAULTS: dict[str, object] = {
 }
 WB10_KEYS = tuple(WB10_DEFAULTS)
 RELEASE_ONLY = ("contamination_hashset",)
+# WB22 (D42; owner 2026-11-23) owns the SHIPPED VALUE of these keys: lane B's
+# own GPU list may differ from [round] funded_pod_skus in a shipped file (that
+# is its purpose, "separate from [round]"). The PARSER default (key absent)
+# stays the same file's [round] list, pinned by test_wb10_key_default and
+# test_wb10_funded_pod_skus_default_is_lane_a_list_and_separate. The key is
+# trainer/intake-side (no consensus digest reads it), so the drop-when-default
+# fingerprints still hold with any shipped value.
+SHIPPED_VALUE_OWNED_ELSEWHERE = ("funded_pod_skus",)
 # One legal value under the decided options: the mutation is the refusal of
 # other values (test_wb10_validation.py).
 SINGLE_VALUED = ("router_rows", "sentinel_target_rule")

@@ -322,16 +322,44 @@ class LaneDInputsSource:
         the subset that are bars (KING_D, the house, a confirm stage's
         original king), whose fault refuses the tick. An entry declaring a
         context outside ``[lane_d] contexts`` is not forecast: the settlement
-        closes it at registration (``context_not_armed``)."""
+        closes it at registration (``context_not_armed``).
+
+        Plan rev6.15 ("Highest ≤ declared, else skip"): a digest whose
+        effective context is ``None`` (no armed variant ≤ its declared
+        context) is not forecast. An entry or open record is then skipped by
+        the settlement (``context_below_armed``); a miner KING_D without a
+        forecast makes its cohort ``king_unscored``. Neither refuses the
+        tick. The house (no declared context) is always forecast."""
         from ..eval.lane_d_scorer import effective_context
 
         declarable = {int(c) for c in self.cfg.lane_d.contexts}
 
-        def eff(declared: int) -> int:
+        armed_ints = [int(c) for c in armed]
+
+        def eff(declared: int) -> int | None:
+            # rev6.15: no armed variant ≤ declared ⇒ not scored (``None``),
+            # decided here too so the skip never depends on the scorer build.
+            if not any(c <= int(declared) for c in armed_ints):
+                return None
             return effective_context(int(declared), armed)
 
+        def put(dg: str, c: int | None, *, replace: bool = False) -> None:
+            if c is None:
+                if replace:
+                    ctx.pop(dg, None)
+                return
+            if replace:
+                ctx[dg] = c
+            else:
+                ctx.setdefault(dg, c)
+
         records = state["entries"]
+        # The house declares no context (it is ours, not a miner's): it runs
+        # at its trained 4096 when armed, else the highest armed below, else
+        # the lowest armed (rev6.15 leaves the house's rule unchanged).
         house_ctx = eff(HOUSE_TRAINED_CONTEXT)
+        if house_ctx is None:
+            house_ctx = min(int(c) for c in armed)
         houses = {str(state["house"]["digest"]), str(house["digest"])}
         king = state["king"]
         bars = set(houses) | {str(king["digest"])}
@@ -342,17 +370,17 @@ class LaneDInputsSource:
         ctx: dict[str, int] = {}
         for e in entries:
             if int(e["context"]) in declarable:
-                ctx.setdefault(e["digest"], eff(e["context"]))
+                put(str(e["digest"]), eff(e["context"]))
         from .lane_d import OPEN_STATUSES
 
         for dg, rec in sorted(records.items()):
             if rec.get("status") in OPEN_STATUSES and int(rec["context"]) in declarable:
-                ctx.setdefault(str(dg), eff(rec["context"]))
+                put(str(dg), eff(rec["context"]))
         for dg in sorted(bars):
             if dg in houses or (dg == str(king["digest"]) and king.get("house")):
-                ctx[dg] = house_ctx
+                put(dg, house_ctx, replace=True)
             elif dg in records and int(records[dg]["context"]) in declarable:
-                ctx[dg] = eff(records[dg]["context"])
+                put(dg, eff(records[dg]["context"]), replace=True)
             elif dg in records:
                 raise LaneDInputsError("state_unreadable",
                                        f"king {dg[:16]} declares context "
@@ -454,6 +482,11 @@ class LaneDInputsSource:
         windows = self._windows(pools)
         need, bars = self._needed(entries, state, house, ctxs)
         forecasts = self._forecasts(need, bars, windows, state, house, ctxs)
+        # W3b6a: the bench host sweeps each digest at the context it is
+        # forecast at (the same map, once per settlement).
+        set_contexts = getattr(self._bench_host, "set_contexts", None)
+        if callable(set_contexts):
+            set_contexts(dict(need))
         dirs = [d for d, _ in pools]
         return LaneDInputs(pool_dir=dirs[-1], entries=entries, forecasts=forecasts,
                            uid_of=uid_of, house=house, prior_pool_dirs=tuple(dirs[:-1]),
@@ -679,7 +712,7 @@ class SSHEvalHost:
 INPUTS_FILE_KEYS = ("intake_state_dir", "pool_pins", "house_pointer", "house_signer_ss58",
                     "eval_hosts", "eval_host_name", "eval_cache_dir", "eval_cache_budget_bytes",
                     "eval_device", "eval_timeout_seconds", "grant_expires_seconds",
-                    "readiness", "t7")
+                    "readiness", "t7", "bench_hosts")
 _REQUIRED_KEYS = ("intake_state_dir", "pool_pins", "house_pointer", "house_signer_ss58",
                   "eval_hosts", "eval_cache_dir", "eval_cache_budget_bytes", "readiness", "t7")
 
@@ -702,9 +735,12 @@ def load_inputs_services(cfg: Any, path) -> dict:
         grant_expires_seconds = 3600                # optional, presigned GET lifetime
         readiness = "/abs/laned_readiness.json"     # rev6.6: laned_readiness/1 (DocumentFile)
         t7 = "/abs/t7.json"                         # rev6.6: laned_t7/1 pod evidence
+        bench_hosts = "/abs/lane_d_bench_hosts.toml"  # optional (W3b6a): [[host]] bench pod
 
-    Returns the keyword arguments (``bench_host`` is ``None``: no lane D
-    bench host transport exists yet, so a crowning candidate holds).
+    Returns the keyword arguments. ``bench_host`` is the W3b6a
+    :class:`~cascade.validator.lane_d_bench_host.SSHBenchHost` on
+    ``bench_hosts`` (sharing the eval cache dir / budget layout and the
+    grants), or ``None`` without the key: a crowning candidate then holds.
     Raises :class:`LaneDInputsConfigError`."""
     p = Path(path)
     try:
@@ -741,9 +777,15 @@ def load_inputs_services(cfg: Any, path) -> dict:
                        host_name=raw.get("eval_host_name", "") or ops.eval_host,
                        device=raw.get("eval_device", "cuda"),
                        timeout_s=float(raw.get("eval_timeout_seconds", 3600)), grants=grants)
+    bench = None
+    if raw.get("bench_hosts"):
+        from .lane_d_bench_host import SSHBenchHost
+
+        bench = SSHBenchHost(raw["bench_hosts"], cache_dir=raw["eval_cache_dir"],
+                             budget_bytes=raw["eval_cache_budget_bytes"], grants=grants)
     return {"intake_state_dir": intake, "pool": PinFilePool(raw["pool_pins"]),
             "eval_host": host, "house_pointer": Path(raw["house_pointer"]),
-            "house_signer_ss58": raw["house_signer_ss58"], "bench_host": None,
+            "house_signer_ss58": raw["house_signer_ss58"], "bench_host": bench,
             "readiness": DocumentFile(raw["readiness"]), "t7": DocumentFile(raw["t7"])}
 
 

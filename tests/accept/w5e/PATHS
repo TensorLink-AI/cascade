@@ -13,3 +13,10 @@ cascade/validator/schemas/lane_d_report_1.json
 # lane_d_status.py:51).
 cascade/validator/lane_d_queue.py
 cascade/validator/lane_d_status.py
+# Orchestrator decision 2026-11-23 (blocker 1, option (a)): the confirm stage
+# leaves the producer, the audit and the replay together (plan rev6.11 (b)
+# "W5e: remove the stage": ~58 refs in cascade/audit/lane_d.py, ~30 in
+# cascade/satellite/lane_d_replay.py), so an honest first-verdict crown is
+# audited and replayed as such and no report carries confirm_on_king_change.
+cascade/audit/lane_d.py
+cascade/satellite/lane_d_replay.py

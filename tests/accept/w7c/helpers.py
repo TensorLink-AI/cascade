@@ -280,7 +280,8 @@ class BenchHost:
 
 class FlakyHost(BenchHost):
     """A bench pod that is down: every sweep call is logged, then raises (the
-    settlement records the candidate as ``bench_hold``)."""
+    settlement records the candidate as ``bench_hold``, and its entry stays
+    open in status ``hold``: plan rev6.11 (b), the W5e spec)."""
 
     def __call__(self, digests, suites) -> dict:
         self.calls.append((tuple(digests), tuple(suites)))

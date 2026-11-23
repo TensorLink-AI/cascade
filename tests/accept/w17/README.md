@@ -221,3 +221,13 @@ once at `status/lane_d.json`).
 carries its subprocess's `ModuleNotFoundError`. The fixtures (real
 `settle_lane_d` runs) and the W18 / W-S3 modules they call are on main, so
 nothing fails for another reason.
+
+## Correction (plan rev6.11 (b)): crown at the first verdict
+
+The confirmation duel is dropped (owner 2026-11-23): a crown is decided at
+the first verdict, first clear (max-T LCB vs KING_D) ∧ A10 ∧ the §1.3b gate.
+There is no `confirm` stage, no `confirm_pending` status or reason and no
+`lost_confirmation`; a held first clear is `hold` / `bench_hold`. This WP's
+crowning chains move to that rule with nothing weakened. The rich scenario's bench pod is down at B1, so X's first clear is held open (`hold` / `bench_hold`, confirm stage `first`, verdict `cleared`). The king scenario lists X from B2_NEXT_ERA, where it is crowned at its first verdict. The held scenario lists X from B2. The confirm-stage queue and progress tests now pin the held first clear and its judged set, and the reason enum is pinned free of `confirm_pending`. On main the
+old code still runs the confirmation stage, so the changed tests fail on an
+assertion until the W5e implementation lands.

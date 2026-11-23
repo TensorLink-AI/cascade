@@ -96,12 +96,16 @@ settlement (W7a) can call it. It is never read from `cfg.contexts`.
   - `contexts` must be a non-empty subset of `SCORER_CONTEXTS`, else
     `ValueError`. The record is deterministic: the same bytes give the same
     record, whatever the order of `contexts`.
-- `effective_context(declared, armed_contexts) -> int` returns `declared`
-  when it is armed. Otherwise it returns the highest armed variant **not
-  above** `declared`, and when every armed variant is above `declared`, the
-  lowest armed one. A model is never run past the context its miner declared.
-  In the normal case the gates are monotone (a series usable at 64k is usable
-  at 32k), so this is the plan's "highest armed variant". The scored context
+- `effective_context(declared, armed_contexts) -> int | None` returns
+  `declared` when it is armed. Otherwise it returns the highest armed variant
+  **not above** `declared`. ~~When every armed variant is above `declared`,
+  the lowest armed one.~~ **(plan rev6.15, owner 2026-11-23: "Highest ≤
+  declared, else skip")** When every armed variant is above `declared` it
+  returns **`None`**: the entry is not scored that settlement (the settlement
+  skips it `context_below_armed`, W7a). A model is never run past the context
+  its miner declared. In the normal case the gates are monotone (a series
+  usable at 64k is usable at 32k), so 4096 is armed whenever anything is and
+  `None` is rare. The scored context
   switches at the settlement where the declared variant arms. An
   empty armed set, or a declared value that is not a scorer context (or is a
   bool or str), is a `ValueError`.

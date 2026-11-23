@@ -225,3 +225,13 @@ Four tests pass on main and must keep passing: the three unarmed invariant-1
 tests and `test_present_records_keep_the_w7c_shape`. `accept W14
 --expect-fail` on main: 82 collected, 4 passed, 78 right-reason, 0
 wrong-reason.
+
+## Correction (plan rev6.11 (b)): crown at the first verdict
+
+The confirmation duel is dropped (owner 2026-11-23): a crown is decided at
+the first verdict, first clear (max-T LCB vs KING_D) ∧ A10 ∧ the §1.3b gate.
+There is no `confirm` stage, no `confirm_pending` status or reason and no
+`lost_confirmation`; a held first clear is `hold` / `bench_hold`. This WP's
+crowning chains move to that rule with nothing weakened. The helpers use W7c's own 48-window `W7cChain`: boundary(1) waits on the floors, boundary(2) is X's first, crowning verdict, boundary(3) judges nothing. The absent-settlement test defers a pending (floor-waiting) entry, which then crowns at its first verdict at boundary(3). On main the
+old code still runs the confirmation stage, so the changed tests fail on an
+assertion until the W5e implementation lands.

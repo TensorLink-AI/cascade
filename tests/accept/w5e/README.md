@@ -249,3 +249,16 @@ A scratch prototype of the contract (stage removed, bench_hold status
 **Other WPs whose fixtures expect the confirm stage** (corrections needed
 before the W5e implementation can pass CROSS; not edited here): W3b3, W3b5,
 W5c, W5f, W5g, W1.5 (crowning e2e chains at boundary 2), W7c, W7d, W9.
+
+## PATHS correction (orchestrator 2026-11-23): audit and replay
+
+Plan rev6.11 (b) ("W5e: remove the stage") counts the confirm stage in
+`cascade/validator/lane_d.py`, `cascade/audit/lane_d.py` and
+`cascade/satellite/lane_d_replay.py`. Dropping it from the producer alone
+leaves the audit and the replay expecting a confirm-stage crown and the
+`confirm_on_king_change` config echo. That fails 124 honest-chain tests
+that pass on main (W5c, W5f, W7a, W7d, W8, W8b, W9) and the W1.5 e2e audit.
+So W5e's PATHS add those two files (only those): W5e removes the stage from
+the producer, the audit and the replay together. The audit and replay
+rules W7a / W9 / W7d add on top (embargo, draw and fresh-share fields,
+`confirmation_stage_present`) stay those WPs' work. No test changed.

@@ -368,3 +368,15 @@ The three "a different judgement at the same boundary" edits (recovery
 `edited_after_signing`, the swapped report, the defective `body`) now toggle
 `crowned` (`helpers.other_crown`) instead of setting it to `null`, so the
 edit changes the body whatever boundary(2) decided.
+
+## Correction: a held first clear is status `hold` (orchestrator 2026-11-23)
+
+`test_rv7_b1_recovery_adopts_a_persisted_bench_hold` pinned a held
+first-clear candidate as status `pending`. Plan rev6.11 (b) ("Follow-up
+code and tests", W5e: "Verdict outcomes become `lost` | `crowned`, plus
+the existing `bench_hold` hold") and the W5e spec (`tests/accept/w5e`
+README "Fail closed", `test_w5e_gate.py`, `test_w5e_fail_closed.py`) keep
+it in the existing open status `hold` with reason `bench_hold`. The
+assertion now pins `hold` / `bench_hold`; the `gate_hold` assertion is
+unchanged. On main the old code writes `confirm_pending`, so the test
+still fails on an assertion pending the W5e implementation.

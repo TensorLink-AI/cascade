@@ -113,6 +113,7 @@ SKIP_REASONS`, the digest not in `judged`) or nothing for a judged entry
 | digest equals the house's | `duplicate_digest` | `closed` | yes |
 | second entry of an open hotkey | `hotkey_has_open_entry` | `closed` | yes |
 | context not in `contexts` | `context_not_armed` | `closed` | yes |
+| **(plan rev6.15)** armed record given, no armed variant ≤ the declared context (declared 4096, armed 8192/16384) | `context_below_armed` | `pending` | yes |
 | NaN forecasts at selection | `checkpoint_fault` | `closed` | yes |
 | NaN on the drawn suite at confirmation | `checkpoint_fault` | `closed` | no |
 | NaN on the drawn suite at a re-gate | `checkpoint_fault` | `closed` | yes |
