@@ -35,6 +35,18 @@ Per settlement, in order (the first two can end the settlement early):
    receipt links (C1);
 4. with a state snapshot, its digest, canonical bytes and consensus fields.
 
+W5f (§1.4 "The house", §2 items 1-2, T10), re-derived from the chain: a new
+house digest while a miner holds KING_D (and is neither KING_D nor a prior
+king) opens a house challenger. It is judged alone in its own cohort
+(``members == [house]``, ``king_digest`` = KING_D, no ``house_digest``, its T
+the report's house record's), first clear then confirmation (D20) on its own
+progress, never a miner entry's of the same digest. A confirmed, passing
+house retakes KING_D: ``king_after`` is the house record, the miner king the
+newest prior king, the slot burns (``house_king``) and ``crowned`` is null. A
+lost house is not judged again; a retake or a new pointer ends it. An entry
+is ``duplicate_digest`` exactly when it is a copy: a new entry naming the
+house or KING_D, an open entry naming a new house, or one already closed so.
+
 Only structured fields are compared (invariant 7). A mismatch is a field
 path (``verdicts[0].lcb``, ``pay.court[1].uid``, ``receipt.report_sha256``,
 ``state.king``); ``extensions`` is never read. Once a settlement is not
@@ -98,6 +110,11 @@ _COHORT_KEYS = frozenset({"index", "king_digest", "king_reveal_ts", "stage", "me
 _VERDICT_KEYS = frozenset({"digest", "king_digest", "stage", "cohort", "lcb", "gain", "cleared",
                            "outcome", "confirmation", "lowfreq"})
 _ENTRY_STABLE = ("hotkey", "coldkey", "context", "ready_block", "reveal_block", "reveal_ts")
+OPEN_STATUSES = ("pending", "confirm_pending")
+# The chain's internal key of the house challenger's progress (pending first
+# clear, hold, used windows, status): never a miner entry's key, so a miner
+# copy of the house never lends it its progress.
+_HOUSE_KEY = "house:"
 
 _PATH_RE = re.compile(r"^[a-z][a-z0-9_]*(\[[0-9]+\]|\.[a-z0-9_]+)*$")
 _KEY_RE = re.compile(r"^[a-z0-9_]+$")
@@ -465,15 +482,24 @@ class _Chain:
     holds: dict = field(default_factory=dict)
     # digest -> every window id it has been judged on
     used: dict = field(default_factory=dict)
-    # digest -> status in the last report, and its stable entry fields
+    # digest -> status / reason in the last report, and its stable entry fields
+    # (the house challenger's status under its ``_HOUSE_KEY`` key)
     status: dict = field(default_factory=dict)
+    reasons: dict = field(default_factory=dict)
     entries: dict = field(default_factory=dict)
+    # W5f: the open house challenger {digest, reveal_ts, status}, or None
+    house_entry: dict | None = None
+
+
+def _house_key(digest: str) -> str:
+    return _HOUSE_KEY + digest
 
 
 @dataclass
 class _Verdict:
     index: int
     digest: str
+    key: str
     stage: str
     cleared: bool
     lcb: float
@@ -510,6 +536,13 @@ class _Settlement:
         self.dropped_holds: list[str] = []
         self.gate_out: dict[str, str] = {}
         self.gated = False
+        # W5f: the house challenger judged this settlement (None when there
+        # is none), its chain key, its status after it, and a retake.
+        self.house_ch: dict | None = None
+        self.hkey: str | None = None
+        self.house_status: str | None = None
+        self.crown_key: str | None = None
+        self.retake = False
         self.crown: str | None = None
         self.king_after: dict | None = None
         self.prior_kings: list = []
@@ -535,7 +568,9 @@ class _Settlement:
         self._guarded("rows_sha256", self.check_rows_sha)
         self._guarded("house", self.check_house)
         self._guarded("king_before", self.check_king_before)
+        self._guarded("house", self.derive_house_entry)
         self._guarded("entries", self.check_entries)
+        self._guarded("entries", self.check_duplicates)
         self._guarded("windows", self.index_windows)
         self._guarded("rows", self.index_rows)
         self._guarded("cohorts", self.check_cohorts)
@@ -596,6 +631,66 @@ class _Settlement:
             kb = dict(c.king)
         _compare(self.d, "king_before", kb, self.r.get("king_before"))
         self.king_before = kb
+
+    def derive_house_entry(self) -> None:
+        """W5f (§1.4 "It enters at that settlement"): a new house digest ends
+        any earlier house challenger; while a miner holds KING_D it opens a
+        fresh one, unless its digest is KING_D's or a prior king's. The fresh
+        challenger starts with no progress of its own (first clear, hold and
+        used windows), whatever a miner entry of that digest had."""
+        c = self.chain
+        if self.house is None or self.king_before is None:
+            raise TypeError("no house")
+        hd = self.house["digest"]
+        he = dict(c.house_entry) if c.house_entry is not None else None
+        if c.king is not None and hd != c.house:
+            fresh = copy.deepcopy(c)
+            old = [k for k in (*fresh.pending, *fresh.holds, *fresh.used, *fresh.status)
+                   if k.startswith(_HOUSE_KEY)]
+            for k in old:
+                for d in (fresh.pending, fresh.holds, fresh.used, fresh.status, fresh.reasons):
+                    d.pop(k, None)
+            self.chain = fresh
+            known = {self.king_before["digest"], *(p["digest"] for p in c.prior_kings)}
+            he = None
+            if not self.king_before["house"] and hd not in known:
+                he = {"digest": hd, "reveal_ts": int(self.house["reveal_ts"]),
+                      "status": "pending"}
+        if he is not None and (he["digest"] != hd or self.king_before["house"]):
+            he = None
+        self.house_ch = he
+        self.hkey = _house_key(hd) if he is not None else None
+
+    def _house_open(self) -> bool:
+        return self.house_ch is not None and self.house_ch["status"] in OPEN_STATUSES
+
+    def _dg(self, key: str) -> str:
+        """The digest a chain key stands for (the house challenger's is the house's)."""
+        return self.house_ch["digest"] if key == self.hkey else key
+
+    def check_duplicates(self) -> None:
+        """An entry is ``duplicate_digest`` exactly when it is a copy: a new
+        entry naming the house or KING_D (refused at registration), an open
+        entry naming a new house (W5f), or one already closed so."""
+        if self.house is None or self.king_before is None:
+            raise TypeError("no house")
+        hd = self.house["digest"]
+        taken = {hd, self.king_before["digest"]}
+        c = self.chain
+        for dg, (i, e) in sorted(self.entries.items()):
+            if dg not in c.entries:
+                want, excused = dg in taken, False
+            elif c.reasons.get(dg) == "duplicate_digest":
+                want, excused = True, False
+            else:
+                # An open entry loses its UID before a copy closes (B8).
+                want = dg == hd and c.status.get(dg) in OPEN_STATUSES
+                excused = e.get("reason") == "deregistered"
+            got = e.get("reason") == "duplicate_digest"
+            if got != want and not (want and excused):
+                self.d.add(f"entries[{i}].reason")
+            if got and want and e.get("status") != "closed":
+                self.d.add(f"entries[{i}].status")
 
     def check_entries(self) -> None:
         entries = self.r["entries"]
@@ -693,7 +788,10 @@ class _Settlement:
         king change ``restart`` drops the hold (the entry restarts)."""
         kb = self.king_before["digest"]
         for dg in sorted(self.chain.holds):
-            if self.chain.holds[dg]["king_d"] != kb and self.rule != "original":
+            if dg.startswith(_HOUSE_KEY) and (dg != self.hkey or not self._house_open()):
+                # Only an open house challenger's hold is re-gated.
+                self.dropped_holds.append(dg)
+            elif self.chain.holds[dg]["king_d"] != kb and self.rule != "original":
                 self.dropped_holds.append(dg)
             else:
                 self.held.append(dg)
@@ -753,17 +851,26 @@ class _Settlement:
                 or len(set(members)) != len(members):
             d.add(f"{at}.members")
             return 0
+        # W5f: the house challenges a miner KING_D alone in its own cohort
+        # (the house digest is never a miner member: a miner copy is closed).
+        is_house = bars_house in members
+        if is_house and (members != [bars_house] or not self._house_open()):
+            d.add(f"{at}.members")
+            return 0
+        keys = [self.hkey] if is_house else list(members)
         for m in members:
-            if m not in self.entries or m not in by_digest:
+            if (not is_house and m not in self.entries) or m not in by_digest:
                 d.add(f"{at}.members")
                 return 0
-            if m in self.held:
+        for m, key in zip(members, keys, strict=True):
+            if key in self.held:
                 d.add(f"verdicts[{by_digest[m]}]")
-        reveal = {m: int(self.entries[m][1]["reveal_ts"]) for m in members}
+        reveal = ({bars_house: int(self.house_ch["reveal_ts"])} if is_house
+                  else {m: int(self.entries[m][1]["reveal_ts"]) for m in members})
         if members != sorted(members, key=lambda m: (reveal[m], m)):
             d.add(f"{at}.members")
         # C4: the stage and king every member is judged at.
-        expect = [self._expected_stage(m) for m in members]
+        expect = [self._expected_stage(k) for k in keys]
         stage, kd, king_ts = expect[0]
         if any(e != expect[0] for e in expect[1:]):
             d.add(f"{at}.members")
@@ -787,8 +894,8 @@ class _Settlement:
             w = self.windows.get(wid)
             if w is None or not (w["min_target_ts"] > bound and w["min_first_seen_ts"] > bound):
                 ok = False
-        for m in members:
-            if self.chain.used.get(m, set()) & set(wids):
+        for key in keys:
+            if self.chain.used.get(key, set()) & set(wids):
                 ok = False
         if not ok:
             d.add(f"{at}.window_ids")
@@ -804,8 +911,9 @@ class _Settlement:
         if not isinstance(refused, dict) or not all(_is_int(n) and n >= 0
                                                     for n in refused.values()):
             d.add(f"{at}.refused")
-        # The house is a second bar exactly when a miner holds the cohort's KING_D.
-        bars = [kd] if kd == bars_house else [kd, bars_house]
+        # The house is a second bar exactly when a miner holds the cohort's
+        # KING_D and the house is not the challenger (never its own bar).
+        bars = [kd] if kd == bars_house or is_house else [kd, bars_house]
         if len(bars) == 1:
             if "house_digest" in c:
                 d.add(f"{at}.house_digest")
@@ -826,17 +934,18 @@ class _Settlement:
                 mase.append(float(row["mase"]))
             scores[dg] = (np.asarray(crps, dtype=np.float64), np.asarray(mase, dtype=np.float64))
         judged = {bar: _judge(cfg, scores, bar, members, clusters, self.seed) for bar in bars}
-        for n, m in enumerate(members):
+        for n, (m, key) in enumerate(zip(members, keys, strict=True)):
             j = by_digest[m]
             covered.add(m)
             lcb, gain, cleared = judged[kd][n]
             if len(bars) > 1:
                 cleared = cleared and judged[bars_house][n][2]
             v = verdicts_of(self.r)[j]
-            lf_fail = self._verdict(j, v, m, stage, kd, i, (lcb, gain),
+            lf_fail = self._verdict(j, v, key, stage, kd, i, (lcb, gain),
                                     judged[bars_house][n] if len(bars) > 1 else None, cleared)
             stated = float(v["lcb"]) if _is_num(v.get("lcb")) else lcb
-            self.verdicts.append(_Verdict(index=j, digest=m, stage=stage, cleared=cleared,
+            self.verdicts.append(_Verdict(index=j, digest=m, key=key, stage=stage,
+                                          cleared=cleared,
                                           lcb=lcb, set_sha256=set_sha, king=kd,
                                           king_ts=king_ts, windows=list(wids),
                                           stated_lcb=stated, lowfreq_fail=lf_fail))
@@ -924,14 +1033,18 @@ class _Settlement:
     # ── the gate, outcomes and the crown ────────────────────────────────────
 
     def _candidates(self) -> list[dict]:
-        out = [{"digest": v.digest, "lcb": v.lcb, "held": False} for v in self.verdicts
+        out = [{"digest": v.digest, "key": v.key, "lcb": v.lcb, "held": False}
+               for v in self.verdicts
                if v.cleared and v.stage == "confirm" and not v.lowfreq_fail]
-        out += [{"digest": dg, "lcb": float(self.chain.holds[dg]["lcb"]), "held": True}
-                for dg in self.held]
+        out += [{"digest": self._dg(k), "key": k, "lcb": float(self.chain.holds[k]["lcb"]),
+                 "held": True} for k in self.held]
         for c in out:
-            c["reveal_ts"] = int(self.entries[c["digest"]][1]["reveal_ts"]) \
-                if c["digest"] in self.entries else 0
-            if c["digest"] not in self.entries:
+            if c["key"] == self.hkey:
+                c["reveal_ts"] = int(self.house_ch["reveal_ts"])
+            elif c["digest"] in self.entries:
+                c["reveal_ts"] = int(self.entries[c["digest"]][1]["reveal_ts"])
+            else:
+                c["reveal_ts"] = 0
                 self.d.add("entries")
         return out
 
@@ -977,7 +1090,7 @@ class _Settlement:
             # of this settlement, or a held candidate whose entry was still
             # confirm_pending.
             c = names.get(dg)
-            if c is None or (c["held"] and self.chain.status.get(dg) != "confirm_pending"):
+            if c is None or (c["held"] and self.chain.status.get(c["key"]) != "confirm_pending"):
                 self.d.add(f"{at}.digest")
                 continue
             self._held_from(at, res, c)
@@ -998,7 +1111,7 @@ class _Settlement:
             if "held_from" in res:
                 self.d.add(f"{at}.held_from")
             return
-        hold = self.chain.holds[cand["digest"]]
+        hold = self.chain.holds[cand["key"]]
         want = {k: hold[k] for k in ("boundary", "report_sha256", "set_sha256", "lcb", "king_d")}
         _compare(self.d, f"{at}.held_from", want, res.get("held_from"))
 
@@ -1015,7 +1128,11 @@ class _Settlement:
         cands = self.cands
         passing = [c for c in cands if self._gate_outcome(c["digest"]) == "pass"]
         passing.sort(key=lambda c: (-c["lcb"], c["reveal_ts"], c["digest"]))
-        self.crown = passing[0]["digest"] if passing else None
+        self.crown_key = passing[0]["key"] if passing else None
+        # W5f: a passing house challenger retakes KING_D; ``crowned`` names
+        # a miner crowning only, so it stays null.
+        self.retake = self.crown_key is not None and self.crown_key == self.hkey
+        self.crown = None if self.retake or not passing else passing[0]["digest"]
         verdicts = verdicts_of(self.r)
         for v in self.verdicts:
             if not v.cleared or (v.stage == "confirm" and v.lowfreq_fail):
@@ -1026,7 +1143,7 @@ class _Settlement:
                 o = self._gate_outcome(v.digest)
                 if o in ("gate_regression", "checkpoint_fault"):
                     v.outcome = "lost"
-                elif o == "pass" and v.digest == self.crown:
+                elif o == "pass" and v.key == self.crown_key:
                     v.outcome = "crowned"
                 else:
                     v.outcome = "confirmed"
@@ -1039,16 +1156,20 @@ class _Settlement:
         kb = self.king_before
         if kb is None:
             raise TypeError("no king")
-        if self.crown is not None:
+        if self.retake:
+            self.king_after = {"digest": self.house["digest"], "hotkey": None, "house": True,
+                               "reveal_ts": self.house["reveal_ts"]}
+        elif self.crown is not None:
             e = self.entries[self.crown][1]
             self.king_after = {"digest": self.crown, "hotkey": e["hotkey"], "house": False,
                                "reveal_ts": e["reveal_ts"]}
         else:
             self.king_after = dict(kb)
         _compare(self.d, "king_after", self.king_after, self.r.get("king_after"))
-        # C3: a crown over a miner king pushes it onto the prior kings.
+        # C3: a crown (or a house retake) over a miner king pushes it onto
+        # the prior kings.
         prior = [dict(k) for k in self.chain.prior_kings]
-        if self.crown is not None and not kb["house"]:
+        if self.crown_key is not None and not kb["house"]:
             prior = [dict(kb), *prior][:self.rpk]
         self.prior_kings = prior
         _compare(self.d, "prior_kings", prior, self.r.get("prior_kings"))
@@ -1091,32 +1212,39 @@ class _Settlement:
         want: dict[str, tuple[str, str]] = {}
         for v in self.verdicts:
             if v.outcome == "crowned":
-                want[v.digest] = ("crowned", "crowned")
+                want[v.key] = ("crowned", "crowned")
             elif v.outcome == "confirm_pending":
-                want[v.digest] = ("confirm_pending", "confirm_pending")
+                want[v.key] = ("confirm_pending", "confirm_pending")
             elif v.outcome == "lost":
                 o = self._gate_outcome(v.digest) if v.cleared else None
                 if v.cleared and v.lowfreq_fail:
-                    want[v.digest] = ("lost", "lowfreq_regression")
+                    want[v.key] = ("lost", "lowfreq_regression")
                 elif o == "checkpoint_fault":
-                    want[v.digest] = ("closed", "checkpoint_fault")
+                    want[v.key] = ("closed", "checkpoint_fault")
                 elif o == "gate_regression":
-                    want[v.digest] = ("lost", "gate_regression")
+                    want[v.key] = ("lost", "gate_regression")
                 else:
-                    want[v.digest] = ("lost", "lost_confirmation" if v.stage == "confirm"
-                                      else "lost_duel")
+                    want[v.key] = ("lost", "lost_confirmation" if v.stage == "confirm"
+                                   else "lost_duel")
             elif self._gate_outcome(v.digest) == "bench_hold":
-                want[v.digest] = ("confirm_pending", "bench_hold")
-        for dg in self.held:
-            o = self._gate_outcome(dg)
-            if dg == self.crown:
-                want[dg] = ("crowned", "crowned")
+                want[v.key] = ("confirm_pending", "bench_hold")
+        for key in self.held:
+            o = self._gate_outcome(self._dg(key))
+            if key == self.crown_key:
+                want[key] = ("crowned", "crowned")
             elif o == "bench_hold":
-                want[dg] = ("confirm_pending", "bench_hold")
+                want[key] = ("confirm_pending", "bench_hold")
             elif o == "gate_regression":
-                want[dg] = ("lost", "gate_regression")
+                want[key] = ("lost", "gate_regression")
             elif o == "checkpoint_fault":
-                want[dg] = ("closed", "checkpoint_fault")
+                want[key] = ("closed", "checkpoint_fault")
+        # W5f: the house challenger is not a listed entry; its status is
+        # carried in the chain (and bound by the state snapshot).
+        if self.hkey is not None:
+            if self.hkey in self.dropped_holds:
+                self.house_status = "pending"
+            if self.hkey in want:
+                self.house_status = want.pop(self.hkey)[0]
         for dg in sorted(want):
             if dg not in self.entries:
                 self.d.add("entries")
@@ -1201,6 +1329,21 @@ class _Settlement:
                 for k in ("status", "reason"):
                     if not _same(rec.get(k), e.get(k)):
                         d.add(f"{at}.{k}" if at != "state.entries" else at)
+        # W5f: the house challenger's record is present exactly while there
+        # is one (its digest and T the house's; its status when this
+        # settlement decided it).
+        he = self.house_after()
+        got_he = state.get("house_entry")
+        if he is None:
+            if "house_entry" in state:
+                d.add("state.house_entry")
+        elif not isinstance(got_he, dict):
+            d.add("state.house_entry")
+        else:
+            keys = ("digest", "reveal_ts", "status") if self.house_status is not None \
+                else ("digest", "reveal_ts")
+            _compare(d, "state.house_entry", {k: he[k] for k in keys},
+                     {k: got_he.get(k) for k in keys})
         _compare(d, "state.last_report",
                  {"boundary": self.b, "rows_sha256": self.r.get("rows_sha256"),
                   "report_sha256": self.body_sha,
@@ -1219,36 +1362,54 @@ class _Settlement:
             c.holds.pop(dg, None)
             c.pending.pop(dg, None)
         for v in self.verdicts:
-            c.used.setdefault(v.digest, set()).update(v.windows)
+            c.used.setdefault(v.key, set()).update(v.windows)
             if v.outcome == "confirm_pending":
-                c.pending[v.digest] = {"set_sha256": v.set_sha256, "king_digest": v.king,
-                                       "king_reveal_ts": v.king_ts}
+                c.pending[v.key] = {"set_sha256": v.set_sha256, "king_digest": v.king,
+                                    "king_reveal_ts": v.king_ts}
             elif v.stage == "first":
-                c.pending.pop(v.digest, None)
+                c.pending.pop(v.key, None)
         # A hold keeps its first record: the settlement (and its verified
         # report body) whose confirmation cleared and the gate first held.
-        decided = [(v.digest, {"boundary": self.b, "report_sha256": self.body_sha,
-                               "set_sha256": v.set_sha256, "lcb": v.stated_lcb,
-                               "king_d": self.king_before["digest"]})
+        decided = [(v.key, {"boundary": self.b, "report_sha256": self.body_sha,
+                            "set_sha256": v.set_sha256, "lcb": v.stated_lcb,
+                            "king_d": self.king_before["digest"]})
                    for v in self.verdicts
                    if v.cleared and v.stage == "confirm" and not v.lowfreq_fail]
-        decided += [(dg, c.holds[dg]) for dg in self.held if dg in c.holds]
-        for dg, record in decided:
-            o = self._gate_outcome(dg)
+        decided += [(k, c.holds[k]) for k in self.held if k in c.holds]
+        for key, record in decided:
+            o = self._gate_outcome(self._dg(key))
             if o == "bench_hold":
-                c.holds[dg] = c.holds.get(dg) or dict(record)
+                c.holds[key] = c.holds.get(key) or dict(record)
                 continue
-            c.holds.pop(dg, None)
-            if o != "pass" or dg == self.crown:
-                c.pending.pop(dg, None)
+            c.holds.pop(key, None)
+            if o != "pass" or key == self.crown_key:
+                c.pending.pop(key, None)
         for v in self.verdicts:
             if v.outcome == "lost":
-                c.pending.pop(v.digest, None)
-                c.holds.pop(v.digest, None)
+                c.pending.pop(v.key, None)
+                c.holds.pop(v.key, None)
         c.status = {dg: e.get("status") for dg, (_, e) in sorted(self.entries.items())}
+        c.reasons = {dg: e.get("reason") for dg, (_, e) in sorted(self.entries.items())}
         c.entries = {dg: {k: e.get(k) for k in _ENTRY_STABLE}
                      for dg, (_, e) in sorted(self.entries.items())}
+        # W5f: the house challenger carries on, or ends with a retake.
+        c.house_entry = self.house_after()
+        for d in (c.pending, c.holds, c.used):
+            for k in [k for k in d if k.startswith(_HOUSE_KEY)]:
+                if c.house_entry is None or k != _house_key(c.house_entry["digest"]):
+                    d.pop(k, None)
+        if c.house_entry is not None:
+            c.status[_house_key(c.house_entry["digest"])] = c.house_entry["status"]
         return c
+
+    def house_after(self) -> dict | None:
+        """The house challenger after this settlement (None after a retake)."""
+        if self.house_ch is None or self.retake:
+            return None
+        he = dict(self.house_ch)
+        if self.house_status is not None:
+            he["status"] = self.house_status
+        return he
 
 
 def verdicts_of(report: dict) -> list:
