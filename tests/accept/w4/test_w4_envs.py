@@ -182,6 +182,7 @@ def test_worker_hello_carries_the_environment_when_probed(tmp_path):
 def test_cli_hello_prints_the_probed_environment(monkeypatch, capsys, tmp_path):
     import cascade.eval.lane_d_handshake as hs
     from cascade.eval.lane_d_forecasts import main
+    from cascade.eval.lane_d_handshake import probe_environment  # noqa: F401 (rev6.18 name)
 
     (tmp_path / "cascade").mkdir()
     (tmp_path / "cascade" / "__init__.py").write_text("")
