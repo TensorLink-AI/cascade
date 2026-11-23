@@ -24,7 +24,9 @@ Per settlement, in order (the first two can end the settlement early):
    canonical body is checked (``signature_unverifiable`` when the verifier
    cannot run, a mismatch at ``signer`` / ``signature`` when it fails);
 2. the stated ``params`` equal the config, ``seed`` and ``rows_sha256`` are
-   re-derived, and every cohort is re-judged from the signed rows: the
+   re-derived, the rev6.6 armed context set (``armed_contexts`` +
+   ``armed_evidence``, when stated) is verified from its own evidence (never
+   re-derived from ``cfg.contexts``), and every cohort is re-judged from the signed rows: the
    forward-only bound on both clocks, the floors, one finite row per
    (window, scored model), the max-T LCB, gain and clear against KING_D and,
    when a miner holds KING_D, against the house as a second bar;
@@ -118,6 +120,13 @@ _HOUSE_KEY = "house:"
 
 _PATH_RE = re.compile(r"^[a-z][a-z0-9_]*(\[[0-9]+\]|\.[a-z0-9_]+)*$")
 _KEY_RE = re.compile(r"^[a-z0-9_]+$")
+# rev6.6 (§1.1): the armed-context evidence a report carries, and the source
+# floor of the readiness gate (stated by the plan, not a config key).
+ARMED_MIN_SOURCES = 20
+_ARMED_EVIDENCE_KEYS = frozenset({"min_long_series", "min_sources", "readiness_sha256",
+                                  "t7_sha256", "variants"})
+_ARMED_VARIANT_KEYS = frozenset({"context", "series", "sources", "t7_fits", "armed"})
+_HEX64_RE = re.compile(r"[0-9a-f]{64}")
 _HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 _SIG_RE = re.compile(r"^[0-9a-f]{128}$")
 _BLOCK_HASH_RE = re.compile(r"^0x[0-9a-f]{64}$")
@@ -566,6 +575,7 @@ class _Settlement:
         self._guarded("params", lambda: _compare(self.d, "params", expected_params(self.cfg),
                                                  self.r.get("params")))
         self._guarded("rows_sha256", self.check_rows_sha)
+        self._guarded("armed_evidence", self.check_armed)
         self._guarded("house", self.check_house)
         self._guarded("king_before", self.check_king_before)
         self._guarded("house", self.derive_house_entry)
@@ -608,6 +618,61 @@ class _Settlement:
         rows = self.r.get("rows")
         if not isinstance(rows, list) or _sha(_canonical(rows)) != self.r.get("rows_sha256"):
             self.d.add("rows_sha256")
+
+    def check_armed(self) -> None:
+        """rev6.6: the stated armed set is VERIFIED from the evidence the
+        report carries, never re-derived from ``cfg.contexts`` (a strict
+        subset with supporting evidence matches). Re-implemented from the
+        plan (§1.1): a variant is armed iff ``series >= min_long_series``,
+        ``sources >= 20`` and its T7 row fits. Neither field: nothing to
+        verify (the pre-rev6.6 form)."""
+        r = self.r
+        has_set, has_ev = "armed_contexts" in r, "armed_evidence" in r
+        if not has_set and not has_ev:
+            return
+        if not has_set:
+            self.d.add("armed_contexts")
+        ev = r.get("armed_evidence")
+        if not isinstance(ev, dict) or set(ev) != _ARMED_EVIDENCE_KEYS:
+            self.d.add("armed_evidence")
+            return
+        floor = ev["min_long_series"]
+        if not _is_int(floor) or floor != int(self.cfg.min_long_series):
+            self.d.add("armed_evidence.min_long_series")
+        if not _is_int(ev["min_sources"]) or ev["min_sources"] != ARMED_MIN_SOURCES:
+            self.d.add("armed_evidence.min_sources")
+        for k in ("readiness_sha256", "t7_sha256"):
+            if ev[k] is not None and not (isinstance(ev[k], str) and _HEX64_RE.fullmatch(ev[k])):
+                self.d.add(f"armed_evidence.{k}")
+        want = sorted(int(c) for c in self.cfg.contexts)
+        variants = ev["variants"]
+        if not isinstance(variants, list) or len(variants) != len(want):
+            self.d.add("armed_evidence.variants")
+            return
+        armed = []
+        for i, (c, v) in enumerate(zip(want, variants, strict=True)):
+            at = f"armed_evidence.variants[{i}]"
+            if not isinstance(v, dict) or set(v) != _ARMED_VARIANT_KEYS:
+                self.d.add(at)
+                continue
+            if not _is_int(v["context"]) or v["context"] != c:
+                self.d.add(f"{at}.context")
+            ok_counts = all(_is_int(v[k]) and v[k] >= 0 for k in ("series", "sources"))
+            if not ok_counts or not isinstance(v["t7_fits"], bool) \
+                    or not isinstance(v["armed"], bool):
+                self.d.add(at)
+                continue
+            gates = (v["series"] >= int(self.cfg.min_long_series)
+                     and v["sources"] >= ARMED_MIN_SOURCES and v["t7_fits"])
+            if v["armed"] is not gates:
+                self.d.add(f"{at}.armed")
+            if gates:
+                armed.append(c)
+        if has_set:
+            stated = r["armed_contexts"]
+            if not armed or not isinstance(stated, list) or stated != armed \
+                    or not all(_is_int(c) for c in stated):
+                self.d.add("armed_contexts")
 
     def check_house(self) -> None:
         h = self.r.get("house")
