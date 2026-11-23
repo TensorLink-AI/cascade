@@ -12,6 +12,7 @@ Stdlib only: importing it never imports torch.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
@@ -26,7 +27,7 @@ _IMAGE = re.compile(r"sha256:[0-9a-f]{64}")
 
 class StepRateTableError(ValueError):
     """A table the trainer must not use. ``code``: ``bad_table`` (malformed),
-    ``not_passed`` (evidence whose checks did not all pass) or
+    ``not_passed`` (evidence with a failing check other than coverage, rev6.16) or
     ``wrong_image`` (measured on another train image than the pinned one)."""
 
     def __init__(self, code: str, message: str) -> None:
@@ -85,6 +86,32 @@ def _row(sku: str, row) -> StepRate:
                     memory_total_bytes=ints["memory_total_bytes"])
 
 
+def _body_sha256(doc: dict) -> str:
+    """WB19's seal: sha256 of the canonical JSON without ``body_sha256``."""
+    body = {k: v for k, v in doc.items() if k != "body_sha256"}
+    return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":"),
+                                     allow_nan=False).encode()).hexdigest()
+
+
+def _partial_ok(doc: dict) -> bool:
+    """Partial WB19 evidence (owner 2026-11-23, plan rev6.16): usable when it is
+    sealed and ``coverage`` is its only failing check. Its rows are the measured
+    types; every other type stays unmeasured."""
+    if not isinstance(doc.get("body_sha256"), str):
+        return False
+    checks = doc.get("checks")
+    if not isinstance(checks, list) or not checks:
+        return False
+    failing = []
+    for c in checks:
+        if not (isinstance(c, dict) and isinstance(c.get("name"), str)
+                and isinstance(c.get("passed"), bool)):
+            return False
+        if not c["passed"]:
+            failing.append(c["name"])
+    return bool(failing) and all(n == "coverage" for n in failing)
+
+
 def load_step_rate_table(path: Path | str, *,
                          image_digest: str | None = None) -> dict[str, StepRate]:
     """The table at ``path`` (a bare ``laned_wb19_table/1`` or a
@@ -100,9 +127,14 @@ def load_step_rate_table(path: Path | str, *,
     if not isinstance(doc, dict):
         raise StepRateTableError("bad_table", f"{path}: not a JSON object")
     if doc.get("schema") == EVIDENCE_SCHEMA:
-        if doc.get("passed") is not True:
+        sha = doc.get("body_sha256")
+        if sha is not None and sha != _body_sha256(doc):
+            raise StepRateTableError("bad_table", f"{path}: the evidence body_sha256 does not "
+                                                  "match its body (hand-edited)")
+        if doc.get("passed") is not True and not _partial_ok(doc):
             raise StepRateTableError("not_passed", f"{path}: the WB19 evidence did not pass "
-                                                   "every check")
+                                                   "every check (only a failing coverage "
+                                                   "check is allowed, rev6.16)")
         doc = doc.get("table")
         if not isinstance(doc, dict):
             raise StepRateTableError("bad_table", f"{path}: the evidence carries no table")
