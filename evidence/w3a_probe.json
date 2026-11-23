@@ -1,0 +1,493 @@
+{
+  "schema": "laned_w3a_probe/1",
+  "wp": "W3a",
+  "source": "live",
+  "endpoint_host": "s3.hippius.com",
+  "region": "decentralized",
+  "bucket": "cascade-w3a-probe-20261122",
+  "prefix": "w3a-probe/",
+  "run_id": "f466f7eb48fc10a9",
+  "started_at": "2026-11-23T04:45:27+00:00",
+  "finished_at": "2026-11-23T04:51:47+00:00",
+  "tool": {
+    "module": "cascade.laned.storage_probe",
+    "git_sha": "48ebe0129b8b169f9d53c988dae87e7d17d573e0",
+    "git_dirty": false
+  },
+  "params": {
+    "big_object_bytes": 2684354560,
+    "part_bytes": 268435456,
+    "single_put_bytes": [
+      536870912,
+      2684354560
+    ],
+    "lock_retention_seconds": 86400,
+    "presign_expires_seconds": 3600
+  },
+  "bucket_lock": {
+    "lock_enabled": false,
+    "asserted_by": "owner_flag"
+  },
+  "probes": [
+    {
+      "name": "presigned_upload_part",
+      "result": "pass",
+      "passed": true,
+      "reason": "the capability behaves as lane D needs",
+      "requests": [
+        {
+          "op": "CreateMultipartUpload",
+          "http_status": 200,
+          "request_id": "18EA9E39F939CABF"
+        },
+        {
+          "op": "UploadPart(presigned)",
+          "http_status": 200,
+          "request_id": "18EA9E381DAE3A19"
+        },
+        {
+          "op": "UploadPart(presigned)",
+          "http_status": 200,
+          "request_id": "18EA9E38C82C59F1"
+        },
+        {
+          "op": "CompleteMultipartUpload",
+          "http_status": 200,
+          "request_id": "18EA9E386C5E1861"
+        },
+        {
+          "op": "GetObject",
+          "http_status": 200,
+          "request_id": "18EA9E39898C210A"
+        }
+      ],
+      "objects": [
+        {
+          "key": "w3a-probe/f466f7eb48fc10a9/presigned-mpu.bin",
+          "size": 5243904,
+          "sha256": "a5c88c27b279c426e26801962f505bb4be0c53c931a554eca4964ea40e422ff0"
+        }
+      ],
+      "observations": {
+        "create_status": 200,
+        "url_expires_seconds": 3600,
+        "authorization_header_sent": false,
+        "parts": [
+          {
+            "part_number": 1,
+            "size": 5242880,
+            "http_status": 200,
+            "etag_returned": true
+          },
+          {
+            "part_number": 2,
+            "size": 1024,
+            "http_status": 200,
+            "etag_returned": true
+          }
+        ],
+        "complete_status": 200,
+        "uploaded_sha256": "a5c88c27b279c426e26801962f505bb4be0c53c931a554eca4964ea40e422ff0",
+        "object_size": 5243904,
+        "object_sha256": "a5c88c27b279c426e26801962f505bb4be0c53c931a554eca4964ea40e422ff0"
+      }
+    },
+    {
+      "name": "single_put_limit",
+      "result": "error",
+      "passed": false,
+      "reason": "BrokenPipeError: [Errno 32] Broken pipe",
+      "requests": [
+        {
+          "op": "PutObject(presigned)",
+          "http_status": 200,
+          "request_id": "18EA9E38A71F7A66"
+        },
+        {
+          "op": "HeadObject",
+          "http_status": 200,
+          "request_id": "18EA9E331DBEE48A"
+        }
+      ],
+      "objects": [
+        {
+          "key": "w3a-probe/f466f7eb48fc10a9/single-put-536870912.bin",
+          "size": 536870912,
+          "sha256": "f4ed8b1a49e3175f591ae364a72ee20f7556b2a1383889034c1d142248ae72d8"
+        }
+      ],
+      "observations": {
+        "required_bytes": 2684354560,
+        "authorization_header_sent": false,
+        "attempts": [
+          {
+            "size": 536870912,
+            "http_status": 200,
+            "error_code": null,
+            "object_size": 536870912,
+            "sha256": "f4ed8b1a49e3175f591ae364a72ee20f7556b2a1383889034c1d142248ae72d8"
+          }
+        ],
+        "max_accepted_bytes": 536870912,
+        "min_rejected_bytes": null
+      }
+    },
+    {
+      "name": "object_lock_multipart",
+      "result": "skipped",
+      "passed": false,
+      "reason": "no_object_lock",
+      "requests": [],
+      "objects": [],
+      "observations": {}
+    },
+    {
+      "name": "prefix_bucket_policy",
+      "result": "error",
+      "passed": false,
+      "reason": "RuntimeError: GetBucketPolicy answered 403 (AccessDenied): cannot tell whether a policy exists, so it is not touched",
+      "requests": [
+        {
+          "op": "GetBucketPolicy",
+          "http_status": 403,
+          "request_id": "18EA9E395313A5E9"
+        }
+      ],
+      "objects": [
+        {
+          "key": "w3a-probe/f466f7eb48fc10a9/policy/allowed/object.bin",
+          "size": 0,
+          "sha256": null
+        }
+      ],
+      "observations": {
+        "preexisting_policy": null,
+        "policy": null,
+        "credential": null,
+        "put_policy_status": null,
+        "denied_put_status": null,
+        "allowed_put_status": null,
+        "policy_removed": null
+      }
+    },
+    {
+      "name": "subtoken_scope",
+      "result": "error",
+      "passed": false,
+      "reason": "no conclusive result: see the observations",
+      "requests": [
+        {
+          "op": "HeadBucket(other,main)",
+          "http_status": 403,
+          "request_id": "18EA9E380E4FBA84"
+        }
+      ],
+      "objects": [
+        {
+          "key": "w3a-probe/f466f7eb48fc10a9/subtoken/in-bucket.bin",
+          "size": 1024,
+          "sha256": null
+        }
+      ],
+      "observations": {
+        "subtoken_present": true,
+        "other_bucket": "cascade-manifests",
+        "other_bucket_exists": false,
+        "in_bucket_put_status": null,
+        "in_bucket_get_status": null,
+        "other_bucket_list_status": null
+      }
+    },
+    {
+      "name": "upload_part_copy_2_5gb",
+      "result": "pass",
+      "passed": true,
+      "reason": "the capability behaves as lane D needs",
+      "requests": [
+        {
+          "op": "CreateMultipartUpload(source)",
+          "http_status": 200,
+          "request_id": "18EA9E057F90502B"
+        },
+        {
+          "op": "UploadPart(source)",
+          "http_status": 200,
+          "request_id": "18EA9E053AE878FA"
+        },
+        {
+          "op": "UploadPart(source)",
+          "http_status": 200,
+          "request_id": "18EA9E076C792396"
+        },
+        {
+          "op": "UploadPart(source)",
+          "http_status": 200,
+          "request_id": "18EA9E0AF22C8DD5"
+        },
+        {
+          "op": "UploadPart(source)",
+          "http_status": 200,
+          "request_id": "18EA9E0E537AB8BD"
+        },
+        {
+          "op": "UploadPart(source)",
+          "http_status": 200,
+          "request_id": "18EA9E706569E532"
+        },
+        {
+          "op": "UploadPart(source)",
+          "http_status": 200,
+          "request_id": "18EA9E73C761E080"
+        },
+        {
+          "op": "UploadPart(source)",
+          "http_status": 200,
+          "request_id": "18EA9E743AD2BBF2"
+        },
+        {
+          "op": "UploadPart(source)",
+          "http_status": 200,
+          "request_id": "18EA9E762F240759"
+        },
+        {
+          "op": "UploadPart(source)",
+          "http_status": 200,
+          "request_id": "18EA9E783D42B9A0"
+        },
+        {
+          "op": "UploadPart(source)",
+          "http_status": 200,
+          "request_id": "18EA9E7B93E8D7D3"
+        },
+        {
+          "op": "CompleteMultipartUpload(source)",
+          "http_status": 200,
+          "request_id": "18EA9E7CCBD2E942"
+        },
+        {
+          "op": "CopyObject(single)",
+          "http_status": 200,
+          "request_id": "18EA9E7FC77AC50F"
+        },
+        {
+          "op": "CreateMultipartUpload(dest)",
+          "http_status": 200,
+          "request_id": "18EA9E69310384BB"
+        },
+        {
+          "op": "UploadPartCopy",
+          "http_status": 200,
+          "request_id": "18EA9E6984721BBF"
+        },
+        {
+          "op": "UploadPartCopy",
+          "http_status": 200,
+          "request_id": "18EA9E6841D34BC5"
+        },
+        {
+          "op": "UploadPartCopy",
+          "http_status": 200,
+          "request_id": "18EA9E6B6C261266"
+        },
+        {
+          "op": "UploadPartCopy",
+          "http_status": 200,
+          "request_id": "18EA9E6B89290AB6"
+        },
+        {
+          "op": "UploadPartCopy",
+          "http_status": 200,
+          "request_id": "18EA9E6D31A5EE77"
+        },
+        {
+          "op": "UploadPartCopy",
+          "http_status": 200,
+          "request_id": "18EA9E6D81321BE4"
+        },
+        {
+          "op": "UploadPartCopy",
+          "http_status": 200,
+          "request_id": "18EA9E6C40294C5F"
+        },
+        {
+          "op": "UploadPartCopy",
+          "http_status": 200,
+          "request_id": "18EA9E6FA5D44EB3"
+        },
+        {
+          "op": "UploadPartCopy",
+          "http_status": 200,
+          "request_id": "18EA9E6EDBB1EC8D"
+        },
+        {
+          "op": "UploadPartCopy",
+          "http_status": 200,
+          "request_id": "18EA9E510B77BEA8"
+        },
+        {
+          "op": "CompleteMultipartUpload(dest)",
+          "http_status": 200,
+          "request_id": "18EA9E5012D67AF6"
+        },
+        {
+          "op": "GetObject(dest)",
+          "http_status": 200,
+          "request_id": "18EA9E50023133E8"
+        }
+      ],
+      "objects": [
+        {
+          "key": "w3a-probe/f466f7eb48fc10a9/copy-src.bin",
+          "size": 2684354560,
+          "sha256": "61e0a6ed91fcc57857987db9a9b71c7575efc1865517a9334783fc5d3b6950d7"
+        },
+        {
+          "key": "w3a-probe/f466f7eb48fc10a9/copy-single.bin",
+          "size": 2684354560,
+          "sha256": "61e0a6ed91fcc57857987db9a9b71c7575efc1865517a9334783fc5d3b6950d7"
+        },
+        {
+          "key": "w3a-probe/f466f7eb48fc10a9/copy-dst.bin",
+          "size": 2684354560,
+          "sha256": "61e0a6ed91fcc57857987db9a9b71c7575efc1865517a9334783fc5d3b6950d7"
+        }
+      ],
+      "observations": {
+        "source_status": 200,
+        "source_size": 2684354560,
+        "source_sha256": "61e0a6ed91fcc57857987db9a9b71c7575efc1865517a9334783fc5d3b6950d7",
+        "copy_object_status": 200,
+        "copy_object_error_code": null,
+        "parts": [
+          {
+            "part_number": 1,
+            "range_start": 0,
+            "range_end": 268435455,
+            "http_status": 200
+          },
+          {
+            "part_number": 2,
+            "range_start": 268435456,
+            "range_end": 536870911,
+            "http_status": 200
+          },
+          {
+            "part_number": 3,
+            "range_start": 536870912,
+            "range_end": 805306367,
+            "http_status": 200
+          },
+          {
+            "part_number": 4,
+            "range_start": 805306368,
+            "range_end": 1073741823,
+            "http_status": 200
+          },
+          {
+            "part_number": 5,
+            "range_start": 1073741824,
+            "range_end": 1342177279,
+            "http_status": 200
+          },
+          {
+            "part_number": 6,
+            "range_start": 1342177280,
+            "range_end": 1610612735,
+            "http_status": 200
+          },
+          {
+            "part_number": 7,
+            "range_start": 1610612736,
+            "range_end": 1879048191,
+            "http_status": 200
+          },
+          {
+            "part_number": 8,
+            "range_start": 1879048192,
+            "range_end": 2147483647,
+            "http_status": 200
+          },
+          {
+            "part_number": 9,
+            "range_start": 2147483648,
+            "range_end": 2415919103,
+            "http_status": 200
+          },
+          {
+            "part_number": 10,
+            "range_start": 2415919104,
+            "range_end": 2684354559,
+            "http_status": 200
+          }
+        ],
+        "complete_status": 200,
+        "dest_size": 2684354560,
+        "dest_sha256": "61e0a6ed91fcc57857987db9a9b71c7575efc1865517a9334783fc5d3b6950d7"
+      }
+    },
+    {
+      "name": "compliance_retention_unshortenable",
+      "result": "skipped",
+      "passed": false,
+      "reason": "no_object_lock",
+      "requests": [],
+      "objects": [],
+      "observations": {}
+    }
+  ],
+  "locked_objects": [],
+  "cleanup": {
+    "deleted_versions": 5,
+    "aborted_uploads": 1,
+    "remaining_unlocked": [],
+    "remaining_locked": []
+  },
+  "recommended_path": "presigned_multipart",
+  "passed": false,
+  "anchor_objects": [
+    {
+      "key": "w3a-probe/f466f7eb48fc10a9/anchor.bin",
+      "version_id": null,
+      "size": 1024,
+      "etag": "\"3c6116c0b116f47856cdc3bdf4f3e9a5\"",
+      "sha256": "b7a10cfc6d68a71e59431a2827b12ef591215353a9c9526a486e3cb30d241efc"
+    }
+  ],
+  "verified_live": {
+    "schema": "laned_w3a_verify/1",
+    "verified": true,
+    "binding": "unlocked_anchor",
+    "body_sha256": "e92d83284c4ad5c28c88fa1eb523ef55a42099a819a1e1d64b011fb3b3f6e090",
+    "verified_at": "2026-11-23T04:52:15+00:00",
+    "tool": {
+      "module": "cascade.laned.storage_probe",
+      "git_sha": "48ebe0129b8b169f9d53c988dae87e7d17d573e0",
+      "git_dirty": true
+    },
+    "endpoint_host": "s3.hippius.com",
+    "bucket": "cascade-w3a-probe-20261122",
+    "run_id": "f466f7eb48fc10a9",
+    "objects": [
+      {
+        "key": "w3a-probe/f466f7eb48fc10a9/anchor.bin",
+        "version_id": null,
+        "mode": null,
+        "retain_until": null,
+        "size": 1024,
+        "etag": "\"3c6116c0b116f47856cdc3bdf4f3e9a5\"",
+        "sha256": "b7a10cfc6d68a71e59431a2827b12ef591215353a9c9526a486e3cb30d241efc",
+        "request_ids": [
+          "18EA9E4431D1C35E",
+          "18EA9E47D0724CFD"
+        ]
+      }
+    ],
+    "listing": {
+      "prefix": "w3a-probe/f466f7eb48fc10a9/",
+      "keys": [
+        "w3a-probe/f466f7eb48fc10a9/anchor.bin"
+      ],
+      "request_id": "18EA9E477F4CEE8E"
+    }
+  }
+}
