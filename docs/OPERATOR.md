@@ -3513,8 +3513,15 @@ known_hosts and a dry run. It gets presigned GETs only, never a credential.
 **S8: long context.** `valeval-laned` (80–96 GB, a pinned-venv GPU such as an
 H100 or A100 80 GB, never Blackwell, at least 300 GB disk for the prefetch
 cache and `pool_d_hist`) is rented only at S8, for the 32k–128k contexts.
-Arm a context only when its T7 row (`cascade/eval/lane_d_t7.py`) fits in at
-most half a settlement and in the host's GPU memory.
+No overlay arms a context: every variant is in `contexts` from launch and
+the validator arms it at each settlement once its readiness count
+(`laned_readiness/1`) and its T7 row (`cascade/eval/lane_d_t7.py`,
+`laned_t7/1`: at most half a settlement, inside the host's GPU memory) both
+pass. The `--lane-d-inputs` TOML names the two documents (`readiness = "..."`,
+`t7 = "..."`, both required); they are re-read at every settlement, so
+publishing a new T7 or readiness file takes effect at the next settlement
+without a restart. A missing or invalid document, or no armed variant, means
+no lane D settlement that tick (`inputs_unavailable`), never a guessed set.
 
 **The first-seen recorder (W6fs).** Forward-only judging needs a first-seen
 time for every target point. W6fs adds an append-only ingest log in the forge
