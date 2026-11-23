@@ -54,16 +54,23 @@ archive over :data:`MAX_INFLATED_ARCHIVE_BYTES` or
 corrupt or an unsupported method), a file over :data:`MAX_FILE_BYTES`, a
 ``.py`` source over :data:`MAX_PARSE_BYTES`). Any of these gives the result
 ``budget_exceeded``: the intake refuses it (413), it never passes as clean.
+The returned :class:`ScanReceipt` records why the scan stopped
+(``stopped_by``, internal, not in the receipt): only a deadline overrun
+depends on load, so the intake never caches it (RV7 note 9).
 
 :func:`load_pinned_hashset` maps the ``[lane_b] contamination_hashset`` pin
-to the ``benchmarks/contamination/hashset-v<n>.json`` artefact it names, and
-fails closed when no artefact matches.
+to the ``benchmarks/contamination/hashset-v<n>.json`` file it names, found by
+a streaming sha256 of the raw bytes, loads only that file with WB11's bounded
+``load_lookup`` (RV7 B3) and returns it as a :class:`PinnedHashset` carrying
+the pin; it fails closed when no artefact matches.
 """
 
 from __future__ import annotations
 
 import ast
 import collections
+import gzip
+import hashlib
 import io
 import json
 import math
@@ -127,7 +134,37 @@ def _wb11():
 
 
 class _OverBudget(Exception):
-    """The scan ran past its window budget, its deadline or a memory cap."""
+    """The scan ran past its window budget, its deadline or a memory cap.
+    ``stop`` is the :class:`ScanReceipt` ``stopped_by`` value it gives."""
+
+    def __init__(self, message: str, stop: str = "") -> None:
+        super().__init__(message)
+        self.stop = stop or STOP_CAP
+
+
+# Why a scan stopped (RV7 note 9), on :attr:`ScanReceipt.stopped_by`. Only a
+# deadline overrun depends on load rather than on the tree's content.
+STOP_CAP = "cap"
+STOP_DEADLINE = "deadline"
+STOP_WINDOWS = "windows"
+
+
+class ScanReceipt(dict):
+    """The receipt field :func:`scan_repo` returns: a plain ``dict`` of
+    exactly ``{hashset_version, result, suite, window_id}`` (equal to, and
+    serialised as, that dict), plus the internal :attr:`stopped_by`, which is
+    never part of the receipt: for ``budget_exceeded`` it is
+    :data:`STOP_DEADLINE` (the scan deadline, a property of load),
+    :data:`STOP_WINDOWS` (the window budget) or :data:`STOP_CAP` (a memory
+    cap), both properties of the tree; ``None`` for ``clean`` / ``embedded``.
+    The intake caches a receipt only when its result is content-determined
+    (:attr:`load_dependent` is false)."""
+
+    stopped_by: str | None = None
+
+    @property
+    def load_dependent(self) -> bool:
+        return self.stopped_by == STOP_DEADLINE
 
 
 class _Budget:
@@ -141,11 +178,11 @@ class _Budget:
     def charge(self, n: int) -> None:
         self.used += n
         if self.used > self.max_windows:
-            raise _OverBudget(f"more than {self.max_windows} sub-windows")
+            raise _OverBudget(f"more than {self.max_windows} sub-windows", STOP_WINDOWS)
 
     def tick(self) -> None:
         if time.monotonic() > self.end:
-            raise _OverBudget("past the scan deadline")
+            raise _OverBudget("past the scan deadline", STOP_DEADLINE)
 
 
 # ── hit rule ─────────────────────────────────────────────────────────────────
@@ -471,15 +508,18 @@ def _files(root: Path) -> list[tuple[str, Path]]:
 # ── public API ───────────────────────────────────────────────────────────────
 
 
-def _receipt(version: int, result: str, first: Mapping | None = None) -> dict:
-    return {"hashset_version": version, "result": result,
-            "suite": first["suite"] if first is not None else None,
-            "window_id": first["window_id"] if first is not None else None}
+def _receipt(version: int, result: str, first: Mapping | None = None, *,
+             stopped_by: str | None = None) -> ScanReceipt:
+    r = ScanReceipt(hashset_version=version, result=result,
+                    suite=first["suite"] if first is not None else None,
+                    window_id=first["window_id"] if first is not None else None)
+    r.stopped_by = stopped_by
+    return r
 
 
 def scan_repo(repo_dir: str | os.PathLike, artefact: Mapping, *,
               min_hits: object = None, max_windows: int | None = None,
-              deadline_s: float | None = None) -> dict:
+              deadline_s: float | None = None) -> ScanReceipt:
     """The receipt field ``{hashset_version, result, suite, window_id}`` of
     the tree at ``repo_dir`` against the WB11 hash-set ``artefact``.
 
@@ -491,7 +531,10 @@ def scan_repo(repo_dir: str | os.PathLike, artefact: Mapping, *,
     ``max_windows`` sub-windows, runs past ``deadline_s`` seconds or meets a
     memory cap before it finds one (``None``: :data:`MAX_SCAN_WINDOWS` /
     :data:`SCAN_DEADLINE_S`, read now); else ``"clean"`` with both ``None``.
-    The tree is read, never executed, and ``artefact`` is not mutated.
+    The tree is read, never executed, and ``artefact`` (the dict, or the
+    bounded lookup :func:`load_pinned_hashset` returns) is not mutated. The
+    return is a :class:`ScanReceipt`: the receipt dict, whose internal
+    ``stopped_by`` says why a ``budget_exceeded`` scan stopped.
     Raises ``NotADirectoryError`` when ``repo_dir`` is not a directory."""
     root = Path(repo_dir)
     if not root.is_dir():
@@ -511,20 +554,80 @@ def scan_repo(repo_dir: str | os.PathLike, artefact: Mapping, *,
                 first = matcher.match(values, precharged=precharged)
                 if first is not None:
                     return _receipt(version, RESULT_EMBEDDED, first)
-    except _OverBudget:
-        return _receipt(version, RESULT_BUDGET_EXCEEDED)
+    except _OverBudget as e:
+        return _receipt(version, RESULT_BUDGET_EXCEEDED, stopped_by=e.stop)
     return _receipt(version, RESULT_CLEAN)
 
 
-def load_pinned_hashset(pin: str, root: str | os.PathLike) -> dict | None:
-    """The hash-set artefact ``[lane_b] contamination_hashset = pin`` names.
+class PinnedHashset(Mapping):
+    """The bounded WB11 lookup (:func:`~cascade.eval.contamination.load_lookup`)
+    of a pinned hash-set file, carrying the ``pin`` it was verified against.
+
+    A read-only ``Mapping`` that answers exactly like the lookup it wraps
+    (header keys, the ``exact`` / ``normalised`` hash tables), so
+    ``match_series`` and :func:`scan_repo` take it like the dict artefact.
+    The intake reads :attr:`pin` instead of serialising the hash set."""
+
+    __slots__ = ("_lookup", "_pin")
+
+    def __init__(self, lookup: Mapping, pin: str) -> None:
+        self._lookup = lookup
+        self._pin = str(pin)
+
+    @property
+    def pin(self) -> str:
+        """``sha256:<hex>`` of the file's canonical JSON (WB11
+        ``artefact_sha256``), checked by ``load_lookup`` as it was read."""
+        return self._pin
+
+    def __getitem__(self, key: str) -> object:
+        return self._lookup[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._lookup)
+
+    def __len__(self) -> int:
+        return len(self._lookup)
+
+
+_HASH_CHUNK = 1 << 16
+
+
+def _raw_sha256(path: Path) -> str | None:
+    """``sha256:<hex>`` of the file's raw bytes (decompressed for ``.gz``),
+    streamed in fixed chunks: O(1) memory, nothing parsed. ``None`` when it
+    cannot be read (or is not gzip although named ``.gz``)."""
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as raw:
+            f = gzip.GzipFile(fileobj=raw, mode="rb") if path.name.endswith(".gz") else raw
+            with f:
+                while True:
+                    chunk = f.read(_HASH_CHUNK)
+                    if not chunk:
+                        break
+                    h.update(chunk)
+    except (OSError, EOFError, zlib.error):
+        return None
+    return "sha256:" + h.hexdigest()
+
+
+def load_pinned_hashset(pin: str, root: str | os.PathLike) -> PinnedHashset | None:
+    """The bounded hash set ``[lane_b] contamination_hashset = pin`` names.
 
     ``""`` (unpinned) is ``None``. Otherwise the
     ``benchmarks/contamination/hashset-v<n>.json[.gz]`` under ``root`` whose
-    WB11 ``artefact_sha256`` equals ``pin`` (and whose ``version`` is its
-    ``n``). Raises ``ValueError`` when no artefact matches: a file edited
-    after pinning or a ``root`` without artefacts never falls back to
-    another version."""
+    canonical JSON hashes to ``pin`` (WB11 ``artefact_sha256``, which is the
+    sha256 of the bytes ``write_artefact`` writes) and whose ``version`` is
+    its ``n``, loaded with WB11 ``load_lookup(path, expect_sha256=pin)``
+    (RV7 B3: about 64 B of heap per window, never the whole dict) and
+    returned as a :class:`PinnedHashset` carrying the pin.
+
+    The pinned file is found by a streaming sha256 of each candidate's raw
+    (decompressed) bytes, so a non-matching file is never parsed and only
+    the matching one is loaded. Raises ``ValueError`` when no artefact
+    matches: a file edited after pinning or a ``root`` without artefacts
+    never falls back to another version."""
     pin = str(pin or "")
     if not pin:
         return None
@@ -537,15 +640,17 @@ def load_pinned_hashset(pin: str, root: str | os.PathLike) -> dict | None:
             if m and p.is_file() and not p.is_symlink():
                 candidates.append((int(m.group(1)), p.name, p))
     for n, _name, p in sorted(candidates):
-        try:
-            art = wb11.load_artefact(p)
-        except (OSError, ValueError):
+        if _raw_sha256(p) != pin:
             continue
-        if art.get("version") == n and wb11.artefact_sha256(art) == pin:
-            return art
+        lookup = wb11.load_lookup(p, expect_sha256=pin)
+        if lookup["version"] != n:
+            raise ValueError(f"{p}: hash set version {lookup['version']} does not match its "
+                             f"file name (v{n})")
+        return PinnedHashset(lookup, pin)
     raise ValueError(f"[lane_b] contamination_hashset {pin} matches no artefact under "
                      f"{d} (looked at {len(candidates)} hashset-v<n>.json file(s))")
 
 
 __all__ = ["HASHSET_DIR", "MAX_SCAN_WINDOWS", "RESULT_BUDGET_EXCEEDED", "RESULT_CLEAN",
-           "RESULT_EMBEDDED", "SCAN_DEADLINE_S", "load_pinned_hashset", "scan_repo"]
+           "RESULT_EMBEDDED", "SCAN_DEADLINE_S", "STOP_CAP", "STOP_DEADLINE", "STOP_WINDOWS",
+           "PinnedHashset", "ScanReceipt", "load_pinned_hashset", "scan_repo"]
