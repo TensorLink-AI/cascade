@@ -188,6 +188,24 @@ jobs:
           fi
           echo "LANED=$tools/scripts/laned" >> "$GITHUB_ENV"
 
+      - name: Merged PRs' laned labels (LABELLED L2 rule)
+        # rev6.17: a squash merge `(#N)` is a WP's L2 commit only when PR N
+        # carried laned:<WP> and changed a non-test path in its PATHS
+        # (accept --help, FEATURE rule). Fails closed: without the labels the
+        # git-only rule would over-count (the #817 / W5i case).
+        if: steps.select.outputs.wps != '' || github.event_name == 'merge_group'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          f="$RUNNER_TEMP/laned-pr-labels.json"
+          for i in 1 2 3; do
+            gh pr list -R "$GITHUB_REPOSITORY" --state merged --limit 5000 --json number,labels > "$f" && break
+            [ "$i" = 3 ] && { echo "::error::cannot list merged PRs' labels"; exit 1; }
+            sleep 10
+          done
+          echo "merged PRs with labels listed: $(python3 -c 'import json, sys; print(len(json.load(open(sys.argv[1]))))' "$f")"
+          echo "LANED_PR_LABELS=$f" >> "$GITHUB_ENV"
+
       - name: Accept (check-pr, then expect-fail or accept)
         if: steps.select.outputs.wps != ''
         env:
@@ -420,6 +438,7 @@ jobs:
     permissions:
       contents: write   # push the board to laned/build-state (never main)
       actions: read     # read laned-results artifacts for the ledger
+      pull-requests: read   # merged PRs' laned:<WP> labels (LABELLED L2 rule)
     concurrency:
       group: laned-build-state
       cancel-in-progress: false
@@ -452,6 +471,17 @@ jobs:
 
       - name: Sync (frozen, all extras)
         run: uv sync --frozen --all-extras
+
+      - name: Merged PRs' laned labels (LABELLED L2 rule)
+        # see the pr job's step of the same name; fails closed
+        run: |
+          f="$RUNNER_TEMP/laned-pr-labels.json"
+          for i in 1 2 3; do
+            gh pr list -R "$GITHUB_REPOSITORY" --state merged --limit 5000 --json number,labels > "$f" && break
+            [ "$i" = 3 ] && { echo "::error::cannot list merged PRs' labels"; exit 1; }
+            sleep 10
+          done
+          echo "LANED_PR_LABELS=$f" >> "$GITHUB_ENV"
 
       - name: Harvest the CI results ledger
         run: |

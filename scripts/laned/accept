@@ -171,16 +171,22 @@ When it holds check-pr prints `BATCH <WPs>` (more than one label),
 (more than one label) and `MODE combined` (the WP's tests dir is in the diff)
 or `MODE implementation` for the WP it was asked about. The PR job runs each
 WP's own mode (--combined or the full Accept), one ledger row per WP (with
-the PR number) and CROSS with the whole set as the PR's own WPs. L2 (status
-board and built_on): the squash merge `... (#N)` of a PR whose last
-pull_request ledger row for the WP (mode accept or combined) is green, when
-it changes a path the WP's PATHS match or its tests dir
-(lanedlib.pr_merge_index; accept reads the ledger from laned/build-state, or
-$LANED_LEDGER). A combined merge is also the WP's L1 (a green combined row).
-The git-only L2 rules stay for older merges: a single-WP implementation
-commit, a rev6.3 batch commit (lanedlib.is_batch_impl_commit) and a declared
-coupled-set commit (lanedlib.is_coupled_impl_commit; coupled_batches is still
-read for that, nothing new is declared there).
+the PR number) and CROSS with the whole set as the PR's own WPs.
+LABELLED L2 rule (status board, built_on, CROSS; lanedlib.impl_commit_index):
+a squash merge `... (#N)` whose PR labels are known is a WP's L2 commit iff
+PR N carried laned:<WP> AND the merge changes at least one non-test path
+(outside tests/) the WP's PATHS match. A known PR without the label is never
+the WP's L2, however its files sit in the WP's PATHS (#817 made W5i read L2
+through broad PATHS). Labels come from $LANED_PR_LABELS (the workflow writes
+`gh pr list --state merged --json number,labels`; the step fails closed) and
+the ledger's PR rows (one per laned:<WP> label, field `pr`; laned/build-state
+or $LANED_LEDGER). A green `combined` row also makes the merge that changes
+tests/accept/<wp>/ the WP's L1 (lanedlib.pr_merge_index). Only a commit
+with no PR number or unknown labels falls back to the git-only rules: a
+single-WP implementation commit, a rev6.3 batch commit
+(lanedlib.is_batch_impl_commit) and a declared coupled-set commit
+(lanedlib.is_coupled_impl_commit; coupled_batches is still read for that,
+nothing new is declared there).
 
 CROSS rule (the PR job runs it after the PR's own WP steps, every mode but
 review): a WP other than the PR's own WP(s) is re-accepted when
@@ -950,25 +956,23 @@ def built_on(root: Path, ref: str, wp: str) -> bool:
     others = lanedlib.other_paths(sets, wp)
     coupled = lanedlib.coupled_paths(lanedlib.coupled_batches_at(root, ref), sets, wp)
     paths = lanedlib.parse_paths(proc.stdout)
-    return lanedlib.impl_commit_index(history, wp, paths, others, coupled) is not None \
-        or feature_merge_index(root, ref, history, wp, paths) is not None
+    return lanedlib.impl_commit_index(history, wp, paths, others, coupled,
+                                      lanedlib.first_parent_subjects(root, ref), pr_labels(root)) is not None
 
 
-_LEDGER: dict[tuple[str, str], list[dict]] = {}  # (root, $LANED_LEDGER) -> runs; one read per run
+# (root, $LANED_LEDGER, $LANED_PR_LABELS) -> {PR: WPs}; one read per run
+_LEDGER: dict[tuple[str, str, str], dict[int, set[str]]] = {}
 
 
-def feature_merge_index(root: Path, ref: str, history: list[tuple[str, list[str]]], wp: str,
-                        paths: list[str]) -> int | None:
-    """FEATURE rule L2 (rev6.17): the squash merge ``... (#N)`` of a PR whose
-    last ledger run for the WP (mode accept or combined) is green, changing a
-    path the WP owns (lanedlib.pr_merge_index over lanedlib.ledger_runs)."""
-    key = (str(root), os.environ.get("LANED_LEDGER", ""))
+def pr_labels(root: Path) -> dict[int, set[str]]:
+    """LABELLED L2 rule (lanedlib.impl_commit_index): the laned:<WP> labels
+    of merged PRs, from $LANED_PR_LABELS (the workflow writes it with `gh pr
+    list`) and the ledger's PR rows (laned/build-state, or $LANED_LEDGER)."""
+    key = (str(root), os.environ.get("LANED_LEDGER", ""), os.environ.get("LANED_PR_LABELS", ""))
     if key not in _LEDGER:
-        _LEDGER[key] = lanedlib.ledger_runs(root)
-    prs = lanedlib.green_pr_numbers(_LEDGER[key], wp)
-    if not prs:
-        return None
-    return lanedlib.pr_merge_index(history, lanedlib.first_parent_subjects(root, ref), wp, paths, prs)
+        _LEDGER[key] = lanedlib.merge_pr_labels(lanedlib.pr_labels_file(),
+                                                lanedlib.pr_labels_from_runs(lanedlib.ledger_runs(root)))
+    return _LEDGER[key]
 
 
 def is_test_file(rel: str) -> bool:
@@ -1307,6 +1311,8 @@ def built_wps_at(root: Path, ref: str) -> list[tuple[str, list[str]]]:
     verification = lanedlib.verification_wps_at(root, ref)
     sets = lanedlib.paths_sets_at(root, ref)
     coupled = lanedlib.coupled_batches_at(root, ref)
+    subjects = lanedlib.first_parent_subjects(root, ref)
+    labels = pr_labels(root)
     built: list[tuple[str, list[str]]] = []
     for d in sorted(out):
         proc = lanedlib.git(root, "show", f"{ref}:tests/accept/{d}/PATHS", check=False)
@@ -1315,9 +1321,9 @@ def built_wps_at(root: Path, ref: str) -> list[tuple[str, list[str]]]:
         wp = ids.get(d, d)
         paths = lanedlib.parse_paths(proc.stdout)
         if lanedlib.impl_commit_index(history, wp, paths, lanedlib.other_paths(sets, d),
-                                      lanedlib.coupled_paths(coupled, sets, wp)) is not None or (
-                wp in verification and not lanedlib.missing_paths_at(root, ref, paths)) \
-                or feature_merge_index(root, ref, history, wp, paths) is not None:
+                                      lanedlib.coupled_paths(coupled, sets, wp), subjects,
+                                      labels) is not None or (
+                wp in verification and not lanedlib.missing_paths_at(root, ref, paths)):
             built.append((wp, paths))
     return built
 
@@ -2704,9 +2710,10 @@ def selftest_feature(ident: tuple[str, ...]) -> list[str]:
     merge is each WP's L2 by the ledger (PR number), and a weakened or
     removed assertion refused without laned:tests-correction."""
     failures: list[str] = []
-    saved = {k: os.environ.get(k) for k in ("LANED_PYTEST_CMD", "LANED_LEDGER")}
+    saved = {k: os.environ.get(k) for k in ("LANED_PYTEST_CMD", "LANED_LEDGER", "LANED_PR_LABELS")}
     os.environ["LANED_PYTEST_CMD"] = shlex.join([sys.executable, "-m", "pytest", "-p", "no:cacheprovider"])
     os.environ.pop("LANED_LEDGER", None)
+    os.environ.pop("LANED_PR_LABELS", None)
     six = [f"F{n}" for n in range(1, 7)]
     try:
         with tempfile.TemporaryDirectory(prefix="laned-accept-selftest-feature-") as tmp:
@@ -2741,7 +2748,10 @@ def selftest_feature(ident: tuple[str, ...]) -> list[str]:
             commit({f"tests/accept/{w.lower()}/PATHS": f"pkg/core.py\npkg/{w.lower()}.py\n" for w in six}
                    | {f"tests/accept/{w.lower()}/test_{w.lower()}.py":
                       f"import pkg.{w.lower()}\n\n\ndef test_{w.lower()}():\n    assert pkg.{w.lower()}.VALUE\n"
-                      for w in six}, "tests F1-F6")
+                      for w in six}
+                   | {"tests/accept/g1/PATHS": "pkg/core.py\n",
+                      "tests/accept/g1/test_g1.py": "import pkg.core\n\n\ndef test_g1():\n    assert pkg.core.VALUE\n"},
+                   "tests F1-F6, G1")
             base = commit({"pkg/w1.py": "VALUE = 2\n"}, "impl W1")
             w1_more = ("import pkg.w1\n\n\ndef test_w1_three():\n    assert pkg.w1.VALUE == 3\n")
 
@@ -2885,21 +2895,41 @@ def selftest_feature(ident: tuple[str, ...]) -> list[str]:
             merged = commit({}, "feat(laned): F1-F6 shared core (#77)")
             if any(built_on(root, merged, w) for w in six[2:]):
                 failures.append("feature six: L2 without a ledger row")
-            # ... the ledger's green PR rows (PR #77) make it every labelled WP's L2;
-            # a WP whose last PR row is red does not count
+            # ... the ledger's PR rows (PR #77, one per laned:<WP> label) make it
+            # every labelled WP's L2 (LABELLED rule: label + a non-test PATHS file)
             ledger = Path(tmp) / "ci_runs.json"
             rows = [{"workflow": "laned-accept", "event": "pull_request", "wp": w, "pr": 77,
                      "mode": "combined" if w in ("F1", "F2") else "accept", "head_sha": fhead,
                      "conclusion": "success", "created_at": "2026-11-23T00:00:00Z"} for w in six]
             rows.append({**rows[5], "conclusion": "failure", "created_at": "2026-11-23T01:00:00Z"})
-            rows.append({**rows[0], "wp": "W1", "pr": 78})  # another PR's row: not this merge
             ledger.write_text(json.dumps({"runs": rows}))
             os.environ["LANED_LEDGER"] = str(ledger)
             built = [w for w in six if built_on(root, merged, w)]
-            if built != six[:5]:
-                failures.append(f"feature six: built {built}, want {six[:5]} (F6's last PR row is red)")
+            if built != six:
+                failures.append(f"feature six: built {built}, want {six}")
             if lanedlib.green_pr_numbers(rows, "F6") or lanedlib.green_pr_numbers(rows, "F1") != {77}:
                 failures.append("green_pr_numbers: last row per PR decides")
+            # the #817 / W5i case: G1's broad PATHS (pkg/core.py) cover every
+            # file of #79, a merge labelled laned:F1 only. The git-only rule
+            # took it as G1's L2; with #79's labels known it is not. A merge
+            # labelled laned:G1 that changes only G1's tests (#80) is no L2.
+            core_only = commit({"pkg/core.py": "VALUE = 3\n"}, "fix(laned): F1 core (#79)")
+            g1_tests = commit({"tests/accept/g1/test_g1_more.py": SELFTEST_PASSING}, "tests(laned): G1 (#80)")
+            os.environ.pop("LANED_LEDGER", None)
+            if not built_on(root, core_only, "G1"):
+                failures.append("feature g1: the legacy git-only rule (no labels) no longer sees #79")
+            labels = Path(tmp) / "pr_labels.json"
+            labels.write_text(json.dumps([{"number": 79, "labels": [{"name": "laned:F1"}]},
+                                          {"number": 80, "labels": [{"name": "laned:G1"},
+                                                                    {"name": "laned:tests-correction"}]}]))
+            os.environ["LANED_PR_LABELS"] = str(labels)
+            if built_on(root, g1_tests, "G1"):
+                failures.append("feature g1: an unlabelled (#79) or tests-only labelled (#80) merge gave L2")
+            if lanedlib.parse_pr_labels(labels.read_text()) != {79: {"F1"}, 80: {"G1"}}:
+                failures.append(f"parse_pr_labels: {lanedlib.parse_pr_labels(labels.read_text())}")
+            os.environ.pop("LANED_PR_LABELS", None)
+            lanedlib.git(root, "reset", "-q", "--hard", merged)
+            os.environ["LANED_LEDGER"] = str(ledger)
             # ... and a later tests-only PR for a feature-built WP is a tests-correction
             rc, out, _ = check("after-feature", {"tests/accept/f3/test_f3_more.py":
                                                  "import pkg.f3\n\n\ndef test_more():\n    assert pkg.f3.VALUE\n"},

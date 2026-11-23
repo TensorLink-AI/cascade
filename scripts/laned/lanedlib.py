@@ -371,21 +371,38 @@ def is_coupled_impl_commit(files: list[str], group: list[list[str]]) -> bool:
 
 def impl_commit_index(history: list[tuple[str, list[str]]], wp: str, paths: list[str],
                       others: list[list[str]] | None = None,
-                      coupled: list[list[list[str]]] | None = None) -> int | None:
-    """The L2 commit (plan §17.1): the first commit after the one that added
-    the WP's PATHS file that changes something outside tests/accept/ and only
-    paths inside PATHS, i.e. the WP's implementation merge. With ``others``
-    (every other WP's PATHS) a batch implementation merge counts too
-    (is_batch_impl_commit); with ``coupled`` (per declared coupled set holding
-    the WP, every member's PATHS) a coupled implementation merge counts too
-    (is_coupled_impl_commit). None when absent."""
+                      coupled: list[list[list[str]]] | None = None,
+                      subjects: dict[str, str] | None = None,
+                      pr_labels: dict[int, set[str]] | None = None) -> int | None:
+    """The L2 commit (plan §17.1).
+
+    LABELLED rule (rev6.17): a commit whose subject ends ``(#N)`` with N's
+    labels known (``pr_labels``: from the GitHub PR list and the ledger's PR
+    rows) is the WP's L2 commit iff the PR carried ``laned:<WP>`` AND the
+    commit changes at least one non-test path (outside tests/) its PATHS
+    match. A known PR without the label is never the WP's L2, whatever paths
+    it touches (#817: broad PATHS made W5i read L2 from another WP's merge).
+    It may be the commit that adds the PATHS file (a combined PR).
+
+    Legacy git-only rule (a commit with no PR number or unknown labels): the
+    first commit after the one that added the WP's PATHS file that changes
+    something outside tests/accept/ and only paths inside PATHS. With
+    ``others`` (every other WP's PATHS) a batch implementation merge counts
+    too (is_batch_impl_commit); with ``coupled`` (per declared coupled set
+    holding the WP, every member's PATHS) a coupled implementation merge
+    counts too (is_coupled_impl_commit). None when absent."""
     rel = f"tests/accept/{wp_dir(wp)}/PATHS"
     start = next((i for i, (_, files) in enumerate(history) if rel in files), None)
     if start is None:
         return None
-    for i in range(start + 1, len(history)):
-        files = history[i][1]
-        if not files or all(f.startswith("tests/accept/") for f in files):
+    for i in range(start, len(history)):
+        sha, files = history[i]
+        labels = labels_of_commit(subjects, pr_labels, sha)
+        if labels is not None:
+            if wp in labels and any(not is_test_path(f) and path_matches(f, paths) for f in files):
+                return i
+            continue
+        if i == start or not files or all(f.startswith("tests/accept/") for f in files):
             continue
         if all(path_matches(f, paths) for f in files) or is_batch_impl_commit(files, paths, others) \
                 or any(is_coupled_impl_commit(files, g) for g in coupled or ()):
@@ -406,6 +423,78 @@ CORRECTION_LABEL = "tests-correction"
 PR_MERGE_MODES = ("accept", "combined")
 LEDGER_REFS = ("origin/laned/build-state", "laned/build-state")
 LEDGER_FILE = "status/ci_runs.json"
+
+
+def pr_number(subject: str) -> int | None:
+    m = PR_SUBJECT.search(subject or "")
+    return int(m.group(1)) if m else None
+
+
+def labels_of_commit(subjects: dict[str, str] | None, pr_labels: dict[int, set[str]] | None,
+                     sha: str) -> set[str] | None:
+    """The laned WP labels of the PR whose squash merge is ``sha`` (subject
+    ``... (#N)``), or None when unknown (no PR number, or N not in ``pr_labels``)."""
+    if not subjects or pr_labels is None:
+        return None
+    n = pr_number(subjects.get(sha, ""))
+    return pr_labels.get(n) if n is not None else None
+
+
+def parse_pr_labels(text: str | None) -> dict[int, set[str]]:
+    """``{PR number: {WP, ...}}`` from ``gh pr list --json number,labels``
+    output (a list of ``{"number", "labels": [{"name"}]}``) or a plain
+    ``{"<N>": ["laned:W1", ...]}`` map. Only ``laned:<WP>`` labels count
+    (the laned:tests-correction flag is not a WP); a PR with none maps to an
+    empty set (known: carries no WP label)."""
+    try:
+        data = json.loads(text) if text else None
+    except json.JSONDecodeError:
+        return {}
+    items: list[tuple[object, object]] = []
+    if isinstance(data, list):
+        items = [(d.get("number"), [x.get("name") if isinstance(x, dict) else x
+                                    for x in d.get("labels") or []])
+                 for d in data if isinstance(d, dict)]
+    elif isinstance(data, dict):
+        items = list(data.items())
+    out: dict[int, set[str]] = {}
+    for n, labels in items:
+        try:
+            num = int(n)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            continue
+        out[num] = {str(lab).split(":", 1)[1] for lab in labels or []  # type: ignore[union-attr]
+                    if isinstance(lab, str) and lab.startswith("laned:") and lab != f"laned:{CORRECTION_LABEL}"}
+    return out
+
+
+def pr_labels_from_runs(runs: list[dict]) -> dict[int, set[str]]:
+    """``{PR number: {WP, ...}}`` from ledger rows with a ``pr`` field (the PR
+    job records a row per laned:<WP> label)."""
+    out: dict[int, set[str]] = {}
+    for r in runs:
+        pr = r.get("pr")
+        if isinstance(pr, int) and not isinstance(pr, bool) and isinstance(r.get("wp"), str) \
+                and r.get("event") == "pull_request":
+            out.setdefault(pr, set()).add(r["wp"])
+    return out
+
+
+def merge_pr_labels(*maps: dict[int, set[str]]) -> dict[int, set[str]]:
+    out: dict[int, set[str]] = {}
+    for m in maps:
+        for n, labels in m.items():
+            out.setdefault(n, set()).update(labels)
+    return out
+
+
+def pr_labels_file() -> dict[int, set[str]]:
+    """``$LANED_PR_LABELS`` (``gh pr list --state merged --json number,labels``
+    written by the workflow), or none."""
+    env = os.environ.get("LANED_PR_LABELS")
+    if not env or not Path(env).is_file():
+        return {}
+    return parse_pr_labels(Path(env).read_text(encoding="utf-8"))
 
 
 def first_parent_subjects(root: Path, ref: str) -> dict[str, str]:
