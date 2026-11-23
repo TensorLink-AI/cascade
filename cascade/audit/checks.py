@@ -2927,6 +2927,13 @@ def _lane_d_part(n_uids: int, *, share: float, court: list, king_decay: float,
     return out
 
 
+def _lane_d_max_channels(cfg) -> int | None:
+    """``[generator] max_channels`` (rev6.18 A4, F2): the cap the lane D
+    audit re-derives each multichannel window's channel pick with."""
+    v = getattr(getattr(cfg, "generator", None), "max_channels", None)
+    return None if v is None else int(v)
+
+
 def _lane_d_court(receipt: RoundReceipt, cfg: ChainConfig, lane_d) -> tuple[list | None, str]:
     """``(court uids, "")`` from the lane D record (the signed report and its
     W7c receipt record) for the settlement ``receipt`` closes, or
@@ -2956,7 +2963,8 @@ def _lane_d_court(receipt: RoundReceipt, cfg: ChainConfig, lane_d) -> tuple[list
         return None, (f"lane_d_report_mismatch: the receipt record binds "
                       f"{str(rec.get('report_sha256'))[:12]}, the report body is {body[:12]}")
     res = check_lane_d(report, cfg.lane_d, signer_hotkey=cfg.manifest.validator_hotkey,
-                       prior_reports=None if prior is None else list(prior))
+                       prior_reports=None if prior is None else list(prior),
+                       max_channels=_lane_d_max_channels(cfg))
     if res.status != "PASS":
         return None, f"lane_d_report_unverified: check_lane_d {res.status}: {res.detail}"
     court = (report.get("pay") or {}).get("court")

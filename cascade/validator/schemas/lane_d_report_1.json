@@ -296,8 +296,16 @@
         "kind": {"$ref": "#/$defs/window_kind"},
         "freq_class": {"$ref": "#/$defs/freq_class"},
         "h": {"type": "integer", "minimum": 1, "description": "The drawn horizon: the window id's h<h>."},
-        "origin": {"$ref": "#/$defs/timestamp", "description": "The target start: the window id's middle field."}
-      }
+        "origin": {"$ref": "#/$defs/timestamp", "description": "The target start: the window id's middle field."},
+        "series_id": {"type": "string", "minLength": 1, "description": "rev6.18 A4 (F2): a multichannel window's pool series id, the channel pick's seed input. Present exactly on a multichannel window (absent on a univariate one)."},
+        "n_channels_raw": {"type": "integer", "minimum": 2, "description": "rev6.18 A4 (F2): the stored series' channel count C."},
+        "empty_channels": {"type": "array", "items": {"type": "integer", "minimum": 0}, "description": "rev6.18 A4 (F2): the all-empty channels dropped before the cap, ascending."},
+        "n_channels": {"type": "integer", "minimum": 1, "description": "rev6.18 A4 (F2): the channels scored (at most [generator] max_channels); 1 scores as a univariate window."},
+        "channels": {"type": "array", "minItems": 1, "items": {"type": "integer", "minimum": 0}, "description": "rev6.18 A4 (F2): the scored channel indices, ascending: the non-empty channels, cut to [generator] max_channels by sha256(boundary_block_hash || series_id || 'lane_d_channels') for a wider series."},
+        "channels_sha256": {"$ref": "#/$defs/digest", "description": "rev6.18 A4 (F2): sha256 of the canonical JSON list of the scored channel indices (ascending)."}
+      },
+      "if": {"required": ["n_channels"]},
+      "then": {"required": ["series_id", "n_channels_raw", "empty_channels", "n_channels", "channels", "channels_sha256"]}
     },
     "draw": {
       "type": "object",
