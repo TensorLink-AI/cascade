@@ -238,6 +238,11 @@ def _parse_feeds(raw, where: Path) -> dict:
             raise ValueError(f"{where}: feed {name!r} forecast_product {fp!r} is not a bool")
         out[str(name)] = {"mirror_lag_hours": None if lag is None else float(lag),
                           "forecast_product": fp}
+        # W5a (rev6.10 (a)): the pinned per-feed embargo, carried unchanged
+        # (absent stays absent): a missing or non-numeric value is the
+        # window's refusal in lane_d_forward (unlisted_feed), never a pool error.
+        if "embargo_hours" in f:
+            out[str(name)]["embargo_hours"] = f["embargo_hours"]
     return out
 
 
