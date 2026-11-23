@@ -1,6 +1,6 @@
 # Plan: lane D "open weights" (anything goes on our architecture), with lane E and lane A flexibility — v3
 
-Status: **PLAN v3, ~~rev6.12~~ ~~rev6.14~~ ~~rev6.15~~ ~~rev6.16~~ rev6.18 (proposed 2026-11-22; ~~rev6.12~~ ~~rev6.14~~ ~~rev6.15~~ ~~rev6.16~~ rev6.18 2026-11-23)**: v2's design, made buildable by an
+Status: **PLAN v3, ~~rev6.12~~ ~~rev6.14~~ ~~rev6.15~~ ~~rev6.16~~ ~~rev6.17~~ rev6.18 (proposed 2026-11-22; ~~rev6.12~~ ~~rev6.14~~ ~~rev6.15~~ ~~rev6.16~~ ~~rev6.17~~ rev6.18 2026-11-23)**: v2's design, made buildable by an
 autonomous loop. A work package is done **only when its Accept command exits
 0**; **(rev6)** its level is only what `scripts/laned/status` computes (§17),
 never a claim. Owner decisions are marked **[DECIDE]**. Nothing is armed. **No calendar
@@ -391,6 +391,21 @@ buckets + keys for A6 and the mirror run (data ops); approve the A9 pod ($40
 cap); deploy B8; publish the B10 overlay (testnet, then mainnet); pick the B12
 activation block when the F6 release is cut. (Resolved (owner 2026-11-23, DECIDED: "they're all reasonable"): B12
 option, both B9 owner keys, A3 clamp 0.5, BOOM in the A5 exclusion set.)
+## rev6.17 (owner 2026-11-23; main @ 78b1d45): one PR per feature; tests+code together; PATHS ride along; one plan PR per batch of decisions
+
+One owner decision about the build loop's PR rules ("stop the PR
+bureaucracy"). The design doesn't change. Changed text is marked
+**(rev6.17)**, and superseded text is struck through, not deleted. The
+tooling is W0c (`scripts/laned/accept` FEATURE rule and LABELLED L2 rule,
+`accept --help`), with its acceptance tests in `tests/accept/w0c/`.
+
+| Item | Decision | Landed in |
+|---|---|---|
+| (a) | **Tests + code together (owner 2026-11-23, DECIDED).** A PR may change a WP's `tests/accept/<wp>/` and its code in one diff. CI still proves the contract: the WP's NEW tests, taken from the PR head, run against the base's code and must fail there for a right reason (a new test that already passes on the base proves nothing and is refused, unless the WP is a declared verification WP); then the full Accept must pass on the head. Tests-only and tests-correction PRs stay available but are no longer required. Deleting or weakening an existing assertion (or dropping a `PATHS` entry) needs the `laned:tests-correction` label. The stub scan, invariant 10 and the protected files (`docs/plans/`, `scripts/laned/` outside W0c, status files) stay | §3.1 rules 1, 6; §3 roles; W0c (`accept --combined`) |
+| (b) | **PATHS ride along (owner 2026-11-23, DECIDED).** A PR may add entries to `tests/accept/<wp>/PATHS` and change those files in the same PR: scope is the base's PATHS plus the added entries; a removed entry still counts from the base | §3.1 rule 1; W0c |
+| (c) | **One PR per feature (owner 2026-11-23, DECIDED).** A PR whose labels are all `laned:<WP>` may carry every WP a feature touches: no 3-WP cap, no disjoint-PATHS or no-dependency refusal, no `coupled_batches` declaration. Every WP still runs its own Accept (or combined run) and CROSS, with one ledger row each. A tests-only batch has no cap and may mix built and unbuilt WPs | §3.1 rules 6, 7; W0c |
+| (d) | **L2 needs the label (orchestrator 2026-11-23, follows (c)).** A squash merge `(#N)` is a WP's L2 commit only if PR N carried `laned:<WP>` and changed at least one non-test path in its PATHS (#817 made W5i read L2 through broad PATHS). A merge that changes the WP's tests is also its L1 when its combined run is green | §17.1 L1, L2; W0c (status) |
+| (e) | **One plan PR per batch of decisions (owner 2026-11-23, DECIDED).** Plan text stays out of WP PRs (`docs/plans/` is protected); the decisions of one owner session land in one plan PR | §17.6 |
 
 ## rev6.16 (owner 2026-11-23; main @ 65bcb4b): partial WB19 evidence
 
@@ -3334,8 +3349,12 @@ Accept command exits 0**, never on a builder's word. Conventions:
     batching several WPs, one `laned:<WP>` label per WP, per §3.1 rule 6**)**.
   - **Builder:** starts from origin/main after L1 and opens ONE implementation
     PR labelled `laned:<WP>`, staged with explicit paths. **A builder never
-    edits `tests/accept/`, this plan, `scripts/laned/` or any status file
+    edits ~~`tests/accept/`,~~ this plan, `scripts/laned/` or any status file
     (`status/laned_build.json`, `docs/plans/STATUS.md`).**
+    **(rev6.17)** One agent may write the tests and the code of a feature in
+    one PR (§3.1 rules 1 and 7), labelled with every WP it touches; CI proves
+    the new tests fail on the base and pass on the head. It never deletes or
+    weakens an existing assertion without the `laned:tests-correction` label.
   - **Preparer** (external and owner WPs): writes the scripts and runs their
     dry-runs only; the owner executes and the evidence verifier checks the
     result.
@@ -3488,8 +3507,17 @@ BLOCKING item, and each finding is either fixed or filed as a WP.
 ### 3.1 Build rules
 
 1. **Tests first.** Acceptance tests are written first in `tests/accept/<wp>/`
-   and are **read-only to builders**. CI fails a PR that edits
-   `tests/accept/` together with that WP's implementation.
+   ~~and are **read-only to builders**. CI fails a PR that edits
+   `tests/accept/` together with that WP's implementation.~~
+   **(rev6.17, owner 2026-11-23)** and MAY land in the same PR as the code.
+   "First" is proved by CI, not by PR order: the WP's new tests, taken from
+   the PR head, must fail on the base's code for a right reason, then pass
+   on the head with the full Accept (`accept <WP> --combined`). A new test
+   that already passes on the base proves nothing and is refused, unless the
+   WP is a declared verification WP. A PR may add `PATHS` entries and change
+   those files in the same PR (scope = base PATHS + added entries; removals
+   still count from the base). Deleting or weakening an existing assertion,
+   or dropping a `PATHS` entry, needs the `laned:tests-correction` label.
 2. **Mock only external services**, never the component under change.
 3. **No placeholders.** No `TODO`, stubs, `pass`, `NotImplementedError`,
    hardcoded sample values or mocks outside `tests/`. The stub scan runs in
@@ -3499,18 +3527,23 @@ BLOCKING item, and each finding is either fixed or filed as a WP.
    parser reads.
 5. **Every lane D log line** has a follower pattern, checked by
    `follower_patterns.py`.
-6. **(rev6) Each WP has a tests-only PR (`tests/accept/<wp>/`) followed by
-   ONE implementation PR.** Explicit paths, no stacks, owner-merged;
+6. ~~**(rev6) Each WP has a tests-only PR (`tests/accept/<wp>/`) followed by
+   ONE implementation PR.**~~ **(rev6.17) One PR per feature** (rule 7);
+   tests-only and tests-correction PRs remain available, not required.
+   Explicit paths, no stacks, owner-merged;
    dependents start only after the dependency's code is **on main** (verify `git log
-   origin/main`, never a MERGED badge). This matches rule 1: the tests land
-   first and alone, and the implementation PR never touches them.
-   **(rev6.2, owner 2026-11-22)** Implementation, tests-correction, evidence
-   and review PRs stay **one WP per PR**. A **tests-only PR** (new acceptance
+   origin/main`, never a MERGED badge) **(rev6.17:** or ride in the same
+   feature PR**)**. ~~This matches rule 1: the tests land
+   first and alone, and the implementation PR never touches them.~~
+   **(rev6.2, owner 2026-11-22)** ~~Implementation, tests-correction, evidence
+   and review PRs stay **one WP per PR**.~~ **(rev6.17)** Evidence and review
+   PRs stay one WP per PR. A **tests-only PR** (new acceptance
    tests, no implementation yet) MAY carry several WPs' `tests/accept/<wp>/`
    directories, with one `laned:<WP>` label per WP; each WP's expect-fail (or
    verification) accept run is executed and ledger-recorded separately, and the
-   whole PR fails if any WP's check fails.
-7. **(rev6.3, owner 2026-11-23) Implementation PRs MAY batch up to 3 WPs**
+   whole PR fails if any WP's check fails. **(rev6.17)** No cap, and built
+   and unbuilt WPs may mix (each runs its own mode).
+7. ~~**(rev6.3, owner 2026-11-23) Implementation PRs MAY batch up to 3 WPs**
    when (1) their PATHS sets are disjoint, (2) none depends on another in the
    batch, and (3) each WP's tests are already on main. Each WP in the batch is
    still checked on its own: scope (its PATHS only, files attributed per WP),
@@ -3519,8 +3552,17 @@ BLOCKING item, and each finding is either fixed or filed as a WP.
    overlap stay serial. Tests-corrections found in one pass may likewise be
    batched in one PR (one dir per WP). Labels: one `laned:<WP>` per WP in the
    batch. This narrows rule 6's "one WP per PR" for implementation and
-   tests-correction PRs; evidence and review PRs stay one WP per PR. (Former
+   tests-correction PRs; evidence and review PRs stay one WP per PR.~~ (Former
    rules 7–8 are now 8–9.)
+   **(rev6.17, owner 2026-11-23) One PR per feature.** A PR whose labels are
+   all `laned:<WP>` may carry every WP a feature touches, with tests and code
+   together: no WP cap, no disjoint-PATHS or no-dependency refusal, no
+   `coupled_batches` declaration. Each WP is still checked on its own: its
+   scope (base PATHS + added entries; a file in several WPs' PATHS counts for
+   each), its own Accept or combined run, CROSS, and one ledger row. Every
+   label must own a changed file or test. Every WP whose code the PR changes
+   must carry its label: the squash merge is a WP's L2 commit only if the PR
+   carried `laned:<WP>` and changed a non-test path in its PATHS (§17.1).
 8. **A fresh-context review WP** after every 5 build WPs reach L3 **(rev6)**.
 9. **Blocked is acceptable; faked completion is not.** If a WP can't be fully
    built, the builder stops and records the blocker in `evidence/blocked/<wp>.md`.
@@ -4873,8 +4915,8 @@ Each level needs all the levels below it.
 | Level | Name | Condition |
 |---|---|---|
 | L0 | todo | Listed in §3 |
-| L1 | specified | `tests/accept/<wp>/` and `PATHS` merged on main, and those tests fail on main before L2 (checked by the W0c workflow's expect-fail run) |
-| L2 | built | Implementation PR merged on main (checked with `git log origin/main`), explicit paths only (every changed path is in the WP's `PATHS`) |
+| L1 | specified | `tests/accept/<wp>/` and `PATHS` merged on main, and those tests fail on main before L2 (checked by the W0c workflow's expect-fail run). **(rev6.17)** Or merged with the code in one PR whose `combined` run proved the new tests fail on the base and pass on the head |
+| L2 | built | Implementation PR merged on main (checked with `git log origin/main`), explicit paths only (every changed path is in the WP's `PATHS`). **(rev6.17)** The merged PR carried `laned:<WP>` and changed at least one non-test path in the WP's `PATHS`; a PR without the label never builds the WP, however broad its `PATHS` |
 | L3 | accepted | `scripts/laned/accept <WP>` green in CI on main after the merge. A later red run on main drops the WP back to L2 |
 | L4 | evidenced | External and owner WPs only (Runs in includes `builder`, `pod`, `testnet` or `owner`): evidence JSON present, and the verifier passes against the live resource. n/a for ci-only WPs, which pass L4 automatically |
 | L5 | reviewed | Covered by an RVn whose `evidence/rv<n>.md` has no open BLOCKING item for this WP |
@@ -5000,7 +5042,7 @@ rules inside existing WPs, not §6 D-numbers, so they aren't table rows:
 | (d) | A deferred lane B funded entry's `PayerKeyVault` key has its TTL refreshed on each deferred tick (#629/#633) | WB18 follow-up | owner, 2026-11-22 |
 | (e) | `laned_vault_ledger/1` is produced by W17 | W17 | owner, 2026-11-22 |
 | (f) | An era-init warm-start acceptance is governed by the sentinel of the era its init block opens | W-S2 follow-up | owner, 2026-11-22 |
-| (h) | Tests-only PRs may batch several WPs (one `laned:<WP>` label and one separately recorded accept run per WP; whole PR fails if any WP fails); implementation, tests-correction, evidence and review PRs stay one WP per PR (§3.1 rule 6) | all build WPs | owner, 2026-11-22 |
+| (h) | Tests-only PRs may batch several WPs (one `laned:<WP>` label and one separately recorded accept run per WP; whole PR fails if any WP fails); ~~implementation, tests-correction, evidence and review PRs stay one WP per PR (§3.1 rule 6)~~ **(rev6.17)** one PR per feature, tests + code together, any number of `laned:<WP>` labels; evidence and review PRs stay one WP per PR (§3.1 rules 1, 6, 7) | all build WPs | owner, 2026-11-22; rev6.17 owner, 2026-11-23 |
 
 **Owner inputs** (moved from Appendix A, rev6). These are inputs to runs, not
 design decisions. They're never guessed: the dependent WP stays
@@ -5070,6 +5112,15 @@ S8 is tracked separately.
 - Roles and the builder's no-edit list are in §3 conventions.
 - Appendix A and `LANE_D_PROGRESS.md` are retired in favour of this board
   (Proposed change 21 adopted).
+- **(rev6.17, owner 2026-11-23) The loop.** ~~Tests-only PR, then one
+  implementation PR per WP (or a ≤ 3-WP disjoint batch).~~ One PR per
+  feature: every WP the feature touches, one `laned:<WP>` label each, tests
+  and code together, `PATHS` additions in the same PR. CI runs each WP's
+  `--combined` (or full Accept), CROSS and the freshness guard; merge only
+  when green on a fresh base. Never loosen an existing assertion without
+  `laned:tests-correction` and a reason in the PR body. Plan text never
+  rides in a WP PR: one plan PR (no `laned:` label) per batch of owner
+  decisions.
 
 ---
 
