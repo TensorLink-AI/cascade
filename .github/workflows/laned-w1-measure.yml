@@ -17,7 +17,9 @@
 #   HIPPIUS_S3_ENDPOINT (default https://s3.hippius.com).
 #
 # Output: artifact `laned-w1-<run_id>` (w1.json, w1_summary.txt, the pool
-# index copy, forge_inventory.txt), retained 14 days. Manual dispatch only.
+# index copy, forge_inventory.txt and, after a successful forge sync,
+# readiness.json: the laned_readiness/1 document W8c's arming reads),
+# retained 14 days. Manual dispatch only.
 name: Lane D W1 measure
 
 on:
@@ -214,6 +216,7 @@ jobs:
             --margin-hours "$MARGIN_HOURS" \
             $args \
             --forge-dir ./tsforge --embargo-hours 48 \
+            --readiness-out "$OUT_DIR/readiness.json" \
             --out "$OUT_DIR/w1.json" | tee "$OUT_DIR/w1_summary.txt"
 
       - name: Upload W1 evidence

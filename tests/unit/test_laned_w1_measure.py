@@ -368,6 +368,28 @@ def test_forward_margin_and_eval_delay(tmp_path):
     assert d9["forge_mirror"]["windows"]["summary"]["T+6h"].startswith("not run")
 
 
+def test_readiness_out_round_trips_through_the_scorer_parser(tmp_path):
+    from cascade.eval import lane_d_scorer
+
+    forge = _mirror(tmp_path / "f")
+    rd = tmp_path / "out" / "readiness.json"
+    assert w1.main(["--forge-dir", str(forge), "--out", str(tmp_path / "w1.json"),
+                    "--readiness-out", str(rd)]) == 0
+    raw = rd.read_bytes()
+    doc = json.loads(raw)
+    assert w1.READINESS_SCHEMA == lane_d_scorer.READINESS_SCHEMA
+    assert set(doc) == {"schema", "rungs"}
+    assert all(set(r) == {"context", "series", "sources"} for r in doc["rungs"])
+    counts = lane_d_scorer._readiness_counts(raw)
+    fm = json.loads((tmp_path / "w1.json").read_text())["forge_mirror"]
+    assert counts == {r["context"]: (r["series"], r["sources"])
+                      for r in fm["long_history"]["rungs"]}
+    assert counts[4096] == (3, 2) and counts[131072] == (0, 0)
+    with pytest.raises(SystemExit):                     # rungs come from the mirror only
+        w1.main(["--snapshots-dir", str(tmp_path), "--out", str(tmp_path / "x.json"),
+                 "--readiness-out", str(tmp_path / "r.json")])
+
+
 def test_forge_and_snapshots_together(tmp_path):
     forge = _mirror(tmp_path / "f")
     full = {f"s{i}": _walk(600, 40 + i) for i in range(2)}

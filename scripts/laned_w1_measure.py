@@ -946,6 +946,22 @@ def forge_measure(mirror: dict, *, commit_times: list[float] | None, sweep_days:
     }
 
 
+READINESS_SCHEMA = "laned_readiness/1"
+
+
+def readiness_doc(forge_block: dict) -> dict:
+    """The ``laned_readiness/1`` document W8c's per-variant arming reads
+    (:func:`cascade.eval.lane_d_scorer._readiness_counts`): exactly
+    ``{"schema", "rungs": [{"context", "series", "sources"}]}``, one rung per
+    measured context, from the forge mirror's long-history inventory. The
+    gate itself (``min_long_series``, ≥ 20 sources, T7) is applied by the
+    scorer, not here."""
+    return {"schema": READINESS_SCHEMA,
+            "rungs": [{"context": int(r["context"]), "series": int(r["series"]),
+                       "sources": int(r["sources"])}
+                      for r in forge_block["long_history"]["rungs"]]}
+
+
 def print_summary(doc: dict, out=sys.stdout) -> None:
     fm = doc.get("forge_mirror")
     if fm:
@@ -1005,6 +1021,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="forge: commit-time sweep length back from the mirror's end")
     ap.add_argument("--first-seen-clock", choices=FIRST_SEEN_CLOCKS, default="min",
                     help="forge: first-seen proxy upper bound (see module docs)")
+    ap.add_argument("--readiness-out", default=None,
+                    help=f"forge: also write the {READINESS_SCHEMA} document (W8c's readiness "
+                         "gate input) from the long-history rungs")
     ap.add_argument("--max-series-per-source", type=int, default=200,
                     help="forge: per-feed series cap (the reader's default; 0 = none)")
     ap.add_argument("--out", required=True, help="output JSON")
@@ -1026,6 +1045,8 @@ def main(argv: list[str] | None = None) -> int:
         ap.error("--min-fresh-share must be in [0, 1]")
     if args.max_windows < args.min_windows:
         ap.error("--max-windows must be >= --min-windows")
+    if args.readiness_out and not args.forge_dir:
+        ap.error("--readiness-out needs --forge-dir (the rungs are measured from the mirror)")
     commit_times = [parse_time(t) for t in args.commit_time or ()] or None
     if args.snapshots_dir:
         root = Path(args.snapshots_dir)
@@ -1091,8 +1112,15 @@ def main(argv: list[str] | None = None) -> int:
                **body)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out).write_text(json.dumps(doc, indent=2, sort_keys=True), encoding="utf-8")
+    if args.readiness_out:
+        rd = Path(args.readiness_out)
+        rd.parent.mkdir(parents=True, exist_ok=True)
+        rd.write_text(json.dumps(readiness_doc(body["forge_mirror"]), indent=2, sort_keys=True)
+                      + "\n", encoding="utf-8")
     print_summary(doc)
     print(f"wrote {args.out}")
+    if args.readiness_out:
+        print(f"wrote {args.readiness_out} ({READINESS_SCHEMA})")
     return 0
 
 
