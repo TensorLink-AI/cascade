@@ -182,6 +182,8 @@ from .lane_d_report import (
 )
 from .lane_d_state import (
     ABSENT_REASONS,
+    CONFIRM_MIGRATION_EXTENSION,
+    CONFIRM_MIGRATION_TAG,
     HOUSE_ENTRY_KEY,
     PRIOR_STATE_EXTENSION,
     LaneDReceiptError,
@@ -191,6 +193,7 @@ from .lane_d_state import (
     load_report_file,
     make_absent_receipt,
     make_receipt,
+    migrate_confirm_pending,
     refresh_house,
     report_digest,
     report_path,
@@ -979,6 +982,10 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
         check_persisted_report(persisted,
                                signer_ss58=str(getattr(signer, "hotkey", signer).ss58_address),
                                boundary=boundary, prior_state_sha256=prior_sha, where=rp)
+    # W7c (rev6.11 (b); orchestrator decision 2026-11-23): a testnet state
+    # written by the old code may hold `confirm_pending` entries. Migrated
+    # after the prior digest is taken, so the receipt binds legacy -> migrated.
+    migrated = migrate_confirm_pending(state)
     refresh_house(state, house)
     king_before = _king_record(state["king"])
     pools = _load_pools(pool_dir, prior_pool_dirs, int(cfg.horizon))
@@ -1342,7 +1349,12 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
         "pay": {"share": pay["share"], "court": court},
         # RV7 B1: the state this settlement ran from, under the signature, so
         # recovery can check a persisted report against the state as loaded.
-        "extensions": {PRIOR_STATE_EXTENSION: prior_sha},
+        "extensions": {PRIOR_STATE_EXTENSION: prior_sha,
+                       # W7c: the one settlement that migrated a legacy
+                       # confirm_pending state (never consensus).
+                       **({CONFIRM_MIGRATION_EXTENSION: {"tag": CONFIRM_MIGRATION_TAG,
+                                                         "entries": migrated}}
+                          if migrated else {})},
     }
     if draws:
         # W5j: the settlement's draw record, present iff a cohort was drawn
