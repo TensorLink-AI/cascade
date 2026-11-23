@@ -1,0 +1,21 @@
+# WB16: router-row decision D40, decided option (a) "router rows frozen"
+# (owner default 2026-11-21; plan §3.0 WB16 row, §12b.2 LB2, D40 row).
+# README.md has the contract.
+#
+# (a) is TODAY's backend: these tests pin that it stays frozen. They pass on
+# main by design (see README "Mode"). Every entry below already exists on main;
+# a change to any of them re-runs these tests (CROSS), which is the point.
+#
+# The compact-rows backend: ExpertSlices freezes every parameter and trains
+# only selected w_in/w_out rows (expert_training.py:112-122).
+cascade/trainer/expert_training.py
+# The expert-leg paths: the routing-bias update is skipped and restore_frozen
+# copies every non-expert tensor back from the king.
+cascade/trainer/pyramid_trainer.py
+cascade/trainer/moe_trainer.py
+# The merge byte-check (merge_expert_slices) the validator runs.
+cascade/trainer/pyramid_model.py
+cascade/trainer/moe_model.py
+cascade/validator/expert_lane.py
+# [lane_b] router_rows: LANE_B_ROUTER_ROWS = ("frozen",) (WB10 parse).
+cascade/shared/config/lane_b.py
