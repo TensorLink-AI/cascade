@@ -456,6 +456,29 @@ def paired_gate(candidate_rows: Mapping, king_rows: Mapping, house_rows: Mapping
     return res
 
 
+# ── the bound record text (W3b6b, plan rev6.13) ──────────────────────────────
+
+
+def _finite_or_null(obj):
+    if isinstance(obj, float) and not math.isfinite(obj):
+        return None
+    if isinstance(obj, Mapping):
+        return {str(k): _finite_or_null(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_finite_or_null(v) for v in obj]
+    return obj
+
+
+def sweep_record_text(record: Mapping) -> str:
+    """One sweep record's canonical text (sorted keys, compact separators,
+    ASCII-escaped, every non-finite float written as ``null``): the bytes a
+    gate result's ``rows`` digest binds and ``bench_v/lane_d/`` publishes."""
+    import json
+
+    return json.dumps(_finite_or_null(record), sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=True, allow_nan=False)
+
+
 # ── one host session ─────────────────────────────────────────────────────────
 
 
@@ -530,4 +553,4 @@ class SweepSession:
 
 __all__ = ["CLASSES", "FAULT_CODES", "HOLD_CODES", "INFRA_CODES", "KNOWN_SUITES", "METRICS",
            "OUTCOMES", "REFS", "MixedSessionError", "SweepSession", "classify_suite",
-           "paired_gate", "paired_geomean_lcb", "suite_identity"]
+           "paired_gate", "paired_geomean_lcb", "suite_identity", "sweep_record_text"]

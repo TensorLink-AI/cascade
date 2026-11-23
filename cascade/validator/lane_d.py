@@ -156,7 +156,7 @@ import numpy as np
 
 from ..eval.bootstrap import cohort_maxt_lcbs
 from ..eval.lane_d_scorer import GATE_MIN_SOURCES, SCORING_LEVELS, SCORING_METHOD, score_window
-from .lane_d_bench import paired_gate
+from .lane_d_bench import paired_gate, sweep_record_text
 from .lane_d_forward import eligible_windows
 from .lane_d_frozen import advance_frozen_set
 from .lane_d_gate import gate_record
@@ -477,8 +477,36 @@ def _gate_result(res: dict, digest: str) -> dict:
             "session": str(res["session"])}
 
 
+BENCH_ROWS_ROLES = ("candidate", "king_d", "house")
+
+
+def bench_rows_dir(state_path) -> Path:
+    """W3b6b: where a settlement's bound bench records are persisted,
+    ``<state dir>/<state stem>_bench_rows/<sha256>.json`` (beside
+    ``<stem>_reports``, snapshotted with the state)."""
+    p = Path(state_path)
+    return p.parent / f"{p.stem}_bench_rows"
+
+
+def _save_bench_rows(state_path, texts: dict[str, str]) -> None:
+    """Write each bound record's exact bytes (atomic per file; an existing
+    file is content-addressed, so it is already these bytes)."""
+    if not texts:
+        return
+    d = bench_rows_dir(state_path)
+    d.mkdir(parents=True, exist_ok=True)
+    for digest, text in sorted(texts.items()):
+        path = d / f"{digest}.json"
+        if path.is_file():
+            continue
+        tmp = d / f".{digest}.tmp"
+        tmp.write_bytes(text.encode("ascii"))
+        os.replace(tmp, path)
+
+
 def _run_gate(cands: list[dict], state: dict, cfg, boundary: int,
-              block_hash: str | None, sentinel: str | None, bench
+              block_hash: str | None, sentinel: str | None, bench,
+              texts: dict[str, str] | None = None
               ) -> tuple[dict | None, dict[str, str]]:
     """``(gate record, {digest: outcome})`` for this settlement's crowning
     candidates. No candidate: ``(None, {})`` and no host call. No ``bench``
@@ -501,6 +529,7 @@ def _run_gate(cands: list[dict], state: dict, cfg, boundary: int,
     results, outcomes = [], {}
     for c in _ranked(cands):
         dg = c["digest"]
+        bound = None
         try:
             cand_rec, king_rec, house_rec = bench.paired(dg, king_d, house_d, suites=suites)
         except Exception:  # any host failure is infrastructure: hold, never crown
@@ -509,8 +538,20 @@ def _run_gate(cands: list[dict], state: dict, cfg, boundary: int,
             res = paired_gate(cand_rec, king_rec, house_rec, suite=suite,
                               alpha=float(cfg.alpha), tau_public=float(cfg.tau_public),
                               B=int(cfg.bootstrap_B), seed=seed, sentinel=sentinel)
+            # W3b6b: bind the three records the gate decided on (their
+            # canonical text's sha256, inside the signed body).
+            bound = {}
+            for role, rec in zip(BENCH_ROWS_ROLES, (cand_rec, king_rec, house_rec),
+                                 strict=True):
+                text = sweep_record_text(rec)
+                digest = hashlib.sha256(text.encode("ascii")).hexdigest()
+                bound[role] = digest
+                if texts is not None:
+                    texts[digest] = text
         outcomes[dg] = str(res["outcome"])
         result = _gate_result(res, dg)
+        if bound is not None:
+            result["rows"] = bound
         if "held_from" in c:
             # RV7 B2: a held candidate (no verdict here) names its hold.
             result["held_from"] = dict(c["held_from"])
@@ -1103,9 +1144,10 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
                                          "set_sha256": str(hold["set_sha256"]),
                                          "lcb": float(hold["lcb"]),
                                          "king_d": str(hold["king_d"])}})
+    bench_texts: dict[str, str] = {}
     if persisted is None:
         gate, gate_outcomes = _run_gate(candidates, state, cfg, boundary, boundary_block_hash,
-                                        sentinel, bench)
+                                        sentinel, bench, bench_texts)
     else:
         # Recovery: the outcomes the persisted, verified report recorded.
         gate, gate_outcomes = _adopted_gate(candidates, persisted, rp)
@@ -1223,6 +1265,8 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     validate_report(report)
     body_sha = report_digest(report)
     if persisted is None:
+        # W3b6b: the bound records' bytes land before the report that binds them.
+        _save_bench_rows(state_path, bench_texts)
         save_report_file(rp, report)
     elif report_digest(persisted) != body_sha:
         # The posterior derived from the persisted outcomes must be the one
