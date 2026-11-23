@@ -47,6 +47,24 @@ RV7 B2 adds the crown's provenance (README "Correction (RV7 B2)"):
   same key, matched by boundary and body digest (recomputed here from the
   canonical body, never through the producer);
 - ``era_sentinel``: ``gate.sentinel`` is the era's W-S1 suite.
+
+W9 re-derives what main took on trust (tests/accept/w9/README.md):
+
+- the judged set and every selection skip: ``judged`` is the verdicts,
+  ``skipped`` matches ``entries[].reason``, no open entry is silently
+  omitted, and the caps walked FIFO by ``(reveal_ts, digest)`` over the
+  selection candidates name exactly the ``coldkey_cap_settlement`` skips;
+- the registration rules a signed entry record shows (a resolved coldkey,
+  an armed context, ``reveal_block - ready_block <= ready_ttl_blocks``);
+- each judged window's mirror lag and the king's T (``king_reveal_ts`` of a
+  cohort judged against ``king_before`` or the house is that record's);
+- the canonical row order under ``rows_sha256``;
+- chain mode: ``king_before`` is where the latest verified prior report left
+  KING_D (or, after a house holder, this report's refreshed house), the
+  house record carries over, and an entry's recorded inputs never change;
+- with ``pool_dirs``: every judged snapshot's digest, its ``frontier`` /
+  ``feeds`` completeness and each judged window's record and §1.3
+  eligibility (:func:`window_refusal`, re-implemented here from the spec).
 """
 
 from __future__ import annotations
@@ -55,6 +73,7 @@ import hashlib
 import json
 import math
 from fractions import Fraction
+from pathlib import Path
 
 import numpy as np
 
@@ -655,11 +674,16 @@ def _hold_problem(priors, res: dict) -> str | None:
     return None
 
 
-def _chain_problems(report: dict, prior_reports, signer_hotkey: str) -> str | None:
+def _chain_problems(report: dict, prior_reports, signer_hotkey: str,
+                    entries: dict) -> str | None:
     """Chain mode: every confirm verdict's first clear and every
-    ``held_from`` is shown by a verified earlier report, else why not."""
+    ``held_from`` is shown by a verified earlier report, and the report
+    continues the chain (:func:`_continuity_problem`), else why not."""
     priors = _verified_priors(list(prior_reports), signer_hotkey)
     boundary = int(report["boundary"])
+    why = _continuity_problem(report, priors, entries)
+    if why:
+        return why
     cohorts = report["cohorts"]
     for v in report.get("verdicts") or []:
         if v["stage"] != "confirm":
@@ -689,11 +713,319 @@ def _sentinel_problem(report: dict, era_sentinel) -> str | None:
     return None
 
 
+# ── W9: the judged set, the caps and the registration rules ─────────────────
+
+OPEN_STATUSES = ("pending", "confirm_pending")
+_CAP_SKIP = "coldkey_cap_settlement"
+# An entry selected and then dropped (the floors, an unscorable king, a
+# malformed forecast) counts against the caps like a judged one, as in the
+# producer's selection.
+_SELECTED_SKIPS = ("pending_floor", "king_unscored", "checkpoint_fault")
+# The signed inputs of an entry record: fixed once registered.
+_INPUT_KEYS = ("hotkey", "coldkey", "context", "ready_block", "reveal_block", "reveal_ts")
+
+
+def _int_value(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _registration_problem(cfg, dg: str, e: dict) -> str | None:
+    """The registration rules a signed entry record shows, or ``None``."""
+    ck = e.get("coldkey")
+    if not isinstance(ck, str) or not ck:
+        return f"{dg[:12]}: coldkey {ck!r} is unresolved (coldkey_unresolved), never selected"
+    ctx = e.get("context")
+    if not _int_value(ctx) or ctx not in [int(c) for c in cfg.contexts]:
+        return f"{dg[:12]}: context {ctx!r} is not armed (context_not_armed)"
+    ready, reveal = e.get("ready_block"), e.get("reveal_block")
+    if not (_int_value(ready) and _int_value(reveal)):
+        return f"{dg[:12]}: ready_block / reveal_block {ready!r} / {reveal!r} are not blocks"
+    if reveal - ready > int(cfg.ready_ttl_blocks):
+        return (f"{dg[:12]}: revealed {reveal - ready} blocks after ready > ready_ttl_blocks "
+                f"{int(cfg.ready_ttl_blocks)} (ready_expired)")
+    if not _int_value(e.get("reveal_ts")):
+        return f"{dg[:12]}: reveal_ts {e.get('reveal_ts')!r} is not a unix time"
+    return None
+
+
+def _judged_set_problems(report: dict, cfg, entries: dict) -> list[str]:
+    """README "Judged set" rules 1-5: ``judged`` is the verdicts, every skip
+    is a listed entry's typed reason, no open entry is silently omitted, and
+    the caps re-derived FIFO by ``(reveal_ts, digest)`` over the selection
+    candidates name exactly the ``coldkey_cap_settlement`` skips."""
+    verdicts = list(report.get("verdicts") or [])
+    vdigests = [v["digest"] for v in verdicts]
+    judged = report.get("judged")
+    if not isinstance(judged, list) or judged != vdigests:
+        return [f"judged {judged!r} is not the verdicts' digests {vdigests}"]
+    if len(set(judged)) != len(judged):
+        return ["judged lists a digest twice"]
+    members = [m for c in report.get("cohorts") or [] for m in c["members"]]
+    if sorted(members) != sorted(judged):
+        return [f"the verdicts {sorted(judged)} are not exactly the cohort members "
+                f"{sorted(members)}"]
+    judged_set = set(judged)
+    skipped = report.get("skipped")
+    if not isinstance(skipped, list):
+        return [f"skipped is {type(skipped).__name__}, not a list"]
+    skip_of: dict[str, str] = {}
+    for i, s in enumerate(skipped):
+        if not isinstance(s, dict) or set(s) != {"digest", "reason"}:
+            return [f"skipped[{i}] is not a {{digest, reason}} record"]
+        dg = s["digest"]
+        if dg not in entries:
+            return [f"skipped {str(dg)[:12]} is not a listed entry"]
+        if dg in skip_of:
+            return [f"skipped {str(dg)[:12]} appears twice"]
+        if dg in judged_set:
+            return [f"{str(dg)[:12]} is both judged and skipped"]
+        if entries[dg].get("reason") != s["reason"]:
+            return [f"skipped {str(dg)[:12]} reason {s['reason']!r} != its entry's reason "
+                    f"{entries[dg].get('reason')!r}"]
+        skip_of[dg] = s["reason"]
+    gated = {r["digest"] for r in ((report.get("gate") or {}).get("results") or [])
+             if isinstance(r, dict) and "digest" in r}
+    out = []
+    for dg in sorted(entries):
+        if entries[dg].get("status") in OPEN_STATUSES and dg not in judged_set \
+                and dg not in skip_of and dg not in gated:
+            out.append(f"open entry {dg[:12]} ({entries[dg].get('status')}) is neither judged, "
+                       f"skipped nor gated: silently omitted")
+    if out:
+        return out
+    held = gated - judged_set
+    cands = [dg for dg in judged if dg not in held]
+    cands += [dg for dg, why in skip_of.items()
+              if why in (_CAP_SKIP, *_SELECTED_SKIPS) and dg not in held]
+    for dg in cands:
+        why = _registration_problem(cfg, dg, entries[dg])
+        if why:
+            out.append(why)
+    if out:
+        return out
+    cap_all = int(cfg.max_entries_per_settlement)
+    cap_cold = int(cfg.max_judged_per_coldkey_per_settlement)
+    n, per_cold = 0, {}
+    for dg in sorted(cands, key=lambda d: (int(entries[d]["reveal_ts"]), d)):
+        ck = entries[dg]["coldkey"]
+        over = n >= cap_all or per_cold.get(ck, 0) >= cap_cold
+        capped = skip_of.get(dg) == _CAP_SKIP
+        if over and not capped:
+            out.append(f"{dg[:12]} is over the caps (FIFO by T: {n} selected, {per_cold.get(ck, 0)} "
+                       f"on its coldkey) but not skipped {_CAP_SKIP}")
+        elif capped and not over:
+            out.append(f"{dg[:12]} is skipped {_CAP_SKIP} but its coldkey and the settlement "
+                       f"had room (FIFO by T)")
+        if not over:
+            n += 1
+            per_cold[ck] = per_cold.get(ck, 0) + 1
+    return out
+
+
+def _clock_problems(report: dict, cfg, windows: dict) -> list[str]:
+    """README rules 6-7: each judged window's mirror lag is within the limit
+    (null = unmeasured), and a cohort judged against ``king_before`` or the
+    house states that record's T."""
+    out = []
+    lim = float(cfg.max_mirror_lag_hours)
+    named = [report["king_before"], report["house"]]
+    for c in report.get("cohorts") or []:
+        idx = c["index"]
+        for wid in c["window_ids"]:
+            lag = windows[wid].get("mirror_lag_hours")
+            if lag is not None and not (_finite(lag) and float(lag) <= lim):
+                out.append(f"cohort {idx}: window {wid} mirror_lag_hours {lag!r} > "
+                           f"max_mirror_lag_hours {lim}")
+        for rec in named:
+            if c["king_digest"] == rec["digest"] and c["king_reveal_ts"] != rec["reveal_ts"]:
+                out.append(f"cohort {idx}: king_reveal_ts {c['king_reveal_ts']!r} is not the "
+                           f"named king {str(rec['digest'])[:12]}'s reveal_ts {rec['reveal_ts']!r}")
+    return out
+
+
+def _row_order_problem(report: dict, rows: list) -> str | None:
+    """README rule 8: the rows in the canonical order (cohorts by index, each
+    cohort's ``window_ids`` in order, per window ``[king, house?, *members]``)."""
+    want = []
+    for c in sorted(report.get("cohorts") or [], key=lambda c: int(c["index"])):
+        models = [c["king_digest"], *([c["house_digest"]] if "house_digest" in c else []),
+                  *c["members"]]
+        want += [(int(c["index"]), str(w), str(m)) for w in c["window_ids"] for m in models]
+    got = [(int(r["cohort"]), str(r["window_id"]), str(r["digest"])) for r in rows]
+    if got != want:
+        at = next((i for i, (g, w) in enumerate(zip(got, want, strict=False)) if g != w),
+                  min(len(got), len(want)))
+        return f"rows are not in the canonical order (first difference at row {at})"
+    return None
+
+
+def _continuity_problem(report: dict, priors, entries: dict) -> str | None:
+    """README chain rules 9-11 over the verified prior reports below this
+    boundary: KING_D continues from the latest one (or, after a house holder,
+    from this report's refreshed house), a house digest keeps its record,
+    and an entry's recorded inputs never change."""
+    boundary = int(report["boundary"])
+    earlier = [(b, p) for b, _dg, p in priors if b < boundary]
+    if not earlier:
+        return None
+    latest = max(b for b, _ in earlier)
+    kb, house = report["king_before"], report["house"]
+    for b, p in earlier:
+        if b != latest:
+            continue
+        ka = p.get("king_after")
+        if kb == ka:
+            continue
+        if isinstance(ka, dict) and ka.get("house") is True and kb == house:
+            continue
+        return (f"king_before {str(kb.get('digest'))[:12]} is not where the report at {b} "
+                f"left KING_D ({str((ka or {}).get('digest'))[:12]})")
+    for b, p in sorted(earlier, key=lambda x: x[0]):
+        ph = p.get("house")
+        if isinstance(ph, dict) and ph.get("digest") == house["digest"] and ph != house:
+            return (f"the house {str(house['digest'])[:12]} differs from its record in the "
+                    f"report at {b}")
+        for e in p.get("entries") or []:
+            if not isinstance(e, dict) or e.get("digest") not in entries:
+                continue
+            mine = entries[e["digest"]]
+            for k in _INPUT_KEYS:
+                if e.get(k) != mine.get(k):
+                    return (f"{str(e['digest'])[:12]}: {k} {mine.get(k)!r} differs from the "
+                            f"report at {b} ({e.get(k)!r})")
+    return None
+
+
+# ── W9 (rev6.1): window eligibility from the judged snapshot itself ─────────
+#
+# §1.3 re-implemented from W5a's README (invariant 12: never through
+# ``cascade.validator.lane_d_forward``), with its labels and precedence.
+
+_SNAPSHOT_FILES = ("metadata.json", "hist.npz", "tgt.npz")
+
+
+def _feed_key(series: dict):
+    return series.get("feed") or series.get("source")
+
+
+def window_refusal(series: dict, feeds: dict, bound: float, cfg) -> str | None:
+    """The first failing §1.3 rule's label for one ``pool_d/1`` series
+    record at ``bound`` (``t_max + 3600 * forward_margin_hours``), or
+    ``None`` when the window is eligible. Missing metadata fails closed: an
+    unlisted feed (or no ``feeds`` block) is ``unlisted_feed``; an absent,
+    ``null``, empty or malformed ``frontier`` is ``absent_from_s0``."""
+    h = int(cfg.horizon)
+    ts, seen, end = series.get("target_ts"), series.get("first_seen_ts"), series.get("end_ts")
+    if not (isinstance(ts, list) and isinstance(seen, list) and h > 0
+            and len(ts) == h and len(seen) == h
+            and all(_finite(t) for t in ts) and all(_finite(t) for t in seen)
+            and _finite(end) and float(end) == float(ts[-1])):
+        return "missing_clock"
+    key = _feed_key(series)
+    feed = feeds.get(key) if isinstance(feeds, dict) and isinstance(key, str) else None
+    if not isinstance(feed, dict):
+        return "unlisted_feed"
+    if bool(feed.get("forecast_product", False)):
+        return "forecast_product"
+    lag = feed.get("mirror_lag_hours")
+    if lag is not None and not (_finite(lag) and float(lag) <= float(cfg.max_mirror_lag_hours)):
+        return "over_lag"
+    data_ok = min(float(t) for t in ts) > bound
+    seen_ok = min(float(t) for t in seen) > bound
+    if not data_ok and not seen_ok:
+        return "before_margin"
+    if not seen_ok:
+        return "publish_ahead"
+    if not data_ok:
+        return "late_mirror"
+    frontier = series.get("frontier")
+    after = []
+    for rec in frontier if isinstance(frontier, list) else ():
+        if not (isinstance(rec, (list, tuple)) and len(rec) == 2
+                and _finite(rec[0]) and _finite(rec[1])):
+            return "absent_from_s0"
+        if float(rec[0]) > bound:
+            after.append((float(rec[0]), float(rec[1])))
+    if not after:
+        return "absent_from_s0"
+    if min(float(t) for t in ts) <= min(after)[1]:
+        return "backfill"
+    return None
+
+
+def _snapshot_digest(d: Path) -> str:
+    parts = "".join(hashlib.sha256((d / n).read_bytes()).hexdigest() for n in _SNAPSHOT_FILES)
+    return hashlib.sha256(parts.encode()).hexdigest()
+
+
+def _snapshot_problem(report: dict, cfg, pool_dirs, windows: dict) -> str | None:
+    """README rules 12-14 against the provided snapshot directories."""
+    metas: dict[str, object] = {}
+    for d in pool_dirs:
+        p = Path(d)
+        try:
+            dg = _snapshot_digest(p)
+            meta = json.loads((p / "metadata.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        metas.setdefault(dg, meta)
+    judged: dict[str, list] = {}
+    margin = 3600.0 * float(cfg.forward_margin_hours)
+    for c in report.get("cohorts") or []:
+        bound = float(int(c["t_max"])) + margin
+        for wid in c["window_ids"]:
+            w = windows[wid]
+            sha = w.get("snapshot_sha256")
+            if sha not in metas:
+                return (f"window {wid} names snapshot {str(sha)[:12]}, which no provided "
+                        f"pool directory holds")
+            judged.setdefault(sha, []).append((w, bound))
+    h = int(cfg.horizon)
+    for sha in sorted(judged):
+        meta = metas[sha]
+        series = meta.get("series") if isinstance(meta, dict) else None
+        if not isinstance(series, list):
+            return f"snapshot {sha[:12]} has no series list"
+        feeds = meta.get("feeds")
+        feeds = feeds if isinstance(feeds, dict) else {}
+        by_id = {}
+        for s in series:
+            if not isinstance(s, dict):
+                return f"snapshot {sha[:12]}: a series record is not an object"
+            sid = s.get("series_id")
+            if not isinstance(s.get("frontier"), list):
+                return f"snapshot {sha[:12]}: series {sid!r} has no frontier list"
+            if _feed_key(s) not in feeds:
+                return f"snapshot {sha[:12]}: series {sid!r} feed {_feed_key(s)!r} is not in feeds"
+            ts = s.get("target_ts")
+            if isinstance(sid, str) and isinstance(ts, list) and ts and _finite(ts[0]):
+                by_id[f"{sid}:{int(ts[0])}:h{h}"] = s
+        for w, bound in judged[sha]:
+            wid = w["window_id"]
+            s = by_id.get(wid)
+            if s is None:
+                return f"window {wid} is not a series of snapshot {sha[:12]}"
+            why = window_refusal(s, feeds, bound, cfg)
+            if why is not None:
+                return f"window {wid} is refused on its snapshot at bound {bound}: {why}"
+            source = s.get("source") or s["series_id"]
+            feed = s.get("feed") or source
+            lag = feeds[_feed_key(s)].get("mirror_lag_hours")
+            want = {"source": source, "feed": feed,
+                    "min_target_ts": int(min(s["target_ts"])),
+                    "min_first_seen_ts": int(min(s["first_seen_ts"])),
+                    "mirror_lag_hours": None if lag is None else float(lag)}
+            for k, v in want.items():
+                if w.get(k) != v:
+                    return f"window {wid}: {k} {w.get(k)!r} is not the snapshot's {v!r}"
+    return None
+
+
 _UNSET = object()
 
 
 def check_lane_d(report: dict, cfg, *, signer_hotkey: str, prior_reports=None,
-                 era_sentinel=_UNSET) -> CheckResult:
+                 era_sentinel=_UNSET, pool_dirs=None) -> CheckResult:
     """PASS on a genuine report; FAIL when the signature, ``rows_sha256``,
     a stated parameter or the verdict re-derived from the rows disagrees,
     or the crown's provenance does not hold (RV7 B2).
@@ -703,7 +1035,10 @@ def check_lane_d(report: dict, cfg, *, signer_hotkey: str, prior_reports=None,
     each ``held_from`` must be shown by one that verifies under
     ``signer_hotkey``. ``era_sentinel``: the era's W-S1 receipt record
     (``{"suite", "block", "block_hash"}``) or ``None`` when W-S1 is unarmed;
-    left unset, ``gate.sentinel`` is not pinned."""
+    left unset, ``gate.sentinel`` is not pinned. ``pool_dirs``: snapshot
+    directories the auditor holds; every snapshot a judged window names must
+    be among them, valid, and give that window's record and eligibility
+    (README rules 12-14); ``None`` skips those rules."""
     from ..shared.sr25519 import SignatureVerifierUnavailable
 
     if not isinstance(report, dict) or report.get("schema") != SCHEMA:
@@ -761,9 +1096,18 @@ def check_lane_d(report: dict, cfg, *, signer_hotkey: str, prior_reports=None,
             problems += _cohort_problems(report, cfg, c, rows_by, windows, entries, confirms)
         if problems:
             return _fail(NAME, "; ".join(problems[:5]))
+        why = _row_order_problem(report, rows)
+        if why:
+            return _fail(NAME, why)
+        problems = _clock_problems(report, cfg, windows)
+        if problems:
+            return _fail(NAME, "; ".join(problems[:5]))
         # The §1.3b gate decides every crowning candidate; the crowning and
         # the paid court follow from it.
         crown, problems = _crown_problems(report, cfg, boundary, confirms, entries)
+        if problems:
+            return _fail(NAME, "; ".join(problems[:5]))
+        problems = _judged_set_problems(report, cfg, entries)
         if problems:
             return _fail(NAME, "; ".join(problems[:5]))
         before, after = report["king_before"], report["king_after"]
@@ -786,11 +1130,15 @@ def check_lane_d(report: dict, cfg, *, signer_hotkey: str, prior_reports=None,
                                f"nothing may crown")
         if prior_reports is not None:
             try:
-                why = _chain_problems(report, prior_reports, signer_hotkey)
+                why = _chain_problems(report, prior_reports, signer_hotkey, entries)
             except SignatureVerifierUnavailable as e:
                 return _warn(NAME, f"cannot verify the prior reports' signatures: {e}")
             if why:
                 return _fail(NAME, f"chain: {why}")
+        if pool_dirs is not None:
+            why = _snapshot_problem(report, cfg, list(pool_dirs), windows)
+            if why:
+                return _fail(NAME, f"snapshot: {why}")
         court = (report.get("pay") or {}).get("court") or []
         if float((report.get("pay") or {}).get("share", -1.0)) != float(cfg.share):
             return _fail(NAME, "pay share differs from config")
@@ -808,4 +1156,4 @@ def check_lane_d(report: dict, cfg, *, signer_hotkey: str, prior_reports=None,
     return _ok(NAME, f"boundary {boundary}: {len(cohorts)} cohort(s), {n_rows} rows re-derived")
 
 
-__all__ = ["check_lane_d"]
+__all__ = ["check_lane_d", "window_refusal"]
