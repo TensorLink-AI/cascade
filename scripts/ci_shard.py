@@ -163,25 +163,40 @@ def verify(n: int, collected: str | None) -> int:
     return 0
 
 
-DURATION = re.compile(r"(\d+\.\d+)s (?:call|setup|teardown)\s+(tests/unit/\S+?\.py)::(\S+)")
+DURATION = re.compile(r"(\d+\.\d+)s (call|setup|teardown)\s+(tests/unit/\S+?\.py)::(\S+)")
 
 
 def refresh(logs: list[str]) -> int:
-    per_file: dict[str, float] = defaultdict(float)
-    per_name: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    """Rebuild the weights from shard logs of one or more PR runs.
+
+    Each test phase weighs the MAX seen across the logs: runner speed varies
+    a lot between jobs (torch-heavy tests run 3-6x slower on some runners),
+    and the slowest shard sets the wall time, so plan for the slow case.
+    Entries for tests no longer defined at the top level of their file are
+    dropped, so logs from older runs are safe to include.
+    """
+    worst: dict[tuple[str, str, str], float] = {}
     for log in logs:
         for line in Path(log).read_text(errors="replace").splitlines():
             m = DURATION.search(line)
             if m:
-                secs, f, rest = float(m.group(1)), m.group(2), m.group(3)
-                per_file[f] += secs
-                per_name[f][top_name(rest)] += secs
+                key = (m.group(3), m.group(4), m.group(2))
+                worst[key] = max(worst.get(key, 0.0), float(m.group(1)))
+    current = {f: set(top_level_tests(f)) for f in test_files()}
+    per_file: dict[str, float] = defaultdict(float)
+    per_name: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    for (f, rest, _phase), secs in worst.items():
+        name = top_name(rest)
+        if name in current.get(f, ()):
+            per_file[f] += secs
+            per_name[f][name] += secs
     if not per_file:
         print("no pytest --durations lines found", file=sys.stderr)
         return 1
     data = {
-        "_doc": "Measured seconds per tests/unit file (sum of pytest --durations lines) "
-        "for scripts/ci_shard.py. Regenerate: ci_shard.py --refresh-weights <shard logs>.",
+        "_doc": "Worst measured seconds per tests/unit file (sum over its tests of the max "
+        "pytest --durations per phase across PR runs) for scripts/ci_shard.py. "
+        "Regenerate: ci_shard.py --refresh-weights <shard logs>.",
         "files": {f: round(s, 2) for f, s in sorted(per_file.items())},
         "split": {
             f: {n: round(s, 2) for n, s in sorted(per_name[f].items())}
