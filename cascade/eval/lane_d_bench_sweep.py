@@ -46,6 +46,9 @@ REQUEST_SCHEMA = "lane-d-bench-request/1"
 REPLY_SCHEMA = "lane-d-bench-reply/1"
 SWEEP_ERROR_CODES = ("checkpoint_unavailable", "sweep_failed")
 SIDECAR_FILES = ("config.json", "forecast_wrapper.py", "model.py", "weights.safetensors")
+# Lane A's DEC-CA-0063 sidecar settings, as the box sends them
+# (cascade.validator.lane_d_bench_host.bench_settings).
+SETTINGS_KEYS = ("num_samples", "max_series", "batch_size", "workers", "data_dir")
 _REPO = Path(__file__).resolve().parents[2]
 
 
@@ -88,7 +91,23 @@ def _checked(request) -> tuple[list[str], list[str], dict[str, int], dict]:
     if not isinstance(grants, Mapping) or set(grants) != set(digests) or not all(
             grants[d] is None or isinstance(grants[d], Mapping) for d in digests):
         raise ValueError("request grants must give every digest a grant object or null")
-    return list(digests), list(suites), {d: int(contexts[d]) for d in digests}, dict(grants)
+    return (list(digests), list(suites), {d: int(contexts[d]) for d in digests}, dict(grants),
+            _checked_settings(request.get("settings")))
+
+
+def _pos_int(v, floor: int) -> bool:
+    return type(v) is int and v >= floor
+
+
+def _checked_settings(s) -> dict:
+    """The sidecar settings lane A's sweep uses, sent by the box (exact keys)."""
+    if not isinstance(s, Mapping) or set(s) != set(SETTINGS_KEYS):
+        raise ValueError(f"request settings must be an object with exactly {list(SETTINGS_KEYS)}")
+    if not (_pos_int(s["num_samples"], 1) and _pos_int(s["batch_size"], 1)
+            and _pos_int(s["max_series"], 0) and isinstance(s["workers"], str)
+            and (s["data_dir"] is None or isinstance(s["data_dir"], str))):
+        raise ValueError(f"request settings are malformed: {dict(s)!r}")
+    return {k: s[k] for k in SETTINGS_KEYS}
 
 
 def materialise(entry_dir, work_dir, *, digest: str, context: int) -> Path:
@@ -111,11 +130,16 @@ def materialise(entry_dir, work_dir, *, digest: str, context: int) -> Path:
 
 
 def _default_sidecar(device: str = "cuda") -> Callable:
-    def run(dirs, suites):
+    def run(dirs, suites, settings):
         from .benchmarks import run_bench_reports
 
         return run_bench_reports(list(dirs), project_dir=_REPO / "benchmarks",
-                                 suites=tuple(suites), device=device)
+                                 suites=tuple(suites), device=device,
+                                 num_samples=int(settings["num_samples"]),
+                                 max_series=int(settings["max_series"]),
+                                 batch_size=int(settings["batch_size"]),
+                                 workers=settings["workers"],
+                                 data_dir=settings["data_dir"] or None)
     return run
 
 
@@ -142,7 +166,7 @@ def serve_sweep(request, *, cache, work_dir, contract=None, expect=None,
     the sweep cannot run here."""
     from .lane_d_forecasts import LaneDForecastError, _checkpoint, _scoring_lease
 
-    digests, suites, contexts, grants = _checked(request)
+    digests, suites, contexts, grants, settings = _checked(request)
     names = _gate_keys()
     rows: dict[str, dict] = {}
     dirs: list[tuple[str, Path]] = []
@@ -167,7 +191,7 @@ def serve_sweep(request, *, cache, work_dir, contract=None, expect=None,
                                            f"{dg[:16]}: cannot materialise ({e})") from e
     if dirs:
         run = _default_sidecar() if sidecar is None else sidecar
-        reports = list(run([d for _, d in dirs], tuple(names[s] for s in suites)))
+        reports = list(run([d for _, d in dirs], tuple(names[s] for s in suites), settings))
         if len(reports) != len(dirs) or all(r is None for r in reports):
             raise LaneDBenchSweepError("sweep_failed", "the sidecar pass returned no report")
         from .benchmarks import item_rows_from_report
