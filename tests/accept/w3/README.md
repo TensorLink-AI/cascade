@@ -139,6 +139,26 @@ Resubmits:
 - While the hotkey has an open entry, a new submit is
   `409 hotkey_entry_open` (T6).
 
+## Contexts (rev6.6, owner 2026-11-23)
+
+`test_w3_contexts.py`. `[lane_d] contexts` is the set a miner may declare.
+Since rev6.6 its default lists every variant,
+`[4096, 8192, 16384, 32768, 65536, 131072]` (W2).
+
+- A context in `cfg.contexts` is accepted at submit and at ready, whether or
+  not the variant is armed. Arming is computed per settlement by the main
+  validator (W5d `armed_record`, recorded by W7a), not by the intake. An
+  entry that declares an unarmed variant is scored at the highest armed
+  variant until its own variant arms. The ready record and the commit payload
+  keep the **declared** context.
+- A context not in `cfg.contexts` is still refused at submit with
+  `400 context_not_armed`. The code keeps its historical name; it means "not
+  a declarable context". Nothing is minted.
+- The default-config test fails on a main whose W2 default is still the
+  three launch contexts (an `AssertionError` on `cfg.contexts`). It passes once
+  W2's rev6.6 default lands, with no W3 code change. The other two tests pass
+  on main.
+
 ## Dedup (before any eval spend)
 
 Dedup is by the manifest's `weights.safetensors` sha256:

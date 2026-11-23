@@ -41,7 +41,7 @@ weights compare after normalising to shares of their sum.
 | `share` | 0.0 | `king_decay` | 0.5 |
 | `takes_from` | `"lane_b"` (today's; D1's `lane_a` comes by overlay) | `max_entries_per_settlement` | 8 |
 | `remainder` | `"burn"` | `max_open_per_coldkey` | 2 |
-| `contexts` | `[4096, 8192, 16384]` | `max_bench_holds` | 4 |
+| `contexts` | `[4096, 8192, 16384, 32768, 65536, 131072]` (rev6.6) | `max_bench_holds` | 4 |
 | `horizon` | 64 | `loser_ttl_eras` | 4 |
 | `forward_margin_hours` | 6.0 | `dtypes` | `["BF16"]` |
 | `min_windows` | 1000 | `max_mirror_lag_hours` | 6.0 |
@@ -51,6 +51,14 @@ weights compare after normalising to shares of their sum.
 | `alpha` | 0.05 | `max_reveal_delay_days` | 14 |
 | `bootstrap_B` | 10000 (lanes A/B, MarketCast) | `max_source_share` | 0.25 |
 | `gate_suites` | `["gift", "boom", "time", "fev"]` (§16 names) | `gate_weights` | equal over `gate_suites`, and follows it when only the suites are set |
+
+**(rev6.6, owner 2026-11-23) `contexts` default.** Every variant is in
+`contexts` from launch, `[4096, 8192, 16384, 32768, 65536, 131072]`, in the
+dataclass, the loader fallback and both shipped files. `contexts` is the set a
+miner may *declare*; whether a variant is *armed* is computed per settlement
+from its two gates (W5d `armed_record`, recorded in the signed report by W7a),
+never configured. The mutation pair is `[4096, 32768]` vs `[4096, 8192, 16384]`
+so both differ from the default.
 
 **Defaults assumed (the plan states none):** `lowfreq_freqs` ("daily and
 slower") must be a non-empty list of frequency strings containing `"D"` and
