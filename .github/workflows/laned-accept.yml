@@ -34,7 +34,13 @@
 #   tests/accept/<wp>/ dirs, one label per dir, none of them built on the base;
 #   each WP then runs its own --verification above and is ledger-recorded with
 #   its own tests_tree (every tests-only run records it). A per-WP PASS/FAIL
-#   table is printed and the job fails when any WP fails.
+#   table is printed and the job fails when any WP fails. Plan rev6.3 (b): a
+#   tests-only PR for up to 3 WPs all built on the base is a batch of
+#   tests-corrections (MODE tests-correction per WP), and an implementation PR
+#   may carry up to 3 WPs (BATCH IMPLEMENTATION rule in accept --help:
+#   disjoint PATHS, no in-batch Depends, each WP's tests on the base, every
+#   file in exactly one WP's PATHS): MODE implementation per WP, each WP's own
+#   full Accept and ledger row, CROSS over the whole set.
 #   then, every mode but review: `accept <WPs> --cross` re-accepts every OTHER
 #   WP at >= L2 on the base whose tests depend on the PR's changed paths
 #   (imports, string-named paths, PATHS overlap; CROSS rule in accept --help)
