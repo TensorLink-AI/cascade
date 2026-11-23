@@ -11,7 +11,7 @@ from .helpers import PATH_IDS, SUBCOMMANDS, chosen_upload_path, decision_path_id
 
 def _lane_d_parser():
     import cascade.miner.lane_d  # noqa: F401  (PATHS)
-
+    # isort: split
     from cascade.miner.cli import build_parser
 
     root = build_parser()

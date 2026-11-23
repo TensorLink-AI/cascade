@@ -561,7 +561,7 @@ def run_cli(capsys, caplog, *argv: str) -> Result:
     import logging
 
     import cascade.miner.lane_d  # noqa: F401  (PATHS)
-
+    # isort: split
     from cascade.miner.cli import main
 
     caplog.set_level(logging.DEBUG)
