@@ -178,7 +178,7 @@ def test_step_with_the_source_settles_like_the_hand_built_inputs(tmp_path):
     host = h.w8b.BenchHost(rig.fx["house"]["digest"])
 
     def hand_inputs(b):
-        return LaneDInputs(**h.expected_inputs(rig.fx, b))
+        return LaneDInputs(**rig.expected(b))
 
     def hand_bench(b):
         return SweepSession(rig.source.bench(b).session_id, host)
@@ -196,4 +196,6 @@ def test_step_with_the_source_settles_like_the_hand_built_inputs(tmp_path):
         assert h.w8b.body_sha256(got) == h.w8b.body_sha256(want), f"boundary {b}"
     final = json.loads(store.objects[report_key(h.B2)])
     assert final["crowned"] == rig.fx["x"]
+    assert final.get("armed_contexts") == list(h.DEFAULT_ARMED), \
+        "rev6.6: the signed report records the settlement's armed set"
     assert step.court_for(h.B2)[0] == h.CHALLENGER_UID
