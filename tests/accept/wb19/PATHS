@@ -1,0 +1,11 @@
+# WB19: expert-leg measurement per candidate GPU (LB6, plan §12b.6; OA8).
+# README.md has the contract.
+# The measurement tool. `run` trains one short lane B expert leg (or, with
+# --mode full, one full lane A leg) ON A RENTED POD with the pinned contract and
+# writes a hashed per-run record; `run --dry-run --gpu-fixture` is the CPU-only
+# CI/preflight path; `combine` assembles evidence/wb19.json (the per-GPU table).
+# torch is imported only inside the real leg path, never at module import.
+scripts/laned_wb19_measure.py
+# The trainer-side reader WB22/WB23 consume: the per-GPU step-rate table
+# (schema laned_wb19_table/1), steps_for_hours (D42b (a)). Stdlib only.
+cascade/funding/step_rates.py
