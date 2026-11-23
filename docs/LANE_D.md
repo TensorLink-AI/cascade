@@ -57,13 +57,24 @@ Context is not a checkpoint property. At `ready` you declare the context your
 entry is judged at, one of `[lane_d] contexts`. The weights load at any
 context because the positional buffers are non-persistent.
 
-- **Launch contexts:** `contexts = [4096, 8192, 16384]` (4k, 8k and 16k).
-- **Later (S8):** 32768, 65536 and 131072 are armed only at rollout stage
-  S8, by overlay through the same `contexts` key, after the T7 measurements
-  on the S8 eval host show the longer context fits. The model trains on
-  4096-point rows, so quality beyond 16k is unproven until then.
-- A context that is not armed is refused at submit (`context_not_armed`) and
-  skipped at judging with the same reason.
+- **Declarable from launch:** `contexts = [4096, 8192, 16384, 32768, 65536,
+  131072]` (4k to 128k). You may declare any of them; a value outside
+  `contexts` is refused at submit (`context_not_armed`) and closed at
+  judging with the same reason.
+- **Armed per settlement, automatically (no overlay):** a variant is armed
+  when both gates pass: (1) at least `min_long_series` (300) series from at
+  least 20 sources have enough history for it (the pinned
+  `laned_readiness/1` document), and (2) its T7 wall time and memory fit the
+  settlement budget on the eval host that scores lane D (the pinned
+  `laned_t7/1` pod document). The validator computes the armed set at every
+  settlement and records it, with the two documents' sha256s, in the signed
+  report (`armed_contexts`, `armed_evidence`); satellites verify it there.
+- **An unarmed declaration is still valid:** the entry is scored at the
+  highest armed variant below its declared context (the lowest armed one if
+  none is below), and at its own context from the settlement its variant
+  arms. The model trains on 4096-point rows, so quality beyond 16k is
+  unproven until T7 measures it; in practice 32k–128k pass gate (2) only on
+  the 96 GB eval host (stage S8).
 - The lane D scorer never pads: each window's history is truncated to the
   largest patch multiple it really has, up to your declared context. A 4k
   model and the same bytes declared at 16k score identically on windows with
