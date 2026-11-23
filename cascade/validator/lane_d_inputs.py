@@ -13,9 +13,15 @@ sources only:
    against its pin;
 3. the house record from the W5f signed pointer;
 4. the metagraph (``{hotkey: uid}``);
-5. every needed checkpoint's forecasts on every pinned window, computed on
-   the lane D eval host (:mod:`cascade.eval.lane_d_forecasts`) behind the W4
-   handshake. Only histories leave the box, never a target (D12).
+5. (rev6.6) the settlement's armed context set, the W5d
+   :func:`~cascade.eval.lane_d_scorer.armed_record` of the pinned
+   ``laned_readiness/1`` and ``laned_t7/1`` document bytes, returned as
+   ``LaneDInputs.armed`` (W8b passes it to ``settle_lane_d(armed=)``, so the
+   signed report records it);
+6. every needed checkpoint's forecasts on every pinned window at its
+   ``effective_context`` under that set, computed on the lane D eval host
+   (:mod:`cascade.eval.lane_d_forecasts`) behind the W4 handshake. Only
+   histories leave the box, never a target (D12).
 
 ``source.bench(boundary)`` is the boundary's bench
 :class:`~cascade.validator.lane_d_bench.SweepSession` (``None`` without a
@@ -83,6 +89,11 @@ INPUTS_ERROR_CODES = (
     "handshake_mismatch",       # the eval host runs other code (W4, T19)
     "forecasts_unavailable",    # the eval host failed (or a bar's checkpoint faulted)
     "forecast_malformed",       # KING_D's or the house's forecasts are malformed
+    # rev6.6: the settlement's armed context set (W5d armed_record)
+    "readiness_unavailable",    # the pinned laned_readiness/1 document is unreadable
+    "t7_unavailable",           # the pinned laned_t7/1 document is unreadable
+    "armed_invalid",            # armed_record refuses a document
+    "no_armed_context",         # no variant passes both gates: nothing can be scored
 )
 
 STATE_FILE = "lane_d_state.json"
@@ -128,8 +139,11 @@ class LaneDInputsSource:
     def __init__(self, cfg: Any, *, state_dir, intake_state_dir,
                  chain_factory: Callable[[], Any], pool: Callable[[int], Sequence[Mapping]],
                  eval_host: Any, house_pointer, house_signer_ss58: str,
+                 readiness: Callable[[], bytes], t7: Callable[[], bytes],
                  bench_host: Callable | None = None, expected_identity=None):
         self.cfg = cfg
+        self._readiness = readiness
+        self._t7 = t7
         self.state_path = Path(state_dir) / STATE_FILE
         self.intake_state_dir = Path(intake_state_dir)
         self.house_pointer = Path(house_pointer)
@@ -271,19 +285,53 @@ class LaneDInputsSource:
             out.append((d, pool))
         return out
 
+    def _document(self, read: Callable[[], bytes], code: str, what: str) -> bytes:
+        try:
+            raw = read()
+        except Exception as e:  # noqa: BLE001 — absent or unreadable: never a guessed gate
+            raise LaneDInputsError(code, f"the {what} document is unreadable ({e})") from e
+        if not isinstance(raw, (bytes, bytearray)):
+            raise LaneDInputsError(code, f"the {what} document is not bytes "
+                                         f"({type(raw).__name__})")
+        return bytes(raw)
+
+    def _armed(self) -> dict:
+        """rev6.6: the settlement's W5d armed record from the pinned readiness
+        and T7 documents' bytes (read now, once per settlement)."""
+        from ..eval.lane_d_scorer import armed_record
+
+        readiness = self._document(self._readiness, "readiness_unavailable",
+                                   "laned_readiness/1")
+        t7 = self._document(self._t7, "t7_unavailable", "laned_t7/1")
+        try:
+            rec = armed_record(self.cfg.lane_d.contexts, readiness=readiness, t7=t7,
+                               min_long_series=self.cfg.lane_d.min_long_series)
+        except ValueError as e:
+            raise LaneDInputsError("armed_invalid", str(e)) from e
+        if not rec["armed_contexts"]:
+            raise LaneDInputsError("no_armed_context",
+                                   "no lane D variant passes both gates; nothing can be scored")
+        return rec
+
     # ── the forecasts ───────────────────────────────────────────────────────
 
-    def _house_context(self) -> int:
-        armed = tuple(int(c) for c in self.cfg.lane_d.contexts)
-        return HOUSE_TRAINED_CONTEXT if HOUSE_TRAINED_CONTEXT in armed else min(armed)
-
-    def _needed(self, entries: list[dict], state: dict, house: dict
+    def _needed(self, entries: list[dict], state: dict, house: dict, armed: Sequence[int]
                 ) -> tuple[dict[str, int], frozenset[str]]:
         """``({digest: context}, bars)``: every digest the settlement may read
-        a forecast of, and the subset that are bars (KING_D, the house, a
-        confirm stage's original king), whose fault refuses the tick."""
+        a forecast of, at its effective context under ``armed`` (rev6.6), and
+        the subset that are bars (KING_D, the house, a confirm stage's
+        original king), whose fault refuses the tick. An entry declaring a
+        context outside ``[lane_d] contexts`` is not forecast: the settlement
+        closes it at registration (``context_not_armed``)."""
+        from ..eval.lane_d_scorer import effective_context
+
+        declarable = {int(c) for c in self.cfg.lane_d.contexts}
+
+        def eff(declared: int) -> int:
+            return effective_context(int(declared), armed)
+
         records = state["entries"]
-        house_ctx = self._house_context()
+        house_ctx = eff(HOUSE_TRAINED_CONTEXT)
         houses = {str(state["house"]["digest"]), str(house["digest"])}
         king = state["king"]
         bars = set(houses) | {str(king["digest"])}
@@ -293,17 +341,22 @@ class LaneDInputsSource:
                 bars.add(str(conf["king_digest"]))
         ctx: dict[str, int] = {}
         for e in entries:
-            ctx.setdefault(e["digest"], int(e["context"]))
+            if int(e["context"]) in declarable:
+                ctx.setdefault(e["digest"], eff(e["context"]))
         from .lane_d import OPEN_STATUSES
 
         for dg, rec in sorted(records.items()):
-            if rec.get("status") in OPEN_STATUSES:
-                ctx.setdefault(str(dg), int(rec["context"]))
+            if rec.get("status") in OPEN_STATUSES and int(rec["context"]) in declarable:
+                ctx.setdefault(str(dg), eff(rec["context"]))
         for dg in sorted(bars):
             if dg in houses or (dg == str(king["digest"]) and king.get("house")):
                 ctx[dg] = house_ctx
+            elif dg in records and int(records[dg]["context"]) in declarable:
+                ctx[dg] = eff(records[dg]["context"])
             elif dg in records:
-                ctx[dg] = int(records[dg]["context"])
+                raise LaneDInputsError("state_unreadable",
+                                       f"king {dg[:16]} declares context "
+                                       f"{records[dg]['context']} outside [lane_d] contexts")
             else:
                 raise LaneDInputsError("state_unreadable",
                                        f"the state names king {dg[:16]} with no entry record "
@@ -323,7 +376,7 @@ class LaneDInputsSource:
         return [{"window_id": wid, "history": first[wid]} for wid in sorted(first)]
 
     def _forecasts(self, need: dict[str, int], bars: frozenset[str], windows: list[dict],
-                   state: dict, house: dict) -> dict:
+                   state: dict, house: dict, armed: Sequence[int]) -> dict:
         from ..eval.lane_d_handshake import HandshakeMismatch, check_handshake
 
         try:
@@ -338,6 +391,9 @@ class LaneDInputsSource:
         pin = getattr(self._eval_host, "set_pinned", None)
         if callable(pin):
             pin(king_d=str(state["king"]["digest"]), house=str(house["digest"]))
+        arm = getattr(self._eval_host, "set_armed", None)
+        if callable(arm):
+            arm([int(c) for c in armed])
         horizon = int(self.cfg.lane_d.horizon)
         n = len(windows)
         ids = [w["window_id"] for w in windows]
@@ -393,32 +449,53 @@ class LaneDInputsSource:
         house = self._house()
         state = self._state(house)
         pools = self._pools(b)
+        armed = self._armed()
+        ctxs = tuple(armed["armed_contexts"])
         windows = self._windows(pools)
-        need, bars = self._needed(entries, state, house)
-        forecasts = self._forecasts(need, bars, windows, state, house)
+        need, bars = self._needed(entries, state, house, ctxs)
+        forecasts = self._forecasts(need, bars, windows, state, house, ctxs)
         dirs = [d for d, _ in pools]
         return LaneDInputs(pool_dir=dirs[-1], entries=entries, forecasts=forecasts,
-                           uid_of=uid_of, house=house, prior_pool_dirs=tuple(dirs[:-1]))
+                           uid_of=uid_of, house=house, prior_pool_dirs=tuple(dirs[:-1]),
+                           armed=armed)
 
 
 def build_lane_d_inputs(cfg: Any, *, state_dir, intake_state_dir,
                         chain_factory: Callable[[], Any], pool, eval_host, house_pointer,
-                        house_signer_ss58: str, bench_host: Callable | None = None,
+                        house_signer_ss58: str, readiness: Callable[[], bytes],
+                        t7: Callable[[], bytes], bench_host: Callable | None = None,
                         expected_identity=None) -> LaneDInputsSource | None:
     """The lane D inputs source for ``cfg`` (the full ``ChainConfig``), or
     ``None`` while ``[lane_d] from_block = 0`` (nothing is called, read or
-    created). Building an armed source reads nothing."""
+    created). Building an armed source reads nothing. ``readiness`` / ``t7``
+    (rev6.6) return the pinned ``laned_readiness/1`` / ``laned_t7/1``
+    document bytes, read once per settlement (:class:`DocumentFile`)."""
     if int(getattr(getattr(cfg, "lane_d", None), "from_block", 0) or 0) <= 0:
         return None
     return LaneDInputsSource(cfg, state_dir=state_dir, intake_state_dir=intake_state_dir,
                              chain_factory=chain_factory, pool=pool, eval_host=eval_host,
                              house_pointer=house_pointer, house_signer_ss58=house_signer_ss58,
-                             bench_host=bench_host, expected_identity=expected_identity)
+                             readiness=readiness, t7=t7, bench_host=bench_host,
+                             expected_identity=expected_identity)
 
 
 # ── the production collaborators ─────────────────────────────────────────────
 
 POOL_PINS_SCHEMA = "lane-d-pool-pins/1"
+
+
+class DocumentFile:
+    """A pinned evidence document (rev6.6: ``laned_readiness/1``,
+    ``laned_t7/1``): ``doc()`` is the file's bytes, re-read at every call so
+    an update arms a variant at the next settlement without a restart (the
+    signed report pins the bytes used by sha256). Any defect raises (the
+    source's ``readiness_unavailable`` / ``t7_unavailable``)."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+
+    def __call__(self) -> bytes:
+        return self.path.read_bytes()
 
 
 class PinFilePool:
@@ -560,6 +637,11 @@ class SSHEvalHost:
         """KING_D and the house: the eval host's cache never evicts them."""
         self._pinned = {"king_d": king_d, "house": house}
 
+    def set_armed(self, contexts) -> None:
+        """rev6.6: the settlement's armed set, sent from now on as the
+        request's ``contexts`` (the eval host's ``declared_context`` gate)."""
+        self.contexts = tuple(int(c) for c in contexts)
+
     @staticmethod
     def _cut(history, context: int) -> np.ndarray:
         h = np.asarray(history, dtype=np.float64).reshape(-1)
@@ -596,9 +678,10 @@ class SSHEvalHost:
 
 INPUTS_FILE_KEYS = ("intake_state_dir", "pool_pins", "house_pointer", "house_signer_ss58",
                     "eval_hosts", "eval_host_name", "eval_cache_dir", "eval_cache_budget_bytes",
-                    "eval_device", "eval_timeout_seconds", "grant_expires_seconds")
+                    "eval_device", "eval_timeout_seconds", "grant_expires_seconds",
+                    "readiness", "t7")
 _REQUIRED_KEYS = ("intake_state_dir", "pool_pins", "house_pointer", "house_signer_ss58",
-                  "eval_hosts", "eval_cache_dir", "eval_cache_budget_bytes")
+                  "eval_hosts", "eval_cache_dir", "eval_cache_budget_bytes", "readiness", "t7")
 
 
 def load_inputs_services(cfg: Any, path) -> dict:
@@ -617,6 +700,8 @@ def load_inputs_services(cfg: Any, path) -> dict:
         eval_device = "cuda"                        # optional
         eval_timeout_seconds = 3600                 # optional, per SSH call
         grant_expires_seconds = 3600                # optional, presigned GET lifetime
+        readiness = "/abs/laned_readiness.json"     # rev6.6: laned_readiness/1 (DocumentFile)
+        t7 = "/abs/t7.json"                         # rev6.6: laned_t7/1 pod evidence
 
     Returns the keyword arguments (``bench_host`` is ``None``: no lane D
     bench host transport exists yet, so a crowning candidate holds).
@@ -658,9 +743,10 @@ def load_inputs_services(cfg: Any, path) -> dict:
                        timeout_s=float(raw.get("eval_timeout_seconds", 3600)), grants=grants)
     return {"intake_state_dir": intake, "pool": PinFilePool(raw["pool_pins"]),
             "eval_host": host, "house_pointer": Path(raw["house_pointer"]),
-            "house_signer_ss58": raw["house_signer_ss58"], "bench_host": None}
+            "house_signer_ss58": raw["house_signer_ss58"], "bench_host": None,
+            "readiness": DocumentFile(raw["readiness"]), "t7": DocumentFile(raw["t7"])}
 
 
-__all__ = ["INPUTS_ERROR_CODES", "LaneDInputsConfigError", "LaneDInputsError",
+__all__ = ["INPUTS_ERROR_CODES", "DocumentFile", "LaneDInputsConfigError", "LaneDInputsError",
            "LaneDInputsSource", "PinFilePool", "SSHEvalHost", "VaultGetGrants",
            "build_lane_d_inputs", "load_inputs_services"]
