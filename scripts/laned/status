@@ -42,6 +42,16 @@ IMPLEMENTATION) is the L2 commit of each of its WPs: no tests/accept/ file,
 the WP's own PATHS and at most 2 other WPs' PATHS (at REF) match every file
 exactly once, each matching some (lanedlib.is_batch_impl_commit).
 
+FEATURE rule (plan rev6.17, accept --help): a PR may carry tests and code for
+any number of laned:<WP> labels. LABELLED L2 rule: its squash merge (subject
+`... (#N)`) is the L2 commit of a WP iff PR N carried laned:<WP> and the
+merge changes a non-test path the WP's PATHS match; a PR whose labels are
+known but lack the WP never is (lanedlib.impl_commit_index). Labels: the
+`gh pr list` file in $LANED_PR_LABELS plus the ledger's PR rows (field
+`pr`). A green `combined` row makes the merge that changes tests/accept/<wp>/
+the WP's L1 commit too (`combined_commit`). The git-only rules above apply
+only to commits with no PR number or unknown labels.
+
 Ci-only WPs pass L4 automatically (§17.1). L4 for external WPs and an
 execution-stage gate need the evidence blob at REF to
 have been verified by a green push/accept run (`accept <WP> --evidence F`,
@@ -309,8 +319,16 @@ class Board:
         self.detail: dict[str, dict] = {}
         self.verification_wps = lanedlib.parse_verification_wps(tree.show(lanedlib.VERIFICATION_WPS_PATH))
         self._paths_sets: dict[str, list[str]] | None = None
+        self._subjects: dict[str, str] | None = None
+        self._pr_labels: dict[int, set[str]] | None = None
+        self.pr_labels_extra: dict[int, set[str]] = lanedlib.pr_labels_file()
 
     # -- per-level conditions ------------------------------------------------
+    def subjects(self) -> dict[str, str]:
+        if self._subjects is None:
+            self._subjects = lanedlib.first_parent_subjects(self.tree.root, self.tree.commit)
+        return self._subjects
+
     def l2_commit(self, wp: str, paths: list[str]) -> int | None:
         # shared with `accept --check-pr` (tests-only vs tests-correction);
         # with every other WP's PATHS a batch implementation squash merge
@@ -321,9 +339,15 @@ class Board:
             self._paths_sets = lanedlib.paths_sets_at(self.tree.root, self.tree.commit)
             self._coupled = lanedlib.parse_coupled_batches(
                 self.tree.show(lanedlib.COUPLED_BATCHES_PATH))
+        if self._pr_labels is None:
+            # LABELLED rule (rev6.17): known PR labels from --pr-labels /
+            # $LANED_PR_LABELS (gh pr list) and the ledger's PR rows
+            self._pr_labels = lanedlib.merge_pr_labels(self.pr_labels_extra,
+                                                       lanedlib.pr_labels_from_runs(self.runs))
         return lanedlib.impl_commit_index(self.tree.history, wp, paths,
                                           lanedlib.other_paths(self._paths_sets, wp),
-                                          lanedlib.coupled_paths(self._coupled, self._paths_sets, wp))
+                                          lanedlib.coupled_paths(self._coupled, self._paths_sets, wp),
+                                          self.subjects(), self._pr_labels)
 
     def verification_commit(self, wp: str, runs: list[dict]) -> int | None:
         """First-parent index of the merge of a green ``verification`` PR run:
@@ -426,8 +450,20 @@ class Board:
         # Verification WP (accept --help, MODE verification): the merge of a
         # green verification PR is both its L1 and its L2 commit.
         vf = self.verification_commit(wp, verified)
-        impl = self.l2_commit(wp, lanedlib.parse_paths(paths_text))
-        if not expect_fail_ok and vf is None:
+        paths = lanedlib.parse_paths(paths_text)
+        impl = self.l2_commit(wp, paths)
+        # FEATURE rule (rev6.17): L2 of a labelled squash merge (#N) comes
+        # from impl (LABELLED rule: the PR carried laned:<WP> and changed a
+        # non-test path in the WP's PATHS); a green `combined` row (tests +
+        # code) makes the merge that changes tests/accept/<wp>/ its L1 too.
+        comb = lanedlib.pr_merge_index(self.tree.history, self.subjects(), wp, paths,
+                                       lanedlib.green_pr_numbers(self.runs, wp, ("combined",)),
+                                       need_tests=True)
+        if comb is not None:
+            det["combined_commit"] = self.tree.history[comb][0]
+            det.setdefault("l1_commit", self.tree.history[comb][0])
+            det["expect_fail_success"] = True
+        if not expect_fail_ok and vf is None and comb is None:
             return 0
         if impl is None and vf is None:
             return 1
@@ -781,6 +817,9 @@ def test_inv4_in_a_helper_module():
 
 def cmd_selftest() -> int:
     failures: list[str] = []
+    # the fixture repo's `(#N)` subjects must never meet the real repo's PR
+    # labels (the workflow exports LANED_PR_LABELS)
+    os.environ.pop("LANED_PR_LABELS", None)
 
     def expect(cond: bool, what: str) -> None:
         if not cond:
@@ -1026,6 +1065,69 @@ def cmd_selftest() -> int:
                    f"batch impl {wp}: {det}, want L2 at {impl12}")
         expect(data["wps"]["B3"]["level"] == "L1",
                f"a merge with a stray file gave B3 {data['wps']['B3']['level']}, want L1")
+
+        # (7) FEATURE / LABELLED rules (rev6.17): one squash merge (#7)
+        # labelled F1 F2 carries F1's new tests, PATHS and code plus F2's code
+        # (overlapping PATHS fc/): F1's green `combined` row makes it F1's L1
+        # and L2, F2's label + f2/ change its L2. F3 (PATHS fc/ f3/, not
+        # labelled) gets nothing from #7 nor from #8, a merge labelled F1 that
+        # only changes fc/core.py (all inside F3's PATHS: the git-only rule
+        # would have said L2, the #817 / W5i case); #9, labelled F3 but
+        # changing only F3's tests, is no L2 either.
+        put(PLAN, (root / PLAN).read_text() + "".join(
+            f"| {w} | feature {w} | — | ci | `scripts/laned/accept {w}` |\n" for w in ("F1", "F2", "F3")))
+        put("tests/accept/f2/PATHS", "fc/\nf2/\n")
+        put("tests/accept/f2/test_f2.py", "def test_f2():\n    assert True\n")
+        put("tests/accept/f3/PATHS", "fc/\nf3/\n")
+        put("tests/accept/f3/test_f3.py", "def test_f3():\n    assert True\n")
+        f_tests = commit("tests F2 F3 (#6)")
+        put("tests/accept/f1/PATHS", "fc/\nf1/\n")
+        put("tests/accept/f1/test_f1.py", "def test_f1():\n    assert True\n")
+        put("fc/core.py", "VALUE = 1\n")
+        put("f1/mod.py", "VALUE = 1\n")
+        put("f2/mod.py", "VALUE = 1\n")
+        feat = commit("feat(laned): F1 F2 core (#7)")
+        put("fc/core.py", "VALUE = 2\n")
+        only_core = commit("fix(laned): F1 core (#8)")
+        put("tests/accept/f3/test_f3_more.py", "def test_more():\n    assert True\n")
+        commit("tests(laned): F3 more (#9)")
+
+        def pr_row(w: str, m: str, pr: int) -> dict:
+            return {"workflow": "laned-accept", "event": "pull_request", "wp": w, "mode": m, "pr": pr,
+                    "head_sha": "0" * 40, "conclusion": "success", "created_at": "2026-11-23T01:00:00Z"}
+
+        f_runs = [pr_row("F1", "combined", 7), pr_row("F2", "accept", 7), pr_row("F1", "accept", 8),
+                  pr_row("F3", "tests-correction", 9)]
+        f_runs += [{"workflow": "laned-accept", "event": "pull_request", "mode": "expect-fail", "wp": w,
+                    "head_sha": f_tests, "conclusion": "success"} for w in ("F2", "F3")]
+        _, data = level(f_runs, "F1")
+        f1, f2, f3 = (data["wps"][w] for w in ("F1", "F2", "F3"))
+        expect(f1["level"] == "L2" and f1.get("l1_commit") == feat and f1.get("l2_commit") == feat,
+               f"feature F1: {f1}, want L1 + L2 at {feat}")
+        expect(f2["level"] == "L2" and f2.get("l2_commit") == feat, f"feature F2: {f2}, want L2 at {feat}")
+        expect(f3["level"] == "L1" and "l2_commit" not in f3,
+               f"F3 (never labelled on a code merge): {f3}, want L1")
+        # without any label knowledge the git-only rule takes #8 as F3's L2
+        # (the old behaviour); a labels file saying #8 carried only laned:F1
+        # restores the LABELLED rule
+        legacy = [r for r in f_runs if "pr" not in r]
+        _, data = level(legacy, "F1")
+        expect(data["wps"]["F3"].get("l2_commit") == only_core,
+               f"legacy git-only rule: F3 {data['wps']['F3']}, want L2 at {only_core}")
+        labels_file = Path(tmp) / "pr_labels.json"
+        labels_file.write_text(json.dumps([{"number": n, "labels": [{"name": f"laned:{w}"} for w in ws]}
+                                           for n, ws in ((7, ("F1", "F2")), (8, ("F1",)), (9, ("F3",)))]))
+        saved_labels = os.environ.get("LANED_PR_LABELS")
+        os.environ["LANED_PR_LABELS"] = str(labels_file)
+        try:
+            _, data = level(legacy, "F1")
+        finally:
+            if saved_labels is None:
+                os.environ.pop("LANED_PR_LABELS", None)
+            else:
+                os.environ["LANED_PR_LABELS"] = saved_labels
+        expect(data["wps"]["F3"]["level"] == "L1" and data["wps"]["F2"].get("l2_commit") == feat,
+               f"labels file: F3 {data['wps']['F3']}, F2 {data['wps']['F2']}")
     for f in failures:
         print(f"status selftest: FAIL {f}", file=sys.stderr)
     if failures:
