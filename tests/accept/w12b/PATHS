@@ -1,0 +1,15 @@
+# W12b: `cascade status --json` and `discovery-check` lane D fields (plan
+# rev6 §3.0 W12b row; depends on W2 and W17; README.md has the contract).
+#
+# `cascade status` builds its JSON in live_status.py: SOURCES (the public
+# status objects it reads), status_snapshot (lanes / queues / freshness) and
+# fetch_snapshot (sources URLs). The lane D source is W17's
+# status/lane_d.json (cascade/validator/lane_d_status.py, read-only here).
+cascade/miner/live_status.py
+# `cascade discovery-check` turns a snapshot into release checks
+# (check_snapshot: one `<lane>_queue` check per active lane).
+cascade/miner/discovery_check.py
+# The unit suite pins today's source count and queue set exactly
+# (`len(reads) == 5`, `== 10`, `queues == {"a", "b", "c"}`); adding the
+# lane D source changes those, so the builder updates them in the same PR.
+tests/unit/test_live_status.py
