@@ -1,12 +1,12 @@
-"""W0c (plan rev6.3 (b)): batch implementation PRs and batch tests-corrections.
+"""W0c (plan rev6.3 (b), rev6.17): feature PRs over several WPs.
 
-`scripts/laned/accept <WP> --check-pr --pr-wps A,B,C` lets one implementation
-PR carry up to 3 WPs when their PATHS are disjoint, none depends on another
-(plan §3.0 Depends, transitively) and each WP's tests are already on the base;
-every changed file must be in exactly one batch WP's PATHS. Each WP is still
+`scripts/laned/accept <WP> --check-pr --pr-wps A,B,C` lets one PR carry any
+number of laned:<WP> labels (rev6.17, one PR per feature): overlapping PATHS
+and in-batch Depends are allowed; every changed file must be in some
+labelled WP's PATHS and every label must own a changed file. Each WP is still
 accepted on its own, and the squash merge is each WP's L2 commit (status board
-and `built_on`). A tests-only PR for up to 3 WPs all built on the base is a
-batch of tests-corrections. A single label keeps the one-WP rules.
+and `built_on`). A tests-only batch has no size cap and may mix built and
+unbuilt WPs (MODE per WP). A single label keeps the one-WP rules.
 """
 
 from __future__ import annotations
@@ -117,15 +117,31 @@ def test_batch_implementation_passes_for_every_label(repo, labels):
             assert re.search(rf"^SCOPE {w} \d+ file\(s\)$", proc.stdout, re.M), proc.stdout
 
 
+PASSES = {
+    # rev6.17 FEATURE rule: none of these is refused any more
+    "four_wps": ["B1", "B2", "B3", "B4"],
+    "overlapping_paths": ["B1", "O1"],
+    "in_batch_dependency": ["B1", "D1"],
+    "transitive_dependency": ["D2", "B1"],
+    "deps_unknown": ["B1", "X1"],
+}
+
+
+@pytest.mark.parametrize("case", sorted(PASSES))
+def test_feature_batch_passes(repo, case):
+    labels = PASSES[case]
+    head = _branch(repo, f"pr-{case}", _impl(*labels))
+    for wp in labels:
+        proc = _check(repo, head, labels, wp)
+        assert proc.returncode == 0, output(proc)
+        lines = [ln for ln in proc.stdout.splitlines() if ln.startswith(("BATCH ", "MODE "))]
+        assert lines == ["BATCH " + " ".join(labels), "MODE implementation"], proc.stdout
+
+
 REFUSED = {
     # name: (labels, files, step, reason)
-    "four_wps": (["B1", "B2", "B3", "B4"], _impl("B1", "B2", "B3", "B4"), "rule1", "batch-too-many"),
-    "overlapping_paths": (["B1", "O1"], _impl("B1", "O1"), "rule1", "batch-overlapping-paths"),
-    "in_batch_dependency": (["B1", "D1"], _impl("B1", "D1"), "rule1", "batch-dependency"),
-    "transitive_dependency": (["D2", "B1"], _impl("B1", "D2"), "rule1", "batch-dependency"),
     "tests_not_on_main": (["B1", "N1"], {**_impl("B1"), "pkg/n1.py": "VALUE = 9\n"}, "rule1",
                           "batch-no-tests"),
-    "deps_unknown": (["B1", "X1"], _impl("B1", "X1"), "rule1", "batch-deps-unknown"),
     "file_in_no_wp": (["B1", "B2"], {**_impl("B1", "B2"), "README.md": "edited\n"}, "paths",
                       "batch-out-of-scope"),
     "laned_tooling": (["B1", "B2"], {**_impl("B1", "B2"), "scripts/laned/accept": "x\n"}, "paths",
@@ -148,25 +164,26 @@ def test_batch_implementation_refused(repo, case):
         assert "MODE " not in proc.stdout, proc.stdout
 
 
-def test_batch_dependency_message_names_both(repo):
-    head = _branch(repo, "pr-dep-msg", _impl("B1", "D2"))
-    proc = _check(repo, head, ["B1", "D2"])
-    assert "D2 depends on B1 (transitively)" in proc.stdout, output(proc)
+def test_dependent_batch_is_one_feature_pr(repo):
+    # rev6.17: D2 depends on B1 (transitively); one feature PR carries both
+    head = _branch(repo, "pr-dep-feature", _impl("B1", "D2"))
+    for wp in ("B1", "D2"):
+        proc = _check(repo, head, ["B1", "D2"], wp)
+        assert proc.returncode == 0, output(proc)
+        assert "depends on" not in proc.stdout, output(proc)
 
 
-def test_file_in_two_batch_wps_is_refused(repo):
-    # B1 and B4 both claim pkg/shared.py: a changed file in two batch WPs'
-    # PATHS. The disjointness gate refuses it (the same entry in both sets)
-    # before the scope check would (batch-ambiguous is its backstop).
+def test_file_in_two_batch_wps_is_owned_by_each(repo):
+    # B1 and B4 both claim pkg/shared.py: rev6.17 counts the changed file
+    # for each WP whose PATHS match it (no overlap / ambiguity refusal)
     write(repo, "tests/accept/b4/PATHS", "pkg/b4.py\npkg/shared.py\n")
     write(repo, "tests/accept/b1/PATHS", "pkg/b1.py\npkg/shared.py\n")
     commit(repo, "tests(laned): widen B1/B4", ["tests/accept/b1/PATHS", "tests/accept/b4/PATHS"])
-    head = _branch(repo, "pr-ambiguous", {**_impl("B1", "B4"), "pkg/shared.py": "S = 1\n"})
+    head = _branch(repo, "pr-shared", {**_impl("B1", "B4"), "pkg/shared.py": "S = 1\n"})
     proc = _check(repo, head, ["B1", "B4"])
-    assert proc.returncode != 0, output(proc)
-    # the disjointness gate fires first: the same entry in both sets
-    assert "FAIL rule1: batch-overlapping-paths" in proc.stdout, output(proc)
-    assert "pkg/shared.py" in proc.stdout, output(proc)
+    assert proc.returncode == 0, output(proc)
+    assert re.search(r"^SCOPE B1 2 file\(s\)$", proc.stdout, re.M), proc.stdout
+    assert re.search(r"^SCOPE B4 2 file\(s\)$", proc.stdout, re.M), proc.stdout
 
 
 def test_single_label_implementation_unchanged(repo):
@@ -240,20 +257,21 @@ def test_batch_merge_is_l2_for_each_wp(repo, tmp_path):
         assert proc.returncode == 0 and f"PASS {wp} tests-correction" in proc.stdout, output(proc)
     git(repo, "checkout", "-q", "main")
 
-    # a built WP and an unbuilt one in one tests batch: refused
+    # rev6.17: a built WP and an unbuilt one in one tests batch, each its own MODE
     mixed = {**more, "tests/accept/d1/test_d1_more.py": "def test_more():\n    assert False\n"}
     h = _branch(repo, "pr-mixed", mixed)
-    proc = _check(repo, h, ["B1", "D1"])
-    assert proc.returncode != 0 and "FAIL rule1: batch-built-wp" in proc.stdout, output(proc)
+    for wp, mode in (("B1", "tests-correction"), ("D1", "tests-only")):
+        proc = _check(repo, h, ["B1", "D1"], wp)
+        assert proc.returncode == 0 and re.search(rf"^MODE {mode}$", proc.stdout, re.M), output(proc)
 
-    # four built WPs: a corrections batch is at most 3
+    # rev6.17: four built WPs in one corrections batch (no cap)
     _branch(repo, "pr-b4", _impl("B4"))
     _squash(repo, "pr-b4", "feat: B4 (#10)")
     four = {f"tests/accept/{w.lower()}/test_{w.lower()}_more.py": "def test_more():\n    assert True\n"
             for w in ("B1", "B2", "B3", "B4")}
     h = _branch(repo, "pr-four-corrections", four)
     proc = _check(repo, h, ["B1", "B2", "B3", "B4"])
-    assert proc.returncode != 0 and "FAIL rule1: batch-too-many" in proc.stdout, output(proc)
+    assert proc.returncode == 0 and re.search(r"^MODE tests-correction$", proc.stdout, re.M), output(proc)
 
 
 def test_batch_impl_squash_with_foreign_file_is_not_l2(repo, tmp_path):
