@@ -11,6 +11,7 @@ from __future__ import annotations
 import fnmatch
 import itertools
 import json
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -393,7 +394,98 @@ def impl_commit_index(history: list[tuple[str, list[str]]], wp: str, paths: list
 
 
 # ---------------------------------------------------------------------------
-# Coupled batches (one implementation PR for WPs whose code must land together)
+# Feature PRs (rev6.17): the squash merge of a green laned:* PR, by PR number
+# ---------------------------------------------------------------------------
+
+# The GitHub squash / merge-queue subject ends with "(#<PR number>)".
+PR_SUBJECT = re.compile(r"\(#(\d+)\)\s*$")
+# A PR label that is a flag, never a WP: lets a combined (tests + code) PR
+# delete or weaken existing assertions of its WPs' tests (accept --check-pr).
+CORRECTION_LABEL = "tests-correction"
+# PR-run ledger modes whose green result attributes the PR's squash merge.
+PR_MERGE_MODES = ("accept", "combined")
+LEDGER_REFS = ("origin/laned/build-state", "laned/build-state")
+LEDGER_FILE = "status/ci_runs.json"
+
+
+def first_parent_subjects(root: Path, ref: str) -> dict[str, str]:
+    """``{sha: subject}`` along ``ref``'s first-parent line."""
+    out = git(root, "log", "--first-parent", "--format=%H%x09%s", ref, check=False).stdout
+    subjects: dict[str, str] = {}
+    for line in out.splitlines():
+        sha, _, subject = line.partition("\t")
+        if sha:
+            subjects[sha] = subject
+    return subjects
+
+
+def green_pr_numbers(runs: list[dict], wp: str, modes: tuple[str, ...] = PR_MERGE_MODES) -> set[int]:
+    """PR numbers whose LAST pull_request ledger row for ``wp`` (any of
+    ``modes``, or a check-pr row) is a green row in one of ``modes``: a PR
+    that went red (or failed check-pr) after a green run never counts."""
+    last: dict[int, dict] = {}
+    for r in runs:
+        pr = r.get("pr")
+        if (r.get("wp") != wp or r.get("event") != "pull_request"
+                or r.get("mode") not in (*PR_MERGE_MODES, "check-pr")
+                or not isinstance(pr, int) or isinstance(pr, bool)):
+            continue
+        if pr not in last or str(r.get("created_at", "")) >= str(last[pr].get("created_at", "")):
+            last[pr] = r
+    return {pr for pr, r in last.items() if r.get("mode") in modes and r.get("conclusion") == "success"}
+
+
+def pr_merge_index(history: list[tuple[str, list[str]]], subjects: dict[str, str], wp: str,
+                   paths: list[str], prs: set[int], need_tests: bool = False) -> int | None:
+    """The first first-parent commit that is the squash merge (subject
+    ``... (#N)``) of a PR in ``prs`` and changes a path the WP owns: one its
+    PATHS match or one under tests/accept/<wp>/ (with ``need_tests``: some
+    file under tests/accept/<wp>/). At or after the commit adding the PATHS
+    file (a combined PR may add it in the same merge). None when absent."""
+    if not prs:
+        return None
+    own = f"tests/accept/{wp_dir(wp)}/"
+    rel = own + "PATHS"
+    start = next((i for i, (_, files) in enumerate(history) if rel in files), None)
+    if start is None:
+        return None
+    for i in range(start, len(history)):
+        sha, files = history[i]
+        m = PR_SUBJECT.search(subjects.get(sha, ""))
+        if not m or int(m.group(1)) not in prs:
+            continue
+        tests = any(f.startswith(own) for f in files)
+        if (tests if need_tests else tests or any(path_matches(f, paths) for f in files)):
+            return i
+    return None
+
+
+def ledger_runs(root: Path) -> list[dict]:
+    """The CI results ledger (``status/ci_runs.json`` on laned/build-state):
+    ``$LANED_LEDGER`` (a file) when set, else the first of LEDGER_REFS that
+    has it, else none. Used by ``accept`` to see feature-PR L2 merges."""
+    env = os.environ.get("LANED_LEDGER")
+    text: str | None = None
+    if env:
+        p = Path(env)
+        text = p.read_text(encoding="utf-8") if p.is_file() else None
+    else:
+        for ref in LEDGER_REFS:
+            proc = git(root, "show", f"{ref}:{LEDGER_FILE}", check=False)
+            if proc.returncode == 0:
+                text = proc.stdout
+                break
+    try:
+        data = json.loads(text) if text else {}
+    except json.JSONDecodeError:
+        return []
+    runs = data.get("runs") if isinstance(data, dict) else None
+    return [r for r in runs if isinstance(r, dict)] if isinstance(runs, list) else []
+
+
+# ---------------------------------------------------------------------------
+# Coupled batches (legacy since rev6.17: still read for L2 attribution of
+# merges made under the COUPLED rule; check-pr no longer needs them)
 # ---------------------------------------------------------------------------
 
 COUPLED_BATCHES_PATH = "scripts/laned/coupled_batches"
