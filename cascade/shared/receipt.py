@@ -645,6 +645,13 @@ class RoundReceipt:
     # sentinel_record`) — satellites verify it from the block hash. None on
     # every unarmed receipt (bytes unchanged).
     sentinel: dict | None = None
+    # LANE_D_PLAN W14 (drop-when-default: only on a settlement lane D judges):
+    # the lane D receipt record — W7c's present record ``{schema, boundary,
+    # prior_state_sha256, posterior_state_sha256, report_sha256}`` or the
+    # absent one (``status: "absent"``, a typed ``reason``, one state digest),
+    # inside the signed body so satellites burn only lane D's share on an
+    # absent settlement. None on every unarmed receipt (bytes unchanged).
+    lane_d: dict | None = None
     receipt_version: int = RECEIPT_VERSION
     signature: str | None = None             # validator-hotkey signature over canonical_body
 
@@ -726,6 +733,8 @@ class RoundReceipt:
             body["bench_report"] = json.loads(json.dumps(self.bench_report, sort_keys=True))
         if self.sentinel is not None:
             body["sentinel"] = json.loads(json.dumps(self.sentinel, sort_keys=True))
+        if self.lane_d is not None:
+            body["lane_d"] = json.loads(json.dumps(self.lane_d, sort_keys=True))
         return json.dumps(
             body, sort_keys=True, separators=(",", ":"), allow_nan=False
         ).encode("utf-8")
@@ -782,6 +791,7 @@ def build_receipt(
     state_post: dict | None = None,
     bench_report: dict | None = None,
     sentinel: dict | None = None,
+    lane_d: dict | None = None,
 ) -> RoundReceipt:
     """Assemble a receipt from live-loop objects (``seeds`` is a ``RoundSeeds``).
 
@@ -828,6 +838,7 @@ def build_receipt(
         state_post=None if state_post is None else dict(state_post),
         bench_report=None if bench_report is None else dict(bench_report),
         sentinel=None if sentinel is None else dict(sentinel),
+        lane_d=None if lane_d is None else dict(lane_d),
     )
 
 
@@ -1021,6 +1032,7 @@ def _receipt_from_obj(obj: dict) -> RoundReceipt:
         bench_report=(dict(obj["bench_report"]) if isinstance(obj.get("bench_report"), dict)
                       else None),
         sentinel=(dict(obj["sentinel"]) if isinstance(obj.get("sentinel"), dict) else None),
+        lane_d=(dict(obj["lane_d"]) if isinstance(obj.get("lane_d"), dict) else None),
         receipt_version=version,
         signature=obj.get("signature"),
     )
