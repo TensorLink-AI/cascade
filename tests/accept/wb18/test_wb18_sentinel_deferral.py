@@ -1,7 +1,8 @@
 """WB18: sentinel interaction (plan §3.0 lane B track, §12b.5 LB5, D35;
 T-rows TB19, TB20 and TS4).
 
-The WB18 row, verbatim:
+The WB18 row (its description as of rev4; rev6.2 appends an owner follow-up
+note on the payer-key TTL, pinned too):
 
     | WB18 | Sentinel interaction (D35/LB5): suite-target deferral,
     `sentinel_max_defer_eras`, no charge on deferral | `status/lane_b.json`
@@ -96,12 +97,35 @@ def _assert_started(sc, hotkey: str, target: str) -> None:
 # ── the plan text these tests implement ──────────────────────────────────────
 
 
+def _plan_row(text: str, wp: str) -> list[str]:
+    """The cells of the plan's WP table row for ``wp`` (exactly one row)."""
+    rows = [ln for ln in text.splitlines() if ln.startswith(f"| {wp} | ")]
+    assert len(rows) == 1, f"expected exactly one plan row for {wp}; got {len(rows)}"
+    cells = [c.strip() for c in rows[0].strip().strip("|").split(" | ")]
+    assert len(cells) == 6, f"{wp} row has {len(cells)} cells: {cells!r}"
+    return cells
+
+
 def test_plan_rows_pinned():
     text = h.PLAN.read_text(encoding="utf-8")
-    assert ("| WB18 | Sentinel interaction (D35/LB5): suite-target deferral, "
-            "`sentinel_max_defer_eras`, no charge on deferral | `status/lane_b.json` "
-            "`deferred: sentinel_target` | W-S1, WB10 | ci | `scripts/laned/accept WB18` "
-            "(TB19–TB20, TS4) |") in text
+    # The WB18 row: id, outputs, depends, runs-in and accept cells exact; the
+    # description keeps its original phrase (later revisions may append notes).
+    wid, desc, outputs, depends, runs_in, accept = _plan_row(text, "WB18")
+    assert (wid, outputs, depends, runs_in, accept) == (
+        "WB18", "`status/lane_b.json` `deferred: sentinel_target`", "W-S1, WB10", "ci",
+        "`scripts/laned/accept WB18` (TB19–TB20, TS4)")
+    assert desc.startswith(
+        "Sentinel interaction (D35/LB5): suite-target deferral, "
+        "`sentinel_max_defer_eras`, no charge on deferral"), desc
+    # rev6.2 (#636) owner-decision note: the payer-key TTL follow-up.
+    flat_desc = _flat(desc)
+    for note in (
+        "**(rev6.2, owner 2026-11-22) Follow-up WP note:**",
+        "its payer key in `PayerKeyVault` (`cascade/funding/vault.py`) has its TTL "
+        "refreshed on each deferred tick",
+        "so a deferral never outlives the key the leg rents on",
+    ):
+        assert note in flat_desc, note
     assert ("| TB19 | **(rev4)** Suite-target entry on the current sentinel suite | "
             "`deferred: sentinel_target`, not charged; judged in a later era |") in text
     assert ("| TB20 | **(rev4)** Same entry past `sentinel_max_defer_eras` | "
