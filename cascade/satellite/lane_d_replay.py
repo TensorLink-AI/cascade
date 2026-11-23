@@ -30,8 +30,9 @@ Per settlement, in order (the first two can end the settlement early):
    forward-only bound on both clocks, the floors, one finite row per
    (window, scored model), the max-T LCB, gain and clear against KING_D and,
    when a miner holds KING_D, against the house as a second bar;
-3. the chain rules: ``king_before`` (C2), D20 stages, confirmation records
-   and disjoint confirmation sets (C4), held candidates (C6), the §1.3b gate
+3. the chain rules: ``king_before`` (C2), every cohort a first (and only)
+   verdict against KING_D (C4, rev6.11 (b): no confirmation stage, record or
+   D20 rule), held candidates (C6), the §1.3b gate
    draw and its results' outcomes from their LCBs, the crown, ``king_after``,
    ``prior_kings`` (C3), the paid court and its decayed shares (C5) and the
    receipt links (C1);
@@ -41,9 +42,9 @@ W5f (§1.4 "The house", §2 items 1-2, T10), re-derived from the chain: a new
 house digest while a miner holds KING_D (and is neither KING_D nor a prior
 king) opens a house challenger. It is judged alone in its own cohort
 (``members == [house]``, ``king_digest`` = KING_D, no ``house_digest``, its T
-the report's house record's), first clear then confirmation (D20) on its own
-progress, never a miner entry's of the same digest. A confirmed, passing
-house retakes KING_D: ``king_after`` is the house record, the miner king the
+the report's house record's), crowned at its first clear (A10 and the gate
+decide) on its own progress, never a miner entry's of the same digest. A
+cleared, passing house retakes KING_D: ``king_after`` is the house record, the miner king the
 newest prior king, the slot burns (``house_king``) and ``crowned`` is null. A
 lost house is not judged again; a retake or a new pointer ends it. An entry
 is ``duplicate_digest`` exactly when it is a copy: a new entry naming the
@@ -110,9 +111,9 @@ _WINDOW_KEYS = frozenset({"window_id", "source", "feed", "min_target_ts", "min_f
 _COHORT_KEYS = frozenset({"index", "king_digest", "king_reveal_ts", "stage", "members", "t_max",
                           "window_ids", "set_sha256", "first_seen_roots", "refused"})
 _VERDICT_KEYS = frozenset({"digest", "king_digest", "stage", "cohort", "lcb", "gain", "cleared",
-                           "outcome", "confirmation", "lowfreq"})
+                           "outcome", "lowfreq"})
 _ENTRY_STABLE = ("hotkey", "coldkey", "context", "ready_block", "reveal_block", "reveal_ts")
-OPEN_STATUSES = ("pending", "confirm_pending")
+OPEN_STATUSES = ("pending", "hold")
 # The chain's internal key of the house challenger's progress (pending first
 # clear, hold, used windows, status): never a miner entry's key, so a miner
 # copy of the house never lends it its progress.
@@ -343,7 +344,6 @@ def expected_params(cfg) -> dict:
             "d_margin": float(cfg.d_margin), "alpha": float(cfg.alpha),
             "bootstrap_B": int(cfg.bootstrap_B), "king_decay": float(cfg.king_decay),
             "reward_prior_kings": int(cfg.reward_prior_kings),
-            "confirm_on_king_change": str(cfg.confirm_on_king_change),
             "max_entries_per_settlement": int(cfg.max_entries_per_settlement),
             "max_judged_per_coldkey_per_settlement":
                 int(cfg.max_judged_per_coldkey_per_settlement),
@@ -617,9 +617,10 @@ class _Chain:
     king: dict | None = None              # KING_D after the last settlement
     house: str | None = None              # the last report's house digest
     prior_kings: list = field(default_factory=list)
-    # digest -> the open first clear {set_sha256, king_digest, king_reveal_ts}
+    # rev6.11 (b): no confirmation stage, so nothing is ever pending a
+    # second set; kept empty so a chain copy has one shape.
     pending: dict = field(default_factory=dict)
-    # digest -> an undecided cleared confirmation {lcb, king_d}
+    # digest -> an undecided cleared first verdict (a bench_hold) {lcb, king_d}
     holds: dict = field(default_factory=dict)
     # digest -> every window id it has been judged on
     used: dict = field(default_factory=dict)
@@ -667,7 +668,6 @@ class _Settlement:
         self.b = boundary
         self.metagraph = metagraph
         self.d = _Paths()
-        self.rule = str(cfg.confirm_on_king_change)
         self.rpk = max(0, int(cfg.reward_prior_kings))
         self.house: dict | None = None
         self.king_before: dict | None = None
@@ -970,27 +970,25 @@ class _Settlement:
     # ── cohorts and verdicts ────────────────────────────────────────────────
 
     def _expected_stage(self, m: str) -> tuple[str, str, int]:
-        """C4 / D20: ``(stage, king digest, king reveal_ts)`` member ``m`` is
-        judged at: ``confirm`` against KING_D after a first clear against it;
-        after a king change ``original`` confirms against the first-clear
-        king and ``restart`` sends the entry back to stage ``first``."""
+        """C4: ``(stage, king digest, king reveal_ts)`` member ``m`` is judged
+        at. rev6.11 (b): always its first (and only) verdict against KING_D."""
         kb = self.king_before
-        p = self.chain.pending.get(m)
-        if p is not None and p["king_digest"] == kb["digest"]:
-            return "confirm", kb["digest"], int(kb["reveal_ts"])
-        if p is not None and self.rule == "original":
-            return "confirm", p["king_digest"], int(p["king_reveal_ts"])
         return "first", kb["digest"], int(kb["reveal_ts"])
 
     def _held_candidates(self) -> None:
-        """C6: the entries holding an undecided cleared confirmation. After a
-        king change ``restart`` drops the hold (the entry restarts)."""
+        """C6: the entries holding an undecided cleared first verdict. After
+        a king change the hold is dropped (no D20 rule; the entry is judged
+        afresh)."""
         kb = self.king_before["digest"]
         for dg in sorted(self.chain.holds):
             if dg.startswith(_HOUSE_KEY) and (dg != self.hkey or not self._house_open()):
                 # Only an open house challenger's hold is re-gated.
                 self.dropped_holds.append(dg)
-            elif self.chain.holds[dg]["king_d"] != kb and self.rule != "original":
+            elif dg == self.house["digest"]:
+                # A held miner entry the new pointer names is a copy of the
+                # house: closed ``duplicate_digest``, its hold dropped (W5f).
+                self.dropped_holds.append(dg)
+            elif self.chain.holds[dg]["king_d"] != kb:
                 self.dropped_holds.append(dg)
             else:
                 self.held.append(dg)
@@ -1186,14 +1184,8 @@ class _Settlement:
                     d.add(f"{at}.house.gain")
                 if hv.get("cleared") is not vs_house[2]:
                     d.add(f"{at}.house.cleared")
-        # C4: a confirmation names the first clear it confirms.
-        p = self.chain.pending.get(m) if stage == "confirm" else None
-        _compare(d, f"{at}.confirmation",
-                 {"stage": stage, "rule": self.rule,
-                  "first_set_sha256": p["set_sha256"] if p else None,
-                  "first_king_digest": p["king_digest"] if p else None},
-                 v.get("confirmation"))
-        return self._lowfreq(at, v.get("lowfreq"), cleared and stage == "confirm")
+        # rev6.11 (b): a cleared first verdict is the crowning candidate.
+        return self._lowfreq(at, v.get("lowfreq"), cleared)
 
     def _lowfreq(self, at: str, lf, candidate: bool) -> bool:
         """W3b5 (A10): a crowning candidate's low-frequency slice is
@@ -1234,7 +1226,7 @@ class _Settlement:
     def _candidates(self) -> list[dict]:
         out = [{"digest": v.digest, "key": v.key, "lcb": v.lcb, "held": False}
                for v in self.verdicts
-               if v.cleared and v.stage == "confirm" and not v.lowfreq_fail]
+               if v.cleared and not v.lowfreq_fail]
         out += [{"digest": self._dg(k), "key": k, "lcb": float(self.chain.holds[k]["lcb"]),
                  "held": True} for k in self.held]
         for c in out:
@@ -1285,11 +1277,11 @@ class _Settlement:
             if dg in self.gate_out:
                 self.d.add(f"{at}.digest")
                 continue
-            # C6: a result is a crowning candidate's: a cleared confirmation
+            # C6: a result is a crowning candidate's: a cleared first verdict
             # of this settlement, or a held candidate whose entry was still
-            # confirm_pending.
+            # on hold.
             c = names.get(dg)
-            if c is None or (c["held"] and self.chain.status.get(c["key"]) != "confirm_pending"):
+            if c is None or (c["held"] and self.chain.status.get(c["key"]) != "hold"):
                 self.d.add(f"{at}.digest")
                 continue
             self._held_from(at, res, c)
@@ -1305,8 +1297,8 @@ class _Settlement:
     def _held_from(self, at: str, res: dict, cand: dict) -> None:
         """RV7 B2: a held candidate's result names its hold, and only a held
         candidate's does. The hold is re-derived from this chain: the earlier
-        verified report (by its body digest) in which the digest's
-        confirmation cleared as ``confirmed`` with the gate absent or
+        verified report (by its body digest) in which the digest's first
+        verdict cleared as ``cleared`` with the gate absent or
         ``bench_hold``, that cohort's ``set_sha256``, the verdict's KING_D
         ``lcb`` and the KING_D it was taken under. An invented or altered
         ``held_from`` differs from it."""
@@ -1338,10 +1330,8 @@ class _Settlement:
         self.crown = None if self.retake or not passing else passing[0]["digest"]
         verdicts = verdicts_of(self.r)
         for v in self.verdicts:
-            if not v.cleared or (v.stage == "confirm" and v.lowfreq_fail):
+            if not v.cleared or v.lowfreq_fail:
                 v.outcome = "lost"
-            elif v.stage == "first":
-                v.outcome = "confirm_pending"
             else:
                 o = self._gate_outcome(v.digest)
                 if o in ("gate_regression", "checkpoint_fault"):
@@ -1349,7 +1339,7 @@ class _Settlement:
                 elif o == "pass" and v.key == self.crown_key:
                     v.outcome = "crowned"
                 else:
-                    v.outcome = "confirmed"
+                    v.outcome = "cleared"
             if verdicts[v.index].get("outcome") != v.outcome:
                 self.d.add(f"verdicts[{v.index}].outcome")
 
@@ -1416,8 +1406,6 @@ class _Settlement:
         for v in self.verdicts:
             if v.outcome == "crowned":
                 want[v.key] = ("crowned", "crowned")
-            elif v.outcome == "confirm_pending":
-                want[v.key] = ("confirm_pending", "confirm_pending")
             elif v.outcome == "lost":
                 o = self._gate_outcome(v.digest) if v.cleared else None
                 if v.cleared and v.lowfreq_fail:
@@ -1427,16 +1415,15 @@ class _Settlement:
                 elif o == "gate_regression":
                     want[v.key] = ("lost", "gate_regression")
                 else:
-                    want[v.key] = ("lost", "lost_confirmation" if v.stage == "confirm"
-                                   else "lost_duel")
+                    want[v.key] = ("lost", "lost_duel")
             elif self._gate_outcome(v.digest) == "bench_hold":
-                want[v.key] = ("confirm_pending", "bench_hold")
+                want[v.key] = ("hold", "bench_hold")
         for key in self.held:
             o = self._gate_outcome(self._dg(key))
             if key == self.crown_key:
                 want[key] = ("crowned", "crowned")
             elif o == "bench_hold":
-                want[key] = ("confirm_pending", "bench_hold")
+                want[key] = ("hold", "bench_hold")
             elif o == "gate_regression":
                 want[key] = ("lost", "gate_regression")
             elif o == "checkpoint_fault":
@@ -1566,18 +1553,13 @@ class _Settlement:
             c.pending.pop(dg, None)
         for v in self.verdicts:
             c.used.setdefault(v.key, set()).update(v.windows)
-            if v.outcome == "confirm_pending":
-                c.pending[v.key] = {"set_sha256": v.set_sha256, "king_digest": v.king,
-                                    "king_reveal_ts": v.king_ts}
-            elif v.stage == "first":
-                c.pending.pop(v.key, None)
         # A hold keeps its first record: the settlement (and its verified
-        # report body) whose confirmation cleared and the gate first held.
+        # report body) whose first verdict cleared and the gate first held.
         decided = [(v.key, {"boundary": self.b, "report_sha256": self.body_sha,
                             "set_sha256": v.set_sha256, "lcb": v.stated_lcb,
                             "king_d": self.king_before["digest"]})
                    for v in self.verdicts
-                   if v.cleared and v.stage == "confirm" and not v.lowfreq_fail]
+                   if v.cleared and not v.lowfreq_fail]
         decided += [(k, c.holds[k]) for k in self.held if k in c.holds]
         for key, record in decided:
             o = self._gate_outcome(self._dg(key))

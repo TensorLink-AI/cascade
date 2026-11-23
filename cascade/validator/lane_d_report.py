@@ -55,7 +55,9 @@ _SIGNATURE_RE = re.compile(r"[0-9a-f]{128}")
 
 # ── the typed enums (each equals the schema file's ``$defs.<name>.enum``) ────
 
-ENTRY_STATUSES = ("pending", "hold", "confirm_pending", "crowned", "lost", "closed")
+# rev6.11 (b): no confirmation stage, so no ``confirm_pending`` status or
+# reason and no ``lost_confirmation``; a bench_hold candidate is ``hold``.
+ENTRY_STATUSES = ("pending", "hold", "crowned", "lost", "closed")
 SKIP_REASONS = ("pending_floor", "coldkey_cap_settlement", "coldkey_unresolved",
                 "coldkey_changed", "king_unscored", "bench_hold", "deregistered",
                 "ready_expired", "reveal_delay_exceeded", "duplicate_digest",
@@ -63,18 +65,20 @@ SKIP_REASONS = ("pending_floor", "coldkey_cap_settlement", "coldkey_unresolved",
                 "mirror_lag_exceeded", "lane_closed")
 # ``gate_regression``: a judged loss on the §1.3b gate (like
 # ``lowfreq_regression``), so an entry reason and never a skip reason.
-ENTRY_REASONS = SKIP_REASONS + ("confirm_pending", "lost_duel", "lost_confirmation",
-                                "lowfreq_regression", "gate_regression", "crowned")
+ENTRY_REASONS = SKIP_REASONS + ("lost_duel", "lowfreq_regression", "gate_regression",
+                                "crowned")
 BURN_REASONS = ("house_king", "deregistered")
 # The §1.3b paired gate's outcomes and references: W3b2's
 # ``lane_d_bench.OUTCOMES`` / ``REFS`` (stated here, not imported, to keep this
 # module's imports light; the acceptance tests pin the equality).
 GATE_OUTCOMES = ("pass", "gate_regression", "checkpoint_fault", "bench_hold")
 GATE_REFS = ("king_d", "house")
-CONFIRMATION_STAGES = ("first", "confirm")
-CONFIRM_RULES = ("restart", "original")
+# rev6.11 (b): a crown is decided at the first verdict; ``cleared`` is a
+# first clear that passed A10 and was not crowned (held by the gate, or a
+# passing non-best candidate).
+CONFIRMATION_STAGES = ("first",)
 LOWFREQ_RESULTS = ("pass", "fail", "no_windows", "not_candidate")
-VERDICT_OUTCOMES = ("lost", "confirm_pending", "confirmed", "crowned")
+VERDICT_OUTCOMES = ("lost", "cleared", "crowned")
 SCHEMA_ERROR_CODES = ("not_object", "unknown_schema", "missing_field", "unknown_field",
                       "bad_type", "bad_value", "rows_sha256_mismatch")
 
@@ -342,7 +346,7 @@ def _check_lowfreq(report: dict) -> None:
     """W3b5 (A10): a verdict's ``lowfreq.lcb`` is present iff its result is
     ``pass`` or ``fail``; an evaluated block has at least one window and an
     empty one (``no_windows``) none; ``fail`` iff some LCB is below
-    ``-tau_public``; and a ``fail`` is a cleared confirmation that is
+    ``-tau_public``; and a ``fail`` is a cleared first verdict that is
     ``lost`` (never crowned or held)."""
     for i, v in enumerate(report["verdicts"]):
         at = _join(_join("verdicts", i), "lowfreq")
@@ -365,10 +369,9 @@ def _check_lowfreq(report: dict) -> None:
         if lf["result"] != want:
             raise ReportSchemaError("bad_value", _join(at, "result"),
                                     f"the worst LCB {worst} gives {want}")
-        if want == "fail" and not (v["stage"] == "confirm" and v["cleared"]
-                                   and v["outcome"] == "lost"):
+        if want == "fail" and not (v["cleared"] and v["outcome"] == "lost"):
             raise ReportSchemaError("bad_value", _join(_join("verdicts", i), "outcome"),
-                                    "a lowfreq fail is a cleared confirmation that is lost")
+                                    "a lowfreq fail is a cleared verdict that is lost")
 
 
 def _check_gate_weights(report: dict) -> None:
@@ -541,7 +544,7 @@ def pinned_report_signer(cfg) -> str:
     return pin
 
 
-__all__ = ["BURN_REASONS", "CONFIRMATION_STAGES", "CONFIRM_RULES", "ENTRY_REASONS",
+__all__ = ["BURN_REASONS", "CONFIRMATION_STAGES", "ENTRY_REASONS",
            "ENTRY_STATUSES", "GATE_OUTCOMES", "GATE_REFS", "LOWFREQ_RESULTS", "REPORT_SCHEMA", "SCHEMA_ERROR_CODES",
            "SCHEMA_PATH", "SIGNATURE_PATTERN", "SIGNATURE_SCHEME", "SKIP_REASONS",
            "VERDICT_OUTCOMES", "WINDOW_REFUSAL_REASONS", "ReportSchemaError", "canonical_body",

@@ -54,8 +54,15 @@ class ExpertEntry:
     # from the canonical body, so a single-target entry's bytes are unchanged.
     # ``selection`` is then the UNION of the targets' selections.
     targets: tuple[str, ...] = ()
+    # WB22 / WB25: GPUs the leg trained on (the rented layout's count), the
+    # audit re-derivation's pin next to ``gpu_name`` (a different count
+    # changes the reduction order). 0 = not recorded — dropped from the
+    # canonical body, so an entry without it keeps its bytes.
+    gpu_n: int = 0
 
     def __post_init__(self) -> None:
+        if isinstance(self.gpu_n, bool) or not isinstance(self.gpu_n, int) or self.gpu_n < 0:
+            raise ValueError(f"expert entry gpu_n must be an int >= 0; got {self.gpu_n!r}")
         for name in ("selection", "exclude"):
             object.__setattr__(self, name, {int(k): sorted(int(x) for x in v)
                                             for k, v in sorted(getattr(self, name).items())})
@@ -96,6 +103,8 @@ class ExpertManifest:
                 e.pop("targets", None)        # single-target: today's bytes
             else:
                 e["targets"] = list(e["targets"])
+            if not e.get("gpu_n"):
+                e.pop("gpu_n", None)          # not recorded: today's bytes
         return json.dumps(d, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
     def digest(self) -> str:

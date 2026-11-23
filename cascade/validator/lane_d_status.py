@@ -48,7 +48,7 @@ REASON_ENUM = tuple(lane_d_state.ENTRY_REASONS)
 BLOCKS_PER_DAY = int(86400 // BLOCK_SECONDS)
 
 # State statuses of an entry still in the queue (queue selection walks these).
-OPEN_STATUSES = ("pending", "confirm_pending", "hold")
+OPEN_STATUSES = ("pending", "hold")
 # The README's ledger mapping for a ``closed`` entry's reason; any other
 # closed reason is ``closed_unjudged``.
 _CLOSED_LEDGER = {"deregistered": "voided", "ready_expired": "ready_expired"}

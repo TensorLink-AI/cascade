@@ -78,7 +78,7 @@
     "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "timestamp": {"type": "integer", "minimum": 0},
     "entry_status": {"type": "string",
-                     "enum": ["pending", "hold", "confirm_pending", "crowned", "lost", "closed"]},
+                     "enum": ["pending", "hold", "crowned", "lost", "closed"]},
     "skip_reason": {"type": "string",
                     "enum": ["pending_floor", "coldkey_cap_settlement", "coldkey_unresolved",
                              "coldkey_changed", "king_unscored", "bench_hold", "deregistered",
@@ -90,8 +90,8 @@
                               "coldkey_changed", "king_unscored", "bench_hold", "deregistered",
                               "ready_expired", "reveal_delay_exceeded", "duplicate_digest",
                               "hotkey_has_open_entry", "context_not_armed", "checkpoint_fault",
-                              "mirror_lag_exceeded", "lane_closed", "confirm_pending",
-                              "lost_duel", "lost_confirmation", "lowfreq_regression",
+                              "mirror_lag_exceeded", "lane_closed",
+                              "lost_duel", "lowfreq_regression",
                               "gate_regression", "crowned"]},
     "burn_reason": {"type": "string", "enum": ["house_king", "deregistered"]},
     "gate_outcome": {"type": "string",
@@ -102,18 +102,17 @@
                                        "over_lag",
                                        "before_margin", "publish_ahead", "late_mirror",
                                        "absent_from_s0", "backfill"]},
-    "confirmation_stage": {"type": "string", "enum": ["first", "confirm"]},
-    "confirm_rule": {"type": "string", "enum": ["restart", "original"]},
+    "confirmation_stage": {"type": "string", "enum": ["first"]},
     "lowfreq_result": {"type": "string", "enum": ["pass", "fail", "no_windows", "not_candidate"]},
     "verdict_outcome": {"type": "string",
-                        "enum": ["lost", "confirm_pending", "confirmed", "crowned"]},
+                        "enum": ["lost", "cleared", "crowned"]},
     "params": {
       "type": "object",
       "description": "§14.3 item 2: every [lane_d] value a satellite needs, as parsed.",
       "required": ["share", "takes_from", "remainder", "horizon", "horizons", "contexts",
                    "forward_margin_hours", "max_mirror_lag_hours", "min_windows", "min_clusters",
                    "d_margin", "alpha", "bootstrap_B", "king_decay", "reward_prior_kings",
-                   "confirm_on_king_change", "max_entries_per_settlement",
+                   "max_entries_per_settlement",
                    "max_judged_per_coldkey_per_settlement", "scoring_levels", "gate_suites",
                    "tau_public", "lowfreq_freqs", "gate_weights", "max_source_share",
                    "min_long_series"],
@@ -134,7 +133,6 @@
         "bootstrap_B": {"type": "integer", "minimum": 1},
         "king_decay": {"type": "number", "minimum": 0},
         "reward_prior_kings": {"type": "integer", "minimum": 0},
-        "confirm_on_king_change": {"$ref": "#/$defs/confirm_rule"},
         "max_entries_per_settlement": {"type": "integer", "minimum": 0},
         "max_judged_per_coldkey_per_settlement": {"type": "integer", "minimum": 0},
         "scoring_levels": {"type": "array", "items": {"type": "number"}},
@@ -256,17 +254,6 @@
                             "description": "The snapshot whose version of the window was scored; one of pool.snapshots[].sha256."}
       }
     },
-    "confirmation": {
-      "type": "object",
-      "required": ["stage", "rule", "first_set_sha256", "first_king_digest"],
-      "additionalProperties": false,
-      "properties": {
-        "stage": {"$ref": "#/$defs/confirmation_stage"},
-        "rule": {"$ref": "#/$defs/confirm_rule"},
-        "first_set_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
-        "first_king_digest": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"}
-      }
-    },
     "lowfreq": {
       "type": "object",
       "required": ["result", "freqs", "n_windows", "tau_public"],
@@ -292,7 +279,7 @@
     "verdict": {
       "type": "object",
       "required": ["digest", "king_digest", "stage", "cohort", "lcb", "gain", "cleared",
-                   "outcome", "confirmation", "lowfreq"],
+                   "outcome", "lowfreq"],
       "additionalProperties": false,
       "properties": {
         "digest": {"$ref": "#/$defs/digest"},
@@ -303,7 +290,6 @@
         "gain": {"type": "number"},
         "cleared": {"type": "boolean"},
         "outcome": {"$ref": "#/$defs/verdict_outcome"},
-        "confirmation": {"$ref": "#/$defs/confirmation"},
         "lowfreq": {"$ref": "#/$defs/lowfreq"},
         "house": {"$ref": "#/$defs/house_judgement"}
       }
