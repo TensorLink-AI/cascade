@@ -247,11 +247,21 @@ def make_plan(tool, tmp_path, capsys, sku, *, mode="expert", **kw) -> dict:
     return json.loads(out.read_text())
 
 
-def make_pod_record(tool, tmp_path, capsys, sku, *, mode="expert", peak=40 * GIB) -> dict:
+def default_peak(sku: str) -> int:
+    """A peak that fits the SKU's device: 40 GiB, or half the device's memory
+    on a smaller card (tests-correction 2026-11-23: WB22 lists 8xRTX4090,
+    24 GiB, in [lane_b] funded_pod_skus)."""
+    base = sku.split("x", 1)[1] if "x" in sku and sku.split("x", 1)[0].isdigit() else sku
+    return min(40 * GIB, GPU_NAMES[base][1] // 2)
+
+
+def make_pod_record(tool, tmp_path, capsys, sku, *, mode="expert", peak=None) -> dict:
     """A finished record as the pod path builds it: a plan whose source is
-    ``pod`` (the real run's GPU probe) finished with a clean leg result."""
+    ``pod`` (the real run's GPU probe) finished with a clean leg result.
+    ``peak`` None = :func:`default_peak` of the SKU."""
     plan = make_plan(tool, tmp_path, capsys, sku, mode=mode)
     plan["source"] = "pod"
+    peak = default_peak(sku) if peak is None else peak
     return tool.finish_record(plan, good_result(plan["steps"], peak=peak))
 
 
