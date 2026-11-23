@@ -26,11 +26,18 @@ lanes B and C off).
 - `lane_d_status.py` says "Wiring the publish into the validator loop is
   W8b's"; `lane_d_sentinel.sweep_and_publish` and
   `shared/sentinel_board.build_sentinel_board` have no production caller.
-- W19 (`tests/accept/w19/README.md`) is not on main when these tests land.
-  W8b pins against W19's README contract: `ValidatorRunner.lane_d_step`, the
-  per-poll `_lane_d_tick(client)` and `self._lane_d_worker` (a
-  `LaneDWorker`: `submit` / `running` / `join`). The W8b build needs W19 on
-  main first; the off-thread test asserts W19's seam before using it.
+- W19's implementation is not on main when these tests land. W8b pins
+  against W19's README contract (as corrected by #691):
+  `cascade/validator/offthread_worker.py` (`LaneDWorker`: `submit` /
+  `running` / `join`), `ValidatorRunner.lane_d_step`, the per-poll
+  `_lane_d_tick(client)` and `self._lane_d_worker`. The W8b build needs W19
+  on main first; the off-thread test asserts W19's seam before using it.
+- **W9 invariant 12** (`tests/accept/w9/test_w9_independence.py`): the
+  audit's static import closure (every import at any depth) reaches
+  `cascade/validator/loop.py` and `weights.py` and must load no
+  `cascade.validator.lane_d*` module. So neither may import the wiring or
+  `settle_lane_d`, even lazily; `cascade/validator/main.py` is outside the
+  closure and is the call site.
 
 ## Contract
 
@@ -143,7 +150,7 @@ When `cfg.lane_d.active(boundary)` for the vector's boundary
 (`_reassert_boundary(cur)` on a re-assert) and not `force_burn`:
 
 - the court is read **only** through `self.lane_d_step.court_for(boundary)`
-  on the poll thread;
+  on the poll thread (`weights.py` imports no lane D producer module);
 - the vector is W8's: `lane_parts(..., lane_d_cfg=cfg.lane_d,
   d_court_uids=court)` with lane D's part passed in `emission_vector`'s
   second argument even with lanes B and C off (RV3 note 10), under the
@@ -159,12 +166,15 @@ When `cfg.lane_d.active(boundary)` for the vector's boundary
 Not active at the boundary (unarmed, before or at `from_block`) or
 `force_burn`: today's vector, byte for byte, and `court_for` is not called.
 
-### run_forever (`cascade/validator/loop.py`)
+### The entry point (`cascade/validator/main.py`)
 
-`run_forever` calls `build_lane_d_step(...)` and assigns `self.lane_d_step`
-before its poll loop, with a `chain_factory` that is not the poll `client`
-(AST check). W19's `_lane_d_tick` then submits each armed boundary off the
-poll thread.
+`main()` calls `build_lane_d_step(...)` and assigns `runner.lane_d_step`
+before `runner.run_forever(...)`, with a `chain_factory` that is not the poll
+`client` (AST check; e.g. a second `ChainClient.from_config` for the step's
+thread). W19's `_lane_d_tick` then submits each armed boundary off the poll
+thread. `loop.py` is not touched by W8b. With the wiring in place the
+audit's import closure still reaches no `cascade.validator.lane_d*` module
+(`test_inv12_audit_import_closure_still_reaches_no_lane_d_module`).
 
 ### Weight timing (invariant 6, T15)
 
@@ -233,8 +243,9 @@ torch or real key; everything under `tmp_path`.
 
 Every wiring test fails with `ModuleNotFoundError: cascade.validator.lane_d_wiring`
 (in `PATHS`); the weight fold tests fail on assertions (lane D unpaid, the
-court never read); the run_forever check on an assertion; the off-thread
-test on W19's missing seam (assertion). The unarmed goldens, the burn cases
+court never read); the off-thread
+test on W19's missing seam (assertion); the entry-point check on an
+assertion; the invariant 12 check on the missing wiring module. The unarmed goldens, the burn cases
 (under the shipped policy a burnt lane D equals today's vector), the
 inactive-boundary and `force_burn` checks pass on main. Run locally with
 `-m "not torch"`.

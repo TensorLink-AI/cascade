@@ -1,7 +1,8 @@
 """W8b in the validator loop: the production step runs off the poll/weight
 thread through W19's seam, the bench sweep never delays `set_weights`, the
 step reads the chain through its own reader (never the poll thread's
-client), and run_forever wires it. Contract: README.md."""
+client), and cascade-validator's main() wires it outside the audit's import
+closure (W9 invariant 12). Contract: README.md."""
 
 from __future__ import annotations
 
@@ -84,15 +85,15 @@ def test_chain_reader_is_built_on_the_step_thread(tmp_path):
     assert {th for _, th in rig.factory.reader.calls} == set(seen)
 
 
-# ── run_forever wires the production step ──────────────────────────────────
+# ── the entry point wires the production step ──────────────────────────────
 
 
-def _run_forever() -> ast.FunctionDef:
-    src = h.module_source("cascade.validator.loop")
-    for node in ast.walk(ast.parse(src)):
-        if isinstance(node, ast.FunctionDef) and node.name == "run_forever":
+def _validator_main() -> ast.FunctionDef:
+    src = h.module_source("cascade.validator.main")
+    for node in ast.parse(src).body:
+        if isinstance(node, ast.FunctionDef) and node.name == "main":
             return node
-    raise AssertionError("ValidatorRunner.run_forever not found in cascade/validator/loop.py")
+    raise AssertionError("main() not found in cascade/validator/main.py")
 
 
 def _named(call: ast.Call, name: str) -> bool:
@@ -101,18 +102,23 @@ def _named(call: ast.Call, name: str) -> bool:
         (isinstance(f, ast.Attribute) and f.attr == name)
 
 
-def test_run_forever_builds_and_wires_the_lane_d_step():
-    fn = _run_forever()
-    builds = [n for n in ast.walk(fn) if isinstance(n, ast.Call)
-              and _named(n, "build_lane_d_step")]
-    assert builds, "run_forever must build the lane D step (lane_d_wiring.build_lane_d_step)"
+def test_validator_main_builds_and_wires_the_lane_d_step():
+    """cascade-validator's main() (outside the audit's import closure,
+    W9 invariant 12) builds the step and sets runner.lane_d_step before
+    run_forever starts the poll loop."""
+    fn = _validator_main()
+    calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call)]
+    builds = [n for n in calls if _named(n, "build_lane_d_step")]
+    assert builds, "main() must build the lane D step (lane_d_wiring.build_lane_d_step)"
     assigned = [n for n in ast.walk(fn) if isinstance(n, ast.Assign | ast.AnnAssign)
                 and any(isinstance(t, ast.Attribute) and t.attr == "lane_d_step"
                         for t in (n.targets if isinstance(n, ast.Assign) else [n.target]))]
-    assert assigned, "run_forever must set self.lane_d_step"
-    loops = [n for n in ast.walk(fn) if isinstance(n, ast.While)]
-    assert loops and all(b.lineno < loops[-1].lineno for b in builds), \
-        "the step is wired before the poll loop starts"
+    assert assigned, "main() must set runner.lane_d_step"
+    runs = [n for n in calls if _named(n, "run_forever")]
+    assert runs, "fixture: main() starts run_forever"
+    first_run = min(n.lineno for n in runs)
+    assert all(n.lineno < first_run for n in builds + assigned), \
+        "the step is wired before run_forever starts the poll loop"
     for call in builds:
         kw = {k.arg: k.value for k in call.keywords}
         assert "chain_factory" in kw, "build_lane_d_step needs chain_factory="
@@ -120,3 +126,20 @@ def test_run_forever_builds_and_wires_the_lane_d_step():
         poll_client = (isinstance(v, ast.Name) and v.id == "client") or (
             isinstance(v, ast.Lambda) and isinstance(v.body, ast.Name) and v.body.id == "client")
         assert not poll_client, "the lane D step must not share the poll thread's chain client"
+
+
+def test_inv12_audit_import_closure_still_reaches_no_lane_d_module():
+    """W9 invariant 12 holds with the wiring in place: the audit's static
+    import closure (which reaches loop.py and weights.py) loads no
+    cascade.validator.lane_d* module, so the weight fold reads lane D only
+    through the injected step, and the wiring module is imported from the
+    entry point alone."""
+    from tests.accept.w9 import helpers as w9
+    from tests.accept.w9.test_w9_independence import _closure
+
+    h.wiring()
+    closure = _closure(["cascade.audit.lane_d", "cascade.audit.checks"])
+    assert "cascade.validator.weights" in closure and "cascade.validator.loop" in closure
+    bad = sorted(m for m in closure if w9.forbidden(m) and m != "torch")
+    assert not bad, f"the audit's static import closure reaches {bad}"
+    assert h.WIRING not in closure

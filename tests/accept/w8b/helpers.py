@@ -46,7 +46,7 @@ from tests.accept.w7a import helpers as w7a
 
 REPO = Path(__file__).resolve().parents[3]
 WIRING = "cascade.validator.lane_d_wiring"
-W19_WORKER = "cascade.validator.lane_d_worker"
+W19_WORKER = "cascade.validator.offthread_worker"   # W19 (#691: not lane_d_*)
 
 ARM_BLOCK = w7a.ARM_BLOCK                 # 9,720,000: an era boundary (3600 grid)
 SETTLEMENT = w7a.SETTLEMENT               # 900
@@ -555,7 +555,7 @@ def w19_surface() -> None:
     from cascade.validator.loop import ValidatorRunner
 
     assert importlib.util.find_spec(W19_WORKER) is not None, \
-        "W19's cascade.validator.lane_d_worker is not on this tree (W8b builds on W19)"
+        f"W19's {W19_WORKER} is not on this tree (W8b builds on W19)"
     names = {f.name for f in fields(ValidatorRunner)}
     assert "lane_d_step" in names, "ValidatorRunner needs W19's `lane_d_step` field"
     assert callable(getattr(ValidatorRunner, "_lane_d_tick", None)), \
