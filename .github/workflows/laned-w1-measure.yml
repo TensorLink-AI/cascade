@@ -17,7 +17,9 @@
 #   HIPPIUS_S3_ENDPOINT (default https://s3.hippius.com).
 #
 # Output: artifact `laned-w1-<run_id>` (w1.json, w1_summary.txt, the pool
-# index copy, forge_inventory.txt), retained 14 days. Manual dispatch only.
+# index copy, forge_inventory.txt and, after a successful forge sync,
+# readiness.json: the laned_readiness/1 document W8c's arming reads),
+# retained 14 days. Manual dispatch only.
 name: Lane D W1 measure
 
 on:
@@ -66,8 +68,10 @@ jobs:
           version: "0.13.4"
           enable-cache: true
 
-      - name: Sync (frozen; hippius extra only — no torch)
-        run: uv sync --frozen --extra hippius
+      # pool-forge (pyarrow/pyyaml/pandas, already in uv.lock) is what the
+      # forge-mirror measurement reads parquet with; still no torch.
+      - name: Sync (frozen; hippius + pool-forge extras — no torch)
+        run: uv sync --frozen --extra hippius --extra pool-forge
 
       - name: Validate inputs
         run: |
@@ -145,9 +149,9 @@ jobs:
             $args \
             --out "$OUT_DIR/w1.json" | tee "$OUT_DIR/w1_summary.txt"
 
-      # Forge mirror, read-only. laned_w1_measure.py has no forge-mirror mode
-      # yet, so this only records an inventory for the follow-up PR (see the
-      # PR body). Restore-only cache: never saved from this job.
+      # Forge mirror, read-only: synced down, inventoried, then measured by the
+      # step after the sync (laned_w1_measure.py --forge-dir, "measured from
+      # forge mirror"). Restore-only cache: never saved from this job.
       - name: Restore forge mirror cache  (restore only)
         if: github.event.inputs.sync_forge != 'false'
         uses: actions/cache/restore@v4
@@ -158,6 +162,7 @@ jobs:
             tsforge-mirror-
 
       - name: Sync forge mirror down  (FORGE READ key only)
+        id: forge_sync
         if: github.event.inputs.sync_forge != 'false'
         continue-on-error: true
         timeout-minutes: 120
@@ -192,6 +197,27 @@ jobs:
             echo "parquet files per top-level feed dir (top 50):"
             find ./tsforge -name '*.parquet' 2>/dev/null | awk -F/ '{print $3"/"$4}' | sort | uniq -c | sort -rn | head -50
           } | tee "$OUT_DIR/forge_inventory.txt"
+
+      # Re-runs the (deterministic) snapshot-diff bound together with the
+      # forge-mirror measurement, so w1.json carries both blocks. Runs only
+      # when the sync above really succeeded (its continue-on-error keeps the
+      # job green otherwise, and w1.json stays the snapshot-only one).
+      - name: Run W1 measurement (+ forge mirror, measured)
+        if: steps.forge_sync.outcome == 'success'
+        run: |
+          args=""
+          while IFS= read -r line; do
+            [ -n "$line" ] && args="$args --build-time $line"
+          done < "$OUT_DIR/build_times.txt"
+          # shellcheck disable=SC2086  # args is a list of NAME=ISO tokens, no spaces
+          uv run --frozen python -P scripts/laned_w1_measure.py \
+            --snapshots-dir "$SNAPS_DIR" \
+            --index "$OUT_DIR/index.json" \
+            --margin-hours "$MARGIN_HOURS" \
+            $args \
+            --forge-dir ./tsforge --embargo-hours 48 \
+            --readiness-out "$OUT_DIR/readiness.json" \
+            --out "$OUT_DIR/w1.json" | tee "$OUT_DIR/w1_summary.txt"
 
       - name: Upload W1 evidence
         if: always()
