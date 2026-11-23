@@ -8,7 +8,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from ..shared.atomic import write_text_atomic
-from ..shared.manifest import contract_digest
+from ..shared.manifest import contract_digest, numerics_contract_digest
 
 
 def check_worker_release(cfg, *, launched: bool = False):
@@ -72,6 +72,7 @@ def identity(cfg, ref):
                  "trainer/sandbox.py", "generation/tier.py"):
         verifier.update((source / file).read_bytes())
     return {"ref": ref, "contract_digest": contract_digest(contract),
+            "numerics_contract_digest": numerics_contract_digest(contract),
             "verifier_sha256": verifier.hexdigest(),
             "generator_policy": hashlib.sha256(json.dumps(asdict(policy), sort_keys=True).encode()).hexdigest()}
 
@@ -98,6 +99,21 @@ def qualify(cfg, ref, work_root):
     return proof
 
 
+def _contract_matches(proof, expected):
+    """The proof's training contract is the live one, up to the image/runtime
+    pins (``IMAGE_RUNTIME_FIELDS``): those change which image runs a leg or
+    whether it snapshots, never the generator a baseline verified. A proof
+    stamped with a numerics digest matches on it; an older proof carries only
+    the full digest, which must then match exactly.
+
+    2026-11-15: arming ``continuation_protocol`` (runtime-only) moved the full
+    digest and blocked the era-2642 king leg for 5.5 h."""
+    if proof.get("contract_digest") == expected["contract_digest"]:
+        return True
+    stamped = proof.get("numerics_contract_digest")
+    return bool(stamped) and stamped == expected["numerics_contract_digest"]
+
+
 def ready(cfg, ref, work_root):
     root = Path(work_root) / "v2-launch.json"
     check_worker_release(cfg, launched=root.exists())
@@ -112,11 +128,19 @@ def ready(cfg, ref, work_root):
             continue
         # A verified launch root remains valid when the first v2 winner replaces
         # the inherited king. Policy changes require a new qualification.
-        keys = ("contract_digest", "generator_policy", "verifier_sha256") if path == root else tuple(expected)
+        keys = ("generator_policy", "verifier_sha256") if path == root else tuple(
+            k for k in expected if k not in ("contract_digest", "numerics_contract_digest"))
         report = proof.get("verification") or {}
-        if (all(proof.get(k) == expected[k] for k in keys) and report.get("ok")
+        if (_contract_matches(proof, expected)
+                and all(proof.get(k) == expected[k] for k in keys) and report.get("ok")
                 and report.get("scope") == "full" and not report.get("runtime_skipped")
                 and report.get("corpus_digest")):
+            if not proof.get("numerics_contract_digest"):
+                # matched on the full digest ⇒ the live numerics digest is
+                # this proof's too: stamp it so a later runtime-only change
+                # (image repin, continuation) keeps it valid
+                proof["numerics_contract_digest"] = expected["numerics_contract_digest"]
+                write_text_atomic(path, json.dumps(proof, sort_keys=True))
             if path != root:
                 write_text_atomic(root, json.dumps(proof, sort_keys=True))
             return True
