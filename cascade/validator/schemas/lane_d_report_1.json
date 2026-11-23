@@ -367,6 +367,17 @@
         "mase": {"type": "number"}
       }
     },
+    "gate_rows": {
+      "type": "object",
+      "description": "W3b6b (plan rev6.13): the sha256 of each bound sweep record's canonical text (lane_d_bench.sweep_record_text), published at bench_v/lane_d/<boundary>/<sha256>.json; present iff the bench session returned the three records.",
+      "required": ["candidate", "king_d", "house"],
+      "additionalProperties": false,
+      "properties": {
+        "candidate": {"$ref": "#/$defs/digest"},
+        "king_d": {"$ref": "#/$defs/digest"},
+        "house": {"$ref": "#/$defs/digest"}
+      }
+    },
     "gate_lcbs": {
       "type": ["object", "null"],
       "required": ["king_d", "house"],
@@ -400,7 +411,8 @@
         "lcb": {"$ref": "#/$defs/gate_lcbs"},
         "blocked_by": {"type": "array", "items": {"$ref": "#/$defs/gate_ref"}},
         "session": {"type": "string", "minLength": 1},
-        "held_from": {"$ref": "#/$defs/held_from"}
+        "held_from": {"$ref": "#/$defs/held_from"},
+        "rows": {"$ref": "#/$defs/gate_rows"}
       },
       "if": {"properties": {"outcome": {"const": "gate_regression"}}},
       "then": {"properties": {"lcb": {"type": "object"}, "blocked_by": {"minItems": 1}}},

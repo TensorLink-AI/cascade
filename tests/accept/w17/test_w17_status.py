@@ -178,9 +178,12 @@ def test_pending_progress_counts_windows_and_clusters_against_the_floors(progres
     assert set(x["progress"]) >= h.PROGRESS_KEYS
     assert {k: x["progress"][k] for k in h.PROGRESS_KEYS} == {
         "windows": 24, "clusters": 4, "min_windows": 30, "min_clusters": 4, "frozen": False}
+    # rev6.10 (a) / rev6.12 (a): the fixture feeds pin embargo_hours = 48, so
+    # Z (revealed 5 h after X) counts the same embargo windows of snapshot 1
+    # as X: data time in (b - e, b], released to miners after b.
     z = h.row_of(doc, fx.z["digest"])
     assert (z["progress"]["windows"], z["progress"]["clusters"], z["progress"]["frozen"]) == (
-        0, 0, False)
+        24, 4, False)
 
 
 def test_progress_is_derived_from_the_state_frozen_set(progress):
