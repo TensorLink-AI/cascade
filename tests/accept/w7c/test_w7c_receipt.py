@@ -303,7 +303,12 @@ def test_a_tampered_state_file_breaks_the_receipt_chain(tmp_path):
 def test_error_codes_are_exported():
     from cascade.validator.lane_d_state import RECEIPT_ERROR_CODES as codes
 
-    assert sorted(map(str, codes)) == sorted(RECEIPT_ERROR_CODES)
+    # W7c pins that all of its codes are exported; later WPs (W14) may extend
+    # the tuple, so this is a superset check, not an equality.
+    exported = list(map(str, codes))
+    assert len(exported) == len(set(exported))
+    missing = sorted(set(RECEIPT_ERROR_CODES) - set(exported))
+    assert not missing, missing
 
 
 # ── the persisted report file ───────────────────────────────────────────────
