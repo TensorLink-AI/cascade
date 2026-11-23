@@ -83,6 +83,7 @@ def _ingest(tmp_path, out_dir, contract, tag):
 
 def test_cpu_tiny_run_from_king_a_f32_base(tmp_path, two_threads):
     import cascade.miner.lane_d_finetune  # noqa: F401  (the W16 module exists)
+    # isort: split
     import torch
     from safetensors.torch import load_file
 
