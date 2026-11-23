@@ -7,8 +7,11 @@ validator. Unarmed (``not cfg.active(boundary)``) it returns
 
 1. registers newly revealed entries in ``lane_d_state.json`` (``ready``
    TTL, duplicate digests, deregistered hotkeys → closed with a typed reason);
-2. selects this settlement's judged entries FIFO by reveal time under the
-   per-settlement and per-coldkey caps (the rest wait, ``coldkey_cap_settlement``);
+2. selects this settlement's judged entries (W5h,
+   :mod:`~cascade.validator.lane_d_queue`): entries pending past
+   ``max_reveal_delay_days`` close, the coldkey re-check at reveal refuses a
+   changed coldkey and holds (bounded) an unreadable one, then FIFO by reveal
+   time under the per-settlement and per-coldkey caps (the rest wait);
 3. advances each judged entry's ``frozen_set`` (W5b,
    :mod:`~cascade.validator.lane_d_frozen`): the union over the newest
    snapshot ``pool_dir`` and the retained ``prior_pool_dirs`` of the windows
@@ -159,6 +162,7 @@ from .lane_d_house import check_house
 from .lane_d_lowfreq import forecast_ok as _forecast_ok
 from .lane_d_lowfreq import lowfreq_check, lowfreq_windows
 from .lane_d_lowfreq import target_usable as _target_usable
+from .lane_d_queue import select_queue
 from .lane_d_report import (
     REPORT_SCHEMA,
     SKIP_REASONS,
@@ -391,27 +395,6 @@ def _close_house_copies(state: dict, skipped: list[dict]) -> None:
         rec.pop("gate_hold", None)
         rec.update(status="closed", reason="duplicate_digest")
         skipped.append({"digest": str(state["house"]["digest"]), "reason": "duplicate_digest"})
-
-
-def _select(state: dict, cfg, exclude: frozenset[str] = frozenset()
-            ) -> tuple[list[str], list[dict]]:
-    """FIFO by reveal time under the per-settlement / per-coldkey caps.
-    ``exclude`` (held gate candidates, re-gated without a duel) is never
-    selected and never counts against a cap."""
-    open_ = sorted((dg for dg, r in state["entries"].items()
-                    if r["status"] in OPEN_STATUSES and dg not in exclude),
-                   key=lambda dg: (state["entries"][dg]["reveal_ts"], dg))
-    chosen, skipped, per_cold = [], [], {}
-    for dg in open_:
-        cold = state["entries"][dg]["coldkey_at_ready"]
-        if (len(chosen) >= int(cfg.max_entries_per_settlement)
-                or per_cold.get(cold, 0) >= int(cfg.max_judged_per_coldkey_per_settlement)):
-            state["entries"][dg]["reason"] = "coldkey_cap_settlement"
-            skipped.append({"digest": dg, "reason": "coldkey_cap_settlement"})
-            continue
-        per_cold[cold] = per_cold.get(cold, 0) + 1
-        chosen.append(dg)
-    return chosen, skipped
 
 
 def _comparison_king(rec: dict, state: dict, cfg) -> tuple[str, str]:
@@ -846,8 +829,10 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     else:
         # A held gate candidate is re-gated, never re-duelled (W5e).
         held = _held_candidates(state, cfg)
-        chosen, capped = _select(state, cfg, frozenset(held))
-        skipped += capped
+        # W5h (lane_d_queue): the reveal-delay close, the coldkey re-check
+        # at reveal, then FIFO by T under the caps.
+        chosen, queued = select_queue(state, cfg, boundary, entries, frozenset(held))
+        skipped += queued
         house_held = house_open and _keeps_hold(house_rec, state, cfg)
 
     # A member whose forecasts are malformed on any pool window is the miner's fault
