@@ -238,11 +238,13 @@ def load_main_oracle():
                              (ORACLE_TRAINER, trainer_src, SNAPSHOT_TRAINER)):
         mod = types.ModuleType(full)
         mod.__package__ = pkg.__name__
-        mod.__file__ = str(HERE / SNAPSHOT_DIR / fname)
+        # __file__ is the live sibling path: save_checkpoint copies
+        # Path(__file__).with_name("pyramid_model.py") into the checkpoint
+        mod.__file__ = str(Path(pkg.__file__).with_name(fname.removesuffix(".txt")))
         sys.modules[full] = mod
-        pending.append((mod, src))
-    for mod, src in pending:
-        exec(compile(src, mod.__file__, "exec"), mod.__dict__)
+        pending.append((mod, src, str(HERE / SNAPSHOT_DIR / fname)))
+    for mod, src, origin in pending:
+        exec(compile(src, origin, "exec"), mod.__dict__)
     return pending[1][0]
 
 

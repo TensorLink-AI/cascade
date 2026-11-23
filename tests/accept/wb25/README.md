@@ -89,7 +89,9 @@ The oracle is main's two PATHS files at `cbe4c79`, kept byte for byte in
 `pyramid_dp.py.txt` sha256 `6842716e…afe8b`). `helpers.load_main_oracle`
 loads them as `cascade.trainer._wb25_main_pyramid_trainer` and
 `cascade.trainer._wb25_main_pyramid_dp`, wired to each other. Every other
-import is the live module. Both sides are called as
+import is the live module, and each oracle module's `__file__` is its live
+sibling path, because `save_checkpoint` copies `pyramid_model.py` and
+`pyramid_wrapper.py` from next to it. Both sides are called as
 `train_pyramid(Toto2Trainer("cpu"), stream, contract, training_seed=1, ...)`
 with the arguments `Toto2Trainer.train` passes.
 
