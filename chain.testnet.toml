@@ -498,10 +498,14 @@ packed_sources = "reject"
 hub_registry_url = "https://registry.hippius.com"   # informational: the hippius_hub
                                                     # client targets its own default
                                                     # endpoint; recorded here for ops
-hub_namespace    = "cascade"                      # Harbor project the robot account can push to
-                                                    # (robot$cascade+...). NOTE: no separate
-                                                    # "cascade-testnet" Harbor project exists yet;
-                                                    # create one + grant the robot to re-separate.
+hub_namespace    = "cascade-testnet"              # TESTNET Harbor project (mainnet: "cascade").
+                                                    # Kept apart so testnet generator/checkpoint
+                                                    # pushes never land beside mainnet artefacts.
+                                                    # OWNER STEP before any testnet push: create
+                                                    # the "cascade-testnet" Harbor project and a
+                                                    # robot account that can push to it
+                                                    # (robot$cascade-testnet+...), and give the
+                                                    # testnet services that robot's credentials.
 s3_endpoint      = "https://s3.hippius.com"
 s3_region        = "decentralized"
 manifest_bucket  = "cascade-testnet-manifests"    # TESTNET bucket (mainnet: cascade-manifests)
