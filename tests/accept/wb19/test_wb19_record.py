@@ -48,7 +48,8 @@ def lane_b_skus():
 @pytest.fixture(scope="module")
 def records_factory(tmp_path_factory, lane_b_skus):
     """A lazy builder (the tool loads in the test body, never in a fixture):
-    one finished expert record per lane B SKU plus the full 8xH100 leg,
+    one finished expert record per lane B SKU plus a full 8xH100 leg (optional
+    in evidence since 2026-11-23; kept here so its validation stays pinned),
     built once per module and deep-copied per test."""
     cache: dict = {}
 
@@ -228,15 +229,30 @@ def test_combine_owner_candidates_join_coverage(tmp_path, records_factory):
     assert ev["oa8_sha256"] == hashlib.sha256(oa8.read_bytes()).hexdigest()
 
 
-def test_combine_needs_the_full_8xh100_leg(tmp_path, records_factory):
+def test_combine_passes_without_the_full_8xh100_leg(tmp_path, records_factory):
+    """Owner 2026-11-23 ("Yes skip it", plan rev6.5): the full lane A leg is
+    optional; expert legs alone pass, and `lane_a_full_leg` is null."""
     tool = load_tool()
     pod_records = records_factory(tool)
     recs = [r for k, r in pod_records.items() if k != "full"]
     rc, _, se, out = _combine(tool, tmp_path, recs)
     assert rc == 0, se
     ev = json.loads(out.read_text())
-    assert ev["passed"] is False and _check(ev, "full_leg")["passed"] is False
+    assert ev["passed"] is True, ev["checks"]
+    fl = _check(ev, "full_leg")
+    assert fl["passed"] is True and "skipped: owner_2026-11-23" in fl["detail"], fl
     assert ev["lane_a_full_leg"] is None
+    assert ev["body_sha256"] == body_sha256(ev)
+
+
+def test_combine_fails_two_full_8xh100_legs(tmp_path, records_factory):
+    tool = load_tool()
+    pod_records = records_factory(tool)
+    recs = list(pod_records.values()) + [copy.deepcopy(pod_records["full"])]
+    rc, _, se, out = _combine(tool, tmp_path, recs)
+    assert rc == 0, se
+    ev = json.loads(out.read_text())
+    assert ev["passed"] is False and _check(ev, "full_leg")["passed"] is False
 
 
 def test_combine_memory_check(tmp_path_factory, records_factory):
