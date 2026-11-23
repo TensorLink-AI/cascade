@@ -765,6 +765,7 @@ def _judged_set_problems(report: dict, cfg, entries: dict) -> list[str]:
         return [f"the verdicts {sorted(judged)} are not exactly the cohort members "
                 f"{sorted(members)}"]
     judged_set = set(judged)
+    house = report["house"]["digest"]
     skipped = report.get("skipped")
     if not isinstance(skipped, list):
         return [f"skipped is {type(skipped).__name__}, not a list"]
@@ -777,7 +778,9 @@ def _judged_set_problems(report: dict, cfg, entries: dict) -> list[str]:
             return [f"skipped {str(dg)[:12]} is not a listed entry"]
         if dg in skip_of:
             return [f"skipped {str(dg)[:12]} appears twice"]
-        if dg in judged_set:
+        if dg in judged_set and not (dg == house and s["reason"] == "duplicate_digest"):
+            # W5f: a miner copy of the house is refused at dedup while the
+            # house itself (same digest, not an entry) is judged.
             return [f"{str(dg)[:12]} is both judged and skipped"]
         if entries[dg].get("reason") != s["reason"]:
             return [f"skipped {str(dg)[:12]} reason {s['reason']!r} != its entry's reason "
@@ -794,7 +797,9 @@ def _judged_set_problems(report: dict, cfg, entries: dict) -> list[str]:
     if out:
         return out
     held = gated - judged_set
-    cands = [dg for dg in judged if dg not in held]
+    # W5f: the house challenger is not a listed entry and is never selected
+    # under the caps (it has no coldkey); only miner entries are candidates.
+    cands = [dg for dg in judged if dg not in held and dg != house]
     cands += [dg for dg, why in skip_of.items()
               if why in (_CAP_SKIP, *_SELECTED_SKIPS) and dg not in held]
     for dg in cands:

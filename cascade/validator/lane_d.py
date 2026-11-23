@@ -804,13 +804,17 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     # W5f: the house entry (§1.4 "It enters at that settlement"), opened by
     # ``refresh_house`` when a new house meets a miner KING_D. It is judged
     # like an entry but lives outside ``entries`` (it has no hotkey and is
-    # never paid); ``recs_of`` resolves a digest to the record judged.
+    # never paid); each judging job carries the records it judges.
     house_rec = state.get(HOUSE_ENTRY_KEY)
     hd = str(state["house"]["digest"])
     _close_house_copies(state, skipped)
 
     def skip(dg: str, reason: str, rec: dict | None = None) -> None:
         (state["entries"][dg] if rec is None else rec)["reason"] = reason
+        if rec is not None and rec is house_rec:
+            # The house entry is not a listed entry: its reason is kept in
+            # state, never a typed ``skipped`` record (which names entries).
+            return
         skipped.append({"digest": dg, "reason": reason})
 
     held: list[str] = []
