@@ -1,0 +1,6 @@
+# W6b pool_d extended history + per-series timestamps, frontier and feeds
+# (plan §3.0 W6b row rev3/rev6.1/rev6.10/rev6.12, §1.7 "pool_d (D12)";
+# README.md has the contract).
+# The pool_d/1 snapshot builder and validator, and its CLI (the owner's live
+# builder run writes evidence/w6b.json with it).
+cascade/pool/pool_d_build.py
