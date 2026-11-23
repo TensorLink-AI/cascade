@@ -83,16 +83,18 @@ from pathlib import Path
 import numpy as np
 
 from ..eval.bootstrap import cohort_maxt_lcbs
-from ..shared.marketcast_report import INFRA_DEFERRED, REPORT_ABSENT
 from .checks import CheckResult, _fail, _ok, _warn
 
 NAME = "lane_d"
 SCHEMA = "lane-d-report/1"
-# W14: the absent lane D receipt record (README w14 "The absent record").
+# W14: the absent lane D receipt record (README w14 "The absent record"),
+# re-stated from the spec: status is MarketCast's REPORT_ABSENT ("absent") and
+# the typed reasons include its INFRA_DEFERRED ("infra_deferred"). Literals,
+# not imports: this module's import allowlist is fixed (invariant 12, W9).
 ABSENT_NAME = "lane_d_absent"
 RECEIPT_SCHEMA = "lane-d-receipt/1"
-ABSENT_STATUS = REPORT_ABSENT
-ABSENT_REASONS = ("report_absent", INFRA_DEFERRED)
+ABSENT_STATUS = "absent"
+ABSENT_REASONS = ("report_absent", "infra_deferred")
 ABSENT_KEYS = ("schema", "status", "boundary", "reason", "prior_state_sha256",
                "posterior_state_sha256")
 LEVELS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
