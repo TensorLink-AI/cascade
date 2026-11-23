@@ -203,6 +203,23 @@ _UNWIRED = object()
 # RV6 B6: scan receipts an intake remembers (by content-pinned ref + pin).
 _LANE_B_SCAN_CACHE_SIZE = 4096
 
+
+def _hashset_pin(hashset: object) -> str | None:
+    """The ``[lane_b] contamination_hashset`` pin a loaded hash set answers
+    for. The bounded lookup ``load_pinned_hashset`` returns carries the pin
+    ``load_lookup`` verified (``.pin``; RV7 B3), so it is never serialised.
+    A plain dict artefact (embedders, tests) is digested with WB11
+    ``artefact_sha256``. Anything else has no known pin (``None``: the
+    pinned intake fails closed, 503)."""
+    pin = getattr(hashset, "pin", None)
+    if isinstance(pin, str) and pin:
+        return pin
+    if isinstance(hashset, dict):
+        from ..eval.contamination import artefact_sha256
+
+        return artefact_sha256(hashset)
+    return None
+
 # Replay bound on the signed timestamp. Funding is idempotent, so the only
 # replay of consequence is re-queueing after a withdraw — a five-minute
 # window plus per-request freshness closes it without clock heroics.
@@ -498,9 +515,7 @@ class FundingIntake:
                         "the contamination check is NOT run although [lane_b] "
                         "contamination_hashset is pinned")
         if self.lane_b_hashset is not None:
-            from ..eval.contamination import artefact_sha256
-
-            self._lane_b_hashset_sha = artefact_sha256(self.lane_b_hashset)
+            self._lane_b_hashset_sha = _hashset_pin(self.lane_b_hashset)
         # DEC-CA-0060: the SKUs a fund request may choose (``[round]
         # funded_pod_skus``) and the walls behind the fund-time warning. None
         # = no chain config (dev): any well-formed SKU, no warning.
@@ -1346,11 +1361,16 @@ class FundingIntake:
                 return 503, {"code": "contamination_scan_failed",
                              "message": "the intake contamination check could not complete — "
                                         "retry later"}
+            # RV7 note 9: a deadline-driven budget_exceeded depends on load,
+            # not on the tree, so it is refused now but never cached (a
+            # re-fund is scanned again). Every other result is cached.
+            load_dependent = bool(getattr(receipt, "load_dependent", False))
             receipt = dict(receipt)
-            with self._lane_b_scan_lock:
-                self._lane_b_scan_cache[key] = receipt
-                while len(self._lane_b_scan_cache) > _LANE_B_SCAN_CACHE_SIZE:
-                    self._lane_b_scan_cache.popitem(last=False)
+            if not load_dependent:
+                with self._lane_b_scan_lock:
+                    self._lane_b_scan_cache[key] = receipt
+                    while len(self._lane_b_scan_cache) > _LANE_B_SCAN_CACHE_SIZE:
+                        self._lane_b_scan_cache.popitem(last=False)
         receipt = dict(receipt)
         if receipt["result"] == contamination_scan.RESULT_BUDGET_EXCEEDED:
             log.warning("lane-B fund refused: the contamination scan of %s ran past its "
