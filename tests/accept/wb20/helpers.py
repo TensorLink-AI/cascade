@@ -230,35 +230,74 @@ def expiry_codes() -> tuple[str, ...]:
 def receipt_keys() -> tuple[str, ...]:
     """WB13: the ``contamination`` receipt field's keys.
 
-    ``scan_repo`` either returns the receipt dict literal directly or returns
-    a call to a same-module helper (``_receipt(...)`` since #643) that builds
-    it; follow such calls one level and read the helper's dict literal."""
+    Derived from ``scan_repo``'s returned value, following recursively and
+    within ``contamination_scan.py`` only:
+
+    * a dict literal (its constant string keys);
+    * a call to a same-module function (``_receipt(...)`` since #643): that
+      function's returned value;
+    * a call to a same-module class (``ScanReceipt(...)``, a ``dict``
+      subclass, since #660): its keyword argument names, ``**{...}`` dict
+      literal keys, and a positional dict literal or helper call;
+    * a local name returned after ``name = <one of the above>``.
+
+    Refuses (``AssertionError``) when nothing is found."""
     tree = _tree(SCAN_PY)
     module_fns = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    module_classes = {n.name for n in tree.body if isinstance(n, ast.ClassDef)}
+    seen: set[str] = set()
 
-    def dict_keys(fn: ast.FunctionDef) -> tuple[str, ...]:
+    def expr_keys(expr: ast.AST | None, fn: ast.FunctionDef) -> tuple[str, ...]:
+        if isinstance(expr, ast.Dict):
+            return tuple(k.value for k in expr.keys
+                         if isinstance(k, ast.Constant) and isinstance(k.value, str))
+        if isinstance(expr, ast.Name):
+            for node in ast.walk(fn):
+                if isinstance(node, ast.Assign) and any(
+                        isinstance(t, ast.Name) and t.id == expr.id for t in node.targets):
+                    keys = expr_keys(node.value, fn)
+                    if keys:
+                        return keys
+                if (isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+                        and node.target.id == expr.id):
+                    keys = expr_keys(node.value, fn)
+                    if keys:
+                        return keys
+            return ()
+        if not (isinstance(expr, ast.Call) and isinstance(expr.func, ast.Name)):
+            return ()
+        name = expr.func.id
+        if name in module_fns:
+            return fn_keys(module_fns[name])
+        if name in module_classes:
+            out: list[str] = []
+            for a in expr.args:
+                out.extend(expr_keys(a, fn))
+            for kw in expr.keywords:
+                if kw.arg is not None:
+                    out.append(kw.arg)
+                else:
+                    out.extend(expr_keys(kw.value, fn))
+            return tuple(dict.fromkeys(out))
+        return ()
+
+    def fn_keys(fn: ast.FunctionDef) -> tuple[str, ...]:
+        if fn.name in seen:
+            return ()
+        seen.add(fn.name)
         for node in ast.walk(fn):
-            if isinstance(node, ast.Return) and isinstance(node.value, ast.Dict):
-                keys = tuple(k.value for k in node.value.keys
-                             if isinstance(k, ast.Constant) and isinstance(k.value, str))
+            if isinstance(node, ast.Return):
+                keys = expr_keys(node.value, fn)
                 if keys:
                     return keys
         return ()
 
-    fn = _function(tree, "scan_repo")
-    keys = dict_keys(fn)
+    keys = fn_keys(_function(tree, "scan_repo"))
     if keys:
         return keys
-    for node in ast.walk(fn):
-        if (isinstance(node, ast.Return) and isinstance(node.value, ast.Call)
-                and isinstance(node.value.func, ast.Name)
-                and node.value.func.id in module_fns):
-            keys = dict_keys(module_fns[node.value.func.id])
-            if keys:
-                return keys
     raise AssertionError(
-        "code truth: scan_repo receipt keys (no returned dict literal in scan_repo "
-        "nor in a same-module helper it returns a call to)")
+        "code truth: scan_repo receipt keys (no returned dict literal, same-module "
+        "helper call or same-module class call carrying them in scan_repo)")
 
 
 @cache
