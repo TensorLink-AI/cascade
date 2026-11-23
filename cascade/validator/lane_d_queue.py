@@ -39,7 +39,7 @@ BLOCKS_PER_DAY = 7200
 # The optional re-check key of an ``entries`` item (and of the resolved record).
 RECHECK_KEY = "coldkey_at_reveal"
 UNRESOLVED_COUNT_KEY = "coldkey_unresolved_settlements"
-OPEN_STATUSES = ("pending", "confirm_pending")
+OPEN_STATUSES = ("pending", "hold")
 
 CAP_REASON = "coldkey_cap_settlement"
 CHANGED_REASON = "coldkey_changed"

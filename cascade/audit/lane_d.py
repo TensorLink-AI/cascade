@@ -18,7 +18,7 @@ verifier. Checks, in order (the first failure is the verdict):
    judgement (``cohorts[].house_digest``, ``verdicts[].house``) is
    re-derived the same way and must be present exactly then. W5f: a new
    house challenges a miner KING_D alone in its own cohort (its T is the
-   report's house record's) with KING_D as its only bar, and a confirmed,
+   report's house record's) with KING_D as its only bar, and a cleared,
    passing house retakes KING_D (``king_after`` the house record,
    ``crowned`` null);
 7. the §1.3b gate (W5e): the signed ``gate`` record's draw (``block`` is
@@ -27,23 +27,23 @@ verifier. Checks, in order (the first failure is the verdict):
    every result's outcome and ``blocked_by`` from its four LCBs against
    ``-tau_public``, and each crowning candidate's verdict from its gate
    outcome. Without a gate record nothing crowns (fail closed). The crown
-   is the highest-LCB passing confirmation or a held candidate re-gated
-   ``pass``; the paid court follows from it.
+   is the highest-LCB passing first clear or a held candidate re-gated
+   ``pass``; the paid court follows from it. rev6.11 (b): there is no
+   confirmation stage; a crown is first clear ∧ A10 ∧ gate, and a cohort or
+   verdict of any stage but ``first`` is a problem.
 
 RV7 B2 adds the crown's provenance (README "Correction (RV7 B2)"):
 
-- ``seed`` is ``lane-d/1:{boundary}:{pool.sha256}``; a stage-``first``
-  cohort is judged against ``king_before``; a stage-``confirm`` verdict
-  names a distinct first clear (``first_set_sha256``) under its own king
-  (under D20 ``restart``, ``king_before``);
-- a cleared confirmation whose A10 ``lowfreq`` block reads ``pass`` /
+- ``seed`` is ``lane-d/1:{boundary}:{pool.sha256}``; every cohort is
+  stage ``first`` and judged against ``king_before``;
+- a cleared verdict whose A10 ``lowfreq`` block reads ``pass`` /
   ``fail`` has that result re-derived from its LCBs; a ``fail`` is ``lost``
   and never gated;
 - a held candidate's gate result carries ``held_from`` (its hold: an
-  earlier boundary, an LCB that cleared ``d_margin``, under ``restart`` the
-  same KING_D); a verdict-backed result carries none;
-- chain mode (``prior_reports``, what W9 runs): each confirm verdict's first
-  clear and each ``held_from`` is shown by an earlier report signed by the
+  earlier boundary, an LCB that cleared ``d_margin``, the same KING_D: a
+  king change drops a hold); a verdict-backed result carries none;
+- chain mode (``prior_reports``, what W9 runs): each ``held_from`` is shown
+  by an earlier report signed by the
   same key, matched by boundary and body digest (recomputed here from the
   canonical body, never through the producer);
 - ``era_sentinel``: ``gate.sentinel`` is the era's W-S1 suite.
@@ -113,7 +113,6 @@ def _expected_params(cfg) -> dict:
             "d_margin": float(cfg.d_margin), "alpha": float(cfg.alpha),
             "bootstrap_B": int(cfg.bootstrap_B), "king_decay": float(cfg.king_decay),
             "reward_prior_kings": int(cfg.reward_prior_kings),
-            "confirm_on_king_change": str(cfg.confirm_on_king_change),
             "max_entries_per_settlement": int(cfg.max_entries_per_settlement),
             "max_judged_per_coldkey_per_settlement":
                 int(cfg.max_judged_per_coldkey_per_settlement),
@@ -212,35 +211,23 @@ def _house_problems(idx: int, m: str, hv, hd: str, want: tuple[float, float, boo
 
 
 def _stage_problem(report: dict, cfg, cohort: dict, v: dict) -> str | None:
-    """RV7 B2 (b)/(c): why the cohort's stage cannot hold for verdict ``v``,
-    or ``None``. A first duel is always against ``king_before``; a
-    confirmation names its first clear, a set distinct from its own, judged
-    under its own KING_D (under D20 ``restart``, ``king_before``)."""
+    """Why the cohort's stage cannot hold for verdict ``v``, or ``None``.
+    rev6.11 (b): every judgement is the first (and only) verdict, against
+    ``king_before``; there is no confirmation stage and no confirmation
+    block."""
     stage, kd = cohort["stage"], cohort["king_digest"]
     kb = report["king_before"]["digest"]
-    if stage == "first":
-        if kd != kb:
-            return f"stage first judged against {str(kd)[:12]}, not king_before {str(kb)[:12]}"
-        return None
-    if stage != "confirm":
-        return f"cohort stage {stage!r} is neither first nor confirm"
-    conf = v.get("confirmation")
-    if not isinstance(conf, dict):
-        return "a confirm verdict without a confirmation record"
-    fs, fk = conf.get("first_set_sha256"), conf.get("first_king_digest")
-    if not _is_hex64(fs) or fs == cohort["set_sha256"]:
-        return "confirm without a distinct first clear (first_set_sha256)"
-    if fk != kd:
-        return f"confirm whose first clear's king {fk!r} is not the cohort king {str(kd)[:12]}"
-    if conf.get("stage") != "confirm":
-        return f"confirm verdict whose confirmation stage is {conf.get('stage')!r}"
-    if str(cfg.confirm_on_king_change) == "restart" and kd != kb:
-        return f"restart confirm against {str(kd)[:12]}, not king_before {str(kb)[:12]}"
+    if stage != "first" or v.get("stage") != "first":
+        return f"stage {stage!r}/{v.get('stage')!r}: only first verdicts exist (rev6.11 (b))"
+    if "confirmation" in v:
+        return "a verdict carries a confirmation block (rev6.11 (b): none exists)"
+    if kd != kb:
+        return f"stage first judged against {str(kd)[:12]}, not king_before {str(kb)[:12]}"
     return None
 
 
 def _lowfreq_problem(cfg, v: dict) -> tuple[str | None, bool]:
-    """W3b5 (A10) for a cleared confirmation: ``(problem, is_fail)``. A
+    """W3b5 (A10) for a cleared first verdict: ``(problem, is_fail)``. A
     ``pass`` / ``fail`` block carries four finite LCBs and its result is
     re-derived from them (``fail`` iff one is below ``-tau_public``); a
     ``fail`` is ``lost``. ``no_windows`` (and an unevaluated block) leaves
@@ -266,8 +253,9 @@ def _lowfreq_problem(cfg, v: dict) -> tuple[str | None, bool]:
 def _cohort_problems(report: dict, cfg, cohort: dict, rows_by: dict, windows: dict,
                      entries: dict, confirms: dict) -> list[str]:
     """The cohort's problems. Every member whose re-derived judgement clears
-    stage ``confirm`` (a crowning candidate) is added to ``confirms``; its
-    outcome is the gate's to decide (:func:`_crown_problems`)."""
+    (rev6.11 (b): a first clear is the crowning candidate) and does not fail
+    A10 is added to ``confirms``; its outcome is the gate's to decide
+    (:func:`_crown_problems`)."""
     out = []
     idx = int(cohort["index"])
     kd, members, wids = cohort["king_digest"], list(cohort["members"]), list(cohort["window_ids"])
@@ -359,14 +347,14 @@ def _cohort_problems(report: dict, cfg, cohort: dict, rows_by: dict, windows: di
             out.append(f"cohort {idx}: {m[:12]} stage/king {v['stage']}/"
                        f"{str(v['king_digest'])[:12]} != cohort {stage}/{kd[:12]}")
             continue
-        if cleared and stage == "confirm":
+        if cleared:
             why, lowfreq_fail = _lowfreq_problem(cfg, v)
             if why:
                 out.append(f"cohort {idx}: {m[:12]} {why}")
             elif not lowfreq_fail:
                 confirms[m] = v
             continue
-        want = "lost" if not cleared else "confirm_pending"
+        want = "lost"
         if v["outcome"] != want:
             out.append(f"cohort {idx}: {m[:12]} outcome {v['outcome']} != re-derived {want}")
     return out
@@ -510,11 +498,11 @@ _MISSING = object()
 def _held_from_problem(report: dict, cfg, boundary: int, hf) -> str | None:
     """RV7 B2 (a), single report: why a held candidate's ``held_from`` cannot
     name its hold, or ``None``. Exactly the five keys; the hold settled at an
-    earlier boundary on a KING_D LCB that cleared ``d_margin``; under D20
-    ``restart`` its KING_D is still ``king_before`` (a king change drops a
-    hold). Whether that hold exists is chain mode's to show."""
+    earlier boundary on a KING_D LCB that cleared ``d_margin``; its KING_D
+    is still ``king_before`` (no D20 rule: a king change drops a hold).
+    Whether that hold exists is chain mode's to show."""
     if hf is _MISSING:
-        return "no held_from: nothing binds it to a cleared, held confirmation"
+        return "no held_from: nothing binds it to a cleared, held first verdict"
     if not isinstance(hf, dict) or set(hf) != _HELD_KEYS:
         keys = sorted(hf) if isinstance(hf, dict) else type(hf).__name__
         return f"held_from keys {keys}"
@@ -526,21 +514,20 @@ def _held_from_problem(report: dict, cfg, boundary: int, hf) -> str | None:
             return f"held_from {k} {hf[k]!r} is not 64 lowercase hex digits"
     if not (_finite(hf["lcb"]) and float(hf["lcb"]) >= float(cfg.d_margin)):
         return f"held_from lcb {hf['lcb']!r} did not clear d_margin {cfg.d_margin}"
-    if str(cfg.confirm_on_king_change) == "restart" \
-            and hf["king_d"] != report["king_before"]["digest"]:
-        return "held_from king_d is not king_before (restart drops a hold on a king change)"
+    if hf["king_d"] != report["king_before"]["digest"]:
+        return "held_from king_d is not king_before (a king change drops a hold)"
     return None
 
 
 def _crown_problems(report: dict, cfg, boundary: int, confirms: dict, entries: dict
                     ) -> tuple[str | None, list[str]]:
     """``(re-derived crown, problems)``. ``confirms`` maps every verdict
-    whose re-derived judgement clears stage ``confirm`` (a crowning
-    candidate) to that verdict. W5e: the gate decides each candidate
-    (``pass`` crowns or stays ``confirmed``, ``gate_regression`` /
-    ``checkpoint_fault`` is ``lost``, ``bench_hold`` stays ``confirmed``);
+    whose re-derived judgement clears (a first clear that did not fail A10:
+    a crowning candidate) to that verdict. W5e: the gate decides each
+    candidate (``pass`` crowns or stays ``cleared``, ``gate_regression`` /
+    ``checkpoint_fault`` is ``lost``, ``bench_hold`` stays ``cleared``);
     without a gate record every candidate is held and nothing crowns; the
-    crown is the highest-LCB passing confirmation, or a held candidate
+    crown is the highest-LCB passing first clear, or a held candidate
     re-gated ``pass`` (it has no verdict this settlement)."""
     outcomes, out = _gate_problems(report, cfg, boundary)
     if out:
@@ -555,14 +542,14 @@ def _crown_problems(report: dict, cfg, boundary: int, confirms: dict, entries: d
 
     for dg in confirms:
         if gated and dg not in outcomes:
-            out.append(f"cleared confirmation {dg[:12]} has no gate result")
+            out.append(f"cleared candidate {dg[:12]} has no gate result")
     held = []
     for dg in outcomes:
         if dg in confirms:
             continue
         if dg in verdicts:
             out.append(f"gate result for {str(dg)[:12]}, whose verdict is not a cleared "
-                       f"confirmation")
+                       f"candidate")
         elif dg not in entries and dg != house["digest"]:
             out.append(f"gate result for {str(dg)[:12]}, neither a verdict, a listed entry "
                        f"nor the house")
@@ -581,7 +568,7 @@ def _crown_problems(report: dict, cfg, boundary: int, confirms: dict, entries: d
     passing = sorted((v for dg, v in confirms.items() if outcomes.get(dg) == "pass"),
                      key=lambda v: (-float(v["lcb"]), reveal_ts(v["digest"]), v["digest"]))
     # A held candidate's clear (its LCB) is not in this report, so when one
-    # passes the crown is the best passing confirmation or that candidate.
+    # passes the crown is the best passing first clear or that candidate.
     allowed = [v["digest"] for v in passing[:1]] + [dg for dg in held if outcomes[dg] == "pass"]
     stated = report.get("crowned")
     if stated is None and house["digest"] in allowed and report["king_after"].get("house") \
@@ -593,11 +580,11 @@ def _crown_problems(report: dict, cfg, boundary: int, confirms: dict, entries: d
     for dg, v in confirms.items():
         o = outcomes.get(dg)
         if o in (None, "bench_hold"):
-            want = "confirmed"
+            want = "cleared"
         elif o in ("gate_regression", "checkpoint_fault"):
             want = "lost"
         else:
-            want = "crowned" if dg == crown else "confirmed"
+            want = "crowned" if dg == crown else "cleared"
         if v["outcome"] != want:
             out.append(f"{dg[:12]}: outcome {v['outcome']} != re-derived {want} "
                        f"(gate {o or 'absent'})")
@@ -626,41 +613,11 @@ def _verified_priors(prior_reports, signer_hotkey: str) -> list[tuple[int, str, 
     return out
 
 
-def _prior_verdict(p: dict, digest: str, cohort_index) -> dict | None:
-    for x in p.get("verdicts") or []:
-        if isinstance(x, dict) and x.get("digest") == digest and x.get("cohort") == cohort_index:
-            return x
-    return None
-
-
-def _first_clear_shown(priors, boundary: int, v: dict, cohort: dict) -> bool:
-    """A verified earlier report judged ``v``'s digest in a stage-``first``
-    cohort with the named set and king, cleared it ``confirm_pending``, on
-    windows disjoint from the confirming cohort's."""
-    conf = v["confirmation"]
-    wids = set(cohort["window_ids"])
-    for b, _dg, p in priors:
-        if b >= boundary:
-            continue
-        for c in p.get("cohorts") or []:
-            if not isinstance(c, dict) or c.get("stage") != "first" \
-                    or c.get("set_sha256") != conf["first_set_sha256"] \
-                    or c.get("king_digest") != conf["first_king_digest"] \
-                    or v["digest"] not in (c.get("members") or []):
-                continue
-            pv = _prior_verdict(p, v["digest"], c.get("index"))
-            if pv and pv.get("stage") == "first" and pv.get("cleared") is True \
-                    and pv.get("outcome") == "confirm_pending" \
-                    and not wids & set(c.get("window_ids") or []):
-                return True
-    return False
-
-
 def _hold_problem(priors, res: dict) -> str | None:
     """Why no verified earlier report shows ``res["held_from"]``: the report
-    at that boundary with that body digest, where the digest's confirmation
-    cleared ``confirmed`` with that LCB, KING_D and set, and its gate record
-    is absent or holds it (``bench_hold``)."""
+    at that boundary with that body digest, where the digest's first verdict
+    cleared (outcome ``cleared``) with that LCB, KING_D and set, and its gate
+    record is absent or holds it (``bench_hold``)."""
     hf, dg = res["held_from"], res["digest"]
     p = next((p for b, d, p in priors
               if b == hf["boundary"] and d == hf["report_sha256"]), None)
@@ -673,13 +630,13 @@ def _hold_problem(priors, res: dict) -> str | None:
         cohorts = p.get("cohorts") or []
         ci = pv.get("cohort")
         c = cohorts[ci] if isinstance(ci, int) and 0 <= ci < len(cohorts) else None
-        if pv.get("stage") == "confirm" and pv.get("cleared") is True \
-                and pv.get("outcome") == "confirmed" and pv.get("lcb") == hf["lcb"] \
+        if pv.get("stage") == "first" and pv.get("cleared") is True \
+                and pv.get("outcome") == "cleared" and pv.get("lcb") == hf["lcb"] \
                 and pv.get("king_digest") == hf["king_d"] and isinstance(c, dict) \
-                and c.get("stage") == "confirm" and c.get("set_sha256") == hf["set_sha256"]:
+                and c.get("stage") == "first" and c.get("set_sha256") == hf["set_sha256"]:
             break
     else:
-        return f"{str(dg)[:12]}: held_from does not match a cleared, held confirmation"
+        return f"{str(dg)[:12]}: held_from does not match a cleared, held first verdict"
     pg = p.get("gate")
     if pg is not None and not any(isinstance(r, dict) and r.get("digest") == dg
                                   and r.get("outcome") == "bench_hold"
@@ -691,21 +648,13 @@ def _hold_problem(priors, res: dict) -> str | None:
 
 def _chain_problems(report: dict, prior_reports, signer_hotkey: str,
                     entries: dict) -> str | None:
-    """Chain mode: every confirm verdict's first clear and every
-    ``held_from`` is shown by a verified earlier report, and the report
-    continues the chain (:func:`_continuity_problem`), else why not."""
+    """Chain mode: every ``held_from`` is shown by a verified earlier
+    report, and the report continues the chain
+    (:func:`_continuity_problem`), else why not."""
     priors = _verified_priors(list(prior_reports), signer_hotkey)
-    boundary = int(report["boundary"])
     why = _continuity_problem(report, priors, entries)
     if why:
         return why
-    cohorts = report["cohorts"]
-    for v in report.get("verdicts") or []:
-        if v["stage"] != "confirm":
-            continue
-        if not _first_clear_shown(priors, boundary, v, cohorts[int(v["cohort"])]):
-            return (f"{v['digest'][:12]}: no verified earlier report shows the first clear "
-                    f"{str(v['confirmation']['first_set_sha256'])[:12]}")
     for res in (report.get("gate") or {}).get("results") or []:
         if "held_from" in res:
             why = _hold_problem(priors, res)
@@ -730,7 +679,7 @@ def _sentinel_problem(report: dict, era_sentinel) -> str | None:
 
 # ── W9: the judged set, the caps and the registration rules ─────────────────
 
-OPEN_STATUSES = ("pending", "confirm_pending")
+OPEN_STATUSES = ("pending", "hold")
 _CAP_SKIP = "coldkey_cap_settlement"
 # An entry selected and then dropped (the floors, an unscorable king, a
 # malformed forecast) counts against the caps like a judged one, as in the
@@ -1051,7 +1000,7 @@ def check_lane_d(report: dict, cfg, *, signer_hotkey: str, prior_reports=None,
     or the crown's provenance does not hold (RV7 B2).
 
     ``prior_reports`` (chain mode, what W9 runs): the earlier signed reports
-    the auditor holds, in any order; each confirm verdict's first clear and
+    the auditor holds, in any order; each
     each ``held_from`` must be shown by one that verifies under
     ``signer_hotkey``. ``era_sentinel``: the era's W-S1 receipt record
     (``{"suite", "block", "block_hash"}``) or ``None`` when W-S1 is unarmed;
