@@ -125,6 +125,15 @@ binds it into a receipt record (:mod:`~cascade.validator.lane_d_state`):
   returns the persisted report, pay and receipt with nothing re-scored,
   re-gated or written; an older boundary is ``stale_boundary``.
 
+W14 (the lane D-only fast kill, Proposed design change 4): a settlement with
+no lane D report goes through :func:`absent_settlement` instead. It reads
+the prior state under the same fail-closed rules, writes nothing, refuses a
+boundary already settled or whose report is persisted, and returns the
+absent receipt record with ``pay`` = lane D's share and an empty court: the
+caller pays it with ``lane_parts(..., d_absent=True)``, so only lane D's
+share burns. KING_D, the court and every pending entry are untouched, and
+the next real settlement judges and pays them.
+
 Light imports only (numpy + the scorer's numpy half): this module is on the
 validator package's import path.
 """
@@ -134,6 +143,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -157,12 +167,15 @@ from .lane_d_report import (
     validate_report,
 )
 from .lane_d_state import (
+    ABSENT_REASONS,
     HOUSE_ENTRY_KEY,
     PRIOR_STATE_EXTENSION,
+    LaneDReceiptError,
     LaneDStateError,
     check_persisted_report,
     load_prior_state,
     load_report_file,
+    make_absent_receipt,
     make_receipt,
     refresh_house,
     report_digest,
@@ -1209,5 +1222,52 @@ def _already_settled(state: dict, rp: Path, boundary: int) -> LaneDSettlement:
     return LaneDSettlement(report=report, pay=_persisted_pay(report, rp), receipt=receipt)
 
 
-__all__ = ["LaneDSettlement", "judge_cohort", "load_pool", "settle_lane_d",
-           "window_id"]
+def absent_settlement(*, cfg, boundary: int, state_path, house: dict, reason: str,
+                      expect_prior_sha256: str | None = None) -> LaneDSettlement:
+    """W14: settle lane D at ``boundary`` with NO lane D report (the operator
+    stopped reports, ``reason="report_absent"``, or the settlement could not
+    run, ``"infra_deferred"``; :data:`~cascade.validator.lane_d_state.ABSENT_REASONS`).
+
+    Unarmed (``not cfg.active(boundary)``): ``LaneDSettlement(None, None,
+    None)``. Armed: ``report`` is ``None``, ``receipt`` the absent record
+    binding the loaded state's digest as prior and posterior, and ``pay``
+    ``{"share": cfg.share, "court_uids": []}`` (the caller burns lane D's
+    whole share with ``lane_parts(..., d_absent=True)``).
+
+    The prior state is read with :func:`~cascade.validator.lane_d_state.load_prior_state`
+    (``state_missing`` / ``state_digest_mismatch``, and ``expect_prior_sha256``
+    as in :func:`settle_lane_d`). It never replaces a judgement: a boundary
+    the state already settled is ``report_conflict`` (that boundary) or
+    ``stale_boundary`` (an older one), and a boundary whose report is
+    persisted (a crash W7c recovery must adopt) is ``report_conflict``. An
+    unknown ``reason`` is ``LaneDReceiptError`` ``bad_value``. Nothing is
+    written, on success or refusal, so a re-call returns the same settlement."""
+    if not cfg.active(boundary):
+        return LaneDSettlement(report=None, pay=None, receipt=None)
+    if not isinstance(reason, str) or reason not in ABSENT_REASONS:
+        raise LaneDReceiptError("bad_value", f"absent reason {reason!r} is not one of "
+                                f"{list(ABSENT_REASONS)}")
+    house = check_house(house)
+    boundary = int(boundary)
+    state = load_prior_state(state_path, house, boundary,
+                             expect_prior_sha256=expect_prior_sha256)
+    settled = int(state["boundary"])
+    if settled == boundary:
+        raise LaneDStateError("report_conflict", f"lane D already settled boundary "
+                              f"{boundary}; it cannot be recorded absent")
+    if settled > boundary:
+        raise LaneDStateError("stale_boundary", f"lane D already settled through {settled}; "
+                              f"got {boundary}")
+    rp = report_path(state_path, boundary)
+    if os.path.lexists(rp):
+        raise LaneDStateError("report_conflict", f"{rp}: a report is persisted for boundary "
+                              f"{boundary}; recovery must adopt it (settle_lane_d), never "
+                              "record it absent")
+    receipt = make_absent_receipt(boundary=boundary, state_sha256=state_digest(state),
+                                  reason=reason)
+    return LaneDSettlement(report=None, pay={"share": float(cfg.share), "court_uids": []},
+                           receipt=receipt)
+
+
+__all__ = ["LaneDSettlement", "absent_settlement", "judge_cohort", "load_pool",
+           "settle_lane_d", "window_id"]

@@ -65,6 +65,11 @@ W9 re-derives what main took on trust (tests/accept/w9/README.md):
 - with ``pool_dirs``: every judged snapshot's digest, its ``frontier`` /
   ``feeds`` completeness and each judged window's record and §1.3
   eligibility (:func:`window_refusal`, re-implemented here from the spec).
+
+W14 (the lane D-only fast kill): :func:`check_lane_d_absent` re-derives a
+settlement with no lane D report from its absent receipt record (the
+structure rules re-implemented here, never imported from the producer). A
+satellite burns lane D's share, and only lane D's, on its ``PASS``.
 """
 
 from __future__ import annotations
@@ -78,10 +83,18 @@ from pathlib import Path
 import numpy as np
 
 from ..eval.bootstrap import cohort_maxt_lcbs
+from ..shared.marketcast_report import INFRA_DEFERRED, REPORT_ABSENT
 from .checks import CheckResult, _fail, _ok, _warn
 
 NAME = "lane_d"
 SCHEMA = "lane-d-report/1"
+# W14: the absent lane D receipt record (README w14 "The absent record").
+ABSENT_NAME = "lane_d_absent"
+RECEIPT_SCHEMA = "lane-d-receipt/1"
+ABSENT_STATUS = REPORT_ABSENT
+ABSENT_REASONS = ("report_absent", INFRA_DEFERRED)
+ABSENT_KEYS = ("schema", "status", "boundary", "reason", "prior_state_sha256",
+               "posterior_state_sha256")
 LEVELS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 
 
@@ -1161,4 +1174,59 @@ def check_lane_d(report: dict, cfg, *, signer_hotkey: str, prior_reports=None,
     return _ok(NAME, f"boundary {boundary}: {len(cohorts)} cohort(s), {n_rows} rows re-derived")
 
 
-__all__ = ["check_lane_d", "window_refusal"]
+def _absent_problem(record) -> str | None:
+    """The first structure defect of an absent receipt record, or None."""
+    if not isinstance(record, dict):
+        return f"not an object ({type(record).__name__})"
+    missing = [k for k in ABSENT_KEYS if k not in record]
+    if missing:
+        return f"missing {missing}"
+    extra = sorted(str(k) for k in record if k not in ABSENT_KEYS)
+    if extra:
+        return f"unknown fields {extra}"
+    if record["schema"] != RECEIPT_SCHEMA:
+        return f"receipt schema {record['schema']!r} is not {RECEIPT_SCHEMA}"
+    if record["status"] != ABSENT_STATUS:
+        return f"status {record['status']!r} is not {ABSENT_STATUS!r}"
+    reason = record["reason"]
+    if not isinstance(reason, str) or reason not in ABSENT_REASONS:
+        return f"reason {reason!r} is not one of {list(ABSENT_REASONS)}"
+    b = record["boundary"]
+    if isinstance(b, bool) or not isinstance(b, int) or b < 0:
+        return f"boundary {b!r} is not a non-negative int"
+    for k in ("prior_state_sha256", "posterior_state_sha256"):
+        if not _is_hex64(record[k]):
+            return f"{k} {record[k]!r} is not 64 lower-case hex"
+    if record["prior_state_sha256"] != record["posterior_state_sha256"]:
+        return "an absent settlement moves no state, but its prior != its posterior"
+    return None
+
+
+def check_lane_d_absent(record, cfg, *, boundary: int, previous_posterior_sha256: str,
+                        report=None) -> CheckResult:
+    """PASS exactly when ``record`` is a well-formed absent lane D receipt
+    record, lane D judges the settlement at ``boundary`` (``cfg.active``),
+    the record names that boundary, its prior is
+    ``previous_posterior_sha256`` (the previous lane D receipt's posterior,
+    or the genesis digest before the first settlement) and no ``report`` is
+    given for the boundary (a published report contradicts the record).
+    Otherwise FAIL. Pure and deterministic."""
+    why = _absent_problem(record)
+    if why:
+        return _fail(ABSENT_NAME, f"absent record: {why}")
+    at = record["boundary"]
+    if isinstance(boundary, bool) or not isinstance(boundary, int) or at != boundary:
+        return _fail(ABSENT_NAME, f"the absent record names boundary {at}, not {boundary!r}")
+    if not cfg.active(boundary):
+        return _fail(ABSENT_NAME, f"lane D does not judge the settlement at {boundary}")
+    if record["prior_state_sha256"] != previous_posterior_sha256:
+        return _fail(ABSENT_NAME, f"the absent record's state {record['prior_state_sha256']} "
+                                  f"is not the previous posterior {previous_posterior_sha256!r}")
+    if report is not None:
+        return _fail(ABSENT_NAME, f"a lane D report is given for boundary {boundary}, which "
+                                  "the record calls absent")
+    return _ok(ABSENT_NAME, f"boundary {boundary}: lane D absent ({record['reason']}); "
+                            "lane D's share burns")
+
+
+__all__ = ["check_lane_d", "check_lane_d_absent", "window_refusal"]
