@@ -110,8 +110,9 @@ def test_no_lock_plan_skips_the_lock_probes_and_plans_no_lock_call(tmp_path):
         assert isinstance(plan[n], list) and plan[n], (n, plan[n])
         text = " ".join(plan[n])
         assert "skipped" in text and SKIP_REASON in text, (n, plan[n])
-    blob = json.dumps(plan)
-    assert not LOCK_WORDS.search(blob), f"the no-lock plan still plans a lock call: {plan}"
+    steps = [s for name in PROBES for s in plan[name]]  # the steps, not the probe names
+    bad = [s for s in steps if LOCK_WORDS.search(s)]
+    assert not bad, f"the no-lock plan still plans a lock call: {bad}"
     assert not leak_problems(printed)
 
 
