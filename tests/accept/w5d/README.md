@@ -60,6 +60,53 @@ equals `evaluate_checkpoint(..., quantile_head=True)` → `stack_components` →
 `wql_per_window` per window to `rel=1e-5` (MASE too). Different batching
 (lane A: one window per forward; lane D: by length) is why it is not exact.
 
+## Arming (rev6.6, owner 2026-11-23): `test_w5d_arming.py`
+
+Plan rev6.6 (§1.1 context bullet, §1.7 readiness, T7 row). `[lane_d] contexts`
+lists every variant from launch and is the set a miner may **declare**. A
+variant is **armed** at a settlement only when both gates pass. The armed set is
+computed here, in the numpy-free half of `lane_d_scorer.py`, so the box-side
+settlement (W7a) can call it. It is never read from `cfg.contexts`.
+
+- `GATE_MIN_SOURCES == 20` and `READINESS_SCHEMA == "laned_readiness/1"`.
+- `armed_record(contexts, *, readiness, t7, min_long_series) -> dict`.
+  `readiness` and `t7` are the pinned documents' **bytes**, or `None` when
+  absent. The record is
+  `{"armed_contexts": [...], "evidence": {"min_long_series", "min_sources",
+  "readiness_sha256", "t7_sha256", "variants": [{"context", "series",
+  "sources", "t7_fits", "armed"}, ...]}}`.
+  - `variants` has one entry per value of `contexts`, ascending.
+    `armed_contexts` holds the variants whose `armed` is true, ascending.
+  - `*_sha256` is the sha256 hex of the bytes given, or `null` for an absent
+    document.
+  - Gate 1 (readiness, W1/R16 per-rung counts) is
+    `{"schema": "laned_readiness/1", "rungs": [{"context", "series", "sources"}]}`.
+    It passes iff `series >= min_long_series` and `sources >= 20`. A variant
+    with no rung counts as `series = sources = 0`. A wrong schema, a missing
+    `rungs`, a non-int, bool or negative count, a rung context outside
+    `SCORER_CONTEXTS` or a duplicate rung is a `ValueError`.
+  - Gate 2 (T7) reads the `laned_t7/1` evidence. It passes for a variant iff
+    the document's `source` is `"pod"` and the variant's row has
+    `peak_mem_source == "cuda_max_allocated"` and fits its budget
+    (`wall_s <= budget.wall_s` and `peak_mem_gb <= budget.mem_gb`,
+    **recomputed**). A row whose stated `fits` disagrees with its numbers is a
+    `ValueError`, because a hand edit is refused and never trusted. Without a
+    row the gate fails. Unparseable bytes or a schema other than `laned_t7/1`
+    is a `ValueError`.
+  - `contexts` must be a non-empty subset of `SCORER_CONTEXTS`, else
+    `ValueError`. The record is deterministic: the same bytes give the same
+    record, whatever the order of `contexts`.
+- `effective_context(declared, armed_contexts) -> int` returns `declared`
+  when it is armed and the highest armed variant otherwise, so the scored
+  context switches at the settlement where the declared variant arms. An
+  empty armed set, or a declared value that is not a scorer context (or is a
+  bool or str), is a `ValueError`.
+- `declared_context` and `forecast_quantiles(..., contexts=)` are unchanged.
+  The caller passes the context to forecast at (the effective one) and the
+  set it may run at (the armed set).
+
+On main these tests fail on the `_s()` assertion (the names are absent).
+
 ## Module contract: `cascade/eval/lane_d_t7.py`
 
 The pod run calls these and writes `evidence/t7.json` with `json.dump`.

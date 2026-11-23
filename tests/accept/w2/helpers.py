@@ -42,7 +42,9 @@ W2_DEFAULTS: dict[str, object] = {
     "share": 0.0,
     "takes_from": "lane_b",
     "remainder": "burn",
-    "contexts": (4096, 8192, 16384),
+    # rev6.6 (owner 2026-11-23): every variant is declarable from launch;
+    # arming is computed per settlement (W5d), never configured.
+    "contexts": (4096, 8192, 16384, 32768, 65536, 131072),
     "horizon": 64,
     "forward_margin_hours": 6.0,
     "min_windows": 1000,
@@ -104,7 +106,8 @@ MUTATIONS: dict[str, tuple[object, object, dict]] = {
     "until_block": (UNTIL_BLOCK, UNTIL_BLOCK_2, {"from_block": ARM_BLOCK}),
     "share": (0.25, 0.1, {"takes_from": "lane_a"}),
     "takes_from": ("lane_a", "lane_c", {}),
-    "contexts": ([4096, 32768], [4096, 8192, 16384, 32768, 65536, 131072], {}),
+    # rev6.6: B is a non-default subset (the default is all six variants).
+    "contexts": ([4096, 32768], [4096, 8192, 16384], {}),
     "horizon": (32, 128, {}),
     "forward_margin_hours": (3.0, 12.0, {}),
     "min_windows": (500, 2000, {}),
