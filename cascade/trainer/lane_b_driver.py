@@ -143,6 +143,8 @@ class FinishedExpertLeg:
     corpus_digest: str
     train_block: int
     gpu_name: str = ""
+    # WB22 / WB25: GPUs the leg trained on (the rented layout); 0 = not recorded
+    gpu_n: int = 0
 
 
 @dataclass
@@ -1041,7 +1043,8 @@ class LaneBDriver:
         return max(8, 3 * len(getattr(lb, "targets", None) or lb.domains))
 
     def _leg_done(self, leg: OpenLeg, leg_pointer: str | None, corpus_digest: str = "",
-                  train_block: int = 0, gpu_name: str = "", failure=None) -> None:
+                  train_block: int = 0, gpu_name: str = "", failure=None,
+                  gpu_n: int = 0) -> None:
         """A leg returned. ``failure`` (a funded leg's
         :class:`~cascade.trainer.lane_c_driver.LegFailure`) decides its queue
         entry: a miner fault ends it; anything else requeues it — a capacity
@@ -1060,7 +1063,7 @@ class LaneBDriver:
                 self.queue.finish(leg, ok=True)
                 self.st.finished.append(asdict(FinishedExpertLeg(
                     leg=asdict(leg), leg_pointer=leg_pointer, corpus_digest=corpus_digest,
-                    train_block=int(train_block), gpu_name=gpu_name)))
+                    train_block=int(train_block), gpu_name=gpu_name, gpu_n=int(gpu_n))))
             elif leg.funding and not getattr(failure, "miner_fault", False):
                 msg = str(getattr(failure, "msg", "") or "leg produced no checkpoint")
                 cls = str(getattr(failure, "error_class", "") or "operator")
@@ -1193,7 +1196,7 @@ class LaneBDriver:
                 base_king_pointer=leg["base_king_ref"], rebased_pointer=ptr,
                 corpus_digest=f["corpus_digest"], train_block=int(f["train_block"]),
                 commit_block=int(sub["commit_block"]), gpu_name=f.get("gpu_name", ""),
-                public_rows=rows, targets=declared if len(declared) > 1 else ()))
+                gpu_n=int(f.get("gpu_n", 0) or 0), public_rows=rows, targets=declared if len(declared) > 1 else ()))
             used.append((ptr, f, sel))
         judgements: list = []
         digest = ""
@@ -1721,6 +1724,8 @@ class RunnerLaneBOps:
         shared operator pool; absent capacity requeues without charging the
         miner again. Other failures are classified like a lane-A funded leg."""
         from ..funding.gpu_choice import GpuChoice
+        from ..funding.lane_b_gpus import lane_b_gpus_from_env, rent_scope
+        from ..provision.layout import layout_gpus
         from ..shared.expert_manifest import leg_label
         from .faults import _FundedOperatorFallback
         from .lane_c_driver import LegFailure
@@ -1742,21 +1747,29 @@ class RunnerLaneBOps:
                 gen = ResolvedGenerator(hotkey=leg.sub.hotkey, uid=leg.sub.uid,
                                         ref=leg.sub.gen_ref)
                 f = leg.funding
+                # WB22 (D42): lane B rents only its own measured GPU types
+                gpus = lane_b_gpus_from_env(self.r.cfg, block=int(era.start_block))
+                if not gpus.rent_skus():
+                    raise LegFailure("no [lane_b] funded_pod_skus type has a measured "
+                                     "step rate (WB19) on the pinned image — not rented",
+                                     miner_fault=False, error_class="no_capacity", burn=False)
                 self.r._funded_leg_failures.pop(gen.hotkey, None)
+                loc = self.r.__dict__.setdefault("_leg_local_obj", threading.local())
+                loc.funded_pod_sku = ""
+                # DEC-CA-0060: the lane-B entry's own choice, never lane A's
+                choice = GpuChoice(
+                    gpu=str(f.get("gpu", "") or ""),
+                    allow_fallback=bool(f.get("gpu_allow_fallback", False)),
+                    max_price_per_hour=float(f.get("gpu_max_price_per_hour", 0.0) or 0.0))
                 try:
-                    entry = self.r._run_funded_leg(
-                        self.r._dispatcher(), gen, seeds, int(block), contract,
-                        f"-x{label}-u{leg.sub.uid}", warm_start_ref=leg.base_king_ref,
-                        contract_block=self.r._era_contract_block(era), era_index=era.index,
-                        role="expert", bench=False, domain=label,
-                        expert_selection=leg.selection,
-                        funded_queue=self.funded_queue(),
-                        # DEC-CA-0060: the lane-B entry's own choice, never lane A's
-                        gpu_choice=GpuChoice(
-                            gpu=str(f.get("gpu", "") or ""),
-                            allow_fallback=bool(f.get("gpu_allow_fallback", False)),
-                            max_price_per_hour=float(f.get("gpu_max_price_per_hour", 0.0)
-                                                     or 0.0)))
+                    with rent_scope(self.r, gpus):
+                        entry = self.r._run_funded_leg(
+                            self.r._dispatcher(), gen, seeds, int(block), contract,
+                            f"-x{label}-u{leg.sub.uid}", warm_start_ref=leg.base_king_ref,
+                            contract_block=self.r._era_contract_block(era),
+                            era_index=era.index, role="expert", bench=False, domain=label,
+                            expert_selection=leg.selection,
+                            funded_queue=self.funded_queue(), gpu_choice=choice)
                 except _FundedOperatorFallback as e:   # incl. _FundedOperatorRent
                     q = self.funded_queue()
                     recovery = q.get(gen.hotkey) if q is not None else None
@@ -1780,8 +1793,11 @@ class RunnerLaneBOps:
                     msg, miner_fault, error_class, burn = verdict
                     raise LegFailure(msg or str(e), miner_fault=miner_fault,
                                      error_class=error_class, burn=burn) from e
+                # WB22 / WB25: the leg's GPU count is the rented layout's (every
+                # GPU of it trains); 0 = not known (no rent recorded)
+                sku = str(getattr(loc, "funded_pod_sku", "") or "")
                 done(leg, entry.trained_pointer, entry.corpus_digest, entry.train_block,
-                     getattr(entry, "gpu_name", ""))
+                     getattr(entry, "gpu_name", ""), gpu_n=layout_gpus(sku) if sku else 0)
             except LegFailure as f:
                 done(leg, None, failure=f)
             except Exception as e:  # noqa: BLE001 — an unclassified failure is ours

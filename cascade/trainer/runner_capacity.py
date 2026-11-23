@@ -43,6 +43,16 @@ def operator_lane_allowed(runner, hotkey: str | None, *, for_king: bool = False)
     return bool(refs) and str(getattr(entry, "ref", "") or "") in set(refs)
 
 
+def _lane_b_rent_skus(runner) -> tuple[str, ...] | None:
+    """WB22 (D42): lane B's measured ``[lane_b] funded_pod_skus`` while this
+    thread runs a lane B leg (``lane_b_gpus.rent_scope``), else None —
+    every lane A leg, whose rent path is unchanged. A module function, not a
+    method, so stub runners that borrow the mixin's methods keep working."""
+    skus = getattr(getattr(runner, "__dict__", {}).get("_leg_local_obj"),
+                   "lane_b_rent_skus", None)
+    return None if skus is None else tuple(skus)
+
+
 class _FundedCapacityMixin:
     """Marketplace capacity waits, per-SKU walls and rent deadlines (DEC-CA-0036)."""
 
@@ -50,7 +60,10 @@ class _FundedCapacityMixin:
         """``[round] funded_sku_per_leg``: every leg rents the cheapest listed
         GPU type that still fits instead of one locked type. Safe because
         rolling runs only past ``era_king_from_block``, where validators lift
-        the gpu_mismatch gate on mixed types."""
+        the gpu_mismatch gate on mixed types. A lane B leg (WB22 rent scope)
+        always picks per leg from lane B's own list."""
+        if _lane_b_rent_skus(self) is not None:
+            return True
         return bool(getattr(self.cfg.round, "funded_sku_per_leg", False))
 
     # Seconds between marketplace polls while a funded/king rent waits for a GPU.
@@ -106,11 +119,15 @@ class _FundedCapacityMixin:
             log.warning("%s: chosen GPU %s ignored — [round] funded_sku_per_leg is off "
                         "(one locked type)", who, gpu)
             return None
-        listed = tuple(getattr(self.cfg.round, "funded_pod_skus", ()) or ())
+        lane_b = _lane_b_rent_skus(self)
+        listed = (lane_b if lane_b is not None
+                  else tuple(getattr(self.cfg.round, "funded_pod_skus", ()) or ()))
         sku = next((s for s in listed if s.lower() == gpu.lower()), None)
         if sku is None:
-            log.warning("%s: chosen GPU %s is no longer in [round] funded_pod_skus — "
-                        "renting the default (cheapest fitting) type", who, gpu)
+            log.warning("%s: chosen GPU %s is no longer in %s — renting the default "
+                        "(cheapest fitting) type", who, gpu,
+                        "lane B's measured [lane_b] funded_pod_skus" if lane_b is not None
+                        else "[round] funded_pod_skus")
             return None
         caps = dict(self._funded_price_caps())
         caps["max_price_per_hour"] = float(getattr(choice, "max_price_per_hour", 0.0) or 0.0)
@@ -120,7 +137,11 @@ class _FundedCapacityMixin:
     def _funded_skus_for_rent(self) -> tuple[str, ...]:
         """GPU types a rent may pick: the locked ``funded_pod_sku``, or — with
         ``[round] funded_sku_per_leg`` (the open market) — every listed type,
-        cheapest fitting executor first."""
+        cheapest fitting executor first. A lane B leg (WB22) rents from lane
+        B's measured list only."""
+        lane_b = _lane_b_rent_skus(self)
+        if lane_b is not None:
+            return lane_b
         rnd = self.cfg.round
         if self._sku_per_leg_active():
             skus = tuple(getattr(rnd, "funded_pod_skus", ()) or ())
