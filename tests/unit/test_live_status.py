@@ -27,7 +27,8 @@ def test_live_snapshot_preserves_future_policy_and_missing_queues():
     data = status_snapshot(docs(), now=NOW, max_age=180)
     assert data["fresh"] and data["ready_for_training"]
     assert data["policy"]["new_rule"]["budget"] == 42
-    assert data["queues"] == {"a": None, "b": None, "c": None}
+    assert data["queues"] == {"a": None, "b": None, "c": None, "d": None}
+    assert data["lanes"]["d"] is None
     assert data["lanes"]["b"]["active"] is False
 
 
@@ -79,7 +80,7 @@ def test_status_cli_json_reads_live_without_a_wallet(monkeypatch, capsys, availa
     out = json.loads(capsys.readouterr().out)
     assert rc == (0 if available else 3)
     assert out["command"] == "status" and out["data"]["ready_for_training"] == available
-    assert len(reads) == 5
+    assert len(reads) == 6 and "status/lane_d.json" in reads
     if not available:
         assert out["error"]["code"] == "live_status_unavailable"
 
@@ -90,7 +91,7 @@ def test_each_invocation_refetches_public_state(monkeypatch, capsys):
                         lambda storage, key, **kw: reads.append(key))
     cli.main(["status", "--json"])
     cli.main(["status", "--json"])
-    assert len(reads) == 10
+    assert len(reads) == 12
 
 
 def test_live_scoring_prefers_published_current_init(monkeypatch, cfg):
@@ -110,7 +111,7 @@ def test_live_scoring_prefers_published_current_init(monkeypatch, cfg):
 
     monkeypatch.setattr("cascade.miner.dashboard.fetch_public_json", fetch)
     assert resolve_live_warm_start(cfg) == PTR
-    assert len(seen) == 5 and "receipts/latest.json" not in seen
+    assert len(seen) == 6 and "receipts/latest.json" not in seen
 
 
 def test_live_scoring_never_falls_back_when_new_feed_is_stale(monkeypatch, cfg):
