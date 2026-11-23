@@ -50,6 +50,10 @@ def _chain_with_sentinel(root, scenario: str):
         published[boundary] = res
 
     chain = h.build_chain(root, after=after)
+    if isinstance(chain, h.BrokenChain):
+        # The chain did not crown where it must: what it published is not
+        # the record under test either (read as the fixture's assertion).
+        published = h.BrokenChain(chain.why)
     return chain, published, store
 
 

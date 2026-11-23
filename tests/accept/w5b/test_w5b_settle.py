@@ -109,9 +109,12 @@ def test_e2e_union_freezes_across_two_settlements(tmp_path):
     assert cohort["members"] == [e["digest"]]
     assert sorted(cohort["window_ids"]) == sorted(got)
     assert cohort["set_sha256"] == set_sha(got)
+    # rev6.11 (b): the clear is a crowning candidate at once; the legacy
+    # call has no gate inputs, so it is held (W5e fail closed) on that set.
     after = _state(state_path)["entries"][e["digest"]]
-    assert after["status"] == "confirm_pending", after
-    assert after["confirm"]["first_set_sha256"] == set_sha(got)
+    assert (after["status"], after["reason"]) == ("hold", "bench_hold"), after
+    assert after["gate_hold"]["set_sha256"] == set_sha(got)
+    assert after.get("confirm") is None
 
 
 def test_t18_entry_readied_in_an_eras_last_settlement_carries_across_eras(tmp_path):
@@ -124,7 +127,7 @@ def test_t18_entry_readied_in_an_eras_last_settlement_carries_across_eras(tmp_pa
     assert mid["entries"][e["digest"]]["frozen_set"]["window_ids"] == sorted(wids(a))
     assert _member_wids(s2.report, e["digest"]) == wids(a) | wids(b), \
         "the accumulated union did not carry across the era boundary"
-    assert _state(state_path)["entries"][e["digest"]]["status"] == "confirm_pending"
+    assert _state(state_path)["entries"][e["digest"]]["status"] == "hold"
 
 
 def test_t18_until_block_closes_pending_entries_unjudged_and_unpaid(tmp_path):
