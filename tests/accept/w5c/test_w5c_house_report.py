@@ -219,12 +219,40 @@ def test_house_report_verdict_rederives_from_the_reports_rows_alone(chains, scen
             "an exact copy of the house has zero gain vs the house and must not clear (ties)"
 
 
+def _is_house_challenger_cohort(cohort, house_digest: str) -> bool:
+    """The refreshed house's own challenger cohort (W5f, plan §1.4 "Refresh:
+    ... It enters at that settlement"; §2 A -> D item 2 "The house can retake
+    KING_D when a better lane A king beats it on forward windows"). Its shape
+    is W5f's contract, not W5c's: it has no second bar."""
+    return house_digest in cohort["members"]
+
+
 @pytest.mark.parametrize("scenario", list(SCENARIOS), ids=lambda s: f"{s[0]}-{s[1]}")
 def test_house_report_rows_account_for_the_house(chains, scenario):
+    """Every MINER cohort judged while a miner holds KING_D names both bars
+    [KING_D, house] and carries their rows.
+
+    The refreshed house is also a challenger at the refresh boundary, in its
+    own cohort (plan §1.4 "Refresh: it's refreshed whenever that digest
+    changes ... It enters at that settlement"; §2 item 2 "The house can
+    retake KING_D when a better lane A king beats it on forward windows").
+    That cohort is W5f's (tests/accept/w5f/README §4: `members == [house]`,
+    `king_digest` = KING_D, no `house_digest`), so it is excluded from the
+    two-bar check here and only its W5f shape is asserted when present (on
+    main, before W5f, it is absent)."""
     c = chains(*scenario)
     report, k1, h1 = c["reports"][-1], c["k1"], c["h1"]
+    checked = 0
     for cohort in report["cohorts"]:
         n = len(cohort["window_ids"])
+        if _is_house_challenger_cohort(cohort, h1["digest"]):
+            assert cohort["members"] == [h1["digest"]], \
+                "the house challenger is judged in its own cohort"
+            assert cohort["king_digest"] == k1["digest"], \
+                "the house challenger is judged against KING_D"
+            assert "house_digest" not in cohort, "the house is never its own second bar"
+            continue
+        checked += 1
         bars = [cohort["king_digest"]] + ([cohort["house_digest"]]
                                           if cohort.get("house_digest") else [])
         assert bars == [k1["digest"], h1["digest"]], "the cohort does not name both bars"
@@ -234,6 +262,7 @@ def test_house_report_rows_account_for_the_house(chains, scenario):
         for dg in [*bars, *cohort["members"]]:
             assert sorted(r["window_id"] for r in got if r["digest"] == dg) == \
                 sorted(cohort["window_ids"]), f"{dg[:12]} is not scored on the cohort's set"
+    assert checked >= 1, "fixture: no miner cohort was judged, the check is vacuous"
 
 
 # ── the house holds KING_D: one bar, no house judgement ────────────────────
