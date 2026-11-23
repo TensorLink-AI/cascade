@@ -66,7 +66,9 @@ def test_new_pool_packs_up_to_32_native_channels_without_padding(tmp_path):
         'id': 'native-panel', 'domain': 'energy', 'frequency': 'PT1H',
         'source_family': 'grid:fixture', 'mv_channels': names,
     }]))
-    frame = pd.DataFrame({'timestamp': pd.date_range('2027-02-01', periods=100, freq='h'),
+    # Observations end inside the freshness window (freshness is judged by the
+    # newest observation, not only the snapshot-file date).
+    frame = pd.DataFrame({'timestamp': pd.date_range('2027-02-24', periods=100, freq='h'),
                           **{n: np.arange(100.) + i for i, n in enumerate(names)}})
     frame.to_parquet(data / '2027-03-01.parquet')
     rows = list(TsbenchForgeSource(root, mv_pack=True).harvest(lambda *args: None, CTX))
