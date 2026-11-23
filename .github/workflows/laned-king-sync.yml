@@ -1,0 +1,64 @@
+name: laned-king-sync
+
+# Copies the signed lane D index (champions/lane_d/index.json) into the repo
+# and writes one card pair per king: champions/lane_d/<digest>/
+# {PROVENANCE.json, MODEL_CARD.md} (LANE_D_PLAN §11.1, W13). No weights in
+# git: the checkpoints live on the Hippius Hub, the R2 public mirror and the
+# HF dataset tensorlink-dev/cascade-lane-d-kings.
+#
+# scripts/laned_king_sync.py reads the public index, verifies it under the
+# pinned [manifest] validator_hotkey and writes through
+# cascade.lane_d.publish.sync_cards (the tested code path). Nothing
+# published yet (404) is a no-op. The fetch is anonymous; the push uses the
+# workflow's own GITHUB_TOKEN, and no storage or HF credential is used here.
+
+on:
+  schedule:
+    - cron: "17,47 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: laned-king-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.13.4"
+
+      # config + sr25519 verification only: no torch, no storage stack
+      - name: Install deps
+        run: |
+          python scripts/check_tls_trust.py --system-only
+          uv pip install --system --python "$(which python)" "pip==26.2.2" -e ".[chain]" numpy
+          python scripts/check_tls_trust.py
+
+      - name: Sync the lane D index and cards
+        run: python scripts/laned_king_sync.py
+
+      - name: Commit and push the cards (if changed)
+        run: |
+          if [ -d champions/lane_d ]; then
+            git add -- champions/lane_d
+          fi
+          if git diff --cached --quiet; then
+            echo "lane D cards unchanged; nothing pushed"
+            exit 0
+          fi
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -m "laned-king-sync: lane D index and cards"
+          git push
