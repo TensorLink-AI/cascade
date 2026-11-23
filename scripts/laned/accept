@@ -2951,6 +2951,10 @@ def cmd_selftest() -> int:
     tests-only / tests-correction MODE rules."""
     failures: list[str] = []
     ident = ("-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false")
+    # the fixture repos' `(#N)` subjects must never meet the real repo's PR
+    # labels or ledger (the PR job exports both)
+    for k in ("LANED_PR_LABELS", "LANED_LEDGER"):
+        os.environ.pop(k, None)
     with tempfile.TemporaryDirectory(prefix="laned-accept-selftest-") as tmp:
         root = Path(tmp) / "repo"
         root.mkdir()

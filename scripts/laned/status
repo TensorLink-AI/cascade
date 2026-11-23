@@ -817,6 +817,9 @@ def test_inv4_in_a_helper_module():
 
 def cmd_selftest() -> int:
     failures: list[str] = []
+    # the fixture repo's `(#N)` subjects must never meet the real repo's PR
+    # labels (the workflow exports LANED_PR_LABELS)
+    os.environ.pop("LANED_PR_LABELS", None)
 
     def expect(cond: bool, what: str) -> None:
         if not cond:
