@@ -1,10 +1,21 @@
 # Plan: lane D "open weights" (anything goes on our architecture), with lane E and lane A flexibility — v3
 
-Status: **PLAN v3, rev6.5 (proposed 2026-11-22; rev6.5 2026-11-23)**: v2's design, made buildable by an
+Status: **PLAN v3, rev6.6 (proposed 2026-11-22; rev6.6 2026-11-23)**: v2's design, made buildable by an
 autonomous loop. A work package is done **only when its Accept command exits
 0**; **(rev6)** its level is only what `scripts/laned/status` computes (§17),
 never a claim. Owner decisions are marked **[DECIDE]**. Nothing is armed. **No calendar
 dates**: stages are gated (§5).
+
+## rev6.6 (owner 2026-11-23; main @ 9917c83)
+
+Records one owner decision, (a) ("can we allow up to 128k for lane D … so
+we just [use] as much as the model they submit allows"; "for lane D they can
+train for however long they up 128k context"). Plan text only. Every changed
+item is marked **(rev6.6)**.
+
+| Item | Decision | Landed in |
+|---|---|---|
+| (a) | **Lane D contexts up to 128k from launch, each armed when its gates pass (owner 2026-11-23, DECIDED).** `[lane_d] contexts` lists **every variant from launch: {4096, 8192, 16384, 32768, 65536, 131072}**. A miner declares any of them at `ready`; a value not in `contexts` is still refused (§1.1: "the miner declares a context from `[lane_d] contexts`"). The scorer keeps today's rule: it truncates each window to the history it really has, ≤ the declared context, no padding. So a model uses as much context as it supports and the data allows. **Arming is automatic per variant, not a separate S8 overlay.** A variant is armed once **both** gates pass: (1) ≥ `min_long_series` (300) series from ≥ 20 sources can use it (W1/R16 readiness counts, measured after the forge gap fix); (2) T7's wall time and memory for that variant pass on the eval host that scores lane D (≤ 50% of a settlement, §1.6). **Until a variant is armed, an entry that declared it is scored at the highest armed variant** (the declaration is valid because the value is in `contexts`; it isn't refused, and it is scored at its own context from the settlement its variant arms). The main validator computes the armed set per settlement and records it, with the evidence it used, in the signed report, so satellites verify it instead of re-deriving it (W7a field, follow-up). Quality beyond 16k stays unproven (32× the trained length, §1.1); T7 measures it. The comparison stays fair because king and challenger are scored on identical targets. Training length and recipe are the miner's (lane D is open weights). **Open, flagged (not decided here):** the brief named the launch eval host as "a 96 GB GPU (the bench pod valeval-blackwell4 is an RTX PRO 6000 96 GB)". D11 still says the launch eval host is a pinned-torch 2.4.1+cu124 pod and **not** Blackwell sm_120, because the pinned torch can't run there (§1.6, §10.2, D11). This rev keeps D11. Gate (2) is measured on whichever pinned-torch host scores lane D. On the ≥ 24 GB launch host, 32k–128k will likely fail gate (2) until the 96 GB pinned-torch valeval-laned is provisioned (W6-S8). Moving the launch eval host to a 96 GB pinned-torch pod is a separate owner call: **[DECIDE D11]** | §1.1 context bullet; §1.7 "Moved to stage S8" + harvest bullets; W2 row (`contexts` default); W6-S8 row; T7 row; §5 S8 row; D2, D10 (§6); §11.2 `docs/LANE_D.md` row; §17 S8 row; §17.4 D2 |
 
 ## rev6.5 (owner 2026-11-23; main @ e77ee6e)
 
@@ -763,9 +774,18 @@ Ephemeris, or anything else, on their own account. Recorded as **DEC-CA-0070**.
 **Context is a scorer-side setting, not a checkpoint property.**
 
 - At `ready` the miner declares a context from `[lane_d] contexts`.
-  **Launch arms `{4096, 8192, 16384}` (rev3).** 32768, 65536 and 131072 are
+  ~~**Launch arms `{4096, 8192, 16384}` (rev3).** 32768, 65536 and 131072 are
   armed later by overlay at stage S8 (§5), through the same `contexts` key
-  (D10). They're never a typed block.
+  (D10).~~ **(rev6.6, owner 2026-11-23)** `contexts` lists every variant
+  from launch: `{4096, 8192, 16384, 32768, 65536, 131072}`. A miner may
+  declare any of them; a value not in `contexts` is refused. Each variant is
+  **armed automatically** once both gates pass: (1) `min_long_series` (300
+  series from ≥ 20 sources) can use it (W1/R16, measured after the forge gap
+  fix), and (2) T7's wall time and memory for it pass on the eval host that
+  scores lane D. No overlay is needed. **An entry that declared an unarmed
+  variant is scored at the highest armed variant** until its own arms. The
+  main validator records the armed set and its evidence in the signed report.
+  Contexts are never a typed block.
 - **Architecture facts (rev3, verified in `pyramid_model.py`):**
   - `patch_size = 32` (`:32`). **(rev5) Training rows are 128 patches**
     (4096 points): `pyramid_trainer.py:360-362` passes `max_ctx_patches=128`
@@ -785,7 +805,10 @@ Ephemeris, or anything else, on their own account. Recorded as **DEC-CA-0070**.
     at d = 4096 patches**.
   - 128k context is 4096 patches, **(rev5) 32× the trained 128-patch rows**. The
     long-range signal in those dimensions is almost entirely suppressed, so
-    quality beyond 16k is unproven and is left to S8's T7 measurements.
+    quality beyond 16k is unproven and is left to ~~S8's~~ T7 measurements
+    **(rev6.6:** T7 gates each variant's arming. The comparison stays fair
+    because king and challenger are scored on identical targets; training
+    length and recipe are the miner's**)**.
 - A new lane D scorer module (`cascade/eval/lane_d_scorer.py`, outside the
   pinned wrapper) builds `CascadeMoEConfig` directly with that context and
   loads the same `state_dict`.
@@ -1373,10 +1396,11 @@ every challenger shares one window draw and the king's scores
   joined (not re-selected), with history extended to **16384 + 64**. It
   carries the A1 timestamps (data time and first-seen per target point) and
   the hist/tgt split (D18).
-- **(rev3) Moved to stage S8** (armed by overlay through `contexts`, D10):
-  history to 131072 + 64, deep backfill, the new long sources (option 3
-  below), and the 96 GB eval host. **(rev5) Only scoring and arming wait
-  for S8. Harvesting long history starts now** (below, WP R16).
+- **(rev3) Moved to stage S8** (~~armed by overlay through `contexts`, D10~~
+  **(rev6.6:** no overlay; each variant arms automatically when its two gates
+  pass, §1.1**)**): history to 131072 + 64, deep backfill, the new long sources (option 3
+  below), and the 96 GB eval host. **(rev5) ~~Only scoring and arming wait
+  for S8.~~ (rev6.6) Scoring at 32k–128k waits only for each variant's gates; in practice the history and the 96 GB host come from S8. Harvesting long history starts now** (below, WP R16).
 
 **(rev5) Harvest now, score later (up to 128k).**
 
@@ -1398,14 +1422,15 @@ every challenger shares one window draw and the king's scores
      sha-pinned per day.
 - **What does not change:** `pool` and lane A (byte-identity test as
   strict); nothing is scored, sent to an eval host or revealed from the
-  archive before its context is armed at S8; nothing runs on the box.
+  archive before its context is armed ~~at S8~~ **(rev6.6:** by its gates, §1.1**)**; nothing runs on the box.
 - **Size bound (arithmetic, not measured):** 4,633 series × 131,136 points ×
   4 B (float32) is about **2.4 GB** for a full copy. Stored append-only, the
   daily delta is small. Most series never reach 128k (see the table below),
   so the real size is below this.
 - **Readiness signal:** R16 reports, per context rung (32k/64k/128k), how many
-  series and sources have reached it. S8 arms a rung only when
-  `min_long_series` is met.
+  series and sources have reached it. ~~S8 arms a rung only when
+  `min_long_series` is met.~~ **(rev6.6)** A rung arms only when
+  `min_long_series` is met **and** T7 passes for it (§1.1); no S8 overlay.
 - **Metadata:** per-series (per-channel) `end_ts`, `first_target_ts` and the
   per-point first-seen record (W6fs). **(rev6.1)** Plus `frontier` for every
   series and a `feeds` entry (`mirror_lag_hours`, `forecast_product`) for
@@ -1607,7 +1632,7 @@ Accept command exits 0**, never on a builder's word. Conventions:
 | WP | What | Depends | Runs in | Accept |
 |---|---|---|---|---|
 | W1 | **(rev3)** Measurement (= S1 B2, `scripts/laned_w1_measure.py`): first-seen existence check; snapshot-diff **upper bound** on forward-eligible counts at both clocks; pool_mkt at 6 h; (§1.3, §1.7): forward-eligible counts and latency per frequency; long-history inventory per context variant; `pool_d` size | — | builder (needs `TSFORGE_S3`) | `scripts/laned/accept W1 --evidence evidence/w1.json` |
-| W2 | `[lane_d]` config: the keys `from_block`, `until_block`, `share`, `takes_from`, `remainder`, `contexts`, `horizon`, `forward_margin_hours`, `min_windows`, `min_clusters`, `min_long_series`, `d_margin`, `alpha`, `bootstrap_B`, `gate_suites`, `gate_weights`, ~~`unselected_suite`~~ **(rev5) dropped:** the held-out suite is the §16 sentinel, drawn from `[v2] sentinel_suites` (W-S1); a lane D key would duplicate it, `tau_public`, `reward_prior_kings`, `king_decay`, `max_entries_per_settlement`, `max_open_per_coldkey`, `max_bench_holds`, `loser_ttl_eras`, `dtypes`, **(rev3)** `max_mirror_lag_hours` (A1), `confirm_on_king_change` (D20), `max_judged_per_coldkey_per_settlement` (A8), `max_coldkey_unresolved_settlements` (A8), `max_reveal_delay_days` (A9), `lowfreq_freqs` (A10); **(rev5)** `ready_ttl_blocks` (B10), `max_source_share` (B14); `contexts` default `[4096, 8192, 16384]` (A5); `dtypes` default `["BF16"]` (A6). **(rev3) Size M, not S:** `lane_d.py` hardcodes `active() = False` (`:65-68`), refuses `from_block > 0` (**(rev5)** `:78-79`) and carries DEC-CA-0062 placeholder keys that must keep parsing (`until_block` and `share` overlay-settable; activation by signed-overlay `from_block`, never a DEC-CA-0045 vote), plus legacy keys still parsed (the deployed file carries `targets`, `teacher_*`, `gain_margin`, …); `ALLOWED["lane_d"]` with `remainder` refused via the `(table, key)` special case (**(rev5)** `netconfig.py:210`); loader parse, round-trip and **mutation** test per key; the 131072 cap; `LaneDConfig.active()` real | W0c | ci | `scripts/laned/accept W2` (includes `unread_keys.py`) |
+| W2 | `[lane_d]` config: the keys `from_block`, `until_block`, `share`, `takes_from`, `remainder`, `contexts`, `horizon`, `forward_margin_hours`, `min_windows`, `min_clusters`, `min_long_series`, `d_margin`, `alpha`, `bootstrap_B`, `gate_suites`, `gate_weights`, ~~`unselected_suite`~~ **(rev5) dropped:** the held-out suite is the §16 sentinel, drawn from `[v2] sentinel_suites` (W-S1); a lane D key would duplicate it, `tau_public`, `reward_prior_kings`, `king_decay`, `max_entries_per_settlement`, `max_open_per_coldkey`, `max_bench_holds`, `loser_ttl_eras`, `dtypes`, **(rev3)** `max_mirror_lag_hours` (A1), `confirm_on_king_change` (D20), `max_judged_per_coldkey_per_settlement` (A8), `max_coldkey_unresolved_settlements` (A8), `max_reveal_delay_days` (A9), `lowfreq_freqs` (A10); **(rev5)** `ready_ttl_blocks` (B10), `max_source_share` (B14); `contexts` default ~~`[4096, 8192, 16384]` (A5)~~ **(rev6.6)** `[4096, 8192, 16384, 32768, 65536, 131072]` (every variant declarable from launch; arming per variant is computed, not configured, §1.1); `dtypes` default `["BF16"]` (A6). **(rev3) Size M, not S:** `lane_d.py` hardcodes `active() = False` (`:65-68`), refuses `from_block > 0` (**(rev5)** `:78-79`) and carries DEC-CA-0062 placeholder keys that must keep parsing (`until_block` and `share` overlay-settable; activation by signed-overlay `from_block`, never a DEC-CA-0045 vote), plus legacy keys still parsed (the deployed file carries `targets`, `teacher_*`, `gain_margin`, …); `ALLOWED["lane_d"]` with `remainder` refused via the `(table, key)` special case (**(rev5)** `netconfig.py:210`); loader parse, round-trip and **mutation** test per key; the 131072 cap; `LaneDConfig.active()` real | W0c | ci | `scripts/laned/accept W2` (includes `unread_keys.py`) |
 | W2b | `[lane_d_ops]` non-consensus table (vault bucket, `pool_d` location, eval host, queue policy), read only by the main validator and the intake; never in receipts | W2 | ci | `scripts/laned/accept W2b` (satellite code path imports nothing from it) |
 | W1.5 | **Walking skeleton** `make laned-e2e` (CI): fixture `pool_d` (with `end_ts`) → tiny checkpoint → intake (filesystem adapter behind the real storage interface) → ingest guards → scorer → signed report → `lane_d_state.json` → emission → `check_lane_d` | W2 | ci | `make laned-e2e` asserts: non-zero lane D weight for the challenger; audit passes; one tampered row fails; unarmed byte-identical; `share = 0` leaves weights unchanged and still yields a valid report; `LaneDConfig.active()` is not a constant. **Every later WP keeps it green and adds ≥ 1 assertion** |
 | W3a | Storage probe scripts (presigned UploadPart, single-PUT size limit, Object Lock on multipart, prefix bucket policy, sub-token scope) + the **storage decision record** `decisions/STORAGE-LANE-D.md` naming the chosen upload path  **(rev5)** Also probes `UploadPartCopy` for ~2.5 GB objects (~~locking a king by copy at crowning~~) and ~~confirms COMPLIANCE retention can't be shortened~~. **(rev6.4)** Hippius has no Object Lock (403 on `GetObjectLockConfiguration` / `GetBucketVersioning` for sub-token and main key): the probe re-runs with `--no-object-lock` and the lock probes are recorded as `skipped`; kings are not locked by copy (§1.2). | — | owner (live Hippius) | `scripts/laned/accept W3a --evidence evidence/w3a_probe.json` (every probe has a recorded live result; the decision record names exactly one path) |
@@ -1627,7 +1652,7 @@ Accept command exits 0**, never on a builder's word. Conventions:
 | W6c | `pool_d_hist` / `pool_d_tgt` split | W6b | ci + builder | `scripts/laned/accept W6c` |
 | W6d | Pinning on Hippius; digests in reports; retention | W6c, W3a | builder | `scripts/laned/accept W6d --evidence evidence/w6d.json` |
 | W6s-*n* | **(rev3: moved to S8)** One WP per deep-history source (option 3, §1.7), each passing cleaning, domain and source keys | W6b | builder | `scripts/laned/accept W6s-<name> --evidence evidence/w6s_<name>.json` |
-| W6-S8 | **(rev3)** S8 long-context work: history to 131072 + 64, deep backfill, valeval-laned (96 GB pinned-torch) provisioning | W6d | builder + pod | `scripts/laned/accept W6-S8 --evidence evidence/w6s8.json` |
+| W6-S8 | **(rev3)** S8 long-context work: history to 131072 + 64, deep backfill, valeval-laned (96 GB pinned-torch) provisioning. **(rev6.6)** S8 is no longer the gate for the 32k–128k contexts (they are in `contexts` from launch and arm automatically on `min_long_series` + T7, §1.1). W6-S8 still owns the 131072 + 64 history/backfill work and valeval-laned provisioning, which in practice is what lets those variants pass their gates | W6d | builder + pod | `scripts/laned/accept W6-S8 --evidence evidence/w6s8.json` |
 | W3b1 | Gate suite draw from the boundary block hash | W1.5 | ci | `scripts/laned/accept W3b1` |
 | W3b2 | Paired sweep vs KING_D and house on one host | W3b1 | ci (recorded suite outputs) + pod | `scripts/laned/accept W3b2` |
 | W3b3 | **(rev5)** Sentinel sweep + publish: the era's §16 sentinel suite (not fixed TIME), swept and published for every new king, never gating | W3b2 | ci | `scripts/laned/accept W3b3` |
@@ -1859,7 +1884,7 @@ These are pinned by tests in the WPs named.
 | T5 | Malformed: extra `.py`, edited `model.py`, wrong `config.json`, `.pt`/`.bin`/pickle, wrong dtype or shape, NaN, oversize | Each refused at ingest with a specific code; nothing executed |
 | T6 | Second entry for a hotkey; coldkey cap; upload after `ready` (overwrite) | Refused; refused; `digest_mismatch` at ingest |
 | T6b | **(rev3)** Three entries from one coldkey ready in one settlement; one coldkey changed between ready and reveal; an unresolvable coldkey | 2 judged, 1 skipped `coldkey_cap_settlement` and carried; `coldkey_changed` refusal; `coldkey_unresolved` alert, then closed after the bound |
-| T7 | Each context variant: wall time and memory on **(rev5)** the launch eval host for 4k/8k/16k (valeval-laned for 32k–128k at S8); 4k model vs declared-128k copy on ≤ 4096-history windows | Identical scores on short windows; a variant is armed only if it fits the budget |
+| T7 | Each context variant: wall time and memory on **(rev5)** the launch eval host for 4k/8k/16k (valeval-laned for 32k–128k ~~at S8~~ **(rev6.6:** once provisioned, W6-S8**)**); 4k model vs declared-128k copy on ≤ 4096-history windows. **(rev6.6)** T7 is gate (2) of each variant's automatic arming (§1.1): it runs per variant on the eval host that scores lane D, and its pass/fail is recorded as evidence the main validator cites in the signed report. Also: an entry declaring an unarmed variant is scored at the highest armed variant, and the same entry scores at its own context once that variant arms | Identical scores on short windows; a variant is armed only if it fits the budget **(rev6.6:** ≤ 50% of a settlement, and `min_long_series` met**)**; unarmed-declared entry scored at the highest armed variant |
 | T7b | Gate: two validators derive the same suite from the block hash; regression vs KING_D or vs house blocks; **(rev5)** the era's sentinel suite swept and published only, never gating | As stated |
 | T7c | 2.5 GB (BF16, rev3) direct upload (multipart or single presigned PUT per W3a); prefetch; box RAM and disk flat | As stated |
 | T8 | **(rev3)** Forward rule, both clocks: **(rev6.1, labels corrected to §1.3 and `lane_d_forward.py:103-110`)** data-time-only pass but first-seen fail (publish-ahead, `publish_ahead`: a future-stamped value our mirror saw before T); first-seen-only pass but data-time fail (late mirror, `late_mirror`: data old, mirror saw it late); both fail (`before_margin`); a series lacking `frontier` or a feed not listed in `feeds` (refused); a feed over `max_mirror_lag_hours`; entry and king T values in both orders; a forecast-product feed; a backfilled partition | **(rev5)** Eligible only if **both** clocks (data time and first-seen) are after wall(max(T_E, T_K)) + `forward_margin` for every target point, and the feed's mirror lag ≤ `max_mirror_lag_hours`; the late-mirror, publish-ahead, over-lag, forecast-product and backfill cases are all ineligible; the snapshot-absence rule is never used for verdicts |
@@ -1982,7 +2007,7 @@ capability release → (rev5) one activation block, live everywhere.**
 | 12b | **(rev5) NOT PLANNED.** ~~(rev3) S6c Lane B~~ (rev4: superseded by the SB track below; it was for the parked §12 variant) | ~~Overlay: `[lane_b] from_block` at an era boundary (shadow first: `[lane_b] share = 0` for ≥ 2 eras, then the D1 split)~~ **(rev6)** struck: no shadow (D45); lane B arms at SB5 | ~~TB1–TB8 passed in S3; ≥ 2 eras of valid lane B reports at share 0 with satellite replay matching; then first paid settlement's vectors match on ≥ 2 validators~~ |
 | 12c | **(rev4) Lane B track SB0–SB5** (runs in parallel with lane D's S2–S3; depends on **S0a–S0c** de-drift, note budget and overlay bring-up, and on the shared S5 capability release) | **SB0** decide D35–D42, D42b · **SB1** build WB10–WB18, **(rev5)** WB22–WB23, W-S1–W-S2 · **SB2** WB19 measurement per GPU type (owner pod yes) · **SB3** testnet: TB10–TB27 (rev5), TS1–TS5, contamination check passing · **SB4** capability release (shared S5) · **SB5 (rev5, D45)** one overlay, once the D41 gate rule is satisfied and SB3 has passed (LB1): `[lane_b] from_block` with full share and `suite_targets` together, live everywhere at that block; no `share = 0` period. **(rev5)** If D40(b) is chosen: an image repin step (EMA constant fixed first; repin outside a seed epoch; moves lane A too) before SB3 | SB3 green including LB1's contamination check; **(rev5)** from the SB5 block, lane B live everywhere: first paid settlement's vectors match on ≥ 2 validators and satellite replay matches; gate-open evidence recorded |
 | 13 | **S7 Operate** | §10.4 runbook; §10.7 checks; revert overlay stays staged | No pending past its latency expectation without progress; first crowning (reported immediately, with seated and judged counts) or a house hold observed end-to-end |
-| 14 | **(rev3) S8 Long context** | W6-S8; rent valeval-laned (96 GB pinned torch) with owner yes; T7 at 32k/64k/128k; then an overlay adds the passing variants to `contexts` (D10) | Each added variant: T7 inside the settlement budget, W1 `min_long_series` met, overlay adopted ≥ 51% |
+| 14 | **(rev3) S8 Long context** | W6-S8; rent valeval-laned (96 GB pinned torch) with owner yes; T7 at 32k/64k/128k; ~~then an overlay adds the passing variants to `contexts` (D10)~~ **(rev6.6:** no overlay: 32k–128k are in `contexts` from launch and each arms automatically when its gates pass, §1.1**)** | Each ~~added~~ **(rev6.6)** armed variant: T7 inside the settlement budget, W1 `min_long_series` met~~, overlay adopted ≥ 51%~~ |
 
 **Block arithmetic.** Every activation or effective block is computed with
 code (`is_era_start`, the activation helpers) from the live chain and
@@ -2035,7 +2060,7 @@ is **accepted** unless a row says otherwise. The explicit answers:
 | # | Decision | Recommended |
 |---|---|---|
 | D1 | Share and source | **(rev5) DECIDED (owner): 25% from the total; equal split A 25 / B 25 / C 25 / D 25 when all lanes are armed.** Mechanically `[lane_d] share = 0.25`, `takes_from = "lane_a"`: lane A gets "the rest" (`lane_pool_shares`, `shared/lane_c.py:584-605`), and the king ladder works inside lane A's 25%. While a lane is off, its share stays with lane A (today's code); while lane B is armed but gated, its share burns (D37). Remainder burns |
-| D2 | Context variants | **(rev3)** Launch arms {4k, 8k, 16k}. {32k, 64k, 128k} arm at **S8** by overlay (`contexts`), each only after T7 and W1 `min_long_series` (owner goal 128k kept) |
+| D2 | Context variants | ~~**(rev3)** Launch arms {4k, 8k, 16k}. {32k, 64k, 128k} arm at **S8** by overlay (`contexts`), each only after T7 and W1 `min_long_series` (owner goal 128k kept)~~ **(rev6.6, owner 2026-11-23)** `contexts` = {4k, 8k, 16k, 32k, 64k, 128k} from launch; each variant arms automatically once W1 `min_long_series` and T7 pass; a declared unarmed variant is scored at the highest armed variant |
 | D2b | Gate | **(rev3)** One gate suite drawn per crowning from the suites **not** held out this era; the held-out suite is the §16 cross-lane sentinel (replaces fixed "TIME unselected"); `tau_public` 0.01; anchors = KING_D and house |
 | D3 | Rate limits | 1 open per hotkey; 2 open per coldkey; 8 judged per settlement |
 | D4 | Eval fee | None at launch |
@@ -2044,7 +2069,7 @@ is **accepted** unless a row says otherwise. The explicit answers:
 | D7 | Court | 2 prior miner kings, decay 0.5; house never in the court |
 | D8 | Losers | Private; vault TTL 4 eras; owner-only archive 14 days; then delete |
 | D9 | House paid? | No: the slot burns; prior miner tails keep paying |
-| D10 | Activation | **(rev5, D45)** One overlay: `from_block` with **`share = 0.25`** (D1) and `takes_from = "lane_a"` together (no `share = 0` shadow), published with an `effective_block` far enough ahead that observed `cfg-` stake reaches ≥ 2/3 before it; kill switch by a staged revert overlay (latency up to about one era); **(rev3)** the S8 long-context arming is also an overlay (`contexts`), live at its block, no shadow |
+| D10 | Activation | **(rev5, D45)** One overlay: `from_block` with **`share = 0.25`** (D1) and `takes_from = "lane_a"` together (no `share = 0` shadow), published with an `effective_block` far enough ahead that observed `cfg-` stake reaches ≥ 2/3 before it; kill switch by a staged revert overlay (latency up to about one era); ~~**(rev3)** the S8 long-context arming is also an overlay (`contexts`), live at its block, no shadow~~ **(rev6.6)** long-context arming needs no overlay: every variant is in `contexts` from launch and arms automatically on its gates (§1.1, D2) |
 | D11 | Eval host | **(rev3)** Launch: valpriv-4090 or another pinned-torch 2.4.1+cu124 pod (≥ 24 GB; the 16k fit is checked in B2). **Not** Blackwell sm_120. valeval-laned (H100/A100 80 GB class, pinned torch) only at S8 |
 | D12 | Pool packaging | `pool` untouched (keep length never raised); **(rev3)** launch `pool_d` = `pool`'s series ids joined, history to 16384 + 64, A1 timestamps, `pool_d_hist` (no targets) to the eval pod, `pool_d_tgt` on the box; 32k–128k history work at S8; dedicated builder |
 | D13 | Weights license | Open licenses only (Apache-2.0 / OpenMDW-1.1); kings are published |
@@ -2341,7 +2366,7 @@ and the audit checks it.
 
 | Surface | Change |
 |---|---|
-| `docs/LANE_D.md` (new) | what lane D is; checkpoint format; context as a declared scorer setting; export, verify, submit, ready, commit; dedicated hotkey; **(rev5)** the licence attestation at `ready` (weights and training data licensed for Apache-2.0/OpenMDW publication; no restricted-licence teacher outputs, e.g. Timestral under MarketCast's `[marketcast]` licence terms) and the takedown path; forward-only rule and **expected latency by frequency**; house; gate and **(rev5)** the rotating sentinel; pay and court; license; FAQ; **(rev3)** coldkey caps and the typed skip reasons, confirmation-duel latency, both clocks and mirror lag, BF16 only, launch contexts 4k–16k (S8 later), max reveal delay |
+| `docs/LANE_D.md` (new) | what lane D is; checkpoint format; context as a declared scorer setting; export, verify, submit, ready, commit; dedicated hotkey; **(rev5)** the licence attestation at `ready` (weights and training data licensed for Apache-2.0/OpenMDW publication; no restricted-licence teacher outputs, e.g. Timestral under MarketCast's `[marketcast]` licence terms) and the takedown path; forward-only rule and **expected latency by frequency**; house; gate and **(rev5)** the rotating sentinel; pay and court; license; FAQ; **(rev3)** coldkey caps and the typed skip reasons, confirmation-duel latency, both clocks and mirror lag, BF16 only, ~~launch contexts 4k–16k (S8 later)~~ **(rev6.6)** contexts 4k–128k declarable from launch, each armed when its gates pass (unarmed ⇒ scored at the highest armed), max reveal delay |
 | `docs/INTERFACE.md` | a lane D checkpoint interface section |
 | `docs/MINER.md` | lane table, link, "no compute keys needed for lane D" |
 | `docs/AGENT_MINING.md` | lane D agent workflow; **local scores on the revealed pool overstate forward gains** |
@@ -3122,7 +3147,7 @@ otherwise `evidence/gates/<stage>.json`, checked by
 | S6 | X6a at L4; the lane D WPs (§3.0 "Lane D core") at L7 |
 | SB0–SB5 | The same levels per §5 row 12c: SB0 as S0 for D35–D42 and D42b; SB1 as S2 for its WPs; SB2 WB19 at L4; SB3 as S3 for TB10–TB27 and TS1–TS5; SB4 = S5 (shared release); SB5 the lane B WPs at L7 |
 | S7 | X7 at L4 |
-| S8 | W6-S8 at L4; each added context rung at L7 |
+| S8 | W6-S8 at L4; each ~~added~~ **(rev6.6)** armed context rung at L7 |
 
 ### 17.3 Coverage counters
 
@@ -3151,7 +3176,7 @@ script parses this table on main; it changes only by an owner-merged plan PR.
 | D | Status | Option chosen | Class | Decided |
 |---|---|---|---|---|
 | D1 | decided | `[lane_d] share = 0.25` from the total, `takes_from = "lane_a"`; A 25 / B 25 / C 25 / D 25 | O | owner, 2026-11-21 |
-| D2 | decided | Launch {4k, 8k, 16k}; {32k, 64k, 128k} at S8 by overlay | O | owner (default), 2026-11-21 |
+| D2 | decided | ~~Launch {4k, 8k, 16k}; {32k, 64k, 128k} at S8 by overlay~~ **(rev6.6)** All six contexts declarable from launch; each auto-armed on `min_long_series` + T7 | O | owner, 2026-11-23 (rev6.6; was owner default 2026-11-21) |
 | D2b | decided | One gate suite per crowning from the suites not held out; the sentinel is held out | S | owner (default), 2026-11-21 |
 | D3 | decided | 1 open per hotkey, 2 per coldkey, 8 judged per settlement | O | owner (default), 2026-11-21 |
 | D4 | decided | No eval fee at launch | S | owner (default), 2026-11-21 |
