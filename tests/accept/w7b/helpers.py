@@ -69,12 +69,12 @@ ARMED = {
 }
 # W5a fails closed: a feed missing from `feeds` is `unlisted_feed`, so every
 # feed the series name is listed (as in tests/accept/w7a/helpers.py).
-FEEDS = {"feed-a": {"mirror_lag_hours": 1.5, "forecast_product": False},
-         "src1": {"mirror_lag_hours": None, "forecast_product": False},
-         "src2": {"mirror_lag_hours": 1.0, "forecast_product": False},
-         "src3": {"mirror_lag_hours": None, "forecast_product": False},
-         "src4": {"mirror_lag_hours": 1.0, "forecast_product": False},
-         "src5": {"mirror_lag_hours": 1.0, "forecast_product": False}}
+FEEDS = {"feed-a": {"mirror_lag_hours": 1.5, "forecast_product": False, "embargo_hours": 0.0},
+         "src1": {"mirror_lag_hours": None, "forecast_product": False, "embargo_hours": 0.0},
+         "src2": {"mirror_lag_hours": 1.0, "forecast_product": False, "embargo_hours": 0.0},
+         "src3": {"mirror_lag_hours": None, "forecast_product": False, "embargo_hours": 0.0},
+         "src4": {"mirror_lag_hours": 1.0, "forecast_product": False, "embargo_hours": 0.0},
+         "src5": {"mirror_lag_hours": 1.0, "forecast_product": False, "embargo_hours": 0.0}}
 # W5a fails closed on a missing `frontier` too (`absent_from_s0`), so every
 # series records its S0 as one `[as_of_ts, end_ts]` frontier record: S0 was
 # taken 3 h before the snapshot's first target (after the bound, T0 + 6 h)
