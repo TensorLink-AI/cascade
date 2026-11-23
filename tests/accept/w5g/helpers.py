@@ -345,10 +345,12 @@ def gate_inputs(mode: str, x: str, h: str, tag: str):
 
 
 class Flow:
-    """Challenger X against the genesis house H0. Boundary 1: X first-clears
-    on snapshot 1. Boundary 2: X clears its confirmation on snapshot 2 and is
-    gated with `mode2`. Later boundaries re-use snapshot 2 (no fresh window,
-    so a held X can only be re-gated) unless a fresh snapshot is asked for."""
+    """Challenger X against the genesis house H0. Boundary 1 lists no entry
+    (nothing is judged). Boundary 2: X enters and clears at its first verdict
+    on snapshot 2 and is gated with `mode2` (plan rev6.11 (b): a first clear
+    is the crowning candidate; no confirmation duel). Later boundaries re-use
+    snapshot 2 (no fresh window, so a held X can only be re-gated) unless a
+    fresh snapshot is asked for."""
 
     def __init__(self, tmp_path: Path, *, mode2: str, cfg=None, extra=(), x_quality="sharp"):
         self.tmp = Path(tmp_path)
@@ -367,14 +369,12 @@ class Flow:
         self.reports: dict[int, dict] = {}
         self.hosts: dict[int, object] = {}
         self.n = 0
-        self.settle_at(1, "pass", snap=1)
-        v = verdict_of(self.reports[1], self.x["digest"])
-        assert v is not None and v["outcome"] == "confirm_pending", \
-            f"fixture: X did not first-clear at boundary 1: {v}"
+        self.settle_at(1, "pass", snap=1, entries=[])
+        assert self.reports[1]["judged"] == [], "fixture: boundary 1 lists no entry"
         self.settle_at(2, mode2, snap=2)
         v = verdict_of(self.reports[2], self.x["digest"])
-        assert v is not None and v["stage"] == "confirm" and v["cleared"] is True, \
-            f"fixture: X did not clear its confirmation at boundary 2: {v}"
+        assert v is not None and v["stage"] == "first" and v["cleared"] is True, \
+            f"fixture: X did not clear at its first verdict at boundary 2: {v}"
 
     def pool(self, snap: int):
         if snap not in self.pools:
@@ -384,7 +384,8 @@ class Flow:
     def settle_at(self, n: int, mode: str, *, snap: int = 2, entries=None):
         pool_dir, recs = self.pool(snap)
         hash_, bench, host = gate_inputs(mode, self.x["digest"], self.h0["digest"], f"b{n}")
-        out = settle(self.cfg, boundary(n), pool_dir, entries or self.entries, self.h0,
+        listed = self.entries if entries is None else entries
+        out = settle(self.cfg, boundary(n), pool_dir, listed, self.h0,
                      forecasts(recs, self.models), self.uid_of, self.path,
                      hash_=hash_, bench=bench)
         self.reports[n] = out.report
