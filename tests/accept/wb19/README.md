@@ -132,7 +132,8 @@ root/cascade/validator_state.db
 ```
 
 The guard only stats them and **never reads them** (`cascade-ops.env` holds
-alert secrets). `run`, dry run included, refuses `prod_host` on any reason.
+alert secrets). A stat that raises an `OSError` (a GitHub runner's user may
+not stat `/root`) counts as absent and never crashes the tool. `run`, dry run included, refuses `prod_host` on any reason.
 `combine` is pure JSON assembly and isn't guarded. On the prod box the
 subprocess tests in `test_wb19_cli.py` that need a non-prod host skip, and
 `test_cli_refuses_on_this_prod_box` runs instead.

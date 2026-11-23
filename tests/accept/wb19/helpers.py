@@ -83,7 +83,15 @@ def host_is_prod() -> bool:
     """The same markers the tool's guard checks, on this host's real ``/``."""
     if str(os.environ.get("CASCADE_HOST_ROLE", "")).strip().lower() == "prod":
         return True
-    return any((Path("/") / m).exists() for m in PROD_MARKERS)
+    return any(marker_present(Path("/") / m) for m in PROD_MARKERS)
+
+
+def marker_present(path: Path) -> bool:
+    """Stat only. An OSError (e.g. a CI runner may not stat /root) = absent."""
+    try:
+        return path.exists()
+    except OSError:
+        return False
 
 
 def clean_env(tmp_path: Path, **extra: str) -> dict:
