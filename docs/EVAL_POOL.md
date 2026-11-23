@@ -367,7 +367,7 @@ Operator steps:
    ```bash
    TSFORGE_DIR=./tsforge cascade-pool publish \
      --chain-toml "$TOML" --sources tsbench_forge \
-     --max-panel-series-per-feed 5 --max-series-per-domain-freq 750 \
+     --max-panel-series-per-feed 20 --max-series-per-domain-freq 750 \
      --max-series-per-domain 1500 --selection balanced \
      --require-domain --require-source --min-series-per-domain 300 \
      --effective-block "$EFFECTIVE_BLOCK"

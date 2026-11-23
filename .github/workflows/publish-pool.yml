@@ -207,8 +207,17 @@ jobs:
           #   25 per feed (until 2026-10-03) still let 28 panel feeds supply ~26% of
           #   the series but only ~2.5% of the clusters, and transport filled its
           #   600 from ~50 sources. The KOTH bootstrap resamples whole feeds, so
-          #   evidence scales with distinct sources: 5 per feed makes the same caps
-          #   draw from ~2.4x more feeds and tightens the LCB.
+          #   evidence scales with distinct sources: 5 per feed made the same caps
+          #   draw from ~2.4x more feeds and tightened the LCB.
+          #   Raised 2026-11-23 (owner) 5 -> 20 with the domain caps below. The
+          #   bootstrap cluster key is the feed's source_family (pool metadata
+          #   `source`; cascade/pool/builder.py prepare_series, the default
+          #   --cluster-by source_family), and every panel row of one feed carries
+          #   the same family, so extra panel rows add series but no clusters.
+          #   --selection balanced still deals slots across sources first.
+          #   NOTE: the panel cap is not recorded in provenance.json, so a lane D
+          #   pool_d_build replay of a snapshot must pass the same
+          #   --max-panel-series-per-feed it was published with (20 from now on).
           # --max-series-per-domain-freq 750: balance by domain AND granularity —
           #   no (domain, freq) cell can dominate, so an hourly flood inside a
           #   domain can't crowd out that domain's daily series either.
@@ -239,7 +248,7 @@ jobs:
           TSFORGE_DIR=./tsforge cascade-pool publish \
             --chain-toml "$TOML" \
             --sources tsbench_forge \
-            --max-panel-series-per-feed 5 \
+            --max-panel-series-per-feed 20 \
             --max-series-per-domain-freq 750 \
             --max-series-per-domain 1500 \
             --selection balanced \
