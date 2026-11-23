@@ -811,8 +811,14 @@ def combine(cfg, runs: list[dict], *, oa8_types: Sequence[str],
         _check("coverage", not missing,
                f"missing expert runs: {missing}" if missing
                else f"every candidate measured: {list(need)}"),
-        _check("full_leg", len(full) == 1,
-               f"{len(full)} full {FULL_SKU} run(s); exactly one is needed"),
+        # The full lane A leg is OPTIONAL (owner 2026-11-23, "Yes skip it";
+        # plan rev6.5): the measured [round] funded_sku_wall_seconds stands for
+        # the full-leg wall. Zero full runs pass; one is validated as before;
+        # two or more fail.
+        _check("full_leg", len(full) <= 1,
+               f"0 full {FULL_SKU} runs; skipped: owner_2026-11-23 (full leg optional)"
+               if not full else
+               f"{len(full)} full {FULL_SKU} run(s); at most one is allowed"),
         _check("memory", not oom,
                f"peak >= memory_total for {oom}" if oom
                else "every expert leg fits memory at the contract micro-batching"),
