@@ -113,15 +113,15 @@ def combine_gradients(parameters, reference, cap=0.1):
 # POWER_EMA_SIGMA_RELS[POWER_EMA_EVAL] average; a continuation snapshot carries
 # the raw model plus every EMA state, so a resumed leg restores them bitwise.
 #
-# ACTIVATION (owner 2026-11-01 ~06:35): the EMA is SCORED only from the first
-# warm-start seed epoch after the image ships — see power_ema_active. A seed
-# epoch shares ONE init (DEC-CA-0055), so the rule is identical for the king's
-# retrain and every challenger of an epoch. SHADOW MODE (owner 2026-11-01):
-# both averages are always computed; where the gate is off (the random-init
-# epoch) weights.safetensors stays the raw endpoint, byte-identical to the
-# pre-EMA trainer, and the averages ride along as weights_ema005 / _ema010;
-# where it is on, weights.safetensors is the 0.10 average and the raw endpoint
-# rides along as weights_raw (+ the 0.05 file). Validators read only
+# ACTIVATION (lane D W-EMA, plan rev5 §8): the EMA is SCORED on NO leg — see
+# power_ema_active. Every leg of lanes A and B (random init, warm-start king /
+# challenger, lane-B expert leg on any king) scores the raw cooled endpoint;
+# switching the scored file is a later owner activation for every leg (D45).
+# SHADOW MODE (owner 2026-11-01): both averages are always computed;
+# weights.safetensors stays the raw endpoint, byte-identical to the pre-EMA
+# trainer, and the averages ride along as weights_ema005 / _ema010. (Were the
+# gate on, weights.safetensors would be the 0.10 average and the raw endpoint
+# would ride along as weights_raw + the 0.05 file.) Validators read only
 # weights.safetensors; the extras are comparison data, never scored.
 POWER_EMA_SIGMA_RELS = (0.05, 0.10)
 POWER_EMA_EVAL = 1
@@ -154,31 +154,20 @@ def power_ema_settings():
 
 
 def power_ema_active(warm_start_dir, expert_selection):
-    """Is the power EMA on for this leg? Derived only from the leg's INIT
-    (never wall-clock, image or role), so a seed epoch is never mixed:
+    """Is the power EMA SCORED for this leg? Never (lane D W-EMA, plan rev5
+    §8): one rule for every leg of lanes A and B, whatever its init — random
+    init, a king / challenger (heat or full) leg from a warm-start init (raw
+    or EMA-marked), or a lane-B expert leg (``expert_selection``) on a raw or
+    an EMA-marked king. ``weights.safetensors`` is the raw cooled endpoint and
+    both averages ride along unscored as ``weights_ema005`` / ``_ema010``.
 
-    * random init (no ``warm_start_dir``) — the v2 epoch that begins at the
-      first v2 era — stays raw;
-    * a king / challenger (heat or full) leg from a warm-start init — only
-      a DEC-CA-0013 promoted init, the seed epoch's ``warm_start_ckpt``, is
-      ever passed to them — is EMA-scored;
-    * a lane-B expert leg (``expert_selection``) fine-tunes FROM a king
-      checkpoint, so it follows that king: EMA iff the king was itself
-      EMA-scored (its ``config.json`` carries :data:`POWER_EMA_MARKER`),
-      i.e. iff the king's seed epoch began at a promotion.
-
-    A continuation re-derives the same answer from the same init."""
-    import json
-
-    if warm_start_dir is None:
-        return False
-    if expert_selection is None:
-        return True
-    try:
-        obj = json.loads((Path(warm_start_dir) / "config.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return False
-    return isinstance(obj, dict) and isinstance(obj.get(POWER_EMA_MARKER), dict)
+    The arguments name the leg's init and are deliberately not consulted: no
+    per-model "best of both". Switching the scored file is a later owner
+    activation for every leg at once (D45), not a per-init rule. Pure (no
+    clock, no state, no file read), so a continuation re-derives the same
+    answer."""
+    del warm_start_dir, expert_selection
+    return False
 
 
 def power_ema_state(emas):
