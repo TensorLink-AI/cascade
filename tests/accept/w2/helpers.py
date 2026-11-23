@@ -46,7 +46,7 @@ W2_DEFAULTS: dict[str, object] = {
     # arming is computed per settlement (W5d), never configured.
     "contexts": (4096, 8192, 16384, 32768, 65536, 131072),
     "horizon": 64,
-    "forward_margin_hours": 6.0,
+    "forward_margin_hours": 0.0,       # rev6.14 (a): 6 -> 0 (b = T)
     "min_windows": 1000,
     "min_clusters": 20,
     "min_long_series": 300,
@@ -109,7 +109,7 @@ MUTATIONS: dict[str, tuple[object, object, dict]] = {
     # rev6.6: B is a non-default subset (the default is all six variants).
     "contexts": ([4096, 32768], [4096, 8192, 16384], {}),
     "horizon": (32, 128, {}),
-    "forward_margin_hours": (3.0, 12.0, {}),
+    "forward_margin_hours": (3.0, 6.0, {}),   # rev6.14 (a): <= eval_delay_hours (6)
     "min_windows": (500, 2000, {}),
     "min_clusters": (10, 30, {}),
     "min_long_series": (150, 600, {}),

@@ -96,6 +96,7 @@ def test_inv4_settle_never_scores_an_ineligible_window(tmp_path):
     for seed in range(8):
         rng = np.random.default_rng(1000 + seed)
         cfg = lane_d_cfg(forward_margin_hours=float(rng.choice([0.0, 6.0, 12.0])),
+                         eval_delay_hours=12.0,   # rev6.14 (a): >= the margin
                          max_mirror_lag_hours=float(rng.choice([3.0, 6.0, 9.0])))
         t_king = int(T0 + int(rng.integers(-72, 73)) * HOUR)
         entries = [_entry(f"p{seed}-e{i}", T0 + int(rng.integers(0, 49)) * HOUR)

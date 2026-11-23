@@ -17,6 +17,7 @@ schedule, ``notes``) keep parsing as written: the deployed file carries them.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -55,8 +56,12 @@ class LaneDConfig:
     contexts: tuple[int, ...] = LANE_D_CONTEXTS
     horizon: int = 64
     dtypes: tuple[str, ...] = LANE_D_DTYPES
-    # Forward-only judging (§1.3, D5).
-    forward_margin_hours: float = 6.0
+    # Forward-only judging (§1.3, D5). rev6.14 (a): two clocks per entry, T =
+    # wall(max(T_E, T_K)): the eligibility / fresh boundary b = T +
+    # forward_margin_hours (default 0) and the judging start j = T +
+    # eval_delay_hours (default 6, the owner's "delay eval by 6 hours").
+    forward_margin_hours: float = 0.0
+    eval_delay_hours: float = 6.0
     min_windows: int = 1000
     min_clusters: int = 20
     min_long_series: int = 300
@@ -252,9 +257,16 @@ def parse_lane_d(raw: object, *, era_blocks_at: Callable[[int], int] | None = No
     contexts = _contexts(ld.get("contexts", list(LANE_D_CONTEXTS)))
     horizon = _int(ld.get("horizon", 64), "horizon", lo=1, hi=LANE_D_MAX_HORIZON)
     dtypes = _dtypes(ld.get("dtypes", list(LANE_D_DTYPES)))
-    fwd = _float(ld.get("forward_margin_hours", 6.0), "forward_margin_hours")
+    fwd = _float(ld.get("forward_margin_hours", 0.0), "forward_margin_hours")
     if fwd < 0.0:
         raise ValueError(f"[lane_d] forward_margin_hours must be >= 0; got {fwd!r}")
+    delay = _float(ld.get("eval_delay_hours", 6.0), "eval_delay_hours")
+    if not math.isfinite(delay) or delay < 0.0:
+        raise ValueError(f"[lane_d] eval_delay_hours must be >= 0; got {delay!r}")
+    if fwd > delay:
+        # rev6.14 (a): b <= j, else judging could start before a fresh point exists.
+        raise ValueError(f"[lane_d] forward_margin_hours ({fwd}) must be <= eval_delay_hours "
+                         f"({delay})")
     lag = _float(ld.get("max_mirror_lag_hours", 6.0), "max_mirror_lag_hours")
     if lag <= 0.0:
         raise ValueError(f"[lane_d] max_mirror_lag_hours must be > 0; got {lag!r}")
@@ -319,7 +331,7 @@ def parse_lane_d(raw: object, *, era_blocks_at: Callable[[int], int] | None = No
     return LaneDConfig(
         from_block=fb, until_block=ub, share=share, takes_from=takes, remainder=rem,
         contexts=contexts, horizon=horizon, dtypes=dtypes,
-        forward_margin_hours=fwd,
+        forward_margin_hours=fwd, eval_delay_hours=delay,
         min_windows=min_windows,
         min_clusters=_int(ld.get("min_clusters", 20), "min_clusters", lo=1),
         min_long_series=_int(ld.get("min_long_series", 300), "min_long_series", lo=0),
