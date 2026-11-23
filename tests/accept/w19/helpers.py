@@ -30,7 +30,13 @@ from functools import cache
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
-WORKER_MODULE = "cascade.validator.lane_d_worker"
+# Generic off-thread infrastructure, deliberately NOT named lane_d_*: W9's
+# invariant 12 (tests/accept/w9/helpers.py FORBIDDEN_STEMS) forbids the
+# audit's import closure, which reaches cascade/validator/loop.py, from
+# loading any `cascade.validator.lane_d_*` module, and loop.py imports this.
+WORKER_MODULE = "cascade.validator.offthread_worker"
+# What the worker module must never import (W9 invariant 12, via loop.py).
+WORKER_FORBIDDEN_PREFIX = "cascade.validator.lane_d"
 
 KING = "w19KingHotkey"
 ARM_BLOCK = 9_720_000           # an era boundary on the 900-block grid
@@ -199,6 +205,16 @@ def module_source(name: str) -> str:
 
     mod = importlib.import_module(name)
     return Path(mod.__file__).read_text(encoding="utf-8")
+
+
+def module_source_static(name: str) -> str:
+    """The source of module ``name`` located WITHOUT executing it (static
+    scans must not load what they check for). Fails if it does not exist."""
+    import importlib.util
+
+    spec = importlib.util.find_spec(name)
+    assert spec is not None and spec.origin, f"module {name} not found (W19 PATHS)"
+    return Path(spec.origin).read_text(encoding="utf-8")
 
 
 def polls(start: int, stop: int) -> list[int]:
