@@ -1003,6 +1003,24 @@ def cmd_selftest() -> int:
                f"batch B4: {b4}, want L1 at {squash2}")
         expect(all(data["wps"][w]["level"] == "L1" for w in ("B1", "B2", "B3")),
                "a later batch changed B1-B3's level")
+
+        # (6) BATCH IMPLEMENTATION (plan rev6.3 (b)): one squash merge
+        # implementing B1 and B2 (disjoint PATHS b1/, b2/) is the L2 commit of
+        # both; a merge with a file in no WP's PATHS is L2 for none (B3).
+        put("b1/mod.py", "VALUE = 1\n")
+        put("b2/mod.py", "VALUE = 1\n")
+        impl12 = commit("feat: B1 B2 (#3)")
+        put("b3/mod.py", "VALUE = 1\n")
+        put("README.md", "edited with B3\n")
+        commit("feat: B3 + a stray file (#4)")
+        _, data = level(list(entries.values()), "B1")
+        for wp in ("B1", "B2"):
+            det = data["wps"][wp]
+            expect(det["level"] == "L2" and det.get("l2_commit") == impl12
+                   and det.get("l2_via") == "implementation",
+                   f"batch impl {wp}: {det}, want L2 at {impl12}")
+        expect(data["wps"]["B3"]["level"] == "L1",
+               f"a merge with a stray file gave B3 {data['wps']['B3']['level']}, want L1")
     for f in failures:
         print(f"status selftest: FAIL {f}", file=sys.stderr)
     if failures:

@@ -2042,6 +2042,174 @@ def selftest_batch(ident: tuple[str, ...]) -> list[str]:
     return failures
 
 
+SELFTEST_BATCH_IMPL_PLAN = """# selftest plan
+
+| WP | What | Depends | Runs in | Accept |
+|---|---|---|---|---|
+| I1 | one | — | ci | `scripts/laned/accept I1` |
+| I2 | two | — | ci | `scripts/laned/accept I2` |
+| I3 | three | — | ci | `scripts/laned/accept I3` |
+| I4 | four | — | ci | `scripts/laned/accept I4` |
+| D1 | needs I1 | I1 | ci | `scripts/laned/accept D1` |
+| D2 | needs D1 | D1 **(rev6)** | ci | `scripts/laned/accept D2` |
+| O1 | overlaps I1 | — | ci | `scripts/laned/accept O1` |
+| N1 | no tests yet | — | ci | `scripts/laned/accept N1` |
+
+| WP | Stage | Runs in | Accept |
+|---|---|---|---|
+| X1 | S9 | ci | `scripts/laned/accept X1` |
+"""
+
+
+def selftest_batch_impl(ident: tuple[str, ...]) -> list[str]:
+    """The BATCH IMPLEMENTATION rule of --check-pr (plan rev6.3 (b)), the
+    per-WP Accept after it, the squash merge as each WP's L2 commit
+    (built_on) and the tests-correction batch, on a real git repo."""
+    failures: list[str] = []
+    saved = os.environ.get("LANED_PYTEST_CMD")
+    os.environ["LANED_PYTEST_CMD"] = shlex.join([sys.executable, "-m", "pytest", "-p", "no:cacheprovider"])
+    # WP -> (PATHS, implementation files)
+    wps = {"I1": ("pkg/i1.py\n", {"pkg/i1.py": "VALUE = 1\n"}),
+           "I2": ("pkg/i2/\n", {"pkg/i2/__init__.py": "", "pkg/i2/mod.py": "VALUE = 1\n"}),
+           "I3": ("pkg/i3_*.py\n", {"pkg/i3_core.py": "VALUE = 1\n"}),
+           "I4": ("pkg/i4.py\n", {"pkg/i4.py": "VALUE = 1\n"}),
+           "D1": ("pkg/d1.py\n", {"pkg/d1.py": "VALUE = 1\n"}),
+           "D2": ("pkg/d2.py\n", {"pkg/d2.py": "VALUE = 1\n"}),
+           "O1": ("pkg/\n", {"pkg/o1.py": "VALUE = 1\n"}),
+           "X1": ("pkg/x1.py\n", {"pkg/x1.py": "VALUE = 1\n"})}
+    mods = {"I1": "pkg.i1", "I2": "pkg.i2.mod", "I3": "pkg.i3_core", "I4": "pkg.i4",
+            "D1": "pkg.d1", "D2": "pkg.d2", "O1": "pkg.o1", "X1": "pkg.x1"}
+
+    def impl(*names: str) -> dict[str, str]:
+        out: dict[str, str] = {}
+        for n in names:
+            out.update(wps[n][1])
+        return out
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="laned-accept-selftest-batchimpl-") as tmp:
+            root = Path(tmp) / "repo"
+            root.mkdir()
+
+            def commit(files: dict[str, str], msg: str) -> str:
+                for rel, text in files.items():
+                    (root / rel).parent.mkdir(parents=True, exist_ok=True)
+                    (root / rel).write_text(text)
+                lanedlib.git(root, "add", "-A")
+                lanedlib.git(root, *ident, "commit", "-q", "-m", msg)
+                return lanedlib.git(root, "rev-parse", "HEAD").stdout.strip()
+
+            lanedlib.git(root, "init", "-q")
+            lanedlib.git(root, "checkout", "-q", "-b", "main")
+            commit({lanedlib.PLAN_PATH: SELFTEST_BATCH_IMPL_PLAN, ".gitignore": "__pycache__/\n",
+                    "README.md": "x\n", "pkg/__init__.py": ""}, "plan")
+            for w, (paths, _) in wps.items():
+                d = lanedlib.wp_dir(w)
+                commit({f"tests/accept/{d}/PATHS": paths,
+                        f"tests/accept/{d}/test_{d}.py": f"import {mods[w]}\n\n\ndef test_{d}():\n"
+                                                         f"    assert {mods[w]}.VALUE == 1\n"}, f"tests {w}")
+            base = lanedlib.git(root, "rev-parse", "HEAD").stdout.strip()
+
+            def check(name: str, files: dict[str, str], labels: list[str] | None, wp: str,
+                      start: str) -> tuple[int, str, str]:
+                lanedlib.git(root, "checkout", "-q", "-B", name, start)
+                head = commit(files, name)
+                with contextlib.redirect_stdout(io.StringIO()) as buf:
+                    rc = cmd_check_pr(root, wp, start, head, labels)
+                return rc, buf.getvalue(), head
+
+            def want_batch(name: str, files: dict[str, str], labels: list[str], mode: str,
+                           start: str) -> str:
+                head = ""
+                for wp in labels:
+                    rc, out, head = check(f"{name}-{wp}", files, labels, wp, start)
+                    lines = [ln for ln in out.splitlines() if ln.startswith(("BATCH ", "MODE "))]
+                    if rc != 0 or lines != ["BATCH " + " ".join(labels), f"MODE {mode}"]:
+                        failures.append(f"batch-impl {name}: {wp} rc={rc}, want BATCH + MODE {mode}: "
+                                        f"{out.strip()}")
+                return head
+
+            def want_refused(name: str, files: dict[str, str], labels: list[str], want: str,
+                             start: str = base) -> None:
+                for wp in labels:
+                    if REVIEW_WP.match(wp):
+                        continue
+                    rc, out, _ = check(f"{name}-{wp}", files, labels, wp, start)
+                    if rc == 0 or want not in out or "MODE " in out:
+                        failures.append(f"batch-impl {name}: {wp} rc={rc}, want {want}: {out.strip()}")
+
+            want_batch("two", impl("I1", "I2"), ["I1", "I2"], "implementation", base)
+            head3 = want_batch("three", impl("I1", "I2", "I3"), ["I1", "I2", "I3"], "implementation", base)
+            want_refused("four", impl("I1", "I2", "I3", "I4"), ["I1", "I2", "I3", "I4"],
+                         "FAIL rule1: batch-too-many")
+            want_refused("overlap", impl("I1", "O1"), ["I1", "O1"], "FAIL rule1: batch-overlapping-paths")
+            want_refused("dep", impl("I1", "D1"), ["I1", "D1"], "FAIL rule1: batch-dependency: D1 depends on I1")
+            want_refused("dep-transitive", impl("I1", "D2"), ["D2", "I1"],
+                         "FAIL rule1: batch-dependency: D2 depends on I1 (transitively)")
+            want_refused("no-tests", {**impl("I1"), "pkg/n1.py": "VALUE = 1\n"}, ["I1", "N1"],
+                         "FAIL rule1: batch-no-tests")
+            want_refused("deps-unknown", impl("I1", "X1"), ["I1", "X1"], "FAIL rule1: batch-deps-unknown")
+            want_refused("no-wp", {**impl("I1", "I2"), "README.md": "y\n"}, ["I1", "I2"],
+                         "FAIL paths: batch-out-of-scope: outside every batch WP's PATHS: README.md")
+            want_refused("tooling", {**impl("I1", "I2"), "scripts/laned/x.py": "X = 1\n"}, ["I1", "I2"],
+                         "FAIL paths: batch-out-of-scope")
+            want_refused("idle-label", impl("I1"), ["I1", "I2"], "FAIL rule1: batch-label-without-changes")
+            want_refused("review-label", impl("I1"), ["I1", "RV9"], "FAIL rule1: batch-non-wp-label")
+            # one label: unchanged (another WP's files are outside its PATHS)
+            for labels in (None, ["I1"]):
+                rc, out, _ = check("single", impl("I1", "I2"), labels, "I1", base)
+                if rc == 0 or not out.startswith("FAIL paths: outside the WP's PATHS: pkg/i2/"):
+                    failures.append(f"batch-impl single {labels}: rc={rc}: {out.strip()}")
+            rc, out, _ = check("single-ok", impl("I1"), ["I1"], "I1", base)
+            if rc != 0 or out != "MODE implementation\n":
+                failures.append(f"batch-impl single-ok: rc={rc}: {out!r}")
+            # each WP's own Accept passes on the batch head
+            lanedlib.git(root, "checkout", "-q", head3)
+            for wp in ("I1", "I2", "I3"):
+                with contextlib.redirect_stdout(io.StringIO()) as buf, \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    rc = cmd_accept(root, wp, None)
+                if rc != 0:
+                    failures.append(f"batch-impl accept {wp} failed: {buf.getvalue().strip()[-1500:]}")
+            # the squash merge is each WP's L2 commit; a stray-file merge is not
+            lanedlib.git(root, "checkout", "-q", "main")
+            lanedlib.git(root, "merge", "-q", "--squash", head3)
+            merged = commit({}, "feat: I1 I2 I3 (#2)")
+            built = [w for w in ("I1", "I2", "I3", "I4") if built_on(root, merged, w)]
+            if built != ["I1", "I2", "I3"]:
+                failures.append(f"batch-impl squash: built {built}, want I1 I2 I3")
+            stray = commit({"pkg/d1.py": "VALUE = 1\n", "pkg/x1.py": "VALUE = 1\n", "README.md": "z\n"}, "stray")
+            if built_on(root, stray, "D1") or built_on(root, stray, "X1"):
+                failures.append("batch-impl: a merge with a file in no WP's PATHS counted as L2")
+            lanedlib.git(root, "reset", "-q", "--hard", merged)
+            # tests-corrections batch: all built (<= 3) -> MODE tests-correction per WP
+            more = {f"tests/accept/{lanedlib.wp_dir(w)}/test_more_{lanedlib.wp_dir(w)}.py": SELFTEST_PASSING
+                    for w in ("I1", "I2")}
+            head = want_batch("corrections", more, ["I1", "I2"], "tests-correction", merged)
+            lanedlib.git(root, "checkout", "-q", head)
+            for wp in ("I1", "I2"):
+                with contextlib.redirect_stdout(io.StringIO()) as buf, \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    rc = cmd_tests_correction(root, wp, merged, head)
+                if rc != 0:
+                    failures.append(f"batch-impl tests-correction {wp} failed: {buf.getvalue().strip()[-1500:]}")
+            want_refused("mixed", {"tests/accept/i1/test_more_i1.py": SELFTEST_PASSING,
+                                   "tests/accept/d1/test_more_d1.py": SELFTEST_PASSING}, ["I1", "D1"],
+                         "FAIL rule1: batch-built-wp", merged)
+            lanedlib.git(root, "checkout", "-q", "main")
+            four_base = commit(impl("I4"), "feat: I4 (#3)")
+            want_refused("four-corrections",
+                         {f"tests/accept/{lanedlib.wp_dir(w)}/test_more.py": SELFTEST_PASSING
+                          for w in ("I1", "I2", "I3", "I4")},
+                         ["I1", "I2", "I3", "I4"], "FAIL rule1: batch-too-many", four_base)
+    finally:
+        if saved is None:
+            os.environ.pop("LANED_PYTEST_CMD", None)
+        else:
+            os.environ["LANED_PYTEST_CMD"] = saved
+    return failures
+
+
 def cmd_selftest() -> int:
     """Offline check of the RV<n> review mode of --check-pr and of the
     tests-only / tests-correction MODE rules."""
@@ -2092,6 +2260,7 @@ def cmd_selftest() -> int:
     failures += selftest_cross(ident)
     failures += selftest_freshness(ident)
     failures += selftest_batch(ident)
+    failures += selftest_batch_impl(ident)
     for f in failures:
         print(f"accept selftest: FAIL {f}", file=sys.stderr)
     if failures:
