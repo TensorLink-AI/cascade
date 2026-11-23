@@ -1,8 +1,11 @@
-"""W19: `cascade.validator.lane_d_worker.LaneDWorker`, the off-thread runner
-the validator's lane D tick submits to. Contract: README.md."""
+"""W19: `cascade.validator.offthread_worker.LaneDWorker`, the off-thread runner
+the validator's lane D tick submits to. Contract: README.md (the module is
+not named lane_d_*: W9 invariant 12)."""
 
 from __future__ import annotations
 
+import ast
+import importlib
 import threading
 import time
 
@@ -19,9 +22,37 @@ def step():
 
 
 def _worker(step):
-    from cascade.validator.lane_d_worker import LaneDWorker
+    return importlib.import_module(h.WORKER_MODULE).LaneDWorker(step)
 
-    return LaneDWorker(step)
+
+def _resolve(node: ast.ImportFrom, package: str) -> str:
+    if not node.level:
+        return node.module or ""
+    base = package.split(".")
+    base = base[: len(base) - (node.level - 1)] if node.level > 1 else base
+    return ".".join(base + ([node.module] if node.module else []))
+
+
+def test_the_worker_module_imports_no_lane_d_module():
+    """W9 invariant 12: the audit's import closure reaches loop.py, which
+    imports the worker, and must reach no `cascade.validator.lane_d_*`
+    module. So the worker is generic thread infrastructure: a static scan of
+    its imports (and of import-by-string literals) finds no lane D module."""
+    src = h.module_source_static(h.WORKER_MODULE)
+    package = h.WORKER_MODULE.rpartition(".")[0]
+    bad = []
+    for node in ast.walk(ast.parse(src)):
+        names: list[str] = []
+        if isinstance(node, ast.Import):
+            names = [a.name for a in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            mod = _resolve(node, package)
+            names = [mod] + [f"{mod}.{a.name}" for a in node.names]
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            names = [node.value]
+        bad += [n for n in names if n.startswith(h.WORKER_FORBIDDEN_PREFIX)]
+    assert not bad, (f"{h.WORKER_MODULE} imports lane D module(s) {sorted(set(bad))}; "
+                     "W9 invariant 12 forbids them in the audit's closure via loop.py")
 
 
 def test_submit_returns_without_waiting_for_a_hung_step(step):

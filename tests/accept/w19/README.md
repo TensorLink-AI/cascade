@@ -42,9 +42,21 @@ king-check sweep)."
 
 ## Contract
 
-### `cascade/validator/lane_d_worker.py`: `LaneDWorker(step)`
+### `cascade/validator/offthread_worker.py`: `LaneDWorker(step)`
 
 `step` is a callable `step(boundary: int)`; its return value is ignored.
+
+The module is generic thread infrastructure and is deliberately **not**
+named `lane_d_*`. W9's invariant 12 tests (`tests/accept/w9/helpers.py`
+`FORBIDDEN_STEMS` includes `"cascade.validator.lane_d_"`) forbid the audit's
+import closure from loading any `cascade.validator.lane_d_*` module, and that
+closure reaches `cascade/validator/loop.py` (`cascade.audit.checks` →
+the `cascade.validator` package). `loop.py` must import the worker, so a
+`lane_d_worker.py` would break W9 (the first W19 contract used that name,
+and W19 impl PR #684 went red on CROSS W9 for exactly this). For the same reason the worker module imports
+no `cascade.validator.lane_d*` module itself
+(`test_the_worker_module_imports_no_lane_d_module`, a static scan of its
+imports and import-by-string literals).
 
 - `submit(boundary) -> bool`: if no step is running and `boundary` has not
   completed, starts `step(boundary)` on a new **daemon** thread (never the
@@ -119,7 +131,8 @@ read or written. Hung fixtures are released at teardown.
 
 On main the runner tests fail with `AssertionError` (no `lane_d_step` field /
 `_lane_d_tick`), the worker tests with `ModuleNotFoundError` for
-`cascade.validator.lane_d_worker` (in `PATHS`), the `run_forever` check with
+`cascade.validator.offthread_worker` (in `PATHS`; the static import scan with
+`AssertionError` "module ... not found"), the `run_forever` check with
 `AssertionError`; the keep-alive tests pass.
 
 ### Not pinned here (flagged)
@@ -134,6 +147,7 @@ On main the runner tests fail with `AssertionError` (no `lane_d_step` field /
 
 ## PATHS
 
-- `cascade/validator/lane_d_worker.py` (new): the runner.
+- `cascade/validator/offthread_worker.py` (new): the runner (imports no
+  `cascade.validator.lane_d*` module; W9 invariant 12).
 - `cascade/validator/loop.py`: the field, `_lane_d_tick` and the call in
   `run_forever`'s poll loop (`:1105-1115`).
