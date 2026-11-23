@@ -44,7 +44,7 @@ def check_snapshot(snapshot):
     checks["agent_protocol"] = protocol.get("schema") == 1 and set(CAPABILITIES) <= set(protocol.get("capabilities") or ())
     checks["submission_tracking"] = ("submission_status" in (protocol.get("capabilities") or ())
                                       and (protocol.get("submission_status") or {}).get("schema") == 1)
-    for lane in ("a", "b", "c"):
+    for lane in ("a", "b", "c", "d"):
         active = lane == "a" or ((snapshot.get("lanes") or {}).get(lane) or {}).get("active")
         if active:
             checks[f"lane_{lane}_queue"] = bool((snapshot.get("freshness") or {}).get(f"lane_{lane}_queue", {}).get("fresh"))
