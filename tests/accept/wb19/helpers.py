@@ -35,6 +35,7 @@ RUN_REFUSALS = frozenset({
 })
 COMBINE_REFUSALS = frozenset({
     "bad_run", "not_pod", "wrong_image", "wrong_contract", "mixed_block", "duplicate_sku",
+    "bad_note",
 })
 PROD_MARKERS = (
     "etc/cascade-ops.env",
