@@ -94,6 +94,7 @@ settlement give byte-identical states.
 
 Both raise `LaneDReceiptError(ValueError)` with `.code` in
 `RECEIPT_ERROR_CODES`, and return normally otherwise.
+`RECEIPT_ERROR_CODES` must contain every W7c code; later WPs (W14) may extend the tuple.
 
 `verify_receipt(receipt, *, report, state=None)` checks, in this order:
 
