@@ -68,6 +68,7 @@ python -m cascade.eval.lane_d_bench_sweep sweep --cache-dir D --budget-bytes N
 SSHBenchHost(hosts_path, *, cache_dir, budget_bytes, grants=None, timeout_s=..., run=None)
 host.set_contexts({digest: context})      # the source, per settlement
 host(digests, suites) -> {digest: {suite: entry}}    # W3b2's Sweep
+LaneDBenchHostError(RuntimeError)    # every refusal below (the gate holds)
 ```
 
 - At every call it resolves the first `[[host]]` of `hosts_path`

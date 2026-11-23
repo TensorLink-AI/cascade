@@ -56,11 +56,11 @@ def test_hosts_file_is_reread_and_missing_raises(tmp_path):
     host = _host(tmp_path, run)
     host((A,), h.SUITES)
     (tmp_path / "bench_hosts.toml").unlink()
-    with pytest.raises(Exception):
+    with pytest.raises(h.host_mod().LaneDBenchHostError):
         host((A,), h.SUITES)
     assert len(run.calls) == 1, "no host: nothing is run"
     h.hosts_file(tmp_path, stage="init")
-    with pytest.raises(Exception):
+    with pytest.raises(h.host_mod().LaneDBenchHostError):
         host((A,), h.SUITES)
     assert len(run.calls) == 1, "an init-only lane is never a bench host"
 
@@ -68,7 +68,7 @@ def test_hosts_file_is_reread_and_missing_raises(tmp_path):
 def test_digest_without_a_context_raises_before_ssh(tmp_path):
     run = h.Run(h.reply({}))
     host = _host(tmp_path, run)
-    with pytest.raises(Exception):
+    with pytest.raises(h.host_mod().LaneDBenchHostError):
         host(("c" * 64,), h.SUITES)
     assert run.calls == []
 
@@ -95,7 +95,7 @@ def test_hostile_or_broken_reply_raises(tmp_path, bad):
             r["rows"][A] = {"gift": ["not", "a", "mapping"]}
         run = h.Run(r)
     host = _host(tmp_path, run)
-    with pytest.raises(Exception):
+    with pytest.raises(h.host_mod().LaneDBenchHostError):
         host((A,), h.SUITES)
     assert len(run.calls) == 1
 
@@ -108,7 +108,7 @@ def test_a_raising_host_is_a_bench_hold_in_the_session(tmp_path):
     host = _host(tmp_path, h.Run(h.reply({})))
     (tmp_path / "bench_hosts.toml").unlink()
     s = SweepSession("lane-d-bench/1", host)
-    with pytest.raises(Exception):
+    with pytest.raises(h.host_mod().LaneDBenchHostError):
         s.paired(A, B, B, suites=h.SUITES)
 
 
