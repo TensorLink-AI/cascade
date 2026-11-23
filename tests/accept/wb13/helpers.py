@@ -591,6 +591,106 @@ def run_child(code: str, *args: str, timeout: float) -> dict:
     return json.loads(p.stdout.strip().splitlines()[-1])
 
 
+# ── RV7 B3: the intake's bounded load of the pinned hash set ─────────────────
+
+
+def _vm_rss_bytes() -> int | None:
+    """``VmRSS`` of ``/proc/self/status`` in bytes, or ``None`` without /proc."""
+    try:
+        with open("/proc/self/status", encoding="ascii") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def publish(root: Path, art: dict, version: int, suffix: str = ".json") -> tuple[str, Path]:
+    """Write ``art`` as ``benchmarks/contamination/hashset-v<version><suffix>``
+    under ``root`` (WB11 ``write_artefact``); its pin and path."""
+    p = root / "benchmarks" / "contamination" / f"hashset-v{version}{suffix}"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return wb11().write_artefact(art, p), p
+
+
+class Spy:
+    """Wraps ``fn``; records every call's ``(args, kwargs)``."""
+
+    def __init__(self, fn):
+        self.fn, self.calls = fn, []
+
+    def __call__(self, *a, **kw):
+        self.calls.append((a, kw))
+        return self.fn(*a, **kw)
+
+
+class FlakyFetcher(Fetcher):
+    """A fetch that fails transiently on its first ``fails`` calls (raising
+    ``raises``, or answering ``None`` when it is ``None``), then serves
+    ``tree``."""
+
+    def __init__(self, tree: Path, fails: int = 1, raises: Exception | None = None) -> None:
+        super().__init__(tree)
+        self.fails = fails
+        self.transient = raises
+
+    def __call__(self, ref: str):
+        self.calls.append(ref)
+        if len(self.calls) <= self.fails:
+            if self.transient is not None:
+                raise self.transient
+            return None
+        return self.tree
+
+
+# The synthetic large artefact (WB11's 50 000-window scale fixture,
+# tests/accept/wb11/helpers.synth_suites): built in a child, published as
+# hashset-v1.json.gz (a non-matching decoy) and hashset-v2.json.gz (the pinned
+# one; the same tables under version 2). About 4 MB each on disk.
+BIG_BUILD_CHILD = """
+import json, sys
+from pathlib import Path
+from cascade.eval import contamination as c
+from tests.accept.wb11.helpers import synth_suites
+d = Path(sys.argv[1]) / "benchmarks" / "contamination"
+d.mkdir(parents=True, exist_ok=True)
+a = c.build_hashset(synth_suites(), version=1)
+decoy = c.write_artefact(a, d / "hashset-v1.json.gz")
+a["version"] = 2
+pin = c.write_artefact(a, d / "hashset-v2.json.gz")
+print(json.dumps({"pin": pin, "decoy": decoy, "n_exact": len(a["exact"]),
+                  "n_normalised": len(a["normalised"])}))
+"""
+
+# Load in a fresh interpreter (its own VmHWM): ``pinned`` is the production
+# path load_pinned_hashset(pin, root); ``full`` is the control, WB11's
+# load_artefact (the whole dict) of the pinned file. Growth is the peak after
+# the load over the resident set just before it.
+BIG_LOAD_CHILD = """
+from tests.accept.wb13 import helpers as h
+import gc, json, sys
+from pathlib import Path
+from tests.accept.wb11.helpers import synth_suites, WINDOW
+mode, root, pin = sys.argv[1], Path(sys.argv[2]), sys.argv[3]
+seg = synth_suites()["gift"]["series"]["gift/synth/0"][100:100 + WINDOW + 8]
+with h.torch_blocked():
+    m, w = h.scan_mod(), h.wb11()
+    gc.collect()
+    rss0 = h._vm_rss_bytes()
+    if mode == "pinned":
+        lk = m.load_pinned_hashset(pin, root)
+    else:
+        lk = w.load_artefact(root / "benchmarks" / "contamination" / "hashset-v2.json.gz")
+    hwm1 = h._vm_hwm_bytes()
+    first = w.match_series(lk, seg)["first"]
+print(json.dumps({"growth": None if rss0 is None or hwm1 is None else hwm1 - rss0,
+                  "is_dict": isinstance(lk, dict), "type": type(lk).__name__,
+                  "exact_is_dict": isinstance(lk["exact"], dict),
+                  "version": lk["version"], "first": first}))
+"""
+
+
 # ── hash-seed entry point (determinism, fresh interpreters) ──────────────────
 
 
