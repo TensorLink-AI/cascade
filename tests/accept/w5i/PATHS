@@ -1,0 +1,25 @@
+# W5i slow-cadence backtest windows and their scoring weight (plan rev6.9 (a),
+# §3.0 W5i row, rev6.10 (b) draw; README.md has the contract).
+# The bins, the freq classes, the cells a series feeds, the weight and the
+# clamped combined statistic.
+cascade/validator/lane_d_backtest.py
+# The W5j draw takes the backtest cells (hold-out rule, short-history skip).
+cascade/validator/lane_d_draw.py
+# load_pool / window_id / judge_cohort; per-window h for daily short;
+# forward-only floors.
+cascade/validator/lane_d.py
+cascade/validator/lane_d_forward.py
+cascade/validator/lane_d_frozen.py
+# per-window h <= 180 in the scorer; the combined statistic inside every
+# bootstrap replicate of cohort_maxt_lcbs.
+cascade/eval/lane_d_scorer.py
+cascade/eval/bootstrap.py
+# backtest_weight_cap / backtest_ratio_floor and the loader inequality.
+cascade/shared/config/lane_d.py
+# report fields and cross-field checks.
+cascade/validator/schemas/lane_d_report_1.json
+cascade/validator/lane_d_report.py
+# W9 / W7d independent re-derivation; W8c backtest inputs.
+cascade/audit/lane_d.py
+cascade/satellite/lane_d_replay.py
+cascade/validator/lane_d_inputs.py

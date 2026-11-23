@@ -15,3 +15,6 @@ cascade/eval/lane_d_forecasts.py
 # cascade-validator main(): builds the source and passes it to
 # build_lane_d_step as `inputs` (and its bench factory as `bench`).
 cascade/validator/main.py
+# rev6.6 armed contexts (README "Armed contexts"): W8b's LaneDInputs gains
+# the optional `armed` record and the step passes it to settle_lane_d(armed=).
+cascade/validator/lane_d_wiring.py
