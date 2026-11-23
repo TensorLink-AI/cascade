@@ -180,3 +180,16 @@ A scratch control passed all 36 tests: a ~60-line `lane_d_queue.py` plus a
 and W17 accept dirs stayed green with it. The control kept two extra
 per-entry state fields (a re-check flag and an unresolved count), and
 `lane_d_state` accepted them.
+
+## Correction (plan rev6.11 (b)): crown at the first verdict
+
+The confirmation duel is dropped (owner 2026-11-23). `test_t18c_a_deregistered_king_slot_burns`
+needs a crowned KING_D; it now builds its own chain from W5g's helper
+primitives (boundary 1 lists no entry; X enters at boundary 2 and is crowned
+at its first verdict on a passing gate) instead of W5g's `Flow`, so W5g's
+fixture chain can move to rev6.11 without moving this test. Its assertions
+(the court slot of the deregistered king has `uid` None and
+`burn_reason` `deregistered`) are unchanged. On main the old code still runs
+the confirmation stage, so the test fails on an assertion (`fixture: X not
+crowned at its first verdict`) until the W5e implementation lands; with it,
+all 36 W5h tests pass.
