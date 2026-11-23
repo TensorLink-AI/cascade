@@ -20,7 +20,9 @@ at the first verdict.)** The floors are 48 windows / 4 sources and each
 snapshot holds 24 fresh windows, so boundary(1) is a floor wait (X
 `pending` / `pending_floor`, nothing judged), boundary(2) is X's first
 verdict on snapshots 1 and 2 (clear, A10, gate `pass`, crowned) and
-boundary(3) judges nothing. Whenever `settle_lane_d` takes the W5e gate keywords
+boundary(3) judges nothing. That chain is `helpers.W7cChain`; the shared
+`helpers.Chain` and `lane_d_cfg()` keep the 24-window default the W14 and
+W17 helpers build on (their own tests-correction follows W5e). Whenever `settle_lane_d` takes the W5e gate keywords
 (`boundary_block_hash`, `sentinel`, `bench`), the fixture passes them with a
 passing bench session (an armed crowning without them fails closed, W5e
 RV5). The bench pod is the one mocked external service. The signer is a
