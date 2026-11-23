@@ -2,12 +2,14 @@
 non-inferiority check on the private pool (plan rev6 §1.3b, §1.5, §1.7, T4b).
 README.md has the contract.
 
-Every state comes from real settlements. A candidate X first clears against
-the genesis house H0 on snapshot 1 at boundary(1) and confirms on snapshot 2
-at boundary(2): there it is a crowning candidate and the A10 check runs on
-snapshot 2's low-frequency series (years old, so never forward-eligible).
-The miner-king tests crown Y first (boundaries 1-2), then judge X against Y
-and the house (boundaries 3-4).
+Every state comes from real settlements. Plan rev6.11 (b) drops the
+confirmation duel: a first clear is the crowning candidate (first clear ∧
+A10 ∧ the §1.3b gate). Boundary(1) lists no entry (nothing is judged); a
+candidate X enters at boundary(2) and clears against the genesis house H0 at
+its first verdict on snapshot 2: there the A10 check runs on snapshot 2's
+low-frequency series (years old, so never forward-eligible). The miner-king
+tests crown Y at boundary(2) the same way, then judge X against Y and the
+house at boundary(4).
 
 On main the slice is counted inside the frozen set (always 0 here) and
 never decides anything, so every test that expects `pass`/`fail` or a
@@ -51,8 +53,9 @@ FLAT_1 = flat(1.0)
 
 def _house_king_run(tmp_path, *, x_lf, house_lf=FLAT_1, n_lf=8, freq="D", cfg=None,
                     jitter=0.0, x_quality="sharp", lf_in_pool1=False):
-    """X first-clears at boundary(1) and confirms at boundary(2) against the
-    genesis house; snapshot 2 holds `n_lf` low-frequency series of `freq`."""
+    """Boundary(1) lists no entry; X enters at boundary(2) and is judged at
+    its first verdict against the genesis house on snapshot 2, which holds
+    `n_lf` low-frequency series of `freq` (rev6.11 (b): no confirmation)."""
     cfg = cfg or lane_d_cfg()
     h0, x = house(), entry("x", reveal_ts=T_FIRST)
     hd, xd = h0["digest"], x["digest"]
@@ -62,7 +65,8 @@ def _house_king_run(tmp_path, *, x_lf, house_lf=FLAT_1, n_lf=8, freq="D", cfg=No
     fc1 = merge({hd: hourly_forecasts(recs1, "bad", "house-0"),
                  xd: hourly_forecasts(recs1, "sharp", "x")},
                 {hd: lowfreq_forecasts(lf1, house_lf), xd: lowfreq_forecasts(lf1, x_lf)})
-    s1 = settle(cfg, boundary(1), pool1, [x], h0, fc1, uids(x), path)
+    s1 = settle(cfg, boundary(1), pool1, [], h0, fc1, uids(x), path)
+    assert s1.report["judged"] == [], "fixture: boundary(1) lists no entry"
     after_s1 = tmp_path / "after_s1.json"
     shutil.copy(path, after_s1)
     lf2 = lowfreq_records("lf2", n_lf, freq)
@@ -77,10 +81,13 @@ def _house_king_run(tmp_path, *, x_lf, house_lf=FLAT_1, n_lf=8, freq="D", cfg=No
 
 
 def _confirm_verdict(run):
+    """X's first (and only) verdict at boundary(2): a clear on the hourly set
+    makes it a crowning candidate (rev6.11 (b))."""
     v = verdict_of(run["s2"].report, run["x"]["digest"])
-    assert v is not None, "X was not judged on its confirmation set"
-    assert v["stage"] == "confirm" and v["cleared"] is True, \
-        f"fixture: X must clear its confirmation duel on the hourly set: {v!r}"
+    assert v is not None, "X was not judged at boundary(2)"
+    assert v["stage"] == "first" and v["cleared"] is True, \
+        f"fixture: X must clear its first verdict on the hourly set: {v!r}"
+    assert "confirmation" not in v, "rev6.11 (b): no confirmation block"
     return v
 
 
@@ -270,27 +277,34 @@ def test_an_empty_slice_is_no_windows_and_never_blocks(tmp_path):
 # ── who is checked ──────────────────────────────────────────────────────────
 
 
-def test_first_clears_are_not_checked_and_go_confirm_pending(tmp_path):
+def test_a_first_clear_is_checked_at_the_settlement_it_clears(tmp_path):
+    """rev6.11 (b): a first clear is the crowning candidate, so A10 runs on
+    it at once; it never waits in `confirm_pending`."""
     run = _house_king_run(tmp_path, x_lf=flat(1.3), lf_in_pool1=True)
     cfg, xd = run["cfg"], run["x"]["digest"]
-    v1 = verdict_of(run["s1"].report, xd)
-    assert v1["stage"] == "first" and v1["outcome"] == "confirm_pending", v1
-    assert v1["lowfreq"] == {"result": "not_candidate",
-                             "freqs": [str(f) for f in cfg.lowfreq_freqs], "n_windows": 0,
-                             "tau_public": float(cfg.tau_public)}
-    e = entry_of(run["s1"].report, xd)
-    assert (e["status"], e["reason"]) == ("confirm_pending", "confirm_pending")
+    assert verdict_of(run["s1"].report, xd) is None, "fixture: X is not listed at boundary(1)"
+    v = _confirm_verdict(run)
+    check_lowfreq_block(v["lowfreq"], cfg)
+    assert v["lowfreq"]["result"] == "fail" and v["lowfreq"]["n_windows"] == len(run["lf2"])
+    e = entry_of(run["s2"].report, xd)
+    assert (e["status"], e["reason"]) == ("lost", "lowfreq_regression"), e
+    for report in (run["s1"].report, run["s2"].report):
+        assert "confirm_pending" not in {x["status"] for x in report["entries"]}
+        assert "confirm_pending" not in {x["reason"] for x in report["entries"]}
 
 
-def test_a_confirmation_loser_is_lost_confirmation_not_lowfreq_regression(tmp_path):
+def test_a_first_verdict_loser_is_lost_duel_not_lowfreq_regression(tmp_path):
+    """A verdict that does not clear is no crowning candidate: A10 never
+    runs on it and its loss is the duel's (`lost_duel`; rev6.11 (b) drops
+    `lost_confirmation`)."""
     run = _house_king_run(tmp_path, x_lf=flat(1.3), x_quality="bad")
     cfg, xd = run["cfg"], run["x"]["digest"]
     v = verdict_of(run["s2"].report, xd)
-    assert v["stage"] == "confirm" and v["cleared"] is False, v
+    assert v["stage"] == "first" and v["cleared"] is False, v
     assert v["lowfreq"]["result"] == "not_candidate" and v["lowfreq"]["n_windows"] == 0
     assert v["lowfreq"]["tau_public"] == float(cfg.tau_public)
     e = entry_of(run["s2"].report, xd)
-    assert (e["status"], e["reason"]) == ("lost", "lost_confirmation")
+    assert (e["status"], e["reason"]) == ("lost", "lost_duel")
 
 
 def test_a_blocked_entry_is_not_judged_again(tmp_path):
@@ -308,8 +322,9 @@ def test_a_blocked_entry_is_not_judged_again(tmp_path):
 
 
 def _runner_up_run(tmp_path, order=("x", "z")):
-    """X (sharp) and Z (good) both first-clear the house at boundary(1) and
-    confirm at boundary(2); on snapshot 2's slice X regresses (x1.3, jittered)
+    """Boundary(1) lists no entry; X (sharp) and Z (good) both clear the
+    house at their first verdict at boundary(2); on snapshot 2's slice X
+    regresses (x1.3, jittered)
     and Z is better (x0.7). The 5% jitter keeps every window's ratio on its
     side of `-tau_public`, so the result holds for any paired bootstrap.
     `order` is the entries' input order."""
@@ -324,8 +339,8 @@ def _runner_up_run(tmp_path, order=("x", "z")):
     pool1, recs1 = snapshot(tmp_path, 1, T_FIRST + 60)
     fc1 = {hd: hourly_forecasts(recs1, "bad", "house-0"),
            xd: hourly_forecasts(recs1, "sharp", "x"), zd: hourly_forecasts(recs1, "good", "z")}
-    s1 = settle(cfg, boundary(1), pool1, ents, h0, fc1, uid_of, path)
-    assert {verdict_of(s1.report, d)["outcome"] for d in (xd, zd)} == {"confirm_pending"}
+    s1 = settle(cfg, boundary(1), pool1, [], h0, fc1, uid_of, path)
+    assert s1.report["judged"] == [], "fixture: boundary(1) lists no entry"
     lf2 = lowfreq_records("lf2", 8)
     pool2, recs2 = snapshot(tmp_path, 2, T_FIRST + 60, lf2)
     fc2 = merge({hd: hourly_forecasts(recs2, "bad", "house-0"),
@@ -345,7 +360,7 @@ def test_every_crowning_candidate_is_checked_and_a_passing_runner_up_crowns(tmp_
     cfg, x, z, path, s2 = run["cfg"], run["x"], run["z"], run["path"], run["s2"]
     xd, zd = x["digest"], z["digest"]
     vx, vz = verdict_of(s2.report, xd), verdict_of(s2.report, zd)
-    assert vx["cleared"] and vz["cleared"] and vx["stage"] == vz["stage"] == "confirm"
+    assert vx["cleared"] and vz["cleared"] and vx["stage"] == vz["stage"] == "first"
     assert vx["lcb"] > vz["lcb"], "fixture: X must be the max-T best"
     check_lowfreq_block(vx["lowfreq"], cfg)
     check_lowfreq_block(vz["lowfreq"], cfg)
@@ -361,9 +376,11 @@ def test_every_crowning_candidate_is_checked_and_a_passing_runner_up_crowns(tmp_
 
 
 def _miner_king_run(tmp_path, *, x_lf, y_lf4=FLAT_1, house_lf4=FLAT_1):
-    """Y is crowned at boundary(2) (non-inferior on snapshot 2's slice). X,
-    revealed later, first-clears against Y and the house at boundary(3) and
-    confirms at boundary(4); snapshot 4 holds the slice X is checked on."""
+    """Y enters at boundary(2) and is crowned at its first verdict
+    (non-inferior on snapshot 2's slice). X, revealed later, enters at
+    boundary(4) and clears against Y and the house at its first verdict;
+    snapshot 4 holds the slice X is checked on. Boundaries 1 and 3 list no
+    new challenger (rev6.11 (b): no confirmation)."""
     cfg = lane_d_cfg()
     h0 = house()
     y = entry("y", reveal_ts=T_FIRST)
@@ -372,9 +389,10 @@ def _miner_king_run(tmp_path, *, x_lf, y_lf4=FLAT_1, house_lf4=FLAT_1):
     uid_of = uids(y, x)
     path = tmp_path / "state" / "lane_d_state.json"
     pool1, recs1 = snapshot(tmp_path, 1, T_FIRST)
-    settle(cfg, boundary(1), pool1, [y], h0,
-           {hd: hourly_forecasts(recs1, "bad", "house-0"),
-            yd: hourly_forecasts(recs1, "good", "y")}, uid_of, path)
+    s1 = settle(cfg, boundary(1), pool1, [], h0,
+                {hd: hourly_forecasts(recs1, "bad", "house-0"),
+                 yd: hourly_forecasts(recs1, "good", "y")}, uid_of, path)
+    assert s1.report["judged"] == [], "fixture: boundary(1) lists no entry"
     lf2 = lowfreq_records("lf2", 8)
     pool2, recs2 = snapshot(tmp_path, 2, T_FIRST, lf2)
     s2 = settle(cfg, boundary(2), pool2, [y], h0,
@@ -384,12 +402,12 @@ def _miner_king_run(tmp_path, *, x_lf, y_lf4=FLAT_1, house_lf4=FLAT_1):
                        yd: lowfreq_forecasts(lf2, flat(1.0))}), uid_of, path)
     assert s2.report["crowned"] == yd, "fixture: Y must be crowned at boundary(2)"
     pool3, recs3 = snapshot(tmp_path, 3, T_LATER)
-    s3 = settle(cfg, boundary(3), pool3, [y, x], h0,
+    s3 = settle(cfg, boundary(3), pool3, [y], h0,
                 {hd: hourly_forecasts(recs3, "bad", "house-0"),
                  yd: hourly_forecasts(recs3, "good", "y"),
                  xd: hourly_forecasts(recs3, "sharp", "x")}, uid_of, path)
-    assert verdict_of(s3.report, xd)["outcome"] == "confirm_pending", \
-        "fixture: X must first-clear against Y and the house"
+    assert s3.report["judged"] == [] and s3.report["crowned"] is None, \
+        "fixture: boundary(3) judges nothing (Y holds KING_D, X is not listed yet)"
     lf4 = lowfreq_records("lf4", 8)
     pool4, recs4 = snapshot(tmp_path, 4, T_LATER, lf4)
     s4 = settle(cfg, boundary(4), pool4, [y, x], h0,
@@ -407,7 +425,7 @@ def test_with_a_miner_king_a_regression_against_the_house_alone_blocks(tmp_path)
     run = _miner_king_run(tmp_path, x_lf=flat(0.95), house_lf4=flat(0.7))
     xd, yd = run["x"]["digest"], run["y"]["digest"]
     v = verdict_of(run["s4"].report, xd)
-    assert v["stage"] == "confirm" and v["cleared"] and v["king_digest"] == yd, v
+    assert v["stage"] == "first" and v["cleared"] and v["king_digest"] == yd, v
     lf = v["lowfreq"]
     check_lowfreq_block(lf, run["cfg"])
     vs_y, vs_h = expected_lcbs(flat(0.95), flat(1.0)), expected_lcbs(flat(0.95), flat(0.7))
