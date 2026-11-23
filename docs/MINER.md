@@ -2005,3 +2005,24 @@ Every lane-C entry (DEC-CA-0056 review 2026-10-19):
 - Too few windows or assets so far ⇒ your entry WAITS, and is re-judged
   every settlement for up to `verdict_wait_blocks` (6 days). After that it
   is dropped.
+
+## 15. Open weights (lane D): the `cascade lane-d` CLI
+
+Lane D entries are trained cascade_pyramid checkpoints: exactly `config.json`,
+`weights.safetensors` (BF16 only) and the repo's own `model.py` /
+`forecast_wrapper.py`. The full guide is `docs/LANE_D.md` (W12a). Every
+command takes `--json`. No flag takes a key, token or upload URL.
+
+- `cascade lane-d export ./trained --out ./entry` writes the entry directory
+  (the four files only) and prints its digest.
+- `cascade lane-d verify ./entry` runs the validators' ingest guards locally.
+  The file allowlist runs first and nothing in the entry is executed.
+- `cascade lane-d submit https://<intake> ./entry --context 4096 --wallet-name W --wallet-hotkey H`
+  signs the manifest with your hotkey and uploads the files straight to the
+  vault. It commits nothing.
+- `cascade lane-d ready https://<intake> --digest <digest> --context 4096 --licence Apache-2.0 --attest --wallet-name W --wallet-hotkey H`
+  attests the open licence (`--licence` is `Apache-2.0` or `OpenMDW-1.1`;
+  without `--attest` it shows the statement and sends nothing), then commits
+  the entry on chain with an immediate reveal.
+- `cascade lane-d status https://<intake> --hotkey <ss58>` shows the public
+  lane D queue. It needs no wallet.

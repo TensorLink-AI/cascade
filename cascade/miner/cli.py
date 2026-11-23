@@ -33,6 +33,9 @@ Fine-tuning lane (DEC-CA-0056; MarketCast-only: ``mkt:<suite>`` targets):
 ``cascade lane-c check|commit|fund|status``, see ``cascade/miner/lane_c.py``. Domain-expert lane funding (DEC-CA-0059 item
 8): ``cascade lane-b fund|status``, see ``cascade/miner/lane_b.py``.
 
+Open-weights lane (DEC-CA-0062, DEC-CA-0070): ``cascade lane-d
+export|verify|submit|ready|status``, see ``cascade/miner/lane_d.py``.
+
 Every command takes ``--json`` (or ``CASCADE_JSON=1``): one JSON document on
 stdout, human lines on stderr (``cascade/miner/output.py``). Paid actions
 (``fund``, ``submit`` with a key, ``direct fund``) refuse without ``--yes``.
@@ -1643,6 +1646,7 @@ def build_parser() -> argparse.ArgumentParser:
     from .iterate import add_iterate
     from .lane_b import add_lane_b
     from .lane_c import add_lane_c
+    from .lane_d import add_lane_d
     from .live_status import add_status
     from .preflight import add_preflight
     from .starter import add_init
@@ -1672,6 +1676,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_direct(sub)
     add_lane_b(sub)
     add_lane_c(sub)
+    add_lane_d(sub)
     _add_json_flag(parser)
     return parser
 
