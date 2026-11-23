@@ -189,7 +189,7 @@ def _settle(cfg, boundary, pool_dir, entries, fc, state_path, prior=()):
 
     kw = {"prior_pool_dirs": [Path(p) for p in prior]} if prior else {}
     kw.update(gate_inputs(boundary, H0["digest"]))
-    return settle_lane_d(cfg=cfg, boundary=boundary, pool_dir=pool_dir,
+    return settle_lane_d(boundary_ts=2_000_000_000 + 12 * int(boundary), cfg=cfg, boundary=boundary, pool_dir=pool_dir,
                          entries=[dict(e) for e in entries], house=dict(H0),
                          forecasts=fc, uid_of=_uids(*entries), state_path=state_path,
                          signer=fixture_key("signer"), **kw)

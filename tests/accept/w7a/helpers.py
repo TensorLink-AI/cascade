@@ -69,7 +69,8 @@ SKIP_REASONS = ("pending_floor", "coldkey_cap_settlement", "coldkey_unresolved",
                 "coldkey_changed", "king_unscored", "bench_hold", "deregistered",
                 "ready_expired", "reveal_delay_exceeded", "duplicate_digest",
                 "hotkey_has_open_entry", "context_not_armed", "checkpoint_fault",
-                "mirror_lag_exceeded", "lane_closed", "context_below_armed")
+                "mirror_lag_exceeded", "lane_closed", "context_below_armed",
+                "before_eval_delay", "boundary_ts_missing")
 # `context_below_armed` (plan rev6.15, owner 2026-11-23): with the settlement's
 # armed record, a chosen entry whose declared context is below every armed
 # variant is not judged and stays `pending` (never run above its declaration).
@@ -119,7 +120,8 @@ TOP_LEVEL_REQUIRED = ("schema", "boundary", "signer", "signature", "scoring_meth
 # `gate` (RV4): the §1.3b gate record, present iff a candidate reached the gate.
 # rev6.6: `armed_contexts` + `armed_evidence`, present together iff the
 # settlement was handed the W5d armed record (README "Armed contexts").
-TOP_LEVEL_OPTIONAL = ("extensions", "gate", "armed_contexts", "armed_evidence", "draw")
+TOP_LEVEL_OPTIONAL = ("extensions", "gate", "armed_contexts", "armed_evidence", "draw",
+                      "boundary_ts")   # rev6.14 (a)
 PARAMS_FIELDS = ("share", "takes_from", "remainder", "horizon", "horizons", "contexts",
                  "forward_margin_hours", "max_mirror_lag_hours", "min_windows", "min_clusters",
                  "d_margin", "alpha", "bootstrap_B", "king_decay", "reward_prior_kings",
@@ -389,7 +391,7 @@ def settle(chain: dict, cfg, state_path: Path, signer, *, boundary: int, snap: i
     `gate_inputs`): `two_settlements` crowns at BOUNDARY_2."""
     from cascade.validator.lane_d import settle_lane_d
 
-    return settle_lane_d(cfg=cfg, boundary=boundary, pool_dir=chain["pools"][snap],
+    return settle_lane_d(boundary_ts=2_000_000_000 + 12 * int(boundary), cfg=cfg, boundary=boundary, pool_dir=chain["pools"][snap],
                          entries=[dict(e) for e in entries], house=dict(chain["house"]),
                          forecasts=chain["forecasts"][snap], uid_of=dict(uid_of),
                          state_path=state_path, signer=signer,

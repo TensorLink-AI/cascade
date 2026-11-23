@@ -405,3 +405,7 @@ main). That shows the contract can be built and that every honest fixture
 report PASSes.
 
 Run locally with `-m "not torch"`. Nothing here imports torch.
+
+## rev6.14 (a): judging start vs eligibility boundary (owner 2026-11-23)
+
+The audit re-derives the judging start (`frozen_before_eval_delay` FAILs, a judged cohort without `boundary_ts` FAILs) and judges eligibility at `b = T + forward_margin_hours` (default 0). `test_w9_rev614.py`.

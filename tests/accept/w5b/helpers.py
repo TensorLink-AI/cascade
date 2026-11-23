@@ -215,7 +215,7 @@ def settle(cfg, boundary, pool_dir, entries, house_rec, fc, uid_of, state_path, 
         import cascade.validator.lane_d_frozen  # noqa: F401
 
         kw["prior_pool_dirs"] = [Path(p) for p in prior]
-    return settle_lane_d(cfg=cfg, boundary=boundary, pool_dir=pool_dir,
+    return settle_lane_d(boundary_ts=2_000_000_000 + 12 * int(boundary), cfg=cfg, boundary=boundary, pool_dir=pool_dir,
                          entries=[dict(e) for e in entries], house=dict(house_rec),
                          forecasts=fc, uid_of=dict(uid_of), state_path=state_path,
                          signer=fixture_key("signer"), **kw)

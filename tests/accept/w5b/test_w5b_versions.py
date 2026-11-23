@@ -99,7 +99,7 @@ def _settle(cfg, pool_dir, fc, e, h, state_path, prior=()):
     from cascade.validator.lane_d import settle_lane_d
 
     kw = {"prior_pool_dirs": [Path(p) for p in prior]} if prior else {}
-    return settle_lane_d(cfg=cfg, boundary=BOUNDARY_1, pool_dir=pool_dir,
+    return settle_lane_d(boundary_ts=2_000_000_000 + 12 * int(BOUNDARY_1), cfg=cfg, boundary=BOUNDARY_1, pool_dir=pool_dir,
                          entries=[dict(e)], house=dict(h), forecasts=fc,
                          uid_of={e["hotkey"]: CHALLENGER_UID}, state_path=state_path,
                          signer=fixture_key("signer"), **kw)

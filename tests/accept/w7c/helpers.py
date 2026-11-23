@@ -401,7 +401,7 @@ class Chain:
         fc = self.forecasts if forecasts is None else forecasts
         if cfg is None:
             cfg = lane_d_cfg(min_windows=self.min_windows)
-        return settle_lane_d(cfg=cfg, boundary=boundary(n),
+        return settle_lane_d(boundary_ts=2_000_000_000 + 12 * int(boundary(n)), cfg=cfg, boundary=boundary(n),
                              pool_dir=self.pools[n - 1], entries=[dict(self.x)],
                              house=dict(self.house), forecasts=fc, uid_of=dict(self.uid_of),
                              state_path=state_path, signer=self.signer, **kw)

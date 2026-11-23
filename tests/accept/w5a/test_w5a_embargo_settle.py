@@ -83,7 +83,7 @@ def test_settle_judges_embargo_windows_of_every_cadence(tmp_path):
         fc[entry["digest"]][wid] = quantiles_around(y + rng.normal(0, 0.05 * sd, HORIZON),
                                                     0.3 * sd)
         fc[house["digest"]][wid] = quantiles_around(y + 3.0 * sd, 0.3 * sd)
-    s = settle_lane_d(cfg=cfg, boundary=BOUNDARY_1, pool_dir=pool_dir, entries=[dict(entry)],
+    s = settle_lane_d(boundary_ts=2_000_000_000 + 12 * int(BOUNDARY_1), cfg=cfg, boundary=BOUNDARY_1, pool_dir=pool_dir, entries=[dict(entry)],
                       house=dict(house), forecasts=fc, uid_of={entry["hotkey"]: 6},
                       state_path=tmp_path / "state" / "lane_d_state.json",
                       signer=fixture_key("signer"), **gate_inputs(BOUNDARY_1, house["digest"]))

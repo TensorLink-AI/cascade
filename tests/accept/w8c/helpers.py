@@ -159,6 +159,9 @@ class Reader:
         self.calls.append(("block_timestamp", threading.get_ident()))
         if self.fail_timestamp:
             raise ConnectionError(f"w8c: block {block} timestamp unreadable")
+        if int(block) not in self.timestamps:
+            # rev6.14 (a): a boundary block's on-chain timestamp (W8b's fixture clock).
+            return float(w8b.boundary_ts(int(block)))
         return float(self.timestamps[int(block)])
 
     def registered_hotkeys(self):
@@ -439,7 +442,9 @@ def expected_inputs(fx: dict, boundary: int) -> dict:
             # which no W8c settlement reads.
             "forecasts": {dg: f for dg, f in chain["forecasts"][snap].items()
                           if dg in (fx["x"], fx["house"]["digest"])},
-            "uid_of": uid_of(fx), "house": dict(chain["house"])}
+            "uid_of": uid_of(fx), "house": dict(chain["house"]),
+            # rev6.14 (a): the boundary block's on-chain timestamp.
+            "boundary_ts": w8b.boundary_ts(boundary)}
 
 
 def assert_inputs_error(exc: BaseException, code: str) -> None:

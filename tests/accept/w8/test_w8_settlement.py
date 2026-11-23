@@ -72,7 +72,7 @@ def _state_dir(tmp: Path) -> Path:
 def _settle(chain, cfg, state_path, boundary, snap):
     from cascade.validator.lane_d import settle_lane_d
 
-    return settle_lane_d(cfg=cfg, boundary=boundary, pool_dir=chain["pools"][snap], entries=[],
+    return settle_lane_d(boundary_ts=2_000_000_000 + 12 * int(boundary), cfg=cfg, boundary=boundary, pool_dir=chain["pools"][snap], entries=[],
                          house=dict(chain["house"]), forecasts=chain["forecasts"][snap],
                          uid_of={}, state_path=state_path, signer=chain["signer"])
 

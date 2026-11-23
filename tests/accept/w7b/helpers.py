@@ -228,7 +228,7 @@ def signed_report(tmp: Path) -> dict:
         state = tmp / "state" / "lane_d_state.json"
         state.parent.mkdir(parents=True, exist_ok=True)
         cfg = lane_d_cfg()
-        s = settle_lane_d(cfg=cfg, boundary=BOUNDARY_1, pool_dir=pool, entries=[e],
+        s = settle_lane_d(boundary_ts=2_000_000_000 + 12 * int(BOUNDARY_1), cfg=cfg, boundary=BOUNDARY_1, pool_dir=pool, entries=[e],
                           house={"digest": house, "reveal_ts": HOUSE_T}, forecasts=fc,
                           uid_of={hotkey: CHALLENGER_UID}, state_path=state, signer=signer)
         _CACHE[key] = {"report": s.report, "signer": signer, "other": other, "cfg": cfg}

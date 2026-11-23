@@ -209,7 +209,7 @@ def _settle(chain, cfg, state_path: Path, signer, boundary: int, snap: int):
     (`helpers.gate_inputs`): the skeleton crowns at BOUNDARY_2."""
     from cascade.validator.lane_d import settle_lane_d
 
-    return settle_lane_d(cfg=cfg, boundary=boundary, pool_dir=chain.pool_dirs[snap],
+    return settle_lane_d(boundary_ts=2_000_000_000 + 12 * int(boundary), cfg=cfg, boundary=boundary, pool_dir=chain.pool_dirs[snap],
                          entries=[dict(e) for e in chain.entries], house=dict(chain.house),
                          forecasts=chain.forecasts[snap], uid_of=dict(chain.uid_of),
                          state_path=state_path, signer=signer,

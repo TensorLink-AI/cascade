@@ -77,7 +77,7 @@ def _settle(chain, tmp, *, armed, entries=None, cfg=None):
     state = tmp / "state" / "lane_d_state.json"
     state.parent.mkdir(parents=True, exist_ok=True)
     kw = {} if armed is None else {"armed": armed}
-    s = settle_lane_d(cfg=cfg or lane_d_cfg(), boundary=BOUNDARY_1, pool_dir=chain["pools"][1],
+    s = settle_lane_d(boundary_ts=2_000_000_000 + 12 * int(BOUNDARY_1), cfg=cfg or lane_d_cfg(), boundary=BOUNDARY_1, pool_dir=chain["pools"][1],
                       entries=[dict(x) for x in ents], house=dict(chain["house"]),
                       forecasts=chain["forecasts"][1], uid_of=uid_of, state_path=state,
                       signer=fixture_key("signer"),

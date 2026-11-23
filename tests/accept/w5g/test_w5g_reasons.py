@@ -18,6 +18,7 @@ every value of the enum.
 from __future__ import annotations
 
 import ast
+import json
 from pathlib import Path
 
 import numpy as np
@@ -55,7 +56,7 @@ class One:
     """One settlement at boundary(n) on snapshot 1 with a healthy bench."""
 
     def __init__(self, tmp_path, entries, *, cfg=None, models=None, uid_of=None, fc_edit=None,
-                 n=1, armed=None):
+                 n=1, armed=None, **settle_kw):
         self.cfg = cfg or lane_d_cfg()
         self.h0 = house()
         self.path = tmp_path / "state" / "lane_d_state.json"
@@ -70,7 +71,7 @@ class One:
         hash_, bench, _ = gate_inputs("pass", entries[0]["digest"], self.h0["digest"], "b1")
         self.report = settle(self.cfg, boundary(n), pool1, entries, self.h0, fc,
                              uids(*entries) if uid_of is None else uid_of, self.path,
-                             hash_=hash_, bench=bench, armed=armed).report
+                             hash_=hash_, bench=bench, armed=armed, **settle_kw).report
 
 
 def _x(**over):
@@ -154,6 +155,30 @@ def case_context_below_armed(tmp_path):
     stays pending (W7a owns the producer side; this is the reason's case)."""
     x = _x(context=4096)
     r = One(tmp_path, [x], armed=_armed_record((8192, 16384)))
+    return r.path, r.report, x["digest"]
+
+
+def case_before_eval_delay(tmp_path):
+    """Plan rev6.14 (a): the boundary is stamped one second before X's judging
+    start j = max(T_X, T_house) + eval_delay_hours: X is not drawn, frozen or
+    judged, and stays pending."""
+    x = _x()
+    cfg = lane_d_cfg()
+    j = max(int(x["reveal_ts"]), int(house()["reveal_ts"])) + int(3600 * cfg.eval_delay_hours)
+    r = One(tmp_path, [x], cfg=cfg, boundary_ts=j - 1)
+    st = json.loads(r.path.read_text())["entries"][x["digest"]]
+    assert st["frozen_set"] is None and st["used_windows"] == [], \
+        "nothing is frozen or judged before the judging start"
+    return r.path, r.report, x["digest"]
+
+
+def case_boundary_ts_missing(tmp_path):
+    """Plan rev6.14 (a), orchestrator 2026-11-23: a settlement without the
+    boundary's on-chain timestamp (the legacy call) freezes and judges nothing
+    (fail closed)."""
+    x = _x()
+    r = One(tmp_path, [x], boundary_ts=None)
+    assert r.report["cohorts"] == [] and "boundary_ts" not in r.report
     return r.path, r.report, x["digest"]
 
 
@@ -269,6 +294,8 @@ CASES = {
                               "closed", True),
     "context_not_armed": (case_context_not_armed, "context_not_armed", "closed", True),
     "context_below_armed": (case_context_below_armed, "context_below_armed", "pending", True),
+    "before_eval_delay": (case_before_eval_delay, "before_eval_delay", "pending", True),
+    "boundary_ts_missing": (case_boundary_ts_missing, "boundary_ts_missing", "pending", True),
     "checkpoint_fault_forecasts": (case_checkpoint_fault_forecasts, "checkpoint_fault",
                                    "closed", True),
     "checkpoint_fault_gate": (case_checkpoint_fault_gate, "checkpoint_fault", "closed", False),

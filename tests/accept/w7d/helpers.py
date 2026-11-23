@@ -397,7 +397,7 @@ class Chain:
             kw.update(boundary_block_hash=block_hash(f"b{n}"), sentinel=None,
                       bench=SweepSession(f"w7d-sess-b{n}", host))
         b = boundary(n)
-        s = settle_lane_d(cfg=self.cfg, boundary=b, pool_dir=self.pools[n - 1],
+        s = settle_lane_d(boundary_ts=2_000_000_000 + 12 * int(b), cfg=self.cfg, boundary=b, pool_dir=self.pools[n - 1],
                           entries=[dict(e) for e in entries],
                           house=dict(house if house is not None else self.h0),
                           forecasts=self.forecasts, uid_of=dict(self.uids),

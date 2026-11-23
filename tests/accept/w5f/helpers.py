@@ -309,7 +309,7 @@ def settle(cfg, b, pool_dir, entries, house_rec, fc, state_path, *, prior=(),
     if tag is not None:
         kw.update(boundary_block_hash=block_hash(tag),
                   bench=passing_bench(candidates, references, f"sess-{tag}"))
-    return settle_lane_d(cfg=cfg, boundary=b, pool_dir=pool_dir,
+    return settle_lane_d(boundary_ts=2_000_000_000 + 12 * int(b), cfg=cfg, boundary=b, pool_dir=pool_dir,
                          entries=[dict(e) for e in entries], house=copy.deepcopy(house_rec),
                          forecasts=fc, uid_of=dict(UIDS if uid_of is None else uid_of),
                          state_path=state_path, signer=fixture_key("signer"), **kw)

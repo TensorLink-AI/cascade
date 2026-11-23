@@ -163,9 +163,12 @@ index marks the king `takedown`.
 **Forward-only windows.** A window is eligible for entry E against king K
 only if every target point has **both** a data timestamp **and** a first-seen
 time (when our mirror first ingested it) after the wall time of
-max(T_E, T_K) plus `[lane_d] forward_margin_hours` (6 h). The feed's
+max(T_E, T_K) plus `[lane_d] forward_margin_hours` (0 h since rev6.14: data
+after your submission is fresh; the embargo rules add older data). The feed's
 measured mirror lag must also be within `max_mirror_lag_hours`. A series
-without both timestamps is never eligible.
+without both timestamps is never eligible. Judging waits: nothing of an entry
+is drawn, frozen or judged before max(T_E, T_K) plus `eval_delay_hours`
+(6 h), measured against the boundary block's on-chain timestamp.
 
 The forward-only rule sets the expected latency, and latency depends on data
 frequency. Evidence accumulates over every daily `pool_d` snapshot since T
@@ -281,6 +284,11 @@ with one typed reason, and the queue shows it:
 - `context_below_armed`: the declared context is in `contexts`, but no armed
   variant is at or below it this settlement. The entry stays `pending` and is
   never run above its declaration.
+- `before_eval_delay`: the settlement's boundary (its on-chain timestamp) is
+  before the entry's judging start, max(T_E, T_K) plus `eval_delay_hours`
+  (6 h). The entry stays `pending`; nothing of it is drawn, frozen or judged.
+- `boundary_ts_missing`: the validator had no on-chain timestamp for the
+  boundary, so nothing was frozen or judged this settlement (fail closed).
 - `checkpoint_fault`: the checkpoint failed ingest, scoring or its gate sweep.
 - `mirror_lag_exceeded`: the feeds behind the entry's windows lag too much.
 - `lane_closed`: the kill switch `until_block` was reached: nothing is

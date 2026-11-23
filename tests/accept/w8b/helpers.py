@@ -279,13 +279,21 @@ class Inputs:
               "entries": ([dict(e) for e in self.entries]
                           if int(boundary) >= self.listed_from else []),
               "forecasts": chain["forecasts"][snap], "uid_of": dict(self.fx["uid_of"]),
-              "house": dict(chain["house"])}
+              "house": dict(chain["house"]),
+              # rev6.14 (a): the boundary block's on-chain timestamp (fixture clock).
+              "boundary_ts": boundary_ts(boundary)}
         if self.raw:
             return SimpleNamespace(**kw)
         return wiring().LaneDInputs(**kw)
 
 
 # ── fixtures ────────────────────────────────────────────────────────────────
+
+
+def boundary_ts(boundary) -> int:
+    """rev6.14 (a): the fixture's on-chain timestamp of a boundary block, far
+    after every fixture T + eval_delay_hours (12 s per block)."""
+    return 2_000_000_000 + 12 * int(boundary)
 
 
 def fixture(tmp: Path) -> dict:
@@ -380,7 +388,7 @@ class Oracle:
         inp = self.inputs(boundary)
         session = SweepSession(session_id(boundary), self.host)
         prior = self.receipts[-1]["posterior_state_sha256"] if self.receipts else None
-        s = settle_lane_d(cfg=self.cfg.lane_d, boundary=int(boundary), pool_dir=inp.pool_dir,
+        s = settle_lane_d(boundary_ts=inp.boundary_ts, cfg=self.cfg.lane_d, boundary=int(boundary), pool_dir=inp.pool_dir,
                           entries=inp.entries, house=inp.house, forecasts=inp.forecasts,
                           uid_of=inp.uid_of, state_path=self.state_path, signer=signer(),
                           prior_pool_dirs=inp.prior_pool_dirs, expect_prior_sha256=prior,
