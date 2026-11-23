@@ -192,6 +192,7 @@ import argparse
 import ast
 import contextlib
 import io
+import json
 import os
 import posixpath
 import re
@@ -1739,6 +1740,45 @@ def selftest_evidence(ident: tuple[str, ...]) -> list[str]:
     return failures
 
 
+def selftest_w3a_nolock_evidence() -> list[str]:
+    """check_json_evidence: a no-lock W3a run is judged by its verified path
+    verdict; a lock-enabled W3a run and every other WP still need passed: true."""
+    failures: list[str] = []
+    nolock = {"lock_enabled": False, "asserted_by": "owner_flag"}
+    locked = {"lock_enabled": True, "asserted_by": "probe"}
+
+    def ev(wp: str, passed: bool, lock: dict | None, verified: bool | None, path_passed: bool | None) -> str:
+        data: dict = {"wp": wp, "passed": passed}
+        if lock is not None:
+            data["bucket_lock"] = lock
+        if verified is not None:
+            live: dict = {"verified": verified}
+            if path_passed is not None:
+                live["path_verdict"] = {"path": "presigned_multipart", "passed": path_passed}
+            data["verified_live"] = live
+        return json.dumps(data)
+
+    cases = [
+        ("w3a-nolock-path-passed", ev("W3a", False, nolock, True, True), "W3a", True),
+        ("w3a-nolock-path-failed", ev("W3a", False, nolock, True, False), "W3a", False),
+        ("w3a-nolock-path-missing", ev("W3a", False, nolock, True, None), "W3a", False),
+        ("w3a-nolock-not-verified", ev("W3a", False, nolock, False, True), "W3a", False),
+        ("w3a-nolock-no-live", ev("W3a", False, nolock, None, None), "W3a", False),
+        ("w3a-locked-passed-false", ev("W3a", False, locked, True, True), "W3a", False),
+        ("w3a-locked-passed-true", ev("W3a", True, locked, True, True), "W3a", True),
+        ("w3a-no-lock-key", ev("W3a", False, None, True, True), "W3a", False),
+        ("other-wp-nolock-shape", ev("W3b", False, nolock, True, True), "W3b", False),
+        ("other-wp-passed-false", ev("X1", False, None, None, None), "X1", False),
+        ("other-wp-passed-true", ev("X1", True, None, None, None), "X1", True),
+    ]
+    for name, text, wp, want in cases:
+        ok, why = lanedlib.check_json_evidence(text, wp)
+        if ok != want:
+            failures.append(f"w3a-evidence {name}: {'accepted' if ok else 'refused'} ({why}), "
+                            f"want {'accept' if want else 'refuse'}")
+    return failures
+
+
 SELFTEST_CROSS_PLAN = """# plan
 
 | WP | What | Depends | Runs in | Accept |
@@ -2257,6 +2297,7 @@ def cmd_selftest() -> int:
     failures += selftest_tests_correction(ident)
     failures += selftest_verification(ident)
     failures += selftest_evidence(ident)
+    failures += selftest_w3a_nolock_evidence()
     failures += selftest_cross(ident)
     failures += selftest_freshness(ident)
     failures += selftest_batch(ident)
