@@ -1,0 +1,19 @@
+# W8b: validator production wiring of lane D (plan rev6.2 item (g), W8b row;
+# owner accepted 2026-11-23; README.md has the contract). Builds on W19's
+# off-thread seam (cascade/validator/offthread_worker.py, ValidatorRunner
+# `lane_d_step` / `_lane_d_tick` in loop.py), which is W19's, not W8b's.
+#
+# New: build_lane_d_step, the step (settle_lane_d with the row's inputs, the
+# W3b3 sentinel sweep, publish report + receipt + latest + status/lane_d.json,
+# court_for), LaneDInputs, LaneDWiringError, the publish keys. Imported only
+# by the entry point: W9 invariant 12 forbids the audit's import closure
+# (which reaches loop.py and weights.py) from loading cascade.validator.lane_d*.
+cascade/validator/lane_d_wiring.py
+# cascade-validator main(): builds the step (its own chain reader, not the
+# poll client) and sets runner.lane_d_step before run_forever.
+cascade/validator/main.py
+# The weight fold: lane D armed at the vector's boundary => lane_parts with
+# lane_d_cfg and self.lane_d_step.court_for(boundary) (empty court burns),
+# lane D's part always in emission_vector's second argument (RV3 note 10).
+# No lane_d* import here (invariant 12).
+cascade/validator/weights.py

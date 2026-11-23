@@ -1,0 +1,17 @@
+# W12a: lane D docs and agent surfaces (plan rev6.4 §3.0 W12a row, §11.2;
+# README.md has the contract). Docs only: no code, config or test changes.
+docs/LANE_D.md
+docs/INTERFACE.md
+docs/MINER.md
+docs/AGENT_MINING.md
+docs/VALIDATOR.md
+docs/OPERATOR.md
+docs/ARCHITECTURE.md
+AGENTS.md
+agent.md
+llms.txt
+README.md
+CHANGES.md
+# the website surfaces (§11.2 "llms.txt (repo + website)", "website")
+cascade/website/llms.txt
+cascade/website/index.html

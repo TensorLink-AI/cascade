@@ -18,6 +18,7 @@ import pytest
 
 from .helpers import (
     DECISION,
+    LOCK_PROBES,
     PATH_IDS,
     PROBES,
     decision_problems,
@@ -100,3 +101,82 @@ def test_decision_checker_rejects_two_chosen_lines():
     text = _record("upload_relay") + "\nChosen path: presigned_multipart\n"
     assert any("exactly one 'Chosen path:'" in p
                for p in decision_template_problems(text))
+
+
+# ── evidence from a --no-object-lock run (owner 2026-11-23) ──────────────────
+#
+# Hippius has no Object Lock: the lock probes are `skipped: no_object_lock`.
+# The record must then carry ONE "No Object Lock:" consequence line (kings are
+# not locked by copy; immutability comes from the content-addressed path, the
+# ingest re-hash and the R2/HF mirrors) and must not claim kings are locked.
+
+NO_LOCK_LINE = ("- **No Object Lock:** Hippius has no Object Lock, so kings are not locked by "
+                "copy at crowning; immutability comes from the content-addressed path + the "
+                "ingest re-hash (`digest_mismatch`) + the R2/HF mirrors.")
+
+
+def _skipped_ev(results: dict | None = None) -> dict:
+    res = {n: "skipped" for n in LOCK_PROBES}
+    res.update(results or {})
+    return _ev(res)
+
+
+def _nolock_record(chosen: str = "presigned_multipart", extra: str = "",
+                   line: str | None = NO_LOCK_LINE) -> str:
+    return _record(chosen) + "\n## Consequences\n\n" + (line + "\n" if line else "") + extra
+
+
+def test_decision_checker_accepts_no_lock_evidence_with_the_consequence_line():
+    for chosen in ("presigned_multipart", "single_presigned_put", "upload_relay"):
+        assert decision_problems(_nolock_record(chosen), _skipped_ev(),
+                                 b"w3a evidence bytes") == [], chosen
+    ev = _skipped_ev({"presigned_upload_part": "fail"})
+    assert decision_problems(_nolock_record("single_presigned_put"), ev,
+                             b"w3a evidence bytes") == []
+    probs = decision_problems(_nolock_record("presigned_multipart"), ev, b"w3a evidence bytes")
+    assert any("not supported" in p for p in probs), probs
+
+
+def test_decision_checker_requires_the_no_object_lock_line_for_skipped_lock_probes():
+    probs = decision_problems(_nolock_record(line=None), _skipped_ev(), b"w3a evidence bytes")
+    assert any("No Object Lock" in p for p in probs), probs
+    two = _nolock_record(extra=NO_LOCK_LINE + "\n")
+    probs = decision_problems(two, _skipped_ev(), b"w3a evidence bytes")
+    assert any("No Object Lock" in p for p in probs), probs
+
+
+@pytest.mark.parametrize("line", [
+    "No Object Lock: kings are not locked by copy at crowning.",
+    "No Object Lock: immutability comes from content addressing + re-hash + mirrors.",
+    "No Object Lock: kings are not locked; content-addressed path and the R2/HF mirrors.",
+    "No Object Lock: kings are not locked; content-addressed path and the ingest re-hash.",
+    "No Object Lock: (owner fills)",
+], ids=["no-immutability", "no-kings-not-locked", "no-rehash", "no-mirrors", "unfilled"])
+def test_decision_checker_rejects_an_incomplete_no_object_lock_line(line):
+    probs = decision_problems(_nolock_record(line=line), _skipped_ev(), b"w3a evidence bytes")
+    assert any("No Object Lock" in p for p in probs), (line, probs)
+
+
+@pytest.mark.parametrize("claim", [
+    "- **Kings are locked by copy at crowning** (plan §1.2, rev5): the king is",
+    "Kings are COMPLIANCE-locked at crowning.",
+    "The king is locked by copy into a COMPLIANCE-locked prefix.",
+    "Crowned kings stay locked for the reign.",
+], ids=["template-bullet", "compliance-locked", "king-locked-by-copy", "stay-locked"])
+def test_decision_checker_rejects_a_king_lock_claim_when_the_evidence_skipped(claim):
+    probs = decision_problems(_nolock_record(extra=claim + "\n"), _skipped_ev(),
+                              b"w3a evidence bytes")
+    assert any("claims kings are locked" in p for p in probs), (claim, probs)
+
+
+def test_decision_checker_allows_negated_lock_wording_with_no_lock_evidence():
+    extra = ("Kings are never locked: there is no Object Lock on Hippius.\n"
+             "- **Pending entries are never locked**: content addressing stops overwrites.\n")
+    assert decision_problems(_nolock_record(extra=extra), _skipped_ev(),
+                             b"w3a evidence bytes") == []
+
+
+def test_decision_checker_does_not_require_the_line_when_the_lock_probes_ran():
+    claim = "- **Kings are locked by copy at crowning** (plan §1.2, rev5)\n"
+    assert decision_problems(_record("presigned_multipart") + claim, _ev({}),
+                             b"w3a evidence bytes") == []

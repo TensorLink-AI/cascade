@@ -82,6 +82,7 @@ from .manifest_chain import (  # noqa: F401 — re-exported for callers of casca
     ref_as_of,
 )
 from .marketcast import MarketCastMixin
+from .offthread_worker import LaneDWorker
 from .promotion_gate import PromotionGateMixin
 from .receipts import ReceiptMixin
 from .state import ChampionState, StateTransition
@@ -358,6 +359,13 @@ class ValidatorRunner(
     # one being judged — where the trainer's record of its validator bench
     # report (``validator_bench_reports``) is looked up.
     _vbench_later_raw: list = field(default_factory=list, repr=False)
+    # W19 (LANE_D_PLAN invariant 6): the lane D settlement step, called with
+    # the armed settlement boundary on a LaneDWorker daemon thread, never on
+    # this (weight/poll) thread. The step receives only the boundary: it must
+    # open its own chain access, never share the poll thread's client.
+    # None ⇒ no lane D work at all (the poll loop is unchanged).
+    lane_d_step: Callable[[int], object] | None = None
+    _lane_d_worker: LaneDWorker | None = field(default=None, repr=False)
 
     def process_round(
         self,
@@ -1111,8 +1119,34 @@ class ValidatorRunner(
                 self._reassert_weights_at_head(client)
             except Exception as e:  # noqa: BLE001
                 log.warning("weight re-assert check failed: %s", e)
+            self._lane_d_tick(client)
             self._vbench_lease_tick()
             time.sleep(poll)
+
+    def _lane_d_tick(self, client: object) -> None:
+        """W19 (invariant 6): submit the armed lane D settlement to the
+        off-thread worker and return at once; weights never wait on lane D.
+        No step wired, or ``[lane_d]`` unarmed for the current boundary ⇒
+        nothing is read, submitted or started. Never raises."""
+        step = self.lane_d_step
+        if step is None:
+            return
+        lane_d = getattr(self.cfg, "lane_d", None)
+        if lane_d is None or int(getattr(lane_d, "from_block", 0) or 0) <= 0:
+            return
+        try:
+            boundary = self._reassert_boundary(int(client.current_block()))  # type: ignore[attr-defined]
+            if not lane_d.active(boundary):
+                return
+            worker = self._lane_d_worker
+            if worker is None or worker.step is not step:
+                if worker is not None and worker.running:
+                    return
+                worker = LaneDWorker(step)
+                self._lane_d_worker = worker
+            worker.submit(boundary)
+        except Exception as e:  # noqa: BLE001 — lane D must never reach the weight loop
+            log.warning("lane D tick failed: %s", e)
 
     def _reassert_weights_at_head(self, client: object) -> None:
         """The freshness re-assert, under the config in force at the head
