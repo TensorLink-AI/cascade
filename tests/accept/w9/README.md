@@ -61,7 +61,7 @@ that its honest report PASSes.
 
 | fixture | what it is |
 |---|---|
-| `crown_chain` | W7a `two_settlements`: b1 = `ARM + 900`, X first-clears against the house H0 (`confirm_pending`); b2 = `ARM + 1800`, X confirms, passes the gate and is crowned (uid 6). Then b3 = `ARM + 2700` is settled twice from copies of the b2 state: `s3` judges nothing (X keeps KING_D); `s3d` is the same with X deregistered (its slot burns, `deregistered`) |
+| `crown_chain` | **(rev6.11)** W9's own copy of W7a's single-challenger chain: b1 = `ARM + 900`, X's first verdict against the house H0: clear, gate `pass`, crowned (uid 6); b2 = `ARM + 1800` judges nothing. Then b3 = `ARM + 2700` is settled twice from copies of the b2 state: `s3` judges nothing (X keeps KING_D); `s3d` is the same with X deregistered (its slot burns, `deregistered`) |
 | `snapshots` | b1 settled on W7a's snapshot 1 (`honest`) and on three defective copies of it: series `src5-s7` with `frontier` deleted (`frontier_absent`) or `null` (`frontier_null`), and feed `src5` removed from `feeds` (`unlisted_feed`). The producer fails those windows closed and judges the rest, so each report is genuine and PASSes the report-only audit |
 | `caps` | one b1 settlement, three entries A (T0), B (T0+60), C (T0+120). `cold`: `max_judged_per_coldkey_per_settlement = 1`, A and B on coldkey K1, C on K2, so A and C are judged and B is skipped `coldkey_cap_settlement`. `glob`: `max_entries_per_settlement = 2`, three coldkeys, so A and B are judged and C is skipped |
 
@@ -88,8 +88,8 @@ recorded at `ready`), `context`, `ready_block`, `reveal_block` and
    exactly the cohort members.
 2. Each `skipped[]` digest is a listed entry and appears once. Its `reason`
    equals that entry's `entries[].reason`.
-3. **No silent omission.** Every entry whose `status` is `pending` or
-   `confirm_pending` after the settlement is in `judged`, in `skipped`, or
+3. **No silent omission.** Every entry whose `status` is `pending` ~~or
+   `confirm_pending`~~ (rev6.11: no confirmation stage) after the settlement is in `judged`, in `skipped`, or
    has a gate result.
 4. **The caps, FIFO by T.** The *selection candidates* are the judged
    entries plus the entries skipped with `coldkey_cap_settlement`,
@@ -153,16 +153,68 @@ counts only if its signature verifies under `signer_hotkey` and its
     `reveal_block` and `reveal_ts` are identical.
 
 Each chain test's forgery PASSes the single-report audit (asserted, except
-the undo-crown case), so only the chain refutes it. The D20 confirmation
-rule end to end:
+the undo-crown case), so only the chain refutes it. ~~The D20 confirmation
+rule end to end~~ **(rev6.11 (b): no confirmation duel, no D20.)** Every
+verdict is a first verdict against `king_before`, and `king_before` is where
+the chain left KING_D (rule 9), so a crown can't rest on a stale king.
 
-- the first clear exists, is disjoint and was judged against the stated
-  king (W7a RV7, chain mode);
-- under `"restart"` the confirm cohort's king is `king_before` (W7a RV7);
-- `king_before` is where the chain left KING_D (rule 9).
+## rev6.11 / rev6.12 (`test_w9_rev611.py`, `test_w9_embargo.py`, `test_w9_windows.py`)
 
-Together these mean a king change between the first clear and the
-confirmation can't be hidden by restating `king_before`.
+Plan rev6.9 (W5i), rev6.10 (a)/(b), rev6.11 (a)/(b), rev6.12 (a)/(b) and
+the W9 row. Field names are the ones the W5j / W5i / W7a tests pin.
+
+- **Fixture.** `crown_chain` is now W9's own copy of W7a's single-challenger
+  chain (W7a's building blocks, not `two_settlements`, so a W7a fixture
+  change never reshapes W9): b1 is X's first verdict, crowned there; b2
+  judges nothing. Every W7a snapshot W9 settles on pins `embargo_hours = 48`
+  in each listed feed (`helpers.pin_embargo`, W6b). `test_w9_snapshot.py`'s
+  `FEEDS` pin `embargo_hours = 0`, so its cases stay the rev3 rule.
+- **No confirmation stage.** `check_lane_d` FAILs a report whose cohort or
+  verdict `stage` isn't `first`, a verdict with a `confirmation` block, or
+  an entry `confirm_pending`, with `confirmation_stage_present` in `detail`.
+  Rule 3 ("No silent omission") reads `pending` only.
+- **Crowning** is re-derived as first clear ∧ A10 not `fail` ∧ gate `pass`:
+  a crown with an A10 `fail`, no gate, or `cleared = false` FAILs. The honest
+  crown at a first verdict PASSes.
+- **`window_refusal(series, feeds, bound, cfg)`** takes `e = min(feeds[feed]
+  .embargo_hours, cfg.embargo_hours)` for every cadence (no `freq` term,
+  rev6.12 (a)) and applies the rev6.10 rule at the feed bound `bound − 3600
+  e`: first-seen `+ e > bound`, data time `> bound − e`, S0 and backfill at
+  `bound − e`, the §1.3 labels unchanged. A listed feed whose
+  `embargo_hours` is absent, not a number (bool and NaN included) or
+  negative is `unlisted_feed`. `e = 0` is the rev3 rule.
+- **`pool_dirs`:** a snapshot whose feed `e` is above `[lane_d]
+  embargo_hours`, or that carries a non-zero `e` on a publish-ahead feed (a
+  series point whose data time is after its first-seen time), FAILs; the
+  honest snapshot with `e = 48` PASSes.
+- **Report-only re-derivations.** `params` echoes `embargo_hours`,
+  `min_fresh_window_share` and `max_windows_per_settlement` (= `cfg`), and no
+  `embargo_window_share_cap`. Each judged window carries `embargo_hours`
+  (≤ the config), `embargo_window`, `freq`, `kind`, `timeframe` (= `freq`),
+  `bin`, `h`, `origin` (= `min_target_ts`); its clocks satisfy the rule at
+  its `e` against `b = t_max + margin`; `embargo_window` is true iff the
+  window fails the e = 0 rule. F / (F + E) ≥ `min_fresh_window_share` on
+  every judged set, else FAIL with `fresh_share_short` in `detail`. The draw
+  record (top-level `draw` or `cohorts[i].draw`) has `boundary_block_hash`
+  (the boundary's), `seed = f"{boundary_block_hash}:lane_d_windows"`,
+  `max_windows_per_settlement`, `quota` / `capacity` (`{"<timeframe>|<bin>":
+  int}`) and `embargo_windows`; a changed seed, block hash or quota FAILs,
+  and so does a drawn window dropped from the set. Under
+  `max_windows_per_settlement = 32` the b1 draw holds 24…32 windows, no
+  source above `max_source_share`, the same picks in two independent runs,
+  and PASSes.
+- **The clamp.** `cascade.audit.lane_d.combined_log_ratio(r_fwd, r_bt, *,
+  n_fwd, n_bt, cap, floor)` re-implements rev6.9's rule: `c = min(cap, n_bt
+  / (n_bt + n_fwd))` (0 without backtest windows), `log R = (1 − c) · log
+  r_fwd + c · log clamp(r_bt, floor, 1 / floor)`; exactly `log r_fwd` when
+  off; memorisation gains at most `1 − floor^cap`.
+- **Not pinned:** e = 0 on sub-hourly series (reversed by rev6.12 (a)); how
+  the audit treats a listed feed without `embargo_hours` in a snapshot W7a's
+  own fixture writes (W7a / W5a own that fixture).
+
+On main (`315d240`) 46 of the 137 tests fail, each on an `AssertionError` or
+on `ImportError: cannot import name 'combined_log_ratio' from
+'cascade.audit.lane_d'` (in PATHS); the other 91 pass.
 
 ### (rev6.1) Snapshots
 

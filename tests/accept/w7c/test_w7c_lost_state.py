@@ -38,6 +38,7 @@ from .helpers import (
     STATE_ERROR_CODES,
     Chain,
     CountingForecasts,
+    W7cChain,
     boundary,
     canonical,
     chain_fingerprint,
@@ -105,9 +106,9 @@ def _refused_untouched(chain: Chain, n: int, path: Path, code: str, **extra) -> 
 # ── a missing state file after a settlement ─────────────────────────────────
 
 
-@pytest.mark.parametrize("settled", [1, 2], ids=["after_first_clear", "after_crowning"])
+@pytest.mark.parametrize("settled", [1, 2], ids=["after_floor_wait", "after_crowning"])
 def test_rv6_b3_a_missing_state_after_a_settlement_is_refused_not_genesis(tmp_path, settled):
-    chain = Chain(tmp_path)
+    chain = W7cChain(tmp_path)
     path = chain.state_path("run")
     chain.run(path, settled)
     path.unlink()
@@ -117,7 +118,7 @@ def test_rv6_b3_a_missing_state_after_a_settlement_is_refused_not_genesis(tmp_pa
 
 def test_rv6_b3_the_reproduction_no_silent_dethrone_no_rescore(tmp_path):
     """RV6's exact sequence: b1, b2 (X crowned), state deleted, b3."""
-    chain = Chain(tmp_path)
+    chain = W7cChain(tmp_path)
     path = chain.state_path("run")
     chain.settle(1, path)
     s2 = chain.settle(2, path)
@@ -139,7 +140,7 @@ def test_rv6_b3_the_reproduction_no_silent_dethrone_no_rescore(tmp_path):
 @pytest.mark.parametrize("defect,code", [("empty", "bad_json"), ("truncated", "bad_json"),
                                          ("directory", "state_unreadable")])
 def test_rv6_b3_an_unreadable_state_after_a_settlement_is_refused(tmp_path, defect, code):
-    chain = Chain(tmp_path)
+    chain = W7cChain(tmp_path)
     path = chain.state_path("run")
     chain.run(path, 2)
     good = path.read_bytes()
@@ -156,7 +157,7 @@ def test_rv6_b3_an_unreadable_state_after_a_settlement_is_refused(tmp_path, defe
 def test_rv6_b3_load_state_never_hides_an_unreadable_file_as_genesis(tmp_path):
     from cascade.validator.lane_d_state import load_state
 
-    chain = Chain(tmp_path)
+    chain = W7cChain(tmp_path)
     path = chain.state_path("run")
     path.mkdir()
     _refuses(lambda: load_state(path, chain.house), "state_unreadable")
@@ -168,7 +169,7 @@ def test_rv6_b3_load_state_never_hides_an_unreadable_file_as_genesis(tmp_path):
 def test_rv6_b3_genesis_still_applies_when_no_settlement_was_persisted(tmp_path):
     from cascade.validator.lane_d_state import genesis, report_path
 
-    chain = Chain(tmp_path)
+    chain = W7cChain(tmp_path)
     ref = _reference(chain)
     path = chain.state_path("fresh")
     report_path(path, boundary(1)).parent.mkdir(parents=True)   # an empty report dir
@@ -184,7 +185,7 @@ def test_rv6_b3_a_lost_state_before_its_first_report_recovers_from_genesis(tmp_p
     the recovery matches the clean run (README "Recovery")."""
     from .helpers import crash_on_rename
 
-    chain = Chain(tmp_path)
+    chain = W7cChain(tmp_path)
     ref = _reference(chain)
     path = chain.state_path("crash")
     crash_on_rename(monkeypatch, path)
@@ -203,7 +204,7 @@ def test_rv6_b3_a_lost_state_before_its_first_report_recovers_from_genesis(tmp_p
 def test_rv6_b3_a_rolled_back_state_is_refused(tmp_path):
     """The state at boundary(1) put back while boundary(2)'s report is
     persisted: settling boundary(3) on it would re-judge X and drop the crown."""
-    chain = Chain(tmp_path)
+    chain = W7cChain(tmp_path)
     path = chain.state_path("run")
     chain.settle(1, path)
     old = path.read_bytes()
@@ -217,7 +218,7 @@ def test_rv6_b3_an_older_state_with_only_this_boundarys_report_recovers(tmp_path
     """The state at boundary(1) with boundary(2)'s report persisted, settling
     boundary(2): indistinguishable from a crash between the two writes, so it
     is the recovery path, and it ends on the clean run's bytes."""
-    chain = Chain(tmp_path)
+    chain = W7cChain(tmp_path)
     ref = _reference(chain)
     path = chain.state_path("run")
     chain.settle(1, path)
@@ -235,7 +236,7 @@ def test_rv6_b3_an_older_state_with_only_this_boundarys_report_recovers(tmp_path
 def test_rv6_b3_settle_checks_the_expected_prior(tmp_path):
     from cascade.validator.lane_d_state import genesis
 
-    chain = Chain(tmp_path)
+    chain = W7cChain(tmp_path)
     ref = _reference(chain)
     path = chain.state_path("run")
     s1 = _call(lambda: chain.settle(1, path,
@@ -261,7 +262,7 @@ def test_rv6_b3_settle_checks_the_expected_prior(tmp_path):
 def test_rv6_b3_an_expected_genesis_never_licenses_a_lost_state(tmp_path):
     from cascade.validator.lane_d_state import genesis
 
-    chain = Chain(tmp_path)
+    chain = W7cChain(tmp_path)
     path = chain.state_path("run")
     chain.settle(1, path)
     path.unlink()
@@ -275,7 +276,7 @@ def test_rv6_b3_an_expected_genesis_never_licenses_a_lost_state(tmp_path):
 def _crowned_with_backup(tmp_path):
     """b1, b2 (X crowned), the operator's backup of the b2 state, then the
     live state file is lost."""
-    chain = Chain(tmp_path)
+    chain = W7cChain(tmp_path)
     ref = _reference(chain)
     path = chain.state_path("run")
     chain.settle(1, path)

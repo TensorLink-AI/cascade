@@ -30,11 +30,15 @@ from . import helpers as h
 
 H = h.w7a.HORIZON
 BOUND = 1_790_100_000.0
-FEEDS = {"fa": {"mirror_lag_hours": 1.0, "forecast_product": False},
-         "unmeasured": {"mirror_lag_hours": None, "forecast_product": False},
-         "laggy": {"mirror_lag_hours": 6.5, "forecast_product": False},
-         "at-limit": {"mirror_lag_hours": 6.0, "forecast_product": False},
-         "forecast": {"mirror_lag_hours": 1.0, "forecast_product": True}}
+# rev6.10 / rev6.12: every listed feed pins its effective embargo. These
+# cases pin e = 0 (the rev3 rule at bound `b`, byte-identical to the rev6.1
+# labels); test_w9_embargo.py covers e > 0.
+FEEDS = {"fa": {"mirror_lag_hours": 1.0, "forecast_product": False, "embargo_hours": 0.0},
+         "unmeasured": {"mirror_lag_hours": None, "forecast_product": False,
+                        "embargo_hours": 0.0},
+         "laggy": {"mirror_lag_hours": 6.5, "forecast_product": False, "embargo_hours": 0.0},
+         "at-limit": {"mirror_lag_hours": 6.0, "forecast_product": False, "embargo_hours": 0.0},
+         "forecast": {"mirror_lag_hours": 1.0, "forecast_product": True, "embargo_hours": 0.0}}
 
 
 def _series(*, data_start=BOUND + 3600, seen_start=BOUND + 5400, feed="fa", source="src0",

@@ -433,7 +433,12 @@ def expected_inputs(fx: dict, boundary: int) -> dict:
     snap = 1 if int(boundary) <= B1 else 2
     chain = fx["chain"]
     return {"pool_dir": Path(chain["pools"][snap]), "prior_pool_dirs": (),
-            "entries": [dict(fx["entry"])], "forecasts": chain["forecasts"][snap],
+            "entries": [dict(fx["entry"])],
+            # Only the needed digests (X and the house): W7a's chain also
+            # carries forecasts for its `loser` digest (main @ 2cd79be, #758),
+            # which no W8c settlement reads.
+            "forecasts": {dg: f for dg, f in chain["forecasts"][snap].items()
+                          if dg in (fx["x"], fx["house"]["digest"])},
             "uid_of": uid_of(fx), "house": dict(chain["house"])}
 
 
