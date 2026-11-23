@@ -216,6 +216,47 @@ here. `test_w7d_fixture_chains.py` checks every chain fact above, every
 chain rule C1–C4 on the fixtures, and that `check_lane_d` PASSes every
 honest report. It passes on main.
 
+## House-challenger chains (W5f follow-up, `house_helpers.HOUSE_CHAINS`)
+
+W5f (§1.4 "The house", §2 items 1-2, §4 T10) makes a new house a challenger
+while a miner holds KING_D. The replay re-derives it from the chain, never
+from the report's say-so:
+
+- a new house digest while a miner holds KING_D, and is neither KING_D nor
+  a prior king, opens a house challenger. A new pointer ends an earlier one.
+  While the house holds KING_D a new pointer moves the throne in place (C2,
+  no challenger);
+- the challenger is judged alone in its own cohort: `members == [house]`,
+  `king_digest` = KING_D (D20 as for an entry), no `house_digest` and no
+  `verdicts[j].house` (the house is never its own bar), its T the report's
+  `house.reveal_ts`. Its first clear, hold and used windows are its own:
+  never those of a miner entry with the same digest;
+- a confirmed, passing house **retakes** KING_D: `king_after` is the house
+  record, `crowned` is null, its verdict's outcome is `crowned`, KING_D's
+  miner king becomes the newest prior king (C3), and the court's first slot
+  burns (`house_king`). A lost house is never judged again;
+- an entry is `closed` / `duplicate_digest` exactly when it's a copy: a new
+  entry naming the house or KING_D (refused at registration), an open entry
+  naming a new house, or one already closed so;
+- with `states`, `state.house_entry` is present exactly while there's a
+  challenger, with the house's digest and T.
+
+Every chain is real `settle_lane_d` runs built with the W5f helpers
+(`tests/accept/w5f/helpers.py`), signed by the W5f test key:
+
+| chain | settlements |
+|---|---|
+| `house_loses` | X crowned over H0 (b1, b2); b3 a weak H1w is judged alone against X and loses, Y first-clears against X with H1w as the second bar; b4 Y confirms, crowned |
+| `house_retakes` | X then Y crowned (b1..b4); b5 a sharp H1 first-clears against Y; b6 confirms and retakes (prior kings [Y, X], slot burns); b7/b8 Z (sharper) first-clears and confirms against the house, crowned |
+| `copy_at_swap` | X crowned; b3 a miner submits H1's digest at the swap (`duplicate_digest` at registration), H1 first-clears; b4 H1 retakes (prior kings [X]) |
+| `open_copy` | X crowned; b3 an entry with H1's digest first-clears while H0 is the house; b4 the pointer names H1: the entry closes `duplicate_digest` and the house starts at stage `first`; b5 H1 retakes |
+
+Forgeries, each re-signed and its receipt re-issued, are MISMATCH at the
+path: a house cohort with an extra member (`cohorts[i].members`), a retake
+with `crowned` set (`crowned`), a retake without the dethroned miner king in
+the prior kings, court adjusted to match (`prior_kings`), and a
+`duplicate_digest` close of an entry that isn't a copy (`entries[i]`).
+
 ## Tests
 
 | row | test |
@@ -224,6 +265,7 @@ honest report. It passes on main.
 | MATCH on every honest chain (files, mapping, with states and metagraphs); re-derived crown, king, outcomes, gate, pay, body digest; purity; invariant 7 (`extensions`, path grammar); `PYTHONHASHSEED` 0 / 1 / 4242 give equal results | `test_w7d_match.py` |
 | doctored-but-re-signed: crown (withheld, self-consistent withheld, double, `king_after`), verdict (outcome, clear, lcb), rows (resealed, unsealed, dropped), gate outcome (against its LCBs, pass below tau, suite, held re-gate, C6 non-held result), pay (share, uid vs metagraph, burn reason, extra slot, order), params, signature, `king_before`, `prior_kings`, house bar (judgement, dropped bar), D20 (`original` first king, `restart` discarded set), receipts (body, link, genesis); downstream `prior_unverified` | `test_w7d_mismatch.py` |
 | UNVERIFIABLE reasons; posterior state binding | `test_w7d_unverifiable.py` |
+| W5f house challenger: honest chains MATCH (files, mapping, states and metagraphs) with the re-derived outcomes, crown, king and pay; the forgeries above; the fixture facts | `test_w7d_house.py` |
 
 ## Not pinned
 
