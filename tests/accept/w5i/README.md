@@ -19,7 +19,7 @@ may touch only the paths in `PATHS`. W5j's and W2e's tests must stay green.
 - `cells_for_freq(freq, cfg) -> list[dict]`: the cell headers
   (`timeframe`, `bin`, `kind`, `h_lo`, `h_hi`) a series of that `freq` feeds.
   - A sub-daily `freq`, **or any `freq` while `cfg.backtest_weight_cap == 0`**
-    (off by default: nothing built or scored, daily stays h = 64 forward):
+    (an explicit off; the shipped default is 0.05, ON: nothing built or scored, daily stays h = 64 forward):
     one `{"bin": "forward", "kind": "forward", "h_lo": cfg.horizon,
     "h_hi": cfg.horizon}`.
   - A slow `freq` with the cap > 0: its three bins in the order short,
@@ -70,7 +70,7 @@ replicate of the max-T cohort LCB, so the bound holds for the LCB too.
 
 ## Config
 
-`backtest_weight_cap` (default 0) and `backtest_ratio_floor` (0.85): the
+`backtest_weight_cap` (default **0.05**, ON at launch: owner 2026-11-23, W2e #781, plan rev6.15; 0 switches the backtest off) and `backtest_ratio_floor` (0.85): the
 loader refuses a cap > 0 unless `1 - floor ** cap < d_margin` (W2e pins the
 full matrix; one case is repeated here).
 
@@ -85,3 +85,13 @@ testnet check.
 `cascade.validator.lane_d_backtest` and `cascade.validator.lane_d_draw`
 don't exist (`ModuleNotFoundError` for paths in `PATHS`); `judge_cohort` has
 no `kinds` parameter (an `assert` on its signature).
+
+## Correction (owner 2026-11-23): the cap is ON by default
+
+`backtest_weight_cap` defaults to 0.05 (W2e #781, plan rev6.15), not 0. The
+text above no longer calls the backtest "off by default"; 0 is an explicit
+off. `test_w5i_the_default_cap_builds_the_slow_bins` pins the parsed default
+(0.05) and that a slow `freq` then feeds its three bins. Every other test
+passes its cap explicitly and is unchanged. On main `lane_d_backtest` does not
+exist, so the new test fails with `ModuleNotFoundError` (in PATHS), like the
+rest of this dir.

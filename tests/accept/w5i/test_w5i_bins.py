@@ -1,6 +1,7 @@
 """W5i: the owner's horizon bins, freq classes and the cells a series feeds
-(rev6.9 (a) "Horizon bins", "Daily short stays forward-only", "Off by
-default")."""
+(rev6.9 (a) "Horizon bins", "Daily short stays forward-only"; the cap is
+ON by default: `backtest_weight_cap` = 0.05, owner 2026-11-23, W2e #781,
+plan rev6.15; 0 still switches the backtest off)."""
 
 from __future__ import annotations
 
@@ -45,9 +46,29 @@ def test_w5i_subdaily_feeds_one_forward_cell_at_h64(freq):
 
 @pytest.mark.parametrize("freq", sorted(CLASS))
 def test_w5i_off_at_cap_0_every_freq_is_forward_h64(freq):
-    """backtest_weight_cap = 0 (the default): nothing built; daily stays h = 64."""
+    """backtest_weight_cap = 0 (an explicit off; the default is 0.05): nothing
+    built; daily stays h = 64."""
     cells = _mod().cells_for_freq(freq, lane_d_cfg(backtest_weight_cap=0.0))
     assert _headers(cells) == [(freq, "forward", "forward", HORIZON, HORIZON)]
+
+
+@pytest.mark.parametrize("freq", sorted(CLASS))
+def test_w5i_the_default_cap_builds_the_slow_bins(freq):
+    """Owner 2026-11-23 (W2e #781): with no `backtest_weight_cap` in the
+    table the parsed default is 0.05, so a slow freq feeds its three bins
+    (never the cap-0 single forward cell)."""
+    from cascade.shared.config.lane_d import parse_lane_d
+
+    from .helpers import ARM_BLOCK, ERA
+
+    raw = {"from_block": ARM_BLOCK, "share": 0.25, "takes_from": "lane_a", "remainder": "burn",
+           "horizon": HORIZON, "min_windows": 8, "min_clusters": 2, "max_source_share": 1.0,
+           "bootstrap_B": 400, "d_margin": 0.01, "max_windows_per_settlement": 60,
+           "min_fresh_window_share": 0.5}
+    cfg = parse_lane_d(raw, era_blocks_at=lambda _block: ERA)
+    assert float(cfg.backtest_weight_cap) == 0.05, cfg.backtest_weight_cap
+    cells = _mod().cells_for_freq(freq, cfg)
+    assert [c["bin"] for c in cells] == ["short", "medium", "long"], _headers(cells)
 
 
 @pytest.mark.parametrize("freq", sorted(CLASS))
