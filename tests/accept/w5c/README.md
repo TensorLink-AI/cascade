@@ -101,6 +101,16 @@ Rules:
   false`.
 - Rows per cohort = `len(window_ids) * (2 + len(members))` with a house bar
   (KING_D, house, members), `len(window_ids) * (1 + len(members))` without.
+- The two-bar rule is for **miner** cohorts. At a refresh boundary the new
+  house is also a challenger (§1.4: "Refresh: it's refreshed whenever that
+  digest changes ... It enters at that settlement"; §2 item 2: "The house
+  can retake KING_D when a better lane A king beats it on forward
+  windows"), judged in its own cohort: W5f's contract
+  (`tests/accept/w5f/README.md` §4: `members == [house]`, `king_digest` =
+  KING_D, no `house_digest`). `test_house_report_rows_account_for_the_house`
+  skips that cohort (the one whose members contain the house digest) for the
+  bars check, asserts only its W5f shape when present (it is absent before
+  W5f), and requires at least one miner cohort to have been checked.
 - **When the house holds KING_D, neither key appears** (not `null`, not a
   copy of the KING_D judgement). Why absent:
   - there is one bar, so a copy would be a second signed reading of the same
