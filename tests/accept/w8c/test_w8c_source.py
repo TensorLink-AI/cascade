@@ -164,8 +164,10 @@ def test_source_is_deterministic(tmp_path):
 
 def test_step_with_the_source_settles_like_the_hand_built_inputs(tmp_path):
     """W8b's step over the W8c source publishes, at B1..B3, the reports W8b's
-    step publishes over the hand-built inputs (same bench session ids): X is
-    crowned at B2 and paid at uid 6."""
+    step publishes over the hand-built inputs (same bench session ids): the
+    source lists X from B1, so X is crowned at its first verdict at B1 (plan
+    rev6.11 (b): no confirmation duel) and paid at uid 6; B2 and B3 crown
+    nothing and X keeps KING_D (uid 6)."""
     from cascade.validator.lane_d_bench import SweepSession
     from cascade.validator.lane_d_wiring import LaneDInputs, build_lane_d_step
 
@@ -194,8 +196,12 @@ def test_step_with_the_source_settles_like_the_hand_built_inputs(tmp_path):
         got = json.loads(store.objects[report_key(b)])
         want = json.loads(want_store.objects[report_key(b)])
         assert h.w8b.body_sha256(got) == h.w8b.body_sha256(want), f"boundary {b}"
-    final = json.loads(store.objects[report_key(h.B2)])
-    assert final["crowned"] == rig.fx["x"]
+    final = json.loads(store.objects[report_key(h.B1)])
+    assert final["crowned"] == rig.fx["x"], "X is crowned at its first verdict (B1)"
     assert final.get("armed_contexts") == list(h.DEFAULT_ARMED), \
         "rev6.6: the signed report records the settlement's armed set"
-    assert step.court_for(h.B2)[0] == h.CHALLENGER_UID
+    for b in (h.B2, h.B3):
+        assert json.loads(store.objects[report_key(b)])["crowned"] is None, \
+            f"boundary {b}: a reigning X is not crowned again"
+    for b in (h.B1, h.B2, h.B3):
+        assert step.court_for(b)[0] == h.CHALLENGER_UID, f"boundary {b}"
