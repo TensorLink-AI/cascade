@@ -97,8 +97,12 @@ settlement (W7a) can call it. It is never read from `cfg.contexts`.
     `ValueError`. The record is deterministic: the same bytes give the same
     record, whatever the order of `contexts`.
 - `effective_context(declared, armed_contexts) -> int` returns `declared`
-  when it is armed and the highest armed variant otherwise, so the scored
-  context switches at the settlement where the declared variant arms. An
+  when it is armed. Otherwise it returns the highest armed variant **not
+  above** `declared`, and when every armed variant is above `declared`, the
+  lowest armed one. A model is never run past the context its miner declared.
+  In the normal case the gates are monotone (a series usable at 64k is usable
+  at 32k), so this is the plan's "highest armed variant". The scored context
+  switches at the settlement where the declared variant arms. An
   empty armed set, or a declared value that is not a scorer context (or is a
   bool or str), is a `ValueError`.
 - `declared_context` and `forecast_quantiles(..., contexts=)` are unchanged.

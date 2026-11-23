@@ -243,8 +243,18 @@ def test_an_unarmed_declaration_is_scored_at_the_highest_armed_variant():
     assert ec(32768, [4096]) == 4096
 
 
+def test_never_scored_above_the_declared_context():
+    """The highest armed variant is taken among those not above the declared
+    context (a model declared at 32k is never run at 64k); only when every
+    armed variant is above it does the lowest armed one score it."""
+    ec = _s().effective_context
+    assert ec(32768, (4096, 8192, 16384, 65536, 131072)) == 16384
+    assert ec(65536, (4096, 131072)) == 4096
+    assert ec(4096, (8192, 16384)) == 8192
+
+
 def test_the_scored_context_switches_when_its_variant_arms():
-    counts = dict(READY_ALL)
+    counts = {c: (4633, 42) for c in (4096, 8192, 16384)}
     counts[32768] = (250, 30)                 # below min_long_series
     day1 = _record(readiness=counts)
     counts[32768] = (310, 30)                 # crossed it at the next settlement
