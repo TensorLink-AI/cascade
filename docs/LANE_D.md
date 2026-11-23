@@ -70,9 +70,12 @@ context because the positional buffers are non-persistent.
   settlement and records it, with the two documents' sha256s, in the signed
   report (`armed_contexts`, `armed_evidence`); satellites verify it there.
 - **An unarmed declaration is still valid:** the entry is scored at the
-  highest armed variant below its declared context (the lowest armed one if
-  none is below), and at its own context from the settlement its variant
-  arms. The model trains on 4096-point rows, so quality beyond 16k is
+  highest armed variant below its declared context, and at its own context
+  from the settlement its variant arms. It is never run above its declared
+  context: if no armed variant is at or below it, the entry is not scored
+  that settlement. It stays `pending` with the skip reason
+  `context_below_armed` and is judged once a variant at or below its
+  context arms. The model trains on 4096-point rows, so quality beyond 16k is
   unproven until T7 measures it; in practice 32k–128k pass gate (2) only on
   the 96 GB eval host (stage S8).
 - The lane D scorer never pads: each window's history is truncated to the
@@ -275,6 +278,9 @@ with one typed reason, and the queue shows it:
   KING_D or another open entry.
 - `hotkey_has_open_entry`: the hotkey already holds an open entry.
 - `context_not_armed`: the declared context is not in `contexts`.
+- `context_below_armed`: the declared context is in `contexts`, but no armed
+  variant is at or below it this settlement. The entry stays `pending` and is
+  never run above its declaration.
 - `checkpoint_fault`: the checkpoint failed ingest, scoring or its gate sweep.
 - `mirror_lag_exceeded`: the feeds behind the entry's windows lag too much.
 - `lane_closed`: the kill switch `until_block` was reached: nothing is

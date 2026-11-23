@@ -13,8 +13,11 @@ from . import helpers as h
 # §11.2 VALIDATOR row (rev3): "the new report fields (`rows_sha256`,
 # `coldkey`, judged set, `confirmation`, low-frequency result, both clocks)"
 # as `lane-d-report/1` names them (checked against the schema below).
+# Plan rev6.11 (b) removes the `confirmation` block (no confirmation duel;
+# W7a "a verdict carrying `confirmation` is `unknown_field`"), so it is no
+# longer a report field the guide must name.
 REPORT_FIELDS = {"rows_sha256": "", "judged": "", "skipped": "", "coldkey": "entries",
-                 "confirmation": "verdicts", "lowfreq": "verdicts",
+                 "lowfreq": "verdicts",
                  "min_target_ts": "windows", "min_first_seen_ts": "windows",
                  "mirror_lag_hours": "windows"}
 

@@ -322,16 +322,44 @@ class LaneDInputsSource:
         the subset that are bars (KING_D, the house, a confirm stage's
         original king), whose fault refuses the tick. An entry declaring a
         context outside ``[lane_d] contexts`` is not forecast: the settlement
-        closes it at registration (``context_not_armed``)."""
+        closes it at registration (``context_not_armed``).
+
+        Plan rev6.15 ("Highest ≤ declared, else skip"): a digest whose
+        effective context is ``None`` (no armed variant ≤ its declared
+        context) is not forecast. An entry or open record is then skipped by
+        the settlement (``context_below_armed``); a miner KING_D without a
+        forecast makes its cohort ``king_unscored``. Neither refuses the
+        tick. The house (no declared context) is always forecast."""
         from ..eval.lane_d_scorer import effective_context
 
         declarable = {int(c) for c in self.cfg.lane_d.contexts}
 
-        def eff(declared: int) -> int:
+        armed_ints = [int(c) for c in armed]
+
+        def eff(declared: int) -> int | None:
+            # rev6.15: no armed variant ≤ declared ⇒ not scored (``None``),
+            # decided here too so the skip never depends on the scorer build.
+            if not any(c <= int(declared) for c in armed_ints):
+                return None
             return effective_context(int(declared), armed)
 
+        def put(dg: str, c: int | None, *, replace: bool = False) -> None:
+            if c is None:
+                if replace:
+                    ctx.pop(dg, None)
+                return
+            if replace:
+                ctx[dg] = c
+            else:
+                ctx.setdefault(dg, c)
+
         records = state["entries"]
+        # The house declares no context (it is ours, not a miner's): it runs
+        # at its trained 4096 when armed, else the highest armed below, else
+        # the lowest armed (rev6.15 leaves the house's rule unchanged).
         house_ctx = eff(HOUSE_TRAINED_CONTEXT)
+        if house_ctx is None:
+            house_ctx = min(int(c) for c in armed)
         houses = {str(state["house"]["digest"]), str(house["digest"])}
         king = state["king"]
         bars = set(houses) | {str(king["digest"])}
@@ -342,17 +370,17 @@ class LaneDInputsSource:
         ctx: dict[str, int] = {}
         for e in entries:
             if int(e["context"]) in declarable:
-                ctx.setdefault(e["digest"], eff(e["context"]))
+                put(str(e["digest"]), eff(e["context"]))
         from .lane_d import OPEN_STATUSES
 
         for dg, rec in sorted(records.items()):
             if rec.get("status") in OPEN_STATUSES and int(rec["context"]) in declarable:
-                ctx.setdefault(str(dg), eff(rec["context"]))
+                put(str(dg), eff(rec["context"]))
         for dg in sorted(bars):
             if dg in houses or (dg == str(king["digest"]) and king.get("house")):
-                ctx[dg] = house_ctx
+                put(dg, house_ctx, replace=True)
             elif dg in records and int(records[dg]["context"]) in declarable:
-                ctx[dg] = eff(records[dg]["context"])
+                put(dg, eff(records[dg]["context"]), replace=True)
             elif dg in records:
                 raise LaneDInputsError("state_unreadable",
                                        f"king {dg[:16]} declares context "

@@ -225,10 +225,12 @@ def armed_record(contexts, *, readiness, t7, min_long_series) -> dict:
                 "variants": variants}}
 
 
-def effective_context(declared, armed_contexts) -> int:
+def effective_context(declared, armed_contexts) -> int | None:
     """The context an entry is scored at: ``declared`` when it is armed, else
-    the highest armed variant not above ``declared`` (the lowest armed one
-    when every armed variant is above it), so a model never runs past the
+    the highest armed variant below ``declared``, else ``None`` (plan rev6.15,
+    owner 2026-11-23, "Highest ≤ declared, else skip": no armed variant is ≤
+    ``declared``, so the entry is not scored this settlement and the
+    settlement skips it ``context_below_armed``). A model never runs past the
     context its miner declared. Rev6.6: an unarmed declaration is valid and is
     scored at its own context from the settlement its variant arms.
     ``ValueError`` when nothing is armed or ``declared`` is not a scorer
@@ -242,7 +244,7 @@ def effective_context(declared, armed_contexts) -> int:
     if d in armed:
         return d
     below = [c for c in armed if c < d]
-    return max(below) if below else min(armed)
+    return max(below) if below else None
 
 
 def level_indices(head_levels, wanted=SCORING_LEVELS, tol: float = 1e-9) -> list[int]:
