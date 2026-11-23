@@ -454,6 +454,11 @@ class LaneDInputsSource:
         windows = self._windows(pools)
         need, bars = self._needed(entries, state, house, ctxs)
         forecasts = self._forecasts(need, bars, windows, state, house, ctxs)
+        # W3b6a: the bench host sweeps each digest at the context it is
+        # forecast at (the same map, once per settlement).
+        set_contexts = getattr(self._bench_host, "set_contexts", None)
+        if callable(set_contexts):
+            set_contexts(dict(need))
         dirs = [d for d, _ in pools]
         return LaneDInputs(pool_dir=dirs[-1], entries=entries, forecasts=forecasts,
                            uid_of=uid_of, house=house, prior_pool_dirs=tuple(dirs[:-1]),
@@ -679,7 +684,7 @@ class SSHEvalHost:
 INPUTS_FILE_KEYS = ("intake_state_dir", "pool_pins", "house_pointer", "house_signer_ss58",
                     "eval_hosts", "eval_host_name", "eval_cache_dir", "eval_cache_budget_bytes",
                     "eval_device", "eval_timeout_seconds", "grant_expires_seconds",
-                    "readiness", "t7")
+                    "readiness", "t7", "bench_hosts")
 _REQUIRED_KEYS = ("intake_state_dir", "pool_pins", "house_pointer", "house_signer_ss58",
                   "eval_hosts", "eval_cache_dir", "eval_cache_budget_bytes", "readiness", "t7")
 
@@ -702,9 +707,12 @@ def load_inputs_services(cfg: Any, path) -> dict:
         grant_expires_seconds = 3600                # optional, presigned GET lifetime
         readiness = "/abs/laned_readiness.json"     # rev6.6: laned_readiness/1 (DocumentFile)
         t7 = "/abs/t7.json"                         # rev6.6: laned_t7/1 pod evidence
+        bench_hosts = "/abs/lane_d_bench_hosts.toml"  # optional (W3b6a): [[host]] bench pod
 
-    Returns the keyword arguments (``bench_host`` is ``None``: no lane D
-    bench host transport exists yet, so a crowning candidate holds).
+    Returns the keyword arguments. ``bench_host`` is the W3b6a
+    :class:`~cascade.validator.lane_d_bench_host.SSHBenchHost` on
+    ``bench_hosts`` (sharing the eval cache dir / budget layout and the
+    grants), or ``None`` without the key: a crowning candidate then holds.
     Raises :class:`LaneDInputsConfigError`."""
     p = Path(path)
     try:
@@ -741,9 +749,15 @@ def load_inputs_services(cfg: Any, path) -> dict:
                        host_name=raw.get("eval_host_name", "") or ops.eval_host,
                        device=raw.get("eval_device", "cuda"),
                        timeout_s=float(raw.get("eval_timeout_seconds", 3600)), grants=grants)
+    bench = None
+    if raw.get("bench_hosts"):
+        from .lane_d_bench_host import SSHBenchHost
+
+        bench = SSHBenchHost(raw["bench_hosts"], cache_dir=raw["eval_cache_dir"],
+                             budget_bytes=raw["eval_cache_budget_bytes"], grants=grants)
     return {"intake_state_dir": intake, "pool": PinFilePool(raw["pool_pins"]),
             "eval_host": host, "house_pointer": Path(raw["house_pointer"]),
-            "house_signer_ss58": raw["house_signer_ss58"], "bench_host": None,
+            "house_signer_ss58": raw["house_signer_ss58"], "bench_host": bench,
             "readiness": DocumentFile(raw["readiness"]), "t7": DocumentFile(raw["t7"])}
 
 
