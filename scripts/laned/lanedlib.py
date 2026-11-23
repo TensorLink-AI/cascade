@@ -9,6 +9,7 @@ Stdlib only.
 from __future__ import annotations
 
 import fnmatch
+import itertools
 import json
 import re
 import subprocess
@@ -219,6 +220,34 @@ def plan_wp_ids(plan_text: str) -> list[str]:
     return ids
 
 
+def plan_wp_depends(plan_text: str) -> dict[str, str | None]:
+    """``{WP: Depends cell}`` for every WP in the §3.0 WP tables (first header
+    cell ``WP``, with a ``Runs in`` column), first occurrence only. The value
+    is None when the WP's table has no ``Depends`` column (its dependencies
+    cannot be told from the plan)."""
+    out: dict[str, str | None] = {}
+    lines = plan_text.splitlines()
+    i = 0
+    while i < len(lines):
+        if not lines[i].lstrip().startswith("|"):
+            i += 1
+            continue
+        block = []
+        while i < len(lines) and lines[i].lstrip().startswith("|"):
+            block.append(lines[i])
+            i += 1
+        header = [_plan_cell(c) for c in _plan_row(block[0])]
+        if not header or header[0] != "WP" or "Runs in" not in header:
+            continue
+        k = header.index("Depends") if "Depends" in header else None
+        for raw in block[2:]:
+            row = _plan_row(raw)
+            wp = _plan_cell(row[0]) if row else ""
+            if wp and wp not in out:
+                out[wp] = _plan_cell(row[k]) if k is not None and k < len(row) else None
+    return out
+
+
 def accept_evidence_files(plan_text: str, wp: str) -> list[str]:
     """Every ``--evidence <file>`` in the Accept cell of ``wp``'s row in a §3.0
     WP table (first header cell ``WP``, with ``Runs in`` and ``Accept``
@@ -283,10 +312,39 @@ def first_parent_history(root: Path, ref: str) -> list[tuple[str, list[str]]]:
     return history
 
 
-def impl_commit_index(history: list[tuple[str, list[str]]], wp: str, paths: list[str]) -> int | None:
+BATCH_IMPL_MAX = 3  # plan rev6.3 (b): an implementation PR carries at most 3 WPs
+
+
+def is_batch_impl_commit(files: list[str], paths: list[str],
+                         others: list[list[str]] | None) -> bool:
+    """A batch implementation squash merge (plan rev6.3 (b)) for the WP with
+    ``paths``: no tests/accept/ file, some file in the WP's own PATHS, and at
+    most BATCH_IMPL_MAX - 1 sets of ``others`` (the other WPs' PATHS) that,
+    with the WP's own, match every file exactly once and each match a file
+    (the batch's check-pr guaranteed disjointness only among its own WPs, so
+    a broad PATHS of a WP outside the batch never spoils the attribution)."""
+    if not files or not others or any(f.startswith("tests/accept/") for f in files):
+        return False
+    rest = [f for f in files if not path_matches(f, paths)]
+    if not rest or len(rest) == len(files):
+        return False
+    cands = [s for s in others if any(path_matches(f, s) for f in rest)]
+    for n in range(1, BATCH_IMPL_MAX):
+        for combo in itertools.combinations(cands, n):
+            chosen = [paths, *combo]
+            if all(sum(path_matches(f, s) for s in chosen) == 1 for f in files) \
+                    and all(any(path_matches(f, s) for f in files) for s in combo):
+                return True
+    return False
+
+
+def impl_commit_index(history: list[tuple[str, list[str]]], wp: str, paths: list[str],
+                      others: list[list[str]] | None = None) -> int | None:
     """The L2 commit (plan §17.1): the first commit after the one that added
     the WP's PATHS file that changes something outside tests/accept/ and only
-    paths inside PATHS, i.e. the WP's implementation merge. None when absent."""
+    paths inside PATHS, i.e. the WP's implementation merge. With ``others``
+    (every other WP's PATHS) a batch implementation merge counts too
+    (is_batch_impl_commit). None when absent."""
     rel = f"tests/accept/{wp_dir(wp)}/PATHS"
     start = next((i for i, (_, files) in enumerate(history) if rel in files), None)
     if start is None:
@@ -295,9 +353,28 @@ def impl_commit_index(history: list[tuple[str, list[str]]], wp: str, paths: list
         files = history[i][1]
         if not files or all(f.startswith("tests/accept/") for f in files):
             continue
-        if all(path_matches(f, paths) for f in files):
+        if all(path_matches(f, paths) for f in files) or is_batch_impl_commit(files, paths, others):
             return i
     return None
+
+
+def paths_sets_at(root: Path, ref: str) -> dict[str, list[str]]:
+    """``{tests/accept dir name: PATHS entries}`` for every WP dir with a PATHS file at ``ref``."""
+    proc = git(root, "ls-tree", "-r", "--name-only", ref, "--", "tests/accept", check=False)
+    out: dict[str, list[str]] = {}
+    for rel in proc.stdout.split("\n"):
+        parts = rel.split("/")
+        if len(parts) == 4 and parts[3] == "PATHS":
+            shown = git(root, "show", f"{ref}:{rel}", check=False)
+            if shown.returncode == 0:
+                out[parts[2]] = parse_paths(shown.stdout)
+    return out
+
+
+def other_paths(sets: dict[str, list[str]], wp: str) -> list[list[str]]:
+    """Every PATHS set of ``sets`` but the one of ``wp``."""
+    own = wp_dir(wp)
+    return [s for d, s in sorted(sets.items()) if d != own]
 
 
 # ---------------------------------------------------------------------------
