@@ -20,3 +20,6 @@ cascade/shared/expert_manifest.py
 cascade/validator/expert_lane.py
 # The validator passes the round's training contract into judge_manifest.
 cascade/validator/lane_b.py
+# The single-target bytes test rebuilds main's body from asdict(); it drops
+# the leg-length fields (0 = not recorded) the way canonical_body() does.
+tests/unit/test_lane_b_multi_target.py

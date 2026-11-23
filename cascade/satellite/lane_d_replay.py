@@ -74,7 +74,7 @@ from types import MappingProxyType
 
 import numpy as np
 
-from cascade.eval.bootstrap import cohort_maxt_lcbs
+from cascade.eval.bootstrap import _seed_to_int, cohort_maxt_lcbs
 from cascade.shared.sr25519 import SignatureVerifierUnavailable, verify_hotkey
 
 MATCH = "MATCH"
@@ -83,9 +83,13 @@ UNVERIFIABLE = "UNVERIFIABLE"
 STATUSES = (MATCH, MISMATCH, UNVERIFIABLE)
 
 # ``receipt_malformed``: the receipt has no integer boundary, so no report
-# can be located for it.
+# can be located for it. ``confirmation_stage_present`` (rev6.11 (b)): the
+# signed report carries a confirmation stage (a cohort or verdict ``stage``
+# other than ``first``, a verdict ``confirmation`` block or an entry
+# ``confirm_pending``); there is no such stage, so it is refused, never judged.
 UNVERIFIABLE_REASONS = ("unknown_schema", "report_missing", "report_unreadable",
-                        "signature_unverifiable", "prior_unverified", "receipt_malformed")
+                        "signature_unverifiable", "prior_unverified", "receipt_malformed",
+                        "confirmation_stage_present")
 
 REPORT_SCHEMA = "lane-d-report/1"
 STATE_SCHEMA = "lane-d-state/1"
@@ -107,11 +111,25 @@ _DRAW_SPACE = 1 << 256
 
 _ROW_KEYS = frozenset({"window_id", "digest", "cohort", "crps", "mase"})
 _WINDOW_KEYS = frozenset({"window_id", "source", "feed", "min_target_ts", "min_first_seen_ts",
-                          "mirror_lag_hours", "snapshot_sha256"})
+                          "mirror_lag_hours", "snapshot_sha256",
+                          # rev6.10 (a) / rev6.12 (W7a): the embargo record and the
+                          # W5j draw cell
+                          "freq", "embargo_hours", "min_release_ts", "rule", "embargo_window",
+                          "timeframe", "bin", "kind", "freq_class", "h", "origin"})
 _COHORT_KEYS = frozenset({"index", "king_digest", "king_reveal_ts", "stage", "members", "t_max",
-                          "window_ids", "set_sha256", "first_seen_roots", "refused"})
+                          "window_ids", "set_sha256", "first_seen_roots", "refused",
+                          "fresh_windows", "embargo_windows"})
 _VERDICT_KEYS = frozenset({"digest", "king_digest", "stage", "cohort", "lcb", "gain", "cleared",
-                           "outcome", "lowfreq"})
+                           "outcome", "lowfreq", "fresh", "embargo"})
+# W5j: the draw record (top level, present iff a cohort was drawn).
+_DRAW_KEYS = frozenset({"boundary_block_hash", "seed", "max_windows_per_settlement", "cohorts"})
+_DRAW_COHORT_KEYS = frozenset({"index", "quota", "capacity", "candidates_sha256"})
+_DRAW_SEED_TAG = "lane_d_windows"
+_BLOCK_HASH_RE = re.compile(r"^0x[0-9a-f]{64}$")
+# rev6.9 / W7a: the class of a pool freq (exact match), else subdaily.
+_FREQ_CLASS = {"D": "daily", "W": "weekly", "M": "monthly", "ME": "monthly", "MS": "monthly",
+               "Q": "quarterly", "QE": "quarterly", "QS": "quarterly",
+               "A": "yearly", "Y": "yearly", "YE": "yearly"}
 _ENTRY_STABLE = ("hotkey", "coldkey", "context", "ready_block", "reveal_block", "reveal_ts")
 OPEN_STATUSES = ("pending", "hold")
 # The chain's internal key of the house challenger's progress (pending first
@@ -309,6 +327,21 @@ def _close(got, want: float) -> bool:
     return _is_num(got) and math.isclose(float(got), float(want), rel_tol=1e-9, abs_tol=1e-12)
 
 
+def _subscore_ok(stated, scores, idx: list[int]) -> bool:
+    """rev6.12 (b): ``stated`` is ``{n, geomean}`` of the rows at ``idx``
+    (sqrt of the CRPS and MASE geometric means, floors 1e-12 / 1e-9;
+    ``geomean`` null iff n = 0)."""
+    if not isinstance(stated, dict) or set(stated) != {"n", "geomean"} \
+            or not _same(stated["n"], len(idx)):
+        return False
+    if not idx:
+        return stated["geomean"] is None
+    crps, mase = scores
+    lc = float(np.mean(np.log(np.maximum(crps[idx], 1e-12))))
+    lm = float(np.mean(np.log(np.maximum(mase[idx], 1e-9))))
+    return _close(stated["geomean"], math.sqrt(math.exp(lc) * math.exp(lm)))
+
+
 def _king(rec) -> dict:
     """A king record ``{digest, hotkey, house, reveal_ts}`` (raises on a malformed one)."""
     if not isinstance(rec, dict):
@@ -353,7 +386,12 @@ def expected_params(cfg) -> dict:
             "lowfreq_freqs": [str(f) for f in cfg.lowfreq_freqs],
             "gate_weights": dict(_gate_weight_pairs(cfg)),
             "max_source_share": float(cfg.max_source_share),
-            "min_long_series": int(cfg.min_long_series)}
+            "min_long_series": int(cfg.min_long_series),
+            # rev6.10 (a) / rev6.12 (b) (W2e): the embargo cap, the W5j
+            # settlement budget and the minimum fresh share.
+            "embargo_hours": float(cfg.embargo_hours),
+            "max_windows_per_settlement": int(cfg.max_windows_per_settlement),
+            "min_fresh_window_share": float(cfg.min_fresh_window_share)}
 
 
 def court_shares(cfg, n_slots: int) -> list[float]:
@@ -365,6 +403,20 @@ def court_shares(cfg, n_slots: int) -> list[float]:
 
 
 # ── the statistic ───────────────────────────────────────────────────────────
+
+
+def combined_log_ratio(r_fwd: float, r_bt: float, *, n_fwd: int, n_bt: int, cap: float,
+                       floor: float) -> float:
+    """rev6.9 (W5i) combination of the forward and backtest ratios, re-derived
+    here: ``(1 - c) * log(r_fwd) + c * log(clamp(r_bt, floor, 1 / floor))``
+    with ``c = min(cap, n_bt / (n_bt + n_fwd))`` (``c = 0`` without backtest
+    windows). With ``c = 0`` it is exactly ``log(r_fwd)``, so memorising the
+    backtest gains at most ``1 - floor ** cap``."""
+    c = 0.0 if int(n_bt) == 0 else min(float(cap), int(n_bt) / (int(n_bt) + int(n_fwd)))
+    if c <= 0.0:
+        return math.log(float(r_fwd))
+    clamped = min(max(float(r_bt), float(floor)), 1.0 / float(floor))
+    return (1.0 - c) * math.log(float(r_fwd)) + c * math.log(clamped)
 
 
 def _parts(crps: np.ndarray, mase: np.ndarray):
@@ -427,6 +479,138 @@ def gate_draw(cfg, block_hash, sentinel) -> tuple[str, list[str]] | None:
     return None
 
 
+# ── W3b6b: the bound bench records (plan rev6.13) ───────────────────────────
+
+ROWS_ROLES = ("candidate", "king_d", "house")
+_GATE_SEED_TAG = "cascade|lane_d|paired_gate|v1"
+_HEX64 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _rows_source(bench_rows, digest: str) -> bytes | None:
+    """The published bytes of ``digest`` from a ``{sha256: bytes}`` mapping or
+    a directory of ``<sha256>.json`` files, or ``None``."""
+    if isinstance(bench_rows, Mapping):
+        data = bench_rows.get(digest)
+        return bytes(data) if isinstance(data, (bytes, bytearray)) else None
+    p = Path(bench_rows) / f"{digest}.json"
+    try:
+        return p.read_bytes()
+    except OSError:
+        return None
+
+
+def _paired_lcb(ref, cand, *, alpha: float, B: int, seed: str) -> float:
+    """LCB_alpha of ``1 - geomean(cand)/geomean(ref)`` over paired items,
+    items resampled with replacement (the bench gate's statistic, re-derived
+    here: invariant 12 keeps the producer's gate code out of the replay)."""
+    k = np.log(np.maximum(np.asarray(ref, dtype=np.float64), 1e-12))
+    c = np.log(np.maximum(np.asarray(cand, dtype=np.float64), 1e-12))
+    n = k.size
+    if n == 0 or k.shape != c.shape:
+        return float("nan")
+    idx = np.random.default_rng(_seed_to_int(seed)).integers(0, n, size=(B, n))
+    d = (c[idx] - k[idx]).mean(axis=1)
+    return float(np.quantile(1.0 - np.exp(d), alpha))
+
+
+def _suite_items(rec: Mapping, suite: str) -> dict[str, tuple[float, float]] | None:
+    entry = (rec.get("suites") or {}).get(suite) if isinstance(rec.get("suites"), Mapping) \
+        else None
+    rows = entry.get("rows") if isinstance(entry, Mapping) else None
+    if not isinstance(rows, list):
+        return None
+    out: dict[str, tuple[float, float]] = {}
+    for row in rows:
+        if not isinstance(row, Mapping) or not isinstance(row.get("item"), str):
+            return None
+        c, m = row.get("crps"), row.get("mase")
+        if not (_finite(c) and _finite(m)) or row["item"] in out:
+            return None
+        out[row["item"]] = (float(c), float(m))
+    return out
+
+
+def check_gate_rows(report: Mapping, bench_rows, cfg) -> list[str]:
+    """The mismatch paths of ``report``'s bound bench records (W3b6b): each
+    bound digest resolves to bytes hashing to it, whose record names the
+    result's session and its role's digest; a ``pass`` / ``gate_regression``
+    result's four LCBs equal the paired LCBs recomputed from the drawn
+    suite's rows (seed ``cascade|lane_d|paired_gate|v1|lane-d/1:gate:<b>:
+    <hash>|<suite>|<metric>``, within 1e-12); a pass result for the crowned
+    digest must carry ``rows``. Pure; ``[]`` when everything agrees."""
+    out: list[str] = []
+    gate = report.get("gate") if isinstance(report, Mapping) else None
+    if not isinstance(gate, Mapping) or not isinstance(gate.get("results"), list):
+        return out
+    suite = gate.get("suite")
+    seed = f"lane-d/1:gate:{report.get('boundary')}:{gate.get('block_hash')}"
+    king = (report.get("king_before") or {}).get("digest") \
+        if isinstance(report.get("king_before"), Mapping) else None
+    house = (report.get("house") or {}).get("digest") \
+        if isinstance(report.get("house"), Mapping) else None
+    alpha, B = float(cfg.alpha), int(cfg.bootstrap_B)
+    for k, res in enumerate(gate["results"]):
+        at = f"gate.results[{k}]"
+        if not isinstance(res, Mapping):
+            continue
+        rows = res.get("rows")
+        if rows is None:
+            if res.get("outcome") == "pass" and res.get("digest") == report.get("crowned"):
+                out.append(f"{at}.rows")
+            continue
+        if not isinstance(rows, Mapping) or set(rows) != set(ROWS_ROLES) or not all(
+                isinstance(v, str) and _HEX64.match(v) for v in rows.values()):
+            out.append(f"{at}.rows")
+            continue
+        want = {"candidate": res.get("digest"), "king_d": king, "house": house}
+        recs: dict[str, Mapping] = {}
+        for role in ROWS_ROLES:
+            data = _rows_source(bench_rows, rows[role])
+            rec = None
+            if data is not None and hashlib.sha256(data).hexdigest() == rows[role]:
+                try:
+                    rec = json.loads(data.decode("ascii"))
+                except (UnicodeDecodeError, ValueError):
+                    rec = None
+            if not isinstance(rec, Mapping) or rec.get("session") != res.get("session") \
+                    or rec.get("digest") != want[role]:
+                out.append(f"{at}.rows")
+                recs = {}
+                break
+            recs[role] = rec
+        if not recs or res.get("outcome") not in ("pass", "gate_regression"):
+            continue
+        items = {role: _suite_items(recs[role], str(suite)) for role in ROWS_ROLES}
+        lcb = res.get("lcb")
+        if any(v is None for v in items.values()) or not isinstance(lcb, Mapping):
+            out.append(f"{at}.lcb")
+            continue
+        cand = items["candidate"]
+        bad = False
+        for ref in GATE_REFS:
+            ids = sorted(set(cand) & set(items[ref]))
+            for j, m in enumerate(GATE_METRICS):
+                got = _paired_lcb([items[ref][i][j] for i in ids], [cand[i][j] for i in ids],
+                                  alpha=alpha, B=B, seed=f"{_GATE_SEED_TAG}|{seed}|{suite}|{m}")
+                stated = (lcb.get(ref) or {}).get(m) if isinstance(lcb.get(ref), Mapping) \
+                    else None
+                if not (_finite(stated) and math.isfinite(got)
+                        and abs(got - float(stated)) <= 1e-12):
+                    bad = True
+        if bad:
+            out.append(f"{at}.lcb")
+    return out
+
+
+def _default_bench_rows(reports):
+    """``<stem>_bench_rows`` beside a ``<stem>_reports`` directory, else None."""
+    if isinstance(reports, (str, Path)):
+        p = Path(reports)
+        if p.name.endswith("_reports"):
+            return p.parent / (p.name[: -len("_reports")] + "_bench_rows")
+    return None
+
+
 def _gate_result(d: _Paths, at: str, res, tau: float) -> tuple[str | None, str | None]:
     """``(digest, re-derived outcome)`` of one gate result (W3b2's rule: with
     four finite LCBs, ``gate_regression`` iff some LCB < ``-tau_public``,
@@ -437,7 +621,7 @@ def _gate_result(d: _Paths, at: str, res, tau: float) -> tuple[str | None, str |
         return None, None
     # ``held_from`` is optional here: whether a result must carry it is
     # ``_Settlement._held_from``'s rule.
-    for k in sorted((set(res) - {"held_from"}) ^ _RESULT_KEYS):
+    for k in sorted((set(res) - {"held_from", "rows"}) ^ _RESULT_KEYS):
         d.add(_key(at, k))
     dg = res.get("digest")
     if not isinstance(dg, str):
@@ -525,6 +709,8 @@ class _Verdict:
 class _Settlement:
     """One report's re-derivation against the chain so far."""
 
+    bench_rows = None   # W3b6b: the published bench records (replay_chain)
+
     def __init__(self, report: dict, receipt: dict, cfg, chain: _Chain, boundary: int,
                  metagraph: Mapping | None):
         self.r = report
@@ -584,6 +770,7 @@ class _Settlement:
         self._guarded("windows", self.index_windows)
         self._guarded("rows", self.index_rows)
         self._guarded("cohorts", self.check_cohorts)
+        self._guarded("draw", self.check_draw)
         self._guarded("gate", self.check_gate)
         self._guarded("verdicts", self.check_outcomes)
         self._guarded("king_after", self.check_crown)
@@ -813,9 +1000,40 @@ class _Settlement:
                 self.d.add(f"{at}.mirror_lag_hours")
             if w["snapshot_sha256"] not in self.snapshot_shas:
                 self.d.add(f"{at}.snapshot_sha256")
+            self._window_record(at, w)
             self.windows[w["window_id"]] = w
         if ids != sorted(ids):
             self.d.add("windows")
+
+    def _window_record(self, at: str, w: dict) -> None:
+        """rev6.10 (a) / rev6.12 / W5j: the window's own embargo record and
+        draw cell (eligibility at the cohort's bound is the cohort's check)."""
+        d, h = self.d, int(self.cfg.horizon)
+        e = w["embargo_hours"]
+        if not _is_num(e) or not _finite(e) or float(e) < 0 \
+                or float(e) > float(self.cfg.embargo_hours):
+            d.add(f"{at}.embargo_hours")
+            return
+        e = float(e)
+        if w["rule"] != ("embargo" if e > 0.0 else "embargo0"):
+            d.add(f"{at}.rule")
+        if not _same(w["min_release_ts"], int(w["min_first_seen_ts"]) + int(round(3600.0 * e))):
+            d.add(f"{at}.min_release_ts")
+        if not isinstance(w["embargo_window"], bool) or (e == 0.0 and w["embargo_window"]):
+            d.add(f"{at}.embargo_window")
+        freq = w["freq"]
+        if not isinstance(freq, str) or w["timeframe"] != freq:
+            d.add(f"{at}.timeframe")
+        elif w["freq_class"] != _FREQ_CLASS.get(freq, "subdaily"):
+            d.add(f"{at}.freq_class")
+        if w["kind"] != "forward" or w["bin"] != "forward":
+            d.add(f"{at}.bin")
+        if not _same(w["h"], h) or w["window_id"].rsplit(":", 2)[-1] != f"h{h}":
+            d.add(f"{at}.h")
+        parts = w["window_id"].rsplit(":", 2)
+        if not _is_int(w["origin"]) or len(parts) != 3 or parts[1] != str(w["origin"]) \
+                or w["origin"] != w["min_target_ts"]:
+            d.add(f"{at}.origin")
 
     def index_rows(self) -> None:
         rows = self.r["rows"]
@@ -895,6 +1113,65 @@ class _Settlement:
         if set(self.windows) != window_union:
             self.d.add("windows")
 
+    def check_draw(self) -> None:
+        """W5j: the draw record (present iff a cohort was drawn: a cohort and a
+        boundary block hash) is bound to its block hash, the budget and the
+        report's cohorts; each cohort's per-cell quota is its judged windows
+        of that cell, at most the cell's capacity; the judged windows stay
+        within max_windows_per_settlement."""
+        r, d, cfg = self.r, self.d, self.cfg
+        cohorts = r.get("cohorts") or []
+        judged = {x for c in cohorts if isinstance(c, dict)
+                  for x in (c.get("window_ids") or []) if isinstance(x, str)}
+        if len(judged) > int(cfg.max_windows_per_settlement):
+            d.add("cohorts")
+        gate = r.get("gate")
+        if "draw" not in r:
+            # A gated settlement had its block hash: a judged cohort was drawn.
+            if cohorts and isinstance(gate, dict):
+                d.add("draw")
+            return
+        dr = r["draw"]
+        if not isinstance(dr, dict) or set(dr) != _DRAW_KEYS or not cohorts:
+            d.add("draw")
+            return
+        bh = dr["boundary_block_hash"]
+        if not isinstance(bh, str) or not _BLOCK_HASH_RE.match(bh) or (
+                isinstance(gate, dict) and gate.get("block_hash") != bh):
+            d.add("draw.boundary_block_hash")
+        if dr["seed"] != f"{bh}:{_DRAW_SEED_TAG}":
+            d.add("draw.seed")
+        if not _same(dr["max_windows_per_settlement"], int(cfg.max_windows_per_settlement)):
+            d.add("draw.max_windows_per_settlement")
+        dcs = dr["cohorts"]
+        if not isinstance(dcs, list) or len(dcs) != len(cohorts):
+            d.add("draw.cohorts")
+            return
+        for i, (dc, c) in enumerate(zip(dcs, cohorts, strict=True)):
+            at = f"draw.cohorts[{i}]"
+            if not isinstance(dc, dict) or set(dc) != _DRAW_COHORT_KEYS or not isinstance(c, dict):
+                d.add(at)
+                continue
+            if not _same(dc["index"], i):
+                d.add(f"{at}.index")
+            quota, cap = dc["quota"], dc["capacity"]
+            if not isinstance(quota, dict) or not isinstance(cap, dict):
+                d.add(at)
+                continue
+            count: dict[str, int] = {}
+            for x in c.get("window_ids") or []:
+                w = self.windows.get(x)
+                if w is not None:
+                    k = f"{w['timeframe']}|{w['bin']}"
+                    count[k] = count.get(k, 0) + 1
+            for k in sorted(set(quota) | set(count) | set(cap), key=str):
+                q, n = quota.get(k, 0), cap.get(k, 0)
+                if not (_is_int(q) and _is_int(n)) or q != count.get(k, 0) or q > n:
+                    d.add(f"{at}.quota")
+            if not isinstance(dc["candidates_sha256"], str) \
+                    or not _HEX64_RE.match(dc["candidates_sha256"]):
+                d.add(f"{at}.candidates_sha256")
+
     def _cohort(self, i: int, c, by_digest: dict, covered: set, window_union: set) -> int:
         """Re-judge cohort ``i``; returns the number of rows it accounts for."""
         at = f"cohorts[{i}]"
@@ -953,10 +1230,29 @@ class _Settlement:
         window_union.update(wids)
         bound = t_max + 3600.0 * float(cfg.forward_margin_hours)
         ok = len(set(wids)) == len(wids)
+        n_emb = 0
         for wid in wids:
             w = self.windows.get(wid)
-            if w is None or not (w["min_target_ts"] > bound and w["min_first_seen_ts"] > bound):
+            if w is None or not _finite(w.get("embargo_hours")):
                 ok = False
+                continue
+            # rev6.10 (a) / rev6.12 (a), every cadence: eligible at the feed
+            # bound b - e (released after b, data time after b - e); fresh
+            # iff it also passes at e = 0, else an embargo window.
+            e = 3600.0 * float(w["embargo_hours"])
+            if not (w["min_first_seen_ts"] + e > bound and w["min_target_ts"] > bound - e):
+                ok = False
+            fresh = w["min_target_ts"] > bound and w["min_first_seen_ts"] > bound
+            if w["embargo_window"] is fresh:
+                d.add(f"{at}.window_ids")
+            n_emb += 0 if fresh else 1
+        # rev6.12 (b): the split is signed and the fresh share holds.
+        if not _same(c.get("embargo_windows"), n_emb):
+            d.add(f"{at}.embargo_windows")
+        if not _same(c.get("fresh_windows"), len(wids) - n_emb):
+            d.add(f"{at}.fresh_windows")
+        if wids and (len(wids) - n_emb) < float(cfg.min_fresh_window_share) * len(wids):
+            d.add(f"{at}.embargo_windows")
         for key in keys:
             if self.chain.used.get(key, set()) & set(wids):
                 ok = False
@@ -1004,6 +1300,11 @@ class _Settlement:
             if len(bars) > 1:
                 cleared = cleared and judged[bars_house][n][2]
             v = verdicts_of(self.r)[j]
+            # rev6.12 (b): the fresh and embargo sub-scores from the rows.
+            for name, emb in (("fresh", False), ("embargo", True)):
+                idx = [x for x, wid in enumerate(wids) if self.windows[wid]["embargo_window"] is emb]
+                if not _subscore_ok(v.get(name), scores[m], idx):
+                    d.add(f"verdicts[{j}].{name}")
             lf_fail = self._verdict(j, v, key, stage, kd, i, (lcb, gain),
                                     judged[bars_house][n] if len(bars) > 1 else None, cleared)
             stated = float(v["lcb"]) if _is_num(v.get("lcb")) else lcb
@@ -1155,6 +1456,10 @@ class _Settlement:
         for c in cands:
             if c["digest"] not in self.gate_out:
                 self.d.add("gate.results")
+        # W3b6b: the bound bench records, re-derived from the published bytes.
+        if self.bench_rows is not None:
+            for p in check_gate_rows(self.r, self.bench_rows, self.cfg):
+                self.d.add(p)
 
     def _held_from(self, at: str, res: dict, cand: dict) -> None:
         """RV7 B2: a held candidate's result names its hold, and only a held
@@ -1478,12 +1783,27 @@ def _signature_paths(report: dict, signer_ss58: str) -> list[str]:
     return out
 
 
+def _confirmation_stage_present(report: dict) -> bool:
+    """rev6.11 (b): does the signed report carry a confirmation stage?"""
+    def items(key):
+        v = report.get(key)
+        return [x for x in v if isinstance(x, Mapping)] if isinstance(v, list) else []
+
+    for c in items("cohorts"):
+        if "stage" in c and c["stage"] != "first":
+            return True
+    for v in items("verdicts"):
+        if ("stage" in v and v["stage"] != "first") or "confirmation" in v:
+            return True
+    return any("confirm_pending" in (e.get("status"), e.get("reason")) for e in items("entries"))
+
+
 def _unverifiable(boundary, reason: str, **kw) -> SettlementReplay:
     return SettlementReplay(boundary=boundary, status=UNVERIFIABLE, reason=reason, **kw)
 
 
-def _replay_one(reports, receipt, cfg, chain: _Chain, signer_ss58: str, uid_of, states
-                ) -> tuple[SettlementReplay, _Chain]:
+def _replay_one(reports, receipt, cfg, chain: _Chain, signer_ss58: str, uid_of, states,
+                bench_rows=None) -> tuple[SettlementReplay, _Chain]:
     b = receipt.get("boundary") if isinstance(receipt, Mapping) else None
     if not _is_int(b):
         return _unverifiable(None, "receipt_malformed"), chain
@@ -1497,10 +1817,13 @@ def _replay_one(reports, receipt, cfg, chain: _Chain, signer_ss58: str, uid_of, 
         sig_paths = _signature_paths(report, signer_ss58)
     except SignatureVerifierUnavailable:
         return _unverifiable(b, "signature_unverifiable", report_sha256=body_sha), chain
+    if not sig_paths and _confirmation_stage_present(report):
+        return _unverifiable(b, "confirmation_stage_present", report_sha256=body_sha), chain
     metagraph = None
     if uid_of is not None and b in uid_of and isinstance(uid_of[b], Mapping):
         metagraph = uid_of[b]
     s = _Settlement(report, dict(receipt), cfg, chain, b, metagraph)
+    s.bench_rows = bench_rows
     for p in sig_paths:
         s.d.add(p)
     s.run()
@@ -1522,7 +1845,8 @@ def _replay_one(reports, receipt, cfg, chain: _Chain, signer_ss58: str, uid_of, 
 
 def replay_chain(reports, receipts, cfg, *, signer_ss58: str,
                  uid_of: Mapping[int, Mapping[str, int]] | None = None,
-                 states: Mapping[int, bytes] | None = None) -> tuple[SettlementReplay, ...]:
+                 states: Mapping[int, bytes] | None = None,
+                 bench_rows=None) -> tuple[SettlementReplay, ...]:
     """Replay the lane D receipt chain (see the module docstring).
 
     ``reports`` is the published reports directory (``lane_d_report_<b>.json``
@@ -1531,10 +1855,17 @@ def replay_chain(reports, receipts, cfg, *, signer_ss58: str,
     parsed ``[lane_d]`` config in force; ``signer_ss58`` the pinned signer
     (the report's own ``signer`` is never trusted); ``uid_of`` the metagraph
     ``{hotkey: uid}`` per boundary; ``states`` the published state snapshot
-    bytes per boundary. Pure: nothing is written and no input is mutated."""
+    bytes per boundary; bench_rows (W3b6b) the published bench records,
+    a {sha256: bytes} mapping or a directory of <sha256>.json files
+    (default: the <stem>_bench_rows directory beside a <stem>_reports
+    reports directory; with a mapping of reports and no bench_rows the
+    record checks are skipped, as before W3b6b). Pure: nothing is written
+    and no input is mutated."""
     if isinstance(receipts, (str, bytes, Mapping)):
         raise TypeError("receipts must be a sequence of receipt records")
     chain = _Chain()
+    if bench_rows is None:
+        bench_rows = _default_bench_rows(reports)
     out: list[SettlementReplay] = []
     trusted = True
     for receipt in [copy.deepcopy(r) for r in receipts]:
@@ -1542,12 +1873,13 @@ def replay_chain(reports, receipts, cfg, *, signer_ss58: str,
             b = receipt.get("boundary") if isinstance(receipt, Mapping) else None
             out.append(_unverifiable(b if _is_int(b) else None, "prior_unverified"))
             continue
-        res, chain = _replay_one(reports, receipt, cfg, chain, signer_ss58, uid_of, states)
+        res, chain = _replay_one(reports, receipt, cfg, chain, signer_ss58, uid_of, states,
+                                 bench_rows)
         out.append(res)
         trusted = res.status == MATCH
     return tuple(out)
 
 
 __all__ = ["MATCH", "MISMATCH", "RECEIPT_SCHEMA", "REPORT_SCHEMA", "STATE_SCHEMA", "STATUSES",
-           "UNVERIFIABLE", "UNVERIFIABLE_REASONS", "SettlementReplay", "court_shares",
-           "expected_params", "gate_draw", "replay_chain"]
+           "UNVERIFIABLE", "UNVERIFIABLE_REASONS", "SettlementReplay", "check_gate_rows",
+           "combined_log_ratio", "court_shares", "expected_params", "gate_draw", "replay_chain"]

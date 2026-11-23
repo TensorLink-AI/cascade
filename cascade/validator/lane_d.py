@@ -156,8 +156,15 @@ from pathlib import Path
 import numpy as np
 
 from ..eval.bootstrap import cohort_maxt_lcbs
-from ..eval.lane_d_scorer import GATE_MIN_SOURCES, SCORING_LEVELS, SCORING_METHOD, score_window
-from .lane_d_bench import paired_gate
+from ..eval.lane_d_scorer import (
+    GATE_MIN_SOURCES,
+    SCORING_LEVELS,
+    SCORING_METHOD,
+    effective_context,
+    score_window,
+)
+from .lane_d_bench import paired_gate, sweep_record_text
+from .lane_d_draw import draw_windows, freq_class
 from .lane_d_forward import eligible_windows
 from .lane_d_frozen import advance_frozen_set
 from .lane_d_gate import gate_record
@@ -242,6 +249,11 @@ def _parse_feeds(raw, where: Path) -> dict:
             raise ValueError(f"{where}: feed {name!r} forecast_product {fp!r} is not a bool")
         out[str(name)] = {"mirror_lag_hours": None if lag is None else float(lag),
                           "forecast_product": fp}
+        # W5a (rev6.10 (a)): the pinned per-feed embargo, carried unchanged
+        # (absent stays absent): a missing or non-numeric value is the
+        # window's refusal in lane_d_forward (unlisted_feed), never a pool error.
+        if "embargo_hours" in f:
+            out[str(name)]["embargo_hours"] = f["embargo_hours"]
     return out
 
 
@@ -458,8 +470,36 @@ def _gate_result(res: dict, digest: str) -> dict:
             "session": str(res["session"])}
 
 
+BENCH_ROWS_ROLES = ("candidate", "king_d", "house")
+
+
+def bench_rows_dir(state_path) -> Path:
+    """W3b6b: where a settlement's bound bench records are persisted,
+    ``<state dir>/<state stem>_bench_rows/<sha256>.json`` (beside
+    ``<stem>_reports``, snapshotted with the state)."""
+    p = Path(state_path)
+    return p.parent / f"{p.stem}_bench_rows"
+
+
+def _save_bench_rows(state_path, texts: dict[str, str]) -> None:
+    """Write each bound record's exact bytes (atomic per file; an existing
+    file is content-addressed, so it is already these bytes)."""
+    if not texts:
+        return
+    d = bench_rows_dir(state_path)
+    d.mkdir(parents=True, exist_ok=True)
+    for digest, text in sorted(texts.items()):
+        path = d / f"{digest}.json"
+        if path.is_file():
+            continue
+        tmp = d / f".{digest}.tmp"
+        tmp.write_bytes(text.encode("ascii"))
+        os.replace(tmp, path)
+
+
 def _run_gate(cands: list[dict], state: dict, cfg, boundary: int,
-              block_hash: str | None, sentinel: str | None, bench
+              block_hash: str | None, sentinel: str | None, bench,
+              texts: dict[str, str] | None = None
               ) -> tuple[dict | None, dict[str, str]]:
     """``(gate record, {digest: outcome})`` for this settlement's crowning
     candidates. No candidate: ``(None, {})`` and no host call. No ``bench``
@@ -482,6 +522,7 @@ def _run_gate(cands: list[dict], state: dict, cfg, boundary: int,
     results, outcomes = [], {}
     for c in _ranked(cands):
         dg = c["digest"]
+        bound = None
         try:
             cand_rec, king_rec, house_rec = bench.paired(dg, king_d, house_d, suites=suites)
         except Exception:  # any host failure is infrastructure: hold, never crown
@@ -490,8 +531,20 @@ def _run_gate(cands: list[dict], state: dict, cfg, boundary: int,
             res = paired_gate(cand_rec, king_rec, house_rec, suite=suite,
                               alpha=float(cfg.alpha), tau_public=float(cfg.tau_public),
                               B=int(cfg.bootstrap_B), seed=seed, sentinel=sentinel)
+            # W3b6b: bind the three records the gate decided on (their
+            # canonical text's sha256, inside the signed body).
+            bound = {}
+            for role, rec in zip(BENCH_ROWS_ROLES, (cand_rec, king_rec, house_rec),
+                                 strict=True):
+                text = sweep_record_text(rec)
+                digest = hashlib.sha256(text.encode("ascii")).hexdigest()
+                bound[role] = digest
+                if texts is not None:
+                    texts[digest] = text
         outcomes[dg] = str(res["outcome"])
         result = _gate_result(res, dg)
+        if bound is not None:
+            result["rows"] = bound
         if "held_from" in c:
             # RV7 B2: a held candidate (no verdict here) names its hold.
             result["held_from"] = dict(c["held_from"])
@@ -542,8 +595,8 @@ def _pool_window_ids(pools: list[dict]) -> set[str]:
 
 
 def _admitted_versions(pools: list[dict], t_entry: int, t_king: int, cfg
-                       ) -> tuple[dict[str, tuple[dict, dict]], dict[str, int]]:
-    """RV4 one version per window: ``{window_id: (window, pool)}`` taken from
+                       ) -> tuple[dict[str, tuple[dict, dict, object]], dict[str, int]]:
+    """RV4 one version per window: ``{window_id: (window, pool, verdict)}`` taken from
     the EARLIEST loaded snapshot (oldest first, ``pool_dir`` last) whose §1.3
     verdict admits it for ``max(t_entry, t_king)``. A judged window is scored,
     and its report row taken, from that one snapshot only: never admission
@@ -555,12 +608,12 @@ def _admitted_versions(pools: list[dict], t_entry: int, t_king: int, cfg
     snapshot admits it)."""
     verdicts = [list(eligible_windows(p, t_entry=int(t_entry), t_king=int(t_king), cfg=cfg))
                 for p in pools]
-    admitted: dict[str, tuple[dict, dict]] = {}
+    admitted: dict[str, tuple[dict, dict, object]] = {}
     for pool, vs in zip(pools, verdicts, strict=True):
         for w, v in zip(pool["windows"], vs, strict=True):
             wid = w["window_id"]
             if wid and v.eligible and wid not in admitted:
-                admitted[wid] = (w, pool)
+                admitted[wid] = (w, pool, v)
     refused: dict[str, int] = {}
     seen: set[str] = set()
     for pool, vs in reversed(list(zip(pools, verdicts, strict=True))):
@@ -576,8 +629,9 @@ def _admitted_versions(pools: list[dict], t_entry: int, t_king: int, cfg
 
 def _cohort_set(pools: list[dict], members: list[str], bars: list[str], king_ts: int,
                 recs: dict[str, dict], forecasts: dict, cfg, pinned: dict[str, str]
-                ) -> tuple[list[tuple[dict, dict]], dict[str, int]]:
-    """The cohort's judged window set as ``(window, its snapshot)`` pairs: the
+                ) -> tuple[list[tuple[dict, dict, object]], dict[str, int]]:
+    """The cohort's eligible window set as ``(window, its snapshot, its §1.3
+    verdict)`` triples (the W5j draw picks the judged windows from it): the
     intersection of the members' frozen sets that is eligible for
     ``max(T over cohort ∪ king)``, each window in the version of its earliest
     admitting snapshot (:func:`_admitted_versions`), with a usable target, a
@@ -599,7 +653,7 @@ def _cohort_set(pools: list[dict], members: list[str], bars: list[str], king_ts:
     for wid in sorted(common):
         if wid not in admitted:
             continue
-        w, pool = admitted[wid]
+        w, pool, v = admitted[wid]
         if wid in pinned and pinned[wid] != pool["sha256"]:
             continue
         if not _target_usable(w, h) or any(
@@ -608,8 +662,87 @@ def _cohort_set(pools: list[dict], members: list[str], bars: list[str], king_ts:
         if any(wid in recs[m]["used_windows"]
                or _forecast_ok(forecasts.get(m), wid, h) is not True for m in members):
             continue
-        out.append((w, pool))
+        out.append((w, pool, v))
     return out, refused
+
+
+def _draw_cells(picked: list[tuple[dict, dict, object]], cfg) -> list[dict]:
+    """The W5j draw input for a cohort's eligible set: one forward cell per
+    pool ``freq`` (timeframe, bin ``forward``, h = ``horizon``), one draw
+    series per pool ``series_id`` holding its eligible windows' target points
+    in time order. A window is atomic (its id, target and forecasts exist at
+    origin 0 only), so an ineligible separator point follows each window: no
+    candidate straddles two windows, and every candidate is a pool window.
+    ``e0`` is all-false on an embargo window (it fails the e = 0 rule)."""
+    h = int(cfg.horizon)
+    by_cell: dict[str, dict[str, list]] = {}
+    for w, _pool, v in picked:
+        by_cell.setdefault(str(w.get("freq") or ""), {}).setdefault(
+            str(w["series_id"]), []).append((w, bool(v.embargo_window)))
+    cells = []
+    for freq in sorted(by_cell):
+        members = []
+        for sid in sorted(by_cell[freq]):
+            ts, el, e0, src = [], [], [], None
+            for w, emb in sorted(by_cell[freq][sid], key=lambda x: int(x[0]["target_ts"][0])):
+                src = str(w["source"]) if src is None else src
+                ts += [int(t) for t in w["target_ts"][:h]]
+                el += [True] * h
+                e0 += [not emb] * h
+                ts.append(int(w["target_ts"][h - 1]))
+                el.append(False)
+                e0.append(False)
+            members.append({"series_id": sid, "source": src, "ts": ts, "eligible": el,
+                            "e0": e0})
+        cells.append({"timeframe": freq, "bin": "forward", "kind": "forward",
+                      "h_lo": h, "h_hi": h, "series": members})
+    return cells
+
+
+def _drawn(picked: list[tuple[dict, dict, object]], cfg, block_hash: str | None,
+           budget: int) -> tuple[list[tuple[dict, dict, object]], dict | None, bool]:
+    """W5j: ``(judged windows, draw result, meets floors)`` of one cohort.
+    With ``block_hash`` the judged windows are the seeded per-bin draw over
+    the eligible set within ``budget``; without it (the legacy call, which
+    can never crown: W5e fails it closed) the whole eligible set is judged
+    up to ``budget``, as before W5j."""
+    if block_hash is None:
+        ws = picked[:max(0, int(budget))]
+        return ws, None, _meets_floors([w for w, _, _ in ws], cfg)
+    d = draw_windows(_draw_cells(picked, cfg), boundary_block_hash=str(block_hash), cfg=cfg,
+                     budget=int(budget))
+    by_id = {w["window_id"]: (w, pool, v) for w, pool, v in picked}
+    ws = [by_id[x["window_id"]] for x in d["windows"]]
+    return ws, d, bool(d["meets_floors"])
+
+
+def _window_embargo_fields(w: dict, v, h: int) -> dict:
+    """The signed rev6.10-rev6.12 fields of one judged window (W7a): ``freq``,
+    the effective ``embargo_hours`` e, ``min_release_ts`` = min first-seen +
+    e, ``rule`` (``embargo`` when e > 0, else ``embargo0``), ``embargo_window``
+    (rev6.12: False = fresh), and the W5j draw cell (``timeframe`` = freq,
+    ``bin`` / ``kind`` forward, ``freq_class``, ``h``, ``origin`` = the target
+    start)."""
+    freq = str(w.get("freq") or "")
+    e = float(v.embargo_hours)
+    return {"freq": freq, "embargo_hours": e,
+            "min_release_ts": int(min(w["first_seen_ts"])) + int(round(3600.0 * e)),
+            "rule": "embargo" if e > 0.0 else "embargo0",
+            "embargo_window": bool(v.embargo_window),
+            "timeframe": freq, "bin": "forward", "kind": "forward",
+            "freq_class": freq_class(freq), "h": int(h), "origin": int(w["target_ts"][0])}
+
+
+def _subscore(scores, idx: list[int]) -> dict:
+    """rev6.12 (b): ``{n, geomean}`` of one digest's rows at positions ``idx``
+    (the lane D geomean of its CRPS and MASE, floors 1e-12 / 1e-9); null
+    geomean when n = 0."""
+    if not idx:
+        return {"n": 0, "geomean": None}
+    crps, mase = scores
+    lc = float(np.mean(np.log(np.maximum(np.asarray(crps)[idx], 1e-12))))
+    lm = float(np.mean(np.log(np.maximum(np.asarray(mase)[idx], 1e-9))))
+    return {"n": len(idx), "geomean": math.sqrt(math.exp(lc) * math.exp(lm))}
 
 
 def _advance_member(rec: dict, pools: list[dict], king_ts: int, cfg, seed: str) -> dict:
@@ -677,7 +810,12 @@ def _params(cfg) -> dict:
             # the T18e/B14 source cap and the §1.7 context floor.
             "gate_weights": {str(s): float(w) for s, w in cfg.gate_weights},
             "max_source_share": float(cfg.max_source_share),
-            "min_long_series": int(cfg.min_long_series)}
+            "min_long_series": int(cfg.min_long_series),
+            # rev6.10 (a) / rev6.12 (b) (W2e): the embargo cap, the W5j
+            # settlement budget and the minimum fresh share.
+            "embargo_hours": float(cfg.embargo_hours),
+            "max_windows_per_settlement": int(cfg.max_windows_per_settlement),
+            "min_fresh_window_share": float(cfg.min_fresh_window_share)}
 
 
 def _pool_record(pools: list[dict], windows_out: dict) -> dict:
@@ -906,6 +1044,17 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
             state["entries"][dg]["status"] = "closed"
             skip(dg, "checkpoint_fault")
             chosen.remove(dg)
+    # rev6.15 (W5d / W7a): an entry is scored at the highest armed variant
+    # <= its declared context, never above it; with none armed at or below
+    # it, it is not judged this settlement (`pending` / `context_below_armed`).
+    # Only on a settlement handed the armed record; the house is exempt.
+    if armed_fields is not None:
+        armed_set = [int(c) for c in armed_fields["armed_contexts"]]
+        for dg in list(chosen):
+            rec = state["entries"][dg]
+            if effective_context(int(rec["context"]), armed_set) is None:
+                skip(dg, "context_below_armed")
+                chosen.remove(dg)
     if house_open and not house_held:
         fc = forecasts.get(hd)
         if fc is not None and any(_forecast_ok(fc, wid, h) is False for wid in sorted(pool_ids)):
@@ -931,6 +1080,7 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     # snapshot each already-judged window was scored from.
     pinned: dict[str, str] = {}
     rows, windows_out, cohorts, verdicts = [], {}, [], []
+    draws: list[dict] = []
     # The crowning candidates: first verdicts that clear (rev6.11 (b)).
     candidates: list[dict] = []
     # §1.3b A10: the newest private-pool snapshot's low-frequency windows
@@ -959,24 +1109,32 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
         members = frozen
         if not members:
             continue
-        picked, refused = _cohort_set(pools, members, bars, king_ts, recs, forecasts, cfg,
-                                      pinned)
-        while members and not _meets_floors([w for w, _ in picked], cfg):
+        # W5j: the judged windows are the cohort's seeded per-bin draw over
+        # its eligible set, within what is left of the settlement's
+        # max_windows_per_settlement; a draw below the floors (or short of
+        # the minimum fresh share, or out of budget) leaves the latest-T
+        # member pending.
+        budget = int(cfg.max_windows_per_settlement) - len(windows_out)
+        eligible, refused = _cohort_set(pools, members, bars, king_ts, recs, forecasts, cfg,
+                                        pinned)
+        picked, drawn, ok = _drawn(eligible, cfg, boundary_block_hash, budget)
+        while members and not ok:
             m = members.pop()
             skip(m, "pending_floor", recs[m])
             if members:
-                picked, refused = _cohort_set(pools, members, bars, king_ts, recs, forecasts,
-                                              cfg, pinned)
+                eligible, refused = _cohort_set(pools, members, bars, king_ts, recs,
+                                                forecasts, cfg, pinned)
+                picked, drawn, ok = _drawn(eligible, cfg, boundary_block_hash, budget)
         if not members:
             continue
-        ws = [w for w, _ in picked]
+        ws = [w for w, _, _ in picked]
         scores = {}
         scored = [*bars, *members]
         for dg in scored:
             pairs = [score_window(forecasts[dg][w["window_id"]], w["target"], w["history"],
                                   w["seasonal_period"]) for w in ws]
             scores[dg] = (np.asarray([p[0] for p in pairs]), np.asarray([p[1] for p in pairs]))
-        for i, (w, src_pool) in enumerate(picked):
+        for i, (w, src_pool, v) in enumerate(picked):
             lag = (src_pool["feeds"].get(w["feed"]) or {}).get("mirror_lag_hours")
             pinned[w["window_id"]] = str(src_pool["sha256"])
             windows_out[w["window_id"]] = {
@@ -985,7 +1143,11 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
                 "min_first_seen_ts": int(min(w["first_seen_ts"])),
                 "mirror_lag_hours": None if lag is None else float(lag),
                 # The snapshot whose version of the window was scored.
-                "snapshot_sha256": str(src_pool["sha256"])}
+                "snapshot_sha256": str(src_pool["sha256"]),
+                # rev6.10 (a) / rev6.12 (W7a): the effective embargo, the
+                # release time and the rule it was admitted under, the
+                # fresh / embargo class, and the W5j draw cell.
+                **_window_embargo_fields(w, v, h)}
             for dg in scored:
                 rows.append({"window_id": w["window_id"], "digest": dg, "cohort": len(cohorts),
                              "crps": float(scores[dg][0][i]), "mase": float(scores[dg][1][i])})
@@ -1010,12 +1172,30 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
         cohort = {"index": len(cohorts), "king_digest": kd, "king_reveal_ts": int(king_ts),
                   "stage": stage, "members": list(members), "t_max": int(t_max),
                   "window_ids": [w["window_id"] for w in ws], "set_sha256": set_sha,
-                  "first_seen_roots": [], "refused": refused}
+                  "first_seen_roots": [], "refused": refused,
+                  # rev6.12 (b): the fresh / embargo split of the judged set.
+                  "fresh_windows": sum(1 for _, _, v in picked if not v.embargo_window),
+                  "embargo_windows": sum(1 for _, _, v in picked if v.embargo_window)}
         if len(bars) > 1:
             # Present only with a house bar (absent, not null, when the
             # house holds KING_D: one bar, today's shape).
             cohort["house_digest"] = hd
         cohorts.append(cohort)
+        if drawn is not None:
+            # quota: the windows the draw kept per "<timeframe>|<bin>" cell
+            # (after the source cap and the fresh share), so a satellite
+            # binds each cell's count to the judged set.
+            kept: dict[str, int] = {k: 0 for k in drawn["capacity"]}
+            for w, _, _ in picked:
+                k = f"{str(w.get('freq') or '')}|forward"
+                kept[k] = kept.get(k, 0) + 1
+            draws.append({"index": cohort["index"], "quota": kept,
+                          "capacity": dict(drawn["capacity"]),
+                          # the candidate set the draw ran over
+                          "candidates_sha256": hashlib.sha256("\n".join(sorted(
+                              w["window_id"] for w, _, _ in eligible)).encode()).hexdigest()})
+        fresh_idx = [i for i, (_, _, v) in enumerate(picked) if not v.embargo_window]
+        emb_idx = [i for i, (_, _, v) in enumerate(picked) if v.embargo_window]
         for m, r in zip(members, res, strict=True):
             rec = recs[m]
             rec["used_windows"] = sorted(set(rec["used_windows"]) | {w["window_id"] for w in ws})
@@ -1042,7 +1222,10 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
                                    "house": is_house})
             verdicts.append({"digest": m, "king_digest": kd, "stage": stage,
                              "cohort": len(cohorts) - 1, **r, "outcome": outcome,
-                             "lowfreq": lowfreq})
+                             "lowfreq": lowfreq,
+                             # rev6.12 (b): the fresh and embargo sub-scores.
+                             "fresh": _subscore(scores[m], fresh_idx),
+                             "embargo": _subscore(scores[m], emb_idx)})
 
     # Held candidates (an earlier bench_hold) are re-gated with their first
     # clear, without a duel: no rows, no verdict this settlement.
@@ -1063,9 +1246,10 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
                                          "set_sha256": str(hold["set_sha256"]),
                                          "lcb": float(hold["lcb"]),
                                          "king_d": str(hold["king_d"])}})
+    bench_texts: dict[str, str] = {}
     if persisted is None:
         gate, gate_outcomes = _run_gate(candidates, state, cfg, boundary, boundary_block_hash,
-                                        sentinel, bench)
+                                        sentinel, bench, bench_texts)
     else:
         # Recovery: the outcomes the persisted, verified report recorded.
         gate, gate_outcomes = _adopted_gate(candidates, persisted, rp)
@@ -1172,6 +1356,13 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
                                                          "entries": migrated}}
                           if migrated else {})},
     }
+    if draws:
+        # W5j: the settlement's draw record, present iff a cohort was drawn
+        # (absent, never null, otherwise; the legacy call has no block hash).
+        report["draw"] = {"boundary_block_hash": str(boundary_block_hash),
+                          "seed": f"{boundary_block_hash}:lane_d_windows",
+                          "max_windows_per_settlement": int(cfg.max_windows_per_settlement),
+                          "cohorts": draws}
     if gate is not None:
         # Present iff the gate ran (absent, never null, otherwise).
         report["gate"] = gate
@@ -1188,6 +1379,8 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     validate_report(report)
     body_sha = report_digest(report)
     if persisted is None:
+        # W3b6b: the bound records' bytes land before the report that binds them.
+        _save_bench_rows(state_path, bench_texts)
         save_report_file(rp, report)
     elif report_digest(persisted) != body_sha:
         # The posterior derived from the persisted outcomes must be the one

@@ -215,12 +215,21 @@ raises `MeasureRefused` (`.code`, a `RUN_REFUSALS` member):
 
 ```
 python -P scripts/laned_wb19_measure.py combine --chain-toml FILE --runs R1 [R2 …] \
-    --out evidence/wb19.json [--candidates evidence/owner/oa8.json] [--table-out FILE]
+    --out evidence/wb19.json [--candidates evidence/owner/oa8.json] [--table-out FILE] \
+    [--note SKU=TEXT …]
 ```
 
 `COMBINE_REFUSALS` = `bad_run`, `not_pod`, `wrong_image`, `wrong_contract`,
-`mixed_block`, `duplicate_sku`. A refusal follows the same rules as for
-`run`: exit 2, a `REFUSED <code>:` line, nothing written.
+`mixed_block`, `duplicate_sku`, `bad_note`. A refusal follows the same rules
+as for `run`: exit 2, a `REFUSED <code>:` line, nothing written.
+
+- `bad_note` (rev6.16): a `--note` that isn't `SKU=TEXT`, or whose SKU
+  (matched case-insensitively) has no expert run, or whose `TEXT` is empty
+  or longer than 200 characters. A valid note becomes `rows[<SKU as
+  recorded>]["note"] = TEXT`, inside the sealed body. Use it to mark a row
+  measured on a superseded path, such as an 8×H200 row from before WB25 (the
+  single-GPU path, which understates multi-GPU). Without `--note`, no row has
+  a `note` key.
 
 - `bad_run`: an unparseable record, a wrong schema, a missing field, or a
   body hash that doesn't match (a hand edit).
@@ -252,7 +261,9 @@ Otherwise it writes `laned_wb19/1` and exits 0:
 - **`table.rows`** has one row per expert run (never the full leg).
   `overhead_seconds` there is `boot + corpus + harvest`.
 - **`passed`** is true only when every check passes:
-  - `coverage`: every candidate has an expert run. The detail names the
+  - `coverage`: every candidate has an expert run. Evidence where this is
+    the ONLY failing check is still usable (partial evidence, rev6.16; see
+    the reader). The detail names the
     missing SKUs;
   - `full_leg`: at most one full run on `8xH100`. The check is always
     present. With zero full runs it is `passed: true` and its `detail`
@@ -278,7 +289,18 @@ The reader is stdlib only. Importing it never imports torch.
   tokens_per_s, overhead_seconds, peak_memory_bytes, memory_total_bytes`.
 - `load_step_rate_table(path, *, image_digest=None) -> dict[str, StepRate]`
   reads either a bare table or a `laned_wb19/1` evidence file (its `table`).
-  - Evidence with `passed` not true is refused with `not_passed`.
+  - **Partial evidence (owner 2026-11-23, plan rev6.16).** Evidence with
+    `passed` true loads. Evidence with `passed` not true loads **only** when
+    `checks` is a non-empty list of `{name: str, passed: bool}`, at least
+    one check fails, every failing check is named `coverage`, and
+    `body_sha256` is present and matches. Its rows are the measured types;
+    a type with no row stays unmeasured (`rate_for` gives None). Anything
+    else with `passed` not true (malformed checks, a failing `memory` /
+    `full_leg` / other check, or a missing `body_sha256`) is refused with
+    `not_passed`.
+  - Evidence whose `body_sha256` is present but doesn't match its body (a
+    hand edit) is refused with `bad_table`, whether it passed or not.
+  - A row's extra keys (such as `note`) are ignored by the rates.
   - Refused with `bad_table`: unparseable JSON, a wrong schema, no or empty
     `rows`, an `image_digest` that isn't `sha256:<64 hex>`, a rate that is
     non-numeric, ≤ 0 or non-finite, or a missing or negative
@@ -313,17 +335,25 @@ the **shipped** `chain.toml`:
   - `peak_memory_bytes > 0`;
   - `tool.git_sha` is a clean commit on this repo's history that contains
     the tool.
-- **The table** is re-derived from the runs.
-- **Coverage:** every `[lane_b] funded_pod_skus` SKU (a GPU type enters that
-  list only after measurement, D42 1) and every `gpu_types` entry of the
-  committed `evidence/owner/oa8.json` (required, with `oa8_sha256` binding its
-  bytes).
+- **The table** is re-derived from the runs. A row's optional `note` (from
+  `combine --note`, a non-empty string ≤ 200 characters) is carried over.
+- **Checks (partial evidence, owner 2026-11-23, plan rev6.16):** `checks` is
+  a well-formed list. No check other than `coverage` fails, and `passed` is
+  the conjunction of the checks.
+- **Coverage:** the candidates are every `[lane_b] funded_pod_skus` SKU and
+  every `gpu_types` entry of the committed `evidence/owner/oa8.json`
+  (required, with `oa8_sha256` binding its bytes). A candidate with no expert
+  run is **allowed**, but it must be declared: the `coverage` check fails and
+  its detail names every missing SKU. With every candidate measured, the
+  check passes. The WB22 gate refuses a listed type with no row as
+  `gpu_rate_unmeasured`.
 - **The full leg (optional, owner 2026-11-23):** none is required. With no
   full run, `lane_a_full_leg` must be `null` (a value with no run behind it is
   refused). With one full `8xH100` leg, `lane_a_full_leg` must match it, as
   before. More than one is refused.
 - **Memory:** every row fits memory.
-- **The reader:** the WB22 reader loads the file, and its rates match.
+- **The reader:** the WB22 reader loads the file, its rates match, and its
+  rows are exactly the expert runs.
 
 Without `$LANED_EVIDENCE` these skip.
 

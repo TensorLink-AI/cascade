@@ -231,3 +231,14 @@ There is no `confirm` stage, no `confirm_pending` status or reason and no
 crowning chains move to that rule with nothing weakened. The rich scenario's bench pod is down at B1, so X's first clear is held open (`hold` / `bench_hold`, confirm stage `first`, verdict `cleared`). The king scenario lists X from B2_NEXT_ERA, where it is crowned at its first verdict. The held scenario lists X from B2. The confirm-stage queue and progress tests now pin the held first clear and its judged set, and the reason enum is pinned free of `confirm_pending`. On main the
 old code still runs the confirmation stage, so the changed tests fail on an
 assertion until the W5e implementation lands.
+
+## Correction (plan rev6.10 (a) / rev6.12 (a)): embargo windows count toward progress
+
+The fixture feeds (W7c's chain) pin `embargo_hours = 48`. Under the W5a
+embargo-aware eligibility a target point is eligible when its data time is in
+`(b - e, b]` and it is released to miners (`first_seen + e`) after `b`, so Z,
+revealed 5 h after X, counts the same 24 windows over 4 sources of snapshot 1
+as X. `test_pending_progress_counts_windows_and_clusters_against_the_floors`
+now expects `(24, 4, False)` for Z (it expected the rev3 `(0, 0, False)`). X's
+row and the floors are unchanged. On main (rev3 rule) the changed test fails
+on that assertion until the W5a implementation (#800) lands.

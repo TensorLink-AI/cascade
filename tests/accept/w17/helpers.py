@@ -10,6 +10,9 @@ Copied from docs/plans/LANE_D_PLAN.md (rev6; rev6.2 item (e), PR #636):
   statuses / `closed_era`, open disputes) is produced by W17."
 - §11.3 Support: "`status/lane_d.json` shows each pending entry's
   eligible-window progress against the floors."
+- rev6.10 (a) / rev6.12 (a): the fixture feeds (W7c's chain) pin
+  `embargo_hours = 48`, so progress counts embargo windows (data time in
+  `(b - e, b]`, released after `b`) as well as fresh ones.
 - §1.3b Progress board: "every king's suite numbers (gate and the era's
   sentinel, suite named) go into the signed lane D index (§11.1) and
   `status/lane_d.json`." §16 rule 4 / W-S3: "W17 should embed

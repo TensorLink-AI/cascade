@@ -33,6 +33,7 @@
     "rows_sha256": {"$ref": "#/$defs/digest"},
     "pay": {"$ref": "#/$defs/pay"},
     "gate": {"$ref": "#/$defs/gate"},
+    "draw": {"$ref": "#/$defs/draw"},
     "armed_contexts": {
       "type": "array", "minItems": 1, "items": {"type": "integer", "minimum": 1},
       "description": "rev6.6: the variants armed at this settlement (ascending, a subset of params.contexts), present together with armed_evidence; absent on a settlement not handed the armed record."
@@ -84,13 +85,13 @@
                              "coldkey_changed", "king_unscored", "bench_hold", "deregistered",
                              "ready_expired", "reveal_delay_exceeded", "duplicate_digest",
                              "hotkey_has_open_entry", "context_not_armed", "checkpoint_fault",
-                             "mirror_lag_exceeded", "lane_closed"]},
+                             "mirror_lag_exceeded", "lane_closed", "context_below_armed"]},
     "entry_reason": {"type": "string",
                      "enum": ["pending_floor", "coldkey_cap_settlement", "coldkey_unresolved",
                               "coldkey_changed", "king_unscored", "bench_hold", "deregistered",
                               "ready_expired", "reveal_delay_exceeded", "duplicate_digest",
                               "hotkey_has_open_entry", "context_not_armed", "checkpoint_fault",
-                              "mirror_lag_exceeded", "lane_closed",
+                              "mirror_lag_exceeded", "lane_closed", "context_below_armed",
                               "lost_duel", "lowfreq_regression",
                               "gate_regression", "crowned"]},
     "burn_reason": {"type": "string", "enum": ["house_king", "deregistered"]},
@@ -103,6 +104,22 @@
                                        "before_margin", "publish_ahead", "late_mirror",
                                        "absent_from_s0", "backfill"]},
     "confirmation_stage": {"type": "string", "enum": ["first"]},
+    "window_rule": {"type": "string", "enum": ["embargo", "embargo0"],
+                    "description": "rev6.10 (a): embargo when the window's effective embargo e > 0, else embargo0 (the rev3 rule)."},
+    "window_kind": {"type": "string", "enum": ["forward", "backtest"]},
+    "window_bin": {"type": "string", "enum": ["forward", "short", "medium", "long"]},
+    "freq_class": {"type": "string",
+                   "enum": ["subdaily", "daily", "weekly", "monthly", "quarterly", "yearly"]},
+    "subscore": {
+      "type": "object",
+      "description": "rev6.12 (b): a member's sub-score on the fresh or the embargo windows of its judged set: n rows and the lane D geomean (null when n = 0).",
+      "required": ["n", "geomean"],
+      "additionalProperties": false,
+      "properties": {
+        "n": {"type": "integer", "minimum": 0},
+        "geomean": {"type": ["number", "null"], "minimum": 0}
+      }
+    },
     "lowfreq_result": {"type": "string", "enum": ["pass", "fail", "no_windows", "not_candidate"]},
     "verdict_outcome": {"type": "string",
                         "enum": ["lost", "cleared", "crowned"]},
@@ -115,7 +132,8 @@
                    "max_entries_per_settlement",
                    "max_judged_per_coldkey_per_settlement", "scoring_levels", "gate_suites",
                    "tau_public", "lowfreq_freqs", "gate_weights", "max_source_share",
-                   "min_long_series"],
+                   "min_long_series", "embargo_hours", "max_windows_per_settlement",
+                   "min_fresh_window_share"],
       "additionalProperties": false,
       "properties": {
         "share": {"type": "number", "minimum": 0},
@@ -148,7 +166,13 @@
         "max_source_share": {"type": "number", "exclusiveMinimum": 0, "maximum": 1,
                              "description": "T18e/B14: the most of a frozen union one source may hold."},
         "min_long_series": {"type": "integer", "minimum": 0,
-                            "description": "§1.7: the long-series floor that arms a context variant."}
+                            "description": "§1.7: the long-series floor that arms a context variant."},
+        "embargo_hours": {"type": "number", "minimum": 0,
+                          "description": "rev6.10 (a): [lane_d] embargo_hours, the cap of every series' effective embargo."},
+        "max_windows_per_settlement": {"type": "integer", "minimum": 1,
+                                       "description": "rev6.10 (b) / W5j: the settlement's judged-window budget."},
+        "min_fresh_window_share": {"type": "number", "minimum": 0, "maximum": 1,
+                                   "description": "rev6.12 (b): the least share of fresh windows in a frozen set."}
       }
     },
     "pool": {
@@ -216,7 +240,8 @@
     "cohort": {
       "type": "object",
       "required": ["index", "king_digest", "king_reveal_ts", "stage", "members", "t_max",
-                   "window_ids", "set_sha256", "first_seen_roots", "refused"],
+                   "window_ids", "set_sha256", "first_seen_roots", "refused",
+                   "fresh_windows", "embargo_windows"],
       "additionalProperties": false,
       "properties": {
         "index": {"type": "integer", "minimum": 0},
@@ -228,6 +253,10 @@
         "window_ids": {"type": "array", "items": {"type": "string", "minLength": 1}},
         "set_sha256": {"$ref": "#/$defs/digest"},
         "first_seen_roots": {"type": "array", "items": {"$ref": "#/$defs/digest"}},
+        "fresh_windows": {"type": "integer", "minimum": 0,
+                          "description": "rev6.12 (b): judged windows that pass at e = 0."},
+        "embargo_windows": {"type": "integer", "minimum": 0,
+                            "description": "rev6.12 (b): judged windows eligible only through the embargo."},
         "house_digest": {"$ref": "#/$defs/digest",
                          "description": "W5c change 3: the house digest the members were also judged against; present only in a cohort with a house bar (king_digest is not the house)."},
         "refused": {
@@ -241,7 +270,9 @@
     "window": {
       "type": "object",
       "required": ["window_id", "source", "feed", "min_target_ts", "min_first_seen_ts",
-                   "mirror_lag_hours", "snapshot_sha256"],
+                   "mirror_lag_hours", "snapshot_sha256", "freq", "embargo_hours",
+                   "min_release_ts", "rule", "embargo_window", "timeframe", "bin", "kind",
+                   "freq_class", "h", "origin"],
       "additionalProperties": false,
       "properties": {
         "window_id": {"type": "string", "minLength": 1},
@@ -251,7 +282,49 @@
         "min_first_seen_ts": {"$ref": "#/$defs/timestamp"},
         "mirror_lag_hours": {"type": ["number", "null"], "minimum": 0},
         "snapshot_sha256": {"$ref": "#/$defs/digest",
-                            "description": "The snapshot whose version of the window was scored; one of pool.snapshots[].sha256."}
+                            "description": "The snapshot whose version of the window was scored; one of pool.snapshots[].sha256."},
+        "freq": {"type": "string", "description": "The series' pool freq."},
+        "embargo_hours": {"type": "number", "minimum": 0,
+                          "description": "rev6.10 (a): the effective embargo e = min(feed's pinned embargo_hours, params.embargo_hours)."},
+        "min_release_ts": {"$ref": "#/$defs/timestamp",
+                           "description": "min_first_seen_ts + 3600 e: the earliest release of a target point to miners."},
+        "rule": {"$ref": "#/$defs/window_rule"},
+        "embargo_window": {"type": "boolean",
+                           "description": "rev6.12 (b): false = fresh (passes at e = 0), true = embargo window (a mixed target included)."},
+        "timeframe": {"type": "string", "description": "W5j: the draw cell's timeframe (the pool freq)."},
+        "bin": {"$ref": "#/$defs/window_bin"},
+        "kind": {"$ref": "#/$defs/window_kind"},
+        "freq_class": {"$ref": "#/$defs/freq_class"},
+        "h": {"type": "integer", "minimum": 1, "description": "The drawn horizon: the window id's h<h>."},
+        "origin": {"$ref": "#/$defs/timestamp", "description": "The target start: the window id's middle field."}
+      }
+    },
+    "draw": {
+      "type": "object",
+      "description": "W5j (rev6.10 (b), rev6.12 (b)): the settlement's seeded per-bin window draw; present iff a cohort was drawn (absent, never null).",
+      "required": ["boundary_block_hash", "seed", "max_windows_per_settlement", "cohorts"],
+      "additionalProperties": false,
+      "properties": {
+        "boundary_block_hash": {"type": "string", "pattern": "^0x[0-9a-f]{64}$"},
+        "seed": {"type": "string", "minLength": 1, "description": "f\"{boundary_block_hash}:lane_d_windows\"."},
+        "max_windows_per_settlement": {"type": "integer", "minimum": 1},
+        "cohorts": {"type": "array", "items": {"$ref": "#/$defs/draw_cohort"}}
+      }
+    },
+    "draw_cohort": {
+      "type": "object",
+      "required": ["index", "quota", "capacity", "candidates_sha256"],
+      "additionalProperties": false,
+      "properties": {
+        "index": {"type": "integer", "minimum": 0},
+        "quota": {"type": "object", "description": "{\"<timeframe>|<bin>\": windows drawn}.",
+                  "propertyNames": {"type": "string", "pattern": "^[^|]+[|][^|]+$"},
+                  "additionalProperties": {"type": "integer", "minimum": 0}},
+        "capacity": {"type": "object", "description": "{\"<timeframe>|<bin>\": non-overlapping candidates at h_lo}.",
+                     "propertyNames": {"type": "string", "pattern": "^[^|]+[|][^|]+$"},
+                     "additionalProperties": {"type": "integer", "minimum": 0}},
+        "candidates_sha256": {"$ref": "#/$defs/digest",
+                              "description": "sha256 of the sorted candidate window ids, one per line."}
       }
     },
     "lowfreq": {
@@ -279,7 +352,7 @@
     "verdict": {
       "type": "object",
       "required": ["digest", "king_digest", "stage", "cohort", "lcb", "gain", "cleared",
-                   "outcome", "lowfreq"],
+                   "outcome", "lowfreq", "fresh", "embargo"],
       "additionalProperties": false,
       "properties": {
         "digest": {"$ref": "#/$defs/digest"},
@@ -291,6 +364,8 @@
         "cleared": {"type": "boolean"},
         "outcome": {"$ref": "#/$defs/verdict_outcome"},
         "lowfreq": {"$ref": "#/$defs/lowfreq"},
+        "fresh": {"$ref": "#/$defs/subscore"},
+        "embargo": {"$ref": "#/$defs/subscore"},
         "house": {"$ref": "#/$defs/house_judgement"}
       }
     },
@@ -367,6 +442,17 @@
         "mase": {"type": "number"}
       }
     },
+    "gate_rows": {
+      "type": "object",
+      "description": "W3b6b (plan rev6.13): the sha256 of each bound sweep record's canonical text (lane_d_bench.sweep_record_text), published at bench_v/lane_d/<boundary>/<sha256>.json; present iff the bench session returned the three records.",
+      "required": ["candidate", "king_d", "house"],
+      "additionalProperties": false,
+      "properties": {
+        "candidate": {"$ref": "#/$defs/digest"},
+        "king_d": {"$ref": "#/$defs/digest"},
+        "house": {"$ref": "#/$defs/digest"}
+      }
+    },
     "gate_lcbs": {
       "type": ["object", "null"],
       "required": ["king_d", "house"],
@@ -400,7 +486,8 @@
         "lcb": {"$ref": "#/$defs/gate_lcbs"},
         "blocked_by": {"type": "array", "items": {"$ref": "#/$defs/gate_ref"}},
         "session": {"type": "string", "minLength": 1},
-        "held_from": {"$ref": "#/$defs/held_from"}
+        "held_from": {"$ref": "#/$defs/held_from"},
+        "rows": {"$ref": "#/$defs/gate_rows"}
       },
       "if": {"properties": {"outcome": {"const": "gate_regression"}}},
       "then": {"properties": {"lcb": {"type": "object"}, "blocked_by": {"minItems": 1}}},

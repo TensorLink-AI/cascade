@@ -356,13 +356,28 @@ def is_batch_impl_commit(files: list[str], paths: list[str],
     return False
 
 
+def is_coupled_impl_commit(files: list[str], group: list[list[str]]) -> bool:
+    """A coupled implementation squash merge (scripts/laned/coupled_batches)
+    for a WP of ``group`` (the PATHS of every member of its declared coupled
+    set, its own included): no tests/accept/ file, every file in the union
+    of the members' PATHS, and every member's PATHS matching a file (the
+    whole set landed together)."""
+    if not files or len(group) < 2 or any(f.startswith("tests/accept/") for f in files):
+        return False
+    return all(any(path_matches(f, s) for s in group) for f in files) \
+        and all(any(path_matches(f, s) for f in files) for s in group)
+
+
 def impl_commit_index(history: list[tuple[str, list[str]]], wp: str, paths: list[str],
-                      others: list[list[str]] | None = None) -> int | None:
+                      others: list[list[str]] | None = None,
+                      coupled: list[list[list[str]]] | None = None) -> int | None:
     """The L2 commit (plan §17.1): the first commit after the one that added
     the WP's PATHS file that changes something outside tests/accept/ and only
     paths inside PATHS, i.e. the WP's implementation merge. With ``others``
     (every other WP's PATHS) a batch implementation merge counts too
-    (is_batch_impl_commit). None when absent."""
+    (is_batch_impl_commit); with ``coupled`` (per declared coupled set holding
+    the WP, every member's PATHS) a coupled implementation merge counts too
+    (is_coupled_impl_commit). None when absent."""
     rel = f"tests/accept/{wp_dir(wp)}/PATHS"
     start = next((i for i, (_, files) in enumerate(history) if rel in files), None)
     if start is None:
@@ -371,9 +386,57 @@ def impl_commit_index(history: list[tuple[str, list[str]]], wp: str, paths: list
         files = history[i][1]
         if not files or all(f.startswith("tests/accept/") for f in files):
             continue
-        if all(path_matches(f, paths) for f in files) or is_batch_impl_commit(files, paths, others):
+        if all(path_matches(f, paths) for f in files) or is_batch_impl_commit(files, paths, others) \
+                or any(is_coupled_impl_commit(files, g) for g in coupled or ()):
             return i
     return None
+
+
+# ---------------------------------------------------------------------------
+# Coupled batches (one implementation PR for WPs whose code must land together)
+# ---------------------------------------------------------------------------
+
+COUPLED_BATCHES_PATH = "scripts/laned/coupled_batches"
+
+
+def parse_coupled_batches(text: str | None) -> list[tuple[str, ...]]:
+    """Declared coupled sets in a ``coupled_batches`` file: one set per line,
+    WP ids separated by blanks, ``#`` comments (whole-line or trailing) and
+    blank lines ignored. A line naming fewer than two distinct WPs is not a
+    set. Duplicates within a line collapse; order is kept."""
+    out: list[tuple[str, ...]] = []
+    for line in (text or "").splitlines():
+        ids = tuple(dict.fromkeys(line.split("#", 1)[0].split()))
+        if len(ids) >= 2:
+            out.append(ids)
+    return out
+
+
+def coupled_batches_at(root: Path, ref: str) -> list[tuple[str, ...]]:
+    """The declared coupled sets at ``ref``. Read at the base / board ref,
+    never from the PR, and only a W0c PR may edit scripts/laned/, so a PR can
+    never declare its own WPs coupled. No file at ``ref`` means none."""
+    proc = git(root, "show", f"{ref}:{COUPLED_BATCHES_PATH}", check=False)
+    return parse_coupled_batches(proc.stdout) if proc.returncode == 0 else []
+
+
+def coupled_set_of(wps, batches: list[tuple[str, ...]]) -> tuple[str, ...] | None:
+    """The declared coupled set equal to ``wps`` (as a set), or None. Only the
+    exact set is coupled: a subset or superset keeps the ordinary rules."""
+    want = set(wps)
+    return next((b for b in batches if set(b) == want), None)
+
+
+def coupled_paths(batches: list[tuple[str, ...]], sets: dict[str, list[str]],
+                  wp: str) -> list[list[list[str]]]:
+    """For each declared coupled set holding ``wp`` whose every member has a
+    PATHS file in ``sets`` (dir -> entries), the members' PATHS (for
+    impl_commit_index)."""
+    out: list[list[list[str]]] = []
+    for b in batches:
+        if wp in b and all(wp_dir(m) in sets for m in b):
+            out.append([sets[wp_dir(m)] for m in b])
+    return out
 
 
 def paths_sets_at(root: Path, ref: str) -> dict[str, list[str]]:
