@@ -2,14 +2,15 @@
 a miner challenger must also clear `d_margin` against the current house on
 the same set, and the house ranks first on ties (plan rev6 §1.3, T16).
 
-Setup (real settlements, no hand-written state): K1 clears against the
-genesis house H0 at BOUNDARY_1 and confirms on a disjoint snapshot at
-BOUNDARY_2, so a MINER holds KING_D. At BOUNDARY_3 lane A's king has moved:
+Setup (real settlements, no hand-written state): BOUNDARY_1 lists no
+entry; K1 enters at BOUNDARY_2 and is crowned over the genesis house H0 at
+its first verdict (plan rev6.11 (b): no confirmation duel), so a MINER holds
+KING_D. At BOUNDARY_3 lane A's king has moved:
 the house refreshes to H1 (K1 keeps the throne), and challenger Y is judged
 against KING_D = K1 on a fresh snapshot.
 
 On main the verdict compares Y with K1 only, so the tie and the
-worse-than-house cases fail on an assertion (Y goes `confirm_pending`), and
+worse-than-house cases fail on an assertion (Y clears), and
 the house is not scored on the cohort's set.
 """
 
@@ -44,19 +45,22 @@ T_Y = T0 + 2 * DAY
 
 
 def _crowned_k1(tmp_path):
-    """Run BOUNDARY_1 and BOUNDARY_2: K1 is crowned. Returns the state path,
-    cfg, K1 and the uid map."""
+    """Run BOUNDARY_1 (no entry listed) and BOUNDARY_2 (K1 enters and is
+    crowned at its first verdict). Returns the state path, cfg and K1."""
     cfg = lane_d_cfg()
     h0 = house("house-0")
     k1 = entry("k1", reveal_ts=T_K1)
     p1 = group("p1", 6, band_start(T_K1))
     p2 = group("p2", 6, band_start(T_K1) + DAY)
     path = tmp_path / "state" / "lane_d_state.json"
-    for boundary, recs, name in ((BOUNDARY_1, p1, "pool1"), (BOUNDARY_2, p2, "pool2")):
+    for boundary, recs, name, listed in ((BOUNDARY_1, p1, "pool1", []),
+                                         (BOUNDARY_2, p2, "pool2", [k1])):
         pool = write_pool(tmp_path / name, recs, f"w5c-{name}")
         fc = {h0["digest"]: model_forecasts(recs, "bad", "house-0"),
               k1["digest"]: model_forecasts(recs, "fair", "k1")}
-        settle(cfg, boundary, pool, [k1], h0, fc, uids(k1), path)
+        s = settle(cfg, boundary, pool, listed, h0, fc, uids(k1), path)
+        assert s.report["crowned"] == (k1["digest"] if listed else None), \
+            f"fixture: K1 must be crowned at its first verdict, at BOUNDARY_2 only ({boundary})"
     state = read_state(path)
     assert state["king"]["digest"] == k1["digest"] and not state["king"]["house"], \
         "fixture: K1 was not crowned"
@@ -112,14 +116,18 @@ def test_house_change3_control_beating_king_and_a_weak_house_clears(tmp_path):
     s, state, k1, h1, y, _ = _duel(tmp_path, "bad", "good")
     v = verdict_of(s.report, y["digest"])
     assert v is not None and v["cleared"] is True, v
-    assert state["entries"][y["digest"]]["status"] == "confirm_pending"
+    # rev6.11 (b): clearing both bars (and the gate) crowns at the first verdict.
+    assert state["entries"][y["digest"]]["status"] == "crowned"
+    assert s.report["crowned"] == y["digest"] and state["king"]["digest"] == y["digest"]
 
 
 def test_house_change3_challenger_clearing_king_and_house_clears(tmp_path):
     s, state, k1, h1, y, _ = _duel(tmp_path, "fair", "sharp")
     v = verdict_of(s.report, y["digest"])
     assert v is not None and v["cleared"] is True, v
-    assert state["entries"][y["digest"]]["status"] == "confirm_pending"
+    # rev6.11 (b): clearing both bars (and the gate) crowns at the first verdict.
+    assert state["entries"][y["digest"]]["status"] == "crowned"
+    assert s.report["crowned"] == y["digest"] and state["king"]["digest"] == y["digest"]
 
 
 def test_house_change3_house_is_scored_on_the_cohorts_set(tmp_path):

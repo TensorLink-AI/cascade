@@ -88,8 +88,7 @@ def test_cohort_fixture_bands_and_frozen_sets(tmp_path):
     A, B, C = _entries()
     assert [e["digest"] for e in sorted((A, B, C), key=lambda e: e["digest"])] != \
         [A["digest"], B["digest"], C["digest"]], "digest order must differ from T order"
-    # A sharp house: every member loses, so state keeps each frozen set (a
-    # first clear resets it for the disjoint confirmation set).
+    # A sharp house: every member loses, so state keeps each frozen set.
     s, path, *_ = _run(tmp_path, a_band + b_band + c_band, (A, B, C), house_quality="sharp")
     state = read_state(path)
     assert {state["entries"][e["digest"]]["status"] for e in (A, B, C)} == {"lost"}
@@ -180,11 +179,17 @@ def test_deferred_entry_is_judged_next_settlement_on_its_frozen_set(tmp_path):
     a_band, b_band, c_band = _bands()
     A, B, C = _entries()
     records = a_band + b_band + c_band
-    _, path, h, pool, _, cfg = _run(tmp_path, records, (A, B, C),
-                                    skip={C["digest"]: _short_c(c_band)})
+    # A sharp house: A and B lose at BOUNDARY_1, so KING_D stays the house
+    # (rev6.11 (b): a clear would crown at once and move the bar) and C,
+    # deferred, is judged alone at BOUNDARY_2.
+    s1, path, h, pool, _, cfg = _run(tmp_path, records, (A, B, C),
+                                     skip={C["digest"]: _short_c(c_band)},
+                                     house_quality="sharp")
+    assert s1.report["crowned"] is None
     frozen = read_state(path)["entries"][C["digest"]]["frozen_set"]
 
-    fc = _forecasts(records, h, (A, B, C))         # the eval host now has C's windows
+    # the eval host now has C's windows
+    fc = _forecasts(records, h, (A, B, C), house_quality="sharp")
     s2 = settle(cfg, BOUNDARY_2, pool, [A, B, C], h, fc, uids(A, B, C), path)
     mine = [c for c in s2.report["cohorts"] if C["digest"] in c["members"]]
     assert len(mine) == 1, "the deferred entry was not judged at the next settlement"
@@ -193,9 +198,12 @@ def test_deferred_entry_is_judged_next_settlement_on_its_frozen_set(tmp_path):
     assert sorted(cohort["window_ids"]) == frozen["window_ids"]
     assert cohort["set_sha256"] == frozen["set_sha256"]
     assert rows_of(s2.report, C["digest"]) == set(frozen["window_ids"])
+    # Its first (and only) verdict decides it: against the sharp house it
+    # loses the duel, judged on exactly its frozen set.
     after = read_state(path)["entries"][C["digest"]]
-    assert after["status"] == "confirm_pending", after
-    assert after["confirm"]["first_set_sha256"] == frozen["set_sha256"]
+    assert (after["status"], after["reason"]) == ("lost", "lost_duel"), after
+    assert after["used_windows"] == frozen["window_ids"]
+    assert verdict_of(s2.report, C["digest"])["stage"] == "first"
 
 
 def test_deferral_repeats_latest_t_first_until_the_floors_hold(tmp_path):
