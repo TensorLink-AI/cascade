@@ -20,10 +20,18 @@
 #   `test` and can never pass as skipped. `receipt-replay` is unchanged.
 #   Tuning: refresh WEIGHTS in scripts/ci_shard.py from a PR run's
 #   `--durations` output when the shards drift out of balance.
+#
+# Merge queue (2026-11-23): `merge_group` runs exactly what a PR runs, on the
+# queue's combined ref (base + every PR ahead of it in the group): `lint`, the
+# FULL unit suite in 4 shards, the `test` aggregator and `receipt-replay`. No
+# job is conditioned away on merge_group, so both required checks always
+# report there. The single-process `unit (1/1)` run stays on push only.
 name: CI
 
 on:
   pull_request:
+  merge_group:
+    types: [checks_requested]
   push:
     branches: [main, cascade-v2]
 
@@ -68,16 +76,17 @@ jobs:
         run: python3 scripts/ci_shard.py --verify --of 4
 
   unit:
-    name: unit (${{ matrix.shard }}/${{ github.event_name == 'pull_request' && 4 || 1 }})
+    name: unit (${{ matrix.shard }}/${{ github.event_name != 'push' && 4 || 1 }})
     runs-on: ubuntu-latest
     timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
-        shard: ${{ fromJSON(github.event_name == 'pull_request' && '[1, 2, 3, 4]' || '[1]') }}
+        # pull_request and merge_group: 4 shards; push: one process
+        shard: ${{ fromJSON(github.event_name != 'push' && '[1, 2, 3, 4]' || '[1]') }}
     env:
       SHARD: ${{ matrix.shard }}
-      SHARDS: ${{ github.event_name == 'pull_request' && 4 || 1 }}
+      SHARDS: ${{ github.event_name != 'push' && 4 || 1 }}
     steps:
       - uses: actions/checkout@v4
 
