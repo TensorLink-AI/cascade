@@ -236,12 +236,15 @@ def report_digest(report) -> str:
 
 
 def settle(cfg, b, pool_dir, entries, house_rec, fc, uid_of, state_path, *,
-           hash_=None, bench=None, prior=()):
+           hash_=None, bench=None, prior=(), armed=None):
     """`settle_lane_d` with the W5e gate inputs (`bench=None` or
-    `hash_=None` = the gate cannot run: fail closed, `bench_hold`)."""
+    `hash_=None` = the gate cannot run: fail closed, `bench_hold`).
+    ``armed`` (rev6.6) is the W5d armed record, passed only when given."""
     from cascade.validator.lane_d import settle_lane_d
 
     kw = {"prior_pool_dirs": [Path(p) for p in prior]} if prior else {}
+    if armed is not None:
+        kw["armed"] = armed
     return settle_lane_d(cfg=cfg, boundary=b, pool_dir=pool_dir,
                          entries=[dict(e) for e in entries], house=dict(house_rec),
                          forecasts=fc, uid_of=dict(uid_of), state_path=state_path,
