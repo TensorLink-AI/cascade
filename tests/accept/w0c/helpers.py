@@ -34,6 +34,10 @@ _GIT_IDENTITY = {
 
 def tool_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     env = os.environ.copy()
+    # fixture repos use `(#N)` subjects: never the real repo's merged-PR
+    # labels or CI ledger (the laned-accept workflow exports both, rev6.17)
+    env.pop("LANED_PR_LABELS", None)
+    env.pop("LANED_LEDGER", None)
     env.update(_GIT_IDENTITY)
     # accept/expect-fail run this instead of `uv run --frozen pytest` (README).
     env["LANED_PYTEST_CMD"] = shlex.join([sys.executable, "-m", "pytest", "-p", "no:cacheprovider"])
