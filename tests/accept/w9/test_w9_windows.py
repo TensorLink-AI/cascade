@@ -136,9 +136,20 @@ def draw_block_hash(d):
     d["boundary_block_hash"] = "0x" + hashlib.sha256(b"w9 another block").hexdigest()
 
 
+def _quota(d: dict) -> dict:
+    """The per-cell quota of a draw record: `quota` at its top, or the first
+    cohort's (`cohorts[0].quota`; W5j pins the cells, not the nesting)."""
+    if isinstance(d.get("quota"), dict):
+        return d["quota"]
+    cos = d.get("cohorts") or []
+    assert cos and isinstance(cos[0].get("quota"), dict), "the draw record has no quota"
+    return cos[0]["quota"]
+
+
 def draw_quota(d):
-    cell = sorted(d["quota"])[0]
-    d["quota"][cell] = int(d["quota"][cell]) + 1
+    q = _quota(d)
+    cell = sorted(q)[0]
+    q[cell] = int(q[cell]) + 1
 
 
 FORGERIES = [_param("embargo_hours", 24.0), _param("min_fresh_window_share", 0.25),
@@ -214,7 +225,7 @@ def test_rev610_the_draw_caps_the_set_and_is_deterministic(tmp_path_factory):
     assert max(by_src.values()) <= float(cfg.max_source_share) * len(ids)
     assert ids == r1["cohorts"][0]["window_ids"], "the seeded draw is deterministic"
     (dr,) = _draws(r0)
-    assert sum(int(q) for q in dr["quota"].values()) <= DRAW_CAP
+    assert sum(int(q) for q in _quota(dr).values()) <= DRAW_CAP
     assert dr["max_windows_per_settlement"] == DRAW_CAP
     h.assert_pass(r0, cfg, "honest capped draw")
 

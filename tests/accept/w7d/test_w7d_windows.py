@@ -176,9 +176,20 @@ def draw_block_hash(d):
     d["boundary_block_hash"] = "0x" + hashlib.sha256(b"w7d another block").hexdigest()
 
 
+def _quota(d: dict) -> dict:
+    """The per-cell quota of a draw record: `quota` at its top, or the first
+    cohort's (`cohorts[0].quota`; W5j pins the cells, not the nesting)."""
+    if isinstance(d.get("quota"), dict):
+        return d["quota"]
+    cos = d.get("cohorts") or []
+    assert cos and isinstance(cos[0].get("quota"), dict), "the draw record has no quota"
+    return cos[0]["quota"]
+
+
 def draw_quota(d):
-    cell = sorted(d["quota"])[0]
-    d["quota"][cell] = int(d["quota"][cell]) + 1
+    q = _quota(d)
+    cell = sorted(q)[0]
+    q[cell] = int(q[cell]) + 1
 
 
 FORGERIES = [_param("embargo_hours", 24.0), _param("min_fresh_window_share", 0.25),
@@ -250,7 +261,7 @@ def test_rev610_the_draw_caps_the_set_and_the_replay_rederives_it(tmp_path_facto
     assert max(by_src.values()) <= float(c0.cfg.max_source_share) * len(ids)
     assert ids == r1["cohorts"][0]["window_ids"], "the seeded draw is deterministic"
     ds = _draws(r0)
-    assert ds and sum(int(q) for q in ds[0][1]["quota"].values()) <= DRAW_CAP
+    assert ds and sum(int(q) for q in _quota(ds[0][1]).values()) <= DRAW_CAP
     res = replay(c0.pub)
     assert [r.status for r in res] == [mod.MATCH], describe(res)
 
