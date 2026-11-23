@@ -19,9 +19,15 @@ A, B = "a" * 64, "b" * 64
 
 
 def _host(tmp_path, run, **kw):
+    import inspect
+
+    cls = h.host_mod().SSHBenchHost
+    assert "settings" in inspect.signature(cls).parameters, \
+        "SSHBenchHost(..., settings=) carries lane A's sidecar settings (README)"
     kw.setdefault("cache_dir", "/root/lane_d_cache")
     kw.setdefault("budget_bytes", 10 ** 11)
-    host = h.host_mod().SSHBenchHost(h.hosts_file(tmp_path), run=run, **kw)
+    kw.setdefault("settings", dict(h.SETTINGS))
+    host = cls(h.hosts_file(tmp_path), run=run, **kw)
     host.set_contexts({A: 4096, B: 16384})
     return host
 
@@ -36,8 +42,9 @@ def test_round_trip(tmp_path):
     assert "cascade.eval.lane_d_bench_sweep" in remote and " sweep" in remote
     assert "10.0.0.7" in " ".join(call["argv"]), "the hosts file's host"
     req = run.request()
-    assert set(req) == {"schema", "digests", "suites", "contexts", "grants"}, \
-        "only names, contexts and grants leave the box: no weights, no histories"
+    assert set(req) == {"schema", "digests", "suites", "contexts", "grants", "settings"}, \
+        "only names, contexts, grants and sidecar settings leave the box: no weights"
+    assert req["settings"] == h.SETTINGS, "lane A's sidecar settings, as given"
     assert req["schema"] == h.REQUEST_SCHEMA
     assert req["digests"] == [A, B] and req["suites"] == list(h.SUITES)
     assert req["contexts"] == {A: 4096, B: 16384}
