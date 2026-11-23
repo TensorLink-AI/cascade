@@ -257,6 +257,38 @@ with `crowned` set (`crowned`), a retake without the dethroned miner king in
 the prior kings, court adjusted to match (`prior_kings`), and a
 `duplicate_digest` close of an entry that isn't a copy (`entries[i]`).
 
+## Armed contexts (rev6.6, owner 2026-11-23): `test_w7d_armed.py`
+
+Plan rev6.6 §1.1: the main validator records the armed set and its evidence
+in the signed report, and satellites **verify** it rather than re-deriving
+it from `cfg.contexts`. `params.contexts` stays the declarable set
+(`expected_params` keeps copying `cfg.contexts`). The replay re-implements the
+rule itself, with no import of `cascade.eval.lane_d_scorer` (invariant 12).
+
+- A report with neither `armed_contexts` nor `armed_evidence` has nothing to
+  verify (the legacy, pre-rev6.6 form).
+- Otherwise both must be present, or the absent one is a mismatch at
+  `armed_contexts` or `armed_evidence`. They must also be consistent with the
+  report and with `cfg`:
+  - `armed_evidence.min_long_series == cfg.min_long_series`;
+  - `armed_evidence.min_sources == 20`;
+  - `readiness_sha256` and `t7_sha256` are 64 lower-case hex or `null`;
+  - `variants` is exactly `cfg.contexts`, ascending, each
+    `{context, series, sources, t7_fits, armed}` (non-negative ints, bools);
+  - each `armed == (series >= min_long_series and sources >= min_sources and
+    t7_fits)`;
+  - `armed_contexts` is the armed variants, ascending and non-empty (an
+    empty set can't score anything).
+
+  A violation is a MISMATCH at `armed_contexts` or below `armed_evidence`
+  (for example `armed_evidence.variants[2].armed`,
+  `armed_evidence.min_long_series`).
+- A strict subset of `cfg.contexts` whose evidence supports it MATCHes.
+- The tests splice the fields into an honest chain's settlement 2, then
+  re-sign it with the validator's key and re-issue its receipt
+  (`helpers.doctored`). On main the replay ignores the fields: the consistent
+  cases MATCH (pass) and every lie fails on its MISMATCH assertion.
+
 ## Tests
 
 | row | test |
