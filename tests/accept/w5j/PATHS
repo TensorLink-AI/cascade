@@ -1,0 +1,14 @@
+# W5j seeded per-bin window draw (plan rev6.10 (b), rev6.11 (a)/(b), rev6.12 (a)/(b),
+# §3.0 W5j row; README.md has the contract).
+# The draw: seed, cell capacity, quota split, picks, source cap, minimum fresh share,
+# floors and budget.
+cascade/validator/lane_d_draw.py
+# settle_lane_d builds each cohort's windows through the draw (one draw per
+# cohort, identical for KING_D, the house and every member) and records it.
+cascade/validator/lane_d.py
+cascade/validator/lane_d_frozen.py
+# W8c supplies the inputs the draw reads.
+cascade/validator/lane_d_inputs.py
+# The report carries the draw record and the per-window draw fields.
+cascade/validator/lane_d_report.py
+cascade/validator/schemas/lane_d_report_1.json
