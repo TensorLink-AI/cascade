@@ -20,6 +20,7 @@ review → submit/fund if authorized → track the exact entry → read signed r
 - [Lane A](#lane-a-improve-a-generator): full-model generator experiments.
 - [Lane B](#lane-b-improve-selected-expert-rows): target-specific expert experiments.
 - [Lane C](#lane-c-test-a-marketcast-recipe): future-data application tests.
+- [Lane D](#lane-d-train-and-submit-open-weights): open-weights checkpoints.
 - [Tracking](#track-one-submission-after-funding), [rewards](#rewards-and-burns)
   and [v2 settings](#v2-rollout-and-compatibility-reference).
 
@@ -287,6 +288,33 @@ returns the immutable `data.ref` without committing or funding. Pass that exact
 ref to `lane-c commit` (with `--repo-dir ./my-c`) and, once revealed, funding.
 Uploading publishes the recipe to the registry; it is not part of the offline
 agent loop and requires the human's authorization. Never upload keys or data.
+
+## Lane D: train and submit open weights
+
+Lane D (built, unarmed until a signed overlay arms it) takes a trained
+`cascade_pyramid` checkpoint, not a generator. The human trains it on their
+own hardware, with any data or recipe; the agent can prepare and check the
+entry locally. The full guide is [LANE_D.md](LANE_D.md).
+
+1. Read `cascade status --json` (`lanes.d`) and confirm lane D is active and
+   which contexts are armed.
+2. `cascade lane-d export ./trained --out ./entry` writes the four-file entry
+   (BF16 weights, the repo's `model.py` / `forecast_wrapper.py` bytes) and
+   prints its digest. `cascade lane-d verify ./entry` runs the ingest guards
+   locally; both are offline and free.
+3. `cascade lane-d submit` uploads to the private vault, and
+   `cascade lane-d ready` attests the licence and commits on chain with an
+   immediate reveal. Both need the human's explicit authorization: the upload
+   is a submission and the commit replaces the hotkey's lane A pointer, so
+   use a dedicated hotkey.
+4. Track the entry with `cascade lane-d status https://<intake> --hotkey <ss58>`;
+   a skip carries a typed reason (FAQ in [LANE_D.md](LANE_D.md#lane-d-faq)).
+
+Local scores on the revealed public pool overstate forward gains. Lane D
+judges only forward-only windows whose targets reached our data after both
+models were committed, and a model trained or tuned on revealed snapshots can
+look better locally than it will forward. Treat a local gain as directional,
+never as a predicted crown, and never tune on the eval pool.
 
 ## Preflight and human review
 

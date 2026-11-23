@@ -14,6 +14,7 @@
 - [Generator interface](docs/INTERFACE.md): source, determinism, output shapes, dependencies and resource limits; read before editing a generator.
 - [Validator guide](docs/VALIDATOR.md): choose satellite, full evaluator or designated main-validator responsibilities.
 - [Operator runbook](docs/OPERATOR.md): services, capacity, release configuration, recovery and publishing.
+- [Lane D guide](docs/LANE_D.md): open weights: checkpoint format, `cascade lane-d` export/verify/submit/ready/status, forward-only judging, caps, skip reasons and FAQ. Lane D needs no compute keys; submit and commit need human authorization.
 
 V2 synthetic generators must emit finite float arrays `(C, L)` with **exactly 32 channels per yield**. One-dimensional and 1–31-channel yields are rejected. Read the effective policy for length and resource limits.
 
@@ -23,8 +24,9 @@ V2 Lane A is live on mainnet: paid A entries opened **2026-10-30 09:00 UTC**
 and the first v2 era started at the first era boundary after 12:00 UTC
 (block 9,399,600). Use a revealed commitment made at or after the opening;
 earlier reveals are refused. Settlements are 900 blocks (about 3 h) apart;
-an era is 4 settlements (about 12 h). B/C activation remains separate.
-Planned order: **A → C → B**.
+an era is 4 settlements (about 12 h). B, C and D activation are separate:
+each lane is armed on its own (lane D by a signed overlay at an era boundary),
+so read `lanes` in `cascade status --json` rather than assuming an order.
 
 From the intended release's installed environment:
 
@@ -115,6 +117,7 @@ series longer than 4096 are cropped into random 4096-point windows.
 | A | Synthetic data for the full fixed model | Beats the king on private tests and active public benchmark gates; a later checked promotion can advance the shared starting checkpoint |
 | B | Synthetic data for declared targets; the trainer selects expert rows | Passes target and regression tests, then merge acceptance when enabled; accepted updates enter the shared starting model and earn target rewards |
 | C | Currently an eligible MarketCast recipe on a separately pinned Timestral base | Passes future-data tests and later confirmation, then wins an application slot; it does not merge into A/B |
+| D | Miner-trained BF16 weights for the fixed cascade_pyramid architecture (built, unarmed) | Beats the lane D king on forward-only private windows and the gate, then confirms; crowned kings are published. See [LANE_D.md](docs/LANE_D.md) |
 
 V1 centred on full-model data competition with the Toto2 lineage. V2 starts a
 fresh Cascade mixture-of-experts lineage and adds B/C. Discover what is open;

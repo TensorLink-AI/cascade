@@ -35,6 +35,8 @@ remains unspecified and blocked.
 7. [C competition changes](#lane-c-competitions-add-re-weight-end-dec-ca-0056)
 8. [Network config overlays](#network-config-overlays-dec-ca-0057): change
    verdict / payout constants without a fleet release
+9. [Lane D operations](#lane-d-operations-open-weights): intake, vault,
+   launch eval host, S8, first-seen recorder, retention, runbook
 
 ## Before go-live / before a testnet cycle
 
@@ -3480,3 +3482,73 @@ an installed cron or publish a new snapshot. Rebuild from the existing mirror,
 inspect family/drop/window counts, and publish only for a future settlement.
 See [pool build rules](EVAL_POOL.md#v2-pool-size-channel-width-and-evidence).
 A new 32-channel compliant baseline and GPU qualification remain required.
+
+## Lane D operations (open weights)
+
+Lane D ([LANE_D.md](LANE_D.md); plan `docs/plans/LANE_D_PLAN.md` §10) ships
+unarmed (`[lane_d] from_block = 0`). Activation is a signed overlay at an era
+boundary; the kill switch is the overlay `[lane_d] until_block` that
+[`cascade-laned overlay`](#cascade-laned-overlay-lane-d-bring-up-kit-s0c)
+writes. Stages S0–S8 gate the bring-up. Every step that rents, deletes or
+publishes is Approve-tier.
+
+**What runs.** Nothing large transits the box:
+
+| Component | Where | Role |
+|---|---|---|
+| `cascade-laned-intake` | the box, loopback behind Caddy (`deploy/cascade-laned-intake.service`, `python -P -m cascade.lane_d`) | `POST /v1/lane-d/submit`, `POST /v1/lane-d/ready`, `GET /v1/lane-d/queue`; mints `presigned_multipart` upload grants and never logs one |
+| Vault | private bucket `cascade-lane-d-vault`, prefix `lane-d` (`[lane_d_ops] vault_bucket` / `vault_prefix`) | entries at `lane-d/<hotkey>/<digest>/`; never a shared bucket |
+| Launch eval host | `[lane_d_ops] eval_host` (empty until the S4 bring-up) | forecasts for the cohort, KING_D and the house at 4k–16k context |
+| `pool_d` builder | a dedicated small CPU VM | builds the private `pool_d` snapshots; never the box or a rented GPU pod |
+| Main validator | the box | scores forecasts against the `pool_d` targets, runs the bootstrap, signs the `lane-d-report/1` report and writes `lane_d_state.json` |
+
+**The launch eval host runs the pinned torch.** It is valpriv-4090 or another
+pod with the release's `uv sync --frozen` venv (torch 2.4.1+cu124), at least
+24 GB of GPU memory and the worker handshake. It is not valeval-blackwell4:
+Blackwell sm_120 cannot run the pinned torch (only the benchmarks sidecar
+venv), so its numerics would differ and the handshake fails. Bring it up at
+S4 with an on-rent check (`nvidia-smi -L`, VRAM, driver, disk), pinned
+known_hosts and a dry run. It gets presigned GETs only, never a credential.
+
+**S8: long context.** `valeval-laned` (80–96 GB, a pinned-venv GPU such as an
+H100 or A100 80 GB, never Blackwell, at least 300 GB disk for the prefetch
+cache and `pool_d_hist`) is rented only at S8, for the 32k–128k contexts.
+Arm a context only when its T7 row (`cascade/eval/lane_d_t7.py`) fits in at
+most half a settlement and in the host's GPU memory.
+
+**The first-seen recorder (W6fs).** Forward-only judging needs a first-seen
+time for every target point. W6fs adds an append-only ingest log in the forge
+mirror path, used only by the `pool_d` builder, plus a per-feed mirror-lag
+measurement. Its daily Merkle root is committed before any snapshot uses that
+day's records, so first-seen cannot be backdated. It is launch-blocking: a
+series without both clocks, or a feed above `[lane_d] max_mirror_lag_hours`,
+is never eligible.
+
+**Vault retention.** Hippius has no Object Lock and does not apply lifecycle
+rules, so retention is our job. `python -P -m cascade.laned.vault_sweeper`
+moves losers out of the vault `[lane_d] loser_ttl_eras` after judgement into
+an owner-only archive, then deletes archive copies after the 14-day dispute
+window. `--dry-run` writes nothing; a live run needs the owner's standing
+approval (D16). Kings are published to the Hub, R2 and HF mirrors and kept.
+
+**Runbook, per settlement.** Refresh the house if lane A's king digest
+changed. Check that the newest `pool_d` snapshot is pinned (stale over about
+30 h is CRIT; entries stay pending). Forecasts run on the eval host,
+handshake first. The box scores, bootstraps and applies max-T. A candidate
+gets the drawn gate suite on the bench host, behind lane A, paired against
+KING_D and the house. Then come the signed report, `lane_d_state.json` and
+the receipt digests. Faults hold entries at no cost: an eval host or vault
+outage leaves entries queued, a bench outage holds the crowning
+(`bench_hold`, at most `[lane_d] max_bench_holds` settlements), and a
+handshake mismatch scores nothing.
+
+**State.** Protect `lane_d_state.json` like `cascade_state.json`: snapshot
+it before every restart, never hand-edit it, and never restore it across a
+settlement. The S5 restart order is eval host, validator, lane D intake,
+trainer (no legs in flight).
+
+**Alerts.** An entry whose coldkey cannot be resolved raises
+`lane_d_coldkey_unresolved` and closes unjudged after
+`[lane_d] max_coldkey_unresolved_settlements` settlements. Alerts reach a
+webhook only when `/etc/cascade-ops.env` is filled; otherwise they reach only
+`alerts.jsonl`.
