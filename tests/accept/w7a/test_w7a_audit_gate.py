@@ -307,11 +307,11 @@ def test_a_passing_runner_up_crowned_over_a_regressing_best_passes_the_audit(run
 
 
 def test_the_w7a_settlements_with_gate_inputs_pass_the_audit(tmp_path):
-    """W7a's own two-settlement chain (`helpers.two_settlements`, a healthy
+    """W7a's own two-settlement chain (`helpers.loser_then_crown`, a healthy
     bench through `helpers.settle`): a loser, then the gated first-verdict crown."""
     from . import helpers as w7a
 
-    built = w7a.two_settlements(tmp_path)
+    built = w7a.loser_then_crown(tmp_path)
     s2 = built["s2"].report
     assert s2["crowned"] == built["entry"]["digest"]
     assert isinstance(s2.get("gate"), dict), "fixture: W5e wrote no gate record"

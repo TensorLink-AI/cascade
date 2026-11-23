@@ -18,7 +18,7 @@ first verdict and there is no first-clear chain to follow. What stays:
   never gated and never crowned.
 
 Reports come from real `settle_lane_d` calls (W5e's fixtures through
-`test_w7a_audit_gate._build`, W3b5's for A10, W7a's `two_settlements`).
+`test_w7a_audit_gate._build`, W3b5's for A10, W7a's `loser_then_crown`).
 Every doctored report is re-signed by the validator's own key, and every
 doctored case first requires the honest report it starts from to PASS.
 
@@ -441,7 +441,7 @@ def test_honest_first_verdict_reports_pass_the_chain_audit(runs, tmp_path):
         _passes(run["s1"], run["cfg"], f"{name} s1, chain mode", prior=[])
     from . import helpers as w7a
 
-    built = w7a.two_settlements(tmp_path)
+    built = w7a.loser_then_crown(tmp_path)
     _passes(built["s2"].report, built["cfg"], "W7a s2, chain mode", helpers=w7a,
             prior=[built["s1"].report])
 

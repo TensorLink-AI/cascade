@@ -20,8 +20,8 @@ from .helpers import (
     SCHEMA_ERROR_CODES,
     TOP_LEVEL_REQUIRED,
     assert_valid,
+    loser_then_crown,
     reseal,
-    two_settlements,
 )
 
 
@@ -34,7 +34,7 @@ def scratch(tmp_path_factory):
 def _reports(scratch):
     from cascade.validator.lane_d_report import ReportSchemaError, validate_report
 
-    built = two_settlements(scratch)
+    built = loser_then_crown(scratch)
     return built, validate_report, ReportSchemaError
 
 

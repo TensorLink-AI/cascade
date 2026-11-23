@@ -401,13 +401,36 @@ def coldkey(name: str = "coldkey-1") -> str:
 
 
 def two_settlements(tmp: Path, *, rich: bool = True) -> dict:
+    """The single-challenger chain settled at BOUNDARY_1 (snapshot 1) and
+    BOUNDARY_2 (snapshot 2), unchanged for the WPs that import it (W9). Under
+    rev6.11 (b) the challenger is crowned at BOUNDARY_1 already; W7a's own
+    tests use `loser_then_crown`. Built once per scratch dir."""
+    key = f"{tmp}:{rich}"
+    if key not in _CACHE:
+        chain = build_chain(tmp / "chain", rich=rich)
+        e = entry(chain["digests"][0], "challenger", coldkey=coldkey())
+        uid_of = {e["hotkey"]: CHALLENGER_UID}
+        cfg = lane_d_cfg()
+        signer = fixture_key("signer")
+        state = tmp / "state" / "lane_d_state.json"
+        state.parent.mkdir(parents=True, exist_ok=True)
+        s1 = settle(chain, cfg, state, signer, boundary=BOUNDARY_1, snap=1, entries=[e],
+                    uid_of=uid_of)
+        s2 = settle(chain, cfg, state, signer, boundary=BOUNDARY_2, snap=2, entries=[e],
+                    uid_of=uid_of)
+        _CACHE[key] = {"chain": chain, "entry": e, "uid_of": uid_of, "cfg": cfg,
+                       "signer": signer, "state": state, "s1": s1, "s2": s2}
+    return _CACHE[key]
+
+
+def loser_then_crown(tmp: Path, *, rich: bool = True) -> dict:
     """The chain settled at BOUNDARY_1 (snapshot 1) and BOUNDARY_2 (snapshot 2).
     rev6.11 (b): a crown is decided at the FIRST verdict, so BOUNDARY_1
     judges the loser L alone (it loses to the house, which keeps the slot:
     `house_king`) and BOUNDARY_2 judges the challenger, revealed after
     BOUNDARY_1, whose first verdict clears and crowns through the gate.
     Built once per scratch dir; called from test bodies only."""
-    key = f"{tmp}:{rich}"
+    key = f"{tmp}:{rich}:loser"
     if key not in _CACHE:
         chain = build_chain(tmp / "chain", rich=rich)
         e = entry(chain["digests"][0], "challenger", coldkey=coldkey())

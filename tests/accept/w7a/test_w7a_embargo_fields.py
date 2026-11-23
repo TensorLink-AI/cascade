@@ -37,8 +37,8 @@ from .helpers import (
     WINDOW_KINDS,
     WINDOW_RULES,
     assert_valid,
+    loser_then_crown,
     reseal,
-    two_settlements,
     with_embargo_fields,
 )
 
@@ -52,7 +52,7 @@ def scratch(tmp_path_factory):
 
 
 def _base(scratch, **kw) -> dict:
-    built = two_settlements(scratch)
+    built = loser_then_crown(scratch)
     return with_embargo_fields(built["s2"].report, **kw)
 
 
@@ -83,7 +83,7 @@ def test_a_report_with_the_new_fields_validates(scratch, k):
 def test_the_real_reports_carry_the_new_fields(scratch):
     """The producer writes every rev6.10-rev6.12 field itself (W7a's emission;
     the e2e fixture pins e = 0, so every window is fresh, `embargo0`)."""
-    built = two_settlements(scratch)
+    built = loser_then_crown(scratch)
     r = built["s2"].report
     assert_valid(r)
     for k, v in W2E_DEFAULTS.items():

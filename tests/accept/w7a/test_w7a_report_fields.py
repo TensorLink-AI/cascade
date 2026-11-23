@@ -28,7 +28,7 @@ from .helpers import (
     canonical_rows_sha256,
     coldkey,
     finite,
-    two_settlements,
+    loser_then_crown,
     window_id,
 )
 
@@ -40,7 +40,7 @@ def scratch(tmp_path_factory):
 
 
 def _built(scratch, *, rich=True):
-    built = two_settlements(scratch / ("rich" if rich else "legacy"), rich=rich)
+    built = loser_then_crown(scratch / ("rich" if rich else "legacy"), rich=rich)
     for s in (built["s1"], built["s2"]):
         assert s.report is not None, "an armed settlement produced no lane D report"
         assert_valid(s.report)

@@ -575,7 +575,7 @@ and neither `confirm_pending` nor `confirmed` (the name of a held / passing
 non-best outcome is the builder's); `params.confirm_on_king_change` leaves
 the echo (`unknown_field`). Stay on `/1` (plan rec).
 
-**Fixture.** `two_settlements` now judges the loser L alone at BOUNDARY_1
+**Fixture.** `loser_then_crown` (new; `two_settlements` stays as it was for W9, W8b and W8c) judges the loser L alone at BOUNDARY_1
 (lost / `lost_duel`, the house keeps the slot: `house_king`) and the
 challenger, revealed after BOUNDARY_1, at BOUNDARY_2, where its first
 verdict crowns. Every fixture feed pins `embargo_hours: 0` (W5a fails a feed
