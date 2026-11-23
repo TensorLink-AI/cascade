@@ -148,6 +148,19 @@ OWNER_FLAG = "owner_flag"
 ANCHOR_NAME = "anchor.bin"
 ANCHOR_BINDING = "unlocked_anchor"
 
+# The no-lock L4 gate (tests/accept/w3a/README.md "The L4 gate on
+# --no-object-lock evidence"): the probes each upload path depends on
+# (decisions/STORAGE-LANE-D.md "Path ids") plus the ~2.5 GB UploadPartCopy,
+# which every path needs for the server-side king copy at crowning (W6d).
+KING_COPY_PROBE = "upload_part_copy_2_5gb"
+PATH_PROBES = {"presigned_multipart": ("presigned_upload_part", KING_COPY_PROBE),
+               "single_presigned_put": ("single_put_limit", KING_COPY_PROBE),
+               "upload_relay": (KING_COPY_PROBE,)}
+
+# The untracked output of the probe (--out) and of `verify` lives here; an
+# untracked file under it does not make the checkout dirty (tool_info).
+EVIDENCE_DIR = "evidence/"
+
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -204,9 +217,20 @@ def tool_info() -> dict:
                               check=False)
 
     head = git("rev-parse", "HEAD")
-    status = git("status", "--porcelain")
+    # every untracked file listed on its own line, so one under evidence/ (the
+    # probe's --out, verify's rewritten file) can be told apart from the rest
+    status = git("status", "--porcelain", "--untracked-files=all")
     sha = head.stdout.strip() if head.returncode == 0 else ""
-    dirty = status.returncode != 0 or bool(status.stdout.strip())
+
+    def counts(line: str) -> bool:
+        if not line.strip():
+            return False
+        if line.startswith("?? "):
+            path = line[3:].strip().strip('"')
+            return not path.startswith(EVIDENCE_DIR)
+        return True  # any tracked change: modified, staged, deleted, renamed
+
+    dirty = status.returncode != 0 or any(counts(ln) for ln in status.stdout.splitlines())
     return {"module": MODULE, "git_sha": sha, "git_dirty": dirty}
 
 
@@ -1558,7 +1582,33 @@ def _verify_anchors(evidence: dict, client, now: datetime | None) -> dict:
             "verified_at": _iso(at), "tool": tool_info(),
             "endpoint_host": evidence.get("endpoint_host"), "bucket": bucket,
             "run_id": evidence.get("run_id"), "objects": objects,
-            "listing": {"prefix": root, "keys": keys, "request_id": list_rid}}
+            "listing": {"prefix": root, "keys": keys, "request_id": list_rid},
+            "path_verdict": path_verdict(evidence)}
+
+
+def path_verdict(evidence: dict) -> dict:
+    """The top-level verdict of a ``--no-object-lock`` run, recomputed from
+    the evidence body (never from its recorded ``recommended_path`` or
+    ``passed``): ``{"path", "required", "passed"}``. ``path`` is the
+    recommended path of the recorded results, ``required`` the probes it
+    depends on (:data:`PATH_PROBES`); ``passed`` is true iff the evidence is
+    the owner-flag record with both lock probes ``skipped``, every required
+    probe ``pass``, no unlocked leftover, a non-empty ``anchor_objects`` and
+    ``source == "live"``. The other probes' results do not enter it."""
+    rows = [p for p in evidence.get("probes") or [] if isinstance(p, dict)]
+    res = {p.get("name"): p.get("result") for p in rows}
+    path = recommended_path(res)
+    required = list(PATH_PROBES[path])
+    bl = evidence.get("bucket_lock")
+    cleanup = evidence.get("cleanup") if isinstance(evidence.get("cleanup"), dict) else {}
+    passed = (isinstance(bl, dict) and "asserted_by" in bl
+              and evidence.get("source") == "live"
+              and len(rows) == len(PROBES) and set(res) == set(PROBES)
+              and all(res.get(n) == SKIP_RESULT for n in LOCK_PROBES)
+              and all(res.get(n) == "pass" for n in required)
+              and cleanup.get("remaining_unlocked") == []
+              and bool(evidence.get("anchor_objects")))
+    return {"path": path, "required": required, "passed": bool(passed)}
 
 
 def verify_live(evidence: dict, client, *, now: datetime | None = None) -> dict:
