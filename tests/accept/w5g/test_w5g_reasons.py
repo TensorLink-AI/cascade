@@ -47,7 +47,6 @@ REPO = Path(__file__).resolve().parents[3]
 OWNED_ELSEWHERE = {
     "coldkey_changed": "W5h (coldkey re-check at reveal, A8, T6b)",
     "reveal_delay_exceeded": "W5h (max_reveal_delay_days close, A9, T18b)",
-    "lowfreq_regression": "W3b5 (A10 low-frequency check, T4b)",
     "mirror_lag_exceeded": "W5a (max_mirror_lag_hours, A1)",
 }
 
@@ -220,6 +219,40 @@ def case_crowned(tmp_path):
     return _flow(tmp_path, "pass")
 
 
+def case_lowfreq_regression(tmp_path):
+    """W3b5's T4b fixture (tests/accept/w3b5): X first-clears the genesis
+    house at boundary(1), clears its confirmation duel at boundary(2), and
+    regresses 30% on the private pool's daily slice there (the always-run
+    A10 check fails). A judged, final loss: never gated, never crowned."""
+    from tests.accept.w3b5 import helpers as w3
+
+    cfg = w3.lane_d_cfg()
+    h0, x = w3.house(), w3.entry("x", reveal_ts=w3.T_FIRST)
+    hd, xd = h0["digest"], x["digest"]
+    path = tmp_path / "state" / "lane_d_state.json"
+    pool1, recs1 = w3.snapshot(tmp_path, 1, w3.T_FIRST)
+    fc1 = {hd: w3.hourly_forecasts(recs1, "bad", "house-0"),
+           xd: w3.hourly_forecasts(recs1, "sharp", "x")}
+    w3.settle(cfg, w3.boundary(1), pool1, [x], h0, fc1, w3.uids(x), path)
+    lf2 = w3.lowfreq_records("lf2", 8, "D")
+    pool2, recs2 = w3.snapshot(tmp_path, 2, w3.T_FIRST, lf2)
+    fc2 = w3.merge({hd: w3.hourly_forecasts(recs2, "bad", "house-0"),
+                    xd: w3.hourly_forecasts(recs2, "sharp", "x")},
+                   {hd: w3.lowfreq_forecasts(lf2, w3.flat(1.0)),
+                    xd: w3.lowfreq_forecasts(lf2, w3.flat(1.3))})
+    report = w3.settle(cfg, w3.boundary(2), pool2, [x], h0, fc2, w3.uids(x), path).report
+    v = w3.verdict_of(report, xd)
+    assert v is not None and v["stage"] == "confirm" and v["cleared"] is True, \
+        f"fixture: X must clear its confirmation duel: {v!r}"
+    assert v["lowfreq"]["result"] == "fail", f"fixture: the A10 check must fail: {v['lowfreq']!r}"
+    assert v["outcome"] == "lost", v["outcome"]
+    assert report["crowned"] is None, "a low-frequency regression must not crown"
+    assert report["king_after"] == report["king_before"]
+    assert "gate" not in report or xd not in repr(report["gate"]), \
+        "a lowfreq_regression candidate is never gated"
+    return path, report, xd
+
+
 # case id → (builder, exact reason, exact status | a tuple of allowed statuses,
 #            listed in report.skipped?)
 CASES = {
@@ -249,6 +282,7 @@ CASES = {
     "bench_hold_requeued": (case_bench_hold_requeued, "bench_hold", "pending", True),
     "gate_regression": (case_gate_regression, "gate_regression", "lost", False),
     "crowned": (case_crowned, "crowned", "crowned", False),
+    "lowfreq_regression": (case_lowfreq_regression, "lowfreq_regression", "lost", False),
 }
 
 
