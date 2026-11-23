@@ -65,7 +65,9 @@ def target_values(series_id: str, start: int) -> tuple[np.ndarray, np.ndarray]:
 
 def write_pool(directory: Path, recs: list[dict], snapshot: str = "w5j") -> Path:
     directory.mkdir(parents=True, exist_ok=True)
-    feeds = {f: {"mirror_lag_hours": 1.0, "forecast_product": False}
+    # W5a (rev6.10 (a)): every listed feed pins its embargo_hours (a feed
+    # without it fails closed as unlisted_feed); 0 keeps every window fresh.
+    feeds = {f: {"mirror_lag_hours": 1.0, "forecast_product": False, "embargo_hours": 0.0}
              for f in sorted({r["feed"] for r in recs})}
     meta = {"schema": "pool_d/1", "snapshot": snapshot, "horizon": HORIZON,
             "feeds": feeds, "series": recs}
