@@ -1,7 +1,8 @@
 """W-S2: lane B guard/target exclusion for the era's §16 sentinel (plan §3.0,
 §16 rule 2, D33 / D35; T-row TS4).
 
-The W-S2 row, verbatim:
+The W-S2 row (its description as of rev4; rev6.2 appends an owner follow-up
+note on the acceptance sentinel, pinned too):
 
     | W-S2 | **(rev4: now in §3)** lane B guard/target exclusion for the
     sentinel | — | W-S1 | ci | `scripts/laned/accept W-S2` (TS4) |
@@ -53,10 +54,33 @@ def _public_keys(j) -> set[str]:
 # ── the plan text ────────────────────────────────────────────────────────────
 
 
+def _plan_row(text: str, wp: str) -> list[str]:
+    """The cells of the plan's WP table row for ``wp`` (exactly one row)."""
+    rows = [ln for ln in text.splitlines() if ln.startswith(f"| {wp} | ")]
+    assert len(rows) == 1, f"expected exactly one plan row for {wp}; got {len(rows)}"
+    cells = [c.strip() for c in rows[0].strip().strip("|").split(" | ")]
+    assert len(cells) == 6, f"{wp} row has {len(cells)} cells: {cells!r}"
+    return cells
+
+
 def test_plan_rows_pinned():
     text = h.PLAN.read_text(encoding="utf-8")
-    assert ("| W-S2 | **(rev4: now in §3)** lane B guard/target exclusion for the sentinel "
-            "| — | W-S1 | ci | `scripts/laned/accept W-S2` (TS4) |") in text
+    # The W-S2 row: id, outputs, depends, runs-in and accept cells exact; the
+    # description keeps its original phrase (later revisions may append notes).
+    wid, desc, outputs, depends, runs_in, accept = _plan_row(text, "W-S2")
+    assert (wid, outputs, depends, runs_in, accept) == (
+        "W-S2", "—", "W-S1", "ci", "`scripts/laned/accept W-S2` (TS4)")
+    assert desc.startswith(
+        "**(rev4: now in §3)** lane B guard/target exclusion for the sentinel"), desc
+    # rev6.2 (#636) owner-decision note: the acceptance-sentinel follow-up.
+    flat_desc = _flat(desc)
+    for note in (
+        "**(rev6.2, owner 2026-11-22) Follow-up:**",
+        "a warm-start acceptance made at an era-init block is governed by the sentinel "
+        "of the era that init block opens",
+        "trainer `accept_candidates`, validator `verify_acceptance`",
+    ):
+        assert note in flat_desc, note
     assert ("| TS4 | **(rev4: now in §4)** Lane B entry targeting the sentinel | "
             "Deferred (D35) |") in text
     assert "| TS4 | W-S2, WB18 |" in text
