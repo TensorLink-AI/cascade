@@ -1469,11 +1469,17 @@ traffic_steal_bound      = 0.02        # §12b.2
 open_rule                = "cogate"    # §12b.4: "tokens_king_check" (D41) by overlay after the release
 sentinel_target_rule     = "defer"     # D35 (a)
 sentinel_max_defer_eras  = 4           # §12b.5
-# D42 leg cost: lane B's own GPU list (starts as [round] funded_pod_skus; editing
-# it never opens a GPU to lane A), the miner train_hours cap (0.5 h grid) and the
-# leg guard train_hours x guard_factor + overhead, capped at max_leg_seconds
-# ([training] max_train_seconds is never edited for it).
-funded_pod_skus          = ["8xH200", "8xH100", "4xH200", "4xH100"]
+# D42 leg cost: lane B's own GPU list (editing it never opens a GPU to lane A),
+# the miner train_hours cap (0.5 h grid) and the leg guard train_hours x
+# guard_factor + overhead, capped at max_leg_seconds ([training]
+# max_train_seconds is never edited for it).
+# WB22 list (owner 2026-11-23): lane A's data-centre multi-GPU ladder ([round]
+# funded_pod_skus) plus 8xRTX4090, for lane B only. No single-GPU layout
+# (1xRTX4090 "too slow": WB19 measured 0.055 steps/s on one GPU; WB25 trains
+# an expert leg on every GPU of the layout). A type rents only once WB19 has
+# measured its step rate on the pinned image (evidence/wb19.json); until
+# then a lane B fund choosing it is refused gpu_rate_unmeasured.
+funded_pod_skus          = ["8xH200", "8xH100", "4xH200", "4xH100", "8xRTX4090"]
 max_leg_hours            = 6.0
 max_leg_seconds          = 27000       # 6 h x 1.25
 guard_factor             = 1.25
@@ -1641,7 +1647,7 @@ until_block     = 0              # 0 = no end; an era boundary after from_block 
 share           = 0.0            # of the total, carved from takes_from (D1: 0.25 from lane_a by overlay)
 takes_from      = "lane_b"       # lane_a | lane_b | lane_c
 remainder       = "burn"         # release-only burn destination (D21)
-contexts        = [4096, 8192, 16384]  # D2 launch set; subset of 4k..128k (cap 131072)
+contexts        = [4096, 8192, 16384, 32768, 65536, 131072]  # D2 rev6.6: declarable from launch (cap 131072); each arms per settlement on its gates
 horizon         = 64             # points; <= 512 (§1.1)
 dtypes          = ["BF16"]       # D14: BF16 only
 forward_margin_hours = 6.0       # D5
@@ -1652,6 +1658,11 @@ max_source_share = 0.25          # B14
 d_margin        = 0.01           # D5
 alpha           = 0.05
 bootstrap_B     = 10000
+embargo_hours   = 48.0           # W2e rev6.10 (a)/rev6.12 (a): per-series embargo top-up, every cadence (0 = the rev3 rule)
+max_windows_per_settlement = 5000  # W2e rev6.11 (a): per-bin draw cap; >= min_windows
+min_fresh_window_share = 0.5     # W2e rev6.12 (b): fresh share of a frozen set (1 = fresh only)
+backtest_weight_cap = 0.05       # W2e rev6.9: slow-cadence backtest weight cap (0 = off); owner 2026-11-23: ON at launch
+backtest_ratio_floor = 0.85      # W2e rev6.9 (a): cap > 0 needs 1 - floor**cap < d_margin
 gate_suites     = ["gift", "boom", "time", "fev"]  # §16 names
 gate_weights    = { gift = 1.0, boom = 1.0, time = 1.0, fev = 1.0 }  # D2b: equal (absent = equal over gate_suites)
 tau_public      = 0.01

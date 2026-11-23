@@ -4,9 +4,14 @@
   :data:`SCORING_LEVELS` (picked out of the head's Q21 by exact level match,
   nothing interpolated), as lane A does under ``[v2] quantile_head_after``.
   No copula sampling, no Monte-Carlo noise.
-* **Declared contexts.** A forecast runs only at a context in
-  :data:`SCORER_CONTEXTS` and, when the armed ``[lane_d] contexts`` are
-  given, in those too (:func:`declared_context`). Horizons are capped at
+* **Declared, armed and effective contexts (rev6.6).** ``[lane_d]
+  contexts`` is the set a miner may DECLARE (every variant from launch).
+  :func:`armed_record` computes, per settlement, which variants are ARMED
+  (readiness and T7 gates, from the pinned documents' bytes); an entry is
+  scored at :func:`effective_context`: its declared context when armed, else
+  the highest armed variant. A forecast runs only at a context in
+  :data:`SCORER_CONTEXTS` and, when the armed set is given, in it too
+  (:func:`declared_context`). Horizons are capped at
   :data:`MAX_HORIZON` (16 CPM patches × 32: longer spans are outside
   training). Both are refused before anything is loaded or torch imported.
 * **No padding.** Each history is truncated to the largest patch multiple it
@@ -30,6 +35,7 @@ it without torch.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import operator
 import os
@@ -45,8 +51,9 @@ MEDIAN_INDEX = SCORING_LEVELS.index(0.5)
 SCORING_METHOD = "quantile_head"
 
 # Every context the scorer builds a model at: the trained 4096 (128 patches)
-# and its 2×…32× extensions. ``[lane_d] contexts`` arms a subset of these
-# (launch: 4k/8k/16k; 32k–128k by overlay at S8 after T7).
+# and its 2×…32× extensions. ``[lane_d] contexts`` (rev6.6: all six from
+# launch) is the declarable set; each variant arms per settlement on its two
+# gates (:func:`armed_record`), never by overlay.
 SCORER_CONTEXTS: tuple[int, ...] = (4096, 8192, 16384, 32768, 65536, 131072)
 # CPM masks contiguous spans of at most cpm_c_max = 16 patches of 32 points.
 MAX_HORIZON = 16 * 32
@@ -62,12 +69,14 @@ def _as_int(value, what: str) -> int:
 
 
 def declared_context(context, contexts) -> int:
-    """``int(context)`` when it is an armed context (in ``contexts``) and a
-    scorer context (in :data:`SCORER_CONTEXTS`); ``ValueError`` otherwise."""
+    """``int(context)`` when it is in ``contexts`` (the set the forecast may
+    run at: the settlement's armed set, or the declarable ``[lane_d]
+    contexts``) and a scorer context (in :data:`SCORER_CONTEXTS`);
+    ``ValueError`` otherwise."""
     c = _as_int(context, "context")
-    armed = {_as_int(x, "armed context") for x in contexts}
-    if c not in armed:
-        raise ValueError(f"context {c} is not an armed [lane_d] context {sorted(armed)}")
+    allowed = {_as_int(x, "allowed context") for x in contexts}
+    if c not in allowed:
+        raise ValueError(f"context {c} is not in the allowed lane D contexts {sorted(allowed)}")
     if c not in SCORER_CONTEXTS:
         raise ValueError(f"context {c} is not a scorer context {list(SCORER_CONTEXTS)}")
     return c
@@ -78,6 +87,164 @@ def _checked_horizon(horizon) -> int:
     if not 1 <= h <= MAX_HORIZON:
         raise ValueError(f"horizon {h} outside [1, {MAX_HORIZON}] (16 CPM patches x 32)")
     return h
+
+
+# ── per-variant arming (plan rev6.6, §1.1 context bullet; W5d) ──────────────
+# Every [lane_d] contexts value is declarable from launch. A variant is ARMED
+# at a settlement only when both gates pass: (1) readiness, at least
+# ``min_long_series`` series from at least GATE_MIN_SOURCES sources can use it
+# (the W1/R16 per-rung counts, a ``laned_readiness/1`` document); (2) T7, its
+# wall time and memory fit the settlement budget on the eval host (the
+# ``laned_t7/1`` pod document). Pure and numpy-free: the box-side settlement
+# (W7a) records the result, with the documents' sha256s, in the signed report.
+
+GATE_MIN_SOURCES = 20
+READINESS_SCHEMA = "laned_readiness/1"
+T7_SCHEMA = "laned_t7/1"
+_T7_POD_SOURCE = "pod"
+_T7_PEAK_SOURCE = "cuda_max_allocated"
+
+
+def _doc(raw, what: str) -> dict:
+    """Strict JSON object from the pinned document bytes (NaN refused)."""
+    if not isinstance(raw, (bytes, bytearray)):
+        raise ValueError(f"{what} must be the document bytes, got {type(raw).__name__}")
+
+    def _no_constant(name):
+        raise ValueError(f"{what}: non-finite number {name}")
+
+    try:
+        doc = json.loads(bytes(raw).decode("utf-8"), parse_constant=_no_constant)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{what} is not JSON: {exc}") from None
+    if not isinstance(doc, dict):
+        raise ValueError(f"{what} is not a JSON object")
+    return doc
+
+
+def _count(value, what: str) -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{what} must be a non-negative integer, got {value!r}")
+    return value
+
+
+def _readiness_counts(raw) -> dict[int, tuple[int, int]]:
+    """``{context: (series, sources)}`` from a ``laned_readiness/1`` document."""
+    doc = _doc(raw, "readiness")
+    if doc.get("schema") != READINESS_SCHEMA:
+        raise ValueError(f"readiness schema must be {READINESS_SCHEMA!r}, got {doc.get('schema')!r}")
+    rungs = doc.get("rungs")
+    if not isinstance(rungs, list):
+        raise ValueError("readiness has no rungs list")
+    out: dict[int, tuple[int, int]] = {}
+    for i, rung in enumerate(rungs):
+        if not isinstance(rung, dict):
+            raise ValueError(f"readiness rung {i} is not an object")
+        c = rung.get("context")
+        if type(c) is not int or c not in SCORER_CONTEXTS:
+            raise ValueError(f"readiness rung {i}: context {c!r} is not a scorer context")
+        if c in out:
+            raise ValueError(f"readiness rung {i}: duplicate context {c}")
+        out[c] = (_count(rung.get("series"), f"rung {c} series"),
+                  _count(rung.get("sources"), f"rung {c} sources"))
+    return out
+
+
+def _finite_number(value, what: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value):
+        raise ValueError(f"{what} must be a finite number, got {value!r}")
+    return float(value)
+
+
+def _t7_fits(raw) -> dict[int, bool]:
+    """``{variant: passes gate 2}`` from a ``laned_t7/1`` document. ``fits``
+    is recomputed from each row's numbers; a stated value that disagrees is a
+    hand edit and is refused. Only pod evidence measured with each variant's
+    own CUDA peak is a budget input."""
+    doc = _doc(raw, "t7")
+    if doc.get("schema") != T7_SCHEMA:
+        raise ValueError(f"t7 schema must be {T7_SCHEMA!r}, got {doc.get('schema')!r}")
+    rows = doc.get("rows")
+    if not isinstance(rows, list):
+        raise ValueError("t7 has no rows list")
+    pod = doc.get("source") == _T7_POD_SOURCE
+    out: dict[int, bool] = {}
+    for i, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise ValueError(f"t7 row {i} is not an object")
+        v = row.get("variant")
+        if type(v) is not int or v not in SCORER_CONTEXTS:
+            raise ValueError(f"t7 row {i}: variant {v!r} is not a scorer context")
+        if v in out:
+            raise ValueError(f"t7 row {i}: duplicate variant {v}")
+        budget = row.get("budget")
+        if not isinstance(budget, dict):
+            raise ValueError(f"t7 row {v}: no budget")
+        fits = (_finite_number(row.get("wall_s"), f"t7 row {v} wall_s")
+                <= _finite_number(budget.get("wall_s"), f"t7 row {v} budget.wall_s")
+                and _finite_number(row.get("peak_mem_gb"), f"t7 row {v} peak_mem_gb")
+                <= _finite_number(budget.get("mem_gb"), f"t7 row {v} budget.mem_gb"))
+        if row.get("fits") is not fits:
+            raise ValueError(f"t7 row {v}: stated fits {row.get('fits')!r} disagrees with "
+                             f"its numbers ({fits})")
+        exercised = row.get("input_len") == v and type(row.get("history_min")) is int \
+            and row["history_min"] >= v
+        out[v] = bool(fits and pod and exercised
+                      and row.get("peak_mem_source") == _T7_PEAK_SOURCE)
+    return out
+
+
+def armed_record(contexts, *, readiness, t7, min_long_series) -> dict:
+    """The armed variants of ``contexts`` and the evidence they were armed on.
+
+    ``readiness`` / ``t7`` are the pinned ``laned_readiness/1`` and
+    ``laned_t7/1`` document bytes (``None`` when absent: that gate fails for
+    every variant). Returns ``{"armed_contexts": [...], "evidence":
+    {"min_long_series", "min_sources", "readiness_sha256", "t7_sha256",
+    "variants": [{"context", "series", "sources", "t7_fits", "armed"}]}}``,
+    ascending by context. Deterministic in its inputs. ``ValueError`` on a
+    malformed document or a context outside :data:`SCORER_CONTEXTS`."""
+    ctxs = sorted({_as_int(c, "context") for c in contexts})
+    if not ctxs or any(c not in SCORER_CONTEXTS for c in ctxs):
+        raise ValueError(f"contexts {ctxs} must be a non-empty subset of {list(SCORER_CONTEXTS)}")
+    floor = _count(_as_int(min_long_series, "min_long_series"), "min_long_series")
+    counts = {} if readiness is None else _readiness_counts(readiness)
+    fits = {} if t7 is None else _t7_fits(t7)
+    variants = []
+    for c in ctxs:
+        series, sources = counts.get(c, (0, 0))
+        t7_ok = bool(fits.get(c, False))
+        variants.append({"context": c, "series": series, "sources": sources, "t7_fits": t7_ok,
+                         "armed": series >= floor and sources >= GATE_MIN_SOURCES and t7_ok})
+    return {"armed_contexts": [v["context"] for v in variants if v["armed"]],
+            "evidence": {
+                "min_long_series": floor, "min_sources": GATE_MIN_SOURCES,
+                "readiness_sha256": None if readiness is None
+                else hashlib.sha256(bytes(readiness)).hexdigest(),
+                "t7_sha256": None if t7 is None else hashlib.sha256(bytes(t7)).hexdigest(),
+                "variants": variants}}
+
+
+def effective_context(declared, armed_contexts) -> int | None:
+    """The context an entry is scored at: ``declared`` when it is armed, else
+    the highest armed variant below ``declared``, else ``None`` (plan rev6.15,
+    owner 2026-11-23, "Highest ≤ declared, else skip": no armed variant is ≤
+    ``declared``, so the entry is not scored this settlement and the
+    settlement skips it ``context_below_armed``). A model never runs past the
+    context its miner declared. Rev6.6: an unarmed declaration is valid and is
+    scored at its own context from the settlement its variant arms.
+    ``ValueError`` when nothing is armed or ``declared`` is not a scorer
+    context."""
+    d = _as_int(declared, "declared context")
+    if d not in SCORER_CONTEXTS:
+        raise ValueError(f"declared context {d} is not a scorer context {list(SCORER_CONTEXTS)}")
+    armed = {_as_int(c, "armed context") for c in armed_contexts}
+    if not armed:
+        raise ValueError("no armed lane D context: nothing can be scored")
+    if d in armed:
+        return d
+    below = [c for c in armed if c < d]
+    return max(below) if below else None
 
 
 def level_indices(head_levels, wanted=SCORING_LEVELS, tol: float = 1e-9) -> list[int]:
@@ -162,8 +329,10 @@ def forecast_quantiles(checkpoint_dir: str | os.PathLike, histories, *, context:
     """``(n, horizon, 9)`` quantile forecasts of ``histories`` at
     :data:`SCORING_LEVELS`.
 
-    ``contexts`` is the armed ``[lane_d] contexts``: with it ``context`` must
-    pass :func:`declared_context`; without it ``context`` must still be in
+    ``context`` is the context to run at (an entry's
+    :func:`effective_context`) and ``contexts`` the settlement's armed set:
+    with it ``context`` must pass :func:`declared_context`; without it
+    ``context`` must still be in
     :data:`SCORER_CONTEXTS`. ``horizon`` must be in ``[1, MAX_HORIZON]``.
     Both checks run before anything is loaded or torch is imported. Each
     window's model input is its last :func:`batch_plan` length points plus

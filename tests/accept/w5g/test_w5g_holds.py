@@ -4,14 +4,15 @@ candidate re-queues unjudged. Deliberately not lane A's never-timeout hold";
 RV7: "bench holds never expire and aren't capped"). README.md has the
 contract.
 
-X clears its confirmation at boundary 2; every later boundary re-uses that
+X clears at its first verdict at boundary 2 (plan rev6.11 (b): a first
+clear is the crowning candidate); every later boundary re-uses that
 snapshot, so a held X can only be re-gated, never re-duelled. With
-`max_bench_holds = N`, N consecutive `bench_hold` outcomes keep the clear;
-the next one re-queues X: status `pending`, reason `bench_hold`, the held
-clear and its confirmation dropped, not lost, not closed, not crowned.
+`max_bench_holds = N`, N consecutive `bench_hold` outcomes keep the clear in
+status `hold`; the next one re-queues X: status `pending`, reason
+`bench_hold`, the held clear dropped, not lost, not closed, not crowned.
 
-On main a hold never ends: X stays `confirm_pending` / `bench_hold`
-forever, so the exhaustion tests fail on an AssertionError.
+On main the old code first-clears X at boundary 1 and confirms at boundary
+2, so these tests fail on an AssertionError.
 """
 
 from __future__ import annotations
@@ -36,7 +37,8 @@ from .helpers import (
     verdict_of,
 )
 
-HELD_STATUSES = ("hold", "confirm_pending")
+# rev6.11 (b): a held first clear stays open as `hold` (no confirm_pending).
+HELD_STATUSES = ("hold",)
 T_LATE = T_X + 60 * DAY   # revealed after every fixture window: never frozen
 
 
@@ -74,18 +76,26 @@ def _assert_requeued(f: Flow, report):
         assert all(r["outcome"] != "pass" for r in gate.get("results", [])), gate
 
 
-def _assert_requeue_is_judged_afresh(f: Flow):
+def _assert_requeue_is_judged_afresh(f: Flow, mode: str = "pass"):
     """The settlement after the re-queue, on a fresh snapshot: X is duelled
-    again (rows, a verdict at stage `first`), never re-gated on the old clear."""
+    again (rows, a verdict at stage `first`), never re-gated on the old clear.
+    rev6.11 (b): that first verdict is decided at once, crowned on a passing
+    gate (`mode` "pass"), held on a hold mode. Returns the report."""
     snap = max(f.pools) + 1
-    report = f.next("pass", snap=snap)
+    report = f.next(mode, snap=snap)
     v = verdict_of(report, f.x["digest"])
     assert v is not None, "a re-queued entry was not judged on the fresh snapshot"
     assert v["stage"] == "first", f"a re-queued entry restarts its duel: {v['stage']}"
+    assert v["cleared"] is True, v
     assert rows_of(report, f.x["digest"]), "a re-queued entry must be re-duelled (rows)"
-    assert report["crowned"] is None
     rec = f.state_entry()
-    assert (rec["status"], rec["reason"]) == ("confirm_pending", "confirm_pending")
+    if mode == "pass":
+        assert report["crowned"] == f.x["digest"]
+        assert (rec["status"], rec["reason"]) == ("crowned", "crowned")
+    else:
+        assert report["crowned"] is None
+        assert (rec["status"], rec["reason"]) == ("hold", "bench_hold")
+    return report
 
 
 @pytest.mark.parametrize("limit", [0, 2, None], ids=["max0", "max2", "default4"])
@@ -140,18 +150,18 @@ def test_every_kind_of_hold_counts(tmp_path):
 
 def test_the_bound_counts_consecutive_holds_of_one_clear(tmp_path):
     """The count belongs to one held clear: a re-queued entry that clears
-    and confirms again starts a new count."""
+    again (at its new first verdict) starts a new count."""
     cfg = lane_d_cfg(max_bench_holds=1)
     f = Flow(tmp_path, mode2="no_bench", cfg=cfg)
     _assert_held(f, f.reports[2], 1)
     _assert_requeued(f, f.next("host_down"))
-    _assert_requeue_is_judged_afresh(f)                     # snapshot 3: first clear
-    report = f.next("reference_fault", snap=4)              # snapshot 4: confirm, held
-    v = verdict_of(report, f.x["digest"])
-    assert v is not None and v["stage"] == "confirm" and v["cleared"], f"fixture: {v}"
+    # snapshot 3: a new first clear, held: hold 1 of the new clear (with
+    # max_bench_holds = 1 the old count would re-queue it here).
+    report = _assert_requeue_is_judged_afresh(f, mode="reference_fault")
     _assert_held(f, report, 1)
-    report = f.next("pass", snap=4)
+    report = f.next("pass", snap=3)
     assert report["crowned"] == f.x["digest"]
+    assert rows_of(report, f.x["digest"]) == set(), "a held candidate was re-duelled"
     assert f.king() == f.x["digest"]
 
 

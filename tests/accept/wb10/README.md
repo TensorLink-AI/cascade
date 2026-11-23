@@ -59,7 +59,7 @@ tuples, so either form is fine. `contamination_min_hits` is a TOML table
 | `open_rule` | `"cogate"` | §12b.4: "default `"cogate"`, so unarmed digests don't move" |
 | `sentinel_target_rule` | `"defer"` | D35 (a) |
 | `sentinel_max_defer_eras` | 4 | §12b.5 recommended |
-| `funded_pod_skus` | the same file's `[round] funded_pod_skus` | D42 (mainnet `["8xH200","8xH100","4xH200","4xH100"]`; read from the file) |
+| `funded_pod_skus` | the same file's `[round] funded_pod_skus` | D42 (mainnet `["8xH200","8xH100","4xH200","4xH100"]`; read from the file). **Tests-correction 2026-11-23:** this is the PARSER default (key absent). The SHIPPED value is WB22's (lane B's own GPU list, owner 2026-11-23), so the shipped-table and drop-when-default tests only require it to parse; it moves no consensus digest |
 | `max_leg_hours` | 6.0 | D42 |
 | `max_leg_seconds` | 27000 (6 h × 1.25) | §12b.6 |
 | `guard_factor` | 1.25 | §12b.6 recommended |

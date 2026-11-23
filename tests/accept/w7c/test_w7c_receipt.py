@@ -20,11 +20,12 @@ from .helpers import (
     RECEIPT_ERROR_CODES,
     RECEIPT_KEYS,
     STATE_ERROR_CODES,
-    Chain,
+    W7cChain,
     body_sha,
     boundary,
     canonical,
     is_hex64,
+    other_crown,
     receipt_of,
     sha,
     state_sha,
@@ -35,7 +36,7 @@ from .helpers import (
 
 def _chain_run(tmp_path, upto: int):
     """A clean run: settlements, and the state file bytes after each."""
-    chain = Chain(tmp_path)
+    chain = W7cChain(tmp_path)
     path = chain.state_path("run")
     runs, states = [], []
     for n in range(1, upto + 1):
@@ -69,7 +70,7 @@ def _resign(report: dict, key) -> dict:
 
 
 def test_receipt_unchanged_when_unarmed(tmp_path):
-    chain = Chain(tmp_path)
+    chain = W7cChain(tmp_path)
     path = chain.state_path("unarmed")
     s = chain.settle(1, path, cfg=unarmed_cfg())
     assert s.report is None and s.pay is None
@@ -249,7 +250,7 @@ def test_a_swapped_report_at_the_same_boundary_is_refused(tmp_path):
     chain, _, runs, _ = _chain_run(tmp_path, 2)
     _, r2 = _receipts(runs)
     swapped = copy.deepcopy(runs[1].report)
-    swapped["crowned"] = None
+    swapped["crowned"] = other_crown(swapped, chain)
     swapped = _resign(swapped, chain.signer)
     with pytest.raises(ValueError) as e:
         verify_receipt(r2, report=swapped)
@@ -276,7 +277,7 @@ def test_a_tampered_state_file_breaks_the_receipt_chain(tmp_path):
         verify_receipt_chain,
     )
 
-    chain = Chain(tmp_path)
+    chain = W7cChain(tmp_path)
     path = chain.state_path("run")
     s1 = chain.settle(1, path)
     (r1,) = _receipts([s1])
@@ -319,7 +320,7 @@ def test_the_signed_report_is_persisted_before_the_state(tmp_path, monkeypatch):
 
     from cascade.validator.lane_d_state import load_report_file, report_path
 
-    chain = Chain(tmp_path)
+    chain = W7cChain(tmp_path)
     path = chain.state_path("run")
     order = []
     real = os.replace

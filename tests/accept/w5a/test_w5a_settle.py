@@ -7,7 +7,8 @@
 * invariant 10 pair: unarmed nothing is judged or written; armed the trap
   windows are refused and the eligible ones scored;
 * the skeleton end to end with trap windows on which the challenger is
-  catastrophically wrong: refused, so it still clears, confirms and is paid.
+  catastrophically wrong: refused, so it still clears, is crowned (rev6.11:
+  at its first verdict) and is paid.
 
 On main the settlement scores the clock-passing traps (over-lag, forecast
 product, backfill, absent from S0), so these fail on an assertion.
@@ -199,9 +200,9 @@ def _trap_chain(tmp_path):
     return cfg, entry, house, snaps, {entry["hotkey"]: CHALLENGER_UID}
 
 
-def _assert_no_trap_scored(report, traps, by_wid, feeds, cfg):
+def _assert_no_trap_scored(report, traps, by_wid, feeds, cfg, *, require_rows=True):
     wids = {r["window_id"] for r in report["rows"]}
-    assert wids, "the armed settlement scored no rows"
+    assert wids or not require_rows, "the armed settlement scored no rows"
     scored_traps = sorted(wids & traps)
     assert not scored_traps, f"ineligible windows were scored: {scored_traps[:5]}"
     bound = bound_of(T0, HOUSE_T, cfg)
@@ -249,7 +250,10 @@ def test_e2e_skeleton_refuses_trap_windows_and_still_pays_the_challenger(tmp_pat
         pool_dir, fc, traps, feeds, by_wid = snaps[n]
         s = _settle(cfg, boundary, pool_dir, [entry], house, fc, uid_of, state_path)
         assert s.report is not None, f"boundary {boundary}: no report"
-        _assert_no_trap_scored(s.report, traps, by_wid, feeds, cfg)
+        # rev6.11 (b): the challenger is crowned at its first verdict
+        # (BOUNDARY_1); BOUNDARY_2 may then judge nothing.
+        _assert_no_trap_scored(s.report, traps, by_wid, feeds, cfg,
+                               require_rows=boundary == BOUNDARY_1)
         reports.append(s)
     s2 = reports[-1]
     state = json.loads(state_path.read_text())

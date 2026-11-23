@@ -126,6 +126,8 @@ def test_inv12_a_full_replay_loads_no_producer_module_and_no_torch(saved):
                          timeout=CHAIN_TIMEOUT)
     assert out.returncode == 0, out.stderr[-2000:]
     got = json.loads(out.stdout.strip().splitlines()[-1])
-    assert len(got["results"]) == 4, got["results"]
+    # `house_bar` settles b1..b3 (rev6.11 (b), #755: X crowned at b2, Y at b3).
+    assert len(got["results"]) == 3, got["results"]
+    assert all(r["status"] == "MATCH" for r in got["results"]), got["results"]
     bad = [m for m in got["modules"] if forbidden(m)]
     assert not bad, f"a replay loads {bad}"

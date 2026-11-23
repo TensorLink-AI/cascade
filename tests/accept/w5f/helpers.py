@@ -133,7 +133,7 @@ def target_values(series_id: str, start: int) -> tuple[np.ndarray, np.ndarray]:
 
 def write_pool(directory: Path, records: list[dict], snapshot: str) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
-    feeds = {r["feed"]: {"mirror_lag_hours": FEED_LAG_HOURS, "forecast_product": False}
+    feeds = {r["feed"]: {"mirror_lag_hours": FEED_LAG_HOURS, "forecast_product": False, "embargo_hours": 0.0}
              for r in records}
     meta = {"schema": "pool_d/1", "snapshot": snapshot, "horizon": HORIZON,
             "feeds": dict(sorted(feeds.items())), "series": records}
@@ -367,8 +367,9 @@ class Chain:
 
 
 def crown_x(chain: Chain) -> None:
-    """boundary(1): X (fair) first-clears against the genesis house H0 (bad);
-    boundary(2): X confirms on a disjoint snapshot and passes the gate."""
+    """boundary(1): X (fair) clears against the genesis house H0 (bad) at its
+    first verdict and, through the gate, is crowned (plan rev6.11 (b): no
+    confirmation duel); boundary(2): X holds KING_D, nothing is judged."""
     chain.model(H0["digest"], "bad", "house-0")
     chain.model(X["digest"], "fair", "x")
     chain.run(1, [X], H0)
@@ -379,8 +380,9 @@ def crown_x(chain: Chain) -> None:
 
 
 def crown_y(chain: Chain) -> None:
-    """boundary(3)/(4): Y (good) clears KING_D = X and the house bar H0, then
-    confirms: Y is KING_D and X its prior miner king."""
+    """boundary(3): Y (good) clears KING_D = X and the house bar H0 at its
+    first verdict and is crowned (rev6.11 (b)); boundary(4) judges nothing:
+    Y is KING_D and X its prior miner king."""
     chain.model(Y["digest"], "good", "y")
     chain.run(3, [X, Y], H0)
     chain.run(4, [X, Y], H0, candidates=[Y["digest"]],

@@ -182,6 +182,78 @@ Unarmed, `build_lane_d_inputs` returns `None` and `build_lane_d_step`
 returns `None`. Handling a `None` source when building `bench` is the
 builder's job.
 
+### Armed contexts (rev6.6; tests-correction 2026-11-23, `test_w8c_armed.py`)
+
+The plan's rev6.6 section and §1.1 context bullet: "The main validator
+computes the armed set per settlement and records it, with the evidence it
+used, in the signed report". W5d (`armed_record`, `effective_context`, #744)
+and W7a (`settle_lane_d(..., armed=)`, `check_armed`) are merged; this
+source is what computes the set in production. Until this correction the
+source treated `cfg.lane_d.contexts` (the DECLARABLE set) as armed and never
+passed `armed=`, so no production report carried `armed_contexts`.
+
+```
+build_lane_d_inputs(cfg, *, ..., readiness, t7) -> source | None   # both REQUIRED keyword-only
+readiness() -> bytes      # the pinned laned_readiness/1 document's bytes, read at every call
+t7() -> bytes             # the pinned laned_t7/1 document's bytes, read at every call
+LaneDInputs.armed         # new field on W8b's dataclass, default None (W8b unchanged)
+DocumentFile(path)        # production source: () -> the file's bytes, re-read at every call
+SSHEvalHost.set_armed(contexts)   # the request's "contexts" becomes the armed set
+```
+
+- **Unarmed / at build:** neither document source is called.
+- **`source(boundary)`** reads both documents once, on the calling thread,
+  after the pools and before the eval host is contacted, and computes
+  `armed = lane_d_scorer.armed_record(cfg.lane_d.contexts, readiness=<bytes>,
+  t7=<bytes>, min_long_series=cfg.lane_d.min_long_series)`. The returned
+  `LaneDInputs.armed` is exactly that record; W8b's step passes it to
+  `settle_lane_d(..., armed=inputs.armed)` (`getattr(inputs, "armed", None)`,
+  so an inputs object without the field settles as before), and the signed
+  report then carries `armed_contexts` / `armed_evidence` (W7a).
+- **Forecast contexts:** each digest is forecast at
+  `effective_context(declared, armed["armed_contexts"])`: an entry or a
+  miner KING_D at its declared context when armed, else the highest armed
+  variant below it, ~~else the lowest armed one~~ **(plan rev6.15, owner
+  2026-11-23)** else **not forecast at all** (`effective_context` is
+  `None`: no armed variant ≤ the declared context; the settlement skips the
+  entry `context_below_armed`, and a miner KING_D without a forecast makes
+  its cohort `king_unscored`; no new input error, the tick is not refused);
+  the house (and a house KING_D) as declared 4096 (the trained length). The
+  house declares no context of its own, so the rev6.15 skip doesn't apply
+  to it: when no armed variant is ≤ 4096 it runs at the lowest armed one,
+  as before. The skip is deterministic: the same documents give the same
+  eval-host calls. The entry rows keep their
+  declared `context` (settle_lane_d records it). An entry whose declared
+  context is not in `cfg.lane_d.contexts` is not forecast (settle_lane_d
+  closes it at registration, `context_not_armed`).
+- **The eval host:** when it has `set_armed`, the source calls
+  `set_armed(armed_contexts)` once per settlement, after the handshake and
+  before the first forecast. `SSHEvalHost` then sends that list as the
+  request's `contexts` (the eval host's `declared_context` gate); before any
+  `set_armed` it sends `cfg.lane_d.contexts` as today.
+- **The inputs TOML** gains two required keys, `readiness` and `t7` (absolute
+  paths of the two documents); `load_inputs_services` returns
+  `readiness=DocumentFile(...)`, `t7=DocumentFile(...)`. The documents are
+  re-read per settlement, so a readiness update arms a variant at the next
+  settlement without a restart; the report pins the bytes used by sha256.
+
+**Fail closed** (each a `LaneDInputsError`, nothing written, no hello and no
+forecast; W8b reports `inputs_unavailable` with it as `__cause__`):
+
+| Input | Code |
+|---|---|
+| `readiness()` raises (absent, unreadable) | `readiness_unavailable` |
+| `t7()` raises (absent, unreadable) | `t7_unavailable` |
+| `armed_record` refuses a document (not JSON, wrong schema, bad counts, a T7 row whose stated `fits` disagrees with its numbers) | `armed_invalid` |
+| no variant passes both gates (nothing can be scored) | `no_armed_context` |
+
+Consensus: deterministic in (boundary, sources, document bytes); lane A is
+untouched; unarmed is byte-identical. Satellites verify the recorded record
+(W7d `armed_*` checks) and do not re-read the documents.
+
+Builder PATHS: `cascade/validator/lane_d_wiring.py` is added (the
+`LaneDInputs.armed` field and the `armed=` pass-through only).
+
 ### Invariants
 
 - **1:** above (unarmed: `None`, nothing used, nothing created).
@@ -196,8 +268,8 @@ builder's job.
 ## Fixtures and services
 
 W8b's fixture (`tests/accept/w8b/helpers.py`, W7a's synthetic chain, numpy
-only): X is revealed at `REVEAL_BLOCK`, first-clears at B1 and is crowned at
-B2 (uid 6). The intake queue file is written in the real format. The house
+only): X is revealed at `REVEAL_BLOCK`, is listed from B1 and is crowned at
+its first verdict at B1 (uid 6; plan rev6.11 (b)). The intake queue file is written in the real format. The house
 pointer is a real W5f pointer signed by a test key. Fakes stand in for the
 reader, the W6d pin list, the eval host (W7a's forecasts), the bench pod
 (W8b's) and the bucket. The eval-host tests use a real `PrefetchCache` with
@@ -215,8 +287,9 @@ chain, storage, pod, torch, GPU or real key; everything lives under
   settlement is byte-identical.
 - **The house's context.** The pointer carries none. Any context in
   `[lane_d] contexts` passes here. 4096 (the trained length) is the obvious
-  choice. The rev6.6 "highest armed variant" rule for unarmed declared
-  contexts isn't in this WP.
+  choice. The ~~rev6.6 "highest armed variant"~~ **(rev6.15)** "highest
+  armed variant ≤ declared, else skip" rule for unarmed declared contexts is
+  W5d's `effective_context`; this WP only applies it (and skips `None`).
 - **The metagraph** is read at head (`registered_hotkeys`), as the intake's
   registration gate does. A boundary-pinned metagraph would need a public
   `ChainClient` read at a block (owner call; not added here).
@@ -236,3 +309,16 @@ Every source and eval-host test fails with `ModuleNotFoundError` for
 subprocess. The invariant 12 check and the `main()` AST check fail on
 assertions. `test_inv12_nothing_on_the_weight_path_imports_the_source` passes
 on main. Run locally with `-m "not torch"` (no test here needs torch).
+
+## Correction (plan rev6.11 (b)): crown at the first verdict
+
+The confirmation duel is dropped (owner 2026-11-23): a crown is decided at
+the first verdict, first clear (max-T LCB vs KING_D) ∧ A10 ∧ the §1.3b gate.
+The source lists X from B1 (its reveal is before B1), so X is crowned at B1.
+`test_step_with_the_source_settles_like_the_hand_built_inputs` keeps its
+report-for-report comparison with W8b's hand-built inputs at B1..B3 and now
+reads the crown from the B1 report (with the armed set), asserts B2 and B3
+crown nothing and that uid 6 is KING_D's court slot at B1, B2 and B3 (it
+checked B2 only). Nothing is weakened. On main the old code still runs the
+confirmation stage (X is crowned at B2), so the changed test fails on an
+assertion until the W5e implementation lands.

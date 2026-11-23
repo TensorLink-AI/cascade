@@ -55,7 +55,7 @@ class One:
     """One settlement at boundary(n) on snapshot 1 with a healthy bench."""
 
     def __init__(self, tmp_path, entries, *, cfg=None, models=None, uid_of=None, fc_edit=None,
-                 n=1):
+                 n=1, armed=None):
         self.cfg = cfg or lane_d_cfg()
         self.h0 = house()
         self.path = tmp_path / "state" / "lane_d_state.json"
@@ -70,7 +70,7 @@ class One:
         hash_, bench, _ = gate_inputs("pass", entries[0]["digest"], self.h0["digest"], "b1")
         self.report = settle(self.cfg, boundary(n), pool1, entries, self.h0, fc,
                              uids(*entries) if uid_of is None else uid_of, self.path,
-                             hash_=hash_, bench=bench).report
+                             hash_=hash_, bench=bench, armed=armed).report
 
 
 def _x(**over):
@@ -136,6 +136,27 @@ def case_context_not_armed(tmp_path):
     return r.path, r.report, x["digest"]
 
 
+def _armed_record(armed, contexts=(4096, 8192, 16384), mls=300) -> dict:
+    """A consistent W5d armed record (written by hand, no W5d import): armed
+    variants pass both gates, the others fail the readiness gate."""
+    variants = [{"context": c, "series": 4633 if c in armed else 12,
+                 "sources": 42 if c in armed else 3, "t7_fits": True, "armed": c in armed}
+                for c in contexts]
+    return {"armed_contexts": [c for c in contexts if c in armed],
+            "evidence": {"min_long_series": mls, "min_sources": 20,
+                         "readiness_sha256": "a1" * 32, "t7_sha256": "b2" * 32,
+                         "variants": variants}}
+
+
+def case_context_below_armed(tmp_path):
+    """Plan rev6.15 (owner 2026-11-23, "Highest ≤ declared, else skip"):
+    declared 4096 with only 8192 and 16384 armed. The entry is not judged and
+    stays pending (W7a owns the producer side; this is the reason's case)."""
+    x = _x(context=4096)
+    r = One(tmp_path, [x], armed=_armed_record((8192, 16384)))
+    return r.path, r.report, x["digest"]
+
+
 def case_checkpoint_fault_forecasts(tmp_path):
     x = _x()
 
@@ -154,33 +175,11 @@ def case_lane_closed(tmp_path):
     return r.path, r.report, x["digest"]
 
 
-def case_confirm_pending(tmp_path):
-    x = _x()
-    r = One(tmp_path, [x])
-    return r.path, r.report, x["digest"]
-
-
 def case_lost_duel(tmp_path):
     x = _x()
     r = One(tmp_path, [x], models={house()["digest"]: ("good", "house-0"),
                                    x["digest"]: ("bad", "x")})
     return r.path, r.report, x["digest"]
-
-
-def case_lost_confirmation(tmp_path):
-    cfg = lane_d_cfg()
-    h0 = house()
-    x = _x()
-    path = tmp_path / "state" / "lane_d_state.json"
-    report = None
-    for n, q in ((1, "sharp"), (2, "bad")):
-        pool, recs = snapshot(tmp_path, n)
-        hash_, bench, _ = gate_inputs("pass", x["digest"], h0["digest"], f"b{n}")
-        report = settle(cfg, boundary(n), pool, [x], h0,
-                        forecasts(recs, {h0["digest"]: ("fair", "house-0"),
-                                         x["digest"]: (q, "x")}),
-                        uids(x), path, hash_=hash_, bench=bench).report
-    return path, report, x["digest"]
 
 
 def _flow(tmp_path, mode2):
@@ -220,10 +219,11 @@ def case_crowned(tmp_path):
 
 
 def case_lowfreq_regression(tmp_path):
-    """W3b5's T4b fixture (tests/accept/w3b5): X first-clears the genesis
-    house at boundary(1), clears its confirmation duel at boundary(2), and
-    regresses 30% on the private pool's daily slice there (the always-run
-    A10 check fails). A judged, final loss: never gated, never crowned."""
+    """W3b5's T4b fixture (tests/accept/w3b5): boundary(1) lists no entry; X
+    enters at boundary(2), clears the genesis house at its first verdict
+    (rev6.11 (b)) and regresses 30% on the private pool's daily slice there
+    (the always-run A10 check fails). A judged, final loss: never gated,
+    never crowned."""
     from tests.accept.w3b5 import helpers as w3
 
     cfg = w3.lane_d_cfg()
@@ -233,7 +233,8 @@ def case_lowfreq_regression(tmp_path):
     pool1, recs1 = w3.snapshot(tmp_path, 1, w3.T_FIRST)
     fc1 = {hd: w3.hourly_forecasts(recs1, "bad", "house-0"),
            xd: w3.hourly_forecasts(recs1, "sharp", "x")}
-    w3.settle(cfg, w3.boundary(1), pool1, [x], h0, fc1, w3.uids(x), path)
+    s1 = w3.settle(cfg, w3.boundary(1), pool1, [], h0, fc1, w3.uids(x), path)
+    assert s1.report["judged"] == [], "fixture: boundary(1) lists no entry"
     lf2 = w3.lowfreq_records("lf2", 8, "D")
     pool2, recs2 = w3.snapshot(tmp_path, 2, w3.T_FIRST, lf2)
     fc2 = w3.merge({hd: w3.hourly_forecasts(recs2, "bad", "house-0"),
@@ -242,8 +243,8 @@ def case_lowfreq_regression(tmp_path):
                     xd: w3.lowfreq_forecasts(lf2, w3.flat(1.3))})
     report = w3.settle(cfg, w3.boundary(2), pool2, [x], h0, fc2, w3.uids(x), path).report
     v = w3.verdict_of(report, xd)
-    assert v is not None and v["stage"] == "confirm" and v["cleared"] is True, \
-        f"fixture: X must clear its confirmation duel: {v!r}"
+    assert v is not None and v["stage"] == "first" and v["cleared"] is True, \
+        f"fixture: X must clear at its first verdict: {v!r}"
     assert v["lowfreq"]["result"] == "fail", f"fixture: the A10 check must fail: {v['lowfreq']!r}"
     assert v["outcome"] == "lost", v["outcome"]
     assert report["crowned"] is None, "a low-frequency regression must not crown"
@@ -267,18 +268,17 @@ CASES = {
     "hotkey_has_open_entry": (case_hotkey_has_open_entry, "hotkey_has_open_entry",
                               "closed", True),
     "context_not_armed": (case_context_not_armed, "context_not_armed", "closed", True),
+    "context_below_armed": (case_context_below_armed, "context_below_armed", "pending", True),
     "checkpoint_fault_forecasts": (case_checkpoint_fault_forecasts, "checkpoint_fault",
                                    "closed", True),
     "checkpoint_fault_gate": (case_checkpoint_fault_gate, "checkpoint_fault", "closed", False),
     "checkpoint_fault_regate": (case_checkpoint_fault_regate, "checkpoint_fault",
                                 "closed", True),
     "lane_closed": (case_lane_closed, "lane_closed", "closed", True),
-    "confirm_pending": (case_confirm_pending, "confirm_pending", "confirm_pending", False),
     "lost_duel": (case_lost_duel, "lost_duel", "lost", False),
-    "lost_confirmation": (case_lost_confirmation, "lost_confirmation", "lost", False),
-    "bench_hold": (case_bench_hold, "bench_hold", ("hold", "confirm_pending"), False),
-    "bench_hold_regate": (case_bench_hold_regate, "bench_hold", ("hold", "confirm_pending"),
-                          True),
+    # rev6.11 (b): a held first clear is `hold` (no confirm_pending).
+    "bench_hold": (case_bench_hold, "bench_hold", "hold", False),
+    "bench_hold_regate": (case_bench_hold_regate, "bench_hold", "hold", True),
     "bench_hold_requeued": (case_bench_hold_requeued, "bench_hold", "pending", True),
     "gate_regression": (case_gate_regression, "gate_regression", "lost", False),
     "crowned": (case_crowned, "crowned", "crowned", False),
@@ -352,6 +352,21 @@ def _emitted_reasons() -> set[str]:
              and id(n) not in docstrings and n.value in reasons}
     found |= set(map(str, lane_d_report.GATE_OUTCOMES)) & reasons
     return found
+
+
+def test_no_confirm_stage_reason_or_status_exists():
+    """rev6.11 (b): the confirmation duel is dropped. `confirm_pending` and
+    `lost_confirmation` are in no reason or status enum, and the settlement
+    emits neither (W5e: "Drop `lost_confirmation`; a loss is `lost_duel`")."""
+    from cascade.validator import lane_d_report, lane_d_state
+
+    for name in ("confirm_pending", "lost_confirmation"):
+        for enum in (lane_d_report.ENTRY_REASONS, lane_d_state.ENTRY_REASONS,
+                     lane_d_report.SKIP_REASONS):
+            assert name not in tuple(map(str, enum)), name
+        assert name not in _emitted_reasons(), name
+    for enum in (lane_d_report.ENTRY_STATUSES, lane_d_state.ENTRY_STATUSES):
+        assert "confirm_pending" not in tuple(map(str, enum))
 
 
 def test_every_reason_the_settlement_can_emit_has_a_case():

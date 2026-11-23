@@ -407,6 +407,12 @@ def test_runner_ops_dispatch_funded_leg_on_the_miners_key(cfg, tmp_path, monkeyp
                                gpu_name="L40S")
 
     monkeypatch.setattr(TrainerRunner, "_run_funded_leg", run)
+    # WB22: no step-rate table wired here (no rate gate); the gate itself is
+    # pinned by tests/accept/wb22
+    import cascade.funding.lane_b_gpus as lbg
+
+    monkeypatch.setattr(lbg, "lane_b_gpus_from_env",
+                        lambda cfg, **kw: lbg.lane_b_gpus(cfg, None))
     ops = RunnerLaneBOps(r, client=None, window_source=None)
     assert ops.miner_funded
     leg = OpenLeg(sub=LaneBSubmission("alice", 7, GEN, "energy", 5,
@@ -415,7 +421,7 @@ def test_runner_ops_dispatch_funded_leg_on_the_miners_key(cfg, tmp_path, monkeyp
                   funding={"entry_ref": "x", "gpu": "H100", "gpu_allow_fallback": True})
     for _ in range(2):
         ev = threading.Event()
-        ops.dispatch_leg(leg, 3, 7300, lambda leg, ptr, *a, failure=None, ev=ev:
+        ops.dispatch_leg(leg, 3, 7300, lambda leg, ptr, *a, failure=None, ev=ev, **kw:
                          (results.append((ptr, failure)), ev.set()))
         assert ev.wait(5)
     gen, suffix, kw = calls[0]

@@ -22,7 +22,9 @@ from dataclasses import dataclass, field
 
 LANE_D_TAKES_FROM = ("lane_a", "lane_b", "lane_c")
 LANE_D_REMAINDERS = ("burn",)
-# D2: the context variants an entry may be judged at; 131072 is the cap.
+# D2 (rev6.6): the context variants an entry may DECLARE, all of them from
+# launch; 131072 is the cap. Arming is computed per settlement from its two
+# gates (cascade.eval.lane_d_scorer.armed_record), never configured here.
 LANE_D_CONTEXTS = (4096, 8192, 16384, 32768, 65536, 131072)
 LANE_D_MAX_CONTEXT = 131072
 # §1.1: any lane D horizon is at most 16 CPM patches x 32 points.
@@ -50,7 +52,7 @@ class LaneDConfig:
     takes_from: str = "lane_b"
     remainder: str = "burn"
     # What an entry is judged at (§1.1, D2, D14).
-    contexts: tuple[int, ...] = (4096, 8192, 16384)
+    contexts: tuple[int, ...] = LANE_D_CONTEXTS
     horizon: int = 64
     dtypes: tuple[str, ...] = LANE_D_DTYPES
     # Forward-only judging (§1.3, D5).
@@ -62,6 +64,17 @@ class LaneDConfig:
     d_margin: float = 0.01
     alpha: float = 0.05
     bootstrap_B: int = 10_000
+    # W2e (rev6.10 (a)/(b), rev6.11 (a), rev6.12 (b)): the per-series embargo
+    # top-up (0 = the rev3 rule), the per-settlement window cap (>= min_windows)
+    # and the minimum fresh share of a frozen set (1 = fresh windows only).
+    embargo_hours: float = 48.0
+    max_windows_per_settlement: int = 5000
+    min_fresh_window_share: float = 0.5
+    # W2e (rev6.9 (a)): slow-cadence backtest scoring weight cap (0 = off) and
+    # its ratio floor; cap > 0 needs 1 - floor ** cap < d_margin. Owner
+    # 2026-11-23: 0.05, ON at launch (1 - 0.85 ** 0.05 ~ 0.0081 < 0.01).
+    backtest_weight_cap: float = 0.05
+    backtest_ratio_floor: float = 0.85
     # Rotating external-benchmark gate (§1.3b, D2b) and the A10 slice.
     gate_suites: tuple[str, ...] = LANE_D_GATE_SUITES
     gate_weights: tuple[tuple[str, float], ...] = tuple((s, 1.0) for s in LANE_D_GATE_SUITES)
@@ -236,7 +249,7 @@ def parse_lane_d(raw: object, *, era_blocks_at: Callable[[int], int] | None = No
     if rem not in LANE_D_REMAINDERS:
         raise ValueError(f"[lane_d] remainder must be one of {LANE_D_REMAINDERS}; got {rem!r}")
 
-    contexts = _contexts(ld.get("contexts", [4096, 8192, 16384]))
+    contexts = _contexts(ld.get("contexts", list(LANE_D_CONTEXTS)))
     horizon = _int(ld.get("horizon", 64), "horizon", lo=1, hi=LANE_D_MAX_HORIZON)
     dtypes = _dtypes(ld.get("dtypes", list(LANE_D_DTYPES)))
     fwd = _float(ld.get("forward_margin_hours", 6.0), "forward_margin_hours")
@@ -276,6 +289,29 @@ def parse_lane_d(raw: object, *, era_blocks_at: Callable[[int], int] | None = No
     models = _str_list(ld.get("teacher_models", ()), "teacher_models")
     if mode == "explicit" and not models:
         raise ValueError("[lane_d] teacher_mode = 'explicit' needs teacher_models")
+    # W2e keys and their cross-key checks (re-run at every overlay adoption:
+    # netconfig.validate_overlay rebuilds the merged config through here).
+    min_windows = _int(ld.get("min_windows", 1000), "min_windows", lo=1)
+    d_margin = _open_unit(ld.get("d_margin", 0.01), "d_margin")
+    embargo = _float(ld.get("embargo_hours", 48.0), "embargo_hours")
+    if embargo < 0.0:
+        raise ValueError(f"[lane_d] embargo_hours must be >= 0; got {embargo!r}")
+    max_windows = _int(ld.get("max_windows_per_settlement", 5000),
+                       "max_windows_per_settlement", lo=1)
+    if max_windows < min_windows:
+        raise ValueError(f"[lane_d] max_windows_per_settlement={max_windows} must be >= "
+                         f"min_windows={min_windows}")
+    fresh = _float(ld.get("min_fresh_window_share", 0.5), "min_fresh_window_share")
+    if not 0.0 <= fresh <= 1.0:
+        raise ValueError(f"[lane_d] min_fresh_window_share must be in [0, 1]; got {fresh!r}")
+    bt_cap = _float(ld.get("backtest_weight_cap", 0.05), "backtest_weight_cap")
+    if not 0.0 <= bt_cap < 1.0:
+        raise ValueError(f"[lane_d] backtest_weight_cap must be in [0, 1); got {bt_cap!r}")
+    bt_floor = _open_unit(ld.get("backtest_ratio_floor", 0.85), "backtest_ratio_floor")
+    if bt_cap > 0.0 and not (1.0 - bt_floor ** bt_cap) < d_margin:
+        raise ValueError(f"[lane_d] backtest_weight_cap={bt_cap} needs 1 - backtest_ratio_floor"
+                         f" ** backtest_weight_cap < d_margin (rev6.9 (a)); got "
+                         f"{1.0 - bt_floor ** bt_cap:.6f} >= {d_margin}")
     margin = float(ld.get("gain_margin", 0.01))
     if not 0.0 < margin < 1.0:
         raise ValueError(f"[lane_d] gain_margin must be in (0, 1); got {margin}")
@@ -284,13 +320,16 @@ def parse_lane_d(raw: object, *, era_blocks_at: Callable[[int], int] | None = No
         from_block=fb, until_block=ub, share=share, takes_from=takes, remainder=rem,
         contexts=contexts, horizon=horizon, dtypes=dtypes,
         forward_margin_hours=fwd,
-        min_windows=_int(ld.get("min_windows", 1000), "min_windows", lo=1),
+        min_windows=min_windows,
         min_clusters=_int(ld.get("min_clusters", 20), "min_clusters", lo=1),
         min_long_series=_int(ld.get("min_long_series", 300), "min_long_series", lo=0),
         max_source_share=_half_open_unit(ld.get("max_source_share", 0.25), "max_source_share"),
-        d_margin=_open_unit(ld.get("d_margin", 0.01), "d_margin"),
+        d_margin=d_margin,
         alpha=_open_unit(ld.get("alpha", 0.05), "alpha"),
         bootstrap_B=_int(ld.get("bootstrap_B", 10_000), "bootstrap_B", lo=100),
+        embargo_hours=embargo, max_windows_per_settlement=max_windows,
+        min_fresh_window_share=fresh, backtest_weight_cap=bt_cap,
+        backtest_ratio_floor=bt_floor,
         gate_suites=suites, gate_weights=gate_w, tau_public=tau, lowfreq_freqs=lowfreq,
         reward_prior_kings=_int(ld.get("reward_prior_kings", 2), "reward_prior_kings", lo=0),
         king_decay=_half_open_unit(ld.get("king_decay", 0.5), "king_decay"),

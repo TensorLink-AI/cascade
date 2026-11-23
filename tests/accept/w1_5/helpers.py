@@ -118,7 +118,7 @@ def make_series(snapshot: int, seed: int) -> list[dict]:
 def feeds_block(series: list[dict]) -> dict:
     """The top-level ``feeds`` block: every feed the series name, with a
     measured lag under the limit and not a forecast product."""
-    return {feed: {"mirror_lag_hours": FEED_LAG_HOURS, "forecast_product": False}
+    return {feed: {"mirror_lag_hours": FEED_LAG_HOURS, "forecast_product": False, "embargo_hours": 0.0}
             for feed in sorted({s["feed"] for s in series})}
 
 

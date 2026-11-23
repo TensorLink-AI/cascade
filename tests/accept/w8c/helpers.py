@@ -26,8 +26,9 @@ format, written here), the W6d pin list (:class:`Pool`), the eval host
 (:class:`EvalHost`: the W4 hello plus W7a's synthetic forecasts), the
 source's chain reader (:class:`Reader`: block timestamps and the registered
 hotkeys, ``ChainClient`` method names) and the bench pod (W8b's
-``BenchHost``). The house pointer is a real W5f signed pointer under a test
-key. No chain, storage, pod, torch or real key. Nothing here imports a module
+``BenchHost``). rev6.6: the readiness and T7 documents (:class:`Doc`) arm
+4096 and 8192 by default (16384 lacks long series). The house pointer is a
+real W5f signed pointer under a test key. No chain, storage, pod, torch or real key. Nothing here imports a module
 in PATHS at import time.
 """
 
@@ -63,6 +64,52 @@ MINER_FAULT_CODES = ("checkpoint_refused", "forecast_malformed")
 
 GIT_HEAD = "a" * 40
 PACKAGE_HASH = "b" * 64
+
+# rev6.6 armed contexts (README "Armed contexts"): the codes a refused
+# readiness / T7 document or an empty armed set gives, and the fixture's
+# default armed set (W7a's contexts are 4096 / 8192 / 16384).
+ARMED_CODES = ("readiness_unavailable", "t7_unavailable", "armed_invalid", "no_armed_context")
+CONTEXTS = (4096, 8192, 16384)
+DEFAULT_ARMED = (4096, 8192)
+
+
+def assert_takes_armed_docs() -> None:
+    """rev6.6: ``build_lane_d_inputs`` takes the readiness and T7 document
+    sources as required keywords. On a build without them every test that
+    builds a source fails here, on an assertion, never a ``TypeError``."""
+    import inspect
+
+    p = inspect.signature(inputs_mod().build_lane_d_inputs).parameters
+    for name in ("readiness", "t7"):
+        assert name in p, f"rev6.6: build_lane_d_inputs(..., {name}=) takes the {name} document"
+        assert p[name].kind is inspect.Parameter.KEYWORD_ONLY, f"{name} is keyword-only"
+        assert p[name].default is inspect.Parameter.empty, \
+            f"{name} is required: a missing document fails closed, it never defaults"
+
+
+def readiness_doc(armed=DEFAULT_ARMED, contexts=CONTEXTS) -> bytes:
+    """A ``laned_readiness/1`` document: a context in ``armed`` has enough
+    long series from enough sources (4633 from 42), the others don't (12
+    from 3)."""
+    rungs = [{"context": c, "series": 4633 if c in armed else 12,
+              "sources": 42 if c in armed else 3} for c in contexts]
+    return json.dumps({"schema": "laned_readiness/1", "rungs": rungs},
+                      sort_keys=True).encode("utf-8")
+
+
+def t7_doc(fits=CONTEXTS, contexts=CONTEXTS, *, lie: int | None = None) -> bytes:
+    """A ``laned_t7/1`` pod document: a variant in ``fits`` is inside its
+    budget, the others are over it. ``lie`` states ``fits`` wrongly for that
+    variant (a hand edit the scorer refuses)."""
+    rows = []
+    for v in contexts:
+        ok = v in fits
+        rows.append({"variant": v, "wall_s": 600.0 if ok else 99999.0,
+                     "peak_mem_gb": 8.0, "budget": {"wall_s": 5400.0, "mem_gb": 24.0},
+                     "fits": (not ok) if v == lie else ok, "input_len": v, "history_min": v,
+                     "peak_mem_source": "cuda_max_allocated"})
+    return json.dumps({"schema": "laned_t7/1", "source": "pod", "rows": rows},
+                      sort_keys=True).encode("utf-8")
 
 
 def inputs_mod():
@@ -136,6 +183,24 @@ class ReaderFactory:
         return self.reader
 
 
+class Doc:
+    """A pinned document source (README "Armed contexts"): ``doc()`` → the
+    document's bytes, re-read at every call. Records its calls' threads;
+    ``fail`` makes it raise (absent or unreadable)."""
+
+    def __init__(self, data: bytes, name: str):
+        self.data = data
+        self.name = name
+        self.calls: list[int] = []
+        self.fail = False
+
+    def __call__(self):
+        self.calls.append(threading.get_ident())
+        if self.fail:
+            raise FileNotFoundError(f"w8c: {self.name} document absent")
+        return self.data
+
+
 class Pool:
     """The W6d pin list: ``pool(boundary)`` → ``[{"dir", "sha256"}]``, oldest
     first. B1 settles on snapshot 1, later boundaries on snapshot 2 (W8b)."""
@@ -177,6 +242,8 @@ class EvalHost:
         self.hello_doc = hello() if hello_doc is None else hello_doc
         self.calls: list[dict] = []
         self.hellos = 0
+        # rev6.6: (armed contexts, forecasts made before) per set_armed call.
+        self.armed_calls: list[tuple[list[int], int]] = []
         self.faults: dict[str, BaseException] = {}
         self.shapes: dict[str, np.ndarray] = {}
         # A window id can recur across snapshots with a different history (the
@@ -195,6 +262,10 @@ class EvalHost:
     def hello(self):
         self.hellos += 1
         return dict(self.hello_doc)
+
+    def set_armed(self, contexts):
+        """rev6.6: the settlement's armed set (the contexts a forecast may run at)."""
+        self.armed_calls.append(([int(c) for c in contexts], len(self.calls)))
 
     def forecast(self, digest, *, context, horizon, windows):
         windows = list(windows)
@@ -311,16 +382,31 @@ class Rig:
         self.pool = Pool(self.fx)
         self.eval_host = EvalHost(self.fx)
         self.bench_host = w8b.BenchHost(self.fx["house"]["digest"]) if bench else None
+        self.readiness = Doc(readiness_doc(), "readiness")
+        self.t7 = Doc(t7_doc(), "t7")
         self.source = self.build()
 
     def build(self, **over):
+        assert_takes_armed_docs()
         kw = dict(state_dir=self.state_dir, intake_state_dir=self.intake_dir,
                   chain_factory=self.factory, pool=self.pool, eval_host=self.eval_host,
                   house_pointer=self.house_path,
                   house_signer_ss58=house_key().ss58_address,
-                  bench_host=self.bench_host, expected_identity=identity())
+                  bench_host=self.bench_host, expected_identity=identity(),
+                  readiness=self.readiness, t7=self.t7)
         kw.update(over)
         return inputs_mod().build_lane_d_inputs(self.cfg, **kw)
+
+    def expected_armed(self) -> dict:
+        """The W5d armed record of the documents the source reads now."""
+        from cascade.eval.lane_d_scorer import armed_record
+
+        return armed_record(self.cfg.lane_d.contexts, readiness=self.readiness.data,
+                            t7=self.t7.data, min_long_series=self.cfg.lane_d.min_long_series)
+
+    def expected(self, boundary: int) -> dict:
+        """``expected_inputs`` plus the armed record (``LaneDInputs`` kwargs)."""
+        return dict(expected_inputs(self.fx, boundary), armed=self.expected_armed())
 
     @property
     def state_path(self) -> Path:
@@ -347,7 +433,12 @@ def expected_inputs(fx: dict, boundary: int) -> dict:
     snap = 1 if int(boundary) <= B1 else 2
     chain = fx["chain"]
     return {"pool_dir": Path(chain["pools"][snap]), "prior_pool_dirs": (),
-            "entries": [dict(fx["entry"])], "forecasts": chain["forecasts"][snap],
+            "entries": [dict(fx["entry"])],
+            # Only the needed digests (X and the house): W7a's chain also
+            # carries forecasts for its `loser` digest (main @ 2cd79be, #758),
+            # which no W8c settlement reads.
+            "forecasts": {dg: f for dg, f in chain["forecasts"][snap].items()
+                          if dg in (fx["x"], fx["house"]["digest"])},
             "uid_of": uid_of(fx), "house": dict(chain["house"])}
 
 

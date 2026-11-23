@@ -398,6 +398,9 @@ class _FundedLegMixin:
         # the harvest of a payer pod: the miner controls it (review F7)
         _loc = self.__dict__.setdefault("_leg_local_obj", threading.local())
         _loc.harvest_pod_payer, _loc.leg_trained = True, False
+        # WB22: the rented layout, read by the lane B driver for the leg's
+        # recorded GPU count (gpu_n); nothing else reads it
+        _loc.funded_pod_sku = str(getattr(pod, "sku", "") or "")
 
         def release_pod() -> None:
             # Owner 2026-11-01: the harvested copy is verified (on the box, or

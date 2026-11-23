@@ -197,3 +197,23 @@ The report enum has no `insufficient` value, and these tests don't add one.
 - 5 pass: the empty slice, series outside `lowfreq_freqs`, first clears,
   confirmation losers and input-order determinism. W7a and W5e built those
   rules, and W3b5 owns them as its assertions.
+
+## Correction (plan rev6.10 (a) / rev6.12 (a)): fixture feeds pin `embargo_hours`
+
+W5a (tests in #758) makes forward eligibility embargo-aware and fails a
+listed feed whose `embargo_hours` is missing closed as `unlisted_feed`. This
+WP's pool fixture wrote feeds without the key, so once the W5a
+implementation lands every fixture window would be refused. Every fixture
+feed now pins `embargo_hours: 0.0` (e = 0, the rev3 rule byte for byte, so
+every verdict is unchanged); on main the key is ignored. No assertion
+changed; every test passes on main and with the W5a implementation.
+
+## Correction (plan rev6.11 (b)): crown at the first verdict
+
+The confirmation duel is dropped (owner 2026-11-23): a crown is decided at
+the first verdict, first clear (max-T LCB vs KING_D) ∧ A10 ∧ the §1.3b gate.
+There is no `confirm` stage, no `confirm_pending` status or reason and no
+`lost_confirmation`; a held first clear is `hold` / `bench_hold`. This WP's
+crowning chains move to that rule with nothing weakened. Boundary(1) lists no entry; the candidate is judged, A10-checked and gated at its first verdict at boundary(2) (the miner-king chain: Y at boundary(2), X at boundary(4)). The first-clear test now pins that a first clear is checked at once, and the loser test pins `lost_duel`. On main the
+old code still runs the confirmation stage, so the changed tests fail on an
+assertion until the W5e implementation lands.
