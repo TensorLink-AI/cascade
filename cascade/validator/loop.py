@@ -73,7 +73,6 @@ from .gating import POOL_PIN_READ_GRACE_SECONDS, ManifestGateMixin  # noqa: F401
 from .king_check import KingCheckMixin
 from .lane_b import LaneBMixin, LaneBTransient, _LaneBRound
 from .lane_c import LaneCMixin, LaneCTransient
-from .lane_d_worker import LaneDWorker
 from .manifest_chain import (  # noqa: F401 — re-exported for callers of cascade.validator.loop
     CHAIN_WALK_DEPTH,
     CHAIN_WALK_MAX_DEPTH,
@@ -83,6 +82,7 @@ from .manifest_chain import (  # noqa: F401 — re-exported for callers of casca
     ref_as_of,
 )
 from .marketcast import MarketCastMixin
+from .offthread_worker import LaneDWorker
 from .promotion_gate import PromotionGateMixin
 from .receipts import ReceiptMixin
 from .state import ChampionState, StateTransition

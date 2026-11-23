@@ -17,6 +17,11 @@ Semantics (tests/accept/w19/README.md):
   later step succeeds.
 - The step gets only the boundary: it must open its own chain access, never
   share the poll thread's (non-thread-safe) client.
+
+Generic thread infrastructure, deliberately not named ``lane_d_*`` and
+importing no lane D module: ``loop.py`` imports it, and the audit's import
+closure (which reaches ``loop.py``) must load no lane D producer module (W9
+invariant 12).
 """
 
 from __future__ import annotations
