@@ -1202,8 +1202,22 @@ def _snapshot_problem(report: dict, cfg, pool_dirs, windows: dict) -> str | None
 _UNSET = object()
 
 
+def _host_problem(host, boundary: int, envs) -> tuple[str, str] | None:
+    """rev6.18 B5/B7: the signed ``host`` names an environment qualified at
+    ``boundary`` with a GPU, driver and torch build it allows."""
+    from ..shared.config.lane_d import ScoringEnvError, host_problem, load_scoring_envs
+
+    if envs is None:
+        try:
+            envs = load_scoring_envs()
+        except ScoringEnvError as e:
+            return "warn", f"cannot check the scoring host: {e}"
+    why = host_problem(host, envs, int(boundary))
+    return None if why is None else ("fail", f"scoring host: {why}")
+
+
 def check_lane_d(report: dict, cfg, *, signer_hotkey: str, prior_reports=None,
-                 era_sentinel=_UNSET, pool_dirs=None) -> CheckResult:
+                 era_sentinel=_UNSET, pool_dirs=None, scoring_envs=None) -> CheckResult:
     """PASS on a genuine report; FAIL when the signature, ``rows_sha256``,
     a stated parameter or the verdict re-derived from the rows disagrees,
     or the crown's provenance does not hold (RV7 B2).
@@ -1216,7 +1230,11 @@ def check_lane_d(report: dict, cfg, *, signer_hotkey: str, prior_reports=None,
     left unset, ``gate.sentinel`` is not pinned. ``pool_dirs``: snapshot
     directories the auditor holds; every snapshot a judged window names must
     be among them, valid, and give that window's record and eligibility
-    (README rules 12-14); ``None`` skips those rules."""
+    (README rules 12-14); ``None`` skips those rules. ``scoring_envs``
+    (rev6.18 B5/B7): the qualified scoring environment list a ``host``
+    record is checked against at the report's boundary (default: the
+    release's committed ``deploy/laned/scoring_envs.toml``; unreadable ->
+    WARN, the auditor cannot judge it)."""
     from ..shared.sr25519 import SignatureVerifierUnavailable
 
     if not isinstance(report, dict) or report.get("schema") != SCHEMA:
@@ -1242,6 +1260,10 @@ def check_lane_d(report: dict, cfg, *, signer_hotkey: str, prior_reports=None,
             diff = sorted(k for k in set(want) | set(report.get("params") or {})
                           if (report.get("params") or {}).get(k) != want.get(k))
             return _fail(NAME, f"stated params differ from config on {diff}")
+        if "host" in report:
+            why = _host_problem(report["host"], boundary, scoring_envs)
+            if why:
+                return _warn(NAME, why[1]) if why[0] == "warn" else _fail(NAME, why[1])
         # RV7 B2 (c): the bootstrap seed is the boundary's and the pool's,
         # never a free choice the producer could grind.
         want_seed = f"lane-d/1:{boundary}:{report['pool']['sha256']}"

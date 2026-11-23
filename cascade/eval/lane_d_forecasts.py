@@ -23,8 +23,9 @@ anything else.
 ``python -m cascade.eval.lane_d_forecasts`` is the eval host's end of the
 box's SSH transport (:class:`cascade.validator.lane_d_inputs.SSHEvalHost`):
 
-* ``hello`` prints the W4 :func:`~cascade.eval.lane_d_handshake.worker_hello`
-  as one JSON line;
+* ``hello [--env NAME]`` prints the W4 :func:`~cascade.eval.lane_d_handshake.worker_hello`
+  as one JSON line, with (rev6.18 B7) this host's scoring environment
+  (:func:`~cascade.eval.lane_d_handshake.probe_environment`);
 * ``forecast --cache-dir D --budget-bytes N`` reads one request (an ``.npz``
   of the window histories plus a JSON ``meta`` record, :data:`REQUEST_SCHEMA`)
   from stdin and prints one :data:`REPLY_SCHEMA` JSON line: the quantiles, or
@@ -254,6 +255,9 @@ def _build_parser() -> argparse.ArgumentParser:
     h = sub.add_parser("hello", help="print the W4 worker hello as JSON")
     h.add_argument("--root", type=Path, default=None,
                    help="release root (default: the imported cascade package's)")
+    h.add_argument("--env", default=None,
+                   help="this host's scoring environment (deploy/laned/scoring_envs.toml; "
+                        "default $CASCADE_LANE_D_SCORING_ENV, else the one entry that fits)")
     f = sub.add_parser("forecast", help="answer one forecast request read from stdin")
     f.add_argument("--cache-dir", type=Path, required=True, help="the W15 prefetch cache root")
     f.add_argument("--budget-bytes", type=int, required=True, help="the cache byte budget")
@@ -269,9 +273,10 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, stream=sys.stderr,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     if args.cmd == "hello":
-        from .lane_d_handshake import worker_hello
+        from .lane_d_handshake import probe_environment, worker_hello
 
-        print(json.dumps(worker_hello(args.root), sort_keys=True))
+        hello = worker_hello(args.root, environment=probe_environment(args.env))
+        print(json.dumps(hello, sort_keys=True))
         return 0
     try:
         reply = serve_forecast(sys.stdin.buffer.read(), cache_dir=args.cache_dir,

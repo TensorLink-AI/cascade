@@ -119,7 +119,9 @@ TOP_LEVEL_REQUIRED = ("schema", "boundary", "signer", "signature", "scoring_meth
 # `gate` (RV4): the §1.3b gate record, present iff a candidate reached the gate.
 # rev6.6: `armed_contexts` + `armed_evidence`, present together iff the
 # settlement was handed the W5d armed record (README "Armed contexts").
-TOP_LEVEL_OPTIONAL = ("extensions", "gate", "armed_contexts", "armed_evidence", "draw")
+# rev6.18 B7: `host`, present iff the settlement was handed the eval host's
+# verified record (README "Scoring host").
+TOP_LEVEL_OPTIONAL = ("extensions", "gate", "armed_contexts", "armed_evidence", "draw", "host")
 PARAMS_FIELDS = ("share", "takes_from", "remainder", "horizon", "horizons", "contexts",
                  "forward_margin_hours", "max_mirror_lag_hours", "min_windows", "min_clusters",
                  "d_margin", "alpha", "bootstrap_B", "king_decay", "reward_prior_kings",

@@ -925,7 +925,8 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
                   forecasts: dict, uid_of: dict, state_path, signer,
                   prior_pool_dirs=(), expect_prior_sha256: str | None = None,
                   boundary_block_hash: str | None = None, sentinel: str | None = None,
-                  bench=None, armed: dict | None = None) -> LaneDSettlement:
+                  bench=None, armed: dict | None = None,
+                  host: dict | None = None) -> LaneDSettlement:
     """Settle lane D at ``boundary`` (see the module docstring).
 
     ``pool_dir`` is the newest ``pool_d`` snapshot; ``prior_pool_dirs`` are
@@ -953,10 +954,24 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     :func:`check_armed` (a ``LaneDArmedError`` before anything is read or
     written) and recorded as the report's ``armed_contexts`` /
     ``armed_evidence``; the forecasts are the eval host's at each entry's
-    ``effective_context``. ``None`` (the legacy call) records neither."""
+    ``effective_context``. ``None`` (the legacy call) records neither.
+
+    ``host`` (rev6.18 B7) is the eval host record the W4 handshake verified
+    (:func:`~cascade.eval.lane_d_handshake.check_worker`: environment, GPU
+    model, driver, torch build, fingerprint and the B6 host identity). Every
+    forecast in ``forecasts`` came from that one host (B6). Given, it must be
+    well formed (a ``ValueError`` before anything is read or written) and is
+    signed as the report's ``host``; ``None`` records no host."""
     if not cfg.active(boundary):
         return LaneDSettlement(report=None, pay=None, receipt=None)
     armed_fields = None if armed is None else check_armed(armed, cfg)
+    if host is not None:
+        from ..shared.config.lane_d import host_record_problem
+
+        why = host_record_problem(host)
+        if why:
+            raise ValueError(f"lane D host record refused: {why}")
+        host = {k: str(v) for k, v in host.items()}
     # W5f: the house is the verified record a signed pointer enters
     # (lane_d_house). Anything else is refused before any state, report or
     # pool is read or written (fail closed).
@@ -1371,6 +1386,10 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
         # on, signed, so satellites verify it (never re-derive it from
         # cfg.contexts). Absent on the legacy call.
         report.update(armed_fields)
+    if host is not None:
+        # rev6.18 B7: the scoring host, signed; the audit checks its env is
+        # qualified at this boundary.
+        report["host"] = host
     report = sign_report(report, signer)
     # Fail closed: a report outside lane-d-report/1 is never returned, and
     # neither the report file nor the state is written (ReportSchemaError

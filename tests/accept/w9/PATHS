@@ -11,3 +11,7 @@ cascade/audit/lane_d.py
 # signed report and the W7c receipt record, without the producer's lane D
 # emission functions.
 cascade/audit/checks.py
+# rev6.18 B5/B7 (F5): check_lane_d checks report.host against the
+# scoring environment list at the boundary (host_problem; audit/lane_d.py
+# is listed above).
+cascade/shared/config/lane_d.py

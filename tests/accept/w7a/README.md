@@ -647,3 +647,13 @@ passed every W7a, W5e and W5a test (462).
 
 **Order:** the W7a implementation needs W2e's keys and lands after W5e's
 (the audit's honest fixtures crown at the first verdict).
+
+### Scoring host (rev6.18 B7)
+
+Tests: `test_w7a_host.py`. `settle_lane_d(..., host=None)` (keyword-only)
+takes the verified eval host record; given, it must pass
+`host_record_problem` (else `ValueError` before anything is written) and is
+signed as the top-level `host` (schema `$defs.host`: exactly `env`,
+`gpu_model`, `driver`, `torch_build`, `fingerprint`, `identity`).
+`validate_report` re-checks the identity (`bad_value` at `host`).
+`LaneDInputs.host` (W8b) carries it to `settle_lane_d`. Absent without a host.

@@ -405,3 +405,12 @@ main). That shows the contract can be built and that every honest fixture
 report PASSes.
 
 Run locally with `-m "not torch"`. Nothing here imports torch.
+
+## Scoring host (rev6.18)
+
+Tests: `test_w9_host.py`. `check_lane_d(..., scoring_envs=None)`: a report
+with `host` FAILs (`scoring host: ...`) unless `host_problem` holds at the
+report's boundary against `scoring_envs` (default: the committed
+`deploy/laned/scoring_envs.toml`; unreadable -> WARN). A report without
+`host` is unchanged. Under F1's refusal table this is an alert-class check
+(not one of the four burn checks); F1 classifies its code.

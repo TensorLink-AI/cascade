@@ -132,3 +132,24 @@ compact separators) over **every** regular file of the entry, as
 - `test_w15_torch.py` is marked `torch`. The production box must never run
   it: run `-m "not torch"` locally (also inside `LANED_PYTEST_CMD`). CI
   installs torch.
+
+## Score cache (rev6.18 B6)
+
+Plan rev6.18 B6: every model in a cohort is forecast on one host in one run.
+Tests: `test_w15_score_cache.py`.
+
+- **`cascade/validator/lane_d_score_cache.py`** (new): `namespace(host_identity,
+  package_hash)` (both 64 hex, else `ValueError`); `ScoreCache(root)` with
+  `get(ns, digest, *, context, horizon, window_ids)` (exact float64 rows in
+  request order, or `None` when any window is missing, the file is corrupt
+  (dropped) or the namespace differs), `put(...)` (non-finite / misshaped
+  arrays are never stored) and `retain(ns, keys)` (deletes other namespaces
+  and unused keys).
+- **`LaneDInputsSource(..., scoring_envs=, score_cache=)`**: with
+  `scoring_envs` the hello is checked by `check_worker` at the boundary
+  (`env_unqualified` otherwise, nothing forecast); `LaneDInputs.host` is the
+  verified host. With a cache, a model is forecast only on a miss; a host
+  change (another fingerprint, driver, env, GPU or torch build) misses for the
+  whole cohort. `load_inputs_services` always loads the list (optional
+  `scoring_envs` path key) and builds the cache from the optional
+  `score_cache_dir` key.

@@ -111,7 +111,9 @@ class LaneDInputs:
     ``entries``, the eval host's ``forecasts``, the metagraph ``uid_of``
     (``{hotkey: uid}``) and the ``house`` pointer record. ``armed`` (rev6.6)
     is the settlement's W5d armed record, passed to ``settle_lane_d(armed=)``
-    (``None``: the legacy call, no armed fields in the report)."""
+    (``None``: the legacy call, no armed fields in the report). ``host``
+    (rev6.18 B7) is the verified eval host's record, passed to
+    ``settle_lane_d(host=)`` (``None``: no ``host`` in the report)."""
 
     pool_dir: Any
     entries: list
@@ -120,6 +122,13 @@ class LaneDInputs:
     house: Mapping
     prior_pool_dirs: tuple = ()
     armed: Mapping | None = None
+    host: Mapping | None = None
+
+
+def _host_of(inp: Any) -> dict | None:
+    """``inp.host`` as a plain dict (``None`` when absent)."""
+    host = getattr(inp, "host", None)
+    return None if host is None else dict(host)
 
 
 def _armed_of(inp: Any) -> dict | None:
@@ -279,7 +288,8 @@ class LaneDStep:
                               uid_of=dict(inp.uid_of), state_path=self.state_path,
                               signer=self.signer, prior_pool_dirs=tuple(inp.prior_pool_dirs),
                               expect_prior_sha256=expect, boundary_block_hash=block_hash,
-                              sentinel=sentinel, bench=bench, armed=_armed_of(inp))
+                              sentinel=sentinel, bench=bench, armed=_armed_of(inp),
+                              **({} if _host_of(inp) is None else {"host": _host_of(inp)}))
         except Exception as e:  # noqa: BLE001 — LaneDStateError, schema, pool or crash
             raise LaneDWiringError("settle_refused",
                                    f"settlement {boundary} refused ({e})") from e

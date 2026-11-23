@@ -12,3 +12,7 @@ cascade/validator/lane_d.py
 # gate_suites, tau_public, lowfreq_freqs) from config itself, never by
 # importing the producer (invariant 12).
 cascade/audit/lane_d.py
+# rev6.18 B7 (F5): LaneDInputs.host passed to settle_lane_d(host=); the
+# host record check (host_record_problem, host_identity).
+cascade/validator/lane_d_wiring.py
+cascade/shared/config/lane_d.py
