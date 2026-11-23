@@ -154,9 +154,13 @@ def test_rv7_b1_recovery_adopts_a_persisted_bench_hold(tmp_path, monkeypatch):
     assert sha(path.read_bytes()) == ref[1][2]
     state = json.loads(path.read_bytes())
     # rev6.11 (b): no `confirm_pending`. A held first-clear candidate stays
-    # open (`pending`) with its clear kept in `gate_hold` (W5e / W5g).
+    # open, status `hold` / reason `bench_hold` (plan rev6.11 (b): "Verdict
+    # outcomes become `lost` | `crowned`, plus the existing `bench_hold`
+    # hold"; W5e README "Fail closed"), with its clear kept in `gate_hold`
+    # (W5e / W5g).
     rec = state["entries"][x]
-    assert state["king"]["digest"] != x and rec["status"] == "pending", rec["status"]
+    assert state["king"]["digest"] != x and rec["status"] == "hold", rec["status"]
+    assert rec["reason"] == "bench_hold", rec["reason"]
     assert rec.get("gate_hold"), "the held clear is kept for the re-gate"
 
     s3 = chain.settle(3, path)
