@@ -276,10 +276,17 @@ Properties worth knowing:
 * **Freshness cutoff** — only snapshots dated `<= as_of` are read and rows
   stamped after `as_of` are dropped, so a rebuild against the same mirror is
   reproducible (the dated bucket pins the audit inputs).
-* **Staleness guard** — a feed whose newest snapshot is older than
-  `max_stale_days` (default 4) before `as_of` is skipped; if *every* feed is
-  stale the build fails loudly instead of republishing old data. With the crons
-  decoupled, a dead scraper must not silently erode the freshness lever.
+* **Staleness guard** — daily-or-faster feeds: unchanged — a feed whose
+  newest snapshot file is older than `max_stale_days` (default 4) before
+  `as_of` is skipped (file date only, so publication-lagged feeds stay
+  admitted). Slower-than-daily cadences and every rollup series are also
+  judged by their newest *observation*: fresh iff the newest file and the
+  newest observation (rows after `as_of` dropped) are at or after
+  `as_of 00:00 UTC − max_stale_days × cadence` (4 weeks for weekly, 4 nominal
+  months for monthly; a rollup's observation time is the end of its newest
+  complete bucket). If *every* feed is stale the build fails loudly instead of
+  republishing old data. With the crons decoupled, a dead scraper must not
+  silently erode the freshness lever.
 * **Cluster labels** — every series lands in `metadata.json` with
   the catalog feed id. New primary builds replace the bootstrap key with its
   source family and retain the feed as `catalog_source` (see below). The validator's KOTH bootstrap resamples these
@@ -288,6 +295,35 @@ Properties worth knowing:
   ~30 once this source feeds the pool.
 * Weekly-and-slower catalog entries, `disabled` feeds, and categorical feeds
   are skipped; panel-expanded feeds are capped at 200 series per source.
+
+#### Slower cadences from fast feeds — the `rollup` contract
+
+A catalog entry may ask cascade to also serve it at daily and weekly cadence:
+
+```yaml
+id: grid_load_hourly
+frequency: PT1H
+rollup: sum        # exactly one of: sum | mean | last
+```
+
+* **Values** — `sum` (flows: counts, energy, volume), `mean` (levels/rates),
+  `last` (stocks/prices: the latest observation in the bucket). Any other
+  value, or a missing key, means no rollup; untagged entries harvest exactly as
+  before.
+* **Buckets** — calendar UTC days (`00:00 → 00:00`) and Monday-start UTC weeks
+  (`Mon 00:00 → Mon 00:00`). A target is produced only if it is slower than
+  the feed (`P1D` feeds get the weekly rollup only).
+* **Complete buckets only** — a bucket holding fewer finite observations
+  than `0.8 × (bucket / frequency)` (the builder's `max_missing_frac = 0.2`)
+  is NaN, never a partial aggregate; a complete-but-short `sum` bucket is
+  pro-rated (`mean × expected count`). The kept span is the freshest run of
+  complete buckets (same 8× gap rule as raw feeds), so partial edge days never
+  enter; interior NaN buckets are interpolated or dropped by the builder.
+* **Ids & metadata** — `<raw series id>.rollup_D` (`freq "D"`, period 7) and
+  `<raw series id>.rollup_W` (`freq "W"`, period 52), same `source`,
+  `source_family` and `domain` as the raw series (one feed = one cluster).
+* The rollup series still needs the builder's `min_length` (horizon + 256
+  points), so a weekly rollup needs ~6 years of raw history.
 
 The defaults produce **~3000 raw series** (Open-Meteo's global grid dominates),
 which clears `[eval] n_windows` with margin after validation drops and leaves
