@@ -139,13 +139,16 @@ class Gang:
         self.procs = [ctx.Process(target=_follower, daemon=True,
                                   args=(r, self.world, port, cfg.to_dict(), deterministic,
                                         seed, self.errors),
-                                  kwargs={"cuda": cuda, "expert_selection": selection})
+                                  kwargs={"cuda": cuda, "expert_selection": selection,
+                                          "cpu_threads": torch.get_num_threads()})
                       for r in range(1, self.world)]
         for p in self.procs:
             p.start()
         if cuda:
             torch.cuda.set_device(0)
-        bound_cpu_threads(self.world)
+            bound_cpu_threads(self.world)
+        # A CPU rank's numerics depend on its thread count (parallel
+        # reductions), so a CPU gang keeps the trainer's count on every rank.
         dist.init_process_group("nccl" if cuda else "gloo",
                                 init_method=f"tcp://127.0.0.1:{port}", rank=0,
                                 world_size=self.world, timeout=_TIMEOUT)
@@ -174,6 +177,7 @@ class Gang:
 
     optimizer = None
     scatter_pending = False
+    slices = None           # rank 0's ExpertSlices on a lane-B expert gang
 
     def shard_optimizer(self, model, optimizer) -> None:
         """Split the muon params over the gang; rank 0 keeps AdamW, buffers
@@ -546,10 +550,11 @@ def _host_losses(marginal, joint) -> tuple[float, float]:
 
 
 def _follower(rank, world, port, cfg_dict, deterministic, seed, errors, *, cuda=True,
-              expert_selection=None) -> None:
+              expert_selection=None, cpu_threads=1) -> None:
     """Helper rank: hold the model, run owned micro-batches, take weights.
 
-    ``cuda``: NCCL on ``cuda:rank`` (else gloo on CPU). ``expert_selection``:
+    ``cuda``: NCCL on ``cuda:rank`` (else gloo on CPU, with rank 0's
+    ``cpu_threads``: a CPU rank's numerics follow its thread count). ``expert_selection``:
     a lane-B leg; the helper builds the same :class:`ExpertSlices` leaves as
     rank 0 and, like rank 0, binds the fast kernels only for lane A."""
     import types
@@ -562,7 +567,9 @@ def _follower(rank, world, port, cfg_dict, deterministic, seed, errors, *, cuda=
     try:
         if cuda:
             torch.cuda.set_device(rank)
-        bound_cpu_threads(world)
+            bound_cpu_threads(world)
+        else:
+            torch.set_num_threads(max(1, int(cpu_threads)))
         device = torch.device("cuda", rank) if cuda else torch.device("cpu")
         if cuda:
             pin_nccl_env()
