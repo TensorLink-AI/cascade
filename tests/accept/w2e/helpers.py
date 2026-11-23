@@ -31,7 +31,8 @@ W2E_DEFAULTS: dict[str, object] = {
     "embargo_hours": 48.0,
     "max_windows_per_settlement": 5000,
     "min_fresh_window_share": 0.5,
-    "backtest_weight_cap": 0.0,
+    # Owner 2026-11-23: ON at launch (1 - 0.85 ** 0.05 ~ 0.0081 < d_margin 0.01).
+    "backtest_weight_cap": 0.05,
     "backtest_ratio_floor": 0.85,
 }
 W2E_KEYS = tuple(W2E_DEFAULTS)
@@ -66,7 +67,7 @@ OVERLAY_VALUE: dict[str, object] = {
     "embargo_hours": 24.0,
     "max_windows_per_settlement": 3000,
     "min_fresh_window_share": 0.75,
-    "backtest_weight_cap": 0.05,
+    "backtest_weight_cap": 0.03,           # 1 - 0.9 ** 0.03 ~ 0.0032 < 0.01
     "backtest_ratio_floor": 0.9,
 }
 
