@@ -14,8 +14,8 @@ from .helpers import (
     REPO,
     STEP_RATES_ENV,
     UNMEASURED,
-    chain_cfg,
     cfg_with_lane_b,
+    chain_cfg,
     gpus,
     norm,
     pinned_image,
@@ -193,12 +193,11 @@ def test_rent_scope_restores_on_exception_and_nests():
     m = gpus()
     runner = SimpleNamespace()
     outer, inner = _gpus(["8xH100"]), _gpus(["8xH200"])
-    with pytest.raises(RuntimeError):
-        with m.rent_scope(runner, outer):
-            with m.rent_scope(runner, inner):
-                assert norm(runner._leg_local_obj.lane_b_rent_skus) == ("8xH200",)
-            assert norm(runner._leg_local_obj.lane_b_rent_skus) == ("8xH100",)
-            raise RuntimeError("leg failed")
+    with pytest.raises(RuntimeError), m.rent_scope(runner, outer):
+        with m.rent_scope(runner, inner):
+            assert norm(runner._leg_local_obj.lane_b_rent_skus) == ("8xH200",)
+        assert norm(runner._leg_local_obj.lane_b_rent_skus) == ("8xH100",)
+        raise RuntimeError("leg failed")
     assert getattr(runner._leg_local_obj, "lane_b_rent_skus", None) is None
 
 
