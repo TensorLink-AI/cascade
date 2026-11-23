@@ -33,6 +33,7 @@
     "rows_sha256": {"$ref": "#/$defs/digest"},
     "pay": {"$ref": "#/$defs/pay"},
     "gate": {"$ref": "#/$defs/gate"},
+    "draw": {"$ref": "#/$defs/draw"},
     "armed_contexts": {
       "type": "array", "minItems": 1, "items": {"type": "integer", "minimum": 1},
       "description": "rev6.6: the variants armed at this settlement (ascending, a subset of params.contexts), present together with armed_evidence; absent on a settlement not handed the armed record."
@@ -253,7 +254,35 @@
         "min_first_seen_ts": {"$ref": "#/$defs/timestamp"},
         "mirror_lag_hours": {"type": ["number", "null"], "minimum": 0},
         "snapshot_sha256": {"$ref": "#/$defs/digest",
-                            "description": "The snapshot whose version of the window was scored; one of pool.snapshots[].sha256."}
+                            "description": "The snapshot whose version of the window was scored; one of pool.snapshots[].sha256."},
+        "timeframe": {"type": "string", "description": "W5j: the draw cell's timeframe, the series' pool freq verbatim."},
+        "bin": {"type": "string", "minLength": 1, "description": "W5j: the draw cell's horizon bin (forward)."},
+        "kind": {"type": "string", "minLength": 1, "description": "W5j: forward (W5i adds backtest)."},
+        "h": {"type": "integer", "minimum": 1, "description": "W5j: the drawn horizon; the window id's h<h>."},
+        "origin": {"$ref": "#/$defs/timestamp", "description": "W5j: the target start timestamp; the window id's middle field."},
+        "embargo_window": {"type": "boolean", "description": "rev6.12 (b): false = fresh (passes at e = 0), true = embargo window (a mixed target included)."}
+      }
+    },
+    "draw": {
+      "type": "object",
+      "description": "W5j (rev6.10 (b), rev6.12 (b)): the settlement's seeded per-bin window draw; absent (never null) on a settlement without a boundary block hash.",
+      "required": ["boundary_block_hash", "seed", "max_windows_per_settlement", "cohorts"],
+      "additionalProperties": false,
+      "properties": {
+        "boundary_block_hash": {"type": "string", "pattern": "^0x[0-9a-f]{64}$"},
+        "seed": {"type": "string", "minLength": 1},
+        "max_windows_per_settlement": {"type": "integer", "minimum": 1},
+        "cohorts": {"type": "array", "items": {"$ref": "#/$defs/draw_cohort"}}
+      }
+    },
+    "draw_cohort": {
+      "type": "object",
+      "required": ["index", "quota", "capacity"],
+      "additionalProperties": false,
+      "properties": {
+        "index": {"type": "integer", "minimum": 0},
+        "quota": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},
+        "capacity": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}}
       }
     },
     "confirmation": {
