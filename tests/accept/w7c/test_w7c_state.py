@@ -17,7 +17,7 @@ import pytest
 
 from .helpers import (
     STATE_ERROR_CODES,
-    Chain,
+    W7cChain,
     boundary,
     canonical,
     read_bytes,
@@ -29,7 +29,7 @@ from .helpers import (
 
 
 def _settled(tmp_path, upto: int = 1):
-    chain = Chain(tmp_path)
+    chain = W7cChain(tmp_path)
     path = chain.state_path("run")
     runs = chain.run(path, upto)
     return chain, path, runs
@@ -221,7 +221,7 @@ def test_load_state_checks_the_expected_digest(tmp_path):
 def test_a_missing_state_file_is_the_genesis_state(tmp_path):
     from cascade.validator.lane_d_state import genesis, load_state, state_digest
 
-    chain = Chain(tmp_path)
+    chain = W7cChain(tmp_path)
     path = chain.state_path("fresh")
     assert load_state(path, chain.house) == genesis(chain.house)
     assert load_state(path, chain.house,

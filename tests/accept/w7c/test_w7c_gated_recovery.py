@@ -1,6 +1,7 @@
 """W7c × W5e (RV7 B1): crash recovery never wedges a GATED settlement.
 
-boundary(2) is X's confirming clear: a crowning candidate, so the §1.3b
+boundary(2) is X's first verdict, a clear (rev6.11 (b): there is no
+confirmation duel): a crowning candidate, so the §1.3b
 gate sweeps the bench in the settlement's session, and the session id (and
 every bench number) is part of the signed body. The crash lands between the
 report write and the state write. A restarted validator has a NEW bench
@@ -28,11 +29,13 @@ from .helpers import (
     STATE_ERROR_CODES,
     Chain,
     FlakyHost,
+    W7cChain,
     body_sha,
     boundary,
     chain_fingerprint,
     crash_on_rename,
     fixture_key,
+    other_crown,
     read_bytes,
     receipt_of,
     replace_string,
@@ -99,7 +102,7 @@ RECOVERY_HOSTS = {
 def test_rv7_b1_recovery_adopts_the_persisted_crowning_report(tmp_path, monkeypatch, mode):
     from cascade.validator.lane_d_state import report_path
 
-    chain = Chain(tmp_path)
+    chain = W7cChain(tmp_path)
     ref = chain_fingerprint(chain, chain.state_path("ref"), 3)
     path = chain.state_path("crash")
     written, persisted = _crash_at_b2(chain, path, monkeypatch)
@@ -130,7 +133,7 @@ def test_rv7_b1_recovery_adopts_a_persisted_bench_hold(tmp_path, monkeypatch):
     validator whose pod now passes must not crown X at boundary(2): the
     persisted hold is the record. X is re-gated at boundary(3) as in the
     clean run."""
-    chain = Chain(tmp_path)
+    chain = W7cChain(tmp_path)
     ref_path = chain.state_path("ref-hold")
     ref = []
     for n in (1, 2, 3):
@@ -150,7 +153,11 @@ def test_rv7_b1_recovery_adopts_a_persisted_bench_hold(tmp_path, monkeypatch):
     assert receipt_of(s) == ref[1][0]
     assert sha(path.read_bytes()) == ref[1][2]
     state = json.loads(path.read_bytes())
-    assert state["king"]["digest"] != x and state["entries"][x]["status"] == "confirm_pending"
+    # rev6.11 (b): no `confirm_pending`. A held first-clear candidate stays
+    # open (`pending`) with its clear kept in `gate_hold` (W5e / W5g).
+    rec = state["entries"][x]
+    assert state["king"]["digest"] != x and rec["status"] == "pending", rec["status"]
+    assert rec.get("gate_hold"), "the held clear is kept for the re-gate"
 
     s3 = chain.settle(3, path)
     assert receipt_of(s3) == ref[2][0]
@@ -161,7 +168,7 @@ def test_rv7_b1_recovery_adopts_a_persisted_bench_hold(tmp_path, monkeypatch):
 RECOVERY_SCRIPT = r"""
 import json, sys
 from pathlib import Path
-from tests.accept.w7c.helpers import Chain, receipt_of
+from tests.accept.w7c.helpers import W7cChain as Chain, receipt_of
 chain = Chain(Path(sys.argv[1]))
 host = chain.passing_host(0.8)
 s = chain.settle(2, chain.state_path("crash"), host=host, session=sys.argv[2])
@@ -173,7 +180,7 @@ print(json.dumps({"receipt": receipt_of(s), "calls": len(host.calls),
 def test_rv7_b1_recovery_in_a_new_process(tmp_path, monkeypatch):
     """The restart is a new process with a new session and a bench that
     answers differently."""
-    chain = Chain(tmp_path)
+    chain = W7cChain(tmp_path)
     ref = chain_fingerprint(chain, chain.state_path("ref"), 3)
     path = chain.state_path("crash")
     _crash_at_b2(chain, path, monkeypatch)
@@ -196,7 +203,7 @@ def test_rv7_b1_every_report_binds_its_prior_state_digest_under_the_signature(tm
     as loaded, so the signed body carries it (at a path the implementer
     chooses; W7a freezes the top-level keys, so `extensions` is the open
     place)."""
-    chain = Chain(tmp_path)
+    chain = W7cChain(tmp_path)
     path = chain.state_path("run")
     for n in (1, 2, 3):
         s = chain.settle(n, path)
@@ -218,7 +225,7 @@ def _doctor(chain: Chain, report: dict, defect: str, prior: str) -> dict:
         sig = report["signature"]
         return {**report, "signature": ("0" if sig[0] != "0" else "1") + sig[1:]}
     if defect == "edited_after_signing":
-        return {**report, "crowned": None}
+        return {**report, "crowned": other_crown(report, chain)}
     if defect == "wrong_boundary":
         return sign_report({**report, "boundary": boundary(3)}, chain.signer)
     if defect == "wrong_prior":
@@ -238,7 +245,7 @@ REFUSALS = {"foreign_signer": "report_unverified", "bad_signature": "report_unve
 def test_rv7_b1_an_unverified_persisted_report_is_refused(tmp_path, monkeypatch, defect):
     from cascade.validator.lane_d_state import report_path
 
-    chain = Chain(tmp_path)
+    chain = W7cChain(tmp_path)
     path = chain.state_path("crash")
     _, persisted = _crash_at_b2(chain, path, monkeypatch)
     prior = hashlib.sha256(path.read_bytes()).hexdigest()
