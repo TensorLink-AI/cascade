@@ -213,8 +213,16 @@ SSHEvalHost.set_armed(contexts)   # the request's "contexts" becomes the armed s
 - **Forecast contexts:** each digest is forecast at
   `effective_context(declared, armed["armed_contexts"])`: an entry or a
   miner KING_D at its declared context when armed, else the highest armed
-  variant below it, else the lowest armed one; the house (and a house
-  KING_D) as declared 4096 (the trained length). The entry rows keep their
+  variant below it, ~~else the lowest armed one~~ **(plan rev6.15, owner
+  2026-11-23)** else **not forecast at all** (`effective_context` is
+  `None`: no armed variant ≤ the declared context; the settlement skips the
+  entry `context_below_armed`, and a miner KING_D without a forecast makes
+  its cohort `king_unscored`; no new input error, the tick is not refused);
+  the house (and a house KING_D) as declared 4096 (the trained length). The
+  house declares no context of its own, so the rev6.15 skip doesn't apply
+  to it: when no armed variant is ≤ 4096 it runs at the lowest armed one,
+  as before. The skip is deterministic: the same documents give the same
+  eval-host calls. The entry rows keep their
   declared `context` (settle_lane_d records it). An entry whose declared
   context is not in `cfg.lane_d.contexts` is not forecast (settle_lane_d
   closes it at registration, `context_not_armed`).
@@ -279,8 +287,9 @@ chain, storage, pod, torch, GPU or real key; everything lives under
   settlement is byte-identical.
 - **The house's context.** The pointer carries none. Any context in
   `[lane_d] contexts` passes here. 4096 (the trained length) is the obvious
-  choice. The rev6.6 "highest armed variant" rule for unarmed declared
-  contexts isn't in this WP.
+  choice. The ~~rev6.6 "highest armed variant"~~ **(rev6.15)** "highest
+  armed variant ≤ declared, else skip" rule for unarmed declared contexts is
+  W5d's `effective_context`; this WP only applies it (and skips `None`).
 - **The metagraph** is read at head (`registered_hotkeys`), as the intake's
   registration gate does. A boundary-pinned metagraph would need a public
   `ChainClient` read at a block (owner call; not added here).
