@@ -1,0 +1,17 @@
+# W8c: the production LaneDInputs source (plan rev6.7, W8c row; owner
+# 2026-11-23 "Yes w8c"; README.md has the contract). W8b's step settles with
+# the LaneDInputs its `inputs` source returns; nothing in production supplies
+# one, so an armed lane D refuses `inputs_unavailable` every settlement.
+#
+# New (box side): build_lane_d_inputs, the source (intake entries, pinned
+# pool_d snapshots, the W5f house, the eval host's forecasts behind the W4
+# handshake, the metagraph, the bench SweepSession), LaneDInputsError and
+# INPUTS_ERROR_CODES. Imported only by the entry point (W9 invariant 12).
+cascade/validator/lane_d_inputs.py
+# New (eval-host side): forecast_entry, one digest's forecasts on the
+# boundary's windows by the W5d scorer over the W15 prefetch cache (W4
+# ingest on a miss), LaneDForecastError and FORECAST_ERROR_CODES.
+cascade/eval/lane_d_forecasts.py
+# cascade-validator main(): builds the source and passes it to
+# build_lane_d_step as `inputs` (and its bench factory as `bench`).
+cascade/validator/main.py
