@@ -33,6 +33,11 @@
     "rows_sha256": {"$ref": "#/$defs/digest"},
     "pay": {"$ref": "#/$defs/pay"},
     "gate": {"$ref": "#/$defs/gate"},
+    "armed_contexts": {
+      "type": "array", "minItems": 1, "items": {"type": "integer", "minimum": 1},
+      "description": "rev6.6: the variants armed at this settlement (ascending, a subset of params.contexts), present together with armed_evidence; absent on a settlement not handed the armed record."
+    },
+    "armed_evidence": {"$ref": "#/$defs/armed_evidence"},
     "extensions": {
       "type": "object",
       "description": "Open and never consensus: satellites must not read verdict, eligibility or weight inputs from it."
@@ -45,6 +50,31 @@
     "properties": {"gate": {"type": "object"}}
   },
   "$defs": {
+    "armed_evidence": {
+      "type": "object",
+      "description": "rev6.6: the evidence the armed set was computed on (W5d armed_record): the pinned readiness (laned_readiness/1) and T7 (laned_t7/1) documents' sha256 (null when absent) and, per params.contexts value, its counts and gates. armed = series >= min_long_series and sources >= min_sources and t7_fits.",
+      "required": ["min_long_series", "min_sources", "readiness_sha256", "t7_sha256", "variants"],
+      "additionalProperties": false,
+      "properties": {
+        "min_long_series": {"type": "integer", "minimum": 0},
+        "min_sources": {"type": "integer", "minimum": 0},
+        "readiness_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+        "t7_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+        "variants": {"type": "array", "items": {"$ref": "#/$defs/armed_variant"}}
+      }
+    },
+    "armed_variant": {
+      "type": "object",
+      "required": ["context", "series", "sources", "t7_fits", "armed"],
+      "additionalProperties": false,
+      "properties": {
+        "context": {"type": "integer", "minimum": 1},
+        "series": {"type": "integer", "minimum": 0},
+        "sources": {"type": "integer", "minimum": 0},
+        "t7_fits": {"type": "boolean"},
+        "armed": {"type": "boolean"}
+      }
+    },
     "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "timestamp": {"type": "integer", "minimum": 0},
     "entry_status": {"type": "string",
