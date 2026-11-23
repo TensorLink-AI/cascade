@@ -125,6 +125,7 @@ SKIP_REASONS`, the digest not in `judged`) or nothing for a judged entry
 | hold N + 1 (re-queued) | `bench_hold` | `pending` | yes |
 | gate regression | `gate_regression` | `lost` | no |
 | gate pass | `crowned` | `crowned` | no |
+| clears the confirmation duel, fails the A10 low-frequency check (W3b5's T4b fixture) | `lowfreq_regression` | `lost` | no |
 
 Also, for every case: every entry in the state (not only the one under test)
 has a reason in `lane_d_state.ENTRY_REASONS` and a status in
@@ -137,14 +138,17 @@ collects the `ENTRY_REASONS` values that appear as string literals (not
 docstrings) in `cascade/validator/lane_d.py`, plus the gate outcomes that are
 entry reasons, and fails on any with no case. A new emitted reason needs a
 case here. `test_every_enum_reason_is_cased_or_owned_elsewhere` accounts for
-every enum value. The four nothing emits yet belong to other WPs:
+every enum value. The three nothing emits yet belong to other WPs:
 
 | reason | owner |
 |---|---|
 | `coldkey_changed` | W5h (A8, T6b) |
 | `reveal_delay_exceeded` | W5h (A9, T18b) |
-| `lowfreq_regression` | W3b5 (A10, T4b) |
 | `mirror_lag_exceeded` | W5a (A1) |
+
+`lowfreq_regression` is emitted by W3b5 (A10, T4b; `cascade/validator/lane_d.py`)
+and pinned here by the case above; W3b5's own tests (tests/accept/w3b5) own
+the check's semantics.
 
 ## Not pinned
 

@@ -59,7 +59,11 @@ validator. Unarmed (``not cfg.active(boundary)``) it returns
    eligible to crown (the best LCB among the passing candidates is crowned),
    ``gate_regression`` is ``lost``, ``checkpoint_fault`` is ``closed`` and
    ``bench_hold`` stays open, its clear kept in ``gate_hold`` and re-gated
-   at a later settlement without a new duel. FAIL CLOSED: with no ``bench``
+   at a later settlement without a new duel. W5g: holds are bounded; the
+   ``gate_hold`` record counts the consecutive holds of one held clear
+   (``holds``) and the hold after ``max_bench_holds`` re-queues the entry
+   unjudged (``pending``/``bench_hold``, its clear dropped, never charged;
+   a re-gate is then a typed ``bench_hold`` skip). FAIL CLOSED: with no ``bench``
    or no ``boundary_block_hash`` (the legacy call) every candidate is
    ``bench_hold``: never crowned, lost or charged. The report carries the
    ``gate`` record whenever the gate ran; a crowned report always has one;
@@ -956,12 +960,23 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
             passing.append(c)
             continue
         if outcome == "bench_hold":
-            # Infrastructure, never the miner's fault: open, the clear kept
-            # (an existing hold keeps its first record), not crowned or lost.
-            rec["gate_hold"] = rec.get("gate_hold") or {
-                "boundary": boundary, "king_d": str(state["king"]["digest"]),
-                "lcb": c["lcb"], "set_sha256": c["set_sha256"]}
-            rec["status"] = "confirm_pending"
+            # Infrastructure, never the miner's fault: never crowned, lost or
+            # charged. W5g (§10.4): the consecutive holds of one held clear
+            # are counted in its ``gate_hold`` record (state, restart-safe).
+            # Holds 1..max_bench_holds keep the clear (an existing hold keeps
+            # its first record); the next one re-queues the entry unjudged:
+            # ``pending`` / ``bench_hold``, the clear and its first clear
+            # dropped, judged afresh on the next fresh windows.
+            prev = rec.get("gate_hold")
+            holds = (int(prev.get("holds", 1)) if prev else 0) + 1
+            if holds > int(cfg.max_bench_holds):
+                rec.pop("gate_hold", None)
+                rec.update(status="pending", confirm=None, frozen_set=None)
+            else:
+                rec["gate_hold"] = {**(prev or {
+                    "boundary": boundary, "king_d": str(state["king"]["digest"]),
+                    "lcb": c["lcb"], "set_sha256": c["set_sha256"]}), "holds": holds}
+                rec["status"] = "confirm_pending"
             reason = "bench_hold"
         else:
             rec.pop("gate_hold", None)
