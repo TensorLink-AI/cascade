@@ -130,7 +130,7 @@ def feeds_block(records: list[dict]) -> dict:
     ``unlisted_feed``; listing every feed keeps eligibility on the clocks and
     the frontier alone."""
     names = sorted({r.get("feed") or r["source"] for r in records})
-    return {f: {"mirror_lag_hours": FEED_LAG_HOURS, "forecast_product": False}
+    return {f: {"mirror_lag_hours": FEED_LAG_HOURS, "forecast_product": False, "embargo_hours": 0.0}
             for f in names}
 
 
