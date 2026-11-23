@@ -68,8 +68,11 @@ def _entry(report, dg) -> dict:
 
 
 def _result(report, dg) -> dict:
-    (r,) = [r for r in report["gate"]["results"] if r["digest"] == dg]
-    return r
+    gate = report.get("gate")
+    assert isinstance(gate, dict), f"the report carries no gate record (gate={gate!r})"
+    rs = [r for r in gate["results"] if r["digest"] == dg]
+    assert len(rs) == 1, f"want one gate result for {dg[:12]}; got {len(rs)}"
+    return rs[0]
 
 
 def _single(tmp, spec1, *, sentinel=None, gated=True) -> dict:
@@ -103,6 +106,28 @@ SENTINEL = "boom"
 
 
 def _build(name: str, tmp):
+    """One scenario, checked for its rev6.11 shape (an `assert`, so a main
+    without the change fails here for a right reason)."""
+    run = _build_raw(name, tmp)
+    for key in ("s1", "s2"):
+        r = run.get(key)
+        if r is None:
+            continue
+        if name not in ("legacy", "losers"):
+            assert isinstance(r.get("gate"), dict), \
+                f"fixture {name}.{key}: no gate record (the first clear must be gated)"
+    if name in ("pass", "sentinel"):
+        assert run["s1"]["crowned"] == run["x"]["digest"], \
+            f"fixture {name}: X is not crowned at its first verdict"
+    if name == "hold":
+        assert run["s2"]["crowned"] == run["x"]["digest"], "fixture hold: no re-gated crown"
+    if name == "legacy":
+        e = _entry(run["s1"], run["x"]["digest"])
+        assert (e["status"], e["reason"]) == ("hold", "bench_hold"), f"fixture legacy: {e}"
+    return run
+
+
+def _build_raw(name: str, tmp):
     h = _h()
     if name == "pass":
         return _single(tmp, lambda x, h0: {x: 0.9, h0: 1.0})

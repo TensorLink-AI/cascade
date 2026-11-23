@@ -59,10 +59,13 @@ def _base(scratch, **kw) -> dict:
 def _refused(report, code, field):
     from cascade.validator.lane_d_report import ReportSchemaError, validate_report
 
-    with pytest.raises(ReportSchemaError) as info:
+    try:
         validate_report(report)
-    assert (info.value.code, info.value.field) == (code, field), \
-        f"refused {info.value.code} at {info.value.field}; want {code} at {field}"
+    except ReportSchemaError as exc:
+        assert (exc.code, exc.field) == (code, field), \
+            f"refused {exc.code} at {exc.field}; want {code} at {field}"
+        return
+    raise AssertionError(f"validate_report accepted a report it must refuse ({code} at {field})")
 
 
 # ── the spliced fixture validates ───────────────────────────────────────────

@@ -78,6 +78,8 @@ class Run:
         v = verdict_of(self.s1.report, self.x["digest"])
         assert v is not None and v.get("stage", "first") == "first" and v["cleared"] is True, \
             f"fixture: X did not clear at its first verdict: {v}"
+        assert isinstance(self.s1.report.get("gate"), dict), \
+            "fixture: X's first clear was not gated (rev6.11: the first clear is the candidate)"
 
     @property
     def drawn(self) -> str:

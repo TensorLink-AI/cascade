@@ -233,6 +233,13 @@ def test_results_with_a_verdict_carry_no_held_from(runs):
 def test_a_report_carrying_held_from_validates_and_the_record_is_closed(runs):
     from cascade.validator.lane_d_report import ReportSchemaError, validate_report
 
+    def code_of(report) -> str:
+        try:
+            validate_report(_resign(report))
+        except ReportSchemaError as exc:
+            return exc.code
+        raise AssertionError("validate_report accepted a bad held_from")
+
     run = runs("hold")
     r = run["s2"]
     assert "held_from" in _result(r, run["x"]["digest"]), "fixture: no held_from"
@@ -240,20 +247,14 @@ def test_a_report_carrying_held_from_validates_and_the_record_is_closed(runs):
     for value, code in ((None, "bad_type"), ("x", "bad_type")):
         bad = copy.deepcopy(r)
         _result(bad, run["x"]["digest"])["held_from"] = value
-        with pytest.raises(ReportSchemaError) as e:
-            validate_report(_resign(bad))
-        assert e.value.code == code, (value, e.value.code, e.value.field)
+        assert code_of(bad) == code, value
     bad = copy.deepcopy(r)
     _result(bad, run["x"]["digest"])["held_from"]["extra"] = 1
-    with pytest.raises(ReportSchemaError) as e:
-        validate_report(_resign(bad))
-    assert e.value.code == "unknown_field", (e.value.code, e.value.field)
+    assert code_of(bad) == "unknown_field"
     for k in sorted(HELD_FROM_KEYS):
         bad = copy.deepcopy(r)
         _result(bad, run["x"]["digest"])["held_from"].pop(k)
-        with pytest.raises(ReportSchemaError) as e:
-            validate_report(_resign(bad))
-        assert e.value.code == "missing_field", (k, e.value.code, e.value.field)
+        assert code_of(bad) == "missing_field", k
 
 
 def _find_key(node, key):

@@ -40,14 +40,23 @@ def _reports(scratch):
 
 def _refused(scratch, report, code, field=None, *, prefix=None):
     _, validate_report, err = _reports(scratch)
-    with pytest.raises(err) as info:
-        validate_report(report)
-    assert info.value.code == code, f"code {info.value.code!r} (field {info.value.field!r})"
-    assert info.value.code in SCHEMA_ERROR_CODES
+    exc = _raised(validate_report, report, err)
+    assert exc.code == code, f"code {exc.code!r} (field {exc.field!r})"
+    assert exc.code in SCHEMA_ERROR_CODES
     if field is not None:
-        assert info.value.field == field, f"field {info.value.field!r}, want {field!r}"
+        assert exc.field == field, f"field {exc.field!r}, want {field!r}"
     if prefix is not None:
-        assert str(info.value.field).startswith(prefix), info.value.field
+        assert str(exc.field).startswith(prefix), exc.field
+
+
+def _raised(validate_report, report, err):
+    """The `ReportSchemaError` `validate_report(report)` raises; a report it
+    accepts is an `AssertionError` (never pytest's `DID NOT RAISE`)."""
+    try:
+        validate_report(report)
+    except err as exc:
+        return exc
+    raise AssertionError("validate_report accepted a report it must refuse")
 
 
 def _s2(scratch) -> dict:
@@ -275,10 +284,9 @@ def test_rows_sha256_mismatch_is_refused(scratch):
 
 def _refused_any(scratch, report, codes, field):
     _, validate_report, err = _reports(scratch)
-    with pytest.raises(err) as info:
-        validate_report(report)
-    assert info.value.code in codes, f"code {info.value.code!r} (field {info.value.field!r})"
-    assert info.value.field == field, f"field {info.value.field!r}, want {field!r}"
+    exc = _raised(validate_report, report, err)
+    assert exc.code in codes, f"code {exc.code!r} (field {exc.field!r})"
+    assert exc.field == field, f"field {exc.field!r}, want {field!r}"
 
 
 def test_a_confirmation_block_is_refused(scratch):
