@@ -230,9 +230,11 @@ def test_max_mirror_lag_hours_is_read_from_cfg(tmp_path):
 
 def test_feed_defaults_to_the_series_source(tmp_path):
     rec = case("eligible", BOUND, "src-feed", "srcLag")
-    feeds = {"srcLag": {"mirror_lag_hours": LAG_H + 3.0, "forecast_product": False}}
+    feeds = {"srcLag": {"mirror_lag_hours": LAG_H + 3.0, "forecast_product": False,
+                       "embargo_hours": 0.0}}
     _assert_refused(_one(tmp_path, rec, feeds=feeds), "over_lag")
-    feeds = {"srcLag": {"mirror_lag_hours": 1.0, "forecast_product": True}}
+    feeds = {"srcLag": {"mirror_lag_hours": 1.0, "forecast_product": True,
+                       "embargo_hours": 0.0}}
     _assert_refused(_one(tmp_path, rec, feeds=feeds, name="pool2"), "forecast_product")
 
 
@@ -241,9 +243,10 @@ def test_listed_feed_with_null_lag_is_not_a_refusal(tmp_path):
     snapshot LISTS with `mirror_lag_hours: null` is declared unmeasured; the
     two clocks still govern (RV3: only an explicit null admits)."""
     rec = case("eligible", BOUND, "u", "srcU")
-    _assert_eligible(_one(tmp_path, rec, feeds={"srcU": {"mirror_lag_hours": None}}))
+    _assert_eligible(_one(tmp_path, rec, feeds={"srcU": {"mirror_lag_hours": None,
+                                                             "embargo_hours": 0.0}}))
     _assert_eligible(_one(tmp_path, rec, name="pool2", feeds={
-        "srcU": {"mirror_lag_hours": None, "forecast_product": False}}))
+        "srcU": {"mirror_lag_hours": None, "forecast_product": False, "embargo_hours": 0.0}}))
 
 
 def test_unlisted_feed_is_refused(tmp_path):

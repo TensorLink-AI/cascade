@@ -1,4 +1,4 @@
-# W5a acceptance tests: forward eligibility
+# W5a acceptance tests: forward eligibility (embargo-aware since rev6.10)
 
 W5a (plan rev6 §3.0 W5a row, §1.3, Proposed design changes 1 and 2, which
 the owner ACCEPTED in rev5, T8, §3.2 invariant 4) replaces W1.5's thin
@@ -171,3 +171,73 @@ after W5e. The bench is the one external service: every digest but the
 house returns the same recorded rows and the house is 10% worse, so the
 crowning candidate passes on any drawn suite and the duel alone decides.
 No assertion changed; every test still passes on main.
+
+## Embargo (rev6.10 (a), rev6.12 (a)/(b); tests-correction)
+
+The W5a row (rev6.10, rev6.11, rev6.12) makes the rule embargo-aware. Let
+`b = max(T_E, T_K) + 3600 · forward_margin_hours` (the bound above) and, per
+series, **for every pool `freq`** (rev6.12 (a) reverses rev6.11's sub-hourly
+zero):
+
+    e = min(feeds[feed].embargo_hours, cfg.embargo_hours)
+
+- **Fail closed:** a listed feed whose `embargo_hours` is missing, `null`, a
+  bool, a string or negative makes the window `unlisted_feed` (same slot in
+  the precedence order: after `missing_clock`). `0` is valid.
+- **The rule:** rules 4 and 5 compare against the **feed bound** `b − e`:
+  every target point needs `data_ts > b − e` and `first_seen > b − e`
+  (`first_seen + e > b`), strictly; the labels keep their meaning
+  (`before_margin`, `publish_ahead`, `late_mirror`). S0 is the earliest
+  frontier record with `as_of_ts > b − e`; backfill is judged against it.
+- **e = 0 is byte-identical to the rev3 rule** (the test diffs the
+  producer's serialised verdicts against `helpers.oracle_reason`, with the
+  feeds at 0 and with `cfg.embargo_hours` at 0).
+- **Mixed targets:** a window may straddle `b`; it passes when every point
+  passes the rule above.
+- **Verdict fields:** an eligible verdict carries `embargo_hours` (the
+  effective e, a float) and `embargo_window` (rev6.12 terms: `False` =
+  **fresh**, the window also passes at e = 0 on every point; `True` =
+  **embargo** window, a mixed one included). W5j's fresh-first draw and
+  `min_fresh_window_share` read the flag; W7a reports it. Refused verdicts
+  may carry anything there.
+- `cfg.embargo_hours` is W2e's key (default 48). The tests never read it:
+  `helpers.with_embargo` hands the producer a config that has it, a
+  `dataclasses.replace` once W2e lands.
+- The per-feed value is pinned in the snapshot (`feeds[feed].embargo_hours`,
+  W6b); `load_pool` must carry it through to `eligible_windows` unchanged
+  (a non-numeric value is the window's refusal, never a pool error).
+
+Fixtures: every listed feed now pins `embargo_hours` (`helpers.feeds_block`,
+default 0), so every pre-embargo test keeps its verdicts.
+
+| Rule | Test (`test_w5a_embargo.py` unless noted) |
+|---|---|
+| inside the embargo eligible at 48, rev3 refusal at 0 | `test_window_inside_the_embargo_is_eligible_at_e48`, `test_same_window_at_e0_is_the_rev3_refusal` |
+| every cadence gets it | `test_every_cadence_gets_the_embargo[...]` |
+| mixed target | `test_a_target_straddling_b_is_eligible_at_e48_only` |
+| catalog only shortens; cfg read | `test_catalog_value_can_only_shorten` |
+| strict feed bound, every point | `test_feed_bound_is_strict_on_both_clocks`, `test_every_target_point_counts_against_the_feed_bound` |
+| S0 / backfill at `b − e` | `test_s0_and_backfill_use_the_feed_bound` |
+| bad feed value fails closed | `test_bad_feed_embargo_fails_closed_as_unlisted_feed`, `test_bad_feed_embargo_ranks_after_missing_clock`, `test_zero_is_a_valid_feed_embargo` |
+| verdict fields | `test_verdict_carries_effective_embargo_and_embargo_window_flag` |
+| e = 0 byte-identical | `test_e0_is_byte_identical_to_the_rev3_verdicts[feed_zero, config_zero]` |
+| property vs the oracle | `test_embargo_rule_matches_the_oracle_over_random_fixtures` |
+| through `settle_lane_d` | `test_w5a_embargo_settle.py::test_settle_judges_embargo_windows_of_every_cadence` |
+
+### On main (tests-correction)
+
+The new embargo tests fail on an `AssertionError` (main refuses embargo
+windows, admits invalid feed values, and its verdicts have no
+`embargo_hours` / `embargo_window`); the byte-identity tests pass. The
+other files change only through `helpers.py` (feeds pin
+`embargo_hours: 0`) and the custom feed dicts in
+`test_w5a_eligibility.py`, and still pass. `test_w5a_settle.py`'s e2e test
+no longer requires rows at BOUNDARY_2: rev6.11 (b) crowns at the first
+verdict, so BOUNDARY_2 may judge nothing. A scratch prototype passed every
+W5a test.
+
+**Blast radius (flag for the coordinator):** the fail-closed rule refuses
+every window of a feed without `embargo_hours`. The pool fixtures of W1.5,
+W3b3, W3b5, W5b, W5c, W5f, W5g, W7b, W7c, W7d and W9 write `feeds` without
+it, so they need the same one-line fixture fix before the W5a
+implementation can pass CROSS. W5e's and W7a's are fixed in this PR.

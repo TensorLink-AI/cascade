@@ -555,3 +555,70 @@ suites. That shows the contract can be built and that every honest fixture
 report PASSes.
 
 `test_w7a_audit_gate.py` and every other W7a test file are unchanged.
+
+### Correction (rev6.11, rev6.12): no confirmation duel; embargo, fresh share and draw fields
+
+Tests-correction PR (w0c `--tests-correction`). Plan rev6.11 (b) drops the
+confirmation duel (crown at the first verdict, W5e); rev6.10 (a)/(b),
+rev6.11 (a) and rev6.12 (a)/(b) add the embargo, the W5j draw and the
+minimum fresh share to the report. This supersedes the enum, field and
+fixture text above where they disagree.
+
+**Removed (rev6.11 (b)).** `ENTRY_STATUSES` loses `confirm_pending`;
+`ENTRY_REASONS` loses `confirm_pending` and `lost_confirmation`;
+`CONFIRM_RULES` and `$defs.confirm_rule` go; `$defs.confirmation` (the
+block) goes and a verdict carrying `confirmation` is `unknown_field`;
+`confirmation_stage`, if kept, is exactly `["first"]` (a `stage` of
+`confirm` is `bad_value`, or `unknown_field` if `stage` is dropped);
+`verdict_outcome` equals `VERDICT_OUTCOMES`, holds `lost` and `crowned`
+and neither `confirm_pending` nor `confirmed` (the name of a held / passing
+non-best outcome is the builder's); `params.confirm_on_king_change` leaves
+the echo (`unknown_field`). Stay on `/1` (plan rec).
+
+**Fixture.** `loser_then_crown` (new; `two_settlements` stays as it was for W9, W8b and W8c) judges the loser L alone at BOUNDARY_1
+(lost / `lost_duel`, the house keeps the slot: `house_king`) and the
+challenger, revealed after BOUNDARY_1, at BOUNDARY_2, where its first
+verdict crowns. Every fixture feed pins `embargo_hours: 0` (W5a fails a feed
+without it closed), and W3b5's pool used here is patched the same way.
+
+**Audit (`check_lane_d`, in PATHS).** A crown is first clear ∧ A10 ∧ gate:
+a cleared verdict is the crowning candidate; `bench_hold` / no gate record
+holds it (neither crowned nor lost, entry `hold` / `bench_hold`); a cohort
+or verdict with `stage: "confirm"` FAILs; every cohort is judged against
+`king_before`; `held_from` names the settlement where the FIRST verdict
+cleared and was held, and its `king_d` must be `king_before` (no D20: a king
+change drops the hold); in chain mode the named report must hold that held
+verdict (a report where the gate passed or crowned it is not a hold). The
+RV7 (b) first-clear chain is gone; a loser doctored into a crown FAILs.
+
+**New report fields.**
+
+| object | field | rule |
+|---|---|---|
+| `params` | `embargo_hours`, `max_windows_per_settlement`, `min_fresh_window_share` | required, as parsed (W2e; tests read them with the plan defaults 48 / 5000 / 0.5) |
+| `windows[]` | `freq` | the series' pool `freq` |
+| | `embargo_hours` | the effective e, number in [0, `params.embargo_hours`] |
+| | `min_release_ts` | `min_first_seen_ts + round(3600 · embargo_hours)` |
+| | `rule` | `embargo0` iff `embargo_hours == 0`, else `embargo` (`$defs.window_rule`) |
+| | `embargo_window` | bool: `false` = fresh, `true` = embargo (mixed included); `embargo0` ⇒ `false` |
+| | `timeframe`, `bin`, `kind`, `freq_class`, `h`, `origin` | the draw cell (W5j / W5i names; `$defs.window_bin`, `window_kind`, `freq_class`); `h` and `origin` equal the window id's `h<h>` and middle field |
+| `cohorts[]` | `fresh_windows`, `embargo_windows` | the counts of its windows by flag; `fresh ≥ min_fresh_window_share × size` (else `bad_value` at `embargo_windows`) |
+| `verdicts[]` | `fresh`, `embargo` | closed `{n, geomean}`: the member's rows on the cohort's fresh / embargo windows; `geomean` is the lane D `_geo` of those rows (rel. 1e-9), `null` iff `n == 0` |
+| top level | `draw` (optional, never `null`) | `{boundary_block_hash (0x + 64 hex), seed = "<hash>:lane_d_windows", max_windows_per_settlement = params', cohorts[]: {index (a cohort of the report), quota, capacity ({"<timeframe>|<bin>": int}, quota ≤ capacity), candidates_sha256}}` |
+| `cohorts` | — | the judged windows across cohorts never exceed `max_windows_per_settlement` (`bad_value` at `cohorts`) |
+
+Tests: `test_w7a_embargo_fields.py` (spliced through
+`helpers.with_embargo_fields`, plus the producer's own report). Whether a
+window is fresh relative to its cohort's `b` is re-derived by W9 / W7d, not
+by `validate_report`.
+
+**On main** (W5e still confirms, W7a's schema still has the confirm enums):
+every changed file's failures are `AssertionError`s: the producer still
+writes `confirm_pending` / the confirmation block / the old params, the
+spliced reports are refused `unknown_field`, and the audit expects
+confirmations. A scratch prototype (W5e stage removed, the schema and
+validator rules above, the producer emitting the fields, the audit changes)
+passed every W7a, W5e and W5a test (462).
+
+**Order:** the W7a implementation needs W2e's keys and lands after W5e's
+(the audit's honest fixtures crown at the first verdict).
