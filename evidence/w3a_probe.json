@@ -458,11 +458,11 @@
     "verified": true,
     "binding": "unlocked_anchor",
     "body_sha256": "e92d83284c4ad5c28c88fa1eb523ef55a42099a819a1e1d64b011fb3b3f6e090",
-    "verified_at": "2026-11-23T04:52:15+00:00",
+    "verified_at": "2026-11-23T06:09:28+00:00",
     "tool": {
       "module": "cascade.laned.storage_probe",
-      "git_sha": "48ebe0129b8b169f9d53c988dae87e7d17d573e0",
-      "git_dirty": true
+      "git_sha": "bbf670b5de9984e37946724a8587d5f4eceb1b3c",
+      "git_dirty": false
     },
     "endpoint_host": "s3.hippius.com",
     "bucket": "cascade-w3a-probe-20261122",
@@ -477,8 +477,8 @@
         "etag": "\"3c6116c0b116f47856cdc3bdf4f3e9a5\"",
         "sha256": "b7a10cfc6d68a71e59431a2827b12ef591215353a9c9526a486e3cb30d241efc",
         "request_ids": [
-          "18EA9E4431D1C35E",
-          "18EA9E47D0724CFD"
+          "18EA9AFB3BDD7A64",
+          "18EA9AFBD3D712AA"
         ]
       }
     ],
@@ -487,7 +487,15 @@
       "keys": [
         "w3a-probe/f466f7eb48fc10a9/anchor.bin"
       ],
-      "request_id": "18EA9E477F4CEE8E"
+      "request_id": "18EA9AFBEE6D67DE"
+    },
+    "path_verdict": {
+      "path": "presigned_multipart",
+      "required": [
+        "presigned_upload_part",
+        "upload_part_copy_2_5gb"
+      ],
+      "passed": true
     }
   }
 }
