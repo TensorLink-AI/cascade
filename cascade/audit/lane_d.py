@@ -126,7 +126,12 @@ def _expected_params(cfg) -> dict:
             # RV4: gate params W7a added to lane-d-report/1 params.
             "gate_weights": {str(s): float(w) for s, w in cfg.gate_weights},
             "max_source_share": float(cfg.max_source_share),
-            "min_long_series": int(cfg.min_long_series)}
+            "min_long_series": int(cfg.min_long_series),
+            # rev6.10 (a) / rev6.12 (b) (W2e): the embargo cap, the W5j
+            # settlement budget and the minimum fresh share.
+            "embargo_hours": float(cfg.embargo_hours),
+            "max_windows_per_settlement": int(cfg.max_windows_per_settlement),
+            "min_fresh_window_share": float(cfg.min_fresh_window_share)}
 
 
 def _body_digest(report: dict) -> str:
@@ -285,8 +290,13 @@ def _cohort_problems(report: dict, cfg, cohort: dict, rows_by: dict, windows: di
         if w is None:
             out.append(f"cohort {idx}: window {wid} has no clock record")
             continue
-        if not (int(w["min_target_ts"]) > bound and int(w["min_first_seen_ts"]) > bound):
-            out.append(f"cohort {idx}: window {wid} is not forward-only for max(T)={t_max}")
+        # rev6.10 (a) / rev6.12 (a), every cadence: eligible at the feed bound
+        # b - e with the window's signed effective embargo e.
+        e = 3600.0 * float(w["embargo_hours"]) if _finite(w.get("embargo_hours")) else None
+        if e is None or not (int(w["min_target_ts"]) > bound - e
+                             and int(w["min_first_seen_ts"]) + e > bound):
+            out.append(f"cohort {idx}: window {wid} is not forward-only for max(T)={t_max} "
+                       f"under its embargo")
     if len(wids) < int(cfg.min_windows):
         out.append(f"cohort {idx}: {len(wids)} windows < min_windows {cfg.min_windows}")
     clusters = [windows[w]["source"] for w in wids if w in windows]
@@ -821,6 +831,156 @@ def _clock_problems(report: dict, cfg, windows: dict) -> list[str]:
     return out
 
 
+CONFIRMATION_STAGE_PRESENT = "confirmation_stage_present"
+_DRAW_SEED_TAG = "lane_d_windows"
+_FREQ_CLASS = {"D": "daily", "W": "weekly", "M": "monthly", "ME": "monthly", "MS": "monthly",
+               "Q": "quarterly", "QE": "quarterly", "QS": "quarterly",
+               "A": "yearly", "Y": "yearly", "YE": "yearly"}
+
+
+def combined_log_ratio(r_fwd: float, r_bt: float, *, n_fwd: int, n_bt: int, cap: float,
+                       floor: float) -> float:
+    """rev6.9 (W5i) combination, re-derived for the audit: ``(1 - c) log r_fwd
+    + c log clamp(r_bt, floor, 1/floor)``, ``c = min(cap, n_bt / (n_bt +
+    n_fwd))`` (0 without backtest windows: exactly ``log r_fwd``)."""
+    c = 0.0 if int(n_bt) == 0 else min(float(cap), int(n_bt) / (int(n_bt) + int(n_fwd)))
+    if c <= 0.0:
+        return math.log(float(r_fwd))
+    clamped = min(max(float(r_bt), float(floor)), 1.0 / float(floor))
+    return (1.0 - c) * math.log(float(r_fwd)) + c * math.log(clamped)
+
+
+def _confirmation_problem(report: dict) -> str | None:
+    """rev6.11 (b): there is no confirmation stage; a report carrying one (a
+    cohort or verdict stage other than ``first``, a verdict ``confirmation``
+    block, an entry ``confirm_pending``) is refused."""
+    for key in ("cohorts", "verdicts"):
+        for i, x in enumerate(report.get(key) or []):
+            if isinstance(x, dict) and (("stage" in x and x["stage"] != "first")
+                                        or (key == "verdicts" and "confirmation" in x)):
+                return f"{CONFIRMATION_STAGE_PRESENT}: {key}[{i}] carries a confirmation stage"
+    for i, e in enumerate(report.get("entries") or []):
+        if isinstance(e, dict) and "confirm_pending" in (e.get("status"), e.get("reason")):
+            return f"{CONFIRMATION_STAGE_PRESENT}: entries[{i}] is confirm_pending"
+    return None
+
+
+def _geomean_of(rows: list) -> float | None:
+    if not rows:
+        return None
+    lc = sum(math.log(max(float(r["crps"]), 1e-12)) for r in rows) / len(rows)
+    lm = sum(math.log(max(float(r["mase"]), 1e-9)) for r in rows) / len(rows)
+    return math.sqrt(math.exp(lc) * math.exp(lm))
+
+
+def _embargo_problems(report: dict, cfg, windows: dict, rows_by: dict) -> list[str]:
+    """rev6.10 (a) / rev6.12 (a)/(b) / W5j, re-derived: each judged window's
+    embargo record and class at its cohort's bound, each cohort's fresh /
+    embargo split and the minimum fresh share, each verdict's sub-scores
+    from the rows, the settlement budget and the draw record."""
+    out: list[str] = []
+    cap, h = float(cfg.embargo_hours), int(cfg.horizon)
+    margin = 3600.0 * float(cfg.forward_margin_hours)
+    for wid, w in windows.items():
+        e = w.get("embargo_hours")
+        if not _finite(e) or isinstance(e, bool) or float(e) < 0 or float(e) > cap:
+            out.append(f"window {wid}: embargo_hours {e!r} is not in [0, {cap}]")
+            continue
+        e = float(e)
+        if w.get("rule") != ("embargo" if e > 0 else "embargo0"):
+            out.append(f"window {wid}: rule {w.get('rule')!r} for e = {e}")
+        if not isinstance(w.get("min_release_ts"), int) or isinstance(w.get("min_release_ts"), bool):
+            out.append(f"window {wid}: min_release_ts {w.get('min_release_ts')!r} is not a timestamp")
+        freq = w.get("freq")
+        if w.get("timeframe") != freq or w.get("freq_class") != _FREQ_CLASS.get(freq, "subdaily") \
+                or w.get("kind") != "forward" or w.get("bin") != "forward" or w.get("h") != h \
+                or wid.rsplit(":", 2)[1:] != [str(w.get("origin")), f"h{h}"]:
+            out.append(f"window {wid}: the draw cell (timeframe/freq_class/kind/bin/h/origin) "
+                       f"does not match the window")
+    share = float(cfg.min_fresh_window_share)
+    judged: set[str] = set()
+    for c in report.get("cohorts") or []:
+        idx, wids = c["index"], [x for x in c["window_ids"] if x in windows]
+        judged.update(wids)
+        bound = float(int(c["t_max"])) + margin
+        n_emb = 0
+        flag = {}
+        for wid in wids:
+            w = windows[wid]
+            fresh = int(w["min_target_ts"]) > bound and int(w["min_first_seen_ts"]) > bound
+            flag[wid] = not fresh
+            if w.get("embargo_window") is fresh:
+                out.append(f"cohort {idx}: window {wid} embargo_window "
+                           f"{w.get('embargo_window')!r}; re-derived {not fresh}")
+            n_emb += 0 if fresh else 1
+        if c.get("embargo_windows") != n_emb or c.get("fresh_windows") != len(wids) - n_emb:
+            out.append(f"cohort {idx}: fresh/embargo {c.get('fresh_windows')!r}/"
+                       f"{c.get('embargo_windows')!r}; re-derived {len(wids) - n_emb}/{n_emb}")
+        if wids and (len(wids) - n_emb) < share * len(wids):
+            out.append(f"cohort {idx}: fresh_share_short: {len(wids) - n_emb} fresh of "
+                       f"{len(wids)} < {share}")
+        for v in report.get("verdicts") or []:
+            if int(v["cohort"]) != int(idx):
+                continue
+            for name, emb in (("fresh", False), ("embargo", True)):
+                rs = [rows_by[(int(idx), x, v["digest"])] for x in wids
+                      if flag[x] is emb and (int(idx), x, v["digest"]) in rows_by]
+                st = v.get(name)
+                want = _geomean_of(rs)
+                if not isinstance(st, dict) or st.get("n") != len(rs) or (
+                        (want is None) is not (st.get("geomean") is None)) or (
+                        want is not None and not math.isclose(float(st["geomean"]), want,
+                                                              rel_tol=1e-9)):
+                    out.append(f"verdict {str(v['digest'])[:12]}: {name} sub-score is not its "
+                               f"rows'")
+    if len(judged) > int(cfg.max_windows_per_settlement):
+        out.append(f"{len(judged)} judged windows > max_windows_per_settlement "
+                   f"{cfg.max_windows_per_settlement}")
+    out += _draw_problems(report, cfg, windows)
+    return out
+
+
+def _draw_problems(report: dict, cfg, windows: dict) -> list[str]:
+    """W5j: the draw record is bound to its block hash (the gate's, when the
+    gate ran), the budget and the cohorts; per cell the quota is the cohort's
+    judged windows of that cell, at most its capacity."""
+    cohorts = report.get("cohorts") or []
+    gate = report.get("gate")
+    if "draw" not in report:
+        return ["a gated settlement with judged cohorts has no draw record"] \
+            if cohorts and isinstance(gate, dict) else []
+    d = report["draw"]
+    out = []
+    if not isinstance(d, dict) or not cohorts:
+        return ["draw record without a drawn cohort"]
+    bh = d.get("boundary_block_hash")
+    if isinstance(gate, dict) and gate.get("block_hash") != bh:
+        out.append(f"draw boundary_block_hash {bh!r} is not the gate's block hash")
+    if d.get("seed") != f"{bh}:{_DRAW_SEED_TAG}":
+        out.append(f"draw seed {d.get('seed')!r} is not <boundary_block_hash>:{_DRAW_SEED_TAG}")
+    if d.get("max_windows_per_settlement") != int(cfg.max_windows_per_settlement):
+        out.append("draw max_windows_per_settlement is not the config's")
+    dcs = d.get("cohorts")
+    if not isinstance(dcs, list) or len(dcs) != len(cohorts):
+        return out + ["draw cohorts do not match the report's cohorts"]
+    for dc, c in zip(dcs, cohorts, strict=True):
+        if not isinstance(dc, dict) or dc.get("index") != c["index"]:
+            out.append(f"draw cohort {c['index']}: index mismatch")
+            continue
+        count: dict[str, int] = {}
+        for x in c["window_ids"]:
+            w = windows.get(x)
+            if w is not None:
+                k = f"{w.get('timeframe')}|{w.get('bin')}"
+                count[k] = count.get(k, 0) + 1
+        quota, capacity = dc.get("quota") or {}, dc.get("capacity") or {}
+        for k in sorted(set(quota) | set(count) | set(capacity)):
+            if quota.get(k, 0) != count.get(k, 0) or quota.get(k, 0) > capacity.get(k, 0):
+                out.append(f"draw cohort {c['index']}: quota {k} {quota.get(k)!r} is not its "
+                           f"{count.get(k, 0)} judged windows (capacity {capacity.get(k)!r})")
+    return out
+
+
 def _row_order_problem(report: dict, rows: list) -> str | None:
     """README rule 8: the rows in the canonical order (cohorts by index, each
     cohort's ``window_ids`` in order, per window ``[king, house?, *members]``)."""
@@ -886,6 +1046,17 @@ def _feed_key(series: dict):
     return series.get("feed") or series.get("source")
 
 
+def _feed_embargo(feed: dict, cfg) -> float | None:
+    """rev6.10 (a): the effective embargo of a listed feed, ``min(its pinned
+    embargo_hours, [lane_d] embargo_hours)``; None (fail closed) when the
+    value is absent, not a number (a bool is not one), negative or not
+    finite."""
+    v = feed.get("embargo_hours")
+    if isinstance(v, bool) or not _finite(v) or float(v) < 0:
+        return None
+    return min(float(v), float(cfg.embargo_hours))
+
+
 def window_refusal(series: dict, feeds: dict, bound: float, cfg) -> str | None:
     """The first failing §1.3 rule's label for one ``pool_d/1`` series
     record at ``bound`` (``t_max + 3600 * forward_margin_hours``), or
@@ -903,6 +1074,14 @@ def window_refusal(series: dict, feeds: dict, bound: float, cfg) -> str | None:
     feed = feeds.get(key) if isinstance(feeds, dict) and isinstance(key, str) else None
     if not isinstance(feed, dict):
         return "unlisted_feed"
+    # rev6.10 (a) / rev6.12 (a), every cadence: e = min(the snapshot's pinned
+    # feed embargo_hours, [lane_d] embargo_hours); the clock, S0 and backfill
+    # rules are judged at the feed bound b - e. A listed feed without a valid
+    # embargo fails closed (W5a row).
+    e = _feed_embargo(feed, cfg)
+    if e is None:
+        return "unlisted_feed"
+    bound = float(bound) - 3600.0 * e
     if bool(feed.get("forecast_product", False)):
         return "forecast_product"
     lag = feed.get("mirror_lag_hours")
@@ -986,6 +1165,27 @@ def _snapshot_problem(report: dict, cfg, pool_dirs, windows: dict) -> str | None
             why = window_refusal(s, feeds, bound, cfg)
             if why is not None:
                 return f"window {wid} is refused on its snapshot at bound {bound}: {why}"
+            # rev6.10 (a): the snapshot's pinned e is at most the config's, a
+            # publish-ahead series (a point seen before its data time) is
+            # only protected at e = 0, and the window states that e.
+            pinned = feeds[_feed_key(s)].get("embargo_hours")
+            if float(pinned) > float(cfg.embargo_hours):
+                return (f"window {wid}: its feed pins embargo_hours {pinned!r} above "
+                        f"[lane_d] embargo_hours {cfg.embargo_hours}")
+            e = _feed_embargo(feeds[_feed_key(s)], cfg)
+            if e > 0.0 and any(float(t) > float(f) for t, f in zip(s["target_ts"],
+                                                                  s["first_seen_ts"],
+                                                                  strict=False)):
+                return (f"window {wid}: a publish-ahead series (a point first seen before its "
+                        f"data time) with a non-zero embargo {e}")
+            if w.get("min_release_ts") != int(min(s["first_seen_ts"])) + int(round(3600.0 * e)):
+                return (f"window {wid}: min_release_ts {w.get('min_release_ts')!r} is not the "
+                        f"snapshot's first-seen + 3600 * {e}")
+            if w.get("origin") != int(s["target_ts"][0]):
+                return f"window {wid}: origin {w.get('origin')!r} is not the snapshot's target start"
+            if not _finite(w.get("embargo_hours")) or float(w["embargo_hours"]) != e:
+                return (f"window {wid}: embargo_hours {w.get('embargo_hours')!r} is not the "
+                        f"snapshot's effective {e}")
             source = s.get("source") or s["series_id"]
             feed = s.get("feed") or source
             lag = feeds[_feed_key(s)].get("mirror_lag_hours")
@@ -1030,6 +1230,9 @@ def check_lane_d(report: dict, cfg, *, signer_hotkey: str, prior_reports=None,
             why = _signature(report, signer_hotkey)
         except SignatureVerifierUnavailable as e:
             return _warn(NAME, f"cannot verify the signature: {e}")
+        if why:
+            return _fail(NAME, why)
+        why = _confirmation_problem(report)
         if why:
             return _fail(NAME, why)
         if report.get("scoring_method") != "quantile_head":
@@ -1078,6 +1281,9 @@ def check_lane_d(report: dict, cfg, *, signer_hotkey: str, prior_reports=None,
         if why:
             return _fail(NAME, why)
         problems = _clock_problems(report, cfg, windows)
+        if problems:
+            return _fail(NAME, "; ".join(problems[:5]))
+        problems = _embargo_problems(report, cfg, windows, rows_by)
         if problems:
             return _fail(NAME, "; ".join(problems[:5]))
         # The §1.3b gate decides every crowning candidate; the crowning and
@@ -1189,4 +1395,5 @@ def check_lane_d_absent(record, cfg, *, boundary: int, previous_posterior_sha256
                             "lane D's share burns")
 
 
-__all__ = ["check_lane_d", "check_lane_d_absent", "window_refusal"]
+__all__ = ["CONFIRMATION_STAGE_PRESENT", "check_lane_d", "check_lane_d_absent", "combined_log_ratio",
+           "window_refusal"]
