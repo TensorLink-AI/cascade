@@ -92,6 +92,19 @@ PROBE_KEYS = ("name", "result", "passed", "reason", "requests", "objects", "obse
 CREDENTIAL_ENV = ("HIPPIUS_S3_ACCESS_KEY", "HIPPIUS_S3_SECRET_KEY",
                   "HIPPIUS_PROBE_SUBTOKEN_ACCESS_KEY", "HIPPIUS_PROBE_SUBTOKEN_SECRET_KEY")
 
+# `--no-object-lock` (owner 2026-11-23: Hippius has no Object Lock; README
+# "No Object Lock"). The owner asserts the bucket has no Object Lock, so the
+# probe never reads the lock configuration, never sends a lock header or a
+# retention, skips the two lock probes and leaves one small UNLOCKED anchor
+# object for `storage_probe verify` to re-read instead of the locked ones.
+NO_LOCK_FLAG = "--no-object-lock"
+SKIP_RESULT = "skipped"
+SKIP_REASON = "no_object_lock"
+OWNER_FLAG_LOCK = {"lock_enabled": False, "asserted_by": "owner_flag"}
+ANCHOR_KEYS = ("key", "version_id", "size", "etag", "sha256")
+ANCHOR_BINDING = "unlocked_anchor"
+MAX_ANCHOR_BYTES = 4096
+
 
 # ── driving the probe (dry-run only) ─────────────────────────────────────────
 
@@ -453,6 +466,29 @@ def live_pair(evidence: dict) -> tuple[dict, FakeS3]:
     return ev, fake
 
 
+def no_lock_evidence(ev: dict) -> bool:
+    """The evidence of a ``--no-object-lock`` run (README "No Object Lock")."""
+    return isinstance(ev, dict) and isinstance(ev.get("bucket_lock"), dict) \
+        and "asserted_by" in ev["bucket_lock"]
+
+
+def anchor_pair(evidence: dict, *, version_ids: bool = True) -> tuple[dict, FakeS3]:
+    """The ``--no-object-lock`` counterpart of :func:`live_pair`: a FakeS3
+    bucket that holds the run's UNLOCKED anchor object(s) and nothing else
+    under the run root, with the evidence's ``etag``/``sha256`` set to what the
+    bucket holds. ``version_ids=False`` models a bucket without versioning
+    (Hippius denies GetBucketVersioning): the anchors' ``version_id`` is null."""
+    ev = copy.deepcopy(evidence)
+    fake = FakeS3(ev.get("bucket"), lock_enabled=False)
+    for i, a in enumerate(ev.get("anchor_objects") or []):
+        data = _object_bytes(a["key"], int(a.get("size") or 0))
+        a["sha256"], a["etag"] = hashlib.sha256(data).hexdigest(), _etag(data)
+        if not version_ids:
+            a["version_id"] = None
+        fake.put_version(a["key"], a["version_id"] or f"null-{i}", data, etag=a["etag"])
+    return ev, fake
+
+
 def canonical_body(evidence: dict) -> bytes:
     """The bytes ``verified_live.body_sha256`` hashes: the evidence object
     WITHOUT its ``verified_live`` key, as ``json.dumps(sort_keys=True,
@@ -741,11 +777,19 @@ def recommended_path(ev: dict) -> str:
 
 
 def passed_rule(ev: dict) -> bool:
-    res = [p.get("result") for p in ev.get("probes", []) if isinstance(p, dict)]
+    rows = [p for p in ev.get("probes", []) if isinstance(p, dict)]
+    no_lock = no_lock_evidence(ev)
+
+    def recorded(p: dict) -> bool:
+        if no_lock and p.get("name") in LOCK_PROBES:
+            return p.get("result") == SKIP_RESULT
+        return p.get("result") in ("pass", "fail")
+
     cleanup = ev.get("cleanup") if isinstance(ev.get("cleanup"), dict) else {}
-    return (ev.get("source") == "live" and len(res) == len(PROBES)
-            and all(r in ("pass", "fail") for r in res)
-            and cleanup.get("remaining_unlocked") == [])
+    return (ev.get("source") == "live" and len(rows) == len(PROBES)
+            and all(recorded(p) for p in rows)
+            and cleanup.get("remaining_unlocked") == []
+            and (not no_lock or bool(ev.get("anchor_objects"))))
 
 
 def _git(*args: str) -> subprocess.CompletedProcess:
@@ -830,7 +874,30 @@ def leak_problems(data: object, extra_text: str = "") -> list[str]:
     return out
 
 
-def _probe_row_problems(i: int, row: object, ctx: dict, params: dict, live: bool) -> list[str]:
+def _skipped_row_problems(where: str, row: dict, no_lock: bool) -> list[str]:
+    """A lock probe of a ``--no-object-lock`` run: ``skipped`` with reason
+    ``no_object_lock``, never ``pass``, and nothing done (no request, object
+    or observation). Any other probe, or any probe of a run without the
+    flag, can't be skipped."""
+    if not no_lock:
+        return [f"{where}.result: 'skipped' is only valid for a lock probe of a "
+                f"{NO_LOCK_FLAG} run (bucket_lock.asserted_by: owner_flag)"]
+    if row["name"] not in LOCK_PROBES:
+        return [f"{where}.result: only the lock probes {LOCK_PROBES} may be skipped "
+                f"in a {NO_LOCK_FLAG} run"]
+    out = []
+    if row["passed"] is not False:
+        out.append(f"{where}.passed: a skipped probe never passed")
+    if row["reason"] != SKIP_REASON:
+        out.append(f"{where}.reason: want {SKIP_REASON!r}, got {row['reason']!r}")
+    if row["requests"] != [] or row["objects"] != [] or row["observations"] != {}:
+        out.append(f"{where}: a skipped lock probe makes no request, creates no object and "
+                   "records no observation")
+    return out
+
+
+def _probe_row_problems(i: int, row: object, ctx: dict, params: dict, live: bool,
+                        no_lock: bool = False) -> list[str]:
     where = f"probes[{i}]"
     if not isinstance(row, dict):
         return [f"{where}: must be an object"]
@@ -840,6 +907,11 @@ def _probe_row_problems(i: int, row: object, ctx: dict, params: dict, live: bool
     name = row["name"]
     where = f"probes[{name}]"
     out = []
+    if row["result"] == SKIP_RESULT:
+        return _skipped_row_problems(where, row, no_lock)
+    if no_lock and name in LOCK_PROBES:
+        return [f"{where}.result: a {NO_LOCK_FLAG} run never runs a lock probe; want "
+                f"'skipped' ({SKIP_REASON}), got {row['result']!r}"]
     if row["result"] not in RESULTS:
         return [f"{where}.result: want one of {RESULTS}, got {row['result']!r}"]
     if row["passed"] is not (row["result"] == "pass"):
@@ -978,6 +1050,12 @@ def _bucket_lock_problems(data: dict, rows: dict, live: bool) -> list[str]:
     bl = data["bucket_lock"]
     if not isinstance(bl, dict):
         return ["bucket_lock must be an object"]
+    if "asserted_by" in bl:
+        # --no-object-lock: the owner's assertion, not a read (none was made).
+        if bl != OWNER_FLAG_LOCK:
+            return [f"bucket_lock: a {NO_LOCK_FLAG} run records exactly {OWNER_FLAG_LOCK}, "
+                    f"got {bl!r}"]
+        return []
     miss = [k for k in BUCKET_LOCK_KEYS if k not in bl]
     if miss:
         return [f"bucket_lock: missing keys {miss}"]
@@ -1011,6 +1089,108 @@ def _rid_ok(rid: object) -> bool:
     return isinstance(rid, str) and bool(rid.strip()) and not rid.startswith("fixture-")
 
 
+def _verified_anchor_problems(data: dict, rec: dict) -> list[str]:
+    """The ``verified_live`` record of a ``--no-object-lock`` run: the bucket
+    re-read the run's UNLOCKED anchor object(s) instead of locked ones
+    (binding ``unlocked_anchor``; there is no lock, so no expiry)."""
+    out = []
+    if rec.get("binding") != ANCHOR_BINDING:
+        out.append(f"verified_live.binding: a {NO_LOCK_FLAG} run is verified by its anchor "
+                   f"object(s): want {ANCHOR_BINDING!r}, got {rec.get('binding')!r}")
+    anchors = {a.get("key"): a for a in data.get("anchor_objects") or [] if isinstance(a, dict)}
+    if not anchors:
+        out.append("verified_live: the evidence has no anchor objects to verify against the bucket")
+    try:
+        at = _ts(rec["verified_at"], "verified_live.verified_at")
+        if at < _ts(data.get("finished_at"), "finished_at"):
+            out.append("verified_live.verified_at is before the run finished")
+    except _Bad as e:
+        out.append(str(e))
+    objs = rec["objects"]
+    if not isinstance(objs, list):
+        return out + ["verified_live.objects must be a list"]
+    seen = []
+    for i, o in enumerate(objs):
+        where = f"verified_live.objects[{i}]"
+        if not isinstance(o, dict) or [k for k in VERIFY_OBJECT_KEYS if k not in o]:
+            out.append(f"{where}: want the keys {VERIFY_OBJECT_KEYS}")
+            continue
+        seen.append(o["key"])
+        a = anchors.get(o["key"])
+        if a is None:
+            out.append(f"{where}.key {o['key']!r} is not an anchor object of the evidence")
+            continue
+        for k in ("version_id", "etag", "sha256", "size"):
+            if o[k] != a.get(k):
+                out.append(f"{where}.{k}: the bucket gave {o[k]!r}, the evidence records "
+                           f"{a.get(k)!r}")
+        if o["mode"] is not None or o["retain_until"] is not None:
+            out.append(f"{where}: an anchor object is unlocked (mode and retain_until null)")
+        rids = o["request_ids"]
+        if not (isinstance(rids, list) and rids and all(_rid_ok(r) for r in rids)):
+            out.append(f"{where}.request_ids: want the live HEAD/GET request ids (non-empty, "
+                       f"never fixture-), got {rids!r}")
+    if sorted(seen) != sorted(k for k in anchors if isinstance(k, str)):
+        out.append(f"verified_live.objects {sorted(seen)} must be exactly the anchor objects "
+                   f"{sorted(k for k in anchors if isinstance(k, str))}")
+    lst = rec["listing"]
+    run_root = f"{data.get('prefix')}{data.get('run_id')}/"
+    if not (isinstance(lst, dict) and all(k in lst for k in ("prefix", "keys", "request_id"))):
+        return out + ["verified_live.listing: want {prefix, keys, request_id}"]
+    if lst["prefix"] != run_root:
+        out.append(f"verified_live.listing.prefix: want the run root {run_root!r}, got "
+                   f"{lst['prefix']!r}")
+    if not isinstance(lst["keys"], list) or set(lst["keys"]) != set(anchors):
+        out.append(f"verified_live.listing.keys: the run root must hold exactly the anchor "
+                   f"objects, got {lst['keys']!r}")
+    if not _rid_ok(lst["request_id"]):
+        out.append("verified_live.listing.request_id: want the live listing's request id")
+    return out
+
+
+def _anchor_problems(data: dict, rows: dict) -> list[str]:
+    """``anchor_objects`` of a ``--no-object-lock`` run: at least one small
+    unlocked object under the run root, written after cleanup, that no probe
+    created, with its version id (null without versioning), HEAD ETag and
+    sha256. Without the flag the key must be absent."""
+    if not no_lock_evidence(data):
+        return (["anchor_objects: only a --no-object-lock run leaves an anchor object"]
+                if "anchor_objects" in data else [])
+    out = []
+    if data["locked_objects"] != []:
+        out.append(f"locked_objects: a {NO_LOCK_FLAG} run locks nothing, got "
+                   f"{data['locked_objects']!r}")
+    cleanup = data["cleanup"] if isinstance(data["cleanup"], dict) else {}
+    if cleanup.get("remaining_locked") not in (None, []):
+        out.append(f"cleanup.remaining_locked: a {NO_LOCK_FLAG} run locks nothing")
+    anchors = data.get("anchor_objects")
+    if not isinstance(anchors, list) or not anchors:
+        return out + [f"anchor_objects: a {NO_LOCK_FLAG} run leaves one unlocked anchor object "
+                      "for `storage_probe verify` to re-read (none recorded)"]
+    run_root = f"{data['prefix']}{data['run_id']}/"
+    probe_keys = {o.get("key") for r in rows.values() for o in (r.get("objects") or [])
+                  if isinstance(o, dict)}
+    for i, a in enumerate(anchors):
+        where = f"anchor_objects[{i}]"
+        if not isinstance(a, dict) or [k for k in ANCHOR_KEYS if k not in a]:
+            out.append(f"{where}: want the keys {ANCHOR_KEYS}")
+            continue
+        key = a["key"]
+        if not (isinstance(key, str) and key.startswith(run_root)) or ".." in str(key).split("/"):
+            out.append(f"{where}.key {key!r} is outside {run_root}")
+        elif key in probe_keys:
+            out.append(f"{where}.key {key!r} is a probe object, not a dedicated anchor")
+        if a["version_id"] is not None and not (isinstance(a["version_id"], str) and a["version_id"]):
+            out.append(f"{where}.version_id: want a version id string or null")
+        if not (isinstance(a["etag"], str) and a["etag"].strip('"')):
+            out.append(f"{where}.etag: want the HEAD ETag of the anchor")
+        if not (isinstance(a["sha256"], str) and HEX64_RE.fullmatch(a["sha256"])):
+            out.append(f"{where}.sha256: want 64 lowercase hex (verify re-reads the bytes)")
+        if not (_is_int(a["size"]) and 0 < a["size"] <= MAX_ANCHOR_BYTES):
+            out.append(f"{where}.size: an anchor object is 1..{MAX_ANCHOR_BYTES} bytes")
+    return out
+
+
 def verified_live_problems(data: dict, *, check_git: bool = True) -> list[str]:
     """The ``verified_live`` record (README "storage_probe verify"): written
     by ``python -P -m cascade.laned.storage_probe verify --evidence FILE``
@@ -1042,6 +1222,8 @@ def verified_live_problems(data: dict, *, check_git: bool = True) -> list[str]:
         if rec[k] != data.get(k):
             out.append(f"verified_live.{k} {rec[k]!r} != evidence {k} {data.get(k)!r}")
     out += [f"verified_live.{p}" for p in _tool_problems(rec["tool"], check_git)]
+    if no_lock_evidence(data):
+        return out + _verified_anchor_problems(data, rec)
     locked = {lo.get("key"): lo for lo in data.get("locked_objects") or [] if isinstance(lo, dict)}
     if not locked:
         out.append("verified_live: the evidence has no locked objects to verify against the bucket")
@@ -1170,11 +1352,14 @@ def evidence_problems(data: object, *, check_git: bool = True,
         out.append(f"probes: unknown probe names {extra}")
     if out:
         return out
+    no_lock = no_lock_evidence(data)
     for i, row in enumerate(rows_list):
-        out += _probe_row_problems(i, row, ctx, params, live=data["source"] == "live")
+        out += _probe_row_problems(i, row, ctx, params, live=data["source"] == "live",
+                                   no_lock=no_lock)
     rows = {r["name"]: r for r in rows_list}
     out += _bucket_lock_problems(data, rows, live=data["source"] == "live")
     out += _locked_problems(data, rows, started, finished, params)
+    out += _anchor_problems(data, rows)
     want_path = recommended_path(data)
     if data["recommended_path"] != want_path:
         out.append(f"recommended_path: the results give {want_path!r}, recorded "
@@ -1240,4 +1425,57 @@ def decision_problems(text: str, evidence: dict, evidence_bytes: bytes) -> list[
     if sha != want:
         out.append(f"decision record: 'Evidence sha256:' {sha!r} is not the evidence file's "
                    f"sha256 {want}")
+    if lock_probes_skipped(evidence):
+        out += no_object_lock_problems(text)
+    return out
+
+
+# The "No Object Lock" consequence (README "No Object Lock"): required when the
+# evidence's lock probes are `skipped: no_object_lock`.
+NO_LOCK_LINE_RE = re.compile(r"^[ \t]*(?:[-*][ \t]+)?\**No Object Lock:\**(.*)$", re.M)
+NO_LOCK_NEEDS = (
+    (re.compile(r"\bkings?\b", re.I), "kings"),
+    (re.compile(r"\b(?:not|never)\s+(?:be\s+)?(?:compliance[- ])?locked\b", re.I),
+     "that kings are NOT locked (by copy at crowning)"),
+    (re.compile(r"content[- ]address", re.I), "the content-addressed path"),
+    (re.compile(r"\bre-?hash", re.I), "the ingest re-hash"),
+    (re.compile(r"\bmirror", re.I), "the R2/HF mirrors"),
+)
+LOCK_CLAIM_RES = (
+    re.compile(r"\b(?:are|is|get|gets|will\s+be|stay|stays|remain|remains)\s+"
+               r"(?:compliance[- ])?locked\b", re.I),
+    re.compile(r"(?<!not )(?<!never )\blocked\s+(?:by\s+copy|at\s+crowning)\b", re.I),
+)
+
+
+def lock_probes_skipped(evidence: dict) -> bool:
+    """Evidence of a ``--no-object-lock`` run: a lock probe ``skipped``."""
+    rows = evidence.get("probes", []) if isinstance(evidence, dict) else []
+    return any(isinstance(p, dict) and p.get("name") in LOCK_PROBES
+               and p.get("result") == SKIP_RESULT for p in rows)
+
+
+def no_object_lock_problems(text: str) -> list[str]:
+    """With skipped lock probes the record carries exactly one ``No Object
+    Lock:`` line (kings are not locked by copy; immutability comes from the
+    content-addressed path + ingest re-hash + the R2/HF mirrors), and no other
+    line claims kings are locked."""
+    out = []
+    lines = NO_LOCK_LINE_RE.findall(text)
+    if len(lines) != 1:
+        out.append(f"decision record: the evidence skipped the lock probes ({SKIP_REASON}), so it "
+                   f"needs exactly one 'No Object Lock:' consequence line, got {len(lines)}")
+    else:
+        val = _clean(lines[0])
+        missing = [what for rx, what in NO_LOCK_NEEDS if not rx.search(val)]
+        if missing:
+            out.append(f"decision record: the 'No Object Lock:' line must state {missing}: "
+                       f"{val!r}")
+    for ln in text.splitlines():
+        if NO_LOCK_LINE_RE.match(ln):
+            continue
+        plain = ln.replace("*", "").replace("`", "")
+        if re.search(r"\bkings?\b", plain, re.I) and any(rx.search(plain) for rx in LOCK_CLAIM_RES):
+            out.append(f"decision record: claims kings are locked, but the evidence skipped the "
+                       f"lock probes ({SKIP_REASON}): {ln.strip()[:120]!r}")
     return out
