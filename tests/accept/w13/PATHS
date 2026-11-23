@@ -1,0 +1,14 @@
+# W13: lane D king publication (plan §3.0 W13 row, §11.1; rev6.4 §1.2: no
+# Object Lock; rev5 B13: Hub/HF takedown path). README.md has the contract.
+#
+# The publication module: publish_king (vault -> Hub, R2, HF mirrors, read-back
+# re-hash), verify_mirrors, build_index / verify_index (signed
+# champions/lane_d/index.json), sync_cards (index + PROVENANCE.json +
+# MODEL_CARD.md), check_one_digest, takedown, hub_repo, HF_MIRROR_REPO,
+# MIRRORS, PublishError. Torch-free, stdlib + the existing lane D intake and
+# storage modules (read only; intake.py and storage.py are NOT in scope).
+cascade/lane_d/publish.py
+# The repo-side sync: reads the published signed index and writes the cards
+# through cascade.lane_d.publish.sync_cards.
+scripts/laned_king_sync.py
+.github/workflows/laned-king-sync.yml
