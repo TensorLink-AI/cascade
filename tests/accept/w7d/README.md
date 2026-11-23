@@ -421,3 +421,13 @@ fact into an assertion.
 | `test_w7d_match.py`, `test_w7d_mismatch.py`, `test_w7d_unverifiable.py` | `ModuleNotFoundError: No module named 'cascade.satellite'` (in PATHS). The subprocess cases fail on their return-code assert |
 | `test_w7d_import_graph.py` | assert: the module file is absent, there's nothing to check, the subprocess import fails |
 | `test_w7d_fixture_chains.py` | passes: it checks the fixtures |
+
+## Correction (plan rev6.11 (b)): crown at the first verdict
+
+The confirmation duel is dropped (owner 2026-11-23): a crown is decided at
+the first verdict, first clear (max-T LCB vs KING_D) ∧ A10 ∧ the §1.3b gate.
+There is no `confirm` stage, no `confirm_pending` status or reason and no
+`lost_confirmation`; a held first clear is `hold` / `bench_hold`. This WP's
+crowning chains move to that rule with nothing weakened. The house-challenger chains (`house_helpers`) now decide at the first verdict. Y is crowned at b3 over X; the house retakes at b5 (`house_retakes`), b3 (`copy_at_swap`) or b4 (`open_copy`, after the held copy C is closed `duplicate_digest` and its hold dropped); Z is crowned over the house at b7. The settlement after each decision judges nothing. `RETAKES` and every expected outcome, court and boundary follow; the forgeries are unchanged. On main the
+old code still runs the confirmation stage, so the changed tests fail on an
+assertion until the W5e implementation lands.
