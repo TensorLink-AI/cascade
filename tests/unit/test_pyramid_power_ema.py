@@ -1,22 +1,22 @@
 """Power EMA on the v2 pyramid trainer — IMAGE-ONLY (owner 2026-11-01): the
 settings are fixed worker constants (``pyramid_trainer.POWER_EMA_*``), never
-contract terms, so ``contract_digest`` is untouched. The scored
-``weights.safetensors`` is the sigma_rel=0.10 per-leg power EMA
-(``moe_trainer.PowerEMA`` math), the raw lineage (``weights_stable`` +
-``optimizer``) is untouched, continuations carry the averages bitwise, lane-B
-frozen bytes survive and the routing bias stays live. CPU only; the
-multi-rank case runs on the gloo backend. "plain" runs switch the EMA off by
-monkeypatching the module constants (tests only).
+contract terms, so ``contract_digest`` is untouched. Every leg computes the
+sigma_rel 0.05 / 0.10 per-leg power EMAs (``moe_trainer.PowerEMA`` math), the
+raw lineage (``weights_stable`` + ``optimizer``) is untouched, continuations
+carry the averages bitwise, lane-B frozen bytes survive and the routing bias
+stays live. CPU only; the multi-rank case runs on the gloo backend. "plain"
+runs switch the EMA off by monkeypatching the module constants (tests only).
 
-Activation (owner 2026-11-01): the EMA is SCORED iff the leg trains from a
-warm-start init (the seed epoch's promoted init). Shadow mode: both averages
-are always computed; a random-init leg (and a lane-B expert on a raw king)
-scores the raw endpoint, byte-identical to the pre-EMA trainer, and writes the
-averages as weights_ema005 / weights_ema010; a scored leg keeps the raw
-endpoint as weights_raw (+ weights_ema005).
+Activation (lane D W-EMA, plan rev5 §8): the EMA is SCORED on NO leg. Every
+leg of lanes A and B — random init, a warm-start king / challenger (also from
+an EMA-marked init), a lane-B expert on a raw or an EMA-marked king — scores
+the raw cooled endpoint, byte-identical to the pre-EMA trainer, and writes
+both averages unscored as weights_ema005 / weights_ema010 (no weights_raw, no
+config.json marker).
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import socket
 import types
@@ -74,8 +74,6 @@ def contract():
 @pytest.fixture
 def plain(monkeypatch):
     """Returns a context manager in which the image's power EMA is off (tests only)."""
-    import contextlib
-
     @contextlib.contextmanager
     def ctx():
         with monkeypatch.context() as m:
@@ -154,7 +152,7 @@ def test_power_ema_matches_the_reference_formula_on_a_toy_sequence():
         assert ema.export(model)["bias"].dtype == model.bias.dtype
 
 
-# ── activation: scored iff the leg's init is a warm start (seed-epoch rule) ───
+# ── activation: no leg scores an average (W-EMA: raw endpoint everywhere) ────
 
 MARKER = {"sigma_rels": [0.05, 0.10], "scored_sigma_rel": 0.10}
 EMA005, EMA010, RAW = ema_weights_file(0.05), ema_weights_file(0.10), RAW_WEIGHTS_FILE
@@ -201,7 +199,9 @@ def test_extra_file_names():
                                      "weights_raw.safetensors")
 
 
-def test_activation_rule_follows_the_init_only(tmp_path):
+def test_activation_rule_scores_raw_for_every_init(tmp_path):
+    """One rule for every leg (lanes A and B, any init): never "best of both"
+    per model; switching the scored file is a later owner activation (D45)."""
     raw, marked, broken = (tmp_path / n for n in ("raw", "marked", "broken"))
     for d in (raw, marked, broken):
         d.mkdir()
@@ -209,17 +209,18 @@ def test_activation_rule_follows_the_init_only(tmp_path):
     (marked / "config.json").write_text(json.dumps({"moe": {}, "power_ema": MARKER}))
     (broken / "config.json").write_text("{")
     sel = {0: [1]}
-    assert not power_ema_active(None, None)                # random init: the v2 seed epoch 0
-    assert power_ema_active(raw, None)                     # any promoted init: king/challenger
-    assert power_ema_active(marked, None)
-    assert not power_ema_active(raw, sel)                  # expert on a raw (random-epoch) king
-    assert power_ema_active(marked, sel)                   # expert on an EMA (warm-epoch) king
-    assert not power_ema_active(broken, sel)
-    assert not power_ema_active(tmp_path / "missing", sel)
+    assert power_ema_active(None, None) is False           # random init
+    assert power_ema_active(raw, None) is False            # promoted init: king/challenger
+    assert power_ema_active(marked, None) is False         # init from an EMA-scored image
+    assert power_ema_active(str(marked), None) is False
+    assert power_ema_active(raw, sel) is False             # expert on a raw king
+    assert power_ema_active(marked, sel) is False          # expert on an EMA-marked king
+    assert power_ema_active(broken, sel) is False
+    assert power_ema_active(tmp_path / "missing", sel) is False
 
 
 def test_shadow_epoch_scores_raw_bitwise_and_writes_both_averages(tmp_path, plain, contract):
-    """The current (random-init) seed epoch: weights.safetensors and every
+    """A random-init leg: weights.safetensors and every
     pre-existing file are byte-identical to the trainer without the feature;
     the two averages ride along as weights_ema005 / weights_ema010 and equal
     the reference replay; no marker, no weights_raw."""
@@ -242,63 +243,62 @@ def test_shadow_epoch_scores_raw_bitwise_and_writes_both_averages(tmp_path, plai
     assert checkpoint_hashes(leg.local_dir) == checkpoint_hashes(ref.local_dir)
 
 
-def test_king_and_challenger_of_a_warm_start_epoch_are_both_ema(tmp_path, contract):
-    """The rule depends only on the epoch's (shared) init: the king's retrain
-    and a challenger, with different seeds and corpora, both score the EMA."""
+def test_king_and_challenger_of_a_warm_start_epoch_both_score_raw(tmp_path, contract):
+    """The king's retrain and a challenger of a warm-start epoch, with
+    different seeds and corpora, both score the raw endpoint (W-EMA)."""
     init = train(tmp_path / "init", contract)                 # last epoch's raw king
     king = train(tmp_path / "king", contract, warm_start_dir=init.local_dir)
     challenger = train(tmp_path / "challenger", contract, warm_start_dir=init.local_dir,
                        seed=7, rng_seed=91)
     for leg in (king, challenger):
-        assert leg.metrics["power_ema_scored"] is True and leg.metrics["power_ema_steps"] == 3
-        assert leg.metrics["power_ema_eval_sigma_rel"] == SIGMAS[EVAL]
-        assert _config(leg.local_dir)["power_ema"] == MARKER
+        assert leg.metrics["power_ema_scored"] is False and leg.metrics["power_ema_steps"] == 3
+        assert "power_ema_eval_sigma_rel" not in leg.metrics
+        assert "power_ema" not in _config(leg.local_dir)
+        assert not (leg.local_dir / RAW).exists()
+        assert (leg.local_dir / EMA005).is_file() and (leg.local_dir / EMA010).is_file()
         verify_checkpoint(leg.local_dir, contract)
 
 
-# ── (b)(c)(f)(g) a warm-start (scored) leg ────────────────────────────────────
+# ── (b)(c)(f)(g) a warm-start leg: raw scored, both averages unscored ────────
 
 
-def test_scored_file_is_the_selected_ema_and_training_is_unperturbed(tmp_path, plain, contract):
+def test_warm_start_scores_the_raw_endpoint_and_training_is_unperturbed(tmp_path, plain, contract):
     init = train(tmp_path / "init", contract)
     plain = train_plain(plain, tmp_path / "plain", contract, warm_start_dir=init.local_dir)
     rec = Recorder()
     armed = train(tmp_path / "armed", contract, warm_start_dir=init.local_dir, continuation=rec)
     assert len(rec.states) == 3 and armed.metrics["power_ema_steps"] == 3
-    assert armed.metrics["power_ema_eval_sigma_rel"] == SIGMAS[EVAL]
+    assert armed.metrics["power_ema_scored"] is False
 
-    # (c) the raw endpoint, stable snapshot and optimizer are bit-identical;
-    # the raw endpoint rides along as weights_raw.safetensors
+    # (c) every file of the EMA-off leg (the raw endpoint, config.json without
+    # a marker, the stable snapshot and optimizer) is byte-identical
+    got, want = _bytes(armed.local_dir), _bytes(plain.local_dir)
+    assert set(got) == set(want) | {EMA005, EMA010}
+    assert {k: got[k] for k in want} == want
     p, a = _files(plain.local_dir), _files(armed.local_dir)
-    _equal(p[STABLE_WEIGHTS_FILE], a[STABLE_WEIGHTS_FILE])
-    _equal(p[OPTIM_STATE_FILE], a[OPTIM_STATE_FILE])
-    raw = p["weights.safetensors"]
+    raw = a["weights.safetensors"]
     _equal(raw, {k: v.contiguous() for k, v in rec.states[-1]["model"].items()})
-    assert (armed.local_dir / RAW).read_bytes() == (plain.local_dir / "weights.safetensors").read_bytes()
 
-    # (b) weights.safetensors = the 0.10 EMA, weights_ema005 = the 0.05 EMA,
-    # both replayed from the per-step raw weights; (f) the routing bias is live
-    scored = a["weights.safetensors"]
-    shadow = _replay(rec.states, SIGMAS[EVAL])
-    _assert_average(scored, shadow, raw)
-    _assert_average(_weights(armed.local_dir, EMA005), _replay(rec.states, 0.05), raw)
-    assert any(not torch.equal(scored[k], raw[k]) for k in shadow)   # the EMA is not the raw endpoint
-    key = f"ema{SIGMAS[EVAL]:g}"
-    assert int(rec.states[-1]["emas"][f"{key}.__t__"].item()) == 3
-    for k, v in shadow.items():
-        assert torch.equal(rec.states[-1]["emas"][f"{key}.{k}"], v)
+    # (b) weights_ema005 / weights_ema010 = the replayed 0.05 / 0.10 averages;
+    # (f) the routing bias is live; they are real averages, not the raw endpoint
+    for sigma, name in ((0.05, EMA005), (0.10, EMA010)):
+        shadow = _replay(rec.states, sigma)
+        avg = _weights(armed.local_dir, name)
+        _assert_average(avg, shadow, raw)
+        assert any(not torch.equal(avg[k], raw[k]) for k in shadow), name
+        key = f"ema{sigma:g}"
+        assert int(rec.states[-1]["emas"][f"{key}.__t__"].item()) == 3
+        for k, v in shadow.items():
+            assert torch.equal(rec.states[-1]["emas"][f"{key}.{k}"], v)
 
-    # (g) every checkpoint consumer still validates; the file set is the
-    # plain leg's plus the two comparison extras; the only config.json
-    # difference is the marker (validators read only "moe")
+    # (g) every checkpoint consumer still validates and hashes only the four
+    # checkpoint files, equal to the EMA-off leg's
     report = verify_checkpoint(armed.local_dir, contract)
     assert report.n_params == verify_checkpoint(plain.local_dir, contract).n_params
     assert set(checkpoint_hashes(armed.local_dir)) == set(CHECKPOINT_FILES)
+    assert checkpoint_hashes(armed.local_dir) == checkpoint_hashes(plain.local_dir)
     assert not (armed.local_dir / POWER_EMA_FILE).exists()
-    assert {f.name for f in armed.local_dir.iterdir()} == {
-        f.name for f in plain.local_dir.iterdir()} | {RAW, EMA005}
-    marked = _config(armed.local_dir)
-    assert marked.pop("power_ema") == MARKER and marked == _config(plain.local_dir)
+    _equal(p[STABLE_WEIGHTS_FILE], a[STABLE_WEIGHTS_FILE])
     q = Wrapper(armed.local_dir).forecast_quantiles_batch([np.arange(4096.0)], 64)
     assert q.shape == (1, 64, 21) and np.isfinite(q).all()
 
@@ -307,7 +307,7 @@ def test_warm_start_resumes_the_raw_lineage_and_restarts_the_ema(tmp_path, plain
     """Future A: a warm start reads weights_stable + optimizer (raw), never the
     EMA; with and without the EMA the next leg's lineage is bit-identical, and
     each warm-started leg's average starts fresh (scope = per leg) — also one
-    epoch further on, from an EMA-scored king."""
+    epoch further on, from a warm-started king."""
     init = train(tmp_path / "init", contract)
     base = train(tmp_path / "base", contract, warm_start_dir=init.local_dir)
     plain = train_plain(plain, tmp_path / "plain", contract, warm_start_dir=base.local_dir)
@@ -352,34 +352,44 @@ def test_restart_reproduces_the_uninterrupted_leg_and_keeps_its_decision(tmp_pat
     with pytest.raises(RuntimeError, match="simulated pod loss"):
         train(tmp_path / "failed", contract, continuation=CrashAt(store, interval=0), **kw)
     snap = store.load()
-    assert snap["power_ema_scored"] is warm
+    assert snap["power_ema_scored"] is False               # raw scored on every leg (W-EMA)
     _equal(snap["emas"], full.emas[2])                     # the snapshot carries the averages bitwise
     resumed = Recording(store, interval=0)
     result = train(tmp_path / "recovered", contract, continuation=resumed, **kw)
     assert sorted(resumed.emas) == [3]
     _equal(resumed.emas[3], full.emas[3])                  # restored EMA states continue bitwise
-    assert result.metrics["power_ema_scored"] is warm and result.metrics["power_ema_steps"] == 3
+    assert result.metrics["power_ema_scored"] is False and result.metrics["power_ema_steps"] == 3
     assert _bytes(expected.local_dir) == _bytes(result.local_dir)   # incl. the extra files
 
 
-def test_a_snapshot_from_the_other_decision_or_without_ema_state_is_refused(tmp_path, plain, contract):
+def test_a_snapshot_from_the_other_decision_or_without_ema_state_is_refused(
+        tmp_path, plain, monkeypatch, contract):
+    """A continuation never mixes scored files: a snapshot an earlier image
+    made with the EMA scored (simulated by forcing the gate on) is refused by
+    this image, which scores raw on every leg, and vice versa."""
     init = train(tmp_path / "init", contract).local_dir
+
+    @contextlib.contextmanager
+    def gate_on():
+        with monkeypatch.context() as m:
+            m.setattr(pyramid_trainer, "power_ema_active", lambda *_: True)
+            yield
+
     stores = {}
-    for name, kw, ctx in (("shadow", {}, None), ("scored", {"warm_start_dir": init}, None),
+    for name, kw, ctx in (("shadow", {"warm_start_dir": init}, contextlib.nullcontext),
+                          ("scored", {"warm_start_dir": init}, gate_on),
                           ("bare", {}, plain)):
         stores[name] = SnapshotStore(tmp_path / name, {"contract": "x", "seed": 1})
         crash = CrashAt(stores[name], interval=0)
         crash.at = 1
-        with pytest.raises(RuntimeError, match="simulated pod loss"):
-            if ctx is None:
-                train(tmp_path / f"failed-{name}", contract, continuation=crash, **kw)
-            else:
-                train_plain(ctx, tmp_path / f"failed-{name}", contract, continuation=crash, **kw)
-    with pytest.raises(ValueError, match="other power EMA decision"):
+        with ctx(), pytest.raises(RuntimeError, match="simulated pod loss"):
+            train(tmp_path / f"failed-{name}", contract, continuation=crash, **kw)
+    with gate_on(), pytest.raises(ValueError, match="other power EMA decision"):
         train(tmp_path / "a", contract, warm_start_dir=init,
               continuation=Continuation(stores["shadow"], interval=0))
     with pytest.raises(ValueError, match="other power EMA decision"):
-        train(tmp_path / "b", contract, continuation=Continuation(stores["scored"], interval=0))
+        train(tmp_path / "b", contract, warm_start_dir=init,
+              continuation=Continuation(stores["scored"], interval=0))
     with pytest.raises(ValueError, match="lacks its power EMA state"):
         train(tmp_path / "c", contract, continuation=Continuation(stores["bare"], interval=0))
 
@@ -427,23 +437,34 @@ def test_expert_leg_on_a_random_init_epoch_king_scores_raw(tmp_path, plain, cont
         _assert_expert_rows(king_w, _weights(leg.local_dir, name), selection, names)
 
 
-def test_expert_leg_on_a_warm_epoch_king_averages_only_its_rows(tmp_path, plain, contract):
+def test_expert_leg_on_an_ema_marked_king_still_scores_raw(tmp_path, plain, contract):
+    """§8: "a lane B leg from an EMA-marked king still scores raw". The king
+    carries the marker an EMA-scored king of an earlier image would; the leg
+    is byte-identical to the EMA-off leg and its averages average only the
+    selected rows."""
     init = train(tmp_path / "init", contract)
-    base = train(tmp_path / "base", contract, warm_start_dir=init.local_dir)   # EMA-scored king
-    assert _config(base.local_dir)["power_ema"] == MARKER
+    base = train(tmp_path / "base", contract, warm_start_dir=init.local_dir)
+    assert "power_ema" not in _config(base.local_dir)          # this image never marks a king
+    marked = _config(base.local_dir)
+    marked["power_ema"] = MARKER
+    (base.local_dir / "config.json").write_text(json.dumps(marked, sort_keys=True))
     selection, names = _selection(base.local_dir)
-    raw = train_plain(plain, tmp_path / "raw", contract, warm_start_dir=base.local_dir,
+    ref = train_plain(plain, tmp_path / "ref", contract, warm_start_dir=base.local_dir,
                       expert_selection=selection)
     leg = train(tmp_path / "leg", contract, warm_start_dir=base.local_dir, expert_selection=selection)
-    assert leg.metrics["power_ema_scored"] is True and _config(leg.local_dir)["power_ema"] == MARKER
+    assert leg.metrics["power_ema_scored"] is False and "power_ema" not in _config(leg.local_dir)
+    got, want = _bytes(leg.local_dir), _bytes(ref.local_dir)
+    assert set(got) == set(want) | {EMA005, EMA010}
+    assert {k: got[k] for k in want} == want                 # scored file bitwise raw
+    assert checkpoint_hashes(leg.local_dir) == checkpoint_hashes(ref.local_dir)
     king = _weights(base.local_dir)
     cand = _weights(leg.local_dir)
-    raw_cand = _weights(raw.local_dir)
-    assert (leg.local_dir / RAW).read_bytes() == (raw.local_dir / "weights.safetensors").read_bytes()
     _assert_expert_rows(king, cand, selection, names)
-    _assert_expert_rows(king, _weights(leg.local_dir, EMA005), selection, names)
-    assert any(not torch.equal(cand[k], raw_cand[k]) for k in cand)   # selected rows carry the EMA
-    for f in (STABLE_WEIGHTS_FILE, OPTIM_STATE_FILE, POWER_EMA_FILE, EMA010):
+    for name in (EMA005, EMA010):
+        avg = _weights(leg.local_dir, name)
+        _assert_expert_rows(king, avg, selection, names)
+        assert any(not torch.equal(avg[k], cand[k]) for k in cand), name   # selected rows averaged
+    for f in (STABLE_WEIGHTS_FILE, OPTIM_STATE_FILE, POWER_EMA_FILE, RAW):
         assert not (leg.local_dir / f).exists()
 
 
@@ -576,7 +597,7 @@ def test_two_rank_gang_ema_matches_one_rank(tmp_path):
 def test_fixed_settings_are_the_owner_values():
     assert pyramid_trainer.POWER_EMA_SIGMA_RELS == (0.05, 0.10)
     assert pyramid_trainer.POWER_EMA_EVAL == 1
-    assert power_ema_settings() == ((0.05, 0.10), 1)        # the 0.10 average is scored
+    assert power_ema_settings() == ((0.05, 0.10), 1)        # computed on every leg, never scored
 
 
 def test_bad_fixed_settings_are_refused(monkeypatch):
