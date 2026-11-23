@@ -18,10 +18,14 @@ expected boundary, so an old report replays unless the boundary is checked;
 `canonical_body`, never the signature bytes; (c) `json.loads` keeps the last
 of duplicate keys, so duplicate keys must be refused when loading.
 
-The chain: one challenger X (sharp forecasts) and the genesis house H0 (bad
-forecasts). Boundary 1 judges X on snapshot 1: a first clear,
-`confirm_pending`. Boundary 2 confirms X on snapshot 2 (disjoint) and crowns
-it. Boundary 3 judges nothing (no open entry) and only advances the state.
+The chain (rev6.11 (b): no confirmation duel, the crown is decided at the
+first verdict): one challenger X (sharp forecasts) and the genesis house H0
+(bad forecasts). The floors are 48 windows / 4 sources and each snapshot
+holds 24 fresh windows. Boundary 1 sees snapshot 1 only: X stays
+`pending` / `pending_floor`, nothing is judged. Boundary 2 sees snapshots
+1 and 2 (48 windows): X is judged once, clears, passes A10 and the gate and
+is crowned at that first verdict. Boundary 3 judges nothing (no open entry)
+and only advances the state.
 The pool snapshots are written once per test and shared by every run of
 that test, so two runs see the same pool bytes.
 
@@ -58,6 +62,7 @@ ERA = 3600
 SETTLEMENT = 900
 ARM_BLOCK = 2700 * ERA
 N_SNAPSHOTS = 3
+FLOOR_WINDOWS = 48          # two snapshots of 24 windows each
 
 
 def boundary(n: int) -> int:
@@ -67,6 +72,7 @@ def boundary(n: int) -> int:
 
 SOURCES = ("src0", "src1", "src2", "src3")
 FEED_LAG_HOURS = 1.0
+EMBARGO_HOURS = 48.0        # [lane_d] embargo_hours (rev6.10 (a))
 SCORING_LEVELS = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
 _Z = tuple(NormalDist().inv_cdf(level) for level in SCORING_LEVELS)
 GATE_SUITES = ("gift", "boom", "time", "fev")
@@ -115,14 +121,15 @@ def is_hex64(value) -> bool:
 
 
 def lane_d_cfg(**over):
-    """The real W2 parse of an armed `[lane_d]` table (floors 24 windows / 4
-    sources, as in the W5e fixture)."""
+    """The real W2 parse of an armed `[lane_d]` table. Floors 48 windows / 4
+    sources (rev6.11: two snapshots' worth, so boundary 1 is a floor wait and
+    boundary 2 the first, crowning, verdict)."""
     from cascade.shared.config.lane_d import parse_lane_d
 
     raw = {"from_block": ARM_BLOCK, "share": 0.25, "takes_from": "lane_a",
            "remainder": "burn", "contexts": [4096, 8192, 16384], "horizon": HORIZON,
            "forward_margin_hours": MARGIN_H, "max_mirror_lag_hours": 6.0,
-           "min_windows": 24, "min_clusters": 4, "bootstrap_B": 200}
+           "min_windows": FLOOR_WINDOWS, "min_clusters": 4, "bootstrap_B": 200}
     return parse_lane_d({**raw, **over}, era_blocks_at=lambda _block: ERA)
 
 
@@ -173,7 +180,10 @@ def _target_values(series_id: str, start: int) -> tuple[np.ndarray, np.ndarray]:
 
 def _write_pool(directory: Path, records: list[dict], snapshot: str) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
-    feeds = {r["feed"]: {"mirror_lag_hours": FEED_LAG_HOURS, "forecast_product": False}
+    # rev6.10 / rev6.12 (W6b): every listed feed pins its effective embargo
+    # (48 h, the decided default; a listed feed without it fails closed).
+    feeds = {r["feed"]: {"mirror_lag_hours": FEED_LAG_HOURS, "forecast_product": False,
+                         "embargo_hours": EMBARGO_HOURS}
              for r in records}
     meta = {"schema": "pool_d/1", "snapshot": snapshot, "horizon": HORIZON,
             "feeds": dict(sorted(feeds.items())), "series": records}
@@ -394,6 +404,13 @@ def receipt_of(settlement):
     """The settlement's receipt record (`None` when the field is absent, so a
     test fails on its assertion, not on an AttributeError)."""
     return getattr(settlement, "receipt", None)
+
+
+def other_crown(report: dict, chain: Chain) -> str | None:
+    """A different judgement at the same boundary: the report's `crowned`
+    toggled between X and none (whatever the chain shape, the edit always
+    changes the body)."""
+    return None if report.get("crowned") else chain.x["digest"]
 
 
 def read_bytes(path) -> bytes | None:

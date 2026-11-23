@@ -105,7 +105,7 @@ def _refused_untouched(chain: Chain, n: int, path: Path, code: str, **extra) -> 
 # ── a missing state file after a settlement ─────────────────────────────────
 
 
-@pytest.mark.parametrize("settled", [1, 2], ids=["after_first_clear", "after_crowning"])
+@pytest.mark.parametrize("settled", [1, 2], ids=["after_floor_wait", "after_crowning"])
 def test_rv6_b3_a_missing_state_after_a_settlement_is_refused_not_genesis(tmp_path, settled):
     chain = Chain(tmp_path)
     path = chain.state_path("run")

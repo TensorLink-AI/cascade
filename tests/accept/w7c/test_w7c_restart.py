@@ -27,6 +27,7 @@ from .helpers import (
     boundary,
     chain_fingerprint,
     crash_on_rename,
+    other_crown,
     read_bytes,
     receipt_of,
     sha,
@@ -57,7 +58,7 @@ def _reference(chain: Chain) -> dict:
     return ref
 
 
-@pytest.mark.parametrize("n", [1, 2, 3], ids=["first_clear", "crowning", "idle"])
+@pytest.mark.parametrize("n", [1, 2, 3], ids=["floor_wait", "crowning", "idle"])
 def test_inv5_t11_crash_after_the_report_lands_recovers_to_the_clean_run(tmp_path, monkeypatch,
                                                                        n):
     from cascade.validator.lane_d_state import load_report_file, report_path
@@ -94,7 +95,7 @@ def test_inv5_t11_crash_after_the_report_lands_recovers_to_the_clean_run(tmp_pat
     assert sha(path.read_bytes()) == ref["states"][2]
 
 
-@pytest.mark.parametrize("n", [1, 2], ids=["first_clear", "crowning"])
+@pytest.mark.parametrize("n", [1, 2], ids=["floor_wait", "crowning"])
 def test_inv5_t11_crash_before_the_report_lands_recovers_to_the_clean_run(tmp_path, monkeypatch,
                                                                         n):
     from cascade.validator.lane_d_state import report_path
@@ -214,7 +215,7 @@ def test_inv5_a_defective_persisted_report_is_refused(tmp_path, monkeypatch, pha
     rp = report_path(path, boundary(2))
     report = json.loads(rp.read_bytes())
     if defect == "body":
-        report["crowned"] = None            # a different judgement, same boundary
+        report["crowned"] = other_crown(report, chain)   # a different judgement, same boundary
         bad = json.dumps(report, sort_keys=True).encode()
     else:
         bad = json.dumps(report, sort_keys=True).encode().replace(

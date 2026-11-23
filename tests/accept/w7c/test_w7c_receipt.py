@@ -25,6 +25,7 @@ from .helpers import (
     boundary,
     canonical,
     is_hex64,
+    other_crown,
     receipt_of,
     sha,
     state_sha,
@@ -249,7 +250,7 @@ def test_a_swapped_report_at_the_same_boundary_is_refused(tmp_path):
     chain, _, runs, _ = _chain_run(tmp_path, 2)
     _, r2 = _receipts(runs)
     swapped = copy.deepcopy(runs[1].report)
-    swapped["crowned"] = None
+    swapped["crowned"] = other_crown(swapped, chain)
     swapped = _resign(swapped, chain.signer)
     with pytest.raises(ValueError) as e:
         verify_receipt(r2, report=swapped)

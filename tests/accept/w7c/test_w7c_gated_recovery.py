@@ -1,6 +1,7 @@
 """W7c × W5e (RV7 B1): crash recovery never wedges a GATED settlement.
 
-boundary(2) is X's confirming clear: a crowning candidate, so the §1.3b
+boundary(2) is X's first verdict, a clear (rev6.11 (b): there is no
+confirmation duel): a crowning candidate, so the §1.3b
 gate sweeps the bench in the settlement's session, and the session id (and
 every bench number) is part of the signed body. The crash lands between the
 report write and the state write. A restarted validator has a NEW bench
@@ -33,6 +34,7 @@ from .helpers import (
     chain_fingerprint,
     crash_on_rename,
     fixture_key,
+    other_crown,
     read_bytes,
     receipt_of,
     replace_string,
@@ -150,7 +152,11 @@ def test_rv7_b1_recovery_adopts_a_persisted_bench_hold(tmp_path, monkeypatch):
     assert receipt_of(s) == ref[1][0]
     assert sha(path.read_bytes()) == ref[1][2]
     state = json.loads(path.read_bytes())
-    assert state["king"]["digest"] != x and state["entries"][x]["status"] == "confirm_pending"
+    # rev6.11 (b): no `confirm_pending`. A held first-clear candidate stays
+    # open (`pending`) with its clear kept in `gate_hold` (W5e / W5g).
+    rec = state["entries"][x]
+    assert state["king"]["digest"] != x and rec["status"] == "pending", rec["status"]
+    assert rec.get("gate_hold"), "the held clear is kept for the re-gate"
 
     s3 = chain.settle(3, path)
     assert receipt_of(s3) == ref[2][0]
@@ -218,7 +224,7 @@ def _doctor(chain: Chain, report: dict, defect: str, prior: str) -> dict:
         sig = report["signature"]
         return {**report, "signature": ("0" if sig[0] != "0" else "1") + sig[1:]}
     if defect == "edited_after_signing":
-        return {**report, "crowned": None}
+        return {**report, "crowned": other_crown(report, chain)}
     if defect == "wrong_boundary":
         return sign_report({**report, "boundary": boundary(3)}, chain.signer)
     if defect == "wrong_prior":
