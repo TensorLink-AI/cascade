@@ -9,6 +9,7 @@ import pytest
 from .helpers import (
     HASHSET_A,
     SHIPPED,
+    SHIPPED_VALUE_OWNED_ELSEWHERE,
     WB10_DEFAULTS,
     WB10_KEYS,
     comparable,
@@ -39,10 +40,17 @@ def test_inv1_lane_b_config_unchanged_when_unarmed(name):
     every WB10 key removed (main's table) and the config with every WB10
     default written out parse equal, with equal contract / numerics / koth /
     lane B leg-contract / verdict digests, slots and active() probes."""
-    shipped = load_ok(shipped_raw(name))
+    # WB22 owns the shipped lane B GPU list (it may differ from [round]'s);
+    # it is pinned to the dropped table's value here, so the comparison is
+    # every OTHER key at its default. No consensus digest reads it.
+    owned = {k: list(field(load_ok(shipped_raw(name)).lane_b, k))
+             for k in SHIPPED_VALUE_OWNED_ELSEWHERE}
+    shipped = load_ok(raw_with(name, {k: None for k in owned}))
     dropped = load_ok(raw_with(name, drop=WB10_KEYS), " (no WB10 keys)")
     explicit = load_ok(raw_with(name, _explicit_defaults(name)), " (explicit defaults)")
     assert shipped.lane_b == dropped.lane_b == explicit.lane_b
+    # the shipped value itself moves no consensus fingerprint
+    assert consensus_fingerprint(load_ok(shipped_raw(name))) == consensus_fingerprint(dropped)
     assert comparable(shipped) == comparable(dropped) == comparable(explicit)
     fp = consensus_fingerprint(dropped)
     assert consensus_fingerprint(shipped) == fp
