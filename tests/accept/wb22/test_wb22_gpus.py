@@ -158,6 +158,46 @@ def test_from_env_fails_closed_on_a_stale_image(tmp_path):
     assert g.rent_skus() == ()
 
 
+def _evidence(tmp_path, skus, *, failing=("coverage",)):
+    """A sealed ``laned_wb19/1`` whose ``failing`` checks fail (WB19's shape)."""
+    import hashlib
+
+    ev = {"schema": "laned_wb19/1", "wp": "WB19", "passed": not failing,
+          "checks": [{"name": n, "passed": n not in failing, "detail": "d"}
+                     for n in ("coverage", "full_leg", "memory")],
+          "runs": [], "table": table(list(skus)), "lane_a_full_leg": None,
+          "oa8_sha256": None}
+    body = json.dumps(ev, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    ev["body_sha256"] = hashlib.sha256(body).hexdigest()
+    p = tmp_path / "wb19.json"
+    p.write_text(json.dumps(ev), encoding="utf-8")
+    return p
+
+
+def test_partial_evidence_rents_measured_only(tmp_path):
+    """Owner 2026-11-23 (plan rev6.16): WB19 evidence whose only failing check
+    is coverage loads; its measured types rent, every other listed type is
+    refused gpu_rate_unmeasured."""
+    m = gpus()
+    p = _evidence(tmp_path, ["8xH200", "8xRTX4090"])
+    g = m.lane_b_gpus_from_env(chain_cfg(), env={STEP_RATES_ENV: str(p)})
+    assert norm(g.rent_skus()) == ("8xH200", "8xRTX4090")
+    for sku in OWNER_LANE_B_SKUS:
+        ref = g.refusal(_choice(sku))
+        if sku in ("8xH200", "8xRTX4090"):
+            assert ref is None, (sku, ref)
+        else:
+            assert ref is not None and ref["code"] == UNMEASURED, (sku, ref)
+
+
+@pytest.mark.parametrize("failing", [("memory",), ("coverage", "full_leg")])
+def test_partial_evidence_with_another_failing_check_fails_closed(tmp_path, failing):
+    m = gpus()
+    p = _evidence(tmp_path, ["8xH200", "8xRTX4090"], failing=failing)
+    g = m.lane_b_gpus_from_env(chain_cfg(), env={STEP_RATES_ENV: str(p)})
+    assert g.rates == {} and g.rent_skus() == ()
+
+
 def test_from_env_missing_default_file_is_nothing_measured(tmp_path):
     m = gpus()
     g = m.lane_b_gpus_from_env(chain_cfg(), env={STEP_RATES_ENV: str(tmp_path / "none.json")})

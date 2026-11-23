@@ -59,6 +59,7 @@ from .helpers import (
 OA8_PATH = REPO / "evidence" / "owner" / "oa8.json"
 FULL_SKU = "8xH100"
 REL = 1e-6
+NOTE_MAX = 200     # a table row's optional operator note (combine --note)
 
 
 def _evidence() -> tuple[dict, Path]:
@@ -195,13 +196,42 @@ def _close(a, b) -> bool:
     return a == b
 
 
+def failing_checks(ev: dict) -> list[str] | None:
+    """Names of the failing checks, or None when ``checks`` is malformed."""
+    checks = ev.get("checks")
+    if not isinstance(checks, list) or not checks:
+        return None
+    out = []
+    for c in checks:
+        if not (isinstance(c, dict) and isinstance(c.get("name"), str)
+                and isinstance(c.get("passed"), bool)):
+            return None
+        if not c["passed"]:
+            out.append(c["name"])
+    return out
+
+
+def note_ok(note) -> bool:
+    return isinstance(note, str) and bool(note.strip()) and len(note) <= NOTE_MAX
+
+
 def evidence_problems(ev: dict, cfg, *, oa8: Path | None = OA8_PATH,
                       check_git: bool = True) -> list[str]:
     p: list[str] = []
     if ev.get("schema") != EVIDENCE_SCHEMA or ev.get("wp") != "WB19":
         return ["schema/wp"]
-    if ev.get("passed") is not True:
-        p.append("passed is not true")
+    # Partial WB19 evidence (owner 2026-11-23, plan rev6.16): coverage may
+    # fail (unmeasured types stay gpu_rate_unmeasured); any other failing
+    # check refuses the evidence. ``passed`` stays the honest conjunction.
+    failing = failing_checks(ev)
+    if failing is None:
+        p.append("checks malformed")
+    else:
+        other = sorted(n for n in failing if n != "coverage")
+        if other:
+            p.append(f"failing check(s) other than coverage: {other}")
+        if ev.get("passed") is not (not failing):
+            p.append("passed is not the conjunction of the checks")
     if ev.get("body_sha256") != body_sha256(ev):
         p.append("evidence body_sha256 does not match (hand-edited)")
     runs = ev.get("runs") or []
@@ -217,7 +247,15 @@ def evidence_problems(ev: dict, cfg, *, oa8: Path | None = OA8_PATH,
         p.append("duplicate expert SKU")
     if not exp:
         return p + ["no expert runs"]
-    if not _close(ev.get("table"), derive_table(runs, cfg)):
+    want_table = derive_table(runs, cfg)
+    for sku, row in ((ev.get("table") or {}).get("rows") or {}).items():
+        if isinstance(row, dict) and "note" in row:
+            if not note_ok(row["note"]):
+                p.append(f"{sku}: note must be a non-empty string of at most "
+                         f"{NOTE_MAX} characters")
+            elif sku in want_table["rows"]:
+                want_table["rows"][sku]["note"] = row["note"]
+    if not _close(ev.get("table"), want_table):
         p.append("table is not the one derived from the runs")
     need = set(cfg.lane_b.funded_pod_skus)
     if oa8 is not None:
@@ -229,8 +267,17 @@ def evidence_problems(ev: dict, cfg, *, oa8: Path | None = OA8_PATH,
             if ev.get("oa8_sha256") != hashlib.sha256(oa8.read_bytes()).hexdigest():
                 p.append("oa8_sha256 does not bind the committed OA8 approval")
     missing = sorted(s for s in need if s.lower() not in {k.lower() for k in skus})
-    if missing:
-        p.append(f"no expert run for {missing}")
+    # a missing candidate is allowed (partial evidence) but must be declared:
+    # the coverage check fails and its detail names every missing SKU
+    cov = [c for c in ev.get("checks") or [] if isinstance(c, dict)
+           and c.get("name") == "coverage"]
+    if len(cov) != 1:
+        p.append("exactly one coverage check")
+    elif missing and (cov[0].get("passed") is not False
+                      or any(s not in str(cov[0].get("detail", "")) for s in missing)):
+        p.append(f"no expert run for {missing}, and the coverage check does not say so")
+    elif not missing and cov[0].get("passed") is not True:
+        p.append("coverage check fails although every candidate has an expert run")
     for r in exp:
         if r["peak_memory_bytes"] >= r["gpu"]["memory_total_bytes"]:
             p.append(f"{r['sku']}: does not fit memory at the contract micro-batching")
@@ -268,10 +315,14 @@ def test_evidence_table_reads_with_wb22_reader():
     from cascade.funding.step_rates import load_step_rate_table
 
     table = load_step_rate_table(path, image_digest=pinned_image())
+    exp = {r["sku"] for r in ev["runs"] if r["mode"] == "expert"}
     for r in ev["runs"]:
         if r["mode"] == "expert":
             assert table[r["sku"]].steps_per_s == pytest.approx(r["steps_per_s"], rel=1e-12)
-    assert set(chain_cfg().lane_b.funded_pod_skus) <= set(table)
+    # partial evidence (owner 2026-11-23): the table holds the measured rows
+    # only; a listed type with no run has no row (the WB22 gate refuses it
+    # gpu_rate_unmeasured)
+    assert set(table) == exp
 
 
 # ── the verifier itself (offline) ──────────────────────────────────────────
@@ -389,6 +440,69 @@ def test_verifier_refuses_unknown_tool_commit(tmp_path_factory):
     ev["runs"][0] = rehash(ev["runs"][0])
     probs = evidence_problems(rehash(ev), chain_cfg(), oa8=None, check_git=True)
     assert any("tool commit" in x for x in probs), probs
+
+
+# ── partial evidence (owner 2026-11-23, plan rev6.16) ─────────────────────
+
+def _partial(tmp_path_factory, drop: str) -> dict:
+    """The synthetic body re-combined without ``drop``'s expert run."""
+    tool = load_tool()
+    ev = _synthetic(tmp_path_factory)
+    runs = [r for r in ev["runs"] if not (r["mode"] == "expert" and r["sku"] == drop)]
+    d = tmp_path_factory.mktemp("v-partial")
+    files = [write_json(d / f"run{i}.json", r) for i, r in enumerate(runs)]
+    out = d / "wb19.json"
+    rc, _, _ = run_tool(tool, ["combine", "--chain-toml", CHAIN_TOML, "--runs", *files,
+                               "--out", out], {"PATH": str(d)}, d, None)
+    assert rc == 0
+    return json.loads(out.read_text())
+
+
+def test_verifier_accepts_partial_coverage(tmp_path_factory):
+    drop = list(chain_cfg().lane_b.funded_pod_skus)[-1]
+    ev = _partial(tmp_path_factory, drop)
+    assert ev["passed"] is False and failing_checks(ev) == ["coverage"]
+    assert evidence_problems(ev, chain_cfg(), oa8=None, check_git=False) == []
+
+
+def test_verifier_refuses_partial_with_another_failing_check(tmp_path_factory):
+    drop = list(chain_cfg().lane_b.funded_pod_skus)[-1]
+    ev = _partial(tmp_path_factory, drop)
+    for c in ev["checks"]:
+        if c["name"] == "memory":
+            c["passed"] = False
+    probs = evidence_problems(rehash(ev), chain_cfg(), oa8=None, check_git=False)
+    assert any("other than coverage" in x for x in probs), probs
+
+
+def test_verifier_refuses_undeclared_missing_coverage(tmp_path_factory):
+    """A missing candidate hidden behind coverage = passed is refused."""
+    drop = list(chain_cfg().lane_b.funded_pod_skus)[-1]
+    ev = _partial(tmp_path_factory, drop)
+    for c in ev["checks"]:
+        if c["name"] == "coverage":
+            c["passed"], c["detail"] = True, "every candidate measured"
+    ev["passed"] = True
+    probs = evidence_problems(rehash(ev), chain_cfg(), oa8=None, check_git=False)
+    assert any("coverage check does not say so" in x for x in probs), probs
+
+
+def test_verifier_refuses_passed_not_the_conjunction(tmp_path_factory):
+    drop = list(chain_cfg().lane_b.funded_pod_skus)[-1]
+    ev = _partial(tmp_path_factory, drop)
+    ev["passed"] = True
+    probs = evidence_problems(rehash(ev), chain_cfg(), oa8=None, check_git=False)
+    assert any("conjunction" in x for x in probs), probs
+
+
+def test_verifier_accepts_a_row_note_and_refuses_a_bad_one(tmp_path_factory):
+    ev = copy.deepcopy(_synthetic(tmp_path_factory))
+    sku = next(iter(ev["table"]["rows"]))
+    ev["table"]["rows"][sku]["note"] = "pre-WB25 single-GPU path: understates multi-GPU"
+    assert evidence_problems(rehash(ev), chain_cfg(), oa8=None, check_git=False) == []
+    ev["table"]["rows"][sku]["note"] = "x" * (NOTE_MAX + 1)
+    probs = evidence_problems(rehash(ev), chain_cfg(), oa8=None, check_git=False)
+    assert any("note" in x for x in probs), probs
 
 
 def test_name_rule_examples():
