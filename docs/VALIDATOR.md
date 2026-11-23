@@ -730,6 +730,54 @@ signed receipts. The trainer latches the gate once and records:
 `king_check` in `gate_evidence` comes from the validators' own receipt, so
 you can compare it with your receipt for the same round.
 
+## Lane D: what satellites verify
+
+Lane D (open weights, [LANE_D.md](LANE_D.md)) ships unarmed:
+`[lane_d] from_block = 0` means no settlement judges it and no consensus
+surface reads the table. It is armed by a signed overlay at an era boundary
+and stopped by the kill switch `[lane_d] until_block`. You need no new
+hardware: the main validator's eval host computes the forecasts, and the box
+scores them against the private targets.
+
+Each settlement the main validator signs a `lane-d-report/1` report
+(`cascade/validator/schemas/lane_d_report_1.json`; every object is closed and
+the open `extensions` map is never consensus). The satellite replay
+(`cascade/satellite/lane_d_replay.py`) and the audit (`check_lane_d` in
+`cascade/audit/lane_d.py`) re-derive it without a pool, weights or torch.
+The fields added for lane D replay:
+
+| Field | Where | What is checked |
+|---|---|---|
+| `rows_sha256` | top level | The sha256 of the canonical `rows` (sorted keys, compact separators, no NaN) is re-derived; a mismatch is refused |
+| `judged` | top level | The digests judged this settlement; must equal the verdicts, with the per-settlement caps walked FIFO by `(reveal_ts, digest)` |
+| `skipped` | top level | One typed skip reason per digest; must match `entries[].reason`, and no open entry may be silently omitted |
+| `coldkey` | `entries[]` | The coldkey recorded at `ready` (null while unresolved); replayed at the same trust level as the rows, so no archive node is needed |
+| `confirmation` | `verdicts[]` | Stage, rule, first-clear set and the king at the first clear; the confirmation set must be disjoint from the first |
+| `lowfreq` | `verdicts[]` | The low-frequency check result; its LCBs are re-derived against `-tau_public` for `pass` and `fail` |
+| `min_target_ts` | `windows[]` | The data-time clock: the earliest target point's timestamp, which must be after max(T) plus `forward_margin_hours` |
+| `min_first_seen_ts` | `windows[]` | The first-seen clock: the earliest first-seen time over the target points, which must be after the same bound |
+| `mirror_lag_hours` | `windows[]` | The feed's measured mirror lag, checked against `max_mirror_lag_hours` |
+
+Per settlement the replay checks the pinned signer's sr25519 signature over
+the canonical body, that the stated `params` equal the `[lane_d]` config in
+force, the seed, the forward-only bound on both clocks, the floors, one
+finite row per window and scored model, the max-T LCBs, gains and clears from
+the signed rows, the gate draw from the boundary block hash, the crown, the
+court and its decayed shares, and the receipt links. Once a settlement does
+not match, every later one is unverifiable (`prior_unverified`).
+
+What satellites cannot verify: satellites hold no pool and `pool_d` is
+private, so they cannot re-derive the targets, the window histories or the
+forecasts; they trust the signed rows and clocks. A loser's rows are not
+reproducible either, because its weights stay private. Crowned kings are
+public, so their rows become re-scorable once a `pool_d` snapshot is
+revealed. This trust level is lower than lane A's bench numbers and is
+accepted explicitly (D17).
+
+A settlement with no lane D report is re-derived from its absent receipt
+record (`check_lane_d_absent`); on a pass a satellite burns lane D's share,
+and only lane D's.
+
 ## Satellite validators (DEC-CA-0058)
 
 A satellite does not evaluate anything. It replays the main validator's
