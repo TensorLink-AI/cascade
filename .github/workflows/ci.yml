@@ -5,11 +5,15 @@
 # pre-existing lint debt (out of scope for this gate).
 #
 # Unit-suite sharding (2026-11-22; the single job took 9-18 min per PR):
-#   pull_request -> the FULL tests/unit suite, split into 4 parallel `unit (k/4)`
+#   pull_request -> the FULL tests/unit suite, split into 6 parallel `unit (k/6)`
 #                   jobs by scripts/ci_shard.py. The split is a deterministic
-#                   partition: every test file runs in exactly one shard, and
-#                   the `lint` job runs `ci_shard.py --verify` to check it. Nothing is
-#                   path-scoped: every PR, laned or not, runs every unit test.
+#                   partition by measured duration (scripts/ci_shard_weights.json);
+#                   files too slow for one shard are split per top-level test.
+#                   The `lint` job runs `ci_shard.py --verify` against pytest's
+#                   own --collect-only list: every collected test must sit in
+#                   exactly one shard. Nothing is path-scoped: every PR, laned
+#                   or not, runs every unit test. The shard count (6) appears in
+#                   the lint verify step, the unit job name, matrix and SHARDS.
 #   push (main, cascade-v2) -> one `unit (1/1)` job running
 #                   `pytest tests/unit` in a single process, exactly as
 #                   before. That run also catches cross-file ordering or
@@ -18,8 +22,9 @@
 #   and every `unit` shard. It runs with if: always() and fails unless every
 #   dependency reports success. A skipped or cancelled shard therefore fails
 #   `test` and can never pass as skipped. `receipt-replay` is unchanged.
-#   Tuning: refresh WEIGHTS in scripts/ci_shard.py from a PR run's
-#   `--durations` output when the shards drift out of balance.
+#   Tuning: when the shards drift out of balance, download every shard log of
+#   one PR run (each prints --durations=0 --durations-min=0.05) and run
+#   `python3 scripts/ci_shard.py --refresh-weights <logs...>`.
 name: CI
 
 on:
@@ -65,19 +70,23 @@ jobs:
         run: uv run python scripts/check_docs.py
 
       - name: Unit shard plan is a partition of tests/unit
-        run: python3 scripts/ci_shard.py --verify --of 4
+        # Collect with pytest itself so a test the planner cannot see (e.g. one
+        # not defined at module top level in a split file) fails here.
+        run: |
+          uv run --frozen pytest tests/unit --collect-only -q > "$RUNNER_TEMP/collected.txt"
+          python3 scripts/ci_shard.py --verify --of 6 --collected "$RUNNER_TEMP/collected.txt"
 
   unit:
-    name: unit (${{ matrix.shard }}/${{ github.event_name == 'pull_request' && 4 || 1 }})
+    name: unit (${{ matrix.shard }}/${{ github.event_name == 'pull_request' && 6 || 1 }})
     runs-on: ubuntu-latest
     timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
-        shard: ${{ fromJSON(github.event_name == 'pull_request' && '[1, 2, 3, 4]' || '[1]') }}
+        shard: ${{ fromJSON(github.event_name == 'pull_request' && '[1, 2, 3, 4, 5, 6]' || '[1]') }}
     env:
       SHARD: ${{ matrix.shard }}
-      SHARDS: ${{ github.event_name == 'pull_request' && 4 || 1 }}
+      SHARDS: ${{ github.event_name == 'pull_request' && 6 || 1 }}
     steps:
       - uses: actions/checkout@v4
 
@@ -114,8 +123,8 @@ jobs:
           else
             list="$RUNNER_TEMP/unit-shard.txt"
             python3 scripts/ci_shard.py --shard "$SHARD" --of "$SHARDS" > "$list"
-            echo "shard $SHARD/$SHARDS: $(wc -l < "$list") test files"
-            uv run --frozen pytest "@$list" "${opts[@]}" --durations=0 --durations-min=0
+            echo "shard $SHARD/$SHARDS: $(wc -l < "$list") units (files or file::test)"
+            uv run --frozen pytest "@$list" "${opts[@]}" --durations=0 --durations-min=0.05
           fi
 
   # The required status check. It aggregates `lint` and every `unit` shard, and
