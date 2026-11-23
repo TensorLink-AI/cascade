@@ -315,10 +315,15 @@ class Board:
         # shared with `accept --check-pr` (tests-only vs tests-correction);
         # with every other WP's PATHS a batch implementation squash merge
         # (plan rev6.3 (b)) is the L2 commit of each of its WPs
+        # (and a declared coupled-set merge, scripts/laned/coupled_batches,
+        # the L2 commit of each member)
         if self._paths_sets is None:
             self._paths_sets = lanedlib.paths_sets_at(self.tree.root, self.tree.commit)
+            self._coupled = lanedlib.parse_coupled_batches(
+                self.tree.show(lanedlib.COUPLED_BATCHES_PATH))
         return lanedlib.impl_commit_index(self.tree.history, wp, paths,
-                                          lanedlib.other_paths(self._paths_sets, wp))
+                                          lanedlib.other_paths(self._paths_sets, wp),
+                                          lanedlib.coupled_paths(self._coupled, self._paths_sets, wp))
 
     def verification_commit(self, wp: str, runs: list[dict]) -> int | None:
         """First-parent index of the merge of a green ``verification`` PR run:

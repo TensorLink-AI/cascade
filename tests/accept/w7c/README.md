@@ -256,13 +256,15 @@ an entry in `confirm_pending` with its `confirm` record
 `frozen_set = null`, `used_windows` = the first-clear set). At the first
 settlement after the release `settle_lane_d` migrates it:
 
-- `confirm.king_digest == KING_D`: the entry is a **crown candidate on its
-  first-clear set**. A10 and the §1.3b gate decide it with no second duel;
-  with a passing gate it is crowned at that settlement (the gate is swept).
-- otherwise: `pending` / `pending_floor`, the first clear discarded (the old
-  D20 (a) outcome). Its first-clear windows stay in `used_windows`, so it is
-  never re-judged on them (§1.3: an entry is never judged twice on a
-  window).
+- ~~`confirm.king_digest == KING_D`: the entry is a crown candidate on its
+  first-clear set~~ **(orchestrator decision 2026-11-23)** whatever
+  `confirm.king_digest` names: `pending` / `pending_floor`, the first clear
+  discarded (the old D20 (a) outcome). The legacy `confirm` record carries
+  no first-clear LCB, so the entry cannot be ranked or gated as a crown
+  candidate; it is re-judged under the first-verdict rule once fresh
+  windows meet the floors. Its first-clear windows stay in `used_windows`,
+  so it is never re-judged on them (§1.3: an entry is never judged twice on
+  a window). Testnet only: lane D was never armed on mainnet.
 - Either way the settlement's signed report carries the typed tag
   `confirm_state_migrated` as a string value somewhere in its body (where is
   the implementer's choice; `extensions` is the open place). The next
@@ -380,3 +382,17 @@ it in the existing open status `hold` with reason `bench_hold`. The
 assertion now pins `hold` / `bench_hold`; the `gate_hold` assertion is
 unchanged. On main the old code writes `confirm_pending`, so the test
 still fails on an assertion pending the W5e implementation.
+
+## Correction (orchestrator decision 2026-11-23): a migrated `confirm_pending` entry is `pending`
+
+The legacy `confirm` record carries no first-clear LCB, so a testnet
+`confirm_pending` entry cannot be a crown candidate even when its
+`confirm.king_digest` is still KING_D. Both cases migrate to `pending` /
+`pending_floor`, with the first-clear windows kept in `used_windows` and the
+`confirm_state_migrated` tag. `test_rev611_confirm_pending_against_the_current_king_is_crowned_on_its_first_clear`
+becomes `..._returns_to_pending_floor`: not crowned, no gate run, not judged
+at b2 (snapshot 2 alone is below the floors), KING_D unchanged, plus the
+existing tag, receipt-binding and run-once checks. The other migration tests
+are unchanged. On main the old code refuses the state
+(`confirm_pending` not in the enum), so the test fails until the W7c
+implementation lands.

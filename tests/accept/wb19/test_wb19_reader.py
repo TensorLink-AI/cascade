@@ -14,7 +14,15 @@ import sys
 
 import pytest
 
-from .helpers import CHAIN_TOML, REPO, TABLE_SCHEMA, load_tool, make_pod_record, write_json
+from .helpers import (
+    CHAIN_TOML,
+    REPO,
+    TABLE_SCHEMA,
+    load_tool,
+    make_pod_record,
+    rehash,
+    write_json,
+)
 
 IMG = "sha256:" + "5d" * 32
 ROW = {"gpu_name": "NVIDIA H100 80GB HBM3", "gpu_count": 8, "driver": "570.86.15",
@@ -98,16 +106,93 @@ def test_load_refuses_unparseable(tmp_path):
     assert ei.value.code == "bad_table"
 
 
-def test_load_evidence_requires_passed(tmp_path):
+def _checks(**failing):
+    return [{"name": n, "passed": not failing.get(n, False), "detail": "d"}
+            for n in ("coverage", "full_leg", "memory")]
+
+
+def _ev(*, passed, checks, seal=True, **extra):
+    ev = {"schema": "laned_wb19/1", "wp": "WB19", "passed": passed, "checks": checks,
+          "table": _table(), **extra}
+    return rehash(ev) if seal else ev
+
+
+def test_load_evidence_passed(tmp_path):
     sr = _sr()
-    ev = {"schema": "laned_wb19/1", "wp": "WB19", "passed": True, "table": _table()}
-    p = write_json(tmp_path / "wb19.json", ev)
+    p = write_json(tmp_path / "wb19.json", _ev(passed=True, checks=_checks()))
     assert "8xH100" in sr.load_step_rate_table(p)
-    ev["passed"] = False
-    p = write_json(tmp_path / "wb19-failed.json", ev)
+    # an unsealed passed file (pre-rev6.16 shape) still loads
+    p = write_json(tmp_path / "wb19-u.json", _ev(passed=True, checks=_checks(), seal=False))
+    assert "8xH100" in sr.load_step_rate_table(p)
+
+
+def test_load_partial_evidence_coverage_only(tmp_path):
+    """Owner 2026-11-23 (plan rev6.16): coverage is the only failing check ⇒
+    the measured rows load; a type with no row stays unmeasured (rate_for None)."""
+    sr = _sr()
+    p = write_json(tmp_path / "wb19.json", _ev(passed=False, checks=_checks(coverage=True)))
+    try:
+        t = sr.load_step_rate_table(p, image_digest=IMG)
+    except sr.StepRateTableError as e:
+        raise AssertionError(f"coverage-only evidence must load (rev6.16): {e}") from e
+    assert set(t) == {"8xH100"}
+    assert sr.rate_for(t, "4xH100") is None
+
+
+@pytest.mark.parametrize("failing", [{"memory": True}, {"full_leg": True},
+                                     {"coverage": True, "memory": True},
+                                     {"coverage": True, "full_leg": True}])
+def test_load_partial_refuses_any_other_failing_check(tmp_path, failing):
+    sr = _sr()
+    p = write_json(tmp_path / "wb19.json", _ev(passed=False, checks=_checks(**failing)))
     with pytest.raises(sr.StepRateTableError) as ei:
         sr.load_step_rate_table(p)
     assert ei.value.code == "not_passed"
+
+
+@pytest.mark.parametrize("checks", [None, [], "coverage", [{"name": "coverage"}],
+                                    [{"name": "coverage", "passed": "no"}],
+                                    [{"name": "coverage", "passed": True}]])
+def test_load_not_passed_with_malformed_or_no_failing_checks(tmp_path, checks):
+    """passed false needs a well-formed list whose failing checks are all coverage."""
+    sr = _sr()
+    p = write_json(tmp_path / "wb19.json", _ev(passed=False, checks=checks))
+    with pytest.raises(sr.StepRateTableError) as ei:
+        sr.load_step_rate_table(p)
+    assert ei.value.code == "not_passed"
+
+
+def test_load_partial_needs_a_matching_body_sha(tmp_path):
+    sr = _sr()
+    unsealed = _ev(passed=False, checks=_checks(coverage=True), seal=False)
+    with pytest.raises(sr.StepRateTableError) as ei:
+        sr.load_step_rate_table(write_json(tmp_path / "a.json", unsealed))
+    assert ei.value.code == "not_passed"
+    tampered = _ev(passed=False, checks=_checks(coverage=True))
+    tampered["table"]["rows"]["8xH100"]["steps_per_s"] = 9.9
+    with pytest.raises(sr.StepRateTableError) as ei:
+        sr.load_step_rate_table(write_json(tmp_path / "b.json", tampered))
+    assert ei.value.code == "bad_table"
+
+
+def test_load_sealed_passed_with_a_wrong_sha_is_bad_table(tmp_path):
+    sr = _sr()
+    ev = _ev(passed=True, checks=_checks())
+    ev["table"]["rows"]["8xH100"]["steps_per_s"] = 9.9
+    code = None
+    try:
+        sr.load_step_rate_table(write_json(tmp_path / "wb19.json", ev))
+    except sr.StepRateTableError as e:
+        code = e.code
+    assert code == "bad_table", "a hand-edited sealed evidence file must be refused bad_table"
+
+
+def test_load_row_note_is_ignored_by_the_rates(tmp_path):
+    sr = _sr()
+    t = _table()
+    t["rows"]["8xH100"]["note"] = "pre-WB25 single-GPU path"
+    got = sr.load_step_rate_table(write_json(tmp_path / "t.json", t))
+    assert got["8xH100"].steps_per_s == ROW["steps_per_s"]
 
 
 def test_rate_for_is_case_insensitive(tmp_path):

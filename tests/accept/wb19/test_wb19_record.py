@@ -343,3 +343,88 @@ def test_finished_record_digests_are_hex(records_factory):
     for r in records_factory(tool).values():
         assert r["source"] == "pod" and r["body_sha256"] == body_sha256(r)
         assert HEX64.fullmatch(r["body_sha256"]) and HEX64.fullmatch(r["leg_config_digest"])
+
+
+# ── partial evidence and row notes (owner 2026-11-23, plan rev6.16) ────────
+
+NOTE = "pre-WB25: single-GPU path, understates multi-GPU"
+
+
+def test_combine_partial_coverage_loads_with_the_reader(tmp_path, records_factory, lane_b_skus):
+    """Coverage the only failing check: the measured rows load; the missing
+    type has no row (WB22 refuses it gpu_rate_unmeasured)."""
+    from cascade.funding.step_rates import load_step_rate_table, rate_for
+
+    tool = load_tool()
+    missing = lane_b_skus[-1]
+    recs = [r for k, r in records_factory(tool).items() if k not in (missing, "full")]
+    rc, _, se, out = _combine(tool, tmp_path, recs)
+    assert rc == 0, se
+    ev = json.loads(out.read_text())
+    assert ev["passed"] is False
+    assert [c["name"] for c in ev["checks"] if not c["passed"]] == ["coverage"]
+    from cascade.funding.step_rates import StepRateTableError
+
+    try:
+        table = load_step_rate_table(out, image_digest=pinned_image())
+    except StepRateTableError as e:
+        raise AssertionError(f"coverage-only evidence must load (rev6.16): {e}") from e
+    assert set(table) == {r["sku"] for r in recs}
+    assert rate_for(table, missing) is None
+
+
+def test_combine_partial_with_a_memory_failure_does_not_load(tmp_path_factory, records_factory,
+                                                            lane_b_skus):
+    from cascade.funding.step_rates import StepRateTableError, load_step_rate_table
+
+    tool = load_tool()
+    d = tmp_path_factory.mktemp("oom-partial")
+    big = make_pod_record(tool, d, None, "4xH100", peak=80 * GIB)
+    keep = [s for s in lane_b_skus[:-1] if s != "4xH100"]
+    recs = [r for k, r in records_factory(tool).items() if k in keep] + [big]
+    rc, _, se, out = _combine(tool, d, recs)
+    assert rc == 0, se
+    with pytest.raises(StepRateTableError) as ei:
+        load_step_rate_table(out)
+    assert ei.value.code == "not_passed"
+
+
+def test_combine_note_marks_a_row(tmp_path, records_factory):
+    tool = load_tool()
+    pod = records_factory(tool)
+    rc, _, se, out = _combine(tool, tmp_path, [pod["8xH200"], pod["8xH100"]],
+                              extra=["--note", f"8xH200={NOTE}"])
+    assert rc == 0, se
+    ev = json.loads(out.read_text())
+    assert ev["table"]["rows"]["8xH200"]["note"] == NOTE
+    assert "note" not in ev["table"]["rows"]["8xH100"]
+    assert ev["body_sha256"] == body_sha256(ev)
+
+
+def test_combine_without_notes_unchanged_when_unarmed(tmp_path, records_factory):
+    """No --note: no row carries a note key (today's table)."""
+    tool = load_tool()
+    pod = records_factory(tool)
+    rc, _, se, out = _combine(tool, tmp_path, [pod["8xH200"]])
+    assert rc == 0, se
+    assert "note" not in json.loads(out.read_text())["table"]["rows"]["8xH200"]
+
+
+def test_combine_without_notes_armed_nonempty_lane_d_effect(tmp_path, records_factory):
+    tool = load_tool()
+    pod = records_factory(tool)
+    rc, _, se, out = _combine(tool, tmp_path, [pod["8xH200"]],
+                              extra=["--note", f"8xh200={NOTE}"])
+    assert rc == 0, se
+    assert json.loads(out.read_text())["table"]["rows"]["8xH200"]["note"] == NOTE
+
+
+@pytest.mark.parametrize("note", ["4xH100=no run for it", "8xH200", "8xH200=", "=x",
+                                  "8xH200=" + "x" * 201])
+def test_combine_refuses_a_bad_note(tmp_path, records_factory, capsys, note):
+    tool = load_tool()
+    pod = records_factory(tool)
+    rc, _, se, out = _combine(tool, tmp_path, [pod["8xH200"]], extra=["--note", note],
+                              capsys=capsys)
+    assert rc == 2 and refusal_code(se) == "bad_note", f"expected REFUSED bad_note: {se!r}"
+    assert not out.exists()
