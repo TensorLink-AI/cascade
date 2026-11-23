@@ -409,7 +409,9 @@ def _gate_result(d: _Paths, at: str, res, tau: float) -> tuple[str | None, str |
     if not isinstance(res, dict):
         d.add(at)
         return None, None
-    for k in sorted(set(res) ^ _RESULT_KEYS):
+    # ``held_from`` is optional here: whether a result must carry it is
+    # ``_Settlement._held_from``'s rule.
+    for k in sorted((set(res) - {"held_from"}) ^ _RESULT_KEYS):
         d.add(_key(at, k))
     dg = res.get("digest")
     if not isinstance(dg, str):
@@ -479,6 +481,8 @@ class _Verdict:
     king: str
     king_ts: int
     windows: list
+    stated_lcb: float = 0.0
+    lowfreq_fail: bool = False
     outcome: str = "lost"
 
 
@@ -828,17 +832,22 @@ class _Settlement:
             lcb, gain, cleared = judged[kd][n]
             if len(bars) > 1:
                 cleared = cleared and judged[bars_house][n][2]
-            self._verdict(j, verdicts_of(self.r)[j], m, stage, kd, i, (lcb, gain),
-                          judged[bars_house][n] if len(bars) > 1 else None, cleared)
+            v = verdicts_of(self.r)[j]
+            lf_fail = self._verdict(j, v, m, stage, kd, i, (lcb, gain),
+                                    judged[bars_house][n] if len(bars) > 1 else None, cleared)
+            stated = float(v["lcb"]) if _is_num(v.get("lcb")) else lcb
             self.verdicts.append(_Verdict(index=j, digest=m, stage=stage, cleared=cleared,
                                           lcb=lcb, set_sha256=set_sha, king=kd,
-                                          king_ts=king_ts, windows=list(wids)))
+                                          king_ts=king_ts, windows=list(wids),
+                                          stated_lcb=stated, lowfreq_fail=lf_fail))
         return len(wids) * (len(bars) + len(members))
 
     def _verdict(self, j: int, v: dict, m: str, stage: str, kd: str, cohort: int,
-                 vs_king: tuple[float, float], vs_house, cleared: bool) -> None:
+                 vs_king: tuple[float, float], vs_house, cleared: bool) -> bool:
+        """Check verdict ``j``; returns whether its A10 slice re-derives
+        ``fail`` (a final loss that never reaches the gate)."""
         at = f"verdicts[{j}]"
-        d, cfg = self.d, self.cfg
+        d = self.d
         keys = _VERDICT_KEYS | ({"house"} if vs_house is not None else set())
         for k in sorted(set(v) ^ keys):
             d.add(_key(at, k))
@@ -876,27 +885,47 @@ class _Settlement:
                   "first_set_sha256": p["set_sha256"] if p else None,
                   "first_king_digest": p["king_digest"] if p else None},
                  v.get("confirmation"))
-        # The A10 slice is report-only (W3b5 not built): a crowning candidate
-        # states the slice count, every other verdict is not a candidate.
-        lf = v.get("lowfreq")
-        freqs = [str(f) for f in cfg.lowfreq_freqs]
-        if not isinstance(lf, dict) or set(lf) != {"result", "freqs", "n_windows", "tau_public"} \
-                or lf.get("freqs") != freqs or not _same(lf.get("tau_public"),
-                                                         float(cfg.tau_public)):
+        return self._lowfreq(at, v.get("lowfreq"), cleared and stage == "confirm")
+
+    def _lowfreq(self, at: str, lf, candidate: bool) -> bool:
+        """W3b5 (A10): a crowning candidate's low-frequency slice is
+        ``no_windows`` (empty, no LCB) or ``pass``/``fail`` with four LCBs,
+        ``fail`` iff some LCB < ``-tau_public``; every other verdict is
+        ``not_candidate`` with an empty slice. Returns the re-derived ``fail``."""
+        d, cfg = self.d, self.cfg
+        tau = float(cfg.tau_public)
+        base = {"result", "freqs", "n_windows", "tau_public"}
+        if not isinstance(lf, dict) or not base <= set(lf) <= base | {"lcb"} \
+                or lf.get("freqs") != [str(f) for f in cfg.lowfreq_freqs] \
+                or not _same(lf.get("tau_public"), tau) or not _is_int(lf.get("n_windows")):
             d.add(f"{at}.lowfreq")
-        elif cleared and stage == "confirm":
-            n = lf.get("n_windows")
-            if not _is_int(n) or n < 0 or lf.get("result") != ("no_windows" if n == 0
-                                                               else "not_candidate"):
+            return False
+        result, n = lf.get("result"), lf["n_windows"]
+        if not candidate:
+            if result != "not_candidate" or n != 0 or "lcb" in lf:
                 d.add(f"{at}.lowfreq")
-        elif lf.get("result") != "not_candidate" or not _same(lf.get("n_windows"), 0):
+            return False
+        if result == "no_windows":
+            if n != 0 or "lcb" in lf:
+                d.add(f"{at}.lowfreq")
+            return False
+        lcb = lf.get("lcb")
+        if result not in ("pass", "fail") or n <= 0 or not (
+                isinstance(lcb, dict) and set(lcb) == set(GATE_REFS)
+                and all(isinstance(lcb[r], dict) and set(lcb[r]) == set(GATE_METRICS)
+                        and all(_finite(lcb[r][m]) for m in GATE_METRICS) for r in GATE_REFS)):
             d.add(f"{at}.lowfreq")
+            return result == "fail"
+        fail = any(float(lcb[r][m]) < -tau for r in GATE_REFS for m in GATE_METRICS)
+        if result != ("fail" if fail else "pass"):
+            d.add(f"{at}.lowfreq.result")
+        return fail
 
     # ── the gate, outcomes and the crown ────────────────────────────────────
 
     def _candidates(self) -> list[dict]:
         out = [{"digest": v.digest, "lcb": v.lcb, "held": False} for v in self.verdicts
-               if v.cleared and v.stage == "confirm"]
+               if v.cleared and v.stage == "confirm" and not v.lowfreq_fail]
         out += [{"digest": dg, "lcb": float(self.chain.holds[dg]["lcb"]), "held": True}
                 for dg in self.held]
         for c in out:
@@ -951,10 +980,27 @@ class _Settlement:
             if c is None or (c["held"] and self.chain.status.get(dg) != "confirm_pending"):
                 self.d.add(f"{at}.digest")
                 continue
+            self._held_from(at, res, c)
             self.gate_out[dg] = outcome if outcome is not None else "gate_regression"
         for c in cands:
             if c["digest"] not in self.gate_out:
                 self.d.add("gate.results")
+
+    def _held_from(self, at: str, res: dict, cand: dict) -> None:
+        """RV7 B2: a held candidate's result names its hold, and only a held
+        candidate's does. The hold is re-derived from this chain: the earlier
+        verified report (by its body digest) in which the digest's
+        confirmation cleared as ``confirmed`` with the gate absent or
+        ``bench_hold``, that cohort's ``set_sha256``, the verdict's KING_D
+        ``lcb`` and the KING_D it was taken under. An invented or altered
+        ``held_from`` differs from it."""
+        if not cand["held"]:
+            if "held_from" in res:
+                self.d.add(f"{at}.held_from")
+            return
+        hold = self.chain.holds[cand["digest"]]
+        want = {k: hold[k] for k in ("boundary", "report_sha256", "set_sha256", "lcb", "king_d")}
+        _compare(self.d, f"{at}.held_from", want, res.get("held_from"))
 
     def _gate_outcome(self, dg: str) -> str:
         """The candidate's gate outcome; without a gate record every
@@ -972,7 +1018,7 @@ class _Settlement:
         self.crown = passing[0]["digest"] if passing else None
         verdicts = verdicts_of(self.r)
         for v in self.verdicts:
-            if not v.cleared:
+            if not v.cleared or (v.stage == "confirm" and v.lowfreq_fail):
                 v.outcome = "lost"
             elif v.stage == "first":
                 v.outcome = "confirm_pending"
@@ -1050,7 +1096,9 @@ class _Settlement:
                 want[v.digest] = ("confirm_pending", "confirm_pending")
             elif v.outcome == "lost":
                 o = self._gate_outcome(v.digest) if v.cleared else None
-                if o == "checkpoint_fault":
+                if v.cleared and v.lowfreq_fail:
+                    want[v.digest] = ("lost", "lowfreq_regression")
+                elif o == "checkpoint_fault":
                     want[v.digest] = ("closed", "checkpoint_fault")
                 elif o == "gate_regression":
                     want[v.digest] = ("lost", "gate_regression")
@@ -1177,12 +1225,18 @@ class _Settlement:
                                        "king_reveal_ts": v.king_ts}
             elif v.stage == "first":
                 c.pending.pop(v.digest, None)
-        decided = [(v.digest, v.lcb) for v in self.verdicts if v.cleared and v.stage == "confirm"]
-        decided += [(dg, float(c.holds[dg]["lcb"])) for dg in self.held if dg in c.holds]
-        for dg, lcb in decided:
+        # A hold keeps its first record: the settlement (and its verified
+        # report body) whose confirmation cleared and the gate first held.
+        decided = [(v.digest, {"boundary": self.b, "report_sha256": self.body_sha,
+                               "set_sha256": v.set_sha256, "lcb": v.stated_lcb,
+                               "king_d": self.king_before["digest"]})
+                   for v in self.verdicts
+                   if v.cleared and v.stage == "confirm" and not v.lowfreq_fail]
+        decided += [(dg, c.holds[dg]) for dg in self.held if dg in c.holds]
+        for dg, record in decided:
             o = self._gate_outcome(dg)
             if o == "bench_hold":
-                c.holds[dg] = c.holds.get(dg) or {"lcb": lcb, "king_d": self.king_before["digest"]}
+                c.holds[dg] = c.holds.get(dg) or dict(record)
                 continue
             c.holds.pop(dg, None)
             if o != "pass" or dg == self.crown:
