@@ -312,7 +312,9 @@ settlement's vector agree with the expected network state.
 ### Shared-series horizon ladder (DEC-CA-0068)
 
 From its decided block, every rung of `[eval] scored_horizons` (64 / 256 / 720)
-scores the SAME `[eval] shared_ladder_windows` series (4000): one seeded
+scores the SAME `[eval] shared_ladder_windows` series (5000, pin
+`lad-ca8d69b3`; 4000 / `lad-556b1b98` before the 2026-11-23 release, which
+activates at the owner-typed `shared_ladder_from_block`): one seeded
 even-by-domain draw over all of the snapshot's series, one window per series
 per rung. A series too short for a rung keeps 64 steps of history and its
 whole tail as the target, NaN-padded to the horizon; the scorer masks the

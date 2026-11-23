@@ -61,7 +61,7 @@ def test_repo_chain_toml_and_record_are_in_sync(shipped, record):
     assert kinds["v2b-69630f92"] == D.OK
     assert kinds["forfeit-42b1a486"] == D.OK
     assert kinds["margin-v2-d30eb443"] == D.OK
-    assert kinds["lad-556b1b98"] == D.OK
+    assert kinds["lad-ca8d69b3"] == D.OK              # 5000/horizon since 2026-11-23 (was lad-556b1b98)
     assert kinds["rolling-era-king"] == D.OK          # typed 2026-11-13 (9136800)
     assert record.vote("rolling-era-king").type_it
     assert kinds["prelaunch-95-r2"] == D.OK           # typed 2026-11-13 (9486900)

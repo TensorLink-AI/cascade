@@ -63,11 +63,15 @@ source = "tally"
 # typed in chain.toml 2026-11-13 (PR #457)
 
 [[vote]]
-feature = "lad-556b1b98"
+feature = "lad-ca8d69b3"
 lock_block = 0
 activation_block = 9494100
 source = "config"
-# typed from the release (rc35, PR #455, owner 2026-11-12): never an open vote
+# 2026-11-23 (owner, DEC-CA-0068 4000 → 5000): was lad-556b1b98 (4000/horizon), typed
+# from the release (rc35, PR #455, owner 2026-11-12) at 9494100, never an open vote.
+# The 5000 count is release-then-activate: the owner types the new
+# shared_ladder_from_block on deploy; until that block is typed into the repo
+# chain.toml, this row mirrors the repo's 9494100. Update both in one PR once typed.
 
 [pins]
 "training.train_image_digest" = "sha256:205ff68242ae78fc923c8a5c7d2c4a4eccdd8afc7c7739cae99187475ba96d6f"

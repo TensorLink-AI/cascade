@@ -600,12 +600,17 @@ scored_from_block = 8992800      # = [round] duel_from_block — LIVE on main si
 # last and keeps the sample path). The main validator is the network's only full
 # evaluator, so every scorer and every audit replay reads this release value; the
 # vote is not needed (a typed block is the owner override — nothing is signalled).
-shared_ladder_windows    = 4000
+# 2026-11-23 (owner): 4000 → 5000 per horizon (15k windows/round, ~25% more eval
+# compute), pin lad-556b1b98 → lad-ca8d69b3. RELEASE-THEN-ACTIVATE: every validator
+# deploys this release first; the owner types the new shared_ladder_from_block (a
+# future era start) on deploy. A node still on 4000 after that block forks verdicts;
+# the fork guard below refuses a config whose count does not hash to the pin.
+shared_ladder_windows    = 5000
 shared_ladder_from_block = 9494100
 # Fork guard (CONSENSUS): the lad- name the two values above hash to. A validator /
 # trainer / audit whose chain.toml lacks it — or computes another — REFUSES to start
 # (a node without the rule would keep the per-rung draw after the switch).
-shared_ladder_feature    = "lad-556b1b98"
+shared_ladder_feature    = "lad-ca8d69b3"
 
 # Public-benchmark logging (LOG-ONLY; never feeds scoring/weights/KOTH). Runs
 # out of process via the benchmarks/ sidecar; best-effort. See benchmarks/README.md.

@@ -140,3 +140,27 @@ reached. The alternative — growing the pool's short domains first — is the
 * Not touched: the training contract, seeds, `contract_digest`, the bench
   gate, the king-check rule, the bootstrap, the margin schedule. Nothing
   retrains; the running seed epoch continues.
+
+## Amendment (accepted, 2026-11-23): 4000 → 5000 series
+
+Owner decision 2026-11-23: `[eval] shared_ladder_windows = 5000` (15,000 verdict
+windows per round across the three rungs, ~25% more private-eval compute than
+4000). The rule is otherwise unchanged. The vote name moves with the count:
+`lad-<sha256("shared-ladder/2|5000|64,256,720|batch=32")[:8]>` = `lad-ca8d69b3`,
+which replaces `lad-556b1b98` as the `[eval] shared_ladder_feature` pin.
+
+* **Release-then-activate.** netuid 91 has external validators. Every validator
+  deploys the release carrying 5000 and the new pin first. The owner then types
+  `shared_ladder_from_block` (a future era start) on deploy as the override; the
+  repo value is not moved by the release. A node still on 4000 after that block
+  draws a different window set and forks verdicts; the fork guard refuses any
+  config whose count does not hash to its pin, so a half-updated chain.toml
+  (5000 with the old pin, or the reverse) does not start.
+* **Replay.** Receipts settled under 4000 stay 4000 history. Tier-0 replay
+  re-derives no windows; the window count matters only to a tier-2 score
+  compare. There is no per-block count schedule, so a tier-2 replay of a round
+  settled under 4000 on this release would draw 5000 series. Re-run such a
+  replay with a 4000 chain.toml.
+* `decided_votes.toml` renames its `lad-` row to `lad-ca8d69b3`; it mirrors the
+  repo `shared_ladder_from_block` until the owner's typed block lands in the
+  repo, when both move in one PR.
