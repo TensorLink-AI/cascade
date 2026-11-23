@@ -286,3 +286,71 @@ def test_schema_file_states_the_armed_fields():
     props = doc["properties"]
     assert "armed_contexts" in props and "armed_evidence" in props
     assert "armed_contexts" not in doc["required"] and "armed_evidence" not in doc["required"]
+
+
+# ── rev6.15: no armed variant ≤ the declared context ⇒ skipped, pending ──────
+
+BELOW = "context_below_armed"
+
+
+def _below_armed(chain, tmp_path):
+    """Declared 4096 with only 8192 and 16384 armed (plan rev6.15, owner
+    2026-11-23: "Highest ≤ declared, else skip")."""
+    e = entry(chain["digests"][0], "challenger", coldkey=coldkey())
+    e["context"] = 4096
+    s, state = _settle(chain, tmp_path, armed=armed_rec((8192, 16384)), entries=[e])
+    return s, state, e["digest"]
+
+
+def test_context_below_armed_is_a_skip_reason():
+    from cascade.validator.lane_d_report import ENTRY_REASONS, SKIP_REASONS
+
+    assert BELOW in tuple(SKIP_REASONS), "rev6.15: the typed skip reason"
+    assert BELOW in tuple(ENTRY_REASONS)
+
+
+def test_an_entry_below_every_armed_variant_is_skipped_and_stays_pending(chain, tmp_path):
+    s, state, dg = _below_armed(chain, tmp_path)
+    r = s.report
+    rec = {x["digest"]: x for x in r["entries"]}[dg]
+    assert rec["context"] == 4096, "the declared context is recorded as declared"
+    assert (rec["status"], rec["reason"]) == ("pending", BELOW), rec
+    assert [x["reason"] for x in r["skipped"] if x["digest"] == dg] == [BELOW], r["skipped"]
+    assert dg not in r["judged"], "never judged above its declared context"
+    assert dg not in {v["digest"] for v in r["verdicts"]}
+    assert r["armed_contexts"] == [8192, 16384]
+    st = json.loads(state.read_text(encoding="utf-8"))["entries"][dg]
+    assert (st["status"], st["reason"]) == ("pending", BELOW), st
+    assert_valid(r)
+
+
+def test_the_below_armed_skip_is_deterministic(chain, tmp_path):
+    a, _, dg = _below_armed(chain, tmp_path / "a")
+    b, _, _ = _below_armed(chain, tmp_path / "b")
+    pick = ("entries", "skipped", "judged", "verdicts", "armed_contexts")
+    assert {k: a.report[k] for k in pick} == {k: b.report[k] for k in pick}
+
+
+def test_an_entry_with_an_armed_variant_below_it_is_not_skipped_below_armed(chain, tmp_path):
+    """Declared 16384 with 4096 and 8192 armed: scored at 8192, never this skip."""
+    e = entry(chain["digests"][0], "challenger", coldkey=coldkey())
+    e["context"] = 16384
+    s, _ = _settle(chain, tmp_path, armed=armed_rec((4096, 8192)), entries=[e])
+    rec = {x["digest"]: x for x in s.report["entries"]}[e["digest"]]
+    assert rec["reason"] != BELOW
+    assert BELOW not in {x["reason"] for x in s.report["skipped"]}
+
+
+def test_validate_refuses_a_below_armed_skip_the_armed_set_contradicts(chain, tmp_path):
+    s, _, dg = _below_armed(chain, tmp_path)
+    assert [x["reason"] for x in s.report["skipped"] if x["digest"] == dg] == [BELOW], \
+        "the fixture report carries the rev6.15 skip"
+    assert_valid(s.report)
+    r = copy.deepcopy(s.report)
+    for k in ("armed_contexts", "armed_evidence"):
+        del r[k]
+    _refused(r, "bad_value")                    # no armed set: the skip is unsupported
+    r = copy.deepcopy(s.report)
+    rec = {x["digest"]: x for x in r["entries"]}[dg]
+    rec["context"] = 8192                       # 8192 is armed: it is not below
+    _refused(r, "bad_value")

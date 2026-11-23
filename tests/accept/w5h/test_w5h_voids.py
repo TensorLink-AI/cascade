@@ -42,14 +42,45 @@ def test_t18c_the_voided_entry_frees_its_coldkey_slot(tmp_path):
     assert_judged(r, y["digest"])
 
 
+def _crowned_at_first_verdict(tmp_path):
+    """X against the genesis house H0: boundary 1 lists no entry; X enters at
+    boundary 2 and is crowned at its first verdict there (plan rev6.11 (b):
+    first clear ∧ A10 ∧ a passing §1.3b gate; no confirmation duel). Built
+    from W5g's primitives, not W5g's `Flow`, so W5g's fixture chain can move
+    without moving this test. Returns `settle_at(n, uid_of)` for boundary 3
+    onwards (re-using snapshot 2) and X."""
+    cfg = g.lane_d_cfg()
+    h0 = g.house()
+    x = g.entry("x", reveal_ts=T_X)
+    path = tmp_path / "state" / "lane_d_state.json"
+    models = {h0["digest"]: ("bad", "house-0"), x["digest"]: ("sharp", "x")}
+    snaps = {1: g.snapshot(tmp_path, 1), 2: g.snapshot(tmp_path, 2)}
+
+    def settle_at(n, listed, uid_of, snap=2):
+        pool_dir, recs = snaps[snap]
+        hash_, bench, _ = g.gate_inputs("pass", x["digest"], h0["digest"], f"b{n}")
+        return g.settle(cfg, g.boundary(n), pool_dir, listed, h0,
+                        g.forecasts(recs, models), uid_of, path,
+                        hash_=hash_, bench=bench).report
+
+    r1 = settle_at(1, [], g.uids(x), snap=1)
+    assert r1["judged"] == [], "fixture: boundary 1 lists no entry"
+    r2 = settle_at(2, [x], g.uids(x))
+    v = g.verdict_of(r2, x["digest"])
+    assert v is not None and v["stage"] == "first" and v["cleared"] is True, \
+        f"fixture: X did not clear at its first verdict at boundary 2: {v}"
+    assert g.read_state(path)["king"]["digest"] == x["digest"], \
+        "fixture: X not crowned at its first verdict"
+    return settle_at, x
+
+
 def test_t18c_a_deregistered_king_slot_burns(tmp_path):
-    """W5g's flow crowns X at boundary 2; at boundary 3 X's hotkey has no UID:
-    KING_D's court slot burns, typed `deregistered` (B8, with W8)."""
-    f = g.Flow(tmp_path, mode2="pass")
-    assert g.read_state(f.path)["king"]["digest"] == f.x["digest"], "fixture: X not crowned"
-    f.uid_of = {}
-    r = f.next("pass", snap=2)
-    (king_slot,) = [s for s in r["pay"]["court"] if s["digest"] == f.x["digest"]]
+    """X is crowned at boundary 2 (its first verdict, rev6.11 (b)); at
+    boundary 3 X's hotkey has no UID: KING_D's court slot burns, typed
+    `deregistered` (B8, with W8)."""
+    settle_at, x = _crowned_at_first_verdict(tmp_path)
+    r = settle_at(3, [x], {})
+    (king_slot,) = [s for s in r["pay"]["court"] if s["digest"] == x["digest"]]
     assert king_slot["uid"] is None
     assert king_slot["burn_reason"] == "deregistered"
 

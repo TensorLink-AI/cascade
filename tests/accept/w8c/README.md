@@ -213,8 +213,16 @@ SSHEvalHost.set_armed(contexts)   # the request's "contexts" becomes the armed s
 - **Forecast contexts:** each digest is forecast at
   `effective_context(declared, armed["armed_contexts"])`: an entry or a
   miner KING_D at its declared context when armed, else the highest armed
-  variant below it, else the lowest armed one; the house (and a house
-  KING_D) as declared 4096 (the trained length). The entry rows keep their
+  variant below it, ~~else the lowest armed one~~ **(plan rev6.15, owner
+  2026-11-23)** else **not forecast at all** (`effective_context` is
+  `None`: no armed variant ≤ the declared context; the settlement skips the
+  entry `context_below_armed`, and a miner KING_D without a forecast makes
+  its cohort `king_unscored`; no new input error, the tick is not refused);
+  the house (and a house KING_D) as declared 4096 (the trained length). The
+  house declares no context of its own, so the rev6.15 skip doesn't apply
+  to it: when no armed variant is ≤ 4096 it runs at the lowest armed one,
+  as before. The skip is deterministic: the same documents give the same
+  eval-host calls. The entry rows keep their
   declared `context` (settle_lane_d records it). An entry whose declared
   context is not in `cfg.lane_d.contexts` is not forecast (settle_lane_d
   closes it at registration, `context_not_armed`).
@@ -260,8 +268,8 @@ Builder PATHS: `cascade/validator/lane_d_wiring.py` is added (the
 ## Fixtures and services
 
 W8b's fixture (`tests/accept/w8b/helpers.py`, W7a's synthetic chain, numpy
-only): X is revealed at `REVEAL_BLOCK`, first-clears at B1 and is crowned at
-B2 (uid 6). The intake queue file is written in the real format. The house
+only): X is revealed at `REVEAL_BLOCK`, is listed from B1 and is crowned at
+its first verdict at B1 (uid 6; plan rev6.11 (b)). The intake queue file is written in the real format. The house
 pointer is a real W5f pointer signed by a test key. Fakes stand in for the
 reader, the W6d pin list, the eval host (W7a's forecasts), the bench pod
 (W8b's) and the bucket. The eval-host tests use a real `PrefetchCache` with
@@ -279,8 +287,9 @@ chain, storage, pod, torch, GPU or real key; everything lives under
   settlement is byte-identical.
 - **The house's context.** The pointer carries none. Any context in
   `[lane_d] contexts` passes here. 4096 (the trained length) is the obvious
-  choice. The rev6.6 "highest armed variant" rule for unarmed declared
-  contexts isn't in this WP.
+  choice. The ~~rev6.6 "highest armed variant"~~ **(rev6.15)** "highest
+  armed variant ≤ declared, else skip" rule for unarmed declared contexts is
+  W5d's `effective_context`; this WP only applies it (and skips `None`).
 - **The metagraph** is read at head (`registered_hotkeys`), as the intake's
   registration gate does. A boundary-pinned metagraph would need a public
   `ChainClient` read at a block (owner call; not added here).
@@ -300,3 +309,16 @@ Every source and eval-host test fails with `ModuleNotFoundError` for
 subprocess. The invariant 12 check and the `main()` AST check fail on
 assertions. `test_inv12_nothing_on_the_weight_path_imports_the_source` passes
 on main. Run locally with `-m "not torch"` (no test here needs torch).
+
+## Correction (plan rev6.11 (b)): crown at the first verdict
+
+The confirmation duel is dropped (owner 2026-11-23): a crown is decided at
+the first verdict, first clear (max-T LCB vs KING_D) ∧ A10 ∧ the §1.3b gate.
+The source lists X from B1 (its reveal is before B1), so X is crowned at B1.
+`test_step_with_the_source_settles_like_the_hand_built_inputs` keeps its
+report-for-report comparison with W8b's hand-built inputs at B1..B3 and now
+reads the crown from the B1 report (with the armed set), asserts B2 and B3
+crown nothing and that uid 6 is KING_D's court slot at B1, B2 and B3 (it
+checked B2 only). Nothing is weakened. On main the old code still runs the
+confirmation stage (X is crowned at B2), so the changed test fails on an
+assertion until the W5e implementation lands.

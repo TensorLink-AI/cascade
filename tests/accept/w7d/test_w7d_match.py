@@ -112,7 +112,9 @@ def test_the_held_candidate_is_regated_and_crowned_without_a_verdict(chains):
     res = replay(c.pub)
     _all_match(res, c.pub)
     x = c.x["digest"]
-    assert res[1].crowned is None and dict(res[1].outcomes) == {x: "bench_hold"}
+    # The held first clear's verdict outcome is `cleared` (status `hold`,
+    # reason `bench_hold`; test_w7d_fixture_chains, W5g, W17).
+    assert res[1].crowned is None and dict(res[1].outcomes) == {x: "cleared"}
     assert dict(res[1].gate) == {}, "no gate ran at the held settlement"
     assert res[2].crowned == x and dict(res[2].outcomes) == {} and dict(res[2].gate) == {x: "pass"}
 

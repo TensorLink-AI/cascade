@@ -121,7 +121,6 @@ def test_same_documents_same_inputs(tmp_path):
     (4096, (4096, 8192), 4096, 4096),       # armed: its own context
     (16384, (4096, 8192), 8192, 4096),      # unarmed: the highest armed below it
     (8192, (4096, 16384), 4096, 4096),
-    (4096, (8192, 16384), 8192, 8192),      # nothing armed below: the lowest armed
     (16384, (16384,), 16384, 16384),
 ])
 def test_each_digest_is_forecast_at_its_effective_context(tmp_path, declared, armed,
@@ -140,16 +139,63 @@ def test_each_digest_is_forecast_at_its_effective_context(tmp_path, declared, ar
         "the entry keeps its declared context (settle_lane_d records it)"
 
 
+def test_no_armed_variant_at_or_below_the_declared_context_is_not_forecast(tmp_path):
+    """Plan rev6.15 (owner 2026-11-23, "Highest ≤ declared, else skip"):
+    declared 4096 with only 8192 and 16384 armed. The miner entry is not
+    forecast: no miner model runs above its declared context. It stays in
+    ``entries`` with its declared context (the settlement skips it
+    ``context_below_armed``), and the source does not refuse the tick. The
+    house declares no context (it is ours): its rule is unchanged, the
+    lowest armed variant here."""
+    fx = h.w8b.fixture(tmp_path)
+    rig = h.Rig(tmp_path, fx=fx, entries=[dict(fx["entry"], context=4096)])
+    rig.readiness.data = h.readiness_doc(armed=(8192, 16384))
+    got = rig.source(h.B1)
+    assert got.armed["armed_contexts"] == [8192, 16384]
+    ctx = _ctx(rig)
+    assert fx["x"] not in ctx, \
+        f"declared 4096, armed (8192, 16384): the entry is not forecast (got {ctx.get(fx['x'])})"
+    assert ctx[fx["house"]["digest"]] == 8192, "the house keeps its rule: the lowest armed"
+    assert [e["context"] for e in got.entries] == [4096], \
+        "the entry is still listed with its declared context (settle_lane_d skips it)"
+    assert fx["x"] not in got.forecasts
+
+
+def test_unforecast_digests_are_the_same_every_build(tmp_path):
+    """The skip is deterministic: two sources over the same documents ask the
+    eval host for the same (digest, context) calls."""
+    fx = h.w8b.fixture(tmp_path)
+    rig = h.Rig(tmp_path, fx=fx, entries=[dict(fx["entry"], context=4096)])
+    rig.readiness.data = h.readiness_doc(armed=(8192, 16384))
+    rig.source(h.B1)
+    first = sorted((c["digest"], c["context"]) for c in rig.eval_host.calls)
+    rig.eval_host.calls.clear()
+    rig.build()(h.B1)
+    second = sorted((c["digest"], c["context"]) for c in rig.eval_host.calls)
+    assert first == second
+    assert fx["x"] not in {d for d, _ in first}
+
+
 def test_open_entries_and_king_d_follow_the_armed_set(tmp_path):
-    """After B1 X is open (its state record has its declared context); at B2
-    with only 8192 armed both X and the house run at 8192."""
+    """After B1 X is open (its state record has its declared context, 4096);
+    at B2 with only 8192 armed the house runs at 8192 (its rule: the lowest
+    armed) and X, declared 4096, is not forecast (plan rev6.15: never above
+    its declared context; the settlement skips it ``context_below_armed``).
+    At B3 with 4096 armed again X runs at 4096."""
     rig = h.Rig(tmp_path)
     rig.step()(h.B1)
+    assert int(json.loads(rig.state_path.read_text(encoding="utf-8"))
+               ["entries"][rig.fx["x"]]["context"]) == 4096
     rig.readiness.data = h.readiness_doc(armed=(8192,))
     rig.eval_host.calls.clear()
     rig.source(h.B2)
     ctx = _ctx(rig)
-    assert ctx[rig.fx["x"]] == 8192 and ctx[rig.fx["house"]["digest"]] == 8192
+    assert ctx[rig.fx["house"]["digest"]] == 8192
+    assert rig.fx["x"] not in ctx, f"X (declared 4096) runs at {ctx.get(rig.fx['x'])}"
+    rig.readiness.data = h.readiness_doc(armed=(4096, 8192))
+    rig.eval_host.calls.clear()
+    rig.source(h.B3)
+    assert _ctx(rig)[rig.fx["x"]] == 4096
 
 
 def test_eval_host_is_told_the_armed_set_before_any_forecast(tmp_path):

@@ -55,7 +55,9 @@ def test_step_passes_the_era_sentinel_drawn_from_the_era_start_hash(tmp_path):
     rig, oracle = _compare_to_oracle(tmp_path, sentinel=True)
     suite = h.era_sentinel(rig.cfg, h.B2)
     assert suite is not None
-    assert rig.published_report(h.B2)["gate"]["sentinel"] == suite
+    s2 = rig.published_report(h.B2)
+    assert "gate" in s2, "B2's first-verdict crown (rev6.11 (b)) runs the gate"
+    assert s2["gate"]["sentinel"] == suite
     assert h.ERA_START in rig.factory.reader.blocks(), "the era-start hash was never read"
 
 

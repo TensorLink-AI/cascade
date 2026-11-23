@@ -249,3 +249,13 @@ assertion; the invariant 12 check on the missing wiring module. The unarmed gold
 (under the shipped policy a burnt lane D equals today's vector), the
 inactive-boundary and `force_burn` checks pass on main. Run locally with
 `-m "not torch"`.
+
+## Correction (plan rev6.11 (b)): crown at the first verdict
+
+The confirmation duel is dropped (owner 2026-11-23): a crown is decided at
+the first verdict, first clear (max-T LCB vs KING_D) ∧ A10 ∧ the §1.3b gate.
+There is no `confirm` stage, no `confirm_pending` status or reason and no
+`lost_confirmation`; a held first clear is `hold` / `bench_hold`. This WP's
+crowning chains move to that rule with nothing weakened. `helpers.Inputs` lists X from B2 (`listed_from`), so B1 still leaves the house on KING_D and X is crowned at its first verdict at B2. The foreign-state test lists X at B1 for validator A so its B1 state still differs from the no-entry state. On main the
+old code still runs the confirmation stage, so the changed tests fail on an
+assertion until the W5e implementation lands.

@@ -167,7 +167,7 @@ re-derives everything that follows from it.
 | C3 `prior_kings`: after a crown by a miner over a miner king, `[king_before] + previous prior_kings`, cut to `reward_prior_kings`. Otherwise it's unchanged (`[]` at genesis) | `prior_kings` |
 | C4 **(rev6.11 (b): no D20, no confirmation duel)** every verdict is a first verdict, judged against `king_before`, and an entry is judged at most once in the chain (a loser is never re-judged; a held clear is re-gated without a verdict, C6). A report carrying a confirmation stage (a cohort or verdict `stage` other than `first`, a verdict `confirmation` block, or an entry `confirm_pending`) is refused: UNVERIFIABLE `confirmation_stage_present`, never a MATCH | `cohorts[i]…`, `verdicts[j]…` |
 | C5 pay: `pay.share == cfg.share`. The court is `[king_after] + prior_kings[:reward_prior_kings]`, king first, by recency. Each slot is `{digest, hotkey (None for the house), uid, burn_reason}`: `uid` is `uid_of[boundary][hotkey]` when the metagraph is given, and `burn_reason` is `None` iff `uid` is an int, else `house_king` (house slot) or `deregistered` | `pay.share`, `pay.court…` |
-| C6 held: a gate result whose digest has no verdict in this report is a held candidate only if an earlier report of the chain left that digest with a cleared first verdict `bench_hold` (gate absent or `bench_hold`). Nothing in between may have decided it, and its entry must be open (`pending`) in the previous report | `gate…` |
+| C6 held: a gate result whose digest has no verdict in this report is a held candidate only if an earlier report of the chain left that digest with a cleared, held first verdict (outcome `cleared`, gate absent or `bench_hold`). Nothing in between may have decided it, and its entry must be open (`hold` / `bench_hold`, rev6.11 (b)) in the previous report | `gate…` |
 
 **Pay shares.** Slot `i` of the court is worth `share * king_decay**i /
 sum_j king_decay**j`. A `None` uid burns. The shares sum to `share`. The
@@ -213,7 +213,7 @@ fixture feed pins `embargo_hours = 48` in the snapshot's `feeds` (W6b).
 | chain | settlements |
 |---|---|
 | `gated` | b1 X floor wait (nothing judged, ungated call); b2 X's first verdict vs H0: clear, gate `pass`, outcome `crowned`; b3 judges nothing |
-| `held` | b1 floor wait; b2 X's first verdict clears with no gate inputs (outcome `bench_hold`, X stays `pending`, nothing crowns); b3 X re-gated without a duel, `pass`, crowned (a gate result, no verdict) |
+| `held` | b1 floor wait; b2 X's first verdict clears with no gate inputs (outcome `cleared`, X held: status `hold`, reason `bench_hold`; nothing crowns); b3 X re-gated without a duel, `pass`, crowned (a gate result, no verdict) |
 | `house_bar` | X crowned at b2; Y's first verdict at b3 against KING_D = X **and** the house: crowned. X becomes a prior king, so the court pays `[Y, X]` by decay |
 | `refresh` | b1 X floor wait vs H0; b2 the house refreshes to H1 (the throne moves in place) and X's first verdict is against H1: crowned; b3 judges nothing |
 
@@ -421,3 +421,25 @@ fact into an assertion.
 | `test_w7d_match.py`, `test_w7d_mismatch.py`, `test_w7d_unverifiable.py` | `ModuleNotFoundError: No module named 'cascade.satellite'` (in PATHS). The subprocess cases fail on their return-code assert |
 | `test_w7d_import_graph.py` | assert: the module file is absent, there's nothing to check, the subprocess import fails |
 | `test_w7d_fixture_chains.py` | passes: it checks the fixtures |
+
+## Correction (plan rev6.11 (b)): crown at the first verdict
+
+The confirmation duel is dropped (owner 2026-11-23): a crown is decided at
+the first verdict, first clear (max-T LCB vs KING_D) ∧ A10 ∧ the §1.3b gate.
+There is no `confirm` stage, no `confirm_pending` status or reason and no
+`lost_confirmation`; a held first clear is `hold` / `bench_hold`. This WP's
+crowning chains move to that rule with nothing weakened. The house-challenger chains (`house_helpers`) now decide at the first verdict. Y is crowned at b3 over X; the house retakes at b5 (`house_retakes`), b3 (`copy_at_swap`) or b4 (`open_copy`, after the held copy C is closed `duplicate_digest` and its hold dropped); Z is crowned over the house at b7. The settlement after each decision judges nothing. `RETAKES` and every expected outcome, court and boundary follow; the forgeries are unchanged. On main the
+old code still runs the confirmation stage, so the changed tests fail on an
+assertion until the W5e implementation lands.
+
+## Correction (plan rev6.11 (b)): the held first clear in the `held` chain
+
+The `held` chain and C6 described a held first clear as verdict outcome
+`bench_hold` with the entry left `pending` (#755). #795, W5g (#791) and W17
+pin the rev6.11 (b) hold as status `hold`, reason `bench_hold`, verdict
+outcome `cleared` (C in `open_copy`, `test_w7d_house.py`). `test_fixture_chain_shapes`
+and `test_the_held_candidate_is_regated_and_crowned_without_a_verdict` now
+expect that one convention (and the fixture test also checks the reason
+`bench_hold`); the C6 row and the `held` row above say the same. Nothing
+else changed. Both tests stay red on main (old confirmation stage) and pass
+with the W5e implementation (#802).
