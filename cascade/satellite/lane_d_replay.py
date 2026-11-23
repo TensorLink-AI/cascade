@@ -83,9 +83,13 @@ UNVERIFIABLE = "UNVERIFIABLE"
 STATUSES = (MATCH, MISMATCH, UNVERIFIABLE)
 
 # ``receipt_malformed``: the receipt has no integer boundary, so no report
-# can be located for it.
+# can be located for it. ``confirmation_stage_present`` (rev6.11 (b)): the
+# signed report carries a confirmation stage (a cohort or verdict ``stage``
+# other than ``first``, a verdict ``confirmation`` block or an entry
+# ``confirm_pending``); there is no such stage, so it is refused, never judged.
 UNVERIFIABLE_REASONS = ("unknown_schema", "report_missing", "report_unreadable",
-                        "signature_unverifiable", "prior_unverified", "receipt_malformed")
+                        "signature_unverifiable", "prior_unverified", "receipt_malformed",
+                        "confirmation_stage_present")
 
 REPORT_SCHEMA = "lane-d-report/1"
 STATE_SCHEMA = "lane-d-state/1"
@@ -365,6 +369,20 @@ def court_shares(cfg, n_slots: int) -> list[float]:
 
 
 # ── the statistic ───────────────────────────────────────────────────────────
+
+
+def combined_log_ratio(r_fwd: float, r_bt: float, *, n_fwd: int, n_bt: int, cap: float,
+                       floor: float) -> float:
+    """rev6.9 (W5i) combination of the forward and backtest ratios, re-derived
+    here: ``(1 - c) * log(r_fwd) + c * log(clamp(r_bt, floor, 1 / floor))``
+    with ``c = min(cap, n_bt / (n_bt + n_fwd))`` (``c = 0`` without backtest
+    windows). With ``c = 0`` it is exactly ``log(r_fwd)``, so memorising the
+    backtest gains at most ``1 - floor ** cap``."""
+    c = 0.0 if int(n_bt) == 0 else min(float(cap), int(n_bt) / (int(n_bt) + int(n_fwd)))
+    if c <= 0.0:
+        return math.log(float(r_fwd))
+    clamped = min(max(float(r_bt), float(floor)), 1.0 / float(floor))
+    return (1.0 - c) * math.log(float(r_fwd)) + c * math.log(clamped)
 
 
 def _parts(crps: np.ndarray, mase: np.ndarray):
@@ -1616,6 +1634,21 @@ def _signature_paths(report: dict, signer_ss58: str) -> list[str]:
     return out
 
 
+def _confirmation_stage_present(report: dict) -> bool:
+    """rev6.11 (b): does the signed report carry a confirmation stage?"""
+    def items(key):
+        v = report.get(key)
+        return [x for x in v if isinstance(x, Mapping)] if isinstance(v, list) else []
+
+    for c in items("cohorts"):
+        if "stage" in c and c["stage"] != "first":
+            return True
+    for v in items("verdicts"):
+        if ("stage" in v and v["stage"] != "first") or "confirmation" in v:
+            return True
+    return any("confirm_pending" in (e.get("status"), e.get("reason")) for e in items("entries"))
+
+
 def _unverifiable(boundary, reason: str, **kw) -> SettlementReplay:
     return SettlementReplay(boundary=boundary, status=UNVERIFIABLE, reason=reason, **kw)
 
@@ -1635,6 +1668,8 @@ def _replay_one(reports, receipt, cfg, chain: _Chain, signer_ss58: str, uid_of, 
         sig_paths = _signature_paths(report, signer_ss58)
     except SignatureVerifierUnavailable:
         return _unverifiable(b, "signature_unverifiable", report_sha256=body_sha), chain
+    if not sig_paths and _confirmation_stage_present(report):
+        return _unverifiable(b, "confirmation_stage_present", report_sha256=body_sha), chain
     metagraph = None
     if uid_of is not None and b in uid_of and isinstance(uid_of[b], Mapping):
         metagraph = uid_of[b]
@@ -1697,5 +1732,5 @@ def replay_chain(reports, receipts, cfg, *, signer_ss58: str,
 
 
 __all__ = ["MATCH", "MISMATCH", "RECEIPT_SCHEMA", "REPORT_SCHEMA", "STATE_SCHEMA", "STATUSES",
-           "UNVERIFIABLE", "UNVERIFIABLE_REASONS", "SettlementReplay", "court_shares",
-           "check_gate_rows", "expected_params", "gate_draw", "replay_chain"]
+           "UNVERIFIABLE", "UNVERIFIABLE_REASONS", "SettlementReplay", "check_gate_rows",
+           "combined_log_ratio", "court_shares", "expected_params", "gate_draw", "replay_chain"]
