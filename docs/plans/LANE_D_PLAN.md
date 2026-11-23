@@ -6,14 +6,15 @@ autonomous loop. A work package is done **only when its Accept command exits
 never a claim. Owner decisions are marked **[DECIDE]**. Nothing is armed. **No calendar
 dates**: stages are gated (§5).
 
-## rev6.3 (owner 2026-11-22; main @ 28a1e98)
+## rev6.3 (owner 2026-11-22/23; main @ a244271)
 
-Adds one proposed WP. Plan text only; nothing else in the design changes.
-The changed item is marked **(rev6.3)**.
+Adds one proposed WP, (a), and one owner decision, (b). Plan text only;
+nothing else in the design changes. Every changed item is marked **(rev6.3)**.
 
 | Item | Decision | Landed in |
 |---|---|---|
 | (a) | **Proposed (owner 2026-11-22 approved adding it):** WB24 lane B miner CLI: `cascade lane-b fund` gains `--declared-rows <file>` (signed WB14 header + `rows=` tag, local refusal with `DECLARED_ROWS_CODES`), `--target suite:<s>` (WB18) and `--train-hours` (WB23, once built); `lane-b status` shows the deferral/refusal reasons; new `lane-b verify-repo <dir>` runs the WB13 scan locally (no upload, never executes the repo) | Lane B table, WB24 row |
+| (b) | **Batch implementation PRs (owner 2026-11-23, DECIDED).** An implementation PR may batch **up to 3 WPs** when (1) their PATHS sets are disjoint, (2) none depends on another in the batch, (3) each WP's tests are already on main. Each WP in the batch is still checked on its own: scope (its PATHS only, files attributed per WP), its own accept, and CROSS; the ledger records one row per WP. A red WP is split out of the batch by the builder (the others proceed); WPs whose PATHS overlap stay serial. Tests-corrections found in one pass may likewise be batched in one PR (one dir per WP). Labels: one `laned:<WP>` per WP in the batch | §3.1 rule 7 (former rules 7–8 renumbered 8–9); §5 S2 Build row |
 
 ## rev6.2 (owner decisions 2026-11-22; main @ 6108ebd)
 
@@ -1692,8 +1693,19 @@ BLOCKING item, and each finding is either fixed or filed as a WP.
    directories, with one `laned:<WP>` label per WP; each WP's expect-fail (or
    verification) accept run is executed and ledger-recorded separately, and the
    whole PR fails if any WP's check fails.
-7. **A fresh-context review WP** after every 5 build WPs reach L3 **(rev6)**.
-8. **Blocked is acceptable; faked completion is not.** If a WP can't be fully
+7. **(rev6.3, owner 2026-11-23) Implementation PRs MAY batch up to 3 WPs**
+   when (1) their PATHS sets are disjoint, (2) none depends on another in the
+   batch, and (3) each WP's tests are already on main. Each WP in the batch is
+   still checked on its own: scope (its PATHS only, files attributed per WP),
+   its own accept, and CROSS; the ledger records one row per WP. A red WP is
+   split out of the batch by the builder (the others proceed); WPs whose PATHS
+   overlap stay serial. Tests-corrections found in one pass may likewise be
+   batched in one PR (one dir per WP). Labels: one `laned:<WP>` per WP in the
+   batch. This narrows rule 6's "one WP per PR" for implementation and
+   tests-correction PRs; evidence and review PRs stay one WP per PR. (Former
+   rules 7–8 are now 8–9.)
+8. **A fresh-context review WP** after every 5 build WPs reach L3 **(rev6)**.
+9. **Blocked is acceptable; faked completion is not.** If a WP can't be fully
    built, the builder stops and records the blocker in `evidence/blocked/<wp>.md`.
 
 ### 3.2 Invariants
@@ -1921,7 +1933,7 @@ capability release → (rev5) one activation block, live everywhere.**
 | 3 | **S0b Note budget** | Decode the live mainnet readiness notes and add the `cfg-` segment. It's trimmed **last** (`activation.py:1334-1357`), so older pending segments go first | No still-pending segment would be trimmed (type their decided blocks in main first if needed); T22 passes on testnet |
 | 4 | **S0c Overlay bring-up** | Publish a **benign seq-1 overlay** (restates current values only) on testnet, then mainnet. Then a deliberately refused overlay on testnet | The 404-every-poll is gone. Fetched from S3 **and** the HF mirror by our validator, the trainer and satellites. `cfg-` lock ≥ 51% in `status/chain.json`. Receipts stamp `netconfig_seq`; the `cascade-audit` netconfig check passes; the trainer logs the same apply block. The refused overlay applies nothing |
 | 5 | **S1 Measure** | W1, W0b, W3a (live Hippius probe); **(rev5)** start R16 long-history harvest (runs continuously from here, scored only from S8) | Forward floors met at the chosen margin (or re-decided); ≥ 1 context variant has `min_long_series`; storage mechanism chosen |
-| 6 | **S2 Build** | **(rev5) All build WPs**, one PR each **(rev6.2: one implementation PR each; tests-only PRs may batch WPs per §3.1 rule 6)**: W1.5, W2 (with `ALLOWED["lane_d"]`) then W3–W19, W-S1–W-S3, the WB track (WB10–WB23) and W-EMA | CI green. Receipt replay on the last N mainnet receipts at the release head: **unarmed ⇒ byte-identical; armed ⇒ lane A verdicts, court and lane A weight entries identical, and lane D fields present and schema-valid** (W3b touches `bench_gate.py`/`public_guards.py`, which lane A replays). Startup-gate test of the shipped chain.toml at the live head for validator **and** trainer (T26). Docs gate |
+| 6 | **S2 Build** | **(rev5) All build WPs**, one PR each **(rev6.2: one implementation PR each; tests-only PRs may batch WPs per §3.1 rule 6; rev6.3: implementation PRs may batch up to 3 WPs per §3.1 rule 7)**: W1.5, W2 (with `ALLOWED["lane_d"]`) then W3–W19, W-S1–W-S3, the WB track (WB10–WB23) and W-EMA | CI green. Receipt replay on the last N mainnet receipts at the release head: **unarmed ⇒ byte-identical; armed ⇒ lane A verdicts, court and lane A weight entries identical, and lane D fields present and schema-valid** (W3b touches `bench_gate.py`/`public_guards.py`, which lane A replays). Startup-gate test of the shipped chain.toml at the live head for validator **and** trainer (T26). Docs gate |
 | 7 | **S2b Catch-up release** | Ship main-as-of-now **without** lane D code to our validator, trainer and satellites, so the lane D release diffs only the lane D and lane B build WPs (§5 S2) **(rev6)** | 2 settlements with identical vectors; no satellite burn |
 | 8 | **S3 Testnet** | §4 matrix including T22–T29 | §4 exit gate |
 | 9 | **S4 Release** | Cut the **capability release** (lane D unarmed, `lane_d` allow-listed). **(rev5)** Bring up the launch eval host (D11; not valeval-laned, which is rented only at S8) (on-rent check, pinned known_hosts, handshake); dry-run the house. **Stage and review the revert overlay.** Send the announcement (§11.3) | Dry-run within the measured cross-host tolerance; announcement sent; revert overlay reviewed |
