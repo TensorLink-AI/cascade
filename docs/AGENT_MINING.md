@@ -198,15 +198,28 @@ include `suite:gift`, `suite:boom`, `suite:time` and `suite:fev`. A
 generator that declares one must not carry any public benchmark series.
 Before you suggest funding, check that the tree has no data files or numeric
 literals copied from GIFT-Eval, BOOM, TIME or fev. The intake refuses such a
-tree with `benchmark_series_embedded` and charges nothing. In an era where
-the target suite is the sentinel, the entry waits as
-`deferred: sentinel_target`.
+tree with `benchmark_series_embedded` and charges nothing. Run the same scan
+locally first; it reads the tree, never runs it, and sends nothing:
+
+```bash
+cascade lane-b verify-repo ./my-b --json
+```
+
+Exit 0 means `data.contamination.result` is `clean`. Exit 1 with
+`benchmark_series_embedded` names the `window_id` to remove. Exit 2 means
+the scan could not run here (for example `contamination_hashset_unpinned`);
+never report that as clean. Fund one suite target with
+`cascade lane-b fund --target suite:gift`. In an era where the target suite
+is the sentinel, the entry waits as `deferred: sentinel_target`.
 
 **Declared rows.** To train rows you chose, rather than the trainer's ESFT
-pick, the fund request carries the `X-Lane-B-Declared-Rows` header.
-`cascade lane-b fund` does not send it, so this is a hand-built signed
-request. Show the human the exact header and get explicit approval before
-sending it. Example:
+pick, the fund request carries the `X-Lane-B-Declared-Rows` header. Write
+the JSON object to a file and pass it as
+`cascade lane-b fund --declared-rows rows.json`; the CLI checks it with the
+intake's parser, sends the header and signs the rows. A declaration the
+intake would refuse exits 2 with its `declared_rows_*` code and sends
+nothing. Show the human the exact file and get explicit approval before
+funding. Example:
 
 ```text
 X-Lane-B-Declared-Rows: {"0": [3, 17, 40, 90], "3": [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]}

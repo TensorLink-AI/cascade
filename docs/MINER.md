@@ -1505,8 +1505,10 @@ domains and horizons:
 | TIME | `suite:time` | `s-time` |
 | fev | `suite:fev` | `s-fev` |
 
-Use the target name with `cascade lane-b fund --targets` and in the
-`X-Lane-B-Targets` header. The commitment carries the short code, because `:`
+Use the target name with `cascade lane-b fund --targets`, or name one suite
+target with `cascade lane-b fund --target suite:gift`, and in the
+`X-Lane-B-Targets` header. `--target` takes only a `suite:<suite>` name; it
+is refused locally with `bad_targets` while suite targets are off. The commitment carries the short code, because `:`
 separates commitment fields. While suite targets are on, no domain name may
 start with `s-`. A generator that declares a suite target must not embed any
 window of the public benchmark series. The intake scans the committed tree
@@ -1548,8 +1550,12 @@ Each layer that has rows must stay inside the clamp set by
 declared rows, and at least one row in total is required. When you send the
 header, the hotkey signature also covers the rows. INTERFACE.md gives the
 [ordinals, per-layer limits and signing](INTERFACE.md#lane-b-submissions-declared-rows-and-the-benchmark-ban).
-`cascade lane-b fund` does not send this header. If you omit it, the trainer
-picks the rows.
+To send it, write the object to a file and pass
+`cascade lane-b fund --declared-rows rows.json`. The CLI parses the file with
+the intake's own parser under the clamp of the chain.toml it loads, then sends
+the canonical rows as the header and signs them. A declaration the intake
+would refuse exits 2 with the same `declared_rows_*` code, and nothing is
+sent. If you omit the flag, the trainer picks the rows.
 
 Declared rows are exclusive, and the earliest reveal holds them. If your
 rows overlap rows held by an open leg, a finished leg awaiting its verdict
@@ -1577,7 +1583,10 @@ charged:
 | `contamination_scan_failed` | 503 | The scan could not complete. Retry later. |
 
 The contamination codes and the `contamination` receipt appear only while
-`contamination_hashset` is pinned.
+`contamination_hashset` is pinned. `cascade lane-b fund` prints the
+receipt's `result`, `suite` and `window_id`, and `--json` carries it in
+`error.contamination`. To check a tree before you commit it, see
+[Lane B: check a tree before funding](#lane-b-check-a-tree-before-funding).
 
 Two deferrals keep a funded entry queued without charging it:
 `deferred: rows_held` (declared rows overlap held rows) and
@@ -1586,6 +1595,47 @@ reason codes are `rows_held` and `sentinel_target`.
 
 An entry that sits idle past the payer-key TTL without entering a leg fails
 with `last_error_class` `funding_expired`. Fund again to re-enter.
+
+`cascade lane-b status` shows these reasons from the public
+`status/lane_b.json` next to the intake queue: each `deferred` row for your
+hotkey and the gate's `gate_closed_reason`. Under `--json` they are in
+`data.lane_b_status`. With no status document published, the output is the
+queue view alone.
+
+### Lane B: check a tree before funding
+
+`cascade lane-b verify-repo` runs the intake's contamination scan on your
+tree locally, so you can fix an embedded benchmark window before you commit
+and fund:
+
+```bash
+cascade lane-b verify-repo ./my-gen --json
+cascade lane-b verify-repo ./my-gen --chain-toml ./chain.toml --json
+```
+
+It scans against the hash set that `[lane_b] contamination_hashset` pins in
+that chain.toml (the release's `benchmarks/contamination/` artefact), with
+`contamination_min_hits`. The tree is read and never imported or run. No
+wallet is opened and nothing is uploaded. `data.contamination` is the same
+receipt the intake attaches (`hashset_version`, `result`, `suite`,
+`window_id`).
+
+| Exit | `error.code` | Meaning |
+|---|---|---|
+| 0 | none | `result` is `clean`. |
+| 1 | `benchmark_series_embedded` | The tree embeds a benchmark window; the receipt names the `suite` and `window_id`. |
+| 1 | `contamination_budget_exceeded` | The tree carries more numeric data than the bounded scan covers. |
+| 1 | `contamination_scan_failed` | The scan could not complete. |
+| 2 | `not_a_directory` | The path is not a directory. |
+| 2 | `contamination_hashset_unpinned` | This chain.toml pins no hash set, so there is nothing to scan against. |
+| 2 | `contamination_hashset_unavailable` | No artefact in this release matches the pin. |
+
+Without the pinned hash set the command never reports `clean`. A clean local
+result does not bind the intake, which scans the committed tree again.
+
+`cascade lane-b fund --train-hours` is refused locally (exit 2,
+`train_hours_unavailable`) until the intake accepts a training-hours request.
+The leg budget is `[lane_b] leg_hours`.
 
 ### When lane B opens
 
