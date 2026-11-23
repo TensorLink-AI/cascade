@@ -38,8 +38,10 @@ import pytest
 
 from .helpers import (
     DAY,
+    FLOOR_WINDOWS,
     HOUSE_T,
     Chain,
+    W7cChain,
     boundary,
     canonical,
     digest,
@@ -104,7 +106,7 @@ def _binds(settlement, legacy: dict, path) -> None:
 
 
 def test_rev611_confirm_pending_against_the_current_king_is_crowned_on_its_first_clear(tmp_path):
-    chain = Chain(tmp_path)
+    chain = W7cChain(tmp_path)
     path = chain.state_path("legacy")
     legacy = _legacy_state(chain, path, king_matches=True)
     x = chain.x["digest"]
@@ -128,7 +130,7 @@ def test_rev611_confirm_pending_against_the_current_king_is_crowned_on_its_first
 
 
 def test_rev611_confirm_pending_against_another_king_returns_to_pending_floor(tmp_path):
-    chain = Chain(tmp_path)
+    chain = W7cChain(tmp_path)
     path = chain.state_path("legacy")
     legacy = _legacy_state(chain, path, king_matches=False)
     x = chain.x["digest"]
@@ -153,7 +155,7 @@ def test_rev611_confirm_pending_against_another_king_returns_to_pending_floor(tm
 def test_rev611_the_migration_is_deterministic(tmp_path, king_matches):
     """Two validators migrating the same legacy state give byte-identical
     states and equal receipts (consensus: external validators re-derive it)."""
-    chain = Chain(tmp_path)
+    chain = W7cChain(tmp_path)
     out = []
     for run in ("a", "b"):
         path = chain.state_path(run)
@@ -167,7 +169,7 @@ def test_rev611_the_migration_is_deterministic(tmp_path, king_matches):
 def test_rev611_a_fresh_state_never_carries_confirm_pending(tmp_path):
     """The new code never writes `confirm_pending`: a clean run's states and
     reports hold no such status at any boundary."""
-    chain = Chain(tmp_path)
+    chain = W7cChain(tmp_path)
     path = chain.state_path("clean")
     for n in (1, 2, 3):
         s = chain.settle(n, path)
@@ -180,11 +182,11 @@ def test_rev611_confirm_on_king_change_is_a_parsed_legacy_key(tmp_path):
     """`[lane_d] confirm_on_king_change` stays parsed (the shipped chain.toml
     carries it) and has no effect: it leaves the report's config echo, so
     both values give byte-identical reports, states and receipts."""
-    chain = Chain(tmp_path)
+    chain = W7cChain(tmp_path)
     out = {}
     for rule in ("restart", "original"):
         path = chain.state_path(f"rule-{rule}")
-        cfg = lane_d_cfg(confirm_on_king_change=rule)
+        cfg = lane_d_cfg(confirm_on_king_change=rule, min_windows=FLOOR_WINDOWS)
         out[rule] = [(sha(canonical({k: v for k, v in s.report.items() if k != "signature"})),
                       receipt_of(s), sha(path.read_bytes()))
                      for s in (chain.settle(n, path, cfg=cfg) for n in (1, 2, 3))]

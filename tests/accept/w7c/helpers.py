@@ -62,7 +62,8 @@ ERA = 3600
 SETTLEMENT = 900
 ARM_BLOCK = 2700 * ERA
 N_SNAPSHOTS = 3
-FLOOR_WINDOWS = 48          # two snapshots of 24 windows each
+FLOOR_WINDOWS = 48          # W7c's chains (rev6.11): two snapshots of 24 windows each
+BASE_FLOOR_WINDOWS = 24     # `lane_d_cfg()` default, kept for the W14 / W17 helpers
 
 
 def boundary(n: int) -> int:
@@ -121,15 +122,17 @@ def is_hex64(value) -> bool:
 
 
 def lane_d_cfg(**over):
-    """The real W2 parse of an armed `[lane_d]` table. Floors 48 windows / 4
-    sources (rev6.11: two snapshots' worth, so boundary 1 is a floor wait and
-    boundary 2 the first, crowning, verdict)."""
+    """The real W2 parse of an armed `[lane_d]` table. Default floors 24
+    windows / 4 sources (the W14 / W17 helpers build on it); W7c's own chain
+    passes `min_windows = FLOOR_WINDOWS` (48, rev6.11: two snapshots' worth,
+    so boundary 1 is a floor wait and boundary 2 the first, crowning,
+    verdict)."""
     from cascade.shared.config.lane_d import parse_lane_d
 
     raw = {"from_block": ARM_BLOCK, "share": 0.25, "takes_from": "lane_a",
            "remainder": "burn", "contexts": [4096, 8192, 16384], "horizon": HORIZON,
            "forward_margin_hours": MARGIN_H, "max_mirror_lag_hours": 6.0,
-           "min_windows": FLOOR_WINDOWS, "min_clusters": 4, "bootstrap_B": 200}
+           "min_windows": BASE_FLOOR_WINDOWS, "min_clusters": 4, "bootstrap_B": 200}
     return parse_lane_d({**raw, **over}, era_blocks_at=lambda _block: ERA)
 
 
@@ -335,9 +338,13 @@ class CountingForecasts(dict):
 
 class Chain:
     """The fixture chain. `pools_dir` holds the snapshots (written once and
-    shared by every run of a test); each run has its own state path."""
+    shared by every run of a test); each run has its own state path.
+    `min_windows` is the floor its default config uses (24, the W14 / W17
+    helpers' chain; W7c's own tests use `W7cChain`, 48)."""
 
-    def __init__(self, root: Path, pools_dir: Path | None = None):
+    def __init__(self, root: Path, pools_dir: Path | None = None, *,
+                 min_windows: int = BASE_FLOOR_WINDOWS):
+        self.min_windows = int(min_windows)
         self.root = Path(root)
         self.pools_dir = Path(pools_dir) if pools_dir is not None else self.root / "pools"
         self.records = [_snapshot_records(n) for n in range(1, N_SNAPSHOTS + 1)]
@@ -391,13 +398,24 @@ class Chain:
             kw.update(boundary_block_hash=block_hash(f"b{n}"), sentinel=None,
                       bench=SweepSession(session or f"w7c-sess-b{n}", host))
         fc = self.forecasts if forecasts is None else forecasts
-        return settle_lane_d(cfg=cfg if cfg is not None else lane_d_cfg(), boundary=boundary(n),
+        if cfg is None:
+            cfg = lane_d_cfg(min_windows=self.min_windows)
+        return settle_lane_d(cfg=cfg, boundary=boundary(n),
                              pool_dir=self.pools[n - 1], entries=[dict(self.x)],
                              house=dict(self.house), forecasts=fc, uid_of=dict(self.uid_of),
                              state_path=state_path, signer=self.signer, **kw)
 
     def run(self, state_path: Path, upto: int) -> list:
         return [self.settle(n, state_path) for n in range(1, upto + 1)]
+
+
+class W7cChain(Chain):
+    """W7c's own chain (README): floors 48 windows, so boundary 1 waits on
+    the floors and boundary 2 is X's first, crowning, verdict."""
+
+    def __init__(self, root: Path, pools_dir: Path | None = None, *,
+                 min_windows: int = FLOOR_WINDOWS):
+        super().__init__(root, pools_dir, min_windows=min_windows)
 
 
 def receipt_of(settlement):

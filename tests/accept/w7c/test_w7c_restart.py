@@ -23,6 +23,7 @@ from .helpers import (
     STATE_ERROR_CODES,
     Chain,
     CountingForecasts,
+    W7cChain,
     body_sha,
     boundary,
     chain_fingerprint,
@@ -63,7 +64,7 @@ def test_inv5_t11_crash_after_the_report_lands_recovers_to_the_clean_run(tmp_pat
                                                                        n):
     from cascade.validator.lane_d_state import load_report_file, report_path
 
-    chain = Chain(tmp_path)
+    chain = W7cChain(tmp_path)
     ref = _reference(chain)
     path = chain.state_path("crash")
     for k in range(1, n):
@@ -100,7 +101,7 @@ def test_inv5_t11_crash_before_the_report_lands_recovers_to_the_clean_run(tmp_pa
                                                                         n):
     from cascade.validator.lane_d_state import report_path
 
-    chain = Chain(tmp_path)
+    chain = W7cChain(tmp_path)
     ref = _reference(chain)
     path = chain.state_path("crash")
     for k in range(1, n):
@@ -122,7 +123,7 @@ def test_inv5_t11_crash_before_the_report_lands_recovers_to_the_clean_run(tmp_pa
 def test_inv5_t11_restart_after_a_settled_boundary_does_not_rescore(tmp_path):
     from cascade.validator.lane_d_state import report_path
 
-    chain = Chain(tmp_path)
+    chain = W7cChain(tmp_path)
     path = chain.state_path("run")
     s1 = chain.settle(1, path)
     s2 = chain.settle(2, path)
@@ -145,7 +146,7 @@ def test_inv5_t11_restart_after_a_settled_boundary_does_not_rescore(tmp_path):
 
 
 def test_inv5_t11_no_double_crown_across_repeated_restarts(tmp_path, monkeypatch):
-    chain = Chain(tmp_path)
+    chain = W7cChain(tmp_path)
     ref = _reference(chain)
     path = chain.state_path("run")
     chain.settle(1, path)
@@ -173,7 +174,7 @@ def test_inv5_t11_no_double_crown_across_repeated_restarts(tmp_path, monkeypatch
 def test_inv5_a_call_at_an_older_boundary_is_refused(tmp_path):
     from cascade.validator.lane_d_state import report_path
 
-    chain = Chain(tmp_path)
+    chain = W7cChain(tmp_path)
     path = chain.state_path("run")
     chain.settle(1, path)
     chain.settle(2, path)
@@ -202,7 +203,7 @@ def test_inv5_a_defective_persisted_report_is_refused(tmp_path, monkeypatch, pha
         codes = {code}
     from cascade.validator.lane_d_state import report_path
 
-    chain = Chain(tmp_path)
+    chain = W7cChain(tmp_path)
     path = chain.state_path("run")
     chain.settle(1, path)
     if phase == "pending":
@@ -235,7 +236,7 @@ def test_inv5_a_resigned_persisted_report_is_accepted_and_kept(tmp_path, monkeyp
     from cascade.validator.lane_d_report import sign_report
     from cascade.validator.lane_d_state import load_report_file, report_path
 
-    chain = Chain(tmp_path)
+    chain = W7cChain(tmp_path)
     ref = _reference(chain)
     path = chain.state_path("run")
     chain.settle(1, path)
@@ -259,7 +260,7 @@ def test_inv5_a_resigned_persisted_report_is_accepted_and_kept(tmp_path, monkeyp
 def test_inv5_two_clean_runs_are_byte_identical(tmp_path):
     from cascade.validator.lane_d_state import report_path
 
-    chain = Chain(tmp_path)
+    chain = W7cChain(tmp_path)
     a, b = chain.state_path("a"), chain.state_path("b")
     for n in (1, 2, 3):
         sa, sb = chain.settle(n, a), chain.settle(n, b)
@@ -273,14 +274,14 @@ def test_inv5_two_clean_runs_are_byte_identical(tmp_path):
 HASHSEED_SCRIPT = r"""
 import json, sys
 from pathlib import Path
-from tests.accept.w7c.helpers import Chain, chain_fingerprint
+from tests.accept.w7c.helpers import W7cChain as Chain, chain_fingerprint
 chain = Chain(Path(sys.argv[1]), pools_dir=Path(sys.argv[2]))
 print(json.dumps(chain_fingerprint(chain, chain.state_path("run"), 3), sort_keys=True))
 """
 
 
 def test_inv5_receipts_are_independent_of_the_hash_seed(tmp_path):
-    pools = Chain(tmp_path / "shared").pools_dir
+    pools = W7cChain(tmp_path / "shared").pools_dir
     outs = []
     for seed in ("0", "4242"):
         env = {"PYTHONPATH": str(REPO), "PYTHONHASHSEED": seed, "PATH": "/usr/bin:/bin",

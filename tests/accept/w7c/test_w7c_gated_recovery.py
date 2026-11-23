@@ -29,6 +29,7 @@ from .helpers import (
     STATE_ERROR_CODES,
     Chain,
     FlakyHost,
+    W7cChain,
     body_sha,
     boundary,
     chain_fingerprint,
@@ -101,7 +102,7 @@ RECOVERY_HOSTS = {
 def test_rv7_b1_recovery_adopts_the_persisted_crowning_report(tmp_path, monkeypatch, mode):
     from cascade.validator.lane_d_state import report_path
 
-    chain = Chain(tmp_path)
+    chain = W7cChain(tmp_path)
     ref = chain_fingerprint(chain, chain.state_path("ref"), 3)
     path = chain.state_path("crash")
     written, persisted = _crash_at_b2(chain, path, monkeypatch)
@@ -132,7 +133,7 @@ def test_rv7_b1_recovery_adopts_a_persisted_bench_hold(tmp_path, monkeypatch):
     validator whose pod now passes must not crown X at boundary(2): the
     persisted hold is the record. X is re-gated at boundary(3) as in the
     clean run."""
-    chain = Chain(tmp_path)
+    chain = W7cChain(tmp_path)
     ref_path = chain.state_path("ref-hold")
     ref = []
     for n in (1, 2, 3):
@@ -167,7 +168,7 @@ def test_rv7_b1_recovery_adopts_a_persisted_bench_hold(tmp_path, monkeypatch):
 RECOVERY_SCRIPT = r"""
 import json, sys
 from pathlib import Path
-from tests.accept.w7c.helpers import Chain, receipt_of
+from tests.accept.w7c.helpers import W7cChain as Chain, receipt_of
 chain = Chain(Path(sys.argv[1]))
 host = chain.passing_host(0.8)
 s = chain.settle(2, chain.state_path("crash"), host=host, session=sys.argv[2])
@@ -179,7 +180,7 @@ print(json.dumps({"receipt": receipt_of(s), "calls": len(host.calls),
 def test_rv7_b1_recovery_in_a_new_process(tmp_path, monkeypatch):
     """The restart is a new process with a new session and a bench that
     answers differently."""
-    chain = Chain(tmp_path)
+    chain = W7cChain(tmp_path)
     ref = chain_fingerprint(chain, chain.state_path("ref"), 3)
     path = chain.state_path("crash")
     _crash_at_b2(chain, path, monkeypatch)
@@ -202,7 +203,7 @@ def test_rv7_b1_every_report_binds_its_prior_state_digest_under_the_signature(tm
     as loaded, so the signed body carries it (at a path the implementer
     chooses; W7a freezes the top-level keys, so `extensions` is the open
     place)."""
-    chain = Chain(tmp_path)
+    chain = W7cChain(tmp_path)
     path = chain.state_path("run")
     for n in (1, 2, 3):
         s = chain.settle(n, path)
@@ -244,7 +245,7 @@ REFUSALS = {"foreign_signer": "report_unverified", "bad_signature": "report_unve
 def test_rv7_b1_an_unverified_persisted_report_is_refused(tmp_path, monkeypatch, defect):
     from cascade.validator.lane_d_state import report_path
 
-    chain = Chain(tmp_path)
+    chain = W7cChain(tmp_path)
     path = chain.state_path("crash")
     _, persisted = _crash_at_b2(chain, path, monkeypatch)
     prior = hashlib.sha256(path.read_bytes()).hexdigest()
