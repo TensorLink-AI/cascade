@@ -102,9 +102,10 @@ class Sidecar:
         self.calls: list[dict] = []
         self.fail = fail
 
-    def __call__(self, dirs, suites):
+    def __call__(self, dirs, suites, settings=None):
         dirs = [Path(d) for d in dirs]
-        self.calls.append({"dirs": dirs, "suites": tuple(suites)})
+        self.calls.append({"dirs": dirs, "suites": tuple(suites),
+                           "settings": None if settings is None else dict(settings)})
         if self.fail:
             return [None] * len(dirs)
         return [self.reports.get(self.digest_of_dir(d)) for d in dirs]
@@ -114,11 +115,36 @@ class Sidecar:
         return d.name.split("-c")[0]
 
 
-def request(digests, *, suites=SUITES, contexts=None, grants=None) -> dict:
+# The sidecar settings lane A's DEC-CA-0063 sweep uses (README "Sidecar
+# settings"), as the box sends them: distinct from every sidecar default so a
+# hard-coded value is caught.
+SETTINGS = {"num_samples": 37, "max_series": 11, "batch_size": 512, "workers": "3",
+            "data_dir": "/pinned/bench-data"}
+
+
+def request(digests, *, suites=SUITES, contexts=None, grants=None, settings=None) -> dict:
     ds = list(digests)
     return {"schema": REQUEST_SCHEMA, "digests": ds, "suites": list(suites),
             "contexts": dict(contexts) if contexts is not None else {d: 4096 for d in ds},
-            "grants": dict(grants) if grants is not None else {d: None for d in ds}}
+            "grants": dict(grants) if grants is not None else {d: None for d in ds},
+            "settings": dict(SETTINGS if settings is None else settings)}
+
+
+def lane_a_settings(cfg) -> dict:
+    """What lane A's ``_vbench_run_sidecar_many`` passes the sidecar
+    (``cascade/validator/validator_bench.py``), read from ``cfg.eval``."""
+    ec = cfg.eval
+    return {"num_samples": int(ec.benchmark_num_samples or ec.num_samples),
+            "max_series": int(ec.cascade_bench_max_series),
+            "batch_size": 512,
+            "workers": str(getattr(ec, "bench_workers", "1")),
+            "data_dir": ec.gift_gate_data_dir or None}
+
+
+def lane_a_timeout_per_checkpoint(cfg) -> int:
+    """Lane A's per-checkpoint sweep allowance (``_vbench_run_sidecar_many``)."""
+    ec = cfg.eval
+    return int(ec.bench_hold_max_hours * 3600) if ec.cascade_bench_max_series == 0 else 1800
 
 
 def grant(digest: str) -> dict:

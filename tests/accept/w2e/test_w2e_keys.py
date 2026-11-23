@@ -39,6 +39,18 @@ def test_w2e_max_windows_default_is_5000_not_2000(name):
 
 
 @pytest.mark.parametrize("name", SHIPPED)
+def test_w2e_backtest_cap_default_is_on_and_meets_the_inequality(name):
+    """Owner 2026-11-23: backtest_weight_cap defaults to 0.05 (ON at launch),
+    which the rev6.9 (a) check admits at the default floor and d_margin:
+    1 - 0.85 ** 0.05 ~ 0.0081 < 0.01."""
+    ld = load_ok(raw_with(name, drop=("backtest_weight_cap",))).lane_d
+    cap = field(ld, "backtest_weight_cap")
+    assert same(cap, 0.05), f"backtest_weight_cap default {cap!r}, owner says 0.05"
+    floor = float(field(ld, "backtest_ratio_floor"))
+    assert 1.0 - floor ** float(cap) < float(ld.d_margin)
+
+
+@pytest.mark.parametrize("name", SHIPPED)
 def test_w2e_forward_margin_hours_stays_6(name):
     """rev6.10 (a): "delay eval by 6 hours" is the existing default."""
     ld = load_ok(raw_with(name, drop=("forward_margin_hours",))).lane_d
