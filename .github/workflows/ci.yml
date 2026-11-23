@@ -115,7 +115,7 @@ jobs:
             list="$RUNNER_TEMP/unit-shard.txt"
             python3 scripts/ci_shard.py --shard "$SHARD" --of "$SHARDS" > "$list"
             echo "shard $SHARD/$SHARDS: $(wc -l < "$list") test files"
-            uv run --frozen pytest "@$list" "${opts[@]}" --durations=40 --durations-min=2
+            uv run --frozen pytest "@$list" "${opts[@]}" --durations=0 --durations-min=0
           fi
 
   # The required status check. It aggregates `lint` and every `unit` shard, and
