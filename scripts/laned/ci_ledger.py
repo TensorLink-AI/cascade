@@ -10,7 +10,7 @@ merged history as ``status/ci_runs.json`` on branch ``laned/build-state``
 
     ci_ledger.py record  --file F --wp W --mode M --event E --head-sha S
                          --conclusion C [--run-id N] [--evidence-sha BLOB]
-                         [--tests-tree TREE]
+                         [--tests-tree TREE] [--pr N]
     ci_ledger.py harvest --repo OWNER/NAME --out F [--root R]
                          [--ledger-ref origin/laned/build-state] [--artifact laned-results]
 
@@ -46,7 +46,8 @@ import lanedlib  # noqa: E402
 
 WORKFLOW = "laned-accept"
 LEDGER_PATH = "status/ci_runs.json"
-MODES = ("accept", "expect-fail", "verification", "tests-correction", "evidence", "check-pr", "gate")
+MODES = ("accept", "expect-fail", "verification", "tests-correction", "evidence", "check-pr", "gate",
+         "combined")
 CONCLUSIONS = ("success", "failure")
 
 
@@ -100,6 +101,10 @@ def cmd_record(args: argparse.Namespace) -> int:
         # tests/accept/<wp>/ the run checked (status
         # finds the merge commit on main by it, squash merges included)
         data["runs"][-1]["tests_tree"] = args.tests_tree
+    if args.pr is not None:
+        # pull_request runs (FEATURE rule, rev6.17): the board attributes the
+        # PR's squash merge `... (#N)` by it
+        data["runs"][-1]["pr"] = args.pr
     if args.run_id is not None:
         data["harvested_run_ids"].append(args.run_id)
     save(path, data)
@@ -288,6 +293,9 @@ def main(argv: list[str] | None = None) -> int:
     rec.add_argument("--evidence-sha", help="blob sha of the evidence/gate file the run verified")
     rec.add_argument("--tests-tree",
                      help="tests-only runs (verification, expect-fail): tree sha of tests/accept/<wp>/ the run checked")
+    rec.add_argument("--pr", type=int,
+                     help="pull_request runs: the PR number (status: its squash merge `(#N)` is the "
+                          "WP's L2 commit when the PR's last row for the WP is green, FEATURE rule)")
     har = sub.add_parser("harvest")
     har.add_argument("--repo", required=True)
     har.add_argument("--out", required=True)
