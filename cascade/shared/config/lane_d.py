@@ -71,8 +71,9 @@ class LaneDConfig:
     max_windows_per_settlement: int = 5000
     min_fresh_window_share: float = 0.5
     # W2e (rev6.9 (a)): slow-cadence backtest scoring weight cap (0 = off) and
-    # its ratio floor; cap > 0 needs 1 - floor ** cap < d_margin.
-    backtest_weight_cap: float = 0.0
+    # its ratio floor; cap > 0 needs 1 - floor ** cap < d_margin. Owner
+    # 2026-11-23: 0.05, ON at launch (1 - 0.85 ** 0.05 ~ 0.0081 < 0.01).
+    backtest_weight_cap: float = 0.05
     backtest_ratio_floor: float = 0.85
     # Rotating external-benchmark gate (§1.3b, D2b) and the A10 slice.
     gate_suites: tuple[str, ...] = LANE_D_GATE_SUITES
@@ -303,7 +304,7 @@ def parse_lane_d(raw: object, *, era_blocks_at: Callable[[int], int] | None = No
     fresh = _float(ld.get("min_fresh_window_share", 0.5), "min_fresh_window_share")
     if not 0.0 <= fresh <= 1.0:
         raise ValueError(f"[lane_d] min_fresh_window_share must be in [0, 1]; got {fresh!r}")
-    bt_cap = _float(ld.get("backtest_weight_cap", 0.0), "backtest_weight_cap")
+    bt_cap = _float(ld.get("backtest_weight_cap", 0.05), "backtest_weight_cap")
     if not 0.0 <= bt_cap < 1.0:
         raise ValueError(f"[lane_d] backtest_weight_cap must be in [0, 1); got {bt_cap!r}")
     bt_floor = _open_unit(ld.get("backtest_ratio_floor", 0.85), "backtest_ratio_floor")

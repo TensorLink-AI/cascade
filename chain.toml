@@ -1655,7 +1655,7 @@ bootstrap_B     = 10000
 embargo_hours   = 48.0           # W2e rev6.10 (a)/rev6.12 (a): per-series embargo top-up, every cadence (0 = the rev3 rule)
 max_windows_per_settlement = 5000  # W2e rev6.11 (a): per-bin draw cap; >= min_windows
 min_fresh_window_share = 0.5     # W2e rev6.12 (b): fresh share of a frozen set (1 = fresh only)
-backtest_weight_cap = 0.0        # W2e rev6.9: slow-cadence backtest weight cap (0 = off)
+backtest_weight_cap = 0.05       # W2e rev6.9: slow-cadence backtest weight cap (0 = off); owner 2026-11-23: ON at launch
 backtest_ratio_floor = 0.85      # W2e rev6.9 (a): cap > 0 needs 1 - floor**cap < d_margin
 gate_suites     = ["gift", "boom", "time", "fev"]  # §16 names
 gate_weights    = { gift = 1.0, boom = 1.0, time = 1.0, fev = 1.0 }  # D2b: equal (absent = equal over gate_suites)
