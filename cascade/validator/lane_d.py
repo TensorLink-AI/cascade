@@ -19,7 +19,7 @@ validator. Unarmed (``not cfg.active(boundary)``) it returns
    :func:`~cascade.validator.lane_d_forward.eligible_windows` admit for
    ``max(T_E, T_K)`` (both clocks after the bound, mirror lag, forecast
    products, present in S0, no backfill), excluding windows the entry was
-   already judged on (the confirmation set is disjoint), capped at
+   already judged on, capped at
    ``max_source_share`` with a drop seeded by the boundary, frozen at the
    floors (``min_windows``, ``min_clusters``). An unfrozen entry stays
    ``pending_floor``; nothing resets at an era boundary (T18). A cohort is
@@ -39,11 +39,13 @@ validator. Unarmed (``not cfg.active(boundary)``) it returns
    same way and on the same set, against the current house, and clears only
    if it clears both (Proposed change 3: the house ranks first on ties, so a
    copy of the house never clears); the house's rows sit next to the king's.
-   A first clear goes ``confirm_pending`` and must clear again on a
-   disjoint set (D20 ``confirm_on_king_change``) before it is crowned;
+   rev6.11 (b): there is no confirmation duel. A first clear is the crowning
+   candidate and is crowned at that settlement when it passes A10 and the
+   §1.3b gate (``confirm_on_king_change`` is a legacy key, parsed and
+   ignored; there is no D20 king-change rule);
 5a. runs the §1.3b A10 low-frequency non-inferiority check (W3b5,
-   :mod:`~cascade.validator.lane_d_lowfreq`) on EVERY verdict that cleared at
-   stage ``confirm``, whatever the gate draw: the slice is the newest
+   :mod:`~cascade.validator.lane_d_lowfreq`) on EVERY verdict that cleared,
+   whatever the gate draw: the slice is the newest
    snapshot's windows whose ``freq`` is in ``lowfreq_freqs`` (the private
    pool, not the forward-only set, §1.7), and the candidate's paired CRPS and
    MASE ``LCB_α`` against the verdict's KING_D and the house must each be
@@ -52,8 +54,8 @@ validator. Unarmed (``not cfg.active(boundary)``) it returns
    ``no_windows`` (an empty slice) never blocks. The verdict's ``lowfreq``
    block carries the four LCBs for ``pass``/``fail``;
 5b. gates the crowning candidates (W5e, §1.3b): every verdict that cleared
-   at stage ``confirm`` and did not fail A10, plus every entry still holding a cleared
-   confirmation the gate could not decide (``bench_hold``), is swept with
+   and did not fail A10, plus every entry still holding a first clear the
+   gate could not decide (``bench_hold``, status ``hold``), is swept with
    KING_D and the house in the settlement's ``bench`` session on the ONE
    suite drawn from ``boundary_block_hash``
    (:func:`~cascade.validator.lane_d_gate.gate_record`; the era's
@@ -95,10 +97,9 @@ W5f (§1.4 "The house", §2 items 1-2, T10) is the house's entry and refresh:
 - a new house while a miner holds KING_D is the second bar of every miner
   cohort from that boundary AND enters as a challenger
   (``lane_d_state.HOUSE_ENTRY_KEY``): judged forward-only against KING_D in
-  its own cohort (``members == [house]``, no ``house_digest``), first clear
-  then the mandatory confirmation on a disjoint set, A10 and the §1.3b gate
-  (swept with KING_D as its only anchor: the house reference is itself). A
-  confirmed, passing house retakes KING_D: the dethroned miner king becomes
+  its own cohort (``members == [house]``, no ``house_digest``), first clear,
+  A10 and the §1.3b gate (swept with KING_D as its only anchor: the house
+  reference is itself). A cleared, passing house retakes KING_D: the dethroned miner king becomes
   the newest prior king, the slot burns (``house_king``) and ``crowned``
   stays null (a retake is not a miner crowning). A weaker house loses and
   is never in the court or a prior king. An open miner entry whose digest
@@ -192,7 +193,7 @@ from .lane_d_state import (
 )
 
 POOL_SCHEMA = "pool_d/1"
-OPEN_STATUSES = ("pending", "confirm_pending")
+OPEN_STATUSES = ("pending", "hold")
 
 
 @dataclass(frozen=True)
@@ -399,17 +400,6 @@ def _close_house_copies(state: dict, skipped: list[dict]) -> None:
         skipped.append({"digest": str(state["house"]["digest"]), "reason": "duplicate_digest"})
 
 
-def _comparison_king(rec: dict, state: dict, cfg) -> tuple[str, str]:
-    """(stage, king digest) a member is judged against (D20)."""
-    conf = rec.get("confirm")
-    if rec["status"] == "confirm_pending" and conf:
-        if conf["king_digest"] == state["king"]["digest"]:
-            return "confirm", state["king"]["digest"]
-        if cfg.confirm_on_king_change == "original":
-            return "confirm", conf["king_digest"]
-    return "first", state["king"]["digest"]
-
-
 def _king_reveal_ts(state: dict, digest: str) -> int | None:
     if state["king"]["digest"] == digest:
         return int(state["king"]["reveal_ts"])
@@ -421,39 +411,27 @@ def _king_reveal_ts(state: dict, digest: str) -> int | None:
     return None
 
 
-def _confirm_king_ts(recs: dict[str, dict], members: list[str], digest: str) -> int | None:
-    """D20 ``"original"``: the reveal time of a first-clear king the state no
-    longer knows (not the king, the house or a prior king), from the
-    ``confirm`` record of a member that first-cleared against it."""
-    for m in sorted(members):
-        conf = recs[m].get("confirm") or {}
-        ts = conf.get("king_reveal_ts")
-        if conf.get("king_digest") == digest and isinstance(ts, int) and not isinstance(ts, bool):
-            return int(ts)
-    return None
-
-
 # ── the §1.3b gate (W5e) ────────────────────────────────────────────────────
 
 
-def _held_candidates(state: dict, cfg) -> list[str]:
-    """The open entries holding a cleared confirmation the gate could not
-    decide (``gate_hold``, a ``bench_hold``). They are re-gated without a new
-    duel. If KING_D changed since the hold, D20 decides: ``"original"`` keeps
-    the hold; ``"restart"`` drops it and the entry restarts at stage
-    ``first`` (its windows stay used)."""
-    return [dg for dg, rec in sorted(state["entries"].items()) if _keeps_hold(rec, state, cfg)]
+def _held_candidates(state: dict) -> list[str]:
+    """The open entries holding a first clear the gate could not decide
+    (``gate_hold``, a ``bench_hold``). They are re-gated without a new duel.
+    A clear held against a KING_D that has since changed is dropped (no D20
+    rule, rev6.11 (b)): the entry is judged afresh against the new king (its
+    windows stay used)."""
+    return [dg for dg, rec in sorted(state["entries"].items()) if _keeps_hold(rec, state)]
 
 
-def _keeps_hold(rec: dict, state: dict, cfg) -> bool:
+def _keeps_hold(rec: dict, state: dict) -> bool:
     """Is ``rec`` (a miner entry or the house entry) an open holder of a
     ``gate_hold`` that is re-gated this settlement (see
-    :func:`_held_candidates`)? A hold D20 ``"restart"`` drops is dropped here."""
+    :func:`_held_candidates`)? A hold taken under another KING_D is dropped
+    here."""
     hold = rec.get("gate_hold")
     if rec["status"] not in OPEN_STATUSES or not hold:
         return False
-    if (hold["king_d"] != state["king"]["digest"]
-            and cfg.confirm_on_king_change != "original"):
+    if hold["king_d"] != state["king"]["digest"]:
         rec.pop("gate_hold")
         rec.update(status="pending", reason="pending_floor", confirm=None, frozen_set=None)
         return False
@@ -685,7 +663,6 @@ def _params(cfg) -> dict:
             "d_margin": float(cfg.d_margin), "alpha": float(cfg.alpha),
             "bootstrap_B": int(cfg.bootstrap_B), "king_decay": float(cfg.king_decay),
             "reward_prior_kings": int(cfg.reward_prior_kings),
-            "confirm_on_king_change": str(cfg.confirm_on_king_change),
             "max_entries_per_settlement": int(cfg.max_entries_per_settlement),
             "max_judged_per_coldkey_per_settlement":
                 int(cfg.max_judged_per_coldkey_per_settlement),
@@ -722,7 +699,7 @@ def _pool_record(pools: list[dict], windows_out: dict) -> dict:
 
 def _not_candidate(cfg) -> dict:
     """The ``lowfreq`` block of a verdict that is not a crowning candidate
-    (a first clear or a loser): never checked by A10."""
+    (a loser): never checked by A10."""
     return {"result": "not_candidate", "freqs": [str(f) for f in cfg.lowfreq_freqs],
             "n_windows": 0, "tau_public": float(cfg.tau_public)}
 
@@ -907,12 +884,12 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
         house_open = False
     else:
         # A held gate candidate is re-gated, never re-duelled (W5e).
-        held = _held_candidates(state, cfg)
+        held = _held_candidates(state)
         # W5h (lane_d_queue): the reveal-delay close, the coldkey re-check
         # at reveal, then FIFO by T under the caps.
         chosen, queued = select_queue(state, cfg, boundary, entries, frozenset(held))
         skipped += queued
-        house_held = house_open and _keeps_hold(house_rec, state, cfg)
+        house_held = house_open and _keeps_hold(house_rec, state)
 
     # A member whose forecasts are malformed on any pool window is the miner's fault
     # (the house's own: its entry closes, fail closed).
@@ -929,23 +906,17 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
             skip(hd, "checkpoint_fault", house_rec)
             house_open = False
 
-    groups: dict[tuple[str, str], list[str]] = {}
-    for dg in chosen:
-        stage, kd = _comparison_king(state["entries"][dg], state, cfg)
-        if stage == "first" and state["entries"][dg]["status"] == "confirm_pending":
-            state["entries"][dg].update(status="pending", reason="pending_floor", confirm=None,
-                                        frozen_set=None)
-        groups.setdefault((kd, stage), []).append(dg)
-    # The miner cohorts, then the house challenger in its own cohort against
-    # KING_D (§2 item 2): the house is never its own second bar.
-    jobs = [(kd, stage, members, {m: state["entries"][m] for m in members}, False)
-            for (kd, stage), members in sorted(groups.items())]
+    # rev6.11 (b): every member is judged at its first (and only) verdict
+    # against the current KING_D: one miner cohort, then the house challenger
+    # in its own cohort against KING_D (§2 item 2): the house is never its own
+    # second bar.
+    kd0 = str(state["king"]["digest"])
+    jobs = []
+    if chosen:
+        jobs.append((kd0, "first", list(chosen),
+                     {m: state["entries"][m] for m in chosen}, False))
     if house_open and not house_held and not state["king"].get("house"):
-        stage, kd = _comparison_king(house_rec, state, cfg)
-        if stage == "first" and house_rec["status"] == "confirm_pending":
-            house_rec.update(status="pending", reason="pending_floor", confirm=None,
-                             frozen_set=None)
-        jobs.append((kd, stage, [hd], {hd: house_rec}, True))
+        jobs.append((kd0, "first", [hd], {hd: house_rec}, True))
 
     # RV4: each judged window is scored from ONE snapshot's version; the
     # report names that snapshot (``windows[].snapshot_sha256``) and lists
@@ -953,17 +924,13 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     # snapshot each already-judged window was scored from.
     pinned: dict[str, str] = {}
     rows, windows_out, cohorts, verdicts = [], {}, [], []
-    # The crowning candidates: verdicts that clear at stage ``confirm``.
+    # The crowning candidates: first verdicts that clear (rev6.11 (b)).
     candidates: list[dict] = []
     # §1.3b A10: the newest private-pool snapshot's low-frequency windows
     # (not the forward-only frozen set, §1.7), the same for every candidate.
     lf_slice = lowfreq_windows(pool, cfg)
     for kd, stage, members, recs, is_house in jobs:
         king_ts = _king_reveal_ts(state, kd)
-        if king_ts is None and stage == "confirm":
-            # D20 "original" after a king change: the first-clear king's T
-            # comes from the confirm record (not king_unscored).
-            king_ts = _confirm_king_ts(recs, members, kd)
         # Change 3: when a miner holds KING_D, the current house is a second
         # bar on the same set (a copy of a fresh house must not win). Its
         # forecasts are required: a house that cannot be scored fails closed.
@@ -1045,47 +1012,33 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
         for m, r in zip(members, res, strict=True):
             rec = recs[m]
             rec["used_windows"] = sorted(set(rec["used_windows"]) | {w["window_id"] for w in ws})
-            first = rec.get("confirm") if stage == "confirm" else None
-            confirmation = {"stage": stage, "rule": str(cfg.confirm_on_king_change),
-                            "first_set_sha256": first["first_set_sha256"] if first else None,
-                            "first_king_digest": first["king_digest"] if first else None}
-            # W3b5 (A10): every crowning candidate is checked on the private
-            # pool's low-frequency slice before the gate; first clears and
+            # W3b5 (A10): every crowning candidate (a first clear) is checked
+            # on the private pool's low-frequency slice before the gate;
             # losers are not candidates.
             lowfreq = (lowfreq_check(lf_slice, forecasts, candidate=m, king_d=kd, house=hd,
                                      cfg=cfg, seed=seed)
-                       if r["cleared"] and stage == "confirm" else _not_candidate(cfg))
+                       if r["cleared"] else _not_candidate(cfg))
             if not r["cleared"]:
                 outcome = "lost"
-                rec.update(status="lost",
-                           reason="lost_confirmation" if stage == "confirm" else "lost_duel")
-            elif stage == "first":
-                outcome = "confirm_pending"
-                # The confirmation accumulates a fresh set, disjoint from
-                # ``used_windows`` (D20).
-                rec.update(status="confirm_pending", reason="confirm_pending",
-                           confirm={"first_set_sha256": set_sha, "king_digest": kd,
-                                    "king_reveal_ts": int(king_ts),
-                                    "rule": str(cfg.confirm_on_king_change),
-                                    "boundary": boundary},
-                           frozen_set=None)
+                rec.update(status="lost", reason="lost_duel")
             elif lowfreq["result"] == "fail":
                 # A10 failed: a judged, final loss; never swept by the gate.
                 outcome = "lost"
                 rec.update(status="lost", reason="lowfreq_regression")
             else:
                 # A crowning candidate (A10 pass or no_windows): crowned
-                # only through the §1.3b gate.
-                outcome = "confirmed"
+                # only through the §1.3b gate (``crowned`` below), else it
+                # stays ``cleared`` (held, or a passing non-best).
+                outcome = "cleared"
                 candidates.append({"digest": m, "lcb": float(r["lcb"]),
                                    "reveal_ts": int(rec["reveal_ts"]), "set_sha256": set_sha,
                                    "house": is_house})
             verdicts.append({"digest": m, "king_digest": kd, "stage": stage,
                              "cohort": len(cohorts) - 1, **r, "outcome": outcome,
-                             "confirmation": confirmation, "lowfreq": lowfreq})
+                             "lowfreq": lowfreq})
 
-    # Held candidates (an earlier bench_hold) are re-gated with the clear
-    # they confirmed, without a duel: no rows, no verdict this settlement.
+    # Held candidates (an earlier bench_hold) are re-gated with their first
+    # clear, without a duel: no rows, no verdict this settlement.
     held_recs = [(dg, state["entries"][dg], False) for dg in held]
     if house_held:
         held_recs.append((hd, house_rec, True))
@@ -1123,8 +1076,8 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
             # charged. W5g (§10.4): the consecutive holds of one held clear
             # are counted in its ``gate_hold`` record (state, restart-safe).
             # Holds 1..max_bench_holds keep the clear (an existing hold keeps
-            # its first record); the next one re-queues the entry unjudged:
-            # ``pending`` / ``bench_hold``, the clear and its first clear
+            # its first record) with status ``hold``; the next one re-queues
+            # the entry unjudged: ``pending`` / ``bench_hold``, the clear
             # dropped, judged afresh on the next fresh windows.
             prev = rec.get("gate_hold")
             holds = (int(prev.get("holds", 1)) if prev else 0) + 1
@@ -1135,7 +1088,7 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
                 rec["gate_hold"] = {**(prev or {
                     "boundary": boundary, "king_d": str(state["king"]["digest"]),
                     "lcb": c["lcb"], "set_sha256": c["set_sha256"]}), "holds": holds}
-                rec["status"] = "confirm_pending"
+                rec["status"] = "hold"
             reason = "bench_hold"
         else:
             rec.pop("gate_hold", None)
