@@ -68,7 +68,7 @@ def test_prefetch_hit_makes_no_request(tmp_path, vault):
 @pytest.mark.parametrize("case", ["extra_file", "object_contradicts_manifest", "edited_model_py"])
 def test_prefetch_refused_by_ingest_admits_nothing(tmp_path, vault, case):
     from cascade.eval.lane_d_cache import prefetch_grant
-
+    # isort: split
     from cascade.eval.lane_d_ingest import IngestError
 
     files = fixture_checkpoint()

@@ -1,0 +1,19 @@
+# W5h queue selection (plan rev6 §1.2 "Rate limits" / "Enforcement" /
+# "Coldkey resolution", §1.5 "State" (A8, A9, B8, B10), §3.0 W5h row, T6b,
+# T18b; README.md has the contract).
+# NEW: the queue selection settle_lane_d calls (FIFO by T, the global and
+# per-coldkey caps, the coldkey re-check at reveal, the coldkey_unresolved
+# bound, the max_reveal_delay_days close). The W5h reason literals live HERE,
+# not in lane_d.py (README "Where the code lives": W5g's emitted-reason scan).
+cascade/validator/lane_d_queue.py
+# settle_lane_d: call the queue selection; registration of the re-check field.
+cascade/validator/lane_d.py
+# the per-entry record of the re-check / the unresolved count, if the state
+# module validates entry records.
+cascade/validator/lane_d_state.py
+# report enums and the schema file, only if a reason or record must change.
+cascade/validator/lane_d_report.py
+cascade/validator/schemas/lane_d_report_1.json
+# the satellites' re-derivation of the judged set (W9), only if it must learn
+# a W5h rule (an open coldkey_unresolved entry is not a selection candidate).
+cascade/audit/lane_d.py

@@ -13,3 +13,10 @@
 # context equivalence over cascade/eval/lane_d_scorer.py, which W5d built);
 # W0b has no implementation of its own (RV5).
 W0b
+#
+# WB16: D40 was decided option (a) (plan decision table, 2026-11-21): the
+# frozen router path IS today's backend, so the plan's WB16 row has no
+# implementation of its own; its acceptance tests (tests/accept/wb16/, PR
+# #699) pass on code already on main (ExpertSlices / merge_expert_slices /
+# worker.py), exactly like W0b.
+WB16
