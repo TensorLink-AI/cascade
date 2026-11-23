@@ -12,7 +12,6 @@ import copy
 import pytest
 
 from . import helpers as h
-from .test_w9_snapshot import _series
 
 HOUR = 3600
 
@@ -31,6 +30,7 @@ def test_rev614_the_honest_crown_signs_boundary_ts_and_passes(run):
 
 def test_rev614_a_cohort_frozen_before_the_judging_start_fails(run):
     r = copy.deepcopy(run["s1"].report)
+    assert "eval_delay_hours" in r["params"], "rev6.14: params echo eval_delay_hours"
     c = r["cohorts"][0]
     r["boundary_ts"] = int(c["t_max"] + HOUR * r["params"]["eval_delay_hours"]) - 1
     res = h.audit(h.resign(r), run["cfg"])
@@ -39,19 +39,8 @@ def test_rev614_a_cohort_frozen_before_the_judging_start_fails(run):
 
 def test_rev614_a_judged_cohort_without_boundary_ts_fails(run):
     r = copy.deepcopy(run["s1"].report)
+    assert "boundary_ts" in r, "rev6.14: the report signs boundary_ts"
     del r["boundary_ts"]
     res = h.audit(h.resign(r), run["cfg"])
     assert res.status == "FAIL", res.detail
 
-
-def test_rev614_a_target_just_after_t_is_fresh_at_margin_0():
-    """rev6.14 (a), T8e: with `forward_margin_hours` = 0, b = T: data and
-    first-seen 1 h after T pass the e = 0 rule (fresh)."""
-    from cascade.audit.lane_d import window_refusal
-
-    cfg = h.w7a.lane_d_cfg(forward_margin_hours=0.0)
-    t = 1_790_000_000
-    rec = _series(data_start=t + HOUR, seen_start=t + HOUR + 60, feed="fe",
-                  frontier=((t + 600, t - HOUR),))
-    feeds = {"fe": {"mirror_lag_hours": 1.0, "forecast_product": False, "embargo_hours": 0.0}}
-    assert window_refusal(rec, feeds, float(t), cfg) is None

@@ -279,15 +279,28 @@ class Inputs:
               "entries": ([dict(e) for e in self.entries]
                           if int(boundary) >= self.listed_from else []),
               "forecasts": chain["forecasts"][snap], "uid_of": dict(self.fx["uid_of"]),
-              "house": dict(chain["house"]),
-              # rev6.14 (a): the boundary block's on-chain timestamp (fixture clock).
-              "boundary_ts": boundary_ts(boundary)}
+              "house": dict(chain["house"])}
+        if takes_boundary_ts():
+            # rev6.14 (a): the boundary block's on-chain timestamp (fixture clock).
+            kw["boundary_ts"] = boundary_ts(boundary)
         if self.raw:
             return SimpleNamespace(**kw)
         return wiring().LaneDInputs(**kw)
 
 
 # ── fixtures ────────────────────────────────────────────────────────────────
+
+
+def takes_boundary_ts() -> bool:
+    """rev6.14 (a): whether the code under test takes the boundary timestamp
+    (so the same fixtures also run on a base without it)."""
+    import dataclasses
+    import inspect
+
+    from cascade.validator.lane_d import settle_lane_d
+
+    return ("boundary_ts" in inspect.signature(settle_lane_d).parameters
+            and "boundary_ts" in {f.name for f in dataclasses.fields(wiring().LaneDInputs)})
 
 
 def boundary_ts(boundary) -> int:
@@ -388,7 +401,8 @@ class Oracle:
         inp = self.inputs(boundary)
         session = SweepSession(session_id(boundary), self.host)
         prior = self.receipts[-1]["posterior_state_sha256"] if self.receipts else None
-        s = settle_lane_d(boundary_ts=inp.boundary_ts, cfg=self.cfg.lane_d, boundary=int(boundary), pool_dir=inp.pool_dir,
+        ts_kw = ({"boundary_ts": inp.boundary_ts} if takes_boundary_ts() else {})
+        s = settle_lane_d(**ts_kw, cfg=self.cfg.lane_d, boundary=int(boundary), pool_dir=inp.pool_dir,
                           entries=inp.entries, house=inp.house, forecasts=inp.forecasts,
                           uid_of=inp.uid_of, state_path=self.state_path, signer=signer(),
                           prior_pool_dirs=inp.prior_pool_dirs, expect_prior_sha256=prior,

@@ -14,11 +14,13 @@ from . import helpers as h
 def test_the_source_hands_the_boundary_block_timestamp(tmp_path):
     rig = h.Rig(tmp_path / "w8c")
     got = rig.source(h.B1)
+    assert hasattr(got, "boundary_ts"), "rev6.14: LaneDInputs carries boundary_ts"
     assert got.boundary_ts == int(rig.reader.block_timestamp(h.B1))
     assert isinstance(got.boundary_ts, int)
 
 
 def test_an_unreadable_boundary_timestamp_is_refused(tmp_path):
+    assert "boundary_ts_unreadable" in h.inputs_mod().INPUTS_ERROR_CODES
     rig = h.Rig(tmp_path / "w8c")
     real = rig.reader.block_timestamp
 
@@ -44,4 +46,5 @@ def test_the_settlement_signs_the_sources_boundary_ts(tmp_path):
     from cascade.validator.lane_d_wiring import report_key
 
     rep = json.loads(store.objects[report_key(h.B1)])
+    assert "boundary_ts" in rep, "rev6.14: the report signs boundary_ts"
     assert rep["boundary_ts"] == int(rig.reader.block_timestamp(h.B1))

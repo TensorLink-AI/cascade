@@ -99,7 +99,7 @@ def _settle(cfg, pool_dir, fc, e, h, state_path, prior=()):
     from cascade.validator.lane_d import settle_lane_d
 
     kw = {"prior_pool_dirs": [Path(p) for p in prior]} if prior else {}
-    return settle_lane_d(boundary_ts=2_000_000_000 + 12 * int(BOUNDARY_1), cfg=cfg, boundary=BOUNDARY_1, pool_dir=pool_dir,
+    return settle_lane_d(**_rev614_ts(settle_lane_d, BOUNDARY_1), cfg=cfg, boundary=BOUNDARY_1, pool_dir=pool_dir,
                          entries=[dict(e)], house=dict(h), forecasts=fc,
                          uid_of={e["hotkey"]: CHALLENGER_UID}, state_path=state_path,
                          signer=fixture_key("signer"), **kw)
@@ -245,3 +245,14 @@ def test_report_names_the_admitting_snapshot_of_a_two_version_window(tmp_path):
     fc = forecasts(recs, [e["digest"]], h["digest"])
     rep = _settle(cfg, pb, fc, e, h, tmp_path / "state.json", prior=[pa]).report
     _assert_pool_names(rep, [la, lb], {w: la["sha256"] for w in wids(recs)})
+
+
+def _rev614_ts(settle, boundary) -> dict:
+    """rev6.14 (a): the fixture's on-chain boundary timestamp (far after every
+    fixture T + eval_delay_hours, 12 s per block), passed only where
+    ``settle_lane_d`` takes it."""
+    import inspect
+
+    if "boundary_ts" not in inspect.signature(settle).parameters:
+        return {}
+    return {"boundary_ts": 2_000_000_000 + 12 * int(boundary)}

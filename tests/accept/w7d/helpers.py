@@ -397,7 +397,7 @@ class Chain:
             kw.update(boundary_block_hash=block_hash(f"b{n}"), sentinel=None,
                       bench=SweepSession(f"w7d-sess-b{n}", host))
         b = boundary(n)
-        s = settle_lane_d(boundary_ts=2_000_000_000 + 12 * int(b), cfg=self.cfg, boundary=b, pool_dir=self.pools[n - 1],
+        s = settle_lane_d(**_rev614_ts(settle_lane_d, b), cfg=self.cfg, boundary=b, pool_dir=self.pools[n - 1],
                           entries=[dict(e) for e in entries],
                           house=dict(house if house is not None else self.h0),
                           forecasts=self.forecasts, uid_of=dict(self.uids),
@@ -715,3 +715,14 @@ def court_shares(cfg, court: list[dict]) -> list[tuple[str, int | None, float]]:
     total = sum(raw)
     return [(s["digest"], s["uid"], float(cfg.share) * w / total)
             for s, w in zip(court, raw, strict=True)]
+
+
+def _rev614_ts(settle, boundary) -> dict:
+    """rev6.14 (a): the fixture's on-chain boundary timestamp (far after every
+    fixture T + eval_delay_hours, 12 s per block), passed only where
+    ``settle_lane_d`` takes it."""
+    import inspect
+
+    if "boundary_ts" not in inspect.signature(settle).parameters:
+        return {}
+    return {"boundary_ts": 2_000_000_000 + 12 * int(boundary)}

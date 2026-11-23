@@ -258,7 +258,11 @@ def settle(cfg, b, pool_dir, entries, house_rec, fc, uid_of, state_path, *,
         kw["armed"] = armed
     if boundary_ts is _FIXTURE_CLOCK:
         boundary_ts = fixture_boundary_ts(b)
-    return settle_lane_d(boundary_ts=boundary_ts, cfg=cfg, boundary=b, pool_dir=pool_dir,
+    import inspect
+
+    if "boundary_ts" in inspect.signature(settle_lane_d).parameters:
+        kw["boundary_ts"] = boundary_ts
+    return settle_lane_d(cfg=cfg, boundary=b, pool_dir=pool_dir,
                          entries=[dict(e) for e in entries], house=dict(house_rec),
                          forecasts=fc, uid_of=dict(uid_of), state_path=state_path,
                          signer=fixture_key("signer"), boundary_block_hash=hash_,

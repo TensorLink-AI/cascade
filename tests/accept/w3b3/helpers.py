@@ -189,7 +189,7 @@ def _settle(cfg, boundary, pool_dir, entries, fc, state_path, prior=()):
 
     kw = {"prior_pool_dirs": [Path(p) for p in prior]} if prior else {}
     kw.update(gate_inputs(boundary, H0["digest"]))
-    return settle_lane_d(boundary_ts=2_000_000_000 + 12 * int(boundary), cfg=cfg, boundary=boundary, pool_dir=pool_dir,
+    return settle_lane_d(**_rev614_ts(settle_lane_d, boundary), cfg=cfg, boundary=boundary, pool_dir=pool_dir,
                          entries=[dict(e) for e in entries], house=dict(H0),
                          forecasts=fc, uid_of=_uids(*entries), state_path=state_path,
                          signer=fixture_key("signer"), **kw)
@@ -484,3 +484,14 @@ def gate_inputs(boundary, house_digest: str) -> dict:
 
         kw["bench"] = SweepSession(f"w3b3-sess-{int(boundary)}", HealthyBench(house_digest))
     return kw
+
+
+def _rev614_ts(settle, boundary) -> dict:
+    """rev6.14 (a): the fixture's on-chain boundary timestamp (far after every
+    fixture T + eval_delay_hours, 12 s per block), passed only where
+    ``settle_lane_d`` takes it."""
+    import inspect
+
+    if "boundary_ts" not in inspect.signature(settle).parameters:
+        return {}
+    return {"boundary_ts": 2_000_000_000 + 12 * int(boundary)}

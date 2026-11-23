@@ -69,7 +69,7 @@ def _settle(cfg, boundary, pool_dir, entries, house, forecasts, uid_of, state_pa
     (`helpers.gate_inputs`): the e2e skeleton crowns at BOUNDARY_2."""
     from cascade.validator.lane_d import settle_lane_d
 
-    return settle_lane_d(boundary_ts=2_000_000_000 + 12 * int(boundary), cfg=cfg, boundary=boundary, pool_dir=pool_dir,
+    return settle_lane_d(**_rev614_ts(settle_lane_d, boundary), cfg=cfg, boundary=boundary, pool_dir=pool_dir,
                          entries=[dict(e) for e in entries], house=dict(house),
                          forecasts=forecasts, uid_of=dict(uid_of), state_path=state_path,
                          signer=fixture_key("signer"),
@@ -264,3 +264,14 @@ def test_e2e_skeleton_refuses_trap_windows_and_still_pays_the_challenger(tmp_pat
     vec = lane_d_vector(N_UIDS, share=s2.pay["share"], court_uids=s2.pay["court_uids"],
                         king_decay=cfg.king_decay, burn_uid=0)
     assert vec[CHALLENGER_UID] > 0.0
+
+
+def _rev614_ts(settle, boundary) -> dict:
+    """rev6.14 (a): the fixture's on-chain boundary timestamp (far after every
+    fixture T + eval_delay_hours, 12 s per block), passed only where
+    ``settle_lane_d`` takes it."""
+    import inspect
+
+    if "boundary_ts" not in inspect.signature(settle).parameters:
+        return {}
+    return {"boundary_ts": 2_000_000_000 + 12 * int(boundary)}

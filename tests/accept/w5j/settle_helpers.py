@@ -125,7 +125,7 @@ def house() -> dict:
 def settle(cfg, boundary, pool_dir, entries, house_rec, fc, uid_of, state_path, block_hash):
     from cascade.validator.lane_d import settle_lane_d
 
-    return settle_lane_d(boundary_ts=2_000_000_000 + 12 * int(boundary), cfg=cfg, boundary=boundary, pool_dir=pool_dir,
+    return settle_lane_d(**_rev614_ts(settle_lane_d, boundary), cfg=cfg, boundary=boundary, pool_dir=pool_dir,
                          entries=[dict(e) for e in entries], house=dict(house_rec),
                          forecasts=fc, uid_of=dict(uid_of), state_path=state_path,
                          signer=fixture_key("signer"), boundary_block_hash=block_hash)
@@ -138,3 +138,14 @@ def draw_cells(recs: list[dict]) -> list[dict]:
                 "eligible": [True] * HORIZON, "e0": [True] * HORIZON} for r in recs]
     return [{"timeframe": "H", "bin": "forward", "kind": "forward",
              "h_lo": HORIZON, "h_hi": HORIZON, "series": members}]
+
+
+def _rev614_ts(settle, boundary) -> dict:
+    """rev6.14 (a): the fixture's on-chain boundary timestamp (far after every
+    fixture T + eval_delay_hours, 12 s per block), passed only where
+    ``settle_lane_d`` takes it."""
+    import inspect
+
+    if "boundary_ts" not in inspect.signature(settle).parameters:
+        return {}
+    return {"boundary_ts": 2_000_000_000 + 12 * int(boundary)}

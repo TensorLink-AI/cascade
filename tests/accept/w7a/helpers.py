@@ -391,7 +391,7 @@ def settle(chain: dict, cfg, state_path: Path, signer, *, boundary: int, snap: i
     `gate_inputs`): `two_settlements` crowns at BOUNDARY_2."""
     from cascade.validator.lane_d import settle_lane_d
 
-    return settle_lane_d(boundary_ts=2_000_000_000 + 12 * int(boundary), cfg=cfg, boundary=boundary, pool_dir=chain["pools"][snap],
+    return settle_lane_d(**_rev614_ts(settle_lane_d, boundary), cfg=cfg, boundary=boundary, pool_dir=chain["pools"][snap],
                          entries=[dict(e) for e in entries], house=dict(chain["house"]),
                          forecasts=chain["forecasts"][snap], uid_of=dict(uid_of),
                          state_path=state_path, signer=signer,
@@ -652,3 +652,14 @@ def with_embargo_fields(report: dict, *, embargo_windows: int = 0) -> dict:
                              "\n".join(sorted(c["window_ids"])).encode()).hexdigest()}
                         for c in out["cohorts"]]}
     return out
+
+
+def _rev614_ts(settle, boundary) -> dict:
+    """rev6.14 (a): the fixture's on-chain boundary timestamp (far after every
+    fixture T + eval_delay_hours, 12 s per block), passed only where
+    ``settle_lane_d`` takes it."""
+    import inspect
+
+    if "boundary_ts" not in inspect.signature(settle).parameters:
+        return {}
+    return {"boundary_ts": 2_000_000_000 + 12 * int(boundary)}

@@ -34,6 +34,7 @@ def _refused(report, code, field):
 
 def test_the_report_signs_boundary_ts_and_echoes_eval_delay(built):
     r = built["s2"].report
+    assert "eval_delay_hours" in r["params"], "rev6.14: params echo eval_delay_hours"
     assert_valid(r)
     assert r["params"]["eval_delay_hours"] == float(built["cfg"].eval_delay_hours)
     assert isinstance(r.get("boundary_ts"), int), "rev6.14: the boundary timestamp is signed"
@@ -44,6 +45,8 @@ def test_the_report_signs_boundary_ts_and_echoes_eval_delay(built):
 def test_a_cohort_frozen_before_its_judging_start_is_refused(built):
     r = copy.deepcopy(built["s2"].report)
     assert r["cohorts"], "fixture: s2 judges a cohort"
+    assert "eval_delay_hours" in r["params"], "rev6.14: params echo eval_delay_hours"
+    assert "boundary_ts" in r, "rev6.14: the report signs boundary_ts"
     c = r["cohorts"][0]
     r["boundary_ts"] = int(c["t_max"] + HOUR * r["params"]["eval_delay_hours"]) - 1
     _refused(r, "bad_value", "cohorts[0]")
@@ -51,12 +54,14 @@ def test_a_cohort_frozen_before_its_judging_start_is_refused(built):
 
 def test_a_cohort_without_the_boundary_timestamp_is_refused(built):
     r = copy.deepcopy(built["s2"].report)
+    assert "boundary_ts" in r, "rev6.14: the report signs boundary_ts"
     del r["boundary_ts"]
     _refused(r, "missing_field", "boundary_ts")
 
 
 def test_boundary_ts_is_never_null(built):
     r = copy.deepcopy(built["s2"].report)
+    assert "boundary_ts" in r, "rev6.14: the report signs boundary_ts"
     r["boundary_ts"] = None
     _refused(r, "bad_type", "boundary_ts")
 
@@ -64,11 +69,13 @@ def test_boundary_ts_is_never_null(built):
 def test_a_boundary_ts_missing_skip_on_a_stamped_settlement_is_refused(built):
     r = copy.deepcopy(built["s2"].report)
     assert r["entries"], "fixture: s2 lists an entry"
+    assert "boundary_ts" in r, "rev6.14: the report signs boundary_ts"
     r["skipped"].append({"digest": r["entries"][0]["digest"], "reason": "boundary_ts_missing"})
     _refused(r, "bad_value", f"skipped[{len(r['skipped']) - 1}].reason")
 
 
 def test_forward_margin_above_eval_delay_is_refused(built):
     r = copy.deepcopy(built["s2"].report)
+    assert "eval_delay_hours" in r["params"], "rev6.14: params echo eval_delay_hours"
     r["params"]["forward_margin_hours"] = float(r["params"]["eval_delay_hours"]) + 1.0
     _refused(reseal(r), "bad_value", "params.forward_margin_hours")

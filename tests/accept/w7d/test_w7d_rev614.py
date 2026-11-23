@@ -33,6 +33,7 @@ def test_rev614_the_honest_chain_signs_boundary_ts_and_matches(chains):
     mod = replay_module()
     c = chains["gated"]
     rep = c.pub.report(2)
+    assert "eval_delay_hours" in rep["params"], "rev6.14: params echo eval_delay_hours"
     assert rep["params"]["eval_delay_hours"] == float(c.cfg.eval_delay_hours)
     assert isinstance(rep.get("boundary_ts"), int)
     assert rep["boundary_ts"] >= rep["cohorts"][0]["t_max"] + HOUR * c.cfg.eval_delay_hours
@@ -43,6 +44,7 @@ def test_rev614_the_honest_chain_signs_boundary_ts_and_matches(chains):
 def test_rev614_a_set_frozen_before_the_judging_start_is_a_mismatch(chains):
     def m(rep):
         assert rep["cohorts"], "fixture: b2 judges X"
+        assert "eval_delay_hours" in rep["params"], "rev6.14: params echo eval_delay_hours"
         c = rep["cohorts"][0]
         rep["boundary_ts"] = int(c["t_max"] + HOUR * rep["params"]["eval_delay_hours"]) - 1
 
@@ -59,6 +61,7 @@ def test_rev614_a_judged_cohort_without_boundary_ts_is_a_mismatch(chains):
 
 def test_rev614_a_forged_eval_delay_echo_is_a_mismatch(chains):
     def m(rep):
+        assert "eval_delay_hours" in rep["params"], "rev6.14: params echo eval_delay_hours"
         rep["params"]["eval_delay_hours"] = 2.0
 
     _lie(chains["gated"], 2, m, ["params.eval_delay_hours"])

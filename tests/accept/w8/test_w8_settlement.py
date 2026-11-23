@@ -72,7 +72,7 @@ def _state_dir(tmp: Path) -> Path:
 def _settle(chain, cfg, state_path, boundary, snap):
     from cascade.validator.lane_d import settle_lane_d
 
-    return settle_lane_d(boundary_ts=2_000_000_000 + 12 * int(boundary), cfg=cfg, boundary=boundary, pool_dir=chain["pools"][snap], entries=[],
+    return settle_lane_d(**_rev614_ts(settle_lane_d, boundary), cfg=cfg, boundary=boundary, pool_dir=chain["pools"][snap], entries=[],
                          house=dict(chain["house"]), forecasts=chain["forecasts"][snap],
                          uid_of={}, state_path=state_path, signer=chain["signer"])
 
@@ -146,3 +146,14 @@ def test_inv9_share_zero_vector_armed_nonempty_lane_d_effect(tmp_path):
         a, b = _pay_parts(s.pay, cfg0)
         assert as_bytes(vector(a, b)) == as_bytes(today)
     _assert_report_verifies(s.report, cfg0, chain["signer"])
+
+
+def _rev614_ts(settle, boundary) -> dict:
+    """rev6.14 (a): the fixture's on-chain boundary timestamp (far after every
+    fixture T + eval_delay_hours, 12 s per block), passed only where
+    ``settle_lane_d`` takes it."""
+    import inspect
+
+    if "boundary_ts" not in inspect.signature(settle).parameters:
+        return {}
+    return {"boundary_ts": 2_000_000_000 + 12 * int(boundary)}

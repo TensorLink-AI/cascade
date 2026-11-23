@@ -209,7 +209,7 @@ def _settle(chain, cfg, state_path: Path, signer, boundary: int, snap: int):
     (`helpers.gate_inputs`): the skeleton crowns at BOUNDARY_2."""
     from cascade.validator.lane_d import settle_lane_d
 
-    return settle_lane_d(boundary_ts=2_000_000_000 + 12 * int(boundary), cfg=cfg, boundary=boundary, pool_dir=chain.pool_dirs[snap],
+    return settle_lane_d(**_rev614_ts(settle_lane_d, boundary), cfg=cfg, boundary=boundary, pool_dir=chain.pool_dirs[snap],
                          entries=[dict(e) for e in chain.entries], house=dict(chain.house),
                          forecasts=chain.forecasts[snap], uid_of=dict(chain.uid_of),
                          state_path=state_path, signer=signer,
@@ -425,3 +425,14 @@ def test_fixture_pool_d_carries_end_ts(chain_kind):
     with np.load(chain.pool_dirs[1] / "hist.npz") as hist:
         assert all(hist[k].shape == (HISTORY,) for k in hist.files)
     assert file_digest(chain.pool_dirs[1] / "tgt.npz") != file_digest(chain.pool_dirs[2] / "tgt.npz")
+
+
+def _rev614_ts(settle, boundary) -> dict:
+    """rev6.14 (a): the fixture's on-chain boundary timestamp (far after every
+    fixture T + eval_delay_hours, 12 s per block), passed only where
+    ``settle_lane_d`` takes it."""
+    import inspect
+
+    if "boundary_ts" not in inspect.signature(settle).parameters:
+        return {}
+    return {"boundary_ts": 2_000_000_000 + 12 * int(boundary)}
