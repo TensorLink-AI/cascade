@@ -388,7 +388,9 @@ operator's vault and the chain commit is a `vault/direct@sha256:…` ref — see
 
 A lane B generator uses the same repo layout and contract as above. You fund
 it with `POST /v1/lane-b/fund` (or `cascade lane-b fund`), naming the
-declared targets in `X-Lane-B-Targets`. This section covers the two
+declared targets in `X-Lane-B-Targets`. The CLI sends the declared rows
+header from `cascade lane-b fund --declared-rows rows.json`, and one suite
+target from `--target suite:gift`. This section covers the two
 additions to that request: optional declared expert rows, and the
 contamination check on the submitted tree. The settings and their defaults
 are listed in [MINER.md](MINER.md#lane-b-track-settings).
@@ -453,7 +455,9 @@ No lane B submission may ship public benchmark series. While
 tree after the identity check and scans it statically. It never runs the
 tree. `.py` files are parsed for number constants, `.json` files for
 numbers, and other files are read as raw numeric arrays and one-column text.
-Every sequence is matched against the pinned hash set. A tree that declares
+Every sequence is matched against the pinned hash set.
+`cascade lane-b verify-repo <dir>` runs the same scan locally, read-only and
+offline, and prints the same `contamination` receipt. A tree that declares
 a `suite:<suite>` target must also fit the size cap
 `suite_target_max_repo_mb` (default `8` MiB), or the request is refused with
 413 `repo_too_large` before the scan runs.
