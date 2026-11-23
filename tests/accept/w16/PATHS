@@ -1,0 +1,6 @@
+# W16: the reference fine-tune script of the lane D miner kit (plan §3.0 W16
+# row, §10.2 "Miner kit", §4 T3; README.md has the contract).
+# One new module, run as `python -P -m cascade.miner.lane_d_finetune`. torch
+# is imported lazily, only after every input check passes, so --help,
+# --dry-run and every typed refusal work on a box without torch.
+cascade/miner/lane_d_finetune.py
