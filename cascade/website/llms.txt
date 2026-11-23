@@ -32,6 +32,7 @@ not live configuration.
 - [Generator interface](https://github.com/TensorLink-AI/cascade/blob/main/docs/INTERFACE.md): read before editing a generator.
 - [Agent instructions](https://github.com/TensorLink-AI/cascade/blob/main/AGENTS.md): local checks and spending boundaries.
 - [Agent walkthrough](https://github.com/TensorLink-AI/cascade/blob/main/docs/AGENT_MINING.md): complete lane A/B/C setup, local tests and review flow.
+- [Lane D guide](https://github.com/TensorLink-AI/cascade/blob/main/docs/LANE_D.md): open weights (built, unarmed): submit miner-trained BF16 cascade_pyramid weights, judged on forward-only private windows; no compute keys needed; submit and commit need the human's authorization.
 
 Use the matching network configuration throughout. A testnet host reads a
 different manifest bucket; do not combine its queues/checkpoints with mainnet.
@@ -44,8 +45,9 @@ V2 Lane A is live on mainnet: paid A entries opened **2026-10-30 09:00 UTC**
 and the first v2 era started at the first era boundary after 12:00 UTC
 (block 9,399,600). Use a revealed commitment made at or after the opening;
 earlier reveals are refused. Settlements are 900 blocks (about 3 h) apart;
-an era is 4 settlements (about 12 h). B/C activation is separate; verify live policy.
-Planned order: **A → C → B**.
+an era is 4 settlements (about 12 h). B, C and D activation are separate;
+each lane is armed on its own (lane D by a signed overlay at an era boundary),
+so verify live policy (`lanes`) rather than assuming an order.
 
 Default to local/read-only work. Publication, chain commitments, submissions
 and paid funding require the human's authorization. Never add `--yes` without it,

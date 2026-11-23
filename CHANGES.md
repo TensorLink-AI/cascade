@@ -1,3 +1,18 @@
+# Lane D (open weights) — release notes
+
+Lane D (DEC-CA-0070) is built and ships unarmed (`[lane_d] from_block = 0`):
+miners submit BF16 cascade_pyramid weights they trained anywhere, judged on
+forward-only private windows against the lane D king and the house. The miner
+CLI is `cascade lane-d` (export, verify, submit, ready, status) and the full
+guide is [docs/LANE_D.md](docs/LANE_D.md): checkpoint format, launch contexts
+4k–16k (S8 later), the immediate reveal, the licence attestation, the house,
+gate, sentinel and court, and a FAQ on the coldkey caps, typed skip reasons,
+confirmation latency and both clocks. MINER, INTERFACE, AGENT_MINING,
+VALIDATOR (the `lane-d-report/1` fields satellites verify), OPERATOR (launch
+eval host, S8, first-seen recorder, vault retention), ARCHITECTURE, AGENTS,
+agent.md, both `llms.txt` and the dashboard gain lane D sections; the stale
+planned lane order is dropped.
+
 # Group packing — review changes
 
 Branch: `feat/group-packing`, based on `cascade-v2` commit `4f10049`.

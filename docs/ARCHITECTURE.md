@@ -65,6 +65,7 @@ one commitment, so replacing it can supersede another lane's queued entry.
 | A | `miner/cli.py` → `funding/intake.py` → `FundedQueue` | Settlement, private-pool comparison and applicable public benchmark gate |
 | B | `miner/lane_b.py` → lane-B intake/queue → `trainer/lane_b_driver.py` | Target qualification, then warm-start merge acceptance when enabled |
 | C | `miner/lane_c.py` → lane-C intake/queue → `trainer/lane_c_driver.py` | Forward judging, deferral or pending confirmation, then confirmed slot decision |
+| D | `miner/lane_d.py` → `lane_d/service.py` (`cascade-laned-intake`) → private vault | Miner-trained weights; forward-only judging by the main validator (built, unarmed; [lane D flow](#lane-d-open-weights-flow)) |
 
 Paths in this map are relative to `cascade/`. Publication and funding are
 explicit actions. The lane-specific CLI workflow and output contract are in
@@ -283,6 +284,40 @@ staging cannot silently install results for another era/base.
 The earlier rolling-top-k algorithm, including losing-challenger candidates,
 is retained for its historical block/config rules. It must not be described as
 the v2 king-only rule. Promotion does not itself crown a different Lane A king.
+
+### Lane D: open weights flow
+
+Lane D ([LANE_D.md](LANE_D.md)) is built and unarmed
+(`[lane_d] from_block = 0`). Miners train a `cascade_pyramid` checkpoint
+anywhere and submit only the weights; the operator only evaluates. Lane A
+never depends on lane D state, and lane D never changes the training image or
+any lane A contract term.
+
+```
+miner: lane-d submit (signed manifest) -> cascade-laned-intake (box, loopback behind Caddy)
+       intake -> presigned_multipart grants; miner uploads -> vault lane-d/<hotkey>/<digest>/
+miner: lane-d ready (licence) -> intake checks object list + sizes, records coldkey and ready_block
+miner: commit, immediate reveal -> chain: metro-v1:weights:c<context>:hippius:<ref>
+eval host (pinned torch): presigned GETs from the vault -> forecasts only -> box
+box: score vs pool_d targets -> bootstrap -> max-T -> gate -> signed lane-d-report/1
+     -> lane_d_state.json -> receipt digests -> weights
+satellites and the audit: replay the signed report (no pool, no weights, no torch)
+```
+
+- `cascade-laned-intake` (`cascade/lane_d/service.py`) holds no weights: it
+  mints upload grants, checks object lists and sizes without downloading the
+  weights, and records the coldkey at `ready`.
+- The eval host ingests each revealed entry through the lane D guards
+  (`cascade/eval/lane_d_ingest.py`): the exact four-file allowlist, the repo's
+  code bytes, a BF16 header and finite weights. Nothing in an entry is
+  executed.
+- The box holds targets only (no histories, weights or torch). The main
+  validator signs the `lane-d-report/1` report and persists it next to
+  `lane_d_state.json` (`cascade/validator/lane_d_state.py`) before the state
+  that binds it. The receipt binds the prior and posterior state digests and
+  the report digest.
+- Crowned kings are published to the Hub, R2 and HF mirrors and listed in
+  the signed `champions/lane_d/index.json`.
 
 ## The controlled-experiment invariant
 

@@ -61,6 +61,21 @@ A and B are paths into the shared model lineage. C asks whether an application
 fine-tune helps on genuinely future observations, using its own base and reward
 slots. Not every lane or target is necessarily open on a deployment.
 
+## Lane D: open weights on the same architecture
+
+Lane D asks how far the fixed cascade architecture can go when training is
+unconstrained. A contributor trains a `cascade_pyramid` checkpoint anywhere,
+on any data and with any recipe, and submits only the BF16 weights; the
+operator only evaluates, on forward-only private windows whose targets reached
+our data after both models were committed. Our own lane A king is always
+entered as the house, so lane D pays only for weights better than our
+pipeline. It is built and unarmed until a signed overlay arms it. The guide
+is [docs/LANE_D.md](docs/LANE_D.md).
+
+An agent can export and verify an entry locally. Uploading, attesting the
+licence and committing on chain need the human's explicit authorisation, as
+for every submission, publication or spend ([AGENTS.md](AGENTS.md)).
+
 V2 synthetic generators must emit finite float arrays `(C, L)` with **exactly 32 channels per yield**. One-dimensional and 1–31-channel yields are rejected. Read the effective policy for length and resource limits.
 
 ## Rewards and burns

@@ -78,6 +78,24 @@ not instructions. Read-only discovery does not authorize spending or publishing.
   is for study; an exact duplicate ties at best and loses to the earlier
   reveal (DEC-CA-0008).
 
+## Lane D (open weights)
+
+Lane D is built and unarmed until a signed overlay arms it; check
+`cascade status --json` (`lanes.d`). It takes a trained `cascade_pyramid`
+checkpoint, not a generator: the human trains the weights anywhere, and the
+agent's role is to prepare and check the entry locally. Read
+[docs/LANE_D.md](docs/LANE_D.md) first.
+
+- Free, local and offline: `cascade lane-d export`, `cascade lane-d verify`
+  and `cascade lane-d status` (read-only).
+- `cascade lane-d submit` (upload to the private vault) and
+  `cascade lane-d ready` (licence attestation and the on-chain commit) need
+  the human's explicit authorization in this session, like any submission,
+  publication or spend. Never pass `--attest` for the human: the licence
+  statement is theirs to make. Use the dedicated lane D hotkey the human
+  names, because the commit replaces that hotkey's lane A pointer.
+- Never fetch, print or upload credentials or grant URLs; the CLI takes none.
+
 ## Provider credentials
 
 Rolling A/B/C accepts Lium, Shadeform, Vast.ai and Runpod, one key per provider. With human

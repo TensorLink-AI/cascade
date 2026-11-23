@@ -9,6 +9,7 @@ on your compute account. Local training experiments need suitable compute too.
 | A | A deterministic Python generator of synthetic time series | Beat the current king with a fully trained model | [Steps 1–7](#1-install) |
 | B | A generator and up to the allowed number of targets | Improve selected experts, then pass merge acceptance when enabled | [Lane B](#13-cascade-v2-and-domain-experts-lane-b) |
 | C | An eligible MarketCast fine-tuning recipe, optionally with a generator | Beat the pinned application base on future data, then confirm and take a slot | [Lane C](#what-you-submit) |
+| D | A trained cascade_pyramid checkpoint (BF16 weights you trained anywhere) | Beat the lane D king on forward-only private windows, then confirm (built, unarmed) | [Lane D](LANE_D.md) |
 
 The submission contract (what the code must be) is [INTERFACE.md](INTERFACE.md).
 This guide is the end-to-end walkthrough.
@@ -2010,8 +2011,15 @@ Every lane-C entry (DEC-CA-0056 review 2026-10-19):
 
 Lane D entries are trained cascade_pyramid checkpoints: exactly `config.json`,
 `weights.safetensors` (BF16 only) and the repo's own `model.py` /
-`forecast_wrapper.py`. The full guide is `docs/LANE_D.md` (W12a). Every
+`forecast_wrapper.py`. The full guide is `docs/LANE_D.md`
+([LANE_D.md](LANE_D.md)): judging, the house, the gate, pay and a FAQ. Every
 command takes `--json`. No flag takes a key, token or upload URL.
+
+Lane D needs no compute keys: you train on your own hardware, on any data
+and with any recipe, and the operator pays for evaluation. Nothing is rented
+on your provider account. Use a dedicated hotkey: a lane D commit replaces
+that hotkey's lane A pointer. Lane D ships unarmed (`[lane_d] from_block = 0`);
+check `cascade status --json` before you submit.
 
 - `cascade lane-d export ./trained --out ./entry` writes the entry directory
   (the four files only) and prints its digest.

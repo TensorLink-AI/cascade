@@ -89,6 +89,7 @@ of the model stays frozen.
 | **A — full model** | A deterministic synthetic-data generator | Challenge the era king on the private pool and applicable public benchmark gate; eligible promotions advance the shared init |
 | **B — selected experts** | A generator and eligible declared targets | Train selected routed rows; qualify on target gains and guards, then pass warm-start merge acceptance when enabled before merging and earning |
 | **C — applications** | An eligible recipe; currently MarketCast | Fine-tune a separately pinned Timestral base, judge on future market observations, and confirm later for a paid slot; no merge into A/B |
+| **D — open weights** | Miner-trained BF16 weights for the fixed cascade_pyramid architecture (built, unarmed) | Beat the lane D king on forward-only private windows and the rotating public gate, then confirm; crowned kings are published. Guide: [docs/LANE_D.md](docs/LANE_D.md) |
 
 B launches independently of the v2 model and has a measured-lineage/routing
 gate. C and its competitions have their own activation settings. Miners select
@@ -102,6 +103,7 @@ contains target limits, migration details and allocation settings.
 | A | Beat the king by the private test's confidence-bound margin, then pass the active public benchmark checks | The throne and its reward ladder; promotion to a future starting checkpoint requires a later king check |
 | B | Each successful target must improve; the leg must satisfy other-domain, horizon and public benchmark regression limits, then merge acceptance when enabled | Only accepted targets start rewards and enter the shared starting model; a rejected or waiting update is unpaid |
 | C | Beat the untouched application base on eligible future windows, pass calibration and duplicate checks, then confirm on fresh windows and win the target slot | A paid application slot; its checkpoint stays separate from A/B |
+| D | Beat KING_D (and the house, our lane A king) by `d_margin` on forward-only windows, pass the drawn public gate suite and the low-frequency check, then clear again on a disjoint window set | KING_D's slot in lane D's share, then a decaying prior-king tail; lane D is paid only once armed |
 
 A's mainnet v2 benchmark rule uses **GIFT-Eval, BOOM, TIME and FEV**. The
 challenger must improve the overall score, stay within each suite's allowed
