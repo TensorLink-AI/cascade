@@ -138,7 +138,7 @@ def test_every_params_field_is_required(scratch, name):
     ("windows", 0, "mirror_lag_hours"), ("windows", 0, "feed"),
     ("entries", 0, "coldkey"), ("entries", 0, "reason"),
     ("cohorts", 0, "first_seen_roots"), ("cohorts", 0, "refused"),
-    ("verdicts", 0, "confirmation"), ("verdicts", 0, "lowfreq"),
+    ("verdicts", 0, "lowfreq"),
     ("pool", None, "first_seen_roots"),
 ])
 def test_nested_fields_are_required(scratch, path):
@@ -150,11 +150,7 @@ def test_nested_fields_are_required(scratch, path):
     _refused(scratch, r, "missing_field", field)
 
 
-def test_nested_confirmation_lowfreq_and_court_fields_are_required(scratch):
-    for key in ("stage", "rule", "first_set_sha256", "first_king_digest"):
-        r = _s2(scratch)
-        del r["verdicts"][0]["confirmation"][key]
-        _refused(scratch, r, "missing_field", f"verdicts[0].confirmation.{key}")
+def test_nested_lowfreq_and_court_fields_are_required(scratch):
     for key in ("result", "freqs", "n_windows", "tau_public"):
         r = _s2(scratch)
         del r["verdicts"][0]["lowfreq"][key]
@@ -211,8 +207,12 @@ def test_inv11_null_entry_reason_is_refused(scratch):
     (("entries", 0, "reason"), "LOST_DUEL"),
     (("entries", 0, "status"), "frozen"),
     (("verdicts", 0, "outcome"), "won"),
-    (("verdicts", 0, "confirmation", "stage"), "second"),
-    (("verdicts", 0, "confirmation", "rule"), "latest"),
+    # rev6.11 (b): the confirm statuses, reasons and outcomes are gone.
+    (("entries", 0, "status"), "confirm_pending"),
+    (("entries", 0, "reason"), "confirm_pending"),
+    (("entries", 0, "reason"), "lost_confirmation"),
+    (("verdicts", 0, "outcome"), "confirm_pending"),
+    (("verdicts", 0, "outcome"), "confirmed"),
     (("verdicts", 0, "lowfreq", "result"), "skipped"),
     (("pool", "sha256"), "abc"),
     (("pool", "first_seen_roots", 0), "not-a-root"),
@@ -268,3 +268,38 @@ def test_rows_sha256_mismatch_is_refused(scratch):
     r["rows"][0]["crps"] = float(r["rows"][0]["crps"]) + 1.0
     _refused(scratch, r, "rows_sha256_mismatch", "rows_sha256")
     assert_valid(reseal(r))  # a resealed row set is structurally valid
+
+
+# ── rev6.11 (b): no confirmation stage or block ─────────────────────────────
+
+
+def _refused_any(scratch, report, codes, field):
+    _, validate_report, err = _reports(scratch)
+    with pytest.raises(err) as info:
+        validate_report(report)
+    assert info.value.code in codes, f"code {info.value.code!r} (field {info.value.field!r})"
+    assert info.value.field == field, f"field {info.value.field!r}, want {field!r}"
+
+
+def test_a_confirmation_block_is_refused(scratch):
+    r = _s2(scratch)
+    r["verdicts"][0]["confirmation"] = {"stage": "first", "rule": "restart",
+                                       "first_set_sha256": None, "first_king_digest": None}
+    _refused(scratch, r, "unknown_field", "verdicts[0].confirmation")
+
+
+@pytest.mark.parametrize("where", ["verdicts", "cohorts"])
+def test_a_confirm_stage_is_refused(scratch, where):
+    """`stage` is fixed to `first` or dropped: `confirm` is `bad_value`
+    (stage kept, enum ["first"]) or `unknown_field` (stage dropped)."""
+    r = _s2(scratch)
+    r[where][0]["stage"] = "confirm"
+    _refused_any(scratch, r, ("bad_value", "unknown_field"), f"{where}[0].stage")
+
+
+def test_params_carry_no_confirm_on_king_change(scratch):
+    r = _s2(scratch)
+    assert "confirm_on_king_change" not in r["params"], \
+        "confirm_on_king_change leaves the config echo (rev6.11 (b))"
+    r["params"]["confirm_on_king_change"] = "restart"
+    _refused(scratch, r, "unknown_field", "params.confirm_on_king_change")

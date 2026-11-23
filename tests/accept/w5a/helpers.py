@@ -67,9 +67,9 @@ def hourly(start: int) -> list[int]:
 
 
 def spec(series_id: str, source: str, target_ts, first_seen_ts, *, frontier=_ABSENT,
-         feed: str | None = None, end_ts=_ABSENT) -> dict:
+         feed: str | None = None, end_ts=_ABSENT, freq: str = "H") -> dict:
     """One pool_d/1 series record (README "pool_d/1 additions")."""
-    rec = {"series_id": series_id, "source": source, "freq": "H", "seasonal_period": 24,
+    rec = {"series_id": series_id, "source": source, "freq": freq, "seasonal_period": 24,
            "target_ts": [int(t) for t in target_ts],
            "first_seen_ts": [int(t) for t in first_seen_ts]}
     rec["first_target_ts"] = rec["target_ts"][0] if rec["target_ts"] else None
@@ -141,13 +141,77 @@ FAIL_CLOSED_KINDS = ("no_frontier", "null_frontier")
 CLOCK_TRAPS = ("before_margin", "late_mirror", "publish_ahead")
 
 
-def feeds_block(sources) -> dict:
+def feeds_block(sources, embargo_hours: float = 0.0) -> dict:
     """Measured lags: every source within the limit, `laggy` over it,
-    `forecasts` a forecast product. `unlisted` is never listed."""
+    `forecasts` a forecast product. `unlisted` is never listed.
+
+    rev6.10/rev6.11: every listed feed pins its effective `embargo_hours`
+    (W6b). The default 0 is the rev3 rule, so every fixture built before the
+    embargo keeps its verdicts byte for byte (README "Embargo")."""
     out = {s: {"mirror_lag_hours": 1.0, "forecast_product": False} for s in sources}
     out["laggy"] = {"mirror_lag_hours": LAG_H + 1.0, "forecast_product": False}
     out["forecasts"] = {"mirror_lag_hours": 1.0, "forecast_product": True}
+    for f in out.values():
+        f["embargo_hours"] = float(embargo_hours)
     return out
+
+
+# ── rev6.10 (a) / rev6.11 (e): the embargo-aware rule ───────────────────────
+
+EMBARGO_H = 48.0                  # [lane_d] embargo_hours default (decided)
+
+# rev6.12 (a): the embargo applies to EVERY cadence (no sub-hourly zero); the
+# fixtures sweep these pool `freq` strings to show `freq` plays no part.
+CADENCE_FREQS = ("10s", "30S", "min", "5min", "15min", "30min", "H", "8H", "D", "W")
+
+
+def with_embargo(cfg, hours: float):
+    """`cfg` with `embargo_hours` set (W2e adds the real key; until then a
+    read-only view). The test never reads the attribute itself."""
+    import dataclasses
+
+    if any(f.name == "embargo_hours" for f in dataclasses.fields(cfg)):
+        return dataclasses.replace(cfg, embargo_hours=float(hours))
+
+    class _View:
+        def __init__(self, base, e):
+            object.__setattr__(self, "_base", base)
+            object.__setattr__(self, "embargo_hours", float(e))
+
+        def __getattr__(self, name):
+            return getattr(self._base, name)
+
+    return _View(cfg, hours)
+
+
+def oracle_embargo(rec: dict, feeds: dict | None, cfg_embargo: float):
+    """README "Embargo": the effective e of a series (every `freq` alike,
+    rev6.12), or None when the feed is listed but its `embargo_hours` is
+    missing or not a non-negative number (fail closed, `unlisted_feed`).
+    Re-derived here from the fixture record, never from the producer."""
+    feed = (feeds or {}).get(rec.get("feed") or rec["source"])
+    if not isinstance(feed, dict):
+        return 0.0                             # unlisted: refused before e matters
+    v = feed.get("embargo_hours")
+    if isinstance(v, bool) or not isinstance(v, int | float) or not v >= 0:
+        return None
+    return min(float(v), float(cfg_embargo))
+
+
+def oracle_fresh(rec: dict, feeds: dict | None, b: float, cfg) -> bool:
+    """rev6.12 terms: a fresh window passes the e = 0 rule on every point."""
+    return oracle_reason(rec, feeds, b, cfg) is None
+
+
+def oracle_embargo_reason(rec: dict, feeds: dict | None, b: float, cfg,
+                          cfg_embargo: float) -> str | None:
+    """The rev6.10 rule: the rev3 oracle at the feed bound `b - e`, with an
+    invalid feed `embargo_hours` refused as `unlisted_feed`."""
+    e = oracle_embargo(rec, feeds, cfg_embargo)
+    if e is None:
+        why = oracle_reason(rec, feeds, b, cfg)
+        return why if why == "missing_clock" else "unlisted_feed"
+    return oracle_reason(rec, feeds, b - HOUR * e, cfg)
 
 
 def target_values(series_id: str) -> tuple[np.ndarray, np.ndarray]:
