@@ -73,7 +73,7 @@ from types import MappingProxyType
 
 import numpy as np
 
-from cascade.eval.bootstrap import cohort_maxt_lcbs
+from cascade.eval.bootstrap import _seed_to_int, cohort_maxt_lcbs
 from cascade.shared.sr25519 import SignatureVerifierUnavailable, verify_hotkey
 
 MATCH = "MATCH"
@@ -427,6 +427,138 @@ def gate_draw(cfg, block_hash, sentinel) -> tuple[str, list[str]] | None:
     return None
 
 
+# ── W3b6b: the bound bench records (plan rev6.13) ───────────────────────────
+
+ROWS_ROLES = ("candidate", "king_d", "house")
+_GATE_SEED_TAG = "cascade|lane_d|paired_gate|v1"
+_HEX64 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _rows_source(bench_rows, digest: str) -> bytes | None:
+    """The published bytes of ``digest`` from a ``{sha256: bytes}`` mapping or
+    a directory of ``<sha256>.json`` files, or ``None``."""
+    if isinstance(bench_rows, Mapping):
+        data = bench_rows.get(digest)
+        return bytes(data) if isinstance(data, (bytes, bytearray)) else None
+    p = Path(bench_rows) / f"{digest}.json"
+    try:
+        return p.read_bytes()
+    except OSError:
+        return None
+
+
+def _paired_lcb(ref, cand, *, alpha: float, B: int, seed: str) -> float:
+    """LCB_alpha of ``1 - geomean(cand)/geomean(ref)`` over paired items,
+    items resampled with replacement (the bench gate's statistic, re-derived
+    here: invariant 12 keeps the producer's gate code out of the replay)."""
+    k = np.log(np.maximum(np.asarray(ref, dtype=np.float64), 1e-12))
+    c = np.log(np.maximum(np.asarray(cand, dtype=np.float64), 1e-12))
+    n = k.size
+    if n == 0 or k.shape != c.shape:
+        return float("nan")
+    idx = np.random.default_rng(_seed_to_int(seed)).integers(0, n, size=(B, n))
+    d = (c[idx] - k[idx]).mean(axis=1)
+    return float(np.quantile(1.0 - np.exp(d), alpha))
+
+
+def _suite_items(rec: Mapping, suite: str) -> dict[str, tuple[float, float]] | None:
+    entry = (rec.get("suites") or {}).get(suite) if isinstance(rec.get("suites"), Mapping) \
+        else None
+    rows = entry.get("rows") if isinstance(entry, Mapping) else None
+    if not isinstance(rows, list):
+        return None
+    out: dict[str, tuple[float, float]] = {}
+    for row in rows:
+        if not isinstance(row, Mapping) or not isinstance(row.get("item"), str):
+            return None
+        c, m = row.get("crps"), row.get("mase")
+        if not (_finite(c) and _finite(m)) or row["item"] in out:
+            return None
+        out[row["item"]] = (float(c), float(m))
+    return out
+
+
+def check_gate_rows(report: Mapping, bench_rows, cfg) -> list[str]:
+    """The mismatch paths of ``report``'s bound bench records (W3b6b): each
+    bound digest resolves to bytes hashing to it, whose record names the
+    result's session and its role's digest; a ``pass`` / ``gate_regression``
+    result's four LCBs equal the paired LCBs recomputed from the drawn
+    suite's rows (seed ``cascade|lane_d|paired_gate|v1|lane-d/1:gate:<b>:
+    <hash>|<suite>|<metric>``, within 1e-12); a pass result for the crowned
+    digest must carry ``rows``. Pure; ``[]`` when everything agrees."""
+    out: list[str] = []
+    gate = report.get("gate") if isinstance(report, Mapping) else None
+    if not isinstance(gate, Mapping) or not isinstance(gate.get("results"), list):
+        return out
+    suite = gate.get("suite")
+    seed = f"lane-d/1:gate:{report.get('boundary')}:{gate.get('block_hash')}"
+    king = (report.get("king_before") or {}).get("digest") \
+        if isinstance(report.get("king_before"), Mapping) else None
+    house = (report.get("house") or {}).get("digest") \
+        if isinstance(report.get("house"), Mapping) else None
+    alpha, B = float(cfg.alpha), int(cfg.bootstrap_B)
+    for k, res in enumerate(gate["results"]):
+        at = f"gate.results[{k}]"
+        if not isinstance(res, Mapping):
+            continue
+        rows = res.get("rows")
+        if rows is None:
+            if res.get("outcome") == "pass" and res.get("digest") == report.get("crowned"):
+                out.append(f"{at}.rows")
+            continue
+        if not isinstance(rows, Mapping) or set(rows) != set(ROWS_ROLES) or not all(
+                isinstance(v, str) and _HEX64.match(v) for v in rows.values()):
+            out.append(f"{at}.rows")
+            continue
+        want = {"candidate": res.get("digest"), "king_d": king, "house": house}
+        recs: dict[str, Mapping] = {}
+        for role in ROWS_ROLES:
+            data = _rows_source(bench_rows, rows[role])
+            rec = None
+            if data is not None and hashlib.sha256(data).hexdigest() == rows[role]:
+                try:
+                    rec = json.loads(data.decode("ascii"))
+                except (UnicodeDecodeError, ValueError):
+                    rec = None
+            if not isinstance(rec, Mapping) or rec.get("session") != res.get("session") \
+                    or rec.get("digest") != want[role]:
+                out.append(f"{at}.rows")
+                recs = {}
+                break
+            recs[role] = rec
+        if not recs or res.get("outcome") not in ("pass", "gate_regression"):
+            continue
+        items = {role: _suite_items(recs[role], str(suite)) for role in ROWS_ROLES}
+        lcb = res.get("lcb")
+        if any(v is None for v in items.values()) or not isinstance(lcb, Mapping):
+            out.append(f"{at}.lcb")
+            continue
+        cand = items["candidate"]
+        bad = False
+        for ref in GATE_REFS:
+            ids = sorted(set(cand) & set(items[ref]))
+            for j, m in enumerate(GATE_METRICS):
+                got = _paired_lcb([items[ref][i][j] for i in ids], [cand[i][j] for i in ids],
+                                  alpha=alpha, B=B, seed=f"{_GATE_SEED_TAG}|{seed}|{suite}|{m}")
+                stated = (lcb.get(ref) or {}).get(m) if isinstance(lcb.get(ref), Mapping) \
+                    else None
+                if not (_finite(stated) and math.isfinite(got)
+                        and abs(got - float(stated)) <= 1e-12):
+                    bad = True
+        if bad:
+            out.append(f"{at}.lcb")
+    return out
+
+
+def _default_bench_rows(reports):
+    """``<stem>_bench_rows`` beside a ``<stem>_reports`` directory, else None."""
+    if isinstance(reports, (str, Path)):
+        p = Path(reports)
+        if p.name.endswith("_reports"):
+            return p.parent / (p.name[: -len("_reports")] + "_bench_rows")
+    return None
+
+
 def _gate_result(d: _Paths, at: str, res, tau: float) -> tuple[str | None, str | None]:
     """``(digest, re-derived outcome)`` of one gate result (W3b2's rule: with
     four finite LCBs, ``gate_regression`` iff some LCB < ``-tau_public``,
@@ -437,7 +569,7 @@ def _gate_result(d: _Paths, at: str, res, tau: float) -> tuple[str | None, str |
         return None, None
     # ``held_from`` is optional here: whether a result must carry it is
     # ``_Settlement._held_from``'s rule.
-    for k in sorted((set(res) - {"held_from"}) ^ _RESULT_KEYS):
+    for k in sorted((set(res) - {"held_from", "rows"}) ^ _RESULT_KEYS):
         d.add(_key(at, k))
     dg = res.get("digest")
     if not isinstance(dg, str):
@@ -523,6 +655,8 @@ class _Verdict:
 
 class _Settlement:
     """One report's re-derivation against the chain so far."""
+
+    bench_rows = None   # W3b6b: the published bench records (replay_chain)
 
     def __init__(self, report: dict, receipt: dict, cfg, chain: _Chain, boundary: int,
                  metagraph: Mapping | None):
@@ -1163,6 +1297,10 @@ class _Settlement:
         for c in cands:
             if c["digest"] not in self.gate_out:
                 self.d.add("gate.results")
+        # W3b6b: the bound bench records, re-derived from the published bytes.
+        if self.bench_rows is not None:
+            for p in check_gate_rows(self.r, self.bench_rows, self.cfg):
+                self.d.add(p)
 
     def _held_from(self, at: str, res: dict, cand: dict) -> None:
         """RV7 B2: a held candidate's result names its hold, and only a held
@@ -1500,8 +1638,8 @@ def _unverifiable(boundary, reason: str, **kw) -> SettlementReplay:
     return SettlementReplay(boundary=boundary, status=UNVERIFIABLE, reason=reason, **kw)
 
 
-def _replay_one(reports, receipt, cfg, chain: _Chain, signer_ss58: str, uid_of, states
-                ) -> tuple[SettlementReplay, _Chain]:
+def _replay_one(reports, receipt, cfg, chain: _Chain, signer_ss58: str, uid_of, states,
+                bench_rows=None) -> tuple[SettlementReplay, _Chain]:
     b = receipt.get("boundary") if isinstance(receipt, Mapping) else None
     if not _is_int(b):
         return _unverifiable(None, "receipt_malformed"), chain
@@ -1519,6 +1657,7 @@ def _replay_one(reports, receipt, cfg, chain: _Chain, signer_ss58: str, uid_of, 
     if uid_of is not None and b in uid_of and isinstance(uid_of[b], Mapping):
         metagraph = uid_of[b]
     s = _Settlement(report, dict(receipt), cfg, chain, b, metagraph)
+    s.bench_rows = bench_rows
     for p in sig_paths:
         s.d.add(p)
     s.run()
@@ -1540,7 +1679,8 @@ def _replay_one(reports, receipt, cfg, chain: _Chain, signer_ss58: str, uid_of, 
 
 def replay_chain(reports, receipts, cfg, *, signer_ss58: str,
                  uid_of: Mapping[int, Mapping[str, int]] | None = None,
-                 states: Mapping[int, bytes] | None = None) -> tuple[SettlementReplay, ...]:
+                 states: Mapping[int, bytes] | None = None,
+                 bench_rows=None) -> tuple[SettlementReplay, ...]:
     """Replay the lane D receipt chain (see the module docstring).
 
     ``reports`` is the published reports directory (``lane_d_report_<b>.json``
@@ -1549,10 +1689,17 @@ def replay_chain(reports, receipts, cfg, *, signer_ss58: str,
     parsed ``[lane_d]`` config in force; ``signer_ss58`` the pinned signer
     (the report's own ``signer`` is never trusted); ``uid_of`` the metagraph
     ``{hotkey: uid}`` per boundary; ``states`` the published state snapshot
-    bytes per boundary. Pure: nothing is written and no input is mutated."""
+    bytes per boundary; bench_rows (W3b6b) the published bench records,
+    a {sha256: bytes} mapping or a directory of <sha256>.json files
+    (default: the <stem>_bench_rows directory beside a <stem>_reports
+    reports directory; with a mapping of reports and no bench_rows the
+    record checks are skipped, as before W3b6b). Pure: nothing is written
+    and no input is mutated."""
     if isinstance(receipts, (str, bytes, Mapping)):
         raise TypeError("receipts must be a sequence of receipt records")
     chain = _Chain()
+    if bench_rows is None:
+        bench_rows = _default_bench_rows(reports)
     out: list[SettlementReplay] = []
     trusted = True
     for receipt in [copy.deepcopy(r) for r in receipts]:
@@ -1560,7 +1707,8 @@ def replay_chain(reports, receipts, cfg, *, signer_ss58: str,
             b = receipt.get("boundary") if isinstance(receipt, Mapping) else None
             out.append(_unverifiable(b if _is_int(b) else None, "prior_unverified"))
             continue
-        res, chain = _replay_one(reports, receipt, cfg, chain, signer_ss58, uid_of, states)
+        res, chain = _replay_one(reports, receipt, cfg, chain, signer_ss58, uid_of, states,
+                                 bench_rows)
         out.append(res)
         trusted = res.status == MATCH
     return tuple(out)
@@ -1568,4 +1716,4 @@ def replay_chain(reports, receipts, cfg, *, signer_ss58: str,
 
 __all__ = ["MATCH", "MISMATCH", "RECEIPT_SCHEMA", "REPORT_SCHEMA", "STATE_SCHEMA", "STATUSES",
            "UNVERIFIABLE", "UNVERIFIABLE_REASONS", "SettlementReplay", "court_shares",
-           "expected_params", "gate_draw", "replay_chain"]
+           "check_gate_rows", "expected_params", "gate_draw", "replay_chain"]
