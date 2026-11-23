@@ -107,7 +107,9 @@ class LaneDInputs:
     """One settlement's inputs: ``pool_dir`` the newest ``pool_d`` snapshot
     (``prior_pool_dirs`` the earlier retained ones), the revealed
     ``entries``, the eval host's ``forecasts``, the metagraph ``uid_of``
-    (``{hotkey: uid}``) and the ``house`` pointer record."""
+    (``{hotkey: uid}``) and the ``house`` pointer record. ``armed`` (rev6.6)
+    is the settlement's W5d armed record, passed to ``settle_lane_d(armed=)``
+    (``None``: the legacy call, no armed fields in the report)."""
 
     pool_dir: Any
     entries: list
@@ -115,6 +117,13 @@ class LaneDInputs:
     uid_of: Mapping
     house: Mapping
     prior_pool_dirs: tuple = ()
+    armed: Mapping | None = None
+
+
+def _armed_of(inp: Any) -> dict | None:
+    """``inp.armed`` as a plain dict (``None`` when absent: the legacy call)."""
+    armed = getattr(inp, "armed", None)
+    return None if armed is None else dict(armed)
 
 
 def report_key(boundary: int) -> str:
@@ -262,7 +271,7 @@ class LaneDStep:
                               uid_of=dict(inp.uid_of), state_path=self.state_path,
                               signer=self.signer, prior_pool_dirs=tuple(inp.prior_pool_dirs),
                               expect_prior_sha256=expect, boundary_block_hash=block_hash,
-                              sentinel=sentinel, bench=bench)
+                              sentinel=sentinel, bench=bench, armed=_armed_of(inp))
         except Exception as e:  # noqa: BLE001 — LaneDStateError, schema, pool or crash
             raise LaneDWiringError("settle_refused",
                                    f"settlement {boundary} refused ({e})") from e
