@@ -1641,7 +1641,7 @@ until_block     = 0              # 0 = no end; an era boundary after from_block 
 share           = 0.0            # of the total, carved from takes_from (D1: 0.25 from lane_a by overlay)
 takes_from      = "lane_b"       # lane_a | lane_b | lane_c
 remainder       = "burn"         # release-only burn destination (D21)
-contexts        = [4096, 8192, 16384]  # D2 launch set; subset of 4k..128k (cap 131072)
+contexts        = [4096, 8192, 16384, 32768, 65536, 131072]  # D2 rev6.6: declarable from launch (cap 131072); each arms per settlement on its gates
 horizon         = 64             # points; <= 512 (§1.1)
 dtypes          = ["BF16"]       # D14: BF16 only
 forward_margin_hours = 6.0       # D5

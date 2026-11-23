@@ -22,7 +22,9 @@ from dataclasses import dataclass, field
 
 LANE_D_TAKES_FROM = ("lane_a", "lane_b", "lane_c")
 LANE_D_REMAINDERS = ("burn",)
-# D2: the context variants an entry may be judged at; 131072 is the cap.
+# D2 (rev6.6): the context variants an entry may DECLARE, all of them from
+# launch; 131072 is the cap. Arming is computed per settlement from its two
+# gates (cascade.eval.lane_d_scorer.armed_record), never configured here.
 LANE_D_CONTEXTS = (4096, 8192, 16384, 32768, 65536, 131072)
 LANE_D_MAX_CONTEXT = 131072
 # §1.1: any lane D horizon is at most 16 CPM patches x 32 points.
@@ -50,7 +52,7 @@ class LaneDConfig:
     takes_from: str = "lane_b"
     remainder: str = "burn"
     # What an entry is judged at (§1.1, D2, D14).
-    contexts: tuple[int, ...] = (4096, 8192, 16384)
+    contexts: tuple[int, ...] = LANE_D_CONTEXTS
     horizon: int = 64
     dtypes: tuple[str, ...] = LANE_D_DTYPES
     # Forward-only judging (§1.3, D5).
@@ -236,7 +238,7 @@ def parse_lane_d(raw: object, *, era_blocks_at: Callable[[int], int] | None = No
     if rem not in LANE_D_REMAINDERS:
         raise ValueError(f"[lane_d] remainder must be one of {LANE_D_REMAINDERS}; got {rem!r}")
 
-    contexts = _contexts(ld.get("contexts", [4096, 8192, 16384]))
+    contexts = _contexts(ld.get("contexts", list(LANE_D_CONTEXTS)))
     horizon = _int(ld.get("horizon", 64), "horizon", lo=1, hi=LANE_D_MAX_HORIZON)
     dtypes = _dtypes(ld.get("dtypes", list(LANE_D_DTYPES)))
     fwd = _float(ld.get("forward_margin_hours", 6.0), "forward_margin_hours")
