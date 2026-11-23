@@ -21,10 +21,10 @@ evidence file's.
 
 Chosen path: presigned_multipart
 
-Evidence sha256: 9298ff34af7f229d44cee99ef06d9e4268fbdd4f7d7b01519f7add7483202a2c
+Evidence sha256: b078add32f84e02d0e2cf0be9fb303c5c07f13e981e773c649ffbe785c3b3044
 
 The sha256 is of the verified evidence file (`verified_live.verified: true`,
-`binding: unlocked_anchor`, verified 2026-11-23T04:52:15Z). The file is added
+`binding: unlocked_anchor`, verified 2026-11-23T06:09:28Z). The file is added
 to main by a separate evidence-only PR after this record lands.
 
 ## Path ids
@@ -134,4 +134,4 @@ path, and the credentials rule above assumes the worst for both.
   bucket `cascade-w3a-probe-20261122`, prefix `w3a-probe/`; locked objects:
   none. Left in the bucket: the unlocked anchor
   `w3a-probe/f466f7eb48fc10a9/anchor.bin` (1024 bytes), which the owner may
-  delete after the evidence PR. Verified 2026-11-23T04:52:15Z.
+  delete after the evidence PR. Verified 2026-11-23T06:09:28Z.
