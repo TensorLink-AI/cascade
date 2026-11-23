@@ -105,6 +105,17 @@ ANCHOR_KEYS = ("key", "version_id", "size", "etag", "sha256")
 ANCHOR_BINDING = "unlocked_anchor"
 MAX_ANCHOR_BYTES = 4096
 
+# The no-lock gate (README "The L4 gate on --no-object-lock evidence"): the
+# probes each upload path DEPENDS on (decisions/STORAGE-LANE-D.md "Path ids"),
+# plus `upload_part_copy_2_5gb`, which every path needs for the server-side
+# king copy at crowning (W6d). These must be `pass`; any other probe may be
+# pass/fail/error, recorded verbatim in the decision's results table.
+KING_COPY_PROBE = "upload_part_copy_2_5gb"
+PATH_PROBES = {"presigned_multipart": ("presigned_upload_part", KING_COPY_PROBE),
+               "single_presigned_put": ("single_put_limit", KING_COPY_PROBE),
+               "upload_relay": (KING_COPY_PROBE,)}
+PATH_VERDICT_KEYS = ("path", "required", "passed")
+
 
 # ── driving the probe (dry-run only) ─────────────────────────────────────────
 
@@ -1145,7 +1156,49 @@ def _verified_anchor_problems(data: dict, rec: dict) -> list[str]:
                    f"objects, got {lst['keys']!r}")
     if not _rid_ok(lst["request_id"]):
         out.append("verified_live.listing.request_id: want the live listing's request id")
+    out += _path_verdict_problems(data, rec)
     return out
+
+
+def path_verdict(ev: dict) -> dict:
+    """The top-level verdict of a ``--no-object-lock`` run (README "The L4
+    gate on --no-object-lock evidence"), recomputed from the evidence body:
+    ``path`` is the recomputed ``recommended_path``, ``required`` the probes
+    that path depends on (:data:`PATH_PROBES`), and ``passed`` is true iff the
+    evidence is the owner-flag record with both lock probes ``skipped``,
+    every required probe ``pass``, ``cleanup.remaining_unlocked == []``, a
+    non-empty ``anchor_objects`` and ``source == "live"``. The other probes'
+    results (pass/fail/error) do not enter it."""
+    rows = [p for p in ev.get("probes", []) if isinstance(p, dict)]
+    res = {p.get("name"): p.get("result") for p in rows}
+    path = recommended_path(ev)
+    required = list(PATH_PROBES[path])
+    cleanup = ev.get("cleanup") if isinstance(ev.get("cleanup"), dict) else {}
+    passed = (no_lock_evidence(ev) and ev.get("source") == "live"
+              and len(rows) == len(PROBES) and set(res) == set(PROBES)
+              and all(res.get(n) == SKIP_RESULT for n in LOCK_PROBES)
+              and all(res.get(n) == "pass" for n in required)
+              and cleanup.get("remaining_unlocked") == []
+              and bool(ev.get("anchor_objects")))
+    return {"path": path, "required": required, "passed": bool(passed)}
+
+
+def _path_verdict_problems(data: dict, rec: dict) -> list[str]:
+    """``verified_live.path_verdict`` of an ``unlocked_anchor`` record: present,
+    exactly the keys ``path``/``required``/``passed``, and equal to the
+    verdict recomputed from the body (so an edited verdict is refused)."""
+    pv = rec.get("path_verdict")
+    if not isinstance(pv, dict):
+        return [f"verified_live.path_verdict: missing: a {NO_LOCK_FLAG} run's verify record "
+                "carries the path verdict ({path, required, passed}) recomputed from the body, "
+                f"got {pv!r}"]
+    if sorted(pv) != sorted(PATH_VERDICT_KEYS):
+        return [f"verified_live.path_verdict: want exactly the keys {PATH_VERDICT_KEYS}, got "
+                f"{sorted(pv)}"]
+    want = path_verdict(data)
+    if pv != want:
+        return [f"verified_live.path_verdict: the evidence gives {want}, recorded {pv}"]
+    return []
 
 
 def _anchor_problems(data: dict, rows: dict) -> list[str]:
@@ -1478,4 +1531,83 @@ def no_object_lock_problems(text: str) -> list[str]:
         if re.search(r"\bkings?\b", plain, re.I) and any(rx.search(plain) for rx in LOCK_CLAIM_RES):
             out.append(f"decision record: claims kings are locked, but the evidence skipped the "
                        f"lock probes ({SKIP_REASON}): {ln.strip()[:120]!r}")
+    return out
+
+
+# ── the L4 gate (test_evidence_every_probe_has_a_live_result) ────────────────
+
+RESULT_ROW_RE = re.compile(r"^[ \t]*\|[ \t]*`?([a-z0-9_]+)`?[ \t]*\|[ \t]*`?([a-z]+)`?[ \t]*\|", re.M)
+
+
+def decision_result_rows(text: str) -> dict[str, list[str]]:
+    """Probe name -> every result recorded for it in the decision's results
+    table (rows ``| `<probe>` | `<result>` | ...``; backticks optional)."""
+    rows: dict[str, list[str]] = {}
+    for name, result in RESULT_ROW_RE.findall(text):
+        if name in PROBES:
+            rows.setdefault(name, []).append(result)
+    return rows
+
+
+def gate_problems(ev: dict, decision_text: str) -> list[str]:
+    """Why ``ev`` does not clear the L4 gate (README "The L4 gate on
+    --no-object-lock evidence"); ``[]`` = it does.
+
+    Lock-enabled evidence (unchanged): every probe ``pass``/``fail`` and
+    top-level ``passed: true``. Evidence with the owner-flag ``bucket_lock``:
+    both lock probes ``skipped``; every probe the decision's Chosen path
+    depends on (:data:`PATH_PROBES`) ``pass``; every other probe
+    pass/fail/error; each probe's result recorded exactly once, verbatim, in
+    the decision's results table; and ``verified_live.path_verdict`` present,
+    equal to :func:`path_verdict` and ``passed: true`` (the body's own
+    ``passed`` may be false: it still counts an ``error`` as incomplete)."""
+    if not isinstance(ev, dict):
+        return ["evidence: top level must be a JSON object"]
+    out = []
+    if ev.get("source") != "live":
+        out.append(f"source: want 'live', got {ev.get('source')!r}")
+    rows = [p for p in ev.get("probes", []) if isinstance(p, dict)]
+    res = {p.get("name"): p.get("result") for p in rows}
+    if sorted(p.get("name") for p in rows) != sorted(PROBES):
+        return out + [f"probes: want exactly one row per probe {sorted(PROBES)}, got "
+                      f"{sorted(str(p.get('name')) for p in rows)}"]
+    if not no_lock_evidence(ev):
+        errored = {n: r for n, r in res.items() if r not in ("pass", "fail")}
+        if errored:
+            out.append(f"probes without a recorded live result (re-run them): {errored}")
+        if ev.get("passed") is not True:
+            out.append(f"passed: want true, got {ev.get('passed')!r}")
+        return out
+    for n in LOCK_PROBES:
+        if res[n] != SKIP_RESULT:
+            out.append(f"{n}: a {NO_LOCK_FLAG} run records the lock probe "
+                       f"{SKIP_RESULT!r} ({SKIP_REASON}), got {res[n]!r}")
+    for n in PROBES:
+        if n not in LOCK_PROBES and res[n] not in RESULTS:
+            out.append(f"{n}: want a recorded result in {RESULTS}, got {res[n]!r}")
+    chosen_lines = CHOSEN_RE.findall(decision_text)
+    chosen = _clean(chosen_lines[0]) if len(chosen_lines) == 1 else None
+    if chosen not in PATH_IDS:
+        out.append(f"decision record: 'Chosen path:' must be exactly one of {PATH_IDS}, got "
+                   f"{chosen!r}")
+    else:
+        for n in PATH_PROBES[chosen]:
+            if res[n] != "pass":
+                out.append(f"{n}: the chosen path {chosen!r} depends on it, so it must be "
+                           f"'pass', got {res[n]!r}")
+    table = decision_result_rows(decision_text)
+    for n in PROBES:
+        got = table.get(n, [])
+        if got != [res[n]]:
+            out.append(f"decision record: the results table must record {n!r} exactly once as "
+                       f"{res[n]!r} (verbatim from the evidence), got {got}")
+    rec = ev.get("verified_live")
+    pv = rec.get("path_verdict") if isinstance(rec, dict) else None
+    want = path_verdict(ev)
+    if pv != want:
+        out.append(f"verified_live.path_verdict: want {want} (recomputed from the body; "
+                   f"`storage_probe verify` writes it), got {pv!r}")
+    elif pv["passed"] is not True:
+        out.append(f"verified_live.path_verdict.passed: the path probes {pv['required']} of "
+                   f"{pv['path']!r} must all pass, got {pv}")
     return out
