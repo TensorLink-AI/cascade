@@ -383,6 +383,30 @@ def house_entry(house: dict) -> dict:
             "confirm": None, "frozen_set": None}
 
 
+CONFIRM_MIGRATION_TAG = "confirm_state_migrated"
+CONFIRM_MIGRATION_EXTENSION = "confirm_state_migration"
+LEGACY_CONFIRM_STATUS = "confirm_pending"
+
+
+def migrate_confirm_pending(state: dict) -> list[str]:
+    """W7c (plan rev6.11 (b); orchestrator decision 2026-11-23): a testnet
+    state written by the old code may hold entries in ``confirm_pending`` (a
+    first clear waiting for its confirmation duel, which no longer exists).
+    The legacy ``confirm`` record carries no first-clear LCB, so the entry is
+    never a crown candidate: whatever king it names, it becomes ``pending`` /
+    ``pending_floor`` with its ``confirm`` record and frozen set dropped and
+    its ``used_windows`` kept (never re-judged on them). Mutates ``state``;
+    returns the migrated digests, sorted (empty: nothing to migrate). Lane D
+    was never armed on mainnet, so only testnet state is touched."""
+    out: list[str] = []
+    for dg, rec in sorted(state.get("entries", {}).items()):
+        if isinstance(rec, dict) and (rec.get("status") == LEGACY_CONFIRM_STATUS
+                                      or rec.get("reason") == LEGACY_CONFIRM_STATUS):
+            rec.update(status="pending", reason="pending_floor", confirm=None, frozen_set=None)
+            out.append(str(dg))
+    return out
+
+
 def refresh_house(state: dict, house: dict) -> None:
     """§1.4: the house follows lane A's king digest. While the house holds
     KING_D the throne moves with it in place (no duel; ``prior_kings`` is
@@ -647,7 +671,8 @@ def verify_receipt_chain(receipts) -> None:
 
 
 __all__ = ["ABSENT_FIELDS", "ABSENT_REASONS", "ABSENT_STATUS",
-           "ENTRY_REASONS", "ENTRY_STATUSES", "HOUSE_ENTRY_KEY", "PRIOR_STATE_EXTENSION",
+           "CONFIRM_MIGRATION_EXTENSION", "CONFIRM_MIGRATION_TAG", "ENTRY_REASONS", "ENTRY_STATUSES",
+           "HOUSE_ENTRY_KEY", "LEGACY_CONFIRM_STATUS", "PRIOR_STATE_EXTENSION",
            "RECEIPT_ERROR_CODES",
            "RECEIPT_FIELDS", "RECEIPT_SCHEMA", "STATE_ERROR_CODES", "STATE_ONLY_REASONS",
            "STATE_SCHEMA", "LaneDReceiptError", "LaneDStateError", "bound_prior_state",

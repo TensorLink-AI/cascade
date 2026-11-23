@@ -62,7 +62,7 @@ SKIP_REASONS = ("pending_floor", "coldkey_cap_settlement", "coldkey_unresolved",
                 "coldkey_changed", "king_unscored", "bench_hold", "deregistered",
                 "ready_expired", "reveal_delay_exceeded", "duplicate_digest",
                 "hotkey_has_open_entry", "context_not_armed", "checkpoint_fault",
-                "mirror_lag_exceeded", "lane_closed")
+                "mirror_lag_exceeded", "lane_closed", "context_below_armed")
 # ``gate_regression``: a judged loss on the §1.3b gate (like
 # ``lowfreq_regression``), so an entry reason and never a skip reason.
 ENTRY_REASONS = SKIP_REASONS + ("lost_duel", "lowfreq_regression", "gate_regression",
@@ -417,9 +417,152 @@ def _check_armed(report: dict) -> None:
                                 f"not the armed variants {armed} of armed_evidence")
 
 
+DRAW_SEED_TAG = "lane_d_windows"
+_SUBSCORE_RTOL = 1e-9
+
+
+def _check_below_armed(report: dict) -> None:
+    """rev6.15: a ``context_below_armed`` skip (or entry reason) needs the
+    signed armed set, and no armed variant may be <= the entry's declared
+    context."""
+    below = {s["digest"] for s in report["skipped"] if s["reason"] == "context_below_armed"}
+    below |= {e["digest"] for e in report["entries"] if e["reason"] == "context_below_armed"}
+    if not below:
+        return
+    if "armed_contexts" not in report:
+        raise ReportSchemaError("bad_value", "skipped",
+                                "context_below_armed without the signed armed set")
+    armed = [int(c) for c in report["armed_contexts"]]
+    for i, e in enumerate(report["entries"]):
+        if e["digest"] in below and any(c <= int(e["context"]) for c in armed):
+            raise ReportSchemaError("bad_value", _join(_join("entries", i), "reason"),
+                                    "an armed variant is <= the declared context")
+
+
+def _check_windows_embargo(report: dict) -> None:
+    """rev6.10 (a) / rev6.12 / W5j: each window's embargo record and draw cell
+    agree with themselves, its id and the config echo."""
+    cap = float(report["params"]["embargo_hours"])
+    for i, w in enumerate(report["windows"]):
+        at = _join("windows", i)
+        e = float(w["embargo_hours"])
+        if e > cap:
+            raise ReportSchemaError("bad_value", _join(at, "embargo_hours"),
+                                    f"above params.embargo_hours {cap}")
+        if w["rule"] != ("embargo" if e > 0.0 else "embargo0"):
+            raise ReportSchemaError("bad_value", _join(at, "rule"),
+                                    f"rule {w['rule']!r} for an effective embargo of {e} h")
+        if w["min_release_ts"] != int(w["min_first_seen_ts"]) + int(round(3600.0 * e)):
+            raise ReportSchemaError("bad_value", _join(at, "min_release_ts"),
+                                    "not min_first_seen_ts + 3600 * embargo_hours")
+        if w["rule"] == "embargo0" and w["embargo_window"]:
+            raise ReportSchemaError("bad_value", _join(at, "embargo_window"),
+                                    "an embargo0 window is fresh")
+        parts = str(w["window_id"]).rsplit(":", 2)
+        if len(parts) == 3 and parts[2] != f"h{w['h']}":
+            raise ReportSchemaError("bad_value", _join(at, "h"), "not the window id's h")
+        if len(parts) == 3 and parts[1] != str(w["origin"]):
+            raise ReportSchemaError("bad_value", _join(at, "origin"), "not the window id's origin")
+
+
+def _check_cohort_split(report: dict) -> None:
+    """rev6.12 (b): each cohort's fresh / embargo counts match its windows'
+    flags and the fresh share holds; W5j: the judged windows stay within
+    ``params.max_windows_per_settlement``."""
+    flag = {w["window_id"]: bool(w["embargo_window"]) for w in report["windows"]}
+    share = float(report["params"]["min_fresh_window_share"])
+    for i, c in enumerate(report["cohorts"]):
+        at = _join("cohorts", i)
+        ids = [x for x in c["window_ids"] if x in flag]
+        n_emb = sum(1 for x in ids if flag[x])
+        if c["fresh_windows"] != len(ids) - n_emb:
+            raise ReportSchemaError("bad_value", _join(at, "fresh_windows"),
+                                    "not the count of its fresh windows")
+        if c["embargo_windows"] != n_emb:
+            raise ReportSchemaError("bad_value", _join(at, "embargo_windows"),
+                                    "not the count of its embargo windows")
+        if ids and c["fresh_windows"] < share * len(ids):
+            raise ReportSchemaError("bad_value", _join(at, "embargo_windows"),
+                                    f"the fresh share is below {share}")
+    judged = {x for c in report["cohorts"] for x in c["window_ids"]}
+    if len(judged) > int(report["params"]["max_windows_per_settlement"]):
+        raise ReportSchemaError("bad_value", "cohorts",
+                                "more judged windows than max_windows_per_settlement")
+
+
+def _geo(rows: list) -> float | None:
+    if not rows:
+        return None
+    lc = sum(math.log(max(float(r["crps"]), 1e-12)) for r in rows) / len(rows)
+    lm = sum(math.log(max(float(r["mase"]), 1e-9)) for r in rows) / len(rows)
+    return math.sqrt(math.exp(lc) * math.exp(lm))
+
+
+def _check_subscores(report: dict) -> None:
+    """rev6.12 (b): each verdict's fresh / embargo sub-score is its rows on
+    its cohort's fresh / embargo windows (``geomean`` null iff n = 0)."""
+    flag = {w["window_id"]: bool(w["embargo_window"]) for w in report["windows"]}
+    cohorts = report["cohorts"]
+    for i, v in enumerate(report["verdicts"]):
+        c = cohorts[v["cohort"]] if 0 <= v["cohort"] < len(cohorts) else None
+        if c is None:
+            continue
+        ids = set(c["window_ids"])
+        mine = [r for r in report["rows"] if r["digest"] == v["digest"]
+                and r["cohort"] == v["cohort"] and r["window_id"] in ids]
+        for name, emb in (("fresh", False), ("embargo", True)):
+            rs = [r for r in mine if flag.get(r["window_id"]) is emb]
+            at = _join(_join("verdicts", i), name)
+            if v[name]["n"] != len(rs):
+                raise ReportSchemaError("bad_value", _join(at, "n"), "not its row count")
+            want, got = _geo(rs), v[name]["geomean"]
+            if (want is None) is not (got is None) or (
+                    want is not None and abs(float(got) - want) > _SUBSCORE_RTOL * want):
+                raise ReportSchemaError("bad_value", _join(at, "geomean"), "not its rows' geomean")
+
+
+def _check_draw(report: dict) -> None:
+    """W5j: the draw record is bound to its block hash, the budget and the
+    report's cohorts; per cell, quota = the cohort's judged windows of that
+    cell and quota <= capacity."""
+    if "draw" not in report:
+        return
+    d = report["draw"]
+    if d["seed"] != f"{d['boundary_block_hash']}:{DRAW_SEED_TAG}":
+        raise ReportSchemaError("bad_value", "draw.seed", "not <boundary_block_hash>:lane_d_windows")
+    if d["max_windows_per_settlement"] != report["params"]["max_windows_per_settlement"]:
+        raise ReportSchemaError("bad_value", "draw.max_windows_per_settlement",
+                                "not params.max_windows_per_settlement")
+    cells = {w["window_id"]: f"{w['timeframe']}|{w['bin']}" for w in report["windows"]}
+    by_index = {c["index"]: c for c in report["cohorts"]}
+    seen: set[int] = set()
+    for i, dc in enumerate(d["cohorts"]):
+        at = _join(_join("draw", "cohorts"), i)
+        c = by_index.get(dc["index"])
+        if c is None or dc["index"] in seen:
+            raise ReportSchemaError("bad_value", _join(at, "index"), "not a cohort of the report")
+        seen.add(dc["index"])
+        count: dict[str, int] = {}
+        for x in c["window_ids"]:
+            k = cells.get(x)
+            if k is not None:
+                count[k] = count.get(k, 0) + 1
+        for k in sorted(set(dc["quota"]) | set(count)):
+            q = dc["quota"].get(k, 0)
+            if q > dc["capacity"].get(k, 0) or q != count.get(k, 0):
+                raise ReportSchemaError("bad_value", _join(_join(at, "quota"), k),
+                                        "not the cohort's drawn windows of that cell, or above "
+                                        "its capacity")
+
+
 def _cross_field(report: dict) -> None:
     """The rules between fields, run after every structural check passes."""
     _check_armed(report)
+    _check_below_armed(report)
+    _check_windows_embargo(report)
+    _check_cohort_split(report)
+    _check_subscores(report)
+    _check_draw(report)
     _check_gate_weights(report)
     _check_snapshots(report)
     _check_house(report)
