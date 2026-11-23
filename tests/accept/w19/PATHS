@@ -3,8 +3,11 @@
 # invariant 6, §4 T15; README.md has the contract).
 #
 # New: the off-thread runner a lane D step is submitted to (one daemon
-# thread, one step at a time, never waited on by the poll loop).
-cascade/validator/lane_d_worker.py
+# thread, one step at a time, never waited on by the poll loop). Generic
+# thread infrastructure, NOT named lane_d_*: W9 invariant 12 forbids the
+# audit's import closure (which reaches loop.py) from loading any
+# cascade.validator.lane_d_* module, and loop.py imports this one.
+cascade/validator/offthread_worker.py
 # The service loop: ValidatorRunner gains the `lane_d_step` field and the
 # `_lane_d_tick(client)` method, and run_forever's poll loop calls the tick
 # next to `_reassert_weights_at_head` (loop.py:1105-1115). The weight loop
