@@ -1,10 +1,22 @@
 # Plan: lane D "open weights" (anything goes on our architecture), with lane E and lane A flexibility — v3
 
-Status: **PLAN v3, rev6.3 (proposed 2026-11-22)**: v2's design, made buildable by an
+Status: **PLAN v3, rev6.4 (proposed 2026-11-22; rev6.4 2026-11-23)**: v2's design, made buildable by an
 autonomous loop. A work package is done **only when its Accept command exits
 0**; **(rev6)** its level is only what `scripts/laned/status` computes (§17),
 never a claim. Owner decisions are marked **[DECIDE]**. Nothing is armed. **No calendar
 dates**: stages are gated (§5).
+
+## rev6.4 (owner 2026-11-23; main @ 54e7f23)
+
+Records two owner decisions, (a) and (b), and one owner finding, (c). Plan
+text only; nothing else in the design changes. Every changed item is marked
+**(rev6.4)**.
+
+| Item | Decision | Landed in |
+|---|---|---|
+| (a) | **W8b accepted (owner 2026-11-23, DECIDED: "i accept w8b").** The rev6.2 (g) proposed WP W8b (validator production wiring of `settle_lane_d`) is accepted; its row is otherwise unchanged | Lane D core table, W8b row marker |
+| (b) | **CI-first testing for loop agents (owner 2026-11-23, DECIDED).** An agent runs only its own WP's `tests/accept/<wp>/` dir locally; every other suite (unit shards, receipt-replay, CROSS) runs in CI, and all are required green before merge. Why: the production box (4 cores / 7 GB) also scores the validator, so local full suites stall scoring | §3.1 rule 10 |
+| (c) | **Hippius has no Object Lock (owner finding 2026-11-23).** `GetObjectLockConfiguration` / `GetBucketVersioning` return 403 for a full-access bucket-scoped sub-token and for the main key; the console offers no lock permission. W3a re-runs its probe with `--no-object-lock` (lock probes recorded as `skipped`). Consequence: lane D kings are **not** locked by a COMPLIANCE copy at crowning; their immutability rests on the content-addressed path, the ingest re-hash on every read, the signed report's digest, and the R2/HF mirrors | §1.2 Storage (Object Lock bullet, "lock only kings" bullet); W3a row; rev5 B9 row |
 
 ## rev6.3 (owner 2026-11-22/23; main @ a244271)
 
@@ -145,7 +157,7 @@ cited in earlier revisions, was an older commit of this branch.
 | B6 | W6a join on (source, pre-suffix source key, channel), same build | W6a, Proposed change 7 |
 | B7 | Quantile head, 9-level grid, no copula sampling; W0b compares quantile-head outputs | §1.5, W0b, W5d, W7a |
 | B8 | Deregistration: entry voided `deregistered`; a court slot burns | §1.5 state, W5h, W8, T18c |
-| B9 | Lock only kings (copy at crowning); pending = content addressing + digest re-check; W3a probes `UploadPartCopy` | §1.2 storage, W3a |
+| B9 | ~~Lock only kings (copy at crowning);~~ **(rev6.4)** no lock: Hippius has no Object Lock, so kings rest on content addressing + re-hash on every read + signed report digest + R2/HF mirrors; pending = content addressing + digest re-check; W3a probes `UploadPartCopy` | §1.2 storage, W3a |
 | B10 | `[lane_d] ready_ttl_blocks` ⇒ `ready_expired` | §1.5 state, W2, W3, W5h, T18d, §14.2 |
 | B11 | **W-EMA**: score the raw cooled endpoint on every leg; EMA files unscored; telemetry only | §8, W-EMA row (§3), §3 Services touched, D40, WB16 |
 | B12 | Daily Merkle root of the first-seen log committed before use | W6fs, W7a, §9 conflict of interest |
@@ -917,8 +929,13 @@ settlement" is a separate, judging-time rule.
   - **Presigned GET and PUT are supported** (max 7 days). Presigned
     **UploadPart is not documented**. Multipart itself is supported (≤ 512 MiB
     per part, ≤ 10,000 parts).
-  - **Object Lock COMPLIANCE is supported.** Lock headers must go on
-    CreateMultipartUpload; they're not supported on Complete.
+  - ~~**Object Lock COMPLIANCE is supported.** Lock headers must go on
+    CreateMultipartUpload; they're not supported on Complete.~~
+    **(rev6.4, owner finding 2026-11-23) Hippius has no Object Lock in
+    practice:** `GetObjectLockConfiguration` and `GetBucketVersioning` return
+    403 for a full-access bucket-scoped sub-token and for the main key, and
+    the console offers no lock permission. W3a re-runs its probe with
+    `--no-object-lock` (lock probes recorded as `skipped`).
   - **Lifecycle rules are accepted but not applied.** TTL deletion must be our
     own job (D16).
   - **Bucket policies** use AWS policy language, but with no IAM it's unclear
@@ -936,6 +953,13 @@ settlement" is a separate, judging-time rule.
     **crowning**, the king is server-side copied into a locked prefix. W3a
     also probes `UploadPartCopy` for ~2.5 GB objects, because a single
     CopyObject may cap below that.
+    **(rev6.4) Superseded for kings: there is no Object Lock**, so lane D
+    kings are **not** locked by a COMPLIANCE copy at crowning. A king's
+    immutability rests on the content-addressed path (manifest digest in the
+    object path), the ingest re-hash on every read (an overwrite fails
+    `digest_mismatch`), the signed report's digest, and the R2/HF mirrors
+    (§11.1). Pending entries are unchanged (content addressing + digest
+    re-check).
   - If prefix-scoped, short-lived credentials exist, use them.
   - Otherwise use **presigned multipart PUT URLs** minted per part with short
     expiry. Presigned URLs can't be revoked before expiry, so integrity comes
@@ -1577,7 +1601,7 @@ Accept command exits 0**, never on a builder's word. Conventions:
 | W2 | `[lane_d]` config: the keys `from_block`, `until_block`, `share`, `takes_from`, `remainder`, `contexts`, `horizon`, `forward_margin_hours`, `min_windows`, `min_clusters`, `min_long_series`, `d_margin`, `alpha`, `bootstrap_B`, `gate_suites`, `gate_weights`, ~~`unselected_suite`~~ **(rev5) dropped:** the held-out suite is the §16 sentinel, drawn from `[v2] sentinel_suites` (W-S1); a lane D key would duplicate it, `tau_public`, `reward_prior_kings`, `king_decay`, `max_entries_per_settlement`, `max_open_per_coldkey`, `max_bench_holds`, `loser_ttl_eras`, `dtypes`, **(rev3)** `max_mirror_lag_hours` (A1), `confirm_on_king_change` (D20), `max_judged_per_coldkey_per_settlement` (A8), `max_coldkey_unresolved_settlements` (A8), `max_reveal_delay_days` (A9), `lowfreq_freqs` (A10); **(rev5)** `ready_ttl_blocks` (B10), `max_source_share` (B14); `contexts` default `[4096, 8192, 16384]` (A5); `dtypes` default `["BF16"]` (A6). **(rev3) Size M, not S:** `lane_d.py` hardcodes `active() = False` (`:65-68`), refuses `from_block > 0` (**(rev5)** `:78-79`) and carries DEC-CA-0062 placeholder keys that must keep parsing (`until_block` and `share` overlay-settable; activation by signed-overlay `from_block`, never a DEC-CA-0045 vote), plus legacy keys still parsed (the deployed file carries `targets`, `teacher_*`, `gain_margin`, …); `ALLOWED["lane_d"]` with `remainder` refused via the `(table, key)` special case (**(rev5)** `netconfig.py:210`); loader parse, round-trip and **mutation** test per key; the 131072 cap; `LaneDConfig.active()` real | W0c | ci | `scripts/laned/accept W2` (includes `unread_keys.py`) |
 | W2b | `[lane_d_ops]` non-consensus table (vault bucket, `pool_d` location, eval host, queue policy), read only by the main validator and the intake; never in receipts | W2 | ci | `scripts/laned/accept W2b` (satellite code path imports nothing from it) |
 | W1.5 | **Walking skeleton** `make laned-e2e` (CI): fixture `pool_d` (with `end_ts`) → tiny checkpoint → intake (filesystem adapter behind the real storage interface) → ingest guards → scorer → signed report → `lane_d_state.json` → emission → `check_lane_d` | W2 | ci | `make laned-e2e` asserts: non-zero lane D weight for the challenger; audit passes; one tampered row fails; unarmed byte-identical; `share = 0` leaves weights unchanged and still yields a valid report; `LaneDConfig.active()` is not a constant. **Every later WP keeps it green and adds ≥ 1 assertion** |
-| W3a | Storage probe scripts (presigned UploadPart, single-PUT size limit, Object Lock on multipart, prefix bucket policy, sub-token scope) + the **storage decision record** `decisions/STORAGE-LANE-D.md` naming the chosen upload path  **(rev5)** Also probes `UploadPartCopy` for ~2.5 GB objects (locking a king by copy at crowning) and confirms COMPLIANCE retention can't be shortened. | — | owner (live Hippius) | `scripts/laned/accept W3a --evidence evidence/w3a_probe.json` (every probe has a recorded live result; the decision record names exactly one path) |
+| W3a | Storage probe scripts (presigned UploadPart, single-PUT size limit, Object Lock on multipart, prefix bucket policy, sub-token scope) + the **storage decision record** `decisions/STORAGE-LANE-D.md` naming the chosen upload path  **(rev5)** Also probes `UploadPartCopy` for ~2.5 GB objects (~~locking a king by copy at crowning~~) and ~~confirms COMPLIANCE retention can't be shortened~~. **(rev6.4)** Hippius has no Object Lock (403 on `GetObjectLockConfiguration` / `GetBucketVersioning` for sub-token and main key): the probe re-runs with `--no-object-lock` and the lock probes are recorded as `skipped`; kings are not locked by copy (§1.2). | — | owner (live Hippius) | `scripts/laned/accept W3a --evidence evidence/w3a_probe.json` (every probe has a recorded live result; the decision record names exactly one path) |
 | W3 | `cascade/lane_d/` intake service: submit/ready for **only the W3a-chosen upload path**; ownership; **(rev3)** records `coldkey_at_ready` and refuses over-cap with `coldkey_cap_open` (advisory, A8); dedup; rate limits; queue; systemd unit with the code-path guard; Caddy route `/v1/lane-d/*`; RAM budget  **(rev5)** Enforces `ready_ttl_blocks` (B10); records the licence attestation at `ready` (B13). | W3a, W2b, R8 | ci (fs adapter) + testnet | `scripts/laned/accept W3` |
 | W4 | Ingest guards: presigned fetch; sha256; `verify_checkpoint`; exact-filename allowlist; **lane-D-only dtype path for BF16** (today's guard requires the pinned F32 spec, `checkpoint_guard.py:323-328`, which lane A keeps unchanged); `verify_weights_finite`; worker handshake (git head + package hash) | W1.5 | ci + pod (handshake live) | `scripts/laned/accept W4` (the T5 malformed set is refused with exact codes) |
 | W5a | Forward eligibility (§1.3): **(rev3) both clocks** (data time and first-seen > wall(max T) + margin) and `max_mirror_lag_hours`; the v2 snapshot-only rule is refused | W1.5 | ci | `scripts/laned/accept W5a` |
@@ -1605,7 +1629,7 @@ Accept command exits 0**, never on a builder's word. Conventions:
 | W7c | `lane_d_state.json` + receipt prior/posterior digest binding. **(rev6.1)** Wiring trap (RV3 note 10): `validator/weights.py:517-524` passes the second element to `emission_vector` only when a lane B or C pay record exists (`pay is not None or pay_c is not None`); if lane D pays while B and C are off, the lane D share is dropped and `set_weights` normalisation hands it to lane A. The WP that wires lane D pay into weights (W7c, or the one that passes `lane_d_cfg` first) adds the lane D pay record to that condition, with a test for "lane D on, B and C off" | W7b | ci | `scripts/laned/accept W7c` |
 | W7d | Satellite replay: an **independent** implementation, no imports from producer eligibility, verdict or weight code (invariant 12) | W7c | ci | `scripts/laned/accept W7d` (import-graph check included) |
 | W8 | Emission: lane D in `lane_parts` / `lane_pool_shares` (`emission.py:330-383`, `lane_c.py`), court decay, house burn  **(rev5)** A deregistered court member's slot burns (B8). **C3 (D48)** decides where lane D's share comes from inside lane A; W8 also changes `lane_pool_shares` (`shared/lane_c.py:584`, returns a `(B, C)` tuple, callers `emission.py:361`, `lane_c.py:605`), a consensus signature at every caller. | W1.5 | ci | `scripts/laned/accept W8` |
-| W8b | **(rev6.2, proposed)** Production wiring: today nothing outside tests calls `cascade.validator.lane_d.settle_lane_d`. The validator loop calls it at each lane D settlement boundary with: the boundary block hash (read-only chain read); the era's sentinel (W-S1 draw from the era-start hash); a bench `SweepSession` on the configured bench host (the W3b2/W5e gate inputs; an armed crown without them is a `bench_hold`); `expect_prior_sha256` from the last published receipt (W7c); the low-frequency check (W3b5); and the house/king state. After settlement: W3b3 `sweep_and_publish` for a new king; W-S3 `build_sentinel_board` with the era's kings list (from W7c state / W17); publish the signed report + receipt; lane D pay reaches weights (W8 emission) **only via the published report**. **Fail-closed:** any unreadable input ⇒ no settlement this tick (retry next tick), never a guessed input. **Restart-safe:** a re-call after restart is idempotent (W7c). **Weight loop:** lane D's bench work runs off the weight loop (W19) or is bounded so weight reasserts are never delayed past a stated bound (2026-11-22: weights went stale ≥ 2 h during a synchronous king-check sweep). **Unarmed:** byte-identical (invariant 1). Ships release-then-activate (external validators on netuid 91) | W5e, W3b5, W7c, W8, W3b3, W-S3, W17 | ci + testnet | `scripts/laned/accept W8b` |
+| W8b | **(rev6.2) (rev6.4, accepted owner 2026-11-23)** Production wiring: today nothing outside tests calls `cascade.validator.lane_d.settle_lane_d`. The validator loop calls it at each lane D settlement boundary with: the boundary block hash (read-only chain read); the era's sentinel (W-S1 draw from the era-start hash); a bench `SweepSession` on the configured bench host (the W3b2/W5e gate inputs; an armed crown without them is a `bench_hold`); `expect_prior_sha256` from the last published receipt (W7c); the low-frequency check (W3b5); and the house/king state. After settlement: W3b3 `sweep_and_publish` for a new king; W-S3 `build_sentinel_board` with the era's kings list (from W7c state / W17); publish the signed report + receipt; lane D pay reaches weights (W8 emission) **only via the published report**. **Fail-closed:** any unreadable input ⇒ no settlement this tick (retry next tick), never a guessed input. **Restart-safe:** a re-call after restart is idempotent (W7c). **Weight loop:** lane D's bench work runs off the weight loop (W19) or is bounded so weight reasserts are never delayed past a stated bound (2026-11-22: weights went stale ≥ 2 h during a synchronous king-check sweep). **Unarmed:** byte-identical (invariant 1). Ships release-then-activate (external validators on netuid 91) | W5e, W3b5, W7c, W8, W3b3, W-S3, W17 | ci + testnet | `scripts/laned/accept W8b` |
 | W9 | Audit `check_lane_d` + `derive_weights` (**rev3:** re-derives the judged set, coldkey caps, both-clock eligibility, the confirmation rule and `rows_sha256`), independent of producer code. **(rev6.1)** Refuses any judged snapshot in which a series lacks `frontier` (absent or `null`) or a feed is not listed in `feeds` (W6b). It re-derives S0 presence (`absent_from_s0`), the backfill rule and mirror-lag eligibility (`over_lag`, `forecast_product`) from the snapshot itself, **without importing `cascade/validator/lane_d_forward`** (invariant 12; RV3 BLOCKING 1); its reason labels follow §1.3 (`publish_ahead` = first-seen fails, `late_mirror` = data time fails). **(rev6.1)** Wiring trap (RV3 note 10): the audit's `emission_vector` call (`audit/checks.py:2834-2841`, `:3660`) passes the second element only when a lane B or C pay record exists, so a lane D share with B and C off would be dropped and handed to lane A by normalisation; W9 must add the lane D pay record to that condition. **(rev6.1)** W9 decides invariant 12 for the shared lane D weight math (`lane_pool_shares` / `lane_parts` / `lane_d_vector`, RV3 note 11) before its tests are written: either re-derive lane D's carve and court vector without these functions, or record them in the plan as shared consensus code exempt from invariant 12 | W7c, W8 | ci | `scripts/laned/accept W9` |
 | W10 | Miner CLI `cascade lane-d export \| verify \| submit \| ready \| status`, **W3a-chosen upload path only**. **(rev5, D43)** The commit reveals immediately (`blocks_until_reveal = min_blocks`), never at boundary − margin; a test asserts the lane D commit path never uses the lane A boundary timing | W3a, W3, W4 | ci + testnet | `scripts/laned/accept W10` |
 | W11 | cascade-ops checks (§10.7) + follower patterns | W5g, W7c | ci (cascade-ops repo) | `scripts/laned/accept W11` (includes `follower_patterns.py`) |
@@ -1707,6 +1731,12 @@ BLOCKING item, and each finding is either fixed or filed as a WP.
 8. **A fresh-context review WP** after every 5 build WPs reach L3 **(rev6)**.
 9. **Blocked is acceptable; faked completion is not.** If a WP can't be fully
    built, the builder stops and records the blocker in `evidence/blocked/<wp>.md`.
+10. **(rev6.4, owner 2026-11-23) CI-first testing for loop agents.** An agent
+    runs **only its own WP's accept dir** (`tests/accept/<wp>/`) locally.
+    Every other suite (unit shards, receipt-replay, CROSS) runs in CI, and all
+    of them are **required green before merge**. Why: the production box
+    (4 cores / 7 GB) also scores the validator, so a local full suite stalls
+    scoring.
 
 ### 3.2 Invariants
 
