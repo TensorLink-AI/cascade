@@ -25,6 +25,24 @@ verifier. Checks, in order (the first failure is the verdict):
    outcome. Without a gate record nothing crowns (fail closed). The crown
    is the highest-LCB passing confirmation or a held candidate re-gated
    ``pass``; the paid court follows from it.
+
+RV7 B2 adds the crown's provenance (README "Correction (RV7 B2)"):
+
+- ``seed`` is ``lane-d/1:{boundary}:{pool.sha256}``; a stage-``first``
+  cohort is judged against ``king_before``; a stage-``confirm`` verdict
+  names a distinct first clear (``first_set_sha256``) under its own king
+  (under D20 ``restart``, ``king_before``);
+- a cleared confirmation whose A10 ``lowfreq`` block reads ``pass`` /
+  ``fail`` has that result re-derived from its LCBs; a ``fail`` is ``lost``
+  and never gated;
+- a held candidate's gate result carries ``held_from`` (its hold: an
+  earlier boundary, an LCB that cleared ``d_margin``, under ``restart`` the
+  same KING_D); a verdict-backed result carries none;
+- chain mode (``prior_reports``, what W9 runs): each confirm verdict's first
+  clear and each ``held_from`` is shown by an earlier report signed by the
+  same key, matched by boundary and body digest (recomputed here from the
+  canonical body, never through the producer);
+- ``era_sentinel``: ``gate.sentinel`` is the era's W-S1 suite.
 """
 
 from __future__ import annotations
@@ -72,6 +90,17 @@ def _expected_params(cfg) -> dict:
             "gate_weights": {str(s): float(w) for s, w in cfg.gate_weights},
             "max_source_share": float(cfg.max_source_share),
             "min_long_series": int(cfg.min_long_series)}
+
+
+def _body_digest(report: dict) -> str:
+    """sha256 hex of the report's canonical body (every field but
+    ``signature``), the digest ``held_from.report_sha256`` names."""
+    return hashlib.sha256(_canon({k: v for k, v in report.items() if k != "signature"})
+                          ).hexdigest()
+
+
+def _is_hex64(value) -> bool:
+    return isinstance(value, str) and len(value) == 64 and set(value) <= _HEX
 
 
 def _signature(report: dict, signer_hotkey: str) -> str | None:
@@ -135,6 +164,58 @@ def _house_problems(idx: int, m: str, hv, hd: str, want: tuple[float, float, boo
     if hv["cleared"] is not cleared:
         out.append(f"cohort {idx}: {m[:12]} house cleared={hv['cleared']} != re-derived {cleared}")
     return out
+
+
+def _stage_problem(report: dict, cfg, cohort: dict, v: dict) -> str | None:
+    """RV7 B2 (b)/(c): why the cohort's stage cannot hold for verdict ``v``,
+    or ``None``. A first duel is always against ``king_before``; a
+    confirmation names its first clear, a set distinct from its own, judged
+    under its own KING_D (under D20 ``restart``, ``king_before``)."""
+    stage, kd = cohort["stage"], cohort["king_digest"]
+    kb = report["king_before"]["digest"]
+    if stage == "first":
+        if kd != kb:
+            return f"stage first judged against {str(kd)[:12]}, not king_before {str(kb)[:12]}"
+        return None
+    if stage != "confirm":
+        return f"cohort stage {stage!r} is neither first nor confirm"
+    conf = v.get("confirmation")
+    if not isinstance(conf, dict):
+        return "a confirm verdict without a confirmation record"
+    fs, fk = conf.get("first_set_sha256"), conf.get("first_king_digest")
+    if not _is_hex64(fs) or fs == cohort["set_sha256"]:
+        return "confirm without a distinct first clear (first_set_sha256)"
+    if fk != kd:
+        return f"confirm whose first clear's king {fk!r} is not the cohort king {str(kd)[:12]}"
+    if conf.get("stage") != "confirm":
+        return f"confirm verdict whose confirmation stage is {conf.get('stage')!r}"
+    if str(cfg.confirm_on_king_change) == "restart" and kd != kb:
+        return f"restart confirm against {str(kd)[:12]}, not king_before {str(kb)[:12]}"
+    return None
+
+
+def _lowfreq_problem(cfg, v: dict) -> tuple[str | None, bool]:
+    """W3b5 (A10) for a cleared confirmation: ``(problem, is_fail)``. A
+    ``pass`` / ``fail`` block carries four finite LCBs and its result is
+    re-derived from them (``fail`` iff one is below ``-tau_public``); a
+    ``fail`` is ``lost``. ``no_windows`` (and an unevaluated block) leaves
+    the candidate to the gate."""
+    lf = v.get("lowfreq")
+    if not isinstance(lf, dict) or lf.get("result") not in ("pass", "fail"):
+        return None, False
+    lcb = lf.get("lcb")
+    if not isinstance(lcb, dict) or set(lcb) != set(GATE_REFS) or any(
+            not isinstance(lcb[r], dict) or set(lcb[r]) != set(_GATE_METRICS)
+            or not all(_finite(lcb[r][q]) for q in _GATE_METRICS) for r in GATE_REFS):
+        return f"lowfreq {lf['result']} without four finite LCBs", False
+    worst = min(float(lcb[r][q]) for r in GATE_REFS for q in _GATE_METRICS)
+    want = "fail" if worst < -float(cfg.tau_public) else "pass"
+    if lf["result"] != want:
+        return (f"lowfreq {lf['result']}; its LCBs re-derive {want} "
+                f"(worst {worst}, -tau_public={-float(cfg.tau_public)})"), False
+    if want == "fail" and v["outcome"] != "lost":
+        return f"lowfreq fail with outcome {v['outcome']}, not lost", True
+    return None, want == "fail"
 
 
 def _cohort_problems(report: dict, cfg, cohort: dict, rows_by: dict, windows: dict,
@@ -214,12 +295,20 @@ def _cohort_problems(report: dict, cfg, cohort: dict, rows_by: dict, windows: di
         if bool(v["cleared"]) != cleared:
             out.append(f"cohort {idx}: {m[:12]} cleared={v['cleared']} != re-derived {cleared}")
         stage = cohort["stage"]
+        why = _stage_problem(report, cfg, cohort, v)
+        if why:
+            out.append(f"cohort {idx}: {m[:12]} {why}")
+            continue
         if v["stage"] != stage or v["king_digest"] != kd:
             out.append(f"cohort {idx}: {m[:12]} stage/king {v['stage']}/"
                        f"{str(v['king_digest'])[:12]} != cohort {stage}/{kd[:12]}")
             continue
         if cleared and stage == "confirm":
-            confirms[m] = v
+            why, lowfreq_fail = _lowfreq_problem(cfg, v)
+            if why:
+                out.append(f"cohort {idx}: {m[:12]} {why}")
+            elif not lowfreq_fail:
+                confirms[m] = v
             continue
         want = "lost" if not cleared else "confirm_pending"
         if v["outcome"] != want:
@@ -243,6 +332,8 @@ GATE_REFS = ("king_d", "house")
 _GATE_METRICS = ("crps", "mase")
 _GATE_KEYS = {"suite", "block", "block_hash", "sentinel", "eligible", "results"}
 _RESULT_KEYS = {"digest", "outcome", "lcb", "blocked_by", "session"}
+# RV7 B2: a held candidate's result also names its hold (optional key).
+_HELD_KEYS = {"boundary", "report_sha256", "set_sha256", "lcb", "king_d"}
 
 
 def _gate_weights(cfg, suites: list[str]) -> dict[str, Fraction]:
@@ -286,7 +377,7 @@ def _finite(x) -> bool:
 def _result_problem(i: int, res, tau: float) -> str | None:
     """Why ``gate.results[i]`` disagrees with W3b2's ``paired_gate`` rule
     re-derived from its own LCBs, or ``None``."""
-    if not isinstance(res, dict) or set(res) != _RESULT_KEYS:
+    if not isinstance(res, dict) or set(res) - {"held_from"} != _RESULT_KEYS:
         keys = sorted(res) if isinstance(res, dict) else type(res).__name__
         return f"gate result {i}: keys {keys}"
     dg, outcome = str(res["digest"])[:12], res["outcome"]
@@ -357,6 +448,34 @@ def _gate_problems(report: dict, cfg, boundary: int) -> tuple[dict, list[str]]:
     return outcomes, out
 
 
+_MISSING = object()
+
+
+def _held_from_problem(report: dict, cfg, boundary: int, hf) -> str | None:
+    """RV7 B2 (a), single report: why a held candidate's ``held_from`` cannot
+    name its hold, or ``None``. Exactly the five keys; the hold settled at an
+    earlier boundary on a KING_D LCB that cleared ``d_margin``; under D20
+    ``restart`` its KING_D is still ``king_before`` (a king change drops a
+    hold). Whether that hold exists is chain mode's to show."""
+    if hf is _MISSING:
+        return "no held_from: nothing binds it to a cleared, held confirmation"
+    if not isinstance(hf, dict) or set(hf) != _HELD_KEYS:
+        keys = sorted(hf) if isinstance(hf, dict) else type(hf).__name__
+        return f"held_from keys {keys}"
+    b = hf["boundary"]
+    if isinstance(b, bool) or not isinstance(b, int) or b >= boundary:
+        return f"held_from boundary {b!r} is not before {boundary}"
+    for k in ("report_sha256", "set_sha256", "king_d"):
+        if not _is_hex64(hf[k]):
+            return f"held_from {k} {hf[k]!r} is not 64 lowercase hex digits"
+    if not (_finite(hf["lcb"]) and float(hf["lcb"]) >= float(cfg.d_margin)):
+        return f"held_from lcb {hf['lcb']!r} did not clear d_margin {cfg.d_margin}"
+    if str(cfg.confirm_on_king_change) == "restart" \
+            and hf["king_d"] != report["king_before"]["digest"]:
+        return "held_from king_d is not king_before (restart drops a hold on a king change)"
+    return None
+
+
 def _crown_problems(report: dict, cfg, boundary: int, confirms: dict, entries: dict
                     ) -> tuple[str | None, list[str]]:
     """``(re-derived crown, problems)``. ``confirms`` maps every verdict
@@ -386,6 +505,14 @@ def _crown_problems(report: dict, cfg, boundary: int, confirms: dict, entries: d
             out.append(f"gate result for {str(dg)[:12]}, neither a verdict nor a listed entry")
         else:
             held.append(dg)
+    results = {r["digest"]: r for r in report["gate"]["results"]} if gated else {}
+    for dg in confirms:
+        if "held_from" in results.get(dg, {}):
+            out.append(f"{dg[:12]}: held_from on a result judged this settlement")
+    for dg in held:
+        why = _held_from_problem(report, cfg, boundary, results[dg].get("held_from", _MISSING))
+        if why:
+            out.append(f"held result {str(dg)[:12]}: {why}")
     if out:
         return None, out
     passing = sorted((v for dg, v in confirms.items() if outcomes.get(dg) == "pass"),
@@ -410,9 +537,140 @@ def _crown_problems(report: dict, cfg, boundary: int, confirms: dict, entries: d
     return crown, out
 
 
-def check_lane_d(report: dict, cfg, *, signer_hotkey: str) -> CheckResult:
+# ── chain mode (RV7 B2): the provenance shown by earlier signed reports ──────
+
+
+def _verified_priors(prior_reports, signer_hotkey: str) -> list[tuple[int, str, dict]]:
+    """``(boundary, body digest, report)`` for each prior report whose
+    signature verifies under ``signer_hotkey``; anything else is not
+    evidence. Raises ``SignatureVerifierUnavailable`` like :func:`_signature`."""
+    out = []
+    for p in prior_reports:
+        if not isinstance(p, dict) or _signature(p, signer_hotkey):
+            continue
+        b = p.get("boundary")
+        if isinstance(b, bool) or not isinstance(b, int):
+            continue
+        try:
+            dg = _body_digest(p)
+        except (TypeError, ValueError):
+            continue
+        out.append((b, dg, p))
+    return out
+
+
+def _prior_verdict(p: dict, digest: str, cohort_index) -> dict | None:
+    for x in p.get("verdicts") or []:
+        if isinstance(x, dict) and x.get("digest") == digest and x.get("cohort") == cohort_index:
+            return x
+    return None
+
+
+def _first_clear_shown(priors, boundary: int, v: dict, cohort: dict) -> bool:
+    """A verified earlier report judged ``v``'s digest in a stage-``first``
+    cohort with the named set and king, cleared it ``confirm_pending``, on
+    windows disjoint from the confirming cohort's."""
+    conf = v["confirmation"]
+    wids = set(cohort["window_ids"])
+    for b, _dg, p in priors:
+        if b >= boundary:
+            continue
+        for c in p.get("cohorts") or []:
+            if not isinstance(c, dict) or c.get("stage") != "first" \
+                    or c.get("set_sha256") != conf["first_set_sha256"] \
+                    or c.get("king_digest") != conf["first_king_digest"] \
+                    or v["digest"] not in (c.get("members") or []):
+                continue
+            pv = _prior_verdict(p, v["digest"], c.get("index"))
+            if pv and pv.get("stage") == "first" and pv.get("cleared") is True \
+                    and pv.get("outcome") == "confirm_pending" \
+                    and not wids & set(c.get("window_ids") or []):
+                return True
+    return False
+
+
+def _hold_problem(priors, res: dict) -> str | None:
+    """Why no verified earlier report shows ``res["held_from"]``: the report
+    at that boundary with that body digest, where the digest's confirmation
+    cleared ``confirmed`` with that LCB, KING_D and set, and its gate record
+    is absent or holds it (``bench_hold``)."""
+    hf, dg = res["held_from"], res["digest"]
+    p = next((p for b, d, p in priors
+              if b == hf["boundary"] and d == hf["report_sha256"]), None)
+    if p is None:
+        return (f"{str(dg)[:12]}: no verified report at boundary {hf['boundary']} with body "
+                f"digest {hf['report_sha256'][:12]} (the hold is not in the chain)")
+    for pv in p.get("verdicts") or []:
+        if not isinstance(pv, dict) or pv.get("digest") != dg:
+            continue
+        cohorts = p.get("cohorts") or []
+        ci = pv.get("cohort")
+        c = cohorts[ci] if isinstance(ci, int) and 0 <= ci < len(cohorts) else None
+        if pv.get("stage") == "confirm" and pv.get("cleared") is True \
+                and pv.get("outcome") == "confirmed" and pv.get("lcb") == hf["lcb"] \
+                and pv.get("king_digest") == hf["king_d"] and isinstance(c, dict) \
+                and c.get("stage") == "confirm" and c.get("set_sha256") == hf["set_sha256"]:
+            break
+    else:
+        return f"{str(dg)[:12]}: held_from does not match a cleared, held confirmation"
+    pg = p.get("gate")
+    if pg is not None and not any(isinstance(r, dict) and r.get("digest") == dg
+                                  and r.get("outcome") == "bench_hold"
+                                  for r in (pg.get("results") if isinstance(pg, dict)
+                                            else None) or []):
+        return f"{str(dg)[:12]}: held_from's report gated it without a bench_hold"
+    return None
+
+
+def _chain_problems(report: dict, prior_reports, signer_hotkey: str) -> str | None:
+    """Chain mode: every confirm verdict's first clear and every
+    ``held_from`` is shown by a verified earlier report, else why not."""
+    priors = _verified_priors(list(prior_reports), signer_hotkey)
+    boundary = int(report["boundary"])
+    cohorts = report["cohorts"]
+    for v in report.get("verdicts") or []:
+        if v["stage"] != "confirm":
+            continue
+        if not _first_clear_shown(priors, boundary, v, cohorts[int(v["cohort"])]):
+            return (f"{v['digest'][:12]}: no verified earlier report shows the first clear "
+                    f"{str(v['confirmation']['first_set_sha256'])[:12]}")
+    for res in (report.get("gate") or {}).get("results") or []:
+        if "held_from" in res:
+            why = _hold_problem(priors, res)
+            if why:
+                return why
+    return None
+
+
+def _sentinel_problem(report: dict, era_sentinel) -> str | None:
+    """``gate.sentinel`` against the era's W-S1 record (``None``: unarmed)."""
+    if era_sentinel is not None and (not isinstance(era_sentinel, dict)
+                                     or not isinstance(era_sentinel.get("suite"), str)):
+        return f"era_sentinel {era_sentinel!r} is neither None nor a W-S1 record"
+    gate = report.get("gate")
+    if not isinstance(gate, dict):
+        return None
+    want = None if era_sentinel is None else era_sentinel["suite"]
+    if gate.get("sentinel") != want:
+        return f"gate.sentinel {gate.get('sentinel')!r} is not the era's W-S1 suite {want!r}"
+    return None
+
+
+_UNSET = object()
+
+
+def check_lane_d(report: dict, cfg, *, signer_hotkey: str, prior_reports=None,
+                 era_sentinel=_UNSET) -> CheckResult:
     """PASS on a genuine report; FAIL when the signature, ``rows_sha256``,
-    a stated parameter or the verdict re-derived from the rows disagrees."""
+    a stated parameter or the verdict re-derived from the rows disagrees,
+    or the crown's provenance does not hold (RV7 B2).
+
+    ``prior_reports`` (chain mode, what W9 runs): the earlier signed reports
+    the auditor holds, in any order; each confirm verdict's first clear and
+    each ``held_from`` must be shown by one that verifies under
+    ``signer_hotkey``. ``era_sentinel``: the era's W-S1 receipt record
+    (``{"suite", "block", "block_hash"}``) or ``None`` when W-S1 is unarmed;
+    left unset, ``gate.sentinel`` is not pinned."""
     from ..shared.sr25519 import SignatureVerifierUnavailable
 
     if not isinstance(report, dict) or report.get("schema") != SCHEMA:
@@ -435,6 +693,15 @@ def check_lane_d(report: dict, cfg, *, signer_hotkey: str) -> CheckResult:
             diff = sorted(k for k in set(want) | set(report.get("params") or {})
                           if (report.get("params") or {}).get(k) != want.get(k))
             return _fail(NAME, f"stated params differ from config on {diff}")
+        # RV7 B2 (c): the bootstrap seed is the boundary's and the pool's,
+        # never a free choice the producer could grind.
+        want_seed = f"lane-d/1:{boundary}:{report['pool']['sha256']}"
+        if report.get("seed") != want_seed:
+            return _fail(NAME, f"seed {report.get('seed')!r} != {want_seed!r}")
+        if era_sentinel is not _UNSET:
+            why = _sentinel_problem(report, era_sentinel)
+            if why:
+                return _fail(NAME, why)
         rows = list(report.get("rows") or [])
         if hashlib.sha256(_canon(rows)).hexdigest() != report.get("rows_sha256"):
             return _fail(NAME, "rows_sha256 does not match the rows")
@@ -474,6 +741,13 @@ def check_lane_d(report: dict, cfg, *, signer_hotkey: str) -> CheckResult:
                    else "no gate result passes")
             return _fail(NAME, f"crowned {report.get('crowned')!r} / king changed, but {why}: "
                                f"nothing may crown")
+        if prior_reports is not None:
+            try:
+                why = _chain_problems(report, prior_reports, signer_hotkey)
+            except SignatureVerifierUnavailable as e:
+                return _warn(NAME, f"cannot verify the prior reports' signatures: {e}")
+            if why:
+                return _fail(NAME, f"chain: {why}")
         court = (report.get("pay") or {}).get("court") or []
         if float((report.get("pay") or {}).get("share", -1.0)) != float(cfg.share):
             return _fail(NAME, "pay share differs from config")
