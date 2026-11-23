@@ -99,6 +99,38 @@ LaneDBenchHostError(RuntimeError)    # every refusal below (the gate holds)
   host has it: once per settlement, with the same `{digest: effective
   context}` map it forecasts at, before returning.
 
+### Sidecar settings (tests-correction 2026-11-23, `test_w3b6a_settings.py`)
+
+The lane D sweep runs the sidecar with exactly the settings lane A's
+DEC-CA-0063 sweep uses (`validator_bench._vbench_run_sidecar_many`), never a
+hard-coded copy, so a lane D and a lane A bench of the same checkpoint
+match:
+
+```
+lane_d_bench_host.bench_settings(cfg) -> {
+    "num_samples": [eval] benchmark_num_samples or [eval] num_samples,
+    "max_series":  [eval] cascade_bench_max_series,
+    "batch_size":  512,                          # the sidecar default lane A runs at
+    "workers":     str([eval] bench_workers),
+    "data_dir":    [eval] gift_gate_data_dir or None,
+    "timeout_s_per_checkpoint": int([eval] bench_hold_max_hours * 3600)
+                                if cascade_bench_max_series == 0 else 1800}
+SSHBenchHost(hosts_path, *, cache_dir, budget_bytes, settings, grants=None, run=None)
+```
+
+- **Box:** the request gains a required `"settings"` key, the five sidecar
+  values above (not the timeout). The SSH timeout is
+  `timeout_s_per_checkpoint × len(digests)`. `load_inputs_services` builds
+  the bench host with `settings=bench_settings(cfg)`.
+- **Pod:** `request["settings"]` is required and exact: `num_samples` and
+  `batch_size` are ints > 0, `max_series` is an int ≥ 0, `workers` is a str,
+  `data_dir` is a str or null, and nothing else. Anything else is a
+  `ValueError` and nothing is fetched or swept. The sidecar is called as
+  `sidecar(dirs, suites, settings)`. The default passes them to
+  `benchmarks.run_bench_reports` (`num_samples=`, `max_series=`,
+  `batch_size=`, `workers=`, `data_dir=`; `device` stays the CLI's
+  `--device`, `cuda` by default as in lane A's host path).
+
 ## Consensus
 
 The transport moves rows only. What decides is `paired_gate` on the three
