@@ -290,6 +290,20 @@ def _write_forge_mirror(tmp_path, as_of):
     return root
 
 
+def _harvest_digest(series) -> str:
+    """sha256 over everything a harvested series hands the builder, in order."""
+    import hashlib
+    import json
+
+    h = hashlib.sha256()
+    for s in series:
+        v = np.ascontiguousarray(np.asarray(s.values, dtype=np.float64))
+        h.update(json.dumps([s.series_id, s.freq, s.seasonal_period, s.domain, s.source,
+                             sorted((s.attrs or {}).items()), list(v.shape)]).encode())
+        h.update(v.tobytes())
+    return h.hexdigest()
+
+
 def test_tsbench_forge_reads_mirror_and_labels_clusters(tmp_path):
     from cascade.pool.sources.tsbench_forge import TsbenchForgeSource
 
@@ -311,6 +325,27 @@ def test_tsbench_forge_reads_mirror_and_labels_clusters(tmp_path):
     assert daily.freq == "D" and daily.seasonal_period == 7
     # The future-dated snapshot (and its absurd row) never entered the series.
     assert float(np.nanmax(daily.values)) < 1e6
+
+
+def test_tsbench_forge_untagged_output_is_pinned(tmp_path):
+    """Untagged catalog entries (no ``rollup``) must harvest byte-identically to
+    the pre-rollup / file-date-freshness reader. Digests were taken from that
+    reader on these fixtures; a change here is a pool-content change."""
+    from cascade.pool.sources.tsbench_forge import TsbenchForgeSource
+
+    as_of = dt.date(2026, 6, 1)
+    ctx = HarvestContext(as_of=as_of, context_length=512, horizon=16, max_series=100)
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    out = list(TsbenchForgeSource(_write_forge_mirror(tmp_path / "a", as_of))
+               .harvest(lambda u, p: None, ctx))
+    assert _harvest_digest(out) == (
+        "e40d2305cab986ec448def06bdf8a5e9765aae7a77a2e2fc1f8ec48121192ecc")
+    sampled = list(TsbenchForgeSource(_write_wide_panel(tmp_path / "b", as_of),
+                                      max_series_per_source=4, panel_sample_seed="block:1")
+                   .harvest(lambda u, p: None, ctx))
+    assert _harvest_digest(sampled) == (
+        "d0cfeddc72f6dc9b1213678922d4ce079d9860a563b1f37bf5d1f4d14a57c871")
 
 
 def test_tsbench_forge_raises_when_everything_is_stale(tmp_path):

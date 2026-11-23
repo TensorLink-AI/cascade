@@ -62,6 +62,10 @@ def _build_parser() -> argparse.ArgumentParser:
                         "weight-set instead of voting the champion, while staying "
                         "Yuma-active. Same as [validator] force_burn = true. Champion "
                         "state is untouched; drop the flag and restart to resume voting.")
+    p.add_argument("--lane-d-inputs", type=Path, default=None,
+                   help="W8c: the lane D inputs TOML (intake state dir, pool_d pins, house "
+                        "pointer + signer, eval hosts; cascade.validator.lane_d_inputs."
+                        "load_inputs_services). Read only while [lane_d] is armed.")
     p.add_argument("--offline", action="store_true", help="No chain/Hippius; print state and exit.")
     p.add_argument("--satellite", action="store_true",
                    help="Run as a DEC-CA-0058 satellite: replay the main validator's "
@@ -498,16 +502,42 @@ def main(argv: list[str] | None = None) -> int:
     # its thread (a websocket is never shared with the poll ``client``).
     from .lane_d_wiring import build_lane_d_step
 
+    # W8c: its settlement inputs come from the source --lane-d-inputs
+    # configures (intake entries, pinned pool_d, the signed house pointer, the
+    # eval host's forecasts), read on the worker's thread through the source's
+    # own chain client. Unarmed nothing is read or built.
     lane_d_store = None
+    lane_d_services = None
     if int(runner.cfg.lane_d.from_block or 0) > 0:
         from ..shared.hippius import open_manifest_store
 
         lane_d_store = open_manifest_store(runner.cfg.storage)
+        if args.lane_d_inputs is None:
+            log.error("lane D is armed but --lane-d-inputs is not set: every lane D "
+                      "settlement refuses inputs_unavailable")
+        else:
+            from .lane_d_inputs import LaneDInputsConfigError, load_inputs_services
+
+            try:
+                lane_d_services = load_inputs_services(runner.cfg, args.lane_d_inputs)
+            except LaneDInputsConfigError as e:
+                print(e, file=sys.stderr)
+                return 2
+    lane_d_dir = Path(runner.cfg.validator.state_db_path).parent
+    lane_d_inputs = None
+    if lane_d_services is not None:
+        from .lane_d_inputs import build_lane_d_inputs
+
+        lane_d_inputs = build_lane_d_inputs(
+            runner.cfg, state_dir=lane_d_dir,
+            chain_factory=lambda: ChainClient.from_config(runner.cfg, network=args.network),
+            **lane_d_services)
     runner.lane_d_step = build_lane_d_step(
-        runner.cfg, state_dir=Path(runner.cfg.validator.state_db_path).parent,
+        runner.cfg, state_dir=lane_d_dir,
         signer=runner.bench_signer,
         chain_factory=lambda: ChainClient.from_config(runner.cfg, network=args.network),
-        store=lane_d_store)
+        store=lane_d_store, inputs=lane_d_inputs,
+        bench=None if lane_d_inputs is None else lane_d_inputs.bench)
     if runner.lane_d_step is not None:
         log.info("lane D armed from block %d: settlements run off the poll thread",
                  int(runner.cfg.lane_d.from_block))

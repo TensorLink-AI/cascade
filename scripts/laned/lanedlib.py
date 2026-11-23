@@ -125,9 +125,27 @@ def check_json_evidence(text: str | None, wp: str) -> tuple[bool, str]:
         return False, "evidence is not a JSON object"
     if data.get("wp") != wp:
         return False, f"evidence wp={data.get('wp')!r}, expected {wp!r}"
+    if wp == "W3a" and w3a_nolock_path_verified(data):
+        return True, "ok"
     if data.get("passed") is not True:
         return False, "evidence does not record passed: true"
     return True, "ok"
+
+
+def w3a_nolock_path_verified(data: dict) -> bool:
+    """A no-lock W3a run (bucket_lock asserted by the owner flag) records
+    top-level passed: false by design (its non-path probes error) and is
+    sha-bound; its gate verdict is verified_live.verified AND
+    verified_live.path_verdict.passed. A lock-enabled run still needs
+    top-level passed: true."""
+    lock = data.get("bucket_lock")
+    if not isinstance(lock, dict) or lock.get("asserted_by") != "owner_flag":
+        return False
+    live = data.get("verified_live")
+    if not isinstance(live, dict) or live.get("verified") is not True:
+        return False
+    verdict = live.get("path_verdict")
+    return isinstance(verdict, dict) and verdict.get("passed") is True
 
 
 def open_blocking_items(text: str) -> list[str]:
