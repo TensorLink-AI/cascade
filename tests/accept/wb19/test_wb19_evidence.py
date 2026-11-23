@@ -7,7 +7,8 @@ re-checked against the SHIPPED chain.toml (contract digest re-derived at the
 recorded block, image pin), the pinned torch, the GPU-vs-SKU rule, the rate and
 wall arithmetic, the table re-derived from the runs, coverage of
 ``[lane_b] funded_pod_skus`` and of the owner's OA8 GPU types, the full 8xH100
-lane A leg, the tool commit on this repo's history, and the WB22 reader.
+lane A leg when one is present (OPTIONAL since the owner skipped it
+2026-11-23), the tool commit on this repo's history, and the WB22 reader.
 
 Without ``$LANED_EVIDENCE`` they SKIP, so WB19 reaches L2/L3 before the pod
 run; L4 needs a green ``accept WB19 --evidence ...`` on main. When it IS set,
@@ -233,9 +234,15 @@ def evidence_problems(ev: dict, cfg, *, oa8: Path | None = OA8_PATH,
     for r in exp:
         if r["peak_memory_bytes"] >= r["gpu"]["memory_total_bytes"]:
             p.append(f"{r['sku']}: does not fit memory at the contract micro-batching")
+    # The full lane A leg is OPTIONAL (owner 2026-11-23, "Yes skip it"; plan
+    # rev6.5): the measured [round] funded_sku_wall_seconds stands for the
+    # full-leg wall. When a full run IS present it is validated as before.
     full = [r for r in runs if r["mode"] == "full" and r["sku"] == FULL_SKU]
-    if len(full) != 1:
-        p.append("needs exactly one full lane A leg on 8xH100")
+    if len(full) > 1:
+        p.append("more than one full lane A leg on 8xH100")
+    elif not full:
+        if ev.get("lane_a_full_leg") is not None:
+            p.append("lane_a_full_leg is set but no full run backs it")
     else:
         f, la = full[0], ev.get("lane_a_full_leg") or {}
         o = f["wall"]["overhead_seconds"]
@@ -339,11 +346,40 @@ def test_verifier_refuses_a_table_not_derived_from_runs(tmp_path_factory):
     assert any("table" in x for x in probs), probs
 
 
-def test_verifier_refuses_missing_full_leg(tmp_path_factory):
-    ev = copy.deepcopy(_synthetic(tmp_path_factory))
+def _without_full_leg(ev: dict) -> dict:
     ev["runs"] = [r for r in ev["runs"] if r["mode"] != "full"]
+    ev["lane_a_full_leg"] = None
+    return rehash(ev)
+
+
+def test_verifier_accepts_evidence_without_a_full_leg(tmp_path_factory):
+    """Owner 2026-11-23 ("Yes skip it", plan rev6.5): WB19 runs only the
+    per-GPU expert legs; the full 8xH100 lane A leg is optional."""
+    ev = _without_full_leg(copy.deepcopy(_synthetic(tmp_path_factory)))
+    assert evidence_problems(ev, chain_cfg(), oa8=None, check_git=False) == []
+
+
+def test_verifier_refuses_lane_a_full_leg_without_a_full_run(tmp_path_factory):
+    ev = copy.deepcopy(_synthetic(tmp_path_factory))
+    la = ev["lane_a_full_leg"]
+    ev = _without_full_leg(ev)
+    ev["lane_a_full_leg"] = la
     probs = evidence_problems(rehash(ev), chain_cfg(), oa8=None, check_git=False)
-    assert any("full lane A leg" in x for x in probs), probs
+    assert any("no full run backs it" in x for x in probs), probs
+
+
+def test_verifier_still_checks_a_present_full_leg(tmp_path_factory):
+    ev = copy.deepcopy(_synthetic(tmp_path_factory))
+    ev["lane_a_full_leg"]["train_seconds"] *= 2
+    probs = evidence_problems(rehash(ev), chain_cfg(), oa8=None, check_git=False)
+    assert any("lane_a_full_leg does not match" in x for x in probs), probs
+
+
+def test_verifier_refuses_two_full_legs(tmp_path_factory):
+    ev = copy.deepcopy(_synthetic(tmp_path_factory))
+    ev["runs"].append(copy.deepcopy(next(r for r in ev["runs"] if r["mode"] == "full")))
+    probs = evidence_problems(rehash(ev), chain_cfg(), oa8=None, check_git=False)
+    assert any("more than one full lane A leg" in x for x in probs), probs
 
 
 def test_verifier_refuses_unknown_tool_commit(tmp_path_factory):

@@ -3,10 +3,17 @@
 WB19 (plan §3.0 lane B rows, §12b.6 LB6, D42 / D42b, §17.4 OA8) measures an
 expert-only lane B leg **per candidate GPU type**: expert-only step rate, leg
 overhead split from training, peak memory at the contract micro-batching,
-image qualification (driver + pinned torch), plus one full lane A leg on
-8×H100 (does the measured full-leg wall cover training only?). It runs in
+image qualification (driver + pinned torch). It runs in
 `pod (owner yes, OA8)`; its Accept is
 `scripts/laned/accept WB19 --evidence evidence/wb19.json`.
+
+**Owner decision 2026-11-23 ("Yes skip it"; plan rev6.5 (a)): WB19 does NOT
+run the full lane A leg on 8×H100.** Only the short per-GPU expert legs run
+(cost cap $20). The measured `[round] funded_sku_wall_seconds` in the shipped
+`chain.toml` stands for the full-leg wall. The full leg is therefore
+**optional** in the evidence: none is required, and `lane_a_full_leg` may be
+`null`. `--mode full` stays in the tool contract (harmless, unused), and if a
+full-mode run IS present it is validated exactly as before.
 
 WB22 and WB23 consume the result: WB22 is "the trainer-side per-GPU step-rate
 table from WB19"; WB23 fixes `steps = floor(train_hours × 3600 ×
@@ -237,7 +244,7 @@ Otherwise it writes `laned_wb19/1` and exits 0:
                                "tokens_per_s", "overhead_seconds", "peak_memory_bytes",
                                "memory_total_bytes", "run_body_sha256"}, …}},
  "lane_a_full_leg": {"sku": "8xH100", "train_seconds", "total_seconds", "overhead_seconds",
-                     "funded_sku_wall_seconds": 8801} | null,
+                     "funded_sku_wall_seconds": 8801} | null (null: no full run),
  "oa8_sha256": "<sha256 of the --candidates file bytes>" | null,
  "body_sha256": "<64>"}
 ```
@@ -247,10 +254,12 @@ Otherwise it writes `laned_wb19/1` and exits 0:
 - **`passed`** is true only when every check passes:
   - `coverage`: every candidate has an expert run. The detail names the
     missing SKUs;
-  - `full_leg`: one full run on `8xH100` exists;
+  - `full_leg`: at most one full run on `8xH100` (zero passes: the full
+    leg is optional since the owner skipped it 2026-11-23; two fail);
   - `memory`: every expert run has `peak < memory_total`. The detail names
     the failing SKUs.
-- **`lane_a_full_leg.funded_sku_wall_seconds`** is
+- **`lane_a_full_leg`** is `null` when there is no full run. When there is
+  one, **`lane_a_full_leg.funded_sku_wall_seconds`** is
   `[round] funded_sku_wall_seconds["8xH100"]` of `--chain-toml`. Put next to
   `train_seconds` / `total_seconds`, it answers the plan's question: is the
   measured full-leg wall training-only?
@@ -306,8 +315,10 @@ the **shipped** `chain.toml`:
   list only after measurement, D42 1) and every `gpu_types` entry of the
   committed `evidence/owner/oa8.json` (required, with `oa8_sha256` binding its
   bytes).
-- **The full leg:** exactly one full `8xH100` leg, and `lane_a_full_leg`
-  matches it.
+- **The full leg (optional, owner 2026-11-23):** none is required. With no
+  full run, `lane_a_full_leg` must be `null` (a value with no run behind it is
+  refused). With one full `8xH100` leg, `lane_a_full_leg` must match it, as
+  before. More than one is refused.
 - **Memory:** every row fits memory.
 - **The reader:** the WB22 reader loads the file, and its rates match.
 
@@ -321,8 +332,9 @@ hashed into the evidence) and the owner-committed evidence PR. The
 `test_verifier_*` tests prove that hand edits are refused: an edited rate
 with no rehash, a dry-run source, the wrong torch, a GPU count that doesn't
 match the SKU, a changed `micro_batches`, out-of-memory, an inconsistent
-`tokens_per_s`, a table not derived from the runs, a missing full leg and an
-unknown tool commit.
+`tokens_per_s`, a table not derived from the runs, a `lane_a_full_leg` that
+doesn't match its full run or has none behind it, two full legs and an
+unknown tool commit. Evidence without a full leg passes.
 
 ## The pod command (operator, after OA8; testnet pod, pinned image)
 
@@ -337,7 +349,7 @@ CASCADE_TRAIN_IMAGE_DIGEST=sha256:<pinned> python -P scripts/laned_wb19_measure.
   --out wb19-<SKU>.json
 ```
 
-On the 8×H100 pod, also run `--mode full` (no `--steps`, no selection). Then,
+No `--mode full` run (owner skipped the full lane A leg 2026-11-23). Then,
 anywhere: `combine --chain-toml chain.toml --runs wb19-*.json --candidates
 evidence/owner/oa8.json --out evidence/wb19.json`. The owner commits
 `evidence/wb19.json`.
@@ -345,10 +357,10 @@ evidence/owner/oa8.json --out evidence/wb19.json`. The owner commits
 ## Failure on main (expected, for the right reason)
 
 Neither PATHS file exists on main. `scripts/laned/accept WB19
---expect-fail` gives 132 collected, 1 passed (`test_name_rule_examples`,
+--expect-fail` gives 136 collected, 1 passed (`test_name_rule_examples`,
 the test's own name rule), 5 skipped (the 2 `test_evidence_*` without
 `$LANED_EVIDENCE`, and on the prod box the 3 non-prod CLI tests) and
-126 right-reason failures:
+130 right-reason failures:
 
 - `AssertionError` "scripts/laned_wb19_measure.py is missing (WB19 builds
   it)" (in-process and CLI);
