@@ -15,9 +15,14 @@ The W1.5, W5a–W5e, W7a and W7b tests must stay green.
 
 Every state, report and receipt comes from real `settle_lane_d` runs on a
 synthetic chain (numpy only, no torch): challenger X (sharp) and the genesis
-house H0 (bad). boundary(1) is X's first clear (`confirm_pending`),
-boundary(2) confirms and crowns X on a disjoint snapshot, boundary(3) judges
-nothing. Whenever `settle_lane_d` takes the W5e gate keywords
+house H0 (bad). **(rev6.11 (b): no confirmation duel; the crown is decided
+at the first verdict.)** The floors are 48 windows / 4 sources and each
+snapshot holds 24 fresh windows, so boundary(1) is a floor wait (X
+`pending` / `pending_floor`, nothing judged), boundary(2) is X's first
+verdict on snapshots 1 and 2 (clear, A10, gate `pass`, crowned) and
+boundary(3) judges nothing. That chain is `helpers.W7cChain`; the shared
+`helpers.Chain` and `lane_d_cfg()` keep the 24-window default the W14 and
+W17 helpers build on (their own tests-correction follows W5e). Whenever `settle_lane_d` takes the W5e gate keywords
 (`boundary_block_hash`, `sentinel`, `bench`), the fixture passes them with a
 passing bench session (an armed crowning without them fails closed, W5e
 RV5). The bench pod is the one mocked external service. The signer is a
@@ -242,6 +247,42 @@ implementer's choice and isn't pinned.
   X, X isn't in `prior_kings`, and the next settlement's prior is the
   recovered posterior.
 
+## Migration of a `confirm_pending` state (rev6.11, `test_w7c_confirm_migration.py`)
+
+Plan rev6.11 (b) drops the confirmation duel (W5e removes the `confirm`
+stage). A testnet `lane_d_state.json` written by the old code may still hold
+an entry in `confirm_pending` with its `confirm` record
+(`{first_set_sha256, king_digest, king_reveal_ts, rule, boundary}`,
+`frozen_set = null`, `used_windows` = the first-clear set). At the first
+settlement after the release `settle_lane_d` migrates it:
+
+- `confirm.king_digest == KING_D`: the entry is a **crown candidate on its
+  first-clear set**. A10 and the §1.3b gate decide it with no second duel;
+  with a passing gate it is crowned at that settlement (the gate is swept).
+- otherwise: `pending` / `pending_floor`, the first clear discarded (the old
+  D20 (a) outcome). Its first-clear windows stay in `used_windows`, so it is
+  never re-judged on them (§1.3: an entry is never judged twice on a
+  window).
+- Either way the settlement's signed report carries the typed tag
+  `confirm_state_migrated` as a string value somewhere in its body (where is
+  the implementer's choice; `extensions` is the open place). The next
+  settlement's report doesn't: the migration runs once. A log line is free;
+  if it is a lane D log call it follows the W0c `follower_patterns` rule
+  (`lane_d_*` tag with a cascade-ops pattern), which is not pinned here.
+- The receipt binds it: `prior_state_sha256` is the legacy state as loaded
+  (the caller's `expect_prior_sha256` equals it), `posterior_state_sha256`
+  the migrated state written, and `verify_receipt` accepts the pair.
+- Two runs from the same legacy state give byte-identical states and equal
+  receipts.
+- No state or report written by the new code contains `confirm_pending`.
+- `[lane_d] confirm_on_king_change` stays a parsed legacy key with no
+  effect: `"restart"` and `"original"` give byte-identical reports, states
+  and receipts (it leaves the config echo).
+
+Where the candidate's first-clear LCB (for ranking among gate passes) comes
+from (the persisted report of `confirm.boundary`, or a re-run on the stored
+set) is the implementer's choice.
+
 ## Not pinned
 
 - The values of `STATE_SCHEMA` and `RECEIPT_SCHEMA`.
@@ -308,3 +349,22 @@ and so do the lost-state tests that pin what must keep working (genesis with
 no artefacts, first-settlement recovery, recovery from b1 state with only
 b2's report, empty/truncated state as `bad_json`).
 The atomic write is already there, and W7c keeps it.
+
+### rev6.11 tests-correction (failing on main at `315d240`)
+
+`helpers.py` changed (the 48-window floors, `other_crown`), so every test
+file runs in the tests-correction classification. On main the old code
+first-clears X at boundary(2) (`confirm_pending`) and its confirmation set
+(snapshot 3 alone, 24 windows) is below the floors, so nothing is crowned.
+17 tests fail on that, each on an `AssertionError`; the other 82 pass.
+
+| test | failure on main |
+|---|---|
+| `test_w7c_gated_recovery.py` crowning-report, bench-hold and new-process cases | X is not crowned (or held) at boundary(2); a held X is `confirm_pending`, not `pending` with `gate_hold` |
+| `test_w7c_restart.py` settled-boundary and repeated-restart cases, `test_w7c_lost_state.py` reproduction and restore, `test_w7c_receipt.py` chain link | X is not KING_D after boundary(2) |
+| `test_w7c_confirm_migration.py` (all six) | main runs the confirmation duel on the legacy state (no crown, still `confirm_pending`, no `confirm_state_migrated` tag), writes `confirm_pending` itself, and echoes `confirm_on_king_change` in `params` |
+
+The three "a different judgement at the same boundary" edits (recovery
+`edited_after_signing`, the swapped report, the defective `body`) now toggle
+`crowned` (`helpers.other_crown`) instead of setting it to `null`, so the
+edit changes the body whatever boundary(2) decided.
