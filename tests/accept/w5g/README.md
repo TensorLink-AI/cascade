@@ -113,6 +113,7 @@ SKIP_REASONS`, the digest not in `judged`) or nothing for a judged entry
 | digest equals the house's | `duplicate_digest` | `closed` | yes |
 | second entry of an open hotkey | `hotkey_has_open_entry` | `closed` | yes |
 | context not in `contexts` | `context_not_armed` | `closed` | yes |
+| **(plan rev6.15)** armed record given, no armed variant ≤ the declared context (declared 4096, armed 8192/16384) | `context_below_armed` | `pending` | yes |
 | NaN forecasts at selection | `checkpoint_fault` | `closed` | yes |
 | NaN on the drawn suite at confirmation | `checkpoint_fault` | `closed` | no |
 | NaN on the drawn suite at a re-gate | `checkpoint_fault` | `closed` | yes |
@@ -181,3 +182,13 @@ implementation lands every fixture window would be refused. Every fixture
 feed now pins `embargo_hours: 0.0` (e = 0, the rev3 rule byte for byte, so
 every verdict is unchanged); on main the key is ignored. No assertion
 changed; every test passes on main and with the W5a implementation.
+
+## Correction (plan rev6.11 (b)): crown at the first verdict
+
+The confirmation duel is dropped (owner 2026-11-23): a crown is decided at
+the first verdict, first clear (max-T LCB vs KING_D) ∧ A10 ∧ the §1.3b gate.
+There is no `confirm` stage, no `confirm_pending` status or reason and no
+`lost_confirmation`; a held first clear is `hold` / `bench_hold`. This WP's
+crowning chains move to that rule with nothing weakened. The Flow lists X from boundary 2, where its first clear is gated with `mode2`. A held clear is `hold` / `bench_hold` (the only held status). A re-queued entry's fresh first verdict is decided at once (crowned on a passing gate, else held with a new count). The `confirm_pending` and `lost_confirmation` cases are gone with their reasons, and `test_no_confirm_stage_reason_or_status_exists` pins that. On main the
+old code still runs the confirmation stage, so the changed tests fail on an
+assertion until the W5e implementation lands.

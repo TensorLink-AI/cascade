@@ -81,9 +81,14 @@ def test_fixture_chain_shapes(chains):
 
     h = _reports(chains["held"])
     assert [r["crowned"] for r in h] == [None, None, x], "held: X crowned at b3"
-    assert "gate" not in h[1] and _outcomes(h[1]) == ["bench_hold"], \
+    # A held first clear is status `hold`, reason `bench_hold`; its verdict
+    # outcome is `cleared` (never crowned), as W5g, W7d's house chains (C
+    # in `open_copy`) and W17 pin it.
+    assert "gate" not in h[1] and _outcomes(h[1]) == ["cleared"], \
         "held: b2's ungated first clear is held"
-    assert _status(h[1], x) == ["pending"], "held: a held candidate stays pending"
+    assert _status(h[1], x) == ["hold"], "held: a held candidate stays open as hold"
+    assert [e.get("reason") for e in h[1].get("entries") or [] if e.get("digest") == x] \
+        == ["bench_hold"], "held: the hold's reason is bench_hold"
     assert h[2]["verdicts"] == [] and _gate_digests(h[2]) == [(x, "pass")]
 
     hb = _reports(chains["house_bar"])

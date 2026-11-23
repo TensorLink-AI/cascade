@@ -156,7 +156,9 @@ def quantiles_around(median: np.ndarray, spread: float) -> np.ndarray:
 
 def forecasts(records, challengers, house: str) -> dict:
     """Challengers close to the truth, the house 3 sd off: a scored challenger
-    clears, so a judged entry is visible in state as `confirm_pending`."""
+    clears, so a judged entry is visible in state as a held first clear
+    (`hold` / `bench_hold`: rev6.11 (b) crowns at the first verdict, and the
+    legacy call has no gate inputs, so W5e holds it)."""
     fc = {d: {} for d in [*challengers, house]}
     rng = np.random.default_rng(7)
     for r in records:

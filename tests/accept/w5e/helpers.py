@@ -9,7 +9,11 @@ Copied from docs/plans/LANE_D_PLAN.md (rev6) §1.3 "Verdict":
   is decided at the FIRST verdict, first clear (max-T LCB against KING_D)
   ∧ A10 ∧ the §1.3b gate. There is no `confirm` stage, no `confirm_pending`
   state and no D20 king-change rule; `confirm_on_king_change` is a legacy
-  key, parsed and ignored.
+  key, parsed and ignored. The stage leaves the producer, the audit
+  (`cascade/audit/lane_d.py`) and the replay
+  (`cascade/satellite/lane_d_replay.py`) together (PATHS, orchestrator
+  2026-11-23), so the honest first-verdict crowns these fixtures build are
+  audited and replayed as crowns.
 
 §1.3b: one gate suite per crowning, drawn from the settlement boundary's
 block hash over `gate_suites` minus the era's §16 sentinel; paired on one

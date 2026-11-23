@@ -245,12 +245,26 @@ def test_an_unarmed_declaration_is_scored_at_the_highest_armed_variant():
 
 def test_never_scored_above_the_declared_context():
     """The highest armed variant is taken among those not above the declared
-    context (a model declared at 32k is never run at 64k); only when every
-    armed variant is above it does the lowest armed one score it."""
+    context (a model declared at 32k is never run at 64k)."""
     ec = _s().effective_context
     assert ec(32768, (4096, 8192, 16384, 65536, 131072)) == 16384
     assert ec(65536, (4096, 131072)) == 4096
-    assert ec(4096, (8192, 16384)) == 8192
+
+
+def test_no_armed_variant_at_or_below_the_declared_context_is_none():
+    """rev6.15 (owner 2026-11-23, "Highest ≤ declared, else skip"): when every
+    armed variant is above the declared context, the entry is not scored
+    (``None``; the settlement skips it ``context_below_armed``), never run at
+    the lowest armed variant above its declaration."""
+    ec = _s().effective_context
+    assert ec(4096, (8192, 16384)) is None
+    assert ec(8192, [16384, 131072]) is None
+    assert ec(16384, (32768,)) is None
+    # Order and container type do not matter; one armed variant ≤ declared is enough.
+    assert ec(16384, [131072, 8192, 32768]) == 8192
+    for c in (4096, 8192, 16384, 32768, 65536, 131072):
+        got = ec(c, (8192, 32768))
+        assert got is None or got <= c, (c, got)
 
 
 def test_the_scored_context_switches_when_its_variant_arms():

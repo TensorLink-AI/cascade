@@ -198,8 +198,9 @@ def test_absent_checks_the_callers_expected_prior(tmp_path):
 
 
 def test_absent_defers_a_pending_crown_never_erases_it(tmp_path):
-    """X's first clear at boundary(1); boundary(2) is absent; X is still
-    confirm_pending and boundary(3) confirms and crowns it."""
+    """X waits on the floors at boundary(1) (pending); boundary(2) is absent;
+    X is still pending and boundary(3) is its first verdict, which crowns it
+    (rev6.11 (b): no confirmation duel)."""
     from cascade.validator.lane_d_state import verify_receipt_chain
 
     chain = Chain(tmp_path)

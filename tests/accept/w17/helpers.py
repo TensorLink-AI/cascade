@@ -272,24 +272,26 @@ def read_report(state_path: Path, boundary: int) -> dict:
 
 def rich_b1(root: Path) -> dict:
     """The queue scenario: every fixture entry revealed before B1, settled
-    once at B1 with ``max_judged_per_coldkey_per_settlement = 1``."""
+    once at B1 with ``max_judged_per_coldkey_per_settlement = 1``. The bench
+    pod is down, so X's first clear (the crowning candidate, rev6.11 (b)) is
+    held open: ``hold`` / ``bench_hold``."""
     fx = Fixture(root)
     cfg = chain_cfg(max_judged_per_coldkey_per_settlement=1)
     sp = fx.state_path("rich")
     s = fx.settle(cfg=cfg, boundary=B1, snapshot=1, state_path=sp, tag="rich",
-                  entries=[fx.x, fx.y, fx.z, fx.l, fx.e, fx.d])
+                  entries=[fx.x, fx.y, fx.z, fx.l, fx.e, fx.d], host=DownHost())
     return {"fx": fx, "cfg": cfg, "state_path": sp, "state": read_state(sp),
             "report": s.report, "reports": [read_report(sp, B1)]}
 
 
 def crowned(root: Path) -> dict:
-    """The king scenario: X and L at B1 (X first clear, L lost), then X
-    confirmed and crowned at B2_NEXT_ERA (the next era) on snapshot 2."""
+    """The king scenario: L at B1 (lost), then X listed and crowned at its
+    first verdict at B2_NEXT_ERA (the next era) on snapshot 2 (rev6.11 (b))."""
     fx = Fixture(root)
     cfg = chain_cfg()
     sp = fx.state_path("crowned")
     s1 = fx.settle(cfg=cfg, boundary=B1, snapshot=1, state_path=sp, tag="crowned",
-                   entries=[fx.x, fx.l])
+                   entries=[fx.l])
     st1 = read_state(sp)
     s2 = fx.settle(cfg=cfg, boundary=B2_NEXT_ERA, snapshot=2, state_path=sp, tag="crowned",
                    entries=[fx.x, fx.l])
@@ -299,12 +301,12 @@ def crowned(root: Path) -> dict:
 
 
 def held(root: Path) -> dict:
-    """The bench-hold scenario: X first clear at B1, then confirmed at B2
-    with the bench pod down: ``confirm_pending`` / ``bench_hold``."""
+    """The bench-hold scenario: B1 lists no entry; X's first clear at B2
+    with the bench pod down is held: ``hold`` / ``bench_hold`` (rev6.11 (b))."""
     fx = Fixture(root)
     cfg = chain_cfg()
     sp = fx.state_path("held")
-    fx.settle(cfg=cfg, boundary=B1, snapshot=1, state_path=sp, tag="held", entries=[fx.x])
+    fx.settle(cfg=cfg, boundary=B1, snapshot=1, state_path=sp, tag="held", entries=[])
     s2 = fx.settle(cfg=cfg, boundary=B2, snapshot=2, state_path=sp, tag="held",
                    entries=[fx.x], host=DownHost())
     return {"fx": fx, "cfg": cfg, "state_path": sp, "state": read_state(sp),

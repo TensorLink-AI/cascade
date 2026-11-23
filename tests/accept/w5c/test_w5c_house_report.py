@@ -82,9 +82,11 @@ SCENARIOS = {
 
 
 def _chain(tmp_path, house_quality: str, y_quality: str | None) -> dict:
-    """The test_w5c_house.py chain, keeping every report: BOUNDARY_1 (K1 vs
-    the genesis house H0), BOUNDARY_2 (K1 confirms, crowned), BOUNDARY_3 (the
-    house refreshes to H1; Y is judged against KING_D = K1 and the house)."""
+    """The test_w5c_house.py chain, keeping every report: BOUNDARY_1 (no
+    entry listed), BOUNDARY_2 (K1 enters and is crowned over the genesis
+    house H0 at its first verdict, rev6.11 (b)), BOUNDARY_3 (the house
+    refreshes to H1; Y is judged against KING_D = K1 and the house, and is
+    crowned when it clears both)."""
     cfg = lane_d_cfg()
     h0 = house("house-0")
     k1 = entry("k1", reveal_ts=T_K1)
@@ -92,12 +94,14 @@ def _chain(tmp_path, house_quality: str, y_quality: str | None) -> dict:
     reports = []
     p1 = group("p1", 6, band_start(T_K1))
     p2 = group("p2", 6, band_start(T_K1) + DAY)
-    for boundary, recs, name in ((BOUNDARY_1, p1, "pool1"), (BOUNDARY_2, p2, "pool2")):
+    for boundary, recs, name, listed in ((BOUNDARY_1, p1, "pool1", []),
+                                         (BOUNDARY_2, p2, "pool2", [k1])):
         pool = write_pool(tmp_path / name, recs, f"w5c-{name}")
         fc = {h0["digest"]: model_forecasts(recs, "bad", "house-0"),
               k1["digest"]: model_forecasts(recs, "fair", "k1")}
-        reports.append(settle(cfg, boundary, pool, [k1], h0, fc, uids(k1), path).report)
-    assert read_state(path)["king"]["digest"] == k1["digest"], "fixture: K1 was not crowned"
+        reports.append(settle(cfg, boundary, pool, listed, h0, fc, uids(k1), path).report)
+    assert reports[-1]["crowned"] == k1["digest"], \
+        "fixture: K1 was not crowned at its first verdict (BOUNDARY_2)"
     h1 = house("house-1", reveal_ts=T_H1)
     y = entry("y", reveal_ts=T_Y, ready_block=ARM_BLOCK + 2 * SETTLEMENT + 40,
               reveal_block=ARM_BLOCK + 2 * SETTLEMENT + 60)
@@ -109,7 +113,10 @@ def _chain(tmp_path, house_quality: str, y_quality: str | None) -> dict:
     reports.append(settle(cfg, BOUNDARY_3, pool, [k1, y], h1, fc, uids(k1, y), path).report)
     state = read_state(path)
     assert state["house"]["digest"] == h1["digest"], "fixture: the house did not refresh"
-    assert state["king"]["digest"] == k1["digest"], "fixture: a miner must hold KING_D"
+    yv = verdict_of(reports[-1], y["digest"])
+    want_king = y["digest"] if yv is not None and yv["cleared"] else k1["digest"]
+    assert state["king"]["digest"] == want_king and not state["king"]["house"], \
+        "fixture: a miner must hold KING_D (Y when it clears both bars, else K1)"
     return {"cfg": cfg, "reports": reports, "k1": k1, "h0": h0, "h1": h1, "y": y,
             "recs": recs}
 
@@ -209,7 +216,9 @@ def test_house_report_verdict_rederives_from_the_reports_rows_alone(chains, scen
         king_cleared = bool(v["lcb"] >= float(cfg.d_margin) and v["gain"] > 0.0)
         assert v["cleared"] is (king_cleared and hv["cleared"]), \
             "cleared != (KING_D cleared AND house cleared), re-derived from signed fields"
-        assert v["outcome"] == ("confirm_pending" if v["cleared"] else "lost")
+        # rev6.11 (b): a clear of both bars (gate pass) crowns at once.
+        assert v["outcome"] == ("crowned" if v["cleared"] else "lost")
+        assert (report["crowned"] == m) is bool(v["cleared"])
         if m == y["digest"]:
             assert (king_cleared, hv["cleared"]) == (want_king, want_house), \
                 "fixture: the scenario does not exercise the branch it names"
@@ -286,7 +295,9 @@ def _house_king_reports(chains, tmp_path):
     s = settle(lane_d_cfg(), BOUNDARY_1, pool, list(members), h, fc, uids(*members),
                tmp_path / "state" / "lane_d_state.json")
     assert s.report["cohorts"] and set(s.report["cohorts"][0]["window_ids"]) == set(wids(cc))
-    return [("house-chain-b1", c["reports"][0]), ("cohort", s.report)]
+    # BOUNDARY_2: K1 is judged while the house holds KING_D (BOUNDARY_1
+    # lists no entry, rev6.11 (b)).
+    return [("house-chain-b2", c["reports"][1]), ("cohort", s.report)]
 
 
 def test_house_holds_king_d_report_carries_no_house_judgement(chains, tmp_path):
@@ -406,7 +417,7 @@ def _flip_to_win(r, c):
     v = _y_verdict(r, c["y"])
     v["house"]["cleared"] = True
     v["cleared"] = True
-    v["outcome"] = "confirm_pending"
+    v["outcome"] = "cleared"
 
 
 def test_audit_fails_a_vs_house_loss_flipped_to_a_win(chains):
@@ -420,13 +431,13 @@ def test_audit_fails_a_house_judgement_where_the_house_holds_king_d(chains):
     from cascade.audit.checks import FAIL, PASS
 
     c = chains("bad", "good")
-    honest = c["reports"][0]
+    honest = c["reports"][1]          # BOUNDARY_2: K1 against the house as KING_D
     res = _audit(honest, c["cfg"])
     assert res.status == PASS, f"the honest report must pass first: {res.status} {res.detail}"
     doctored = copy.deepcopy(honest)
     (cohort,) = doctored["cohorts"]
     hd = doctored["house"]["digest"]
-    assert cohort["king_digest"] == hd, "fixture: the house must hold KING_D at BOUNDARY_1"
+    assert cohort["king_digest"] == hd, "fixture: the house must hold KING_D at BOUNDARY_2"
     cohort["house_digest"] = hd
     for v in doctored["verdicts"]:
         v["house"] = {"digest": hd, "lcb": v["lcb"], "gain": v["gain"], "cleared": v["cleared"]}
