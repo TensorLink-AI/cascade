@@ -8,7 +8,9 @@ dates**: stages are gated (§5).
 
 ## rev6.18 (owner 2026-11-23; main @ 78b1d45): eval v2 (live 50% + public 50%), multivariate, one checker, burn scoping, GPU environments
 
-One owner brief (2026-11-23, "now also do this"), Parts A and B. Plan text
+One owner brief (2026-11-23, "now also do this"), Parts A and B, and the
+owner's answers to its four open items (B12, B9 owner keys, A3 clamp, A5
+BOOM; (owner 2026-11-23, DECIDED: "they're all reasonable")). Plan text
 only. Every changed item elsewhere is marked **(rev6.18)**; superseded text is
 struck, not deleted. Under the rev6.17 rule this is the ONE plan PR for the
 batch; the code lands as the feature PRs in **rev6.18 (F)** below, tests and
@@ -50,13 +52,13 @@ The brief's references were read at 1605ff7. Each was re-read on 78b1d45.
 | B8 | `ab0b412` | **the SHA is not on origin/main.** Its change landed squashed in `0c52d07a` (#471, with the weight keep-alive and bench evidence). The live validator runs `/root/cascade-v2` @ `5e3fade3` (#394), which has neither. `ab0b412` applies cleanly onto `5e3fade3` (merge-tree, no conflict). Deploy-gate needs: see B8 below |
 | B9 | "52 unmarked keys" | **count does not reproduce.** A flattened-key TOML diff of `/root/cascade/chain.toml` vs `origin/main:chain.toml` gives 36 unmarked deployed-side keys + 12 main-only keys in shared tables = 48 (plus 98 keys of tables the deployed file predates). The two owner keys are present as described. Classification below; `cascade-audit decided` today: 2 TYPE findings, exit 1 |
 | B11 | `lane_d.py:86` and `:100-115` | yes (same lines): `:86` `confirm_on_king_change`; `:100-115` the DEC-CA-0062 keys `targets … win_ttl_eras`. No lane D code reads any of them (every same-named read is on `[marketcast]`, `[lane_b]`, `[lane_c]` or the trainer config). `confirm_on_king_change` is still parsed and validated (`lane_d.py:264-266`) |
-| B12 | readers of `init_baseline_geomean` / `init_floor_passed` | **STOP.** They are read: `cascade/shared/receipt.py:974-978` parses both back from archived receipts (the shadow gate has written them into signed verdict bodies since 2026-08-27, so receipt signature verification and audit replay depend on the parse); `receipt.py:498-501` (drop-when-None body); `cascade/validator/loop.py:583-592` (log); `cascade/eval/koth.py:233,454,594-618` (producer). `receipt.py:266` also carries `init_gate_mode` in the default verdict params. Deleting the gate can't delete these fields. Owner call: keep the receipt fields parse-only (read, never written) and delete only the producer + key, or keep the gate |
+| B12 | readers of `init_baseline_geomean` / `init_floor_passed` | **STOP.** They are read: `cascade/shared/receipt.py:974-978` parses both back from archived receipts (the shadow gate has written them into signed verdict bodies since 2026-08-27, so receipt signature verification and audit replay depend on the parse); `receipt.py:498-501` (drop-when-None body); `cascade/validator/loop.py:583-592` (log); `cascade/eval/koth.py:233,454,594-618` (producer). `receipt.py:266` also carries `init_gate_mode` in the default verdict params. Deleting the gate can't delete these fields. ~~Owner call: keep the receipt fields parse-only (read, never written) and delete only the producer + key, or keep the gate~~ **Resolved (owner 2026-11-23, DECIDED: "they're all reasonable"): parse-only receipt fields, producer + key deleted (B12 below)** |
 | B13 | `dedup_probe_*` ignored by the loader | yes: `[round]` `dedup_probe_mode`, `dedup_probe_series`, `dedup_probe_budget_seconds` are in `RETIRED_KEYS["round"]` (`cascade/shared/config/loader.py:86-97`, tested in `tests/unit/test_config.py`). One reader remains: `cascade/shared/sandbox_policy.py:93` refuses `dedup_probe_series > 0` on a weak sandbox; with the line deleted it reads the default 0, so behaviour is unchanged. Safe to delete (`chain.toml:498-500`) |
 | B14 | plan `:3622`, `:3680` (30 h) | yes. No code implements the alarm yet (no `pool_d_stale` in `cascade/`, `deploy/`, `scripts/`) |
 | A4 | no channel handling in `cascade/eval/lane_d_scorer.py`, `cascade/validator/lane_d.py` | yes: lane D is univariate. `_forward` takes `(B, L)` and lifts it to one variate (`lane_d_scorer.py:301-324`, `[:, None]`); `forecast_quantiles` returns `(n, horizon, 9)`. So F2 (C, L) is the first eval feature |
 | A4 | `decisions/DEC-CA-0041-multivariate-scoring.md` | yes (rule as quoted) |
 | A4 | `chain.toml max_channels = 32` | yes, `[generator] max_channels = 32` (`chain.toml:52`) |
-| A5 | TIME dataset list in `cascade/eval/benchmarks.py` | **moved**: `benchmarks.py` only shells out to the sidecar. The TIME source is `Real-TSF/TIME` @ `83e3d0b3be28d11c7182bffcc1892d19b36c4da1` (`benchmarks/cascade_benchmark/datasets.py:56-59`); the task list is timebench's bundled config (`benchmarks/cascade_benchmark/suites/time_bench.py:93-103`). Note: `Datadog/BOOM` (`datasets.py:52-55`) is also a gate suite and is not in the brief's exclusion list (flag for F3 data ops) |
+| A5 | TIME dataset list in `cascade/eval/benchmarks.py` | **moved**: `benchmarks.py` only shells out to the sidecar. The TIME source is `Real-TSF/TIME` @ `83e3d0b3be28d11c7182bffcc1892d19b36c4da1` (`benchmarks/cascade_benchmark/datasets.py:56-59`); the task list is timebench's bundled config (`benchmarks/cascade_benchmark/suites/time_bench.py:93-103`). Note: `Datadog/BOOM` (`datasets.py:52-55`) is also a gate suite and is not in the brief's exclusion list; **added to it (owner 2026-11-23, DECIDED: "they're all reasonable")** |
 
 ### rev6.18 Part A: eval v2 (decided spec)
 
@@ -94,8 +96,9 @@ GiftEvalPretrain + RMISC are one **public half** of 10000 windows.
 - **Per-window clamp:** every per-window ratio (live forward, backtest, public)
   is clamped to `[window_ratio_floor, 1 / window_ratio_floor]` before it
   enters a half. New key `[lane_d] window_ratio_floor`, overlay-settable,
-  proposed default **0.5** (one window can at most halve or double its
-  contribution) **[DECIDE A3-clamp: default value]**.
+  default **0.5**: each window's ratio is clamped to **[0.5, 2]** (one window
+  can at most halve or double its contribution) (owner 2026-11-23, DECIDED: "they're all reasonable").
+  Loader: `0 < window_ratio_floor < 1`.
 - `L = (1 − w) · L_live + w · L_pub`, `w = [lane_d] public_weight`.
 - **`public_weight`**: new `[lane_d]` key, **overlay-settable, default
   0.50**, range `[0, 1)`. It is **not** subject to the `backtest_weight_cap`
@@ -129,16 +132,17 @@ multivariate GiftEvalPretrain datasets):
 
 **A5 RMISC allowed list.** Start from the RMISC folders whose names are not in
 `Salesforce/GiftEval`, `Salesforce/GiftEvalPretrain`,
-`autogluon/fev_datasets`, `autogluon/chronos_datasets`, or the TIME task list
-(`Real-TSF/TIME` @ `83e3d0b`; see (V)) — about 71 of 197 by name. Then per
+`autogluon/fev_datasets`, `autogluon/chronos_datasets`, the TIME task list
+(`Real-TSF/TIME` @ `83e3d0b`; see (V)), or **`Datadog/BOOM`** (@ `69325b5`, a
+gate suite; (owner 2026-11-23, DECIDED: "they're all reasonable")) — about 71 of 197 by name. Then per
 folder: (1) confirm by **data** comparison (series hashes on sampled
 windows), not names; (2) drop non-forecasting sets (EEG/EMG, activity
 recognition, classification, anomaly); (3) read `meta.json`, drop any licence
 that forbids redistribution. Commit the list as
 `data/lane_d/rmisc_allowed.toml` (folder, reason kept, licence, revision).
 Publish the filtered copy + list as the official training source (19 RMISC
-folders are GIFT-Eval test data). Open flag: whether BOOM joins the
-exclusion set.
+folders are GIFT-Eval test data). The data comparison in step (1) covers
+BOOM as well as the other four sources and TIME.
 
 **A6 Storage.** Mirror full GiftEvalPretrain and the allowed RMISC folders,
 each at one pinned HF revision, to Hippius and R2 (owner provides bucket and
@@ -278,12 +282,12 @@ work (not in this batch).
 | main ← deployed (measured live values) | `round.funded_sku_wall_seconds.{8xH100,8xH200}`, `round.funded_sku_wall_measured_image` (3) | type into main with their evidence (#532 pattern) |
 | release lag (main ahead; deployed takes them at its next release) | `lane_c.from_block`, `lane_c.targets`, `marketcast.{from_block,suites,coarse_history_days,eval_context_length,max_synthetic_fraction,snapshot_days}`, `v2.commit_from_block`, `scoring.crowning_anchor_from_block`, `v2.{funded_pod_image_after,funded_sku_wall_measured_image_after,image_after_unqualified_override,prior_train_image_digests,sentinel_from_block,sentinel_ratchet,sentinel_suites,sentinel_tau,train_image_digest_after,worker_code_fingerprint_after}` (20) | none in main. Note: main arms `[marketcast]`/`[lane_c] from_block = 9579600`; the deployed file has 0 |
 | decided votes to type (`cascade-audit decided` findings) | `v2.prelaunch_burn_from_block = 9486900`, `v2.image_decoupled_from_block = 9493200` (2; deployed 0) | owner types both into the deployed file at its next quiet restart ⇒ `decided` exits 0 |
-| **owner** | `training.budget_denomination_after(_block)`, `static_guard.packed_sources(_from_block)` (2 + 2 gates) | owner picks (below) |
+| owner keys, **decided: add to main at live values** (owner 2026-11-23, DECIDED: "they're all reasonable") | `training.budget_denomination_after(_block)`, `static_guard.packed_sources(_from_block)` (2 + 2 gates) | F6 types `[training] budget_denomination_after = "points+mv20"`, `budget_denomination_after_block = 9165600` and `[static_guard] packed_sources = "reject"`, `packed_sources_from_block = 9169200` into main's `chain.toml` |
 
 The 10 already-marked drifted keys stay with #532 (R6x). Done when
 `cascade-audit decided --config <deployed>` exits 0.
 
-*Owner keys (live values; not picked here):*
+*Owner keys (live values). **Decided (owner 2026-11-23, DECIDED: "they're all reasonable"): both are added to main at their live values (the "Add to main" branch of each bullet below).***
 
 - `[training] budget_denomination_after = "points+mv20"`, `_block = 9165600`.
   The DEC-CA-0047 scheduled budget switch of the **v1** contract
@@ -314,8 +318,22 @@ testnet then mainnet. Owner publishes. No code.
 **ignores** them (listed in `RETIRED_KEYS["lane_d"]` so a deployed file still
 loads).
 
-**B12 Init gate.** **STOPPED** (see V): the receipt fields are read. Not
-specified further until the owner picks.
+**B12 Init gate.** ~~**STOPPED** (see V): the receipt fields are read. Not
+specified further until the owner picks.~~ **Decided (owner 2026-11-23, DECIDED: "they're all reasonable").** Delete the
+init gate: `[scoring] init_gate_mode` / `init_gate_tolerance` (config,
+loader parse, `chain_config.py:209-223` pass-through, `chain.toml:910-911`),
+the producer in `cascade/eval/koth.py` (`KothParams.init_gate_mode`, the floor
+computation and both `enforce` branches, `:233`, `:454`, `:594-618`) and the
+log in `cascade/validator/loop.py:583-592`. **Keep** `cascade/shared/receipt.py`
+parsing `init_baseline_geomean` / `init_floor_passed` (`:350-351`, `:453-455`,
+`:498-501`, `:974-978`): read and re-serialised drop-when-None, never
+written again, so every archived receipt still verifies. The `[round]
+init_gate_mode` retired key (`loader.py:91`) is unchanged. This is lane A
+consensus config: it ships in a **release with an activation block**
+(DEC-CA-0045 typed `*_from_block`; before the block the gate runs as today in
+shadow, from it the producer stops), never as a hand edit. Test: an archived
+shadow-era receipt with both fields round-trips byte-identically and its
+signature verifies.
 
 **B13 Dedup probe lines.** Delete `chain.toml:498-500`
 (`dedup_probe_mode`, `dedup_probe_series`, `dedup_probe_budget_seconds`).
@@ -361,18 +379,18 @@ the rows each PR touches.
 | F3 | Public sources: allowed list, index, draw, mirror tooling | A1, A2, A5, A6 (code); data ops = owner | new W5k (public draw), new W6p (index builder + mirror script, read-only on HF until owner keys), W7a (`public.*` hashes), W9 (`ld_draw`, `ld_public_index`) | F2 |
 | F4 | Combined winning rule + per-half reporting + A10 removal | A3, A7, A8 | W2e (`public_weight`, `window_ratio_floor`), W5i (three-part max-T), W5e, W3b5 (removed), W7a (schema minor: per-half/source/domain fields; `lowfreq` dropped), W9, W12a, W17 | F3, F1 |
 | F5 | GPU environments + handshake + cache key | B5, B6, B7 | W4 (handshake fields), W15 (cache key), W7a (`host.*`), W6-S8 / T7 (env list), D11 | — (parallel with F2) |
-| F6 | Config clean-up | B9 (main-side typing only), B11, B13 | W2, `chain.toml`, R6x / #532 | — (B12 out until owner) |
+| F6 | Config cleanup + init-gate removal | B9 (main-side typing incl. both owner keys), B11, B12, B13 | W2, `chain.toml`, R6x / #532, `koth.py`, `loop.py`, `scoring.py`/`loader.py` (B12 is lane A consensus: release + activation block) | — |
 | F7 | Miner status context | B15 | W17, W10, W12b | rev6.15 W7a/W8c landed |
 | F8 | A9 timing harness + evidence | A9 | T7, W1 (`scripts/laned_a9_time.py`) | F4, F5; owner pod |
 
 Not in the list: B4 (in flight), B8 (owner deploy; gate change optional),
-B10 (owner overlay), B12 (stopped), B14 and B16 (this plan text), B17
-(deferred).
+B10 (owner overlay), B14 and B16 (this plan text), B17 (deferred).
 
-**Owner steps left:** pick B12 option; pick both B9 owner keys; type the two
-decided votes into the deployed file; A3-clamp default; buckets + keys for A6
-and the mirror run (data ops); approve the A9 pod ($40 cap); deploy B8; publish
-the B10 overlay (testnet, then mainnet); confirm BOOM in the A5 exclusion set.
+**Owner steps left:** type the two decided votes into the deployed file;
+buckets + keys for A6 and the mirror run (data ops); approve the A9 pod ($40
+cap); deploy B8; publish the B10 overlay (testnet, then mainnet); pick the B12
+activation block when the F6 release is cut. (Resolved (owner 2026-11-23, DECIDED: "they're all reasonable"): B12
+option, both B9 owner keys, A3 clamp 0.5, BOOM in the A5 exclusion set.)
 
 ## rev6.16 (owner 2026-11-23; main @ 65bcb4b): partial WB19 evidence
 
