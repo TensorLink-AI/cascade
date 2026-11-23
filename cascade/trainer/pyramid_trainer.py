@@ -278,8 +278,12 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
     cop_gen = torch.Generator(device=trainer.device).manual_seed(training_seed % (2**63))
     from .pyramid_dp import Gang, gang_size, micro_batch_pass, owned_splits
 
-    world = gang_size(trainer.device) if slices is None else 1
-    gang = Gang(world, cfg, deterministic=trainer.deterministic, seed=training_seed) if world > 1 else None
+    # every leg, lane A or a lane-B expert leg, trains on the whole layout;
+    # an expert gang reduces, shards and syncs only the selected leaves
+    world = gang_size(trainer.device)
+    gang = Gang(world, cfg, deterministic=trainer.deterministic, seed=training_seed,
+                device=trainer.device, expert_selection=expert_selection,
+                slices=slices) if world > 1 else None
     if gang is not None:
         gang.shard_optimizer(model, optimizer)
         gang.scatter_pending = bool(resumed_optimizer)
@@ -514,6 +518,9 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
         metrics.update(power_ema_eval_sigma_rel=ema_sigmas[ema_eval])
     if slices:
         metrics.update(expert_training_backend="compact_rows", expert_trainable_param_count=sum(p.numel() for p in params))
+        # lane B only: the ranks the expert leg trained on (lane A metrics,
+        # which feed receipts, are unchanged)
+        metrics.update(gpu_n=world)
     if grouped_corpus:
         summary = channel_stats.summary()
         if summary is not None:
