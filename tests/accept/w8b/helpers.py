@@ -19,8 +19,9 @@ byte-identical (invariant 1)."
 
 Every settlement is a real `settle_lane_d` run on W7a's synthetic chain
 (`tests/accept/w7a/helpers.py`: numpy only, no torch): challenger X
-first-clears against the house at B1, confirms and is crowned (uid 6) at B2,
-and B3 judges nothing. The external services are fakes: the step's chain
+is listed from B2, where it clears against the house at its first verdict
+and is crowned (uid 6) through the gate (plan rev6.11 (b): no confirmation
+duel); B1 lists no entry and B3 judges nothing. The external services are fakes: the step's chain
 reader (:class:`Reader`, block hashes only), the poll thread's chain client
 (:class:`PollChain`, the weight loop's ``ChainClient`` duck type), the bench
 pod (:class:`BenchHost`) and the storage bucket (:class:`Store`). No real
@@ -50,8 +51,8 @@ W19_WORKER = "cascade.validator.offthread_worker"   # W19 (#691: not lane_d_*)
 
 ARM_BLOCK = w7a.ARM_BLOCK                 # 9,720,000: an era boundary (3600 grid)
 SETTLEMENT = w7a.SETTLEMENT               # 900
-B1 = w7a.BOUNDARY_1                       # X's first clear (confirm_pending)
-B2 = w7a.BOUNDARY_2                       # X confirmed, gated and crowned
+B1 = w7a.BOUNDARY_1                       # no entry listed; the house holds KING_D
+B2 = w7a.BOUNDARY_2                       # X's first verdict: cleared, gated, crowned
 B3 = ARM_BLOCK + 3 * SETTLEMENT           # judges nothing; X keeps KING_D
 ERA_START = ARM_BLOCK                     # the era B1..B3 belong to
 CHALLENGER_UID = w7a.CHALLENGER_UID       # 6: KING_D's uid once crowned
@@ -255,10 +256,14 @@ class Store:
 class Inputs:
     """``inputs(boundary)``: the settlement's pool snapshot, revealed entries,
     eval-host forecasts, metagraph and house (sourced outside W8b; README).
-    B1 settles on snapshot 1, later boundaries on snapshot 2."""
+    B1 settles on snapshot 1, later boundaries on snapshot 2. The entries are
+    listed from B2 (rev6.11 (b): a challenger listed at B1 would be crowned
+    at its first verdict there)."""
 
-    def __init__(self, fx: dict, *, entries: list[dict] | None = None, raw: bool = False):
+    def __init__(self, fx: dict, *, entries: list[dict] | None = None, raw: bool = False,
+                 listed_from: int | None = None):
         self.fx = fx
+        self.listed_from = B2 if listed_from is None else int(listed_from)
         self.entries = [fx["entry"]] if entries is None else list(entries)
         self.calls: list[int] = []
         self.fail = False
@@ -271,7 +276,8 @@ class Inputs:
         snap = 1 if int(boundary) <= B1 else 2
         chain = self.fx["chain"]
         kw = {"pool_dir": chain["pools"][snap], "prior_pool_dirs": (),
-              "entries": [dict(e) for e in self.entries],
+              "entries": ([dict(e) for e in self.entries]
+                          if int(boundary) >= self.listed_from else []),
               "forecasts": chain["forecasts"][snap], "uid_of": dict(self.fx["uid_of"]),
               "house": dict(chain["house"])}
         if self.raw:

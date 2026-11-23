@@ -4,9 +4,10 @@ items 1-2, §4 T10, §14.3; README.md "House-challenger chains").
 Every chain is real `settle_lane_d` runs (`house_helpers.HOUSE_CHAINS`,
 built with the W5f helpers). The replay must MATCH each honest chain: a new
 house that challenges a miner KING_D alone in its own cohort (`members ==
-[house]`, `king_digest` = KING_D, no `house_digest`), whether it loses,
-first-clears or confirms and retakes KING_D (the miner king the newest prior
-king, the slot burns `house_king`, `crowned` null), a miner copy of the
+[house]`, `king_digest` = KING_D, no `house_digest`), whether it loses or
+clears and retakes KING_D at its first verdict (plan rev6.11 (b): no
+confirmation duel; the miner king the newest prior king, the slot burns
+`house_king`, `crowned` null), a miner copy of the
 house closed `duplicate_digest` (at registration, or an open entry the new
 pointer names), and a later miner dethroning the house.
 
@@ -48,7 +49,8 @@ from .house_helpers import (
     verdict_index,
 )
 
-RETAKES = (("house_retakes", 6), ("copy_at_swap", 4), ("open_copy", 5))
+# rev6.11 (b): the house retakes at its first verdict.
+RETAKES = (("house_retakes", 5), ("copy_at_swap", 3), ("open_copy", 4))
 
 
 @pytest.fixture(scope="module")
@@ -84,26 +86,27 @@ def test_fixture_house_loses(chains):
     assert (v["stage"], v["cleared"], v["outcome"]) == ("first", False, "lost")
     yc = r3["cohorts"][r3["verdicts"][verdict_index(r3, Y["digest"])]["cohort"]]
     assert yc["house_digest"] == H1W["digest"], "fixture: H1w is not Y's second bar"
+    assert r3["crowned"] == Y["digest"], "fixture: Y is crowned at its first verdict"
     r4 = c.reports[4]
     assert house_cohort_index(r4) is None, "fixture: a lost house was judged again"
-    assert r4["crowned"] == Y["digest"]
+    assert r4["crowned"] is None and r4["king_after"]["digest"] == Y["digest"]
 
 
 def test_fixture_house_retakes(chains):
     c = chains["house_retakes"]
     r5, r6 = c.reports[5], c.reports[6]
     v5 = r5["verdicts"][verdict_index(r5, H1["digest"])]
-    assert (v5["stage"], v5["cleared"], v5["outcome"]) == ("first", True, "confirm_pending")
-    assert r5["king_after"]["digest"] == Y["digest"]
-    v6 = r6["verdicts"][verdict_index(r6, H1["digest"])]
-    assert (v6["stage"], v6["outcome"]) == ("confirm", "crowned")
-    assert r6["crowned"] is None and r6["king_after"] == _house_record(H1)
-    assert [p["digest"] for p in r6["prior_kings"]] == [Y["digest"], X["digest"]]
-    assert r6["pay"]["court"][0]["burn_reason"] == "house_king"
-    r8 = c.reports[8]
-    assert r8["crowned"] == Z["digest"] and r8["king_before"] == _house_record(H1)
-    assert [p["digest"] for p in r8["prior_kings"]] == [Y["digest"], X["digest"]], \
+    assert (v5["stage"], v5["cleared"], v5["outcome"]) == ("first", True, "crowned")
+    assert r5["crowned"] is None and r5["king_after"] == _house_record(H1)
+    assert [p["digest"] for p in r5["prior_kings"]] == [Y["digest"], X["digest"]]
+    assert r5["pay"]["court"][0]["burn_reason"] == "house_king"
+    assert verdict_index(r6, H1["digest"]) is None, "fixture: the house was judged again"
+    assert r6["king_after"] == _house_record(H1)
+    r7, r8 = c.reports[7], c.reports[8]
+    assert r7["crowned"] == Z["digest"] and r7["king_before"] == _house_record(H1)
+    assert [p["digest"] for p in r7["prior_kings"]] == [Y["digest"], X["digest"]], \
         "fixture: a crown over the house pushed it onto the prior kings"
+    assert r8["crowned"] is None and r8["king_after"]["digest"] == Z["digest"]
 
 
 def test_fixture_copies_are_closed_duplicate_digest(chains):
@@ -113,11 +116,17 @@ def test_fixture_copies_are_closed_duplicate_digest(chains):
     assert r["verdicts"][verdict_index(r, H1["digest"])]["stage"] == "first"
     c = chains["open_copy"]
     r3, r4 = c.reports[3], c.reports[4]
-    assert r3["verdicts"][verdict_index(r3, C["digest"])]["outcome"] == "confirm_pending"
+    # b3 has no gate inputs for C, so its first clear is held (rev6.11 (b)).
+    assert r3["verdicts"][verdict_index(r3, C["digest"])]["outcome"] == "cleared"
+    e3 = r3["entries"][entry_index(r3, C["digest"])]
+    assert (e3["status"], e3["reason"]) == ("hold", "bench_hold")
     e = r4["entries"][entry_index(r4, C["digest"])]
     assert (e["status"], e["reason"]) == ("closed", "duplicate_digest")
     v = r4["verdicts"][verdict_index(r4, H1["digest"])]
     assert v["stage"] == "first", "fixture: the house inherited the copy's first clear"
+    assert all(r.get("held_from") is None for r in (r4.get("gate") or {}).get("results", [])), \
+        "fixture: the house inherited the copy's hold"
+    assert r4["king_after"] == _house_record(H1)
     assert c.reports[5]["king_after"] == _house_record(H1)
 
 
@@ -151,11 +160,13 @@ def test_replay_derives_a_losing_house_challenger(chains):
     c = chains["house_loses"]
     res = _all_match(c, uid_of=dict(c.pub.uid_of))
     r3 = _at(res, c, 3)
-    assert dict(r3.outcomes) == {Y["digest"]: "confirm_pending", H1W["digest"]: "lost"}
-    assert r3.crowned is None and r3.king_after == X["digest"]
-    assert [(d, u) for d, u, _ in r3.pay] == [(X["digest"], UIDS[X["hotkey"]])]
+    assert dict(r3.outcomes) == {Y["digest"]: "crowned", H1W["digest"]: "lost"}
+    assert r3.crowned == Y["digest"] and r3.king_after == Y["digest"]
+    assert [(d, u) for d, u, _ in r3.pay] == [(Y["digest"], UIDS[Y["hotkey"]]),
+                                             (X["digest"], UIDS[X["hotkey"]])]
     r4 = _at(res, c, 4)
-    assert r4.crowned == Y["digest"] and r4.king_after == Y["digest"]
+    assert dict(r4.outcomes) == {}, "a lost house or a crowned king is not judged again"
+    assert r4.crowned is None and r4.king_after == Y["digest"]
     assert [(d, u) for d, u, _ in r4.pay] == [(Y["digest"], UIDS[Y["hotkey"]]),
                                              (X["digest"], UIDS[X["hotkey"]])]
 
@@ -164,35 +175,36 @@ def test_replay_derives_the_house_first_clear_and_retake(chains):
     c = chains["house_retakes"]
     res = _all_match(c, uid_of=dict(c.pub.uid_of))
     r5 = _at(res, c, 5)
-    assert dict(r5.outcomes) == {H1["digest"]: "confirm_pending"}
-    assert r5.crowned is None and r5.king_after == Y["digest"]
-    r6 = _at(res, c, 6)
-    assert dict(r6.outcomes) == {H1["digest"]: "crowned"}
-    assert dict(r6.gate) == {H1["digest"]: "pass"}
-    assert r6.crowned is None, "a retake is not a miner crowning"
-    assert r6.king_after == H1["digest"]
-    assert [(d, u) for d, u, _ in r6.pay] == [(H1["digest"], None),
+    assert dict(r5.outcomes) == {H1["digest"]: "crowned"}
+    assert dict(r5.gate) == {H1["digest"]: "pass"}
+    assert r5.crowned is None, "a retake is not a miner crowning"
+    assert r5.king_after == H1["digest"]
+    assert [(d, u) for d, u, _ in r5.pay] == [(H1["digest"], None),
                                              (Y["digest"], UIDS[Y["hotkey"]]),
                                              (X["digest"], UIDS[X["hotkey"]])]
-    assert math.isclose(sum(s for _, _, s in r6.pay), c.cfg.share, rel_tol=1e-12)
-    shares = [s for _, _, s in r6.pay]
+    assert math.isclose(sum(s for _, _, s in r5.pay), c.cfg.share, rel_tol=1e-12)
+    shares = [s for _, _, s in r5.pay]
     assert shares[0] > shares[1] > shares[2] > 0
+    r6 = _at(res, c, 6)
+    assert dict(r6.outcomes) == {}, "the house is not judged after its retake"
+    assert r6.crowned is None and r6.king_after == H1["digest"]
 
 
 def test_replay_derives_a_miner_dethroning_the_house(chains):
     c = chains["house_retakes"]
     res = _all_match(c, uid_of=dict(c.pub.uid_of))
     r7 = _at(res, c, 7)
-    assert dict(r7.outcomes) == {Z["digest"]: "confirm_pending"}
-    assert r7.king_after == H1["digest"]
-    r8 = _at(res, c, 8)
-    assert r8.crowned == Z["digest"] and r8.king_after == Z["digest"]
-    assert [(d, u) for d, u, _ in r8.pay] == [(Z["digest"], UIDS[Z["hotkey"]]),
+    assert dict(r7.outcomes) == {Z["digest"]: "crowned"}
+    assert r7.crowned == Z["digest"] and r7.king_after == Z["digest"]
+    assert [(d, u) for d, u, _ in r7.pay] == [(Z["digest"], UIDS[Z["hotkey"]]),
                                              (Y["digest"], UIDS[Y["hotkey"]]),
                                              (X["digest"], UIDS[X["hotkey"]])]
+    r8 = _at(res, c, 8)
+    assert dict(r8.outcomes) == {}
+    assert r8.crowned is None and r8.king_after == Z["digest"]
 
 
-@pytest.mark.parametrize("name,n", [("copy_at_swap", 4), ("open_copy", 5)])
+@pytest.mark.parametrize("name,n", [("copy_at_swap", 3), ("open_copy", 4)])
 def test_replay_derives_a_retake_after_a_copy_closed(chains, name, n):
     c = chains[name]
     res = _all_match(c, uid_of=dict(c.pub.uid_of))
@@ -201,8 +213,12 @@ def test_replay_derives_a_retake_after_a_copy_closed(chains, name, n):
     assert dict(r.outcomes) == {H1["digest"]: "crowned"}
     assert [(d, u) for d, u, _ in r.pay] == [(H1["digest"], None),
                                             (X["digest"], UIDS[X["hotkey"]])]
-    first = _at(res, c, n - 1)
-    assert dict(first.outcomes) == {H1["digest"]: "confirm_pending"}
+    # rev6.11 (b): the retake is the house's first verdict; it was never
+    # judged before, and is not judged after.
+    before = _at(res, c, n - 1)
+    assert H1["digest"] not in dict(before.outcomes) or name == "open_copy"
+    after = _at(res, c, n + 1)
+    assert dict(after.outcomes) == {} and after.king_after == H1["digest"]
 
 
 # ── forgeries are MISMATCH at their path ────────────────────────────────────

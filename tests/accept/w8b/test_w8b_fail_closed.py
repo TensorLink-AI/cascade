@@ -126,13 +126,14 @@ def test_malformed_last_published_receipt_is_no_settlement(tmp_path):
 
 
 def _swap_in_foreign_state(tmp_path, rig_store_receipt_from: str):
-    """Validator A settled B1 with X revealed and published; a different,
+    """Validator A settled B1 with X listed (crowned there at its first
+    verdict, rev6.11 (b)) and published; a different,
     self-consistent B1 state (no entries) replaces A's state dir. With A's
     published receipt the swap is refused; with the foreign settlement's own
     published receipt (the control) it settles."""
     cfg = h.chain_cfg(tmp_path / "v")
     fx = h.fixture(tmp_path)
-    a = h.Rig(tmp_path / "a", cfg, fx)
+    a = h.Rig(tmp_path / "a", cfg, fx, inputs=h.Inputs(fx, listed_from=h.B1))
     a.step(h.B1)
     c = h.Rig(tmp_path / "c", cfg, fx, inputs=h.Inputs(fx, entries=[]))
     c.step(h.B1)

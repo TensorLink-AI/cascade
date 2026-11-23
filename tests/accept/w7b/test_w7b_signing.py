@@ -194,7 +194,7 @@ NESTED = [
     ("cohorts", 0, "window_ids"),
     ("cohorts", 0, "set_sha256"),
     ("verdicts", 0, "lcb"),
-    ("verdicts", 0, "confirmation", "rule"),
+    ("verdicts", 0, "lowfreq", "result"),     # rev6.11 (b): no confirmation block
     ("entries", 0, "coldkey"),
     ("params", "d_margin"),
     ("params", "bootstrap_B"),
