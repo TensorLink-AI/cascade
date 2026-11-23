@@ -74,7 +74,9 @@ validator. Unarmed (``not cfg.active(boundary)``) it returns
    ``schemas/lane_d_report_1.json``; every entry considered and not judged is
    a typed skip, court slots that burn name a ``burn_reason``; ``pool.snapshots``
    binds every snapshot a judged window's version came from, the newest
-   always included, and each window names its ``snapshot_sha256``). The
+   always included, and each window names its ``snapshot_sha256``; rev6.6:
+   given the W5d ``armed`` record, ``armed_contexts`` / ``armed_evidence``,
+   checked by :func:`check_armed`). The
    signed report is checked by ``validate_report``: a report outside the
    schema raises and nothing is returned or saved (fail closed). Then it
    saves the new state and returns the pay
@@ -153,7 +155,7 @@ from pathlib import Path
 import numpy as np
 
 from ..eval.bootstrap import cohort_maxt_lcbs
-from ..eval.lane_d_scorer import SCORING_LEVELS, SCORING_METHOD, score_window
+from ..eval.lane_d_scorer import GATE_MIN_SOURCES, SCORING_LEVELS, SCORING_METHOD, score_window
 from .lane_d_bench import paired_gate
 from .lane_d_forward import eligible_windows
 from .lane_d_frozen import advance_frozen_set
@@ -732,11 +734,80 @@ def _closing(cfg, boundary: int) -> bool:
     return until > 0 and int(boundary) == until
 
 
+class LaneDArmedError(ValueError):
+    """A settlement's armed record (rev6.6) is refused: ``code`` is one of
+    :data:`ARMED_CODES`."""
+
+    def __init__(self, code: str, detail: str = ""):
+        self.code = code
+        super().__init__(f"{code}: {detail}" if detail else code)
+
+
+ARMED_CODES = ("no_armed_context", "armed_invalid")
+_ARMED_KEYS = frozenset({"armed_contexts", "evidence"})
+_EVIDENCE_KEYS = frozenset({"min_long_series", "min_sources", "readiness_sha256", "t7_sha256",
+                            "variants"})
+_VARIANT_KEYS = frozenset({"context", "series", "sources", "t7_fits", "armed"})
+
+
+def _nonneg_int(x) -> bool:
+    return type(x) is int and x >= 0
+
+
+def check_armed(armed, cfg) -> dict:
+    """The report fields ``{"armed_contexts", "armed_evidence"}`` of a valid
+    W5d armed record for ``cfg``; ``LaneDArmedError`` otherwise. The record
+    must be exactly what :func:`~cascade.eval.lane_d_scorer.armed_record`
+    gives for ``cfg.contexts`` and ``cfg.min_long_series``: every variant's
+    ``armed`` flag is recomputed from its gates and the armed set from the
+    flags. Pure; never mutates ``armed``."""
+    def bad(why: str):
+        raise LaneDArmedError("armed_invalid", why)
+
+    if not isinstance(armed, dict) or set(armed) != _ARMED_KEYS:
+        bad(f"the record must be an object with exactly {sorted(_ARMED_KEYS)}")
+    ev, stated = armed["evidence"], armed["armed_contexts"]
+    if not isinstance(ev, dict) or set(ev) != _EVIDENCE_KEYS:
+        bad(f"evidence must be an object with exactly {sorted(_EVIDENCE_KEYS)}")
+    if ev["min_long_series"] != int(cfg.min_long_series) or type(ev["min_long_series"]) is not int:
+        bad(f"min_long_series {ev['min_long_series']!r} != config {int(cfg.min_long_series)}")
+    if type(ev["min_sources"]) is not int or ev["min_sources"] != GATE_MIN_SOURCES:
+        bad(f"min_sources {ev['min_sources']!r} != {GATE_MIN_SOURCES}")
+    for k in ("readiness_sha256", "t7_sha256"):
+        if ev[k] is not None and not _is_hex64(ev[k]):
+            bad(f"{k} must be 64 lower-case hex or null")
+    variants = ev["variants"]
+    want = [int(c) for c in sorted(cfg.contexts)]
+    if not isinstance(variants, list) or len(variants) != len(want):
+        bad(f"variants must cover the contexts {want}")
+    flags = []
+    for c, v in zip(want, variants, strict=True):
+        if not isinstance(v, dict) or set(v) != _VARIANT_KEYS or v["context"] != c \
+                or type(v["context"]) is not int:
+            bad(f"variant for {c} malformed")
+        if not (_nonneg_int(v["series"]) and _nonneg_int(v["sources"])
+                and type(v["t7_fits"]) is bool and type(v["armed"]) is bool):
+            bad(f"variant {c}: counts are non-negative ints, flags bools")
+        gates = (v["series"] >= ev["min_long_series"] and v["sources"] >= ev["min_sources"]
+                 and v["t7_fits"])
+        if v["armed"] is not gates:
+            bad(f"variant {c}: armed {v['armed']} disagrees with its gates")
+        if gates:
+            flags.append(c)
+    if not isinstance(stated, list) or any(type(c) is not int for c in stated) \
+            or stated != flags:
+        bad(f"armed_contexts {stated!r} != the armed variants {flags}")
+    if not flags:
+        raise LaneDArmedError("no_armed_context", "no lane D variant is armed; nothing can be scored")
+    return {"armed_contexts": list(flags),
+            "armed_evidence": json.loads(json.dumps(ev, allow_nan=False))}
+
+
 def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: dict,
                   forecasts: dict, uid_of: dict, state_path, signer,
                   prior_pool_dirs=(), expect_prior_sha256: str | None = None,
                   boundary_block_hash: str | None = None, sentinel: str | None = None,
-                  bench=None) -> LaneDSettlement:
+                  bench=None, armed: dict | None = None) -> LaneDSettlement:
     """Settle lane D at ``boundary`` (see the module docstring).
 
     ``pool_dir`` is the newest ``pool_d`` snapshot; ``prior_pool_dirs`` are
@@ -757,9 +828,17 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     persisted settlement is ``state_missing`` and a rolled-back one is
     ``state_digest_mismatch`` (:func:`~cascade.validator.lane_d_state.load_prior_state`);
     every such refusal comes before any pool or forecast is read and writes
-    nothing."""
+    nothing.
+
+    ``armed`` (rev6.6) is the settlement's W5d
+    :func:`~cascade.eval.lane_d_scorer.armed_record`. Given, it is checked by
+    :func:`check_armed` (a ``LaneDArmedError`` before anything is read or
+    written) and recorded as the report's ``armed_contexts`` /
+    ``armed_evidence``; the forecasts are the eval host's at each entry's
+    ``effective_context``. ``None`` (the legacy call) records neither."""
     if not cfg.active(boundary):
         return LaneDSettlement(report=None, pay=None, receipt=None)
+    armed_fields = None if armed is None else check_armed(armed, cfg)
     # W5f: the house is the verified record a signed pointer enters
     # (lane_d_house). Anything else is refused before any state, report or
     # pool is read or written (fail closed).
@@ -1131,6 +1210,11 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     if gate is not None:
         # Present iff the gate ran (absent, never null, otherwise).
         report["gate"] = gate
+    if armed_fields is not None:
+        # rev6.6: the settlement's armed set and the evidence it was armed
+        # on, signed, so satellites verify it (never re-derive it from
+        # cfg.contexts). Absent on the legacy call.
+        report.update(armed_fields)
     report = sign_report(report, signer)
     # Fail closed: a report outside lane-d-report/1 is never returned, and
     # neither the report file nor the state is written (ReportSchemaError

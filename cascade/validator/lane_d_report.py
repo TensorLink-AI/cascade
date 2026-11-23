@@ -380,8 +380,43 @@ def _check_gate_weights(report: dict) -> None:
                                     "not one of params.gate_suites")
 
 
+def _check_armed(report: dict) -> None:
+    """rev6.6: ``armed_contexts`` and ``armed_evidence`` come together; the
+    evidence covers ``params.contexts`` exactly (ascending), states
+    ``params.min_long_series``, each variant's ``armed`` is its two gates and
+    the armed set is the armed variants, ascending."""
+    has_set, has_ev = "armed_contexts" in report, "armed_evidence" in report
+    if not has_set and not has_ev:
+        return
+    if not has_set:
+        raise ReportSchemaError("missing_field", "armed_contexts", "armed_evidence without it")
+    if not has_ev:
+        raise ReportSchemaError("missing_field", "armed_evidence", "armed_contexts without it")
+    ev, params = report["armed_evidence"], report["params"]
+    if ev["min_long_series"] != params["min_long_series"]:
+        raise ReportSchemaError("bad_value", "armed_evidence.min_long_series",
+                                "not params.min_long_series")
+    contexts = sorted(params["contexts"])
+    if [v["context"] for v in ev["variants"]] != contexts:
+        raise ReportSchemaError("bad_value", "armed_evidence.variants",
+                                f"must cover params.contexts {contexts} ascending")
+    armed = []
+    for i, v in enumerate(ev["variants"]):
+        gates = (v["series"] >= ev["min_long_series"] and v["sources"] >= ev["min_sources"]
+                 and v["t7_fits"])
+        if v["armed"] is not gates:
+            raise ReportSchemaError("bad_value", _join(_join("armed_evidence.variants", i), "armed"),
+                                    "disagrees with its gates")
+        if gates:
+            armed.append(v["context"])
+    if report["armed_contexts"] != armed:
+        raise ReportSchemaError("bad_value", "armed_contexts",
+                                f"not the armed variants {armed} of armed_evidence")
+
+
 def _cross_field(report: dict) -> None:
     """The rules between fields, run after every structural check passes."""
+    _check_armed(report)
     _check_gate_weights(report)
     _check_snapshots(report)
     _check_house(report)
