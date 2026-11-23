@@ -1,0 +1,13 @@
+# W9: the audit's lane D re-derivation (plan rev6 §3.0 W9 row, §1.2 caps,
+# §1.3 both clocks and the confirmation duel, §1.5 rows_sha256 and
+# "checks.derive_weights and check_lane_d re-derive the lane D weights",
+# invariants 2, 4 and 12; README.md has the contract).
+# check_lane_d: the judged set and skip reasons (coldkey caps, FIFO, the
+# block-clock entry rules), mirror lag and the king's T, the canonical row
+# order, the chain-mode continuity rules, and (rev6.1) window_refusal plus
+# check_lane_d(..., pool_dirs=...) against the judged snapshots.
+cascade/audit/lane_d.py
+# derive_weights (and LANE_D_WEIGHT_ERRORS): lane D's pay re-derived from the
+# signed report and the W7c receipt record, without the producer's lane D
+# emission functions.
+cascade/audit/checks.py
