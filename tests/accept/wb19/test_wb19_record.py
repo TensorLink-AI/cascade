@@ -239,7 +239,8 @@ def test_combine_passes_without_the_full_8xh100_leg(tmp_path, records_factory):
     assert rc == 0, se
     ev = json.loads(out.read_text())
     assert ev["passed"] is True, ev["checks"]
-    assert _check(ev, "full_leg")["passed"] is True
+    fl = _check(ev, "full_leg")
+    assert fl["passed"] is True and "skipped: owner_2026-11-23" in fl["detail"], fl
     assert ev["lane_a_full_leg"] is None
     assert ev["body_sha256"] == body_sha256(ev)
 

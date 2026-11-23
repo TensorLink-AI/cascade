@@ -254,8 +254,11 @@ Otherwise it writes `laned_wb19/1` and exits 0:
 - **`passed`** is true only when every check passes:
   - `coverage`: every candidate has an expert run. The detail names the
     missing SKUs;
-  - `full_leg`: at most one full run on `8xH100` (zero passes: the full
-    leg is optional since the owner skipped it 2026-11-23; two fail);
+  - `full_leg`: at most one full run on `8xH100`. The check is always
+    present. With zero full runs it is `passed: true` and its `detail`
+    contains `skipped: owner_2026-11-23` (the full leg is optional since the
+    owner skipped it), so the overall `passed` never depends on a full leg.
+    One full run passes; two fail;
   - `memory`: every expert run has `peak < memory_total`. The detail names
     the failing SKUs.
 - **`lane_a_full_leg`** is `null` when there is no full run. When there is
