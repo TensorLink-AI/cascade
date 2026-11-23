@@ -491,6 +491,26 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         log.info("bench lease armed from %s: sweeps rent their host on demand (%s)",
                  args.bench_lease, runner.bench_lease.status())
+    # W8b (LANE_D_PLAN): the lane D settlement step, which W19's worker runs
+    # off this (poll/weight) thread at each armed boundary. Unarmed
+    # ([lane_d] from_block = 0) it is None: nothing is opened, read or
+    # published. It reads block hashes through its OWN chain client, built on
+    # its thread (a websocket is never shared with the poll ``client``).
+    from .lane_d_wiring import build_lane_d_step
+
+    lane_d_store = None
+    if int(runner.cfg.lane_d.from_block or 0) > 0:
+        from ..shared.hippius import open_manifest_store
+
+        lane_d_store = open_manifest_store(runner.cfg.storage)
+    runner.lane_d_step = build_lane_d_step(
+        runner.cfg, state_dir=Path(runner.cfg.validator.state_db_path).parent,
+        signer=runner.bench_signer,
+        chain_factory=lambda: ChainClient.from_config(runner.cfg, network=args.network),
+        store=lane_d_store)
+    if runner.lane_d_step is not None:
+        log.info("lane D armed from block %d: settlements run off the poll thread",
+                 int(runner.cfg.lane_d.from_block))
     if runner.cfg.storage.pool_bucket:
         from .pool import load_bucket_pool
 
