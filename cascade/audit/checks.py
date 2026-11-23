@@ -2803,10 +2803,18 @@ def _check_emission_weights(name: str, receipt: RoundReceipt,
 
 
 def _lane_vector_want(receipt: RoundReceipt, cfg: ChainConfig, got_pol,
-                      n_uids: int) -> tuple[list[float] | None, int, str | None]:
+                      n_uids: int, d_court: list | None = None
+                      ) -> tuple[list[float] | None, int, str | None]:
     """The lane-kept-apart vector (lane A's court, lane B's ``lane_b_pay``,
     lane C's ``lane_c_pay``) under ``got_pol``: ``(want, n paid lane-C
-    slots, None)``, or ``(None, 0, why)`` on the first inconsistency."""
+    slots, None)``, or ``(None, 0, why)`` on the first inconsistency.
+
+    ``d_court`` (W9, only when lane D pays at the settlement): the signed
+    report's ``pay.court`` slot uids, king first. Lane D's share is carved
+    from lane A's pool and its court part is ADDED to the non-lane-A part,
+    re-derived here (:func:`_lane_d_carve`, :func:`_lane_d_part`), never
+    through the producer's lane D emission (invariant 12). A DEC-CA-0055
+    policy then re-shapes lane A's part only (RV3 note 10)."""
     from ..shared.emission import emission_vector, lane_parts
 
     boundary = int(receipt.epoch_start_block)
@@ -2836,9 +2844,125 @@ def _lane_vector_want(receipt: RoundReceipt, cfg: ChainConfig, got_pol,
                       wins=wins, lane_c_cfg=(cfg.lane_c if c_pay is not None else None),
                       c_wins=c_wins,
                       c_slot_frac=(dict(c_pay["slot_frac"]) if c_pay is not None else None))
-    want = emission_vector(a, b if (pay is not None or c_pay is not None) else None, got_pol,
+    if d_court is not None:
+        share_d, why = _lane_d_carve(cfg, cfg.lane_b if pay is not None else None,
+                                     cfg.lane_c if c_pay is not None else None)
+        if why is not None:
+            return None, 0, why
+        pool_a = sum(a)
+        if share_d > 0.0 and pool_a > 0.0:
+            scale = (pool_a - share_d) / pool_a
+            a = [x * scale for x in a]
+        d = _lane_d_part(n_uids, share=share_d, court=d_court,
+                         king_decay=float(cfg.lane_d.king_decay), burn_uid=burn)
+        b = [x + y for x, y in zip(b, d, strict=True)]
+    kept_apart = pay is not None or c_pay is not None or d_court is not None
+    want = emission_vector(a, b if kept_apart else None, got_pol,
                            burn_uid=burn, lane_a_uids=list(receipt.reward_uids))
     return want, len(c_wins), None
+
+
+# ── W9: lane D's pay, re-derived from the signed report ─────────────────────
+#
+# Invariant 12 (README "Invariant 12", RV3 note 11): the lane A / B / C
+# builders stay shared; lane D's carve and court split are re-derived here
+# from the spec (LANE_D_PLAN D1/D48, §1.4), never through the producer's
+# lane D emission.
+
+# ``derive_weights(..., lane_d=...)`` refusal codes, in check order; the code
+# is ``why.split(":", 1)[0].strip()``.
+LANE_D_WEIGHT_ERRORS = ("lane_d_not_armed", "lane_d_record_missing", "lane_d_record_malformed",
+                        "lane_d_boundary_mismatch", "lane_d_report_mismatch",
+                        "lane_d_report_unverified", "lane_d_carve_unsupported")
+
+
+def _lane_d_carve(cfg: ChainConfig, b_cfg, c_cfg) -> tuple[float, str | None]:
+    """``(share_d, None)``: lane D's allocation carved from its
+    ``takes_from`` lane, capped at what that lane holds, given the lane B / C
+    configs paying at the settlement (``None`` = not paying). ``lane_a``
+    takes it from lane A's pool, ``1 - b - c``. A carve from lane B or C
+    while that lane pays would re-split that lane's slots, which this
+    derivation does not rebuild: ``(0.0, why)`` (fail closed); with that
+    lane not paying it holds nothing, so lane D's share is 0."""
+    from ..shared.lane_c import lane_pool_shares
+
+    want = max(0.0, float(cfg.lane_d.share))
+    share_b, share_c, _ = lane_pool_shares(b_cfg, c_cfg)
+    src = str(cfg.lane_d.takes_from)
+    if src == "lane_a":
+        return min(want, max(0.0, 1.0 - share_b - share_c)), None
+    held = {"lane_b": share_b, "lane_c": share_c}.get(src)
+    if held is None:
+        return 0.0, f"lane_d_carve_unsupported: [lane_d] takes_from {src!r} is not a lane"
+    if held <= 0.0 or want == 0.0:
+        return 0.0, None
+    return 0.0, (f"lane_d_carve_unsupported: lane D carved from {src} while {src} pays is "
+                 f"not re-derived by the audit")
+
+
+def _lane_d_part(n_uids: int, *, share: float, court: list, king_decay: float,
+                 burn_uid: int) -> list[float]:
+    """Lane D's part, summing to ``share``: slot ``i`` of ``court`` (uids,
+    king first) is worth ``king_decay ** i`` normalised over the slots; a
+    null, non-integer, out-of-range or repeated uid burns to ``burn_uid``;
+    an empty court burns the whole share."""
+    out = [0.0] * n_uids
+    s = float(share)
+    if s == 0.0:
+        return out
+    if not court:
+        out[burn_uid] += s
+        return out
+    raw = [float(king_decay) ** i for i in range(len(court))]
+    total = sum(raw)
+    seen: set[int] = set()
+    for uid, w in zip(court, raw, strict=True):
+        amt = s * w / total
+        ok = isinstance(uid, int) and not isinstance(uid, bool) and 0 <= uid < n_uids
+        if not ok or uid in seen:
+            out[burn_uid] += amt
+        else:
+            seen.add(uid)
+            out[uid] += amt
+    return out
+
+
+def _lane_d_court(receipt: RoundReceipt, cfg: ChainConfig, lane_d) -> tuple[list | None, str]:
+    """``(court uids, "")`` from the lane D record (the signed report and its
+    W7c receipt record) for the settlement ``receipt`` closes, or
+    ``(None, why)`` with a :data:`LANE_D_WEIGHT_ERRORS` code."""
+    import hashlib
+
+    from .lane_d import _canon, check_lane_d
+
+    boundary = int(receipt.epoch_start_block)
+    if not isinstance(lane_d, dict) or not isinstance(lane_d.get("report"), dict) \
+            or not isinstance(lane_d.get("receipt"), dict):
+        return None, "lane_d_record_malformed: lane_d is not {report, receipt[, prior_reports]}"
+    report, rec = lane_d["report"], lane_d["receipt"]
+    prior = lane_d.get("prior_reports")
+    if prior is not None and not isinstance(prior, (list, tuple)):
+        return None, "lane_d_record_malformed: prior_reports is not a list"
+    for what, b in (("report", report.get("boundary")), ("receipt record", rec.get("boundary"))):
+        if isinstance(b, bool) or not isinstance(b, int) or b != boundary:
+            return None, (f"lane_d_boundary_mismatch: the lane D {what}'s boundary {b!r} is not "
+                          f"the settlement's {boundary}")
+    try:
+        body = hashlib.sha256(_canon({k: v for k, v in report.items() if k != "signature"})
+                              ).hexdigest()
+    except (TypeError, ValueError) as e:
+        return None, f"lane_d_report_mismatch: the report body cannot be digested ({e})"
+    if rec.get("report_sha256") != body:
+        return None, (f"lane_d_report_mismatch: the receipt record binds "
+                      f"{str(rec.get('report_sha256'))[:12]}, the report body is {body[:12]}")
+    res = check_lane_d(report, cfg.lane_d, signer_hotkey=cfg.manifest.validator_hotkey,
+                       prior_reports=None if prior is None else list(prior))
+    if res.status != "PASS":
+        return None, f"lane_d_report_unverified: check_lane_d {res.status}: {res.detail}"
+    court = (report.get("pay") or {}).get("court")
+    if not isinstance(court, list) or not all(isinstance(s, dict) and "uid" in s for s in court):
+        return None, "lane_d_report_unverified: pay.court is not a list of slots"
+    return [s["uid"] for s in court], ""
 
 
 def _rebuild_lane_vector(name: str, receipt: RoundReceipt, cfg: ChainConfig, got_pol,
@@ -3622,7 +3746,8 @@ def _weights_chain_note(receipt: RoundReceipt, client: object) -> str:
     return "; on-chain weight support matches"
 
 
-def derive_weights(receipt: RoundReceipt, cfg: ChainConfig) -> tuple[list[float] | None, str]:
+def derive_weights(receipt: RoundReceipt, cfg: ChainConfig, *,
+                   lane_d=None) -> tuple[list[float] | None, str]:
     """DEC-CA-0058: the weight vector rebuilt from the receipt's records
     (reward UIDs, the DEC-CA-0055 ``emission`` policy, ``lane_b_pay``,
     ``lane_c_pay``) with the same builders :func:`check_weights` compares
@@ -3631,15 +3756,38 @@ def derive_weights(receipt: RoundReceipt, cfg: ChainConfig) -> tuple[list[float]
     rebuilt. ``cfg`` must be the config the receipt was judged under (its
     DEC-CA-0045 blocks and DEC-CA-0057 overlay applied). A satellite sets
     this vector only after :func:`check_weights` passed on the same receipt
-    and the two agree uid for uid."""
+    and the two agree uid for uid.
+
+    ``lane_d`` (W9): ``None``, or ``{"report", "receipt"[, "prior_reports"]}``
+    — the settlement's signed ``lane-d-report/1``, its W7c receipt record
+    and, for chain mode, the earlier signed reports. When lane D pays at the
+    boundary its part is re-derived from the report's ``pay.court`` once
+    :func:`cascade.audit.lane_d.check_lane_d` PASSes it; a refusal's code is
+    one of :data:`LANE_D_WEIGHT_ERRORS`. Lane D paying without a record is
+    refused, never a silent lane A-only vector (RV3 note 10). Unarmed with
+    no record, the result is exactly the lane A/B/C one (invariant 1)."""
     from ..shared.emission import EmissionPolicy, lane_parts
 
+    boundary = int(receipt.epoch_start_block)
+    pays_d = cfg.lane_d.active(boundary)
+    if lane_d is not None and not pays_d:
+        return None, f"lane_d_not_armed: lane D does not pay at the settlement {boundary}"
+    if pays_d and lane_d is None:
+        return None, (f"lane_d_record_missing: lane D pays at the settlement {boundary} but no "
+                      f"lane D record was given")
     if not receipt.weights:
         return None, "no weight vector recorded"
     n = len(receipt.weights)
     burn = cfg.scoring.burn_uid
-    boundary = int(receipt.epoch_start_block)
     rec = getattr(receipt, "emission", None)
+    if pays_d:
+        d_court, why = _lane_d_court(receipt, cfg, lane_d)
+        if d_court is None:
+            return None, why
+        pol = (EmissionPolicy.from_record(rec.get("policy") or {}) if rec is not None
+               else EmissionPolicy())
+        want, _, why = _lane_vector_want(receipt, cfg, pol, n, d_court=d_court)
+        return (want, "") if why is None else (None, why)
     if rec is not None or getattr(receipt, "lane_c_pay", None) is not None:
         pol = (EmissionPolicy.from_record(rec.get("policy") or {}) if rec is not None
                else EmissionPolicy())
