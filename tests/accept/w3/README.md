@@ -149,7 +149,9 @@ Since rev6.6 its default lists every variant,
   not the variant is armed. Arming is computed per settlement by the main
   validator (W5d `armed_record`, recorded by W7a), not by the intake. An
   entry that declares an unarmed variant is scored at the highest armed
-  variant until its own variant arms. The ready record and the commit payload
+  variant **below its declared context** until its own variant arms; with no
+  armed variant ≤ the declared context it is not scored that settlement
+  (`pending` / `context_below_armed`, plan rev6.15) and never above it. The ready record and the commit payload
   keep the **declared** context.
 - A context not in `cfg.contexts` is still refused at submit with
   `400 context_not_armed`. The code keeps its historical name; it means "not
