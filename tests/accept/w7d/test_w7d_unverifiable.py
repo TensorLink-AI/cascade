@@ -162,17 +162,17 @@ def test_a_hand_edited_state_with_reissued_receipts_is_a_mismatch_at_its_king(ch
 def test_a_state_whose_last_report_binds_another_body_is_a_mismatch(chains):
     mod = replay_module()
     c = chains["house_bar"]
-    b3 = boundary(3)
-    state = json.loads(c.pub.states[b3])
-    state["last_report"]["report_sha256"] = c.pub.receipts[1]["report_sha256"]
+    b2 = boundary(2)
+    state = json.loads(c.pub.states[b2])
+    state["last_report"]["report_sha256"] = c.pub.receipts[0]["report_sha256"]
     raw = canonical(state)
     receipts = copy.deepcopy(c.pub.receipts)
-    receipts[2]["posterior_state_sha256"] = sha(raw)
-    receipts[3]["prior_state_sha256"] = sha(raw)
-    res = replay(c.pub, receipts=receipts, states={**c.pub.states, b3: raw})
-    assert [r.status for r in res[:2]] == [mod.MATCH, mod.MATCH], describe(res)
-    assert res[2].status == mod.MISMATCH, describe(res)
-    assert has_path(res[2], "state.last_report"), list(res[2].mismatches)
+    receipts[1]["posterior_state_sha256"] = sha(raw)
+    receipts[2]["prior_state_sha256"] = sha(raw)
+    res = replay(c.pub, receipts=receipts, states={**c.pub.states, b2: raw})
+    assert [r.status for r in res[:1]] == [mod.MATCH], describe(res)
+    assert res[1].status == mod.MISMATCH, describe(res)
+    assert has_path(res[1], "state.last_report"), list(res[1].mismatches)
 
 
 def test_a_non_canonical_state_snapshot_is_a_mismatch(chains):

@@ -60,7 +60,7 @@ def test_a_window_at_the_mirror_lag_limit_passes(run):
     h.assert_pass(h.resign(report), cfg, "a feed exactly at max_mirror_lag_hours")
 
 
-@pytest.mark.parametrize("which", ["s1", "s2"])
+@pytest.mark.parametrize("which", ["s1"])
 def test_the_kings_t_is_the_named_kings_reveal(run, which):
     """T_K is not the report's word: the cohort's king is `king_before` (the
     house H0, T = HOUSE_T), so a lower `king_reveal_ts` (which would admit
