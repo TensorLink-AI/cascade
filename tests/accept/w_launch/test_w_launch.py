@@ -159,7 +159,7 @@ def test_w_launch_lane_d_launches_live_only(net):
     from cascade.validator.lane_d_inputs import LaneDInputsError, LaneDInputsSource
 
     base, b1, b2, launch = bodies(net)
-    assert overrides(PAIRS[net][2])["lane_d"]["public_weight"] == 0.0
+    assert overrides(PAIRS[net][2])["lane_d"].get("public_weight") == 0.0
     assert "lane_d" not in b1["overrides"]
     assert float(base.lane_d.public_weight) == 0.5          # the shipped default
     out = nc_build(base, b2)

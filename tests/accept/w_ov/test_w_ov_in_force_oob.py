@@ -54,6 +54,17 @@ def _history(body):
                        envelope={"body": body})]
 
 
+def _ok(fn, *a, **kw):
+    """``fn(*a, **kw)``; a refusal of the in-force overlay (the #891 stall)
+    or a missing ``in_force`` parameter is an assertion failure, not a crash."""
+    from cascade.shared import netconfig as nc
+
+    try:
+        return fn(*a, **kw)
+    except (nc.NetConfigError, TypeError) as e:
+        raise AssertionError(f"in-force overlay not resolved: {e}") from None
+
+
 def _resolver(base, body, tmp_path):
     from cascade.shared import netconfig as nc
 
@@ -75,7 +86,7 @@ def test_in_force_oob_overlay_resolves_to_release_value_and_keeps_the_rest(caplo
     with pytest.raises(nc.NetConfigError, match="out of bounds"):
         nc.validate_overlay(base, body)
     caplog.set_level(logging.ERROR, logger="cascade.netconfig")
-    got = nc.config_from_history(base, _history(body), APPLY + 900)
+    got = _ok(nc.config_from_history, base, _history(body), APPLY + 900)
     assert got is not base
     assert got.lane_d.min_windows == base.lane_d.min_windows == 1000    # release value
     assert int(got.lane_d.from_block) == LAUNCH and got.lane_d.share == 0.5
@@ -87,10 +98,10 @@ def test_in_force_oob_overlay_resolves_to_release_value_and_keeps_the_rest(caplo
     assert "using release value 1000" in lines[0]
     # logged ONCE per key: a fresh (uncached) resolution does not repeat it
     caplog.clear()
-    again = nc.config_from_history(base, _history(body), APPLY + 1800)
+    again = _ok(nc.config_from_history, base, _history(body), APPLY + 1800)
     assert again == got
     assert not [r for r in caplog.records if "out of current bounds" in r.getMessage()]
-    rep = nc.out_of_bounds_report()[nc.body_digest(body)]
+    rep = getattr(nc, "out_of_bounds_report", dict)().get(nc.body_digest(body), [])
     assert any("[lane_d] min_windows = 40" in x and "release value 1000" in x for x in rep)
 
 
@@ -101,9 +112,9 @@ def test_resolver_config_at_and_status_surfaces(tmp_path):
     body = _body(base, _oob_overrides())
     r = _resolver(base, body, tmp_path)
     assert r.config_at(base, APPLY - 1) is base
-    at = r.config_at(base, APPLY + 900)                  # never raises
+    at = _ok(r.config_at, base, APPLY + 900)             # never raises
     assert at.lane_d.min_windows == 1000
-    s = r.summary()["out_of_bounds"]
+    s = r.summary().get("out_of_bounds", {})
     assert list(s) == [nc.body_digest(body)]
     assert "min_windows" in s[nc.body_digest(body)][0]
 
@@ -114,13 +125,13 @@ def test_satellite_status_lists_the_resolved_keys(tmp_path):
 
     base = shipped_cfg()
     body = _body(base, _oob_overrides())
-    nc.config_from_history(base, _history(body), APPLY)
+    _ok(nc.config_from_history, base, _history(body), APPLY)
     doc = SatelliteRunner.status(SimpleNamespace(
         state=SimpleNamespace(verified_round="", verified_boundary=0, failing="",
                               failing_detail="", failing_round=""),
         _push_failing="", hotkey="h", owner="o", _mode="following",
         sat=SimpleNamespace(stale_after_blocks=1)), APPLY)
-    assert nc.body_digest(body) in doc["netconfig_out_of_bounds"]
+    assert nc.body_digest(body) in doc.get("netconfig_out_of_bounds", {})
 
 
 def test_settlement_view_weight_reassert_and_lane_d_tick_proceed(tmp_path):
@@ -141,8 +152,11 @@ def test_settlement_view_weight_reassert_and_lane_d_tick_proceed(tmp_path):
     me.cfg, me._cfg_base, me._settlement_block = base, None, None
     me.cascade, me.netconfig = None, resolver
     seen = []
-    with me._settlement_cfg(APPLY + 900):                 # _handle_manifest / re-assert
-        seen.append(me.cfg)
+
+    def view():
+        with me._settlement_cfg(APPLY + 900):             # _handle_manifest / re-assert
+            seen.append(me.cfg)
+    _ok(view)
     assert seen[0].lane_d.min_windows == 1000 and int(seen[0].lane_d.from_block) == LAUNCH
     assert me.cfg is base                                  # restored
 
@@ -169,7 +183,7 @@ def test_audit_replay_resolves_the_identical_config():
 
     base = replace(shipped_cfg(), netconfig=replace(shipped_cfg().netconfig, owner_hotkey=""))
     body = _body(base, _oob_overrides())
-    validator = nc.config_from_history(base, _history(body), APPLY)
+    validator = _ok(nc.config_from_history, base, _history(body), APPLY)
 
     class Store:
         def get_text(self, key):
@@ -196,8 +210,8 @@ def test_in_force_release_only_key_and_clamped_share_resolve_to_release():
     body = _body(base, ov)
     with pytest.raises(nc.NetConfigError, match="release-only"):
         nc.check_body(body)
-    assert nc.check_body(body, in_force=True) is body
-    got = nc.build_config(base, body, applied_block=APPLY, in_force=True)
+    assert _ok(nc.check_body, body, in_force=True) is body
+    got = _ok(nc.build_config, base, body, applied_block=APPLY, in_force=True)
     assert (got.raw.get("lane_d") or {}).get("teacher_ref") == \
         (base.raw.get("lane_d") or {}).get("teacher_ref")
     assert got.lane_d.share == base.lane_d.share
@@ -213,7 +227,7 @@ def test_compliant_overlay_in_force_is_identical_to_the_strict_build():
         base = shipped_cfg(name)
         body = _body(base, {"scoring": {"king_decay": 0.7}, **ARMED})
         strict = nc.build_config(base, body, applied_block=APPLY)
-        assert nc.build_config(base, body, applied_block=APPLY, in_force=True) == strict
+        assert _ok(nc.build_config, base, body, applied_block=APPLY, in_force=True) == strict
         assert nc.config_from_history(base, _history(body), APPLY) == strict
         assert nc.in_force_out_of_bounds(base, body["overrides"]) == []
 
@@ -228,6 +242,9 @@ def test_publish_tool_plans_against_the_resolved_previous():
     prev = _body(base, _oob_overrides())
     fix = json.loads(json.dumps(_oob_overrides()))
     fix["lane_d"]["min_windows"] = 100
-    plan = nc.plan_overlay(base, fix, APPLY + ERA, prev)
+    # effective one era AFTER lane D's start: judged against chain.toml alone
+    # (lane D off) the restated from_block would "lie before" the apply block;
+    # against the config every node runs (lane D armed at LAUNCH) it is unchanged
+    plan = nc.plan_overlay(base, fix, LAUNCH + ERA, prev)
     assert plan.ok, plan.render()
     assert any("no longer builds" in w for w in plan.warnings)
