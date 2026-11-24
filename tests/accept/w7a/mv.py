@@ -151,7 +151,7 @@ def settle_mv(chain: dict, state_path: Path, *, boundary: int, snap: int, entrie
     kw = w7a.gate_inputs(boundary, chain["house"]["digest"])
     if block_hash is None:
         kw = {k: v for k, v in kw.items() if k != "boundary_block_hash"}
-    return settle_lane_d(cfg=cfg or w7a.lane_d_cfg(), boundary=boundary,
+    return settle_lane_d(**w7a._rev614_ts(settle_lane_d, boundary), cfg=cfg or w7a.lane_d_cfg(), boundary=boundary,
                          pool_dir=chain["pools"][snap], entries=[dict(e) for e in entries],
                          house=dict(chain["house"]), forecasts=chain["forecasts"][snap],
                          uid_of=dict(uid_of), state_path=state_path,

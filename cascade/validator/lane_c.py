@@ -82,10 +82,9 @@ class LaneCJudgement:
     # DEC-CA-0064 MarketCast entries only: the receipt row's "mkt" record
     # (report binding, after, origin_block, within_wait, coverage, …)
     mkt: dict = field(default_factory=dict)
-    # a PASSING judgement's gain-tiered full-pay period (owner 2026-10-20):
-    # :meth:`cascade.eval.expert_lane.FullPay.record` of ``gain_lcb`` under
-    # the target's tiers (:func:`cascade.shared.lane_c.target_full_pay`),
-    # computed at judge time; a confirmed win records it
+    # a PASSING judgement's gain-scaled full-pay duration (owner 2026-11-24,
+    # DEC-CA-0073): :func:`cascade.shared.lane_c.target_full_pay_record` of
+    # ``gain_lcb``, computed at judge time; a confirmed win records it
     full_pay: dict | None = None
 
 
@@ -117,8 +116,8 @@ def _holder_dict(w: TargetWin | None) -> dict | None:
 
 def _confirmed_win(j: LaneCJudgement, *, round_id: str, settle_block: int,
                    era_index: int) -> TargetWin:
-    """The win a passing confirm judgement records — its full-pay tier is the
-    one computed at judge time (``j.full_pay``), fixed here for good."""
+    """The win a passing confirm judgement records — its full-pay duration
+    is the one computed at judge time (``j.full_pay``), fixed here for good."""
     fp = j.full_pay
     if not fp:
         raise ValueError(f"lane-C confirm of {j.entry.miner_hotkey!r} on {j.entry.target!r} "

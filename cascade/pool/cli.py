@@ -86,11 +86,13 @@ def _add_build_args(p: argparse.ArgumentParser) -> None:
                         "Raise --max-channels alongside, and arm [scoring] mv_score_from_block.")
     p.add_argument("--max-channels", type=int, default=32,
                    help="Max variates a kept series may carry (raise with --mv-pack).")
-    p.add_argument("--max-series-per-domain", type=int, default=800)
+    # Reviewed lane-A caps (2026-11-23: 800/400 -> 1500/750, ~10k-series
+    # snapshot); publish-pool.yml must pass the same values (pinned by test).
+    p.add_argument("--max-series-per-domain", type=int, default=1500)
     p.add_argument(
         "--max-series-per-domain-freq",
         type=int,
-        default=400,
+        default=750,
         help="Cap per (domain, granularity) cell — an hourly flood inside a domain "
         "can't crowd out that domain's daily series.",
     )
@@ -387,6 +389,9 @@ def _add_reveal(sub: argparse._SubParsersAction) -> None:
         help="Withhold the N newest real snapshots (default 2: pending + possibly-active).",
     )
     p.add_argument("--max-reveal", type=int, default=6, help="Upload at most N per run.")
+    p.add_argument("--newest-only", action="store_true",
+                   help="Reveal only the newest retired snapshot (one per run); older "
+                   "retired snapshots stay in the pool bucket and are not backfilled.")
     p.add_argument("--out", type=Path, default=Path("./_reveal_stage"), help="Local staging dir.")
     p.add_argument("--chain-toml", type=Path, default=None, help="Override chain.toml path.")
     _add_lane_args(p)
@@ -418,6 +423,7 @@ def _cmd_reveal(args: argparse.Namespace) -> int:
             keep_newest=args.keep_newest,
             max_reveal=args.max_reveal,
             work_dir=args.out,
+            **({"newest_only": True} if getattr(args, "newest_only", False) else {}),
             **({"prefix": prefix} if prefix != "pool" else {}),
         )
     except StorageError as e:
@@ -610,9 +616,20 @@ def _cmd_publish(args: argparse.Namespace) -> int:
     print(summary.render())
     _warn_if_small(summary, cfg)
 
+    from ..shared.hippius import PoolEntryFrozen
+
     try:
         tar_bytes = pack_dir_to_tar(args.out)
         store = pool_s3_store(cfg.storage)
+        # Freeze horizon, read AFTER the (slow) build: an entry that activates
+        # within one epoch of the chain head is final (consensus: the trainer
+        # pins and every validator re-resolves the same entry by sha256).
+        head = estimate_chain_head(cfg)
+        frozen_before = (None if head is None
+                         else head + int(effective_epoch_blocks(cfg.round, head)))
+        print(f"freeze horizon: chain head ~{head if head is not None else 'unknown'}; "
+              + (f"entries < block {frozen_before} are final" if frozen_before is not None
+                 else "head unknown, existing entries are not replaced"))
         meta = publish_pool_snapshot(
             store,
             tar_bytes,
@@ -622,8 +639,14 @@ def _cmd_publish(args: argparse.Namespace) -> int:
             context_length=summary.context_length,
             horizon=summary.horizon,
             max_keep=args.max_keep,
+            frozen_before_block=frozen_before,
+            allow_replace=head is not None,
             **({"prefix": prefix} if prefix != "pool" else {}),
         )
+    except PoolEntryFrozen as e:
+        # A refusal, not a failure: the published entry stays the scored one.
+        print(f"::warning::pool publish skipped: {e}", file=sys.stderr)
+        return 0
     except StorageError as e:
         print(f"pool publish failed: {e}", file=sys.stderr)
         return 4
@@ -637,6 +660,58 @@ def _cmd_publish(args: argparse.Namespace) -> int:
     print("validators score this pool for rounds whose epoch block >= effective_block "
           "(no chain.toml edit).")
     return 0
+
+
+def chain_head_from_status(doc: dict, now: dt.datetime) -> int | None:
+    """Chain head estimated from a ``status/chain.json`` document: its
+    ``current_block`` plus the wall time elapsed since ``as_of`` at the fixed
+    block time. ``None`` when the document is malformed."""
+    from ..shared.config import BLOCK_SECONDS
+
+    try:
+        block = int(doc["current_block"])
+        as_of = dt.datetime.fromisoformat(str(doc["as_of"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+    if as_of.tzinfo is None:
+        as_of = as_of.replace(tzinfo=dt.UTC)
+    elapsed = max(0.0, (now - as_of).total_seconds())
+    return block + int(elapsed // BLOCK_SECONDS)
+
+
+def estimate_chain_head(cfg, *, store=None, now: dt.datetime | None = None) -> int | None:
+    """A chain-free estimate of the current block for the publish freeze.
+
+    Reads the validator-published ``status/chain.json`` (block anchor + time,
+    extrapolated at the chain's 12 s block time, so a stale anchor still
+    tracks the head) and the trainer's ``latest.json`` ``created_block`` (a
+    lower bound) from the manifest bucket; returns the greater. ``None``
+    when no wall-clock anchor is readable: ``created_block`` alone is only a
+    lower bound and must never loosen the freeze."""
+    import json
+
+    from ..shared.chain_status import CHAIN_STATUS_KEY
+    from ..shared.hippius import open_manifest_store, read_latest_manifest
+    from ..shared.manifest import load_manifest
+
+    now = now or dt.datetime.now(dt.UTC)
+    try:
+        store = store if store is not None else open_manifest_store(cfg.storage)
+    except Exception as e:  # noqa: BLE001
+        log.warning("freeze: manifest store unavailable (%s)", e)
+        return None
+    try:
+        head = chain_head_from_status(json.loads(store.get_text(CHAIN_STATUS_KEY)), now)
+    except Exception as e:  # noqa: BLE001
+        log.warning("freeze: %s unreadable (%s)", CHAIN_STATUS_KEY, e)
+        head = None
+    if head is None:
+        return None
+    try:
+        head = max(head, int(load_manifest(read_latest_manifest(store)).created_block))
+    except Exception as e:  # noqa: BLE001 — the status anchor alone suffices
+        log.warning("freeze: latest manifest unreadable (%s)", e)
+    return head
 
 
 def _resolve_effective_block(args: argparse.Namespace, cfg) -> int:

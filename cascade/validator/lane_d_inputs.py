@@ -81,6 +81,7 @@ INPUTS_ERROR_CODES = (
     "chain_unavailable",        # the source's chain reader cannot be built
     "intake_unreadable",        # the intake queue file is unreadable or malformed
     "reveal_unreadable",        # a reveal block's timestamp is unreadable
+    "boundary_ts_unreadable",   # rev6.14 (a): the boundary block's timestamp is unreadable
     "metagraph_unreadable",     # the registered hotkeys are unreadable
     "state_unreadable",         # lane_d_state.json is refused
     "house_unavailable",        # the W5f pointer is missing, forged or wrongly signed
@@ -527,6 +528,15 @@ class LaneDInputsSource:
             raise LaneDInputsError("not_active", f"lane D does not settle at {b}")
         reader = self._reader()
         entries = self._entries(reader, b)
+        # rev6.14 (a): the boundary block's on-chain Timestamp.Now, the same on
+        # every validator; the judging start is applied against it (never a
+        # guessed or local time).
+        try:
+            boundary_ts = int(reader.block_timestamp(b))
+        except Exception as e:  # noqa: BLE001 — never a guessed time
+            self._readers.pop(threading.get_ident(), None)
+            raise LaneDInputsError("boundary_ts_unreadable",
+                                   f"boundary block {b} timestamp unreadable ({e})") from e
         uid_of = self._uid_of(reader)
         house = self._house()
         state = self._state(house)
@@ -544,7 +554,8 @@ class LaneDInputsSource:
         dirs = [d for d, _ in pools]
         return LaneDInputs(pool_dir=dirs[-1], entries=entries, forecasts=forecasts,
                            uid_of=uid_of, house=house, prior_pool_dirs=tuple(dirs[:-1]),
-                           armed=armed, channel_block_hash=self.channel_block_hash)
+                           armed=armed, boundary_ts=boundary_ts,
+                           channel_block_hash=self.channel_block_hash)
 
 
 def build_lane_d_inputs(cfg: Any, *, state_dir, intake_state_dir,

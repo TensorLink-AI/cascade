@@ -362,6 +362,9 @@ class LaneCDriver:
             td = getattr(self.ops, "tree_digest", None)
             if callable(td):
                 leg["tree_digest"] = str(td(leg["ref"]) or "")
+            if getattr(recipe, "embargo_scan", ()):
+                # DEC-CA-0074: the pre-rent embargo receipt rides the signed record
+                leg["embargo_scan"] = dict(recipe.embargo_scan)
             comp = trainer_competition(leg["target"])
             hours = comp.leg_hours(self.cfg, recipe) if comp is not None else None
             if hours is not None:
@@ -421,7 +424,9 @@ class LaneCDriver:
                                        **({"train_time": float(leg["train_time"])}
                                           if "train_time" in leg else {}),
                                        **({"coldkey": str(leg["coldkey"])}
-                                          if leg.get("coldkey") else {})}}
+                                          if leg.get("coldkey") else {}),
+                                       **({"embargo_scan": dict(leg["embargo_scan"])}
+                                          if leg.get("embargo_scan") else {})}}
                        if result.get("marketcast") else {}),
                     # any other competition's entry data (rides the manifest)
                     **({"competition": dict(result["competition"])}
@@ -889,6 +894,28 @@ class RunnerLaneCOps:
                                     train_time=train_time)
         finally:
             shutil.rmtree(d, ignore_errors=True)
+
+    def mkt_embargo_scan(self, tree, *, train_time: float) -> dict:  # pragma: no cover — bucket glue
+        """DEC-CA-0074 guard (b): the embargo receipt of ``tree`` (None = no
+        generator) against the signed ``pool_mkt`` snapshot active now."""
+        from ..pool.marketcast import MktSnapshotSource
+        from ..shared.hippius import pool_s3_store
+        from ..shared.marketcast_embargo import scan_receipt
+
+        cfg = self.r.cfg
+        mc = cfg.marketcast
+        src = self.__dict__.get("_mkt_scan_src")
+        if src is None:
+            src = self._mkt_scan_src = MktSnapshotSource(
+                pool_s3_store(cfg.storage), prefix=mc.pool_prefix,
+                signer_hotkey=str(cfg.netconfig.owner_hotkey or ""),
+                cache_dir=Path(self.r.work_root) / "_mkt_scan")
+        got = src.snapshot_for(int(self.client.current_block()))
+        if got is None:
+            raise RuntimeError(f"no {mc.pool_prefix} snapshot to scan the embargo against")
+        lb = getattr(cfg, "lane_b", None)
+        hits = dict(getattr(lb, "contamination_min_hits", ()) or ()) or None
+        return scan_receipt(tree, got[0], mc, train_time=float(train_time), min_hits=hits)
 
     def tree_digest(self, ref: str) -> str:
         """The :func:`~cascade.shared.lane_c_manifest.tree_digest` of the

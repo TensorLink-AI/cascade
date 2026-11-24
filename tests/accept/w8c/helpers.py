@@ -143,6 +143,27 @@ def hello(**over) -> dict:
 # ── the fakes ───────────────────────────────────────────────────────────────
 
 
+def fixture_boundary_ts(boundary) -> int:
+    """rev6.14 (a): the fixture's on-chain timestamp of a boundary block (the
+    same clock as W8b's fixtures: far after every fixture T + 6 h, 12 s per
+    block). Defined here so this dir does not need W8b's helpers to have it."""
+    return 2_000_000_000 + 12 * int(boundary)
+
+
+def takes_boundary_ts() -> bool:
+    """rev6.14 (a): whether the code under test takes the boundary timestamp
+    (``settle_lane_d`` and ``LaneDInputs``), so these fixtures also run
+    on a base without it."""
+    import dataclasses
+    import inspect
+
+    from cascade.validator.lane_d import settle_lane_d
+    from cascade.validator.lane_d_wiring import LaneDInputs
+
+    return ("boundary_ts" in inspect.signature(settle_lane_d).parameters
+            and "boundary_ts" in {f.name for f in dataclasses.fields(LaneDInputs)})
+
+
 class Reader:
     """The source's own read-only chain reader (``ChainClient`` method names:
     ``block_timestamp``, ``registered_hotkeys``). Records its calls and
@@ -159,6 +180,9 @@ class Reader:
         self.calls.append(("block_timestamp", threading.get_ident()))
         if self.fail_timestamp:
             raise ConnectionError(f"w8c: block {block} timestamp unreadable")
+        if int(block) not in self.timestamps:
+            # rev6.14 (a): a boundary block's on-chain timestamp (W8b's fixture clock).
+            return float(fixture_boundary_ts(int(block)))
         return float(self.timestamps[int(block)])
 
     def registered_hotkeys(self):
@@ -432,7 +456,7 @@ def expected_inputs(fx: dict, boundary: int) -> dict:
     W8b's hand-built inputs with the metagraph's full ``{hotkey: uid}``."""
     snap = 1 if int(boundary) <= B1 else 2
     chain = fx["chain"]
-    return {"pool_dir": Path(chain["pools"][snap]), "prior_pool_dirs": (),
+    out = {"pool_dir": Path(chain["pools"][snap]), "prior_pool_dirs": (),
             "entries": [dict(fx["entry"])],
             # Only the needed digests (X and the house): W7a's chain also
             # carries forecasts for its `loser` digest (main @ 2cd79be, #758),
@@ -440,6 +464,10 @@ def expected_inputs(fx: dict, boundary: int) -> dict:
             "forecasts": {dg: f for dg, f in chain["forecasts"][snap].items()
                           if dg in (fx["x"], fx["house"]["digest"])},
             "uid_of": uid_of(fx), "house": dict(chain["house"])}
+    if takes_boundary_ts():
+        # rev6.14 (a): the boundary block's on-chain timestamp.
+        out["boundary_ts"] = fixture_boundary_ts(boundary)
+    return out
 
 
 def assert_inputs_error(exc: BaseException, code: str) -> None:
