@@ -815,8 +815,10 @@ def forge_measure(mirror: dict, *, commit_times: list[float] | None, sweep_days:
                 "basis": "first-seen proxy − data time, non-baseline points"},
             "label": FORGE_LABEL}
     # ── fresh / embargo windows over the T sweep ─────────────────────────────
-    scored = [(fid, f["bucket"], s) for fid in sorted(feeds) for s in feeds[fid]["series"]
-              if not feeds[fid]["skipped"]]
+    # Each series takes ITS OWN feed's bucket (feeds[fid]); the earlier loop's
+    # ``f`` is the last feed in sort order and must not leak in here.
+    scored = [(fid, feeds[fid]["bucket"], s) for fid in sorted(feeds)
+              for s in feeds[fid]["series"] if not feeds[fid]["skipped"]]
     sweep: list[dict] | str
     if end is None:
         sweep = "not run: no partition with readable timestamps"

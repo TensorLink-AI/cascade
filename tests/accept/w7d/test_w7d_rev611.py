@@ -10,7 +10,7 @@ is the only defect.
 On main the replay still runs the D20 confirmation rule: a forged
 confirmation stage is a MATCH or a MISMATCH, never UNVERIFIABLE with the
 typed reason, and `combined_log_ratio` doesn't exist (`AttributeError` on
-`cascade.satellite.lane_d_replay`, in PATHS).
+`cascade.audit.lane_d_chain`, in PATHS).
 """
 
 from __future__ import annotations

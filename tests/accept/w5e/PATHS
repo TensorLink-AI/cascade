@@ -19,4 +19,7 @@ cascade/validator/lane_d_status.py
 # cascade/satellite/lane_d_replay.py), so an honest first-verdict crown is
 # audited and replayed as such and no report carries confirm_on_king_change.
 cascade/audit/lane_d.py
-cascade/satellite/lane_d_replay.py
+cascade/audit/lane_d_chain.py
+# rev6.18 A4 (F2): the wiring passes [generator] max_channels to settle_lane_d
+# and refuses inputs whose channels were picked by another block hash.
+cascade/validator/lane_d_wiring.py

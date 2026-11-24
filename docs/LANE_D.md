@@ -34,7 +34,7 @@ A lane D entry is a standard `cascade_pyramid` checkpoint directory holding
 
 | File | Rule |
 |---|---|
-| `config.json` | The contract's model config; its `"moe"` object must equal the contract's (`config_mismatch` otherwise) |
+| `config.json` | The contract's model config, pinned **whole** at `ready` (`cascade/lane_d/entry_config.py`): top-level keys only from `arch`, `base_arch` (= `cascade_pyramid`), `input_transform`, `moe`, `power_ema`, `quantile_levels` (the pyramid's 21 levels), and `moe` keys exactly `CascadeMoEConfig`'s fields; anything else is `409 config_key_not_allowed` / `config_value_not_allowed` / `config_unreadable`. At ingest its `"moe"` object must equal the contract's (`config_mismatch` otherwise) |
 | `model.py` | Byte-identical to the repo's `cascade/trainer/pyramid_model.py` (`code_mismatch` otherwise) |
 | `forecast_wrapper.py` | Byte-identical to the repo's `cascade/trainer/pyramid_wrapper.py` |
 | `weights.safetensors` | BF16 tensors only, the contract's tensor names and shapes, every value finite |
@@ -56,6 +56,28 @@ worker-image repin.
 Context is not a checkpoint property. At `ready` you declare the context your
 entry is judged at, one of `[lane_d] contexts`. The weights load at any
 context because the positional buffers are non-persistent.
+
+**Why `moe.context_length` stays 4096 at every declared context.** The
+contract pins `"moe": {"context_length": 4096, ...}` and ingest requires the
+entry's `"moe"` to equal it, so a 128k declaration still ships 4096 there.
+That is intended, not a cap: the field is positional *metadata*, not a limit
+the scored model enforces.
+
+- The pyramid model never reads `context_length` (or `max_patches`): time
+  attention uses xPos rotary terms computed per forward from the non-persistent
+  `inv_freq` / `zeta` buffers, so there is no learned position table and no
+  sequence-length bound in the weights.
+- The lane D scorer (`cascade/eval/lane_d_scorer.py` `_load_model`) builds the
+  model from the entry's `"moe"` with `context_length` replaced by the
+  context the entry is run at (its effective context, up to 131072), and feeds
+  each window its own no-pad history up to that context.
+- The only reader that would honour 4096 is the pinned `forecast_wrapper.py`
+  edge-pad, which lane D scoring never uses.
+
+Pinning the field keeps every entry's `config.json` identical to the
+contract's (the `config_mismatch` rule) while the context stays a declared
+scorer setting; quality beyond the 4096-point training rows is what T7 and the
+arming gates measure.
 
 - **Declarable from launch:** `contexts = [4096, 8192, 16384, 32768, 65536,
   131072]` (4k to 128k). You may declare any of them; a value outside
@@ -102,7 +124,7 @@ or upload URL; the hotkey signs and the coldkey is never opened.
 cascade lane-d export ./trained --out ./entry
 cascade lane-d verify ./entry
 cascade lane-d submit https://<intake> ./entry --context 4096 --wallet-name W --wallet-hotkey H
-cascade lane-d ready https://<intake> --digest <digest> --context 4096 --licence Apache-2.0 --attest --wallet-name W --wallet-hotkey H
+cascade lane-d ready https://<intake> --digest <digest> --context 4096 --licence MIT --attest --wallet-name W --wallet-hotkey H
 cascade lane-d status https://<intake> --hotkey <ss58>
 ```
 
@@ -143,11 +165,12 @@ from content addressing: the object path carries the manifest digest
 
 ## Licence and takedown
 
-At `ready` you attest, with `--licence Apache-2.0` or `--licence OpenMDW-1.1`
-and `--attest`, that the checkpoint's weights, code and config, and the
-training data used to produce them, are licensed for publication under
-Apache-2.0 or OpenMDW-1.1, and that the training data contains no outputs of
-any teacher model released under a restricted licence. Without `--attest`
+At `ready` you attest, with `--licence MIT` and `--attest`, that the
+checkpoint's weights, code and config, and the training data used to produce
+them, are licensed for publication under the MIT licence (exactly MIT: a
+modified MIT, such as one with a revenue restriction, is not), and that the
+training data contains no outputs of any teacher model released under a
+restricted licence. Without `--attest`
 the CLI shows the statement and sends nothing. Distillation is allowed, from
 Ephemeris or anything else, on your own account, as long as the teacher's
 licence permits it.
@@ -178,8 +201,13 @@ confirmation duel (FAQ).
 
 **Verdict.** A paired cluster bootstrap of the CRPS/MASE geomean ratio
 (clusters = source) with lane A's quantile head scoring. The challenger
-clears if `LCB ≥ d_margin` (`d_margin = 0.01`, at `alpha = 0.05`) and the
-point gain is strictly positive. Several entries freezing in one settlement
+clears if `LCB ≥` the crown bar in force at the settlement (at `alpha =
+0.05`) and the point gain is strictly positive. The bar decays with the
+current KING_D's tenure (the lane D settlements it has held the crown, the
+house included): `d_margin_start` (0.03) at tenure 0, falling linearly to
+`d_margin` (0.01) over `d_margin_warmup_settlements` (32 settlements, about
+4 days at 3 h each), flat after. A new crown restarts it. The signed report
+records the tenure and the bar applied (`crown_bar`). Several entries freezing in one settlement
 form a cohort judged with max-T on their shared window set. When a miner
 holds KING_D, each member must also clear the current house on the same set.
 An entry is
@@ -218,8 +246,12 @@ and only published, so the board shows whether lane D generalises.
 ## Pay and the court
 
 KING_D is paid from lane D's `share` of emissions. The court is KING_D plus
-up to `reward_prior_kings` (2) prior **miner** kings, decayed by
-`king_decay` (0.5) inside lane D's share. Unpaid share (a house king, an
+up to `reward_prior_kings` (2) prior **miner** kings, paid by the explicit
+`court_weights` `[0.80, 0.15, 0.05]` inside lane D's share: 80% to KING_D,
+15% to the newest prior king, 5% to the next. A court with fewer slots splits
+over the slots it has (KING_D alone takes all of it; KING_D plus one prior
+king take 0.80/0.95 and 0.15/0.95). Prior kings keep being paid with no time
+limit. Unpaid share (a house king, an
 empty or deregistered slot) burns; the remainder destination is release-only
 (`remainder = "burn"`). The shipped default is `share = 0.0` and
 `takes_from = "lane_b"`; the activation overlay sets the live split. Check

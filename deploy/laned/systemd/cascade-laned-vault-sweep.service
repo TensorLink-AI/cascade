@@ -1,0 +1,27 @@
+# TEMPLATE (not installed by any script): the W18 vault TTL sweep. First the
+# laned_vault_ledger/1 is exported from lane_d_state.json and its persisted
+# reports (cascade.lane_d.ops_jobs vault-ledger), then the sweeper runs on it.
+#
+# Ships with the sweeper in --dry-run: it plans every archive / delete and
+# writes only its action log under ${LANED_SWEEP_LOG_DIR}. A --live run needs
+# the owner's standing approval D16 (the sweeper reads it from the plan's
+# decision register and refuses without it) and an owner drop-in replacing
+# --dry-run with --live (S3 mode: --s3 --archive-bucket, credentials from the
+# owner's mode-600 env file, never this one). Testnet uses fs mode as here.
+
+[Unit]
+Description=cascade lane D vault TTL sweep (dry-run template)
+
+[Service]
+Type=oneshot
+WorkingDirectory=/
+Environment=PYTHONPATH=/root/cascade
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/cascade-laned-jobs.env
+ExecStartPre=/root/cascade/.venv/bin/python -P -m cascade.lane_d.ops_jobs vault-ledger --chain-toml ${LANED_CHAIN_TOML} --state ${LANED_STATE} --out ${LANED_LEDGER} --log-file ${LANED_LOG}
+ExecStart=/root/cascade/.venv/bin/python -P -m cascade.laned.vault_sweeper --dry-run --vault-dir ${LANED_VAULT_DIR} --archive-dir ${LANED_ARCHIVE_DIR} --ledger ${LANED_LEDGER} --config ${LANED_CHAIN_TOML} --log-dir ${LANED_SWEEP_LOG_DIR}
+Nice=19
+MemoryMax=512M
+NoNewPrivileges=true
+StandardOutput=append:/root/cascade/laned-jobs.log
+StandardError=append:/root/cascade/laned-jobs.log

@@ -36,7 +36,14 @@ e. at every weight push, checks each paid UID against its OWN metagraph: the
 All checks pass ⇒ the satellite sets the vector it derived through the chain
 client's weight path (float32 → u16 quantisation, ``WEIGHT_RETRY_BLOCKS``
 backoff). Any failure ⇒ it burns (``burn_uid``) while staying active and logs
-the failing check at every push until a receipt replays cleanly. Main silent ⇒
+the failing check at every push until a receipt replays cleanly — except
+lane D (LANE_D_PLAN rev6.18 B1/B3): at a settlement lane D pays, the
+satellite reads the lane D record (``lane-d/reports``, the receipt record
+the round receipt embeds) and the audit's one lane D checker decides it
+(the ``lane_d`` row, :func:`cascade.audit.checks.check_lane_d_pay`). A
+``burn``-class failure burns lane D's share ONLY (lanes A/B/C are set as
+derived; log tag ``lane_d_check_burn``); an ``alert``-class one is logged
+(``lane_d_check_alert``) and the signed court stays paid. Main silent ⇒
 it re-asserts the last verified vector until ``[satellite] stale_after_blocks``
 past that settlement's boundary, then burns until a new receipt verifies.
 
@@ -221,12 +228,14 @@ def replay_receipt(receipt, cfg: ChainConfig, *, reader: Any, prev: dict | None,
     check cannot run."""
     from ..audit.checks import (
         FAIL,
+        LANE_D_ROW,
         WARN,
         check_lane_c_chain,
         derive_weights,
         ladder_prior_mismatch,
     )
-    from ..audit.main import apply_receipt_overlay, audit_receipt
+    from ..audit.lane_d import TRANSIENT_CODE
+    from ..audit.main import apply_receipt_overlay, audit_receipt, fetch_lane_d_record
     from ..shared.activation import apply_receipt_activation
     from ..shared.era import forfeited_hotkeys
     from ..shared.hippius import manifest_round_key
@@ -358,22 +367,54 @@ def replay_receipt(receipt, cfg: ChainConfig, *, reader: Any, prev: dict | None,
         sentinel_replay(receipt, cfg_r, client)
     except ValueError as e:
         return _fail("sentinel", str(e))
+    # rev6.18 B1: at a settlement lane D pays, its record (the signed report
+    # and its receipt record) is read once and checked by the audit's one
+    # lane D checker (audit_receipt -> check_lane_d); a failure burns lane
+    # D's share only.
+    pays_d = cfg_r.lane_d.active(int(receipt.epoch_start_block))
+    lane_d = None
+    if pays_d:
+        try:
+            lane_d = fetch_lane_d_record(receipt, reader)
+        except Exception as e:  # noqa: BLE001 — a read failure is retried, never a burn
+            raise Transient(f"lane-d-fetch: {e}") from e
     # d. the audit's tier-0 re-derivation (verdict, cohort, bench gate from the
     # trainer-signed report, king check / ladder, lane payouts, weights)
     rows = audit_receipt(receipt, cfg_audit, tier=0, client=None,
-                         netconfig_store=reader, bench_store=reader)
+                         netconfig_store=reader, bench_store=reader, lane_d=lane_d)
+    lane_d_burn = ""
     for r in rows:
+        if r.name == LANE_D_ROW:
+            if r.status == FAIL:
+                lane_d_burn = r.detail
+            continue
         if r.status == FAIL:
             return _fail(r.name, r.detail)
     for r in rows:
-        if r.status == WARN and r.name in UNVERIFIABLE_WARN:
+        if r.status != WARN:
+            continue
+        if r.name in UNVERIFIABLE_WARN or (r.name == LANE_D_ROW
+                                           and r.detail.startswith(TRANSIENT_CODE)):
             raise Transient(f"{r.name}: {r.detail}")
+    for r in rows:
+        if r.name == LANE_D_ROW and r.status == WARN:
+            log.warning("lane_d_check_alert round=%s %s", rid, r.detail)
     burn = int(cfg_r.scoring.burn_uid)
     if not receipt.weights:
         return Replay(ok=True, vector=None, burn_uid=burn, attribution=_attribution(receipt))
-    vec, why = derive_weights(receipt, cfg_r)
+    # a lane D record the lane_d row refused is dropped: derive_weights then
+    # burns lane D's share (lane_d_record_missing), lanes A/B/C unchanged
+    vec, why = derive_weights(receipt, cfg_r,
+                              lane_d=lane_d if pays_d and not lane_d_burn else None)
     if vec is None:
         return _fail("weights-derive", why)
+    if pays_d and why:
+        # lane D's share burns; lanes A/B/C were compared by the audit's
+        # weights row, so the vector set is the derived one
+        log.warning("lane_d_check_burn round=%s lane D's share burns to uid %d, lanes A/B/C "
+                    "unchanged: %s", rid, burn, lane_d_burn or why)
+        return Replay(ok=True, vector=list(vec), burn_uid=burn,
+                      attribution=_attribution(receipt))
     got = [float(w) for w in receipt.weights]
     bad = [u for u, (a, b) in enumerate(zip(vec, got, strict=True))
            if not math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-12)]
@@ -474,6 +515,11 @@ class SatelliteRunner(ActivationMixin):
     _prelaunch_tally: Any = field(default=None, repr=False)
     _image_decoupled: ActivationRecord = field(default_factory=ActivationRecord, repr=False)
     _image_decoupled_tally: Any = field(default=None, repr=False)
+    # DEC-CA-0068 shared ladder: its own record + tally, exactly as the full
+    # validator (loop.py) declares them (#790 — without them the mixin's
+    # startup raised AttributeError and the satellite never cast the vote).
+    _shared_ladder: ActivationRecord = field(default_factory=ActivationRecord, repr=False)
+    _shared_ladder_tally: Any = field(default=None, repr=False)
     _cfg_base: Any = field(default=None, repr=False)
     _settlement_block: int | None = field(default=None, repr=False)
     _netconfig_now: int | None = field(default=None, repr=False)

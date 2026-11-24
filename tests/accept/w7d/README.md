@@ -1,5 +1,21 @@
 # W7d acceptance tests: the independent satellite replay
 
+> **rev6.18 B2 (owner 2026-11-23, "One lane D checker for outside
+> validators ... delete the other").** The satellite replay is no longer a
+> second checker. `cascade/satellite/` is deleted; the module moved into the
+> audit as `cascade/audit/lane_d_chain.py` (the chain rules of
+> `check_lane_d`) and reaches outside validators only through
+> `check_lane_d(..., chain=...)` / `lane_d_findings` (the satellite: through
+> `audit_receipt` -> the `lane_d` row). Its mismatch paths become rev6.18 B3
+> alert codes (`ld_chain`, `ld_draw`, `ld_judged_set`, `ld_bench`,
+> `ld_snapshot`); the replay-only per-report rules on the paid court and
+> `king_after` were ported into `check_lane_d` as burn codes (`ld_court`,
+> `ld_crown`). The tests below keep testing the rules at the new path
+> (`helpers.MODULE`); invariant 12 now forbids the module from importing the
+> rest of the audit (`cascade.audit.lane_d`, `checks`, `main`, `rederive`)
+> instead of the whole `cascade.audit` package. `test_w7d_audit_chain.py`
+> covers the `check_lane_d` mapping.
+
 W7d (plan rev6 §3.0 W7d row, depends on W7c) is the satellite half of
 §14.3: "Satellites verify the signature, check that the parameters stated in
 the report equal `config_at(boundary)` from the adopted overlay, check
@@ -169,8 +185,13 @@ re-derives everything that follows from it.
 | C5 pay: `pay.share == cfg.share`. The court is `[king_after] + prior_kings[:reward_prior_kings]`, king first, by recency. Each slot is `{digest, hotkey (None for the house), uid, burn_reason}`: `uid` is `uid_of[boundary][hotkey]` when the metagraph is given, and `burn_reason` is `None` iff `uid` is an int, else `house_king` (house slot) or `deregistered` | `pay.share`, `pay.court…` |
 | C6 held: a gate result whose digest has no verdict in this report is a held candidate only if an earlier report of the chain left that digest with a cleared, held first verdict (outcome `cleared`, gate absent or `bench_hold`). Nothing in between may have decided it, and its entry must be open (`hold` / `bench_hold`, rev6.11 (b)) in the previous report | `gate…` |
 
-**Pay shares.** Slot `i` of the court is worth `share * king_decay**i /
-sum_j king_decay**j`. A `None` uid burns. The shares sum to `share`. The
+**Pay shares.** Slot `i` of the court is worth `share * court_weights[i] /
+sum_{j < n} court_weights[j]` (rev6.23, owner 2026-11-24: 0.80 / 0.15 /
+0.05; `king_decay` retired). **(rev6.23) Crown bar.** The replay carries
+KING_D's tenure (0 at genesis, 1 after a crown or house retake, else + 1),
+requires each report's `crown_bar` to be `{tenure, margin}` at that tenure
+with the config's bar, judges every verdict against it, and checks the
+state snapshot's `king_tenure` is the next one. A `None` uid burns. The shares sum to `share`. The
 tests check them against an independent computation and against the
 producer's `emission.lane_d_vector` (the test may import it, the replay may
 not).

@@ -46,8 +46,8 @@ import numpy as np
 
 REPO = Path(__file__).resolve().parents[3]
 
-MODULE = "cascade.satellite.lane_d_replay"
-MODULE_PATH = REPO / "cascade" / "satellite" / "lane_d_replay.py"
+MODULE = "cascade.audit.lane_d_chain"
+MODULE_PATH = REPO / "cascade" / "audit" / "lane_d_chain.py"
 
 HOUR = 3600
 DAY = 86_400
@@ -93,7 +93,11 @@ FORBIDDEN_PACKAGES = (
     "cascade.shared.chain",     # decayed_share_vector (weights)
     "cascade.shared.lane_b",    # lane B weights
     "cascade.shared.lane_c",    # lane C weights
-    "cascade.audit",            # check_lane_d: the other independent re-derivation
+    # rev6.18 B2: this module now lives IN the audit package (the chain rules
+    # of check_lane_d); it still never leans on the per-report checker or
+    # the rest of the audit (cascade.audit.lane_d imports it, not the reverse)
+    "cascade.audit.lane_d", "cascade.audit.checks", "cascade.audit.main",
+    "cascade.audit.rederive",
     "cascade.lane_d",           # the lane D intake service
     "cascade.laned",            # lane D operator tooling (vault sweeper, restore, ...)
     "cascade.eval.lane_d_scorer", "cascade.eval.lane_d_ingest",  # eval-host scoring
@@ -110,7 +114,7 @@ ALLOWED_PRIMITIVES = (
     "cascade.shared.config.lane_d", # the parsed [lane_d] config type
 )
 ALLOWED_PACKAGES = ("cascade", "cascade.eval", "cascade.shared", "cascade.shared.config",
-                    "cascade.satellite")
+                    "cascade.audit")
 
 UNVERIFIABLE_REASONS = ("unknown_schema", "report_missing", "report_unreadable",
                         "signature_unverifiable", "prior_unverified",
@@ -588,7 +592,7 @@ if len(sys.argv) > 2 and sys.argv[2] == "block-sdk":
     for name in ("bittensor", "bittensor.sp_core", "bittensor_wallet", "substrateinterface"):
         sys.modules[name] = None
 from tests.accept.w7d.helpers import lane_d_cfg
-import cascade.satellite.lane_d_replay as rp
+import cascade.audit.lane_d_chain as rp
 pub = Path(sys.argv[1])
 meta = json.loads((pub / "meta.json").read_text())
 receipts = json.loads((pub / "receipts.json").read_text())
@@ -704,14 +708,16 @@ def static_closure(starts) -> set[str]:
 
 
 def satellite_modules() -> list[Path]:
-    d = REPO / "cascade" / "satellite"
-    return sorted(d.rglob("*.py")) if d.is_dir() else []
+    """rev6.18 B2: the chain-rules module (the former satellite replay, now
+    `cascade/audit/lane_d_chain.py`)."""
+    return [MODULE_PATH] if MODULE_PATH.is_file() else []
 
 
 def court_shares(cfg, court: list[dict]) -> list[tuple[str, int | None, float]]:
     """§1.4 pay, re-derived here: slot i of the court is worth
-    `king_decay**i` of `share`, normalised; a slot without a uid burns."""
-    raw = [float(cfg.king_decay) ** i for i in range(len(court))]
+    `court_weights[i]` of `share` (rev6.23, owner 2026-11-24: 0.80 / 0.15 /
+    0.05), normalised over the court's slots; a slot without a uid burns."""
+    raw = [float(w) for w in cfg.court_weights][:len(court)]
     total = sum(raw)
     return [(s["digest"], s["uid"], float(cfg.share) * w / total)
             for s, w in zip(court, raw, strict=True)]

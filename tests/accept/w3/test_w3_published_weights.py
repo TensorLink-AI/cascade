@@ -27,7 +27,7 @@ def producer():
 def _king(hotkey: str, digest: str, crown_block: int) -> dict:
     return {"hotkey": hotkey, "context": 8192, "digest": digest, "crown_block": crown_block,
             "lcb": 0.01, "gate": {"outcome": "pass"}, "sentinel": {"suite": "time"},
-            "license": "Apache-2.0"}
+            "license": "MIT"}
 
 
 def _mirror_with(root: Path, files: dict[str, bytes]) -> str:

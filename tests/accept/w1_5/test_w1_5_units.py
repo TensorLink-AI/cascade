@@ -91,17 +91,25 @@ def test_intake_ready_reads_through_storage(tmp_path):
     assert rec["coldkey_at_ready"] == coldkey
 
 
+# rev6.23 (owner 2026-11-24): lane D's court weights (KING_D, prior 1, prior 2).
+CW = (0.80, 0.15, 0.05)
+
+
 def test_lane_d_emission_part_taken_from_lane_a():
+    import inspect
+
     from cascade.shared.emission import lane_d_vector, lane_parts
 
-    king = lane_d_vector(N_UIDS, share=0.25, court_uids=[CHALLENGER_UID], king_decay=0.5,
+    assert "court_weights" in inspect.signature(lane_d_vector).parameters, \
+        "lane_d_vector takes no court_weights (rev6.23)"
+    king = lane_d_vector(N_UIDS, share=0.25, court_uids=[CHALLENGER_UID], court_weights=CW,
                          burn_uid=BURN_UID)
     assert math.isclose(king[CHALLENGER_UID], 0.25) and math.isclose(sum(king), 0.25)
     # D21 (decided: burn): while the house holds KING_D its slot burns.
-    house = lane_d_vector(N_UIDS, share=0.25, court_uids=[None], king_decay=0.5,
+    house = lane_d_vector(N_UIDS, share=0.25, court_uids=[None], court_weights=CW,
                           burn_uid=BURN_UID)
     assert math.isclose(house[BURN_UID], 0.25) and math.isclose(sum(house), 0.25)
-    assert lane_d_vector(N_UIDS, share=0.0, court_uids=[CHALLENGER_UID], king_decay=0.5,
+    assert lane_d_vector(N_UIDS, share=0.0, court_uids=[CHALLENGER_UID], court_weights=CW,
                          burn_uid=BURN_UID) == [0.0] * N_UIDS
     # D1/D48: lane D's 0.25 comes out of lane A's pool.
     a, b = lane_parts(list(LANE_A_COURT), N_UIDS, king_decay=LANE_A_KING_DECAY,
