@@ -1513,7 +1513,7 @@ guard_factor             = 1.25
 # one is MarketCast (DEC-CA-0064, mkt:<suite>); the generic domain: / freq: /
 # horizon: targets on the public-feed pool_c are refused at load (their
 # windows could be scraped and memorised). Lane C has no pool of its own.
-from_block = 9579600          # owner 2026-11-20: era boundary ~ Tue 24 Nov 22:23 UTC (Wed 09:23 AEDT)
+from_block = 9586800          # owner 2026-11-24: launch moved to era boundary ~ Wed 25 Nov 22:28 UTC (Thu 09:28 AEDT); was 9579600
 share      = 0.25                  # owner-tunable: taken from lane A ⇒ A 50 / B 25 / C 25
 takes_from = "lane_a"
 remainder  = "burn"                # unpaid decay + empty target slots burn
@@ -1712,7 +1712,7 @@ ready_ttl_blocks = 7200          # B10: ~24 h at 12 s blocks
 # source for every class that lists assets. Base, activation and data contract
 # are release-only; listed numeric verdict/payout/liveness controls allow overlays.
 [marketcast]
-from_block         = 9579600                    # owner 2026-11-20: era boundary ~ Tue 24 Nov 22:23 UTC (Wed 09:23 AEDT)
+from_block         = 9586800                    # owner 2026-11-24: launch moved to era boundary ~ Wed 25 Nov 22:28 UTC (Thu 09:28 AEDT); was 9579600
 base_ref           = "mistralai/Timestral-28M@180698bbf5a50dda3516aa6419798437fb03a430"
 base_sha256        = "dfc83c6220937ce5fc6687b35a4df94cd25e28a2cfe6fb92a23dad6301b2015d"  # model.safetensors (HF LFS oid)
 base_arch          = "timestral"

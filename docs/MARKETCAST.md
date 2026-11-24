@@ -10,8 +10,8 @@ every number) are in [MINER.md §14](MINER.md#14-marketcast-lane-c-the-composite
 when they disagree, §14 and the live `chain.toml` win.
 
 > **Status.** The checked-in `chain.toml` arms MarketCast at block
-> **9579600** (`[marketcast]` and `[lane_c] from_block`; about Tue 24 Nov 2026
-> 22:23 UTC). Once validators and the trainer run this release you can commit
+> **9586800** (`[marketcast]` and `[lane_c] from_block`; about Wed 25 Nov 2026
+> 22:28 UTC; owner 2026-11-24 moved it from 9579600). Once validators and the trainer run this release you can commit
 > and fund `mkt:market`, but no leg rents (and nothing is charged) before the
 > first lane-C era starts at that block; queued entries go first. On a
 > release with `from_block = 0` every `mkt:` command is refused
