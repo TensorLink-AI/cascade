@@ -1,0 +1,13 @@
+# Every 3 h on the pool_d cadence grid (W6d CADENCE_SECONDS = 10800, UTC
+# 00/03/06/.../21), a few minutes after the boundary so the period's
+# first-seen root can commit.
+[Unit]
+Description=cascade lane D elastic pool_d build every 3 h
+
+[Timer]
+OnCalendar=*-*-* 00/3:05:00 UTC
+Persistent=false
+Unit=cascade-laned-pool-d.service
+
+[Install]
+WantedBy=timers.target
