@@ -13,16 +13,16 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
+
+from cascade.audit.checks import check_lane_c_registrations
+from cascade.shared.hippius import receipt_round_key
+from cascade.shared.lane_c import TargetWin
 from cascade.shared.lane_c_registrations import (
     RegistrationSnapshots,
     recorded_uid,
     registration_record,
     registration_record_problem,
 )
-
-from cascade.audit.checks import check_lane_c_registrations
-from cascade.shared.hippius import receipt_round_key
-from cascade.shared.lane_c import TargetWin
 from cascade.shared.receipt import dump_receipt, load_receipt, sign_receipt
 
 from . import test_marketcast_validator as T
