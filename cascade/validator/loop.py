@@ -1121,11 +1121,18 @@ class ValidatorRunner(
         if step is None:
             return
         lane_d = getattr(self.cfg, "lane_d", None)
-        if lane_d is None or int(getattr(lane_d, "from_block", 0) or 0) <= 0:
+        nc_ = getattr(self, "netconfig", None)
+        # containment (owner 2026-11-24): an adopted overlay may arm lane D
+        # while the startup config leaves it off; with neither, nothing is read
+        overlaid = bool(nc_ is not None and getattr(nc_, "enabled", False)
+                        and getattr(getattr(nc_, "state", None), "history", None))
+        if (lane_d is None or int(getattr(lane_d, "from_block", 0) or 0) <= 0) and not overlaid:
             return
         try:
             boundary = self._reassert_boundary(int(client.current_block()))  # type: ignore[attr-defined]
-            if not lane_d.active(boundary):
+            if overlaid:
+                lane_d = getattr(self.cfg_at(boundary), "lane_d", None)
+            if lane_d is None or not lane_d.active(boundary):
                 return
             worker = self._lane_d_worker
             if worker is None or worker.step is not step:

@@ -43,7 +43,12 @@ the round receipt embeds) and the audit's one lane D checker decides it
 (the ``lane_d`` row, :func:`cascade.audit.checks.check_lane_d_pay`). A
 ``burn``-class failure burns lane D's share ONLY (lanes A/B/C are set as
 derived; log tag ``lane_d_check_burn``); an ``alert``-class one is logged
-(``lane_d_check_alert``) and the signed court stays paid. Main silent ⇒
+(``lane_d_check_alert``) and the signed court stays paid. Lanes B and C
+are scoped the same way (containment, owner 2026-11-24): a FAIL on a lane
+B / lane C row (``lane_b``; ``lane_c``, ``lane_c_chain``, ``marketcast*``)
+at a settlement that lane pays burns that lane's share ONLY (log tags
+``lane_b_check_burn`` / ``lane_c_check_burn``); lane A and lane D are set
+from the satellite's own derivation. Main silent ⇒
 it re-asserts the last verified vector until ``[satellite] stale_after_blocks``
 past that settlement's boundary, then burns until a new receipt verifies.
 
@@ -85,6 +90,62 @@ FOLLOWING, HOLDING, BURNING = "following", "holding", "burning"
 UNVERIFIABLE_WARN = frozenset({"receipt-signature", "manifest-signature", "netconfig",
                                "bench-gate", "king-check-bench", "bench-source",
                                "bench-coverage", "calendar-launch"})
+
+
+# Containment (owner 2026-11-24): audit rows owned by ONE of lanes B / C. A
+# FAIL on one of them at a settlement that lane pays burns that lane's share
+# only (log tag ``lane_b_check_burn`` / ``lane_c_check_burn``); lane A and
+# lane D are set as derived. Everything else (lane A's rows, the sentinel —
+# a lane A gate —, the netconfig row, signatures, continuity) still burns the
+# whole vector.
+LANE_ROWS = {"lane_b": "b", "lane_c": "c", "lane_c_chain": "c", "marketcast": "c"}
+
+
+def _lane_of_row(name: str) -> str | None:
+    """``"b"`` / ``"c"`` for a lane-owned audit row (``marketcast:<kind>``
+    spec instances are lane C's), else ``None``."""
+    if name.startswith("marketcast:"):
+        return "c"
+    return LANE_ROWS.get(name)
+
+
+def _lane_pays(cfg: ChainConfig, lane: str, boundary: int) -> bool:
+    return bool((cfg.lane_b if lane == "b" else cfg.lane_c).active(int(boundary)))
+
+
+def _lane_shares(cfg: ChainConfig, boundary: int) -> dict[str, float]:
+    """Lane B's / lane C's allocations at ``boundary`` (0 when not paying)."""
+    from ..shared.lane_c import lane_pool_shares
+
+    b = cfg.lane_b if cfg.lane_b.active(boundary) else None
+    c = cfg.lane_c if cfg.lane_c.active(boundary) else None
+    d = cfg.lane_d if cfg.lane_d.active(boundary) else None
+    try:
+        sb, sc, _ = lane_pool_shares(b, c, d)
+    except ValueError:
+        return {"b": 0.0, "c": 0.0}
+    return {"b": float(sb) if b is not None else 0.0, "c": float(sc) if c is not None else 0.0}
+
+
+def within_lane_envelope(recorded: list[float], burned: list[float], *, burn_uid: int,
+                         share: float) -> bool:
+    """Containment attribution of a ``weights`` mismatch: True when the
+    recorded vector differs from ``burned`` (the satellite's derivation with
+    the suspect lanes' shares on ``burn_uid``) ONLY by up to ``share`` moved
+    off ``burn_uid`` onto other uids — exactly what a wrong lane B / lane C
+    payout can do. Every other uid's recorded weight is at least the derived
+    one, and the excess sums to at most ``share``."""
+    eps = 1e-9
+    if len(recorded) != len(burned) or share <= 0.0:
+        return False
+    excess = 0.0
+    for u, (r, w) in enumerate(zip(recorded, burned, strict=True)):
+        if u == int(burn_uid):
+            continue
+        if float(r) < float(w) - eps:
+            return False
+        excess += float(r) - float(w)
+    return excess <= float(share) + eps
 
 
 class Transient(Exception):
@@ -311,6 +372,7 @@ def replay_receipt(receipt, cfg: ChainConfig, *, reader: Any, prev: dict | None,
             raise Transient(f"calendar-launch: {exc}") from exc
         cfg_audit = cfg_r
     # c. continuity
+    scoped: dict[str, str] = {}       # lane -> the failed lane-owned check
     post = getattr(receipt, "state_post", None)
     if post is None:
         return _fail("continuity", "the receipt records no state_post")
@@ -354,7 +416,9 @@ def replay_receipt(receipt, cfg: ChainConfig, *, reader: Any, prev: dict | None,
                                   lane_c=prev.get("lane_c"))
         row = check_lane_c_chain([prev_ns, receipt], cfg_r)
         if row.status == FAIL:
-            return _fail("lane_c_chain", row.detail)
+            if not _lane_pays(cfg_r, "c", boundary):
+                return _fail("lane_c_chain", row.detail)
+            scoped["c"] = f"lane_c_chain: {row.detail}"
     else:
         log.warning("round=%s: first receipt this satellite replays — continuity is "
                     "anchored here", rid)
@@ -383,13 +447,45 @@ def replay_receipt(receipt, cfg: ChainConfig, *, reader: Any, prev: dict | None,
     rows = audit_receipt(receipt, cfg_audit, tier=0, client=None,
                          netconfig_store=reader, bench_store=reader, lane_d=lane_d)
     lane_d_burn = ""
+    weights_fail = None
+    boundary_r = int(receipt.epoch_start_block)
     for r in rows:
         if r.name == LANE_D_ROW:
             if r.status == FAIL:
                 lane_d_burn = r.detail
             continue
-        if r.status == FAIL:
-            return _fail(r.name, r.detail)
+        if r.status != FAIL:
+            continue
+        lane = _lane_of_row(r.name)
+        if lane is not None and _lane_pays(cfg_r, lane, boundary_r):
+            scoped.setdefault(lane, f"{r.name}: {r.detail}")
+            continue
+        if r.name == "weights":
+            # the recorded vector carries the failed lane's part; decided
+            # below once every lane-owned row is known
+            weights_fail = r
+            continue
+        return _fail(r.name, r.detail)
+    if weights_fail is not None and not scoped:
+        # containment: a weights mismatch that lies wholly inside lane B's /
+        # lane C's share (a payout bug, not a lane A one) burns those lanes
+        # only; anything else still burns the whole vector
+        shares = _lane_shares(cfg_r, boundary_r)
+        got_w = [float(w) for w in receipt.weights or ()]
+        for cand in (("b",), ("c",), ("b", "c")):
+            if not all(shares[x] > 0.0 for x in cand):
+                continue
+            vec_l, why_l = derive_weights(
+                receipt, cfg_r, lane_d=lane_d if pays_d and not lane_d_burn else None,
+                burn_lanes=frozenset(cand))
+            if vec_l is not None and within_lane_envelope(
+                    got_w, vec_l, burn_uid=int(cfg_r.scoring.burn_uid),
+                    share=sum(shares[x] for x in cand)):
+                for x in cand:
+                    scoped[x] = f"weights: {weights_fail.detail}"
+                break
+        else:
+            return _fail(weights_fail.name, weights_fail.detail)
     for r in rows:
         if r.status != WARN:
             continue
@@ -405,9 +501,25 @@ def replay_receipt(receipt, cfg: ChainConfig, *, reader: Any, prev: dict | None,
     # a lane D record the lane_d row refused is dropped: derive_weights then
     # burns lane D's share (lane_d_record_missing), lanes A/B/C unchanged
     vec, why = derive_weights(receipt, cfg_r,
-                              lane_d=lane_d if pays_d and not lane_d_burn else None)
+                              lane_d=lane_d if pays_d and not lane_d_burn else None,
+                              burn_lanes=frozenset(scoped))
     if vec is None:
         return _fail("weights-derive", why)
+    if scoped:
+        # containment: the failed lane's share burns; lane A (and lane D,
+        # as derived above) are set from the satellite's own derivation —
+        # the recorded vector is not compared, it carries the faulty part
+        for lane, detail in sorted(scoped.items()):
+            log.warning("lane_%s_check_burn round=%s lane %s's share burns to uid %d, the "
+                        "other lanes as derived: %s", lane, rid, lane.upper(), burn, detail)
+        if weights_fail is not None:
+            log.warning("round=%s weights row (expected with a failed lane): %s", rid,
+                        weights_fail.detail)
+        if pays_d and why:
+            log.warning("lane_d_check_burn round=%s lane D's share burns to uid %d: %s", rid,
+                        burn, lane_d_burn or why)
+        return Replay(ok=True, vector=list(vec), burn_uid=burn,
+                      attribution=_attribution(receipt))
     if pays_d and why:
         # lane D's share burns; lanes A/B/C were compared by the audit's
         # weights row, so the vector set is the derived one

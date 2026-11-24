@@ -108,6 +108,11 @@ def _hours(hi: float) -> Bound:
 
 
 _DECAY = Bound(0.0, 1.0, lo_open=True, why="court split; 1.0 = flat")
+# containment (owner 2026-11-24): a lane start / kill block is a chain block
+# number (u32); the loader keeps it an era boundary, netconfig keeps it
+# forward-only (never earlier than typed, never before the apply block)
+_BLOCK = Bound(0, 2**32 - 1, integer=True,
+               why="a chain block (u32); forward-only, era boundary")
 _PRIOR_KINGS = _count(0, 8, why="court length")
 _FRACTION = Bound(0.0, 1.0, why="a fraction")
 
@@ -157,8 +162,11 @@ BOUNDS: dict[tuple[str, str], Bound] = {
     ("lane_b", "max_leg_seconds"): _count(60, 2 * 48 * 3600, why="leg wall cap"),
     ("lane_b", "guard_factor"): Bound(1.0, 4.0, why="leg wall cap"),
     ("lane_b", "sentinel_max_defer_eras"): _count(0, 100, why=_STALL),
+    ("lane_b", "until_block"): _BLOCK,
     # ── lane C ────────────────────────────────────────────────────────────
     ("lane_c", "share"): Bound(0.0, 0.5, why=_MONEY),
+    ("lane_c", "from_block"): _BLOCK,
+    ("lane_c", "until_block"): _BLOCK,
     ("lane_c", "alpha"): _alpha(),
     ("lane_c", "bootstrap_B"): _boot(),
     ("lane_c", "gain_margin"): _margin(),
@@ -173,6 +181,7 @@ BOUNDS: dict[tuple[str, str], Bound] = {
     ("lane_c", "full_pay_max_days"): Bound(0.0, 365.0, lo_open=True, why=_MONEY),
     ("lane_c", "full_pay_max_gain"): Bound(0.0, 0.5, lo_open=True, why=_MONEY),
     # ── lane C's judge: the listed [marketcast] controls ──────────────────
+    ("marketcast", "from_block"): _BLOCK,
     ("marketcast", "alpha"): _alpha(),
     ("marketcast", "bootstrap_B"): _boot(),
     ("marketcast", "gain_margin"): _margin(),
@@ -195,6 +204,7 @@ BOUNDS: dict[tuple[str, str], Bound] = {
     ("marketcast", "verdict_wait_blocks"): _count(0, 3900, why=_STALL),
     # ── lane D ────────────────────────────────────────────────────────────
     ("lane_d", "share"): Bound(0.0, 0.5, why=_MONEY),
+    ("lane_d", "until_block"): _BLOCK,
     ("lane_d", "alpha"): _alpha(),
     ("lane_d", "bootstrap_B"): _boot(),
     ("lane_d", "d_margin"): _margin(),

@@ -219,8 +219,13 @@ class LaneDStep:
     def __init__(self, cfg: Any, *, state_dir: str | Path, signer: Any,
                  chain_factory: Callable[[], Any], store: Any,
                  inputs: Callable[[int], LaneDInputs] | None = None,
-                 bench: Callable[[int], Any] | None = None):
+                 bench: Callable[[int], Any] | None = None,
+                 cfg_at: Callable[[int], Any] | None = None):
         self.cfg = cfg
+        # containment (owner 2026-11-24): the config in force at a boundary
+        # (the adopted overlay's), so an overlay-armed lane D settles; None =
+        # the startup config (direct construction)
+        self._cfg_at = cfg_at
         self.state_path = Path(state_dir) / STATE_FILE
         self.signer = signer
         self.store = store
@@ -490,6 +495,12 @@ class LaneDStep:
 
     def __call__(self, boundary: int) -> LaneDSettlement | None:
         b = int(boundary)
+        if self._cfg_at is not None:
+            try:
+                self.cfg = self._cfg_at(b)
+            except Exception as e:  # noqa: BLE001 — no config: no settlement (lane D burns)
+                log.warning("lane D: config at boundary %d unavailable (%s); not settled", b, e)
+                return None
         if not self.cfg.lane_d.active(b):
             return None
         if self.signer is None:
@@ -563,16 +574,22 @@ class LaneDStep:
 def build_lane_d_step(cfg: Any, *, state_dir: str | Path, signer: Any,
                       chain_factory: Callable[[], Any], store: Any,
                       inputs: Callable[[int], LaneDInputs] | None = None,
-                      bench: Callable[[int], Any] | None = None) -> LaneDStep | None:
+                      bench: Callable[[int], Any] | None = None,
+                      cfg_at: Callable[[int], Any] | None = None,
+                      always: bool = False) -> LaneDStep | None:
     """The lane D step for ``cfg`` (the full ``ChainConfig``), or ``None``
     while ``[lane_d] from_block = 0`` (nothing is built, read or called).
+    ``always`` (containment, owner 2026-11-24; the validator passes it with
+    ``cfg_at``) builds the step even unarmed: it stays inert — every call at
+    a boundary the config in force there does not arm returns ``None``, as
+    unarmed — until an adopted overlay arms lane D.
     ``chain_factory()`` builds the step's own read-only chain reader
     (``block_hash(block) -> str``) on the step's thread, at its first armed
     call; ``store`` is the bucket the report, receipt and status go to."""
-    if int(getattr(getattr(cfg, "lane_d", None), "from_block", 0) or 0) <= 0:
+    if not always and int(getattr(getattr(cfg, "lane_d", None), "from_block", 0) or 0) <= 0:
         return None
     return LaneDStep(cfg, state_dir=state_dir, signer=signer, chain_factory=chain_factory,
-                     store=store, inputs=inputs, bench=bench)
+                     store=store, inputs=inputs, bench=bench, cfg_at=cfg_at)
 
 
 __all__ = ["RECEIPT_LATEST_KEY", "WIRING_ERROR_CODES", "LaneDInputs", "LaneDStep",

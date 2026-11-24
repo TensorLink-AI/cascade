@@ -173,6 +173,37 @@ on the allow-list; `lane_c.share <= lane_b.share` is load-checked even while
 lane C is dormant, and the lane-C pool opens on first use, so an overlay that
 arms lane C needs no restart.
 
+## Containment by overlay (owner 2026-11-24, launch release)
+
+The 2026-11-25 release is the one validator update; anything testnet finds
+in lanes B / C / D afterwards must be fixable or containable by overlay:
+
+- **Lane C / MarketCast launch is overlay-gated.** `[marketcast] from_block`
+  joins the allow-list. An overlay may move `[lane_c] from_block` and
+  `[marketcast] from_block` LATER than the typed value (or to 0), never
+  earlier (`start_refusals`), never before the apply block, and never once
+  the start has passed (`retroactive_changes`: end a running lane with
+  `until_block`). Moving `[lane_c] from_block` alone carries MarketCast's
+  start with it. The publish tool refuses a start less than one era past
+  the head.
+- **Kill switches.** `[lane_c] until_block` and `[lane_b] until_block` (0 =
+  no end; an era boundary after the start): the settlement AT it is the
+  lane's last, every later one is as if the lane were off. Lane C's also
+  closes MarketCast (derived, never a `[marketcast]` key). No kill switch
+  is ever moved to, or away from, a block before the apply block (lanes B,
+  C, D). Every block key has a W-OV bound (`netconfig_bounds`, u32).
+- **Satellite burns scoped per lane.** A lane B / lane C audit FAIL, or a
+  `weights` mismatch lying wholly inside lane B's / C's share, at a
+  settlement that lane pays burns that lane's share only; lane A and D are
+  set from the satellite's own derivation. Lane A rows, the sentinel (a lane
+  A gate) and the netconfig row still burn the whole vector.
+- **Lane D wiring.** The main validator always builds the lane D step and
+  inputs and judges each boundary under the config in force there, so an
+  overlay-armed lane D settles.
+- **Refresh.** A node signals the NEWEST overlay it can validate (the new
+  bodies newest first, then the one it already held): a refused newer body
+  never drops an older valid one still being signalled.
+
 ## Open
 
 - The main validator's hotkey for mainnet `[netconfig] owner_hotkey`.

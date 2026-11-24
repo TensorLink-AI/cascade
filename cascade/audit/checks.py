@@ -2904,7 +2904,8 @@ def _check_emission_weights(name: str, receipt: RoundReceipt,
 
 
 def _lane_vector_want(receipt: RoundReceipt, cfg: ChainConfig, got_pol,
-                      n_uids: int, d_court: list | None = None
+                      n_uids: int, d_court: list | None = None,
+                      burn_lanes: frozenset = frozenset()
                       ) -> tuple[list[float] | None, int, str | None]:
     """The lane-kept-apart vector (lane A's court, lane B's ``lane_b_pay``,
     lane C's ``lane_c_pay``) under ``got_pol``: ``(want, n paid lane-C
@@ -2915,13 +2916,25 @@ def _lane_vector_want(receipt: RoundReceipt, cfg: ChainConfig, got_pol,
     from lane A's pool and its court part is ADDED to the non-lane-A part,
     re-derived here (:func:`_lane_d_carve`, :func:`_lane_d_part`), never
     through the producer's lane D emission (invariant 12). A DEC-CA-0055
-    policy then re-shapes lane A's part only (RV3 note 10)."""
+    policy then re-shapes lane A's part only (RV3 note 10).
+
+    ``burn_lanes`` (containment, owner 2026-11-24; a satellite whose lane B
+    / lane C check failed): ``"b"`` / ``"c"`` for a lane ACTIVE at the
+    settlement puts that lane's WHOLE share on ``burn_uid`` — its record is
+    not read, its slots pay nothing, lanes A and D (and the other lane) are
+    rebuilt exactly as without the fault. Empty = unchanged behaviour."""
+    from dataclasses import replace as _dc_replace
+
     from ..shared.emission import emission_vector, lane_parts
 
     boundary = int(receipt.epoch_start_block)
     burn = cfg.scoring.burn_uid
+    burn_b = "b" in burn_lanes and cfg.lane_b.active(boundary)
+    burn_c = "c" in burn_lanes and cfg.lane_c.active(boundary)
     wins, pay = [], receipt.lane_b_pay
-    if pay is not None:
+    if burn_b:
+        pay = {}
+    elif pay is not None:
         if not cfg.lane_b.active(boundary):
             return None, 0, "lane-B payout record before lane B is active"
         wins, why = _lane_b_paid_wins(receipt, cfg, n_uids)
@@ -2931,7 +2944,9 @@ def _lane_vector_want(receipt: RoundReceipt, cfg: ChainConfig, got_pol,
         return None, 0, ("lane B is live at this settlement but the receipt carries no "
                          "payout record to rebuild it")
     c_wins, c_pay = [], getattr(receipt, "lane_c_pay", None)
-    if c_pay is not None:
+    if burn_c:
+        c_pay = {}
+    elif c_pay is not None:
         c_wins, why = _lane_c_paid_wins(receipt, cfg, n_uids)
         if why is not None:
             return None, 0, why
@@ -2940,11 +2955,14 @@ def _lane_vector_want(receipt: RoundReceipt, cfg: ChainConfig, got_pol,
                          "lane-C payout record to rebuild it")
     if c_pay is not None and pay is None and cfg.lane_c.takes_from == "lane_b":
         return None, 0, "lane C taken from lane B requires lane B's payout record"
+    b_cfg = (None if pay is None
+             else _dc_replace(cfg.lane_b, remainder="burn") if burn_b else cfg.lane_b)
     a, b = lane_parts(list(receipt.reward_uids), n_uids, king_decay=cfg.scoring.king_decay,
-                      burn_uid=burn, lane_b_cfg=(cfg.lane_b if pay is not None else None),
+                      burn_uid=burn, lane_b_cfg=b_cfg,
                       wins=wins, lane_c_cfg=(cfg.lane_c if c_pay is not None else None),
                       c_wins=c_wins,
-                      c_slot_frac=(dict(c_pay["slot_frac"]) if c_pay is not None else None))
+                      c_slot_frac=(dict(c_pay["slot_frac"])
+                                   if c_pay is not None and not burn_c else None))
     if d_court is not None:
         share_d, why = _lane_d_carve(cfg, cfg.lane_b if pay is not None else None,
                                      cfg.lane_c if c_pay is not None else None)
@@ -3148,18 +3166,21 @@ def lane_d_pay(receipt: RoundReceipt, cfg: ChainConfig, lane_d) -> LaneDPay:
     return LaneDPay(court=court, alerts=alerts)
 
 
-def _lane_d_wants(receipt: RoundReceipt, cfg: ChainConfig, pol, n: int, pay: LaneDPay
+def _lane_d_wants(receipt: RoundReceipt, cfg: ChainConfig, pol, n: int, pay: LaneDPay,
+                  burn_lanes: frozenset = frozenset()
                   ) -> tuple[list[float] | None, list[float] | None, str | None]:
     """``(paid, burned, None)``: the vector with lane D paying its signed
     court (``None`` when the record names none) and with lane D's share
     burned, lanes A/B/C identical in both (B1); or ``(None, None, why)``
     when lanes A/B/C cannot be rebuilt."""
-    burned, _, why = _lane_vector_want(receipt, cfg, pol, n, d_court=[])
+    burned, _, why = _lane_vector_want(receipt, cfg, pol, n, d_court=[],
+                                       burn_lanes=burn_lanes)
     if why is not None:
         return None, None, why
     paid = None
     if pay.court is not None:
-        paid, _, why = _lane_vector_want(receipt, cfg, pol, n, d_court=pay.court)
+        paid, _, why = _lane_vector_want(receipt, cfg, pol, n, d_court=pay.court,
+                                         burn_lanes=burn_lanes)
         if why is not None:
             return None, None, why
     return paid, burned, None
@@ -4161,7 +4182,8 @@ def _weights_chain_note(receipt: RoundReceipt, client: object) -> str:
 
 
 def derive_weights(receipt: RoundReceipt, cfg: ChainConfig, *,
-                   lane_d=None) -> tuple[list[float] | None, str]:
+                   lane_d=None, burn_lanes: frozenset = frozenset()
+                   ) -> tuple[list[float] | None, str]:
     """DEC-CA-0058: the weight vector rebuilt from the receipt's records
     (reward UIDs, the DEC-CA-0055 ``emission`` policy, ``lane_b_pay``,
     ``lane_c_pay``) with the same builders :func:`check_weights` compares
@@ -4187,13 +4209,23 @@ def derive_weights(receipt: RoundReceipt, cfg: ChainConfig, *,
     findings (:func:`lane_d_pay` ``alerts``) keep the court paid. A lane D
     verifier that cannot run is ``(None, "ld_verifier_unavailable: ...")``
     (retry). Unarmed with no record, the result is exactly the lane A/B/C
-    one (invariant 1)."""
+    one (invariant 1).
+
+    ``burn_lanes`` (containment, owner 2026-11-24): a satellite's per-lane
+    burn — ``"b"`` / ``"c"`` for a lane B / lane C check that FAILED at a
+    settlement that lane pays: that lane's whole share goes to ``burn_uid``
+    and every other lane is rebuilt as without the fault
+    (:func:`_lane_vector_want`). Empty (the default) = unchanged; a lane not
+    active at the settlement is ignored."""
     from ..shared.emission import EmissionPolicy, lane_parts
 
     boundary = int(receipt.epoch_start_block)
     pays_d = cfg.lane_d.active(boundary)
+    burn_lanes = frozenset(x for x in burn_lanes
+                           if (x == "b" and cfg.lane_b.active(boundary))
+                           or (x == "c" and cfg.lane_c.active(boundary)))
     if lane_d is not None and not pays_d:
-        vec, why = derive_weights(receipt, cfg)
+        vec, why = derive_weights(receipt, cfg, burn_lanes=burn_lanes)
         if vec is None:
             return None, why
         return vec, f"lane_d_not_armed: lane D does not pay at the settlement {boundary}"
@@ -4208,16 +4240,17 @@ def derive_weights(receipt: RoundReceipt, cfg: ChainConfig, *,
         pay = lane_d_pay(receipt, cfg, lane_d)
         if pay.transient:
             return None, pay.transient
-        paid, burned, why = _lane_d_wants(receipt, cfg, pol, n, pay)
+        paid, burned, why = _lane_d_wants(receipt, cfg, pol, n, pay, burn_lanes=burn_lanes)
         if why is not None:
             return None, why
         if not pay.paid:
             return burned, pay.why
         return paid, ""
-    if rec is not None or getattr(receipt, "lane_c_pay", None) is not None:
+    if (rec is not None or getattr(receipt, "lane_c_pay", None) is not None
+            or burn_lanes):
         pol = (EmissionPolicy.from_record(rec.get("policy") or {}) if rec is not None
                else EmissionPolicy())
-        want, _, why = _lane_vector_want(receipt, cfg, pol, n)
+        want, _, why = _lane_vector_want(receipt, cfg, pol, n, burn_lanes=burn_lanes)
         return (want, "") if why is None else (None, why)
     burn_vec = decayed_share_vector([], n, decay=cfg.scoring.king_decay, burn_uid=burn)
     if cfg.lane_c.active(boundary):

@@ -506,23 +506,41 @@ def main(argv: list[str] | None = None) -> int:
     # configures (intake entries, pinned pool_d, the signed house pointer, the
     # eval host's forecasts), read on the worker's thread through the source's
     # own chain client. Unarmed nothing is read or built.
+    #
+    # Containment (owner 2026-11-24): the step and its inputs are built even
+    # while the STARTUP chain.toml leaves lane D off, and judge each boundary
+    # under the config in force there (``runner.cfg_at``: the adopted
+    # overlay's), so an overlay-armed lane D settles instead of burning its
+    # share. Unarmed at a boundary they return / refuse exactly as unarmed.
+    # Inputs that are missing or do not load while lane D is unarmed at
+    # startup are logged and the step fails closed (inputs_unavailable) if an
+    # overlay later arms it; armed at startup they still refuse to start.
+    armed_at_start = int(runner.cfg.lane_d.from_block or 0) > 0
     lane_d_store = None
     lane_d_services = None
-    if int(runner.cfg.lane_d.from_block or 0) > 0:
-        from ..shared.hippius import open_manifest_store
+    from ..shared.hippius import open_manifest_store
 
+    try:
         lane_d_store = open_manifest_store(runner.cfg.storage)
-        if args.lane_d_inputs is None:
+    except Exception as e:  # noqa: BLE001 — unarmed: never stops the validator
+        if armed_at_start:
+            raise
+        log.warning("lane D store unavailable (%s); an overlay-armed lane D cannot publish", e)
+    if args.lane_d_inputs is None:
+        if armed_at_start:
             log.error("lane D is armed but --lane-d-inputs is not set: every lane D "
                       "settlement refuses inputs_unavailable")
-        else:
-            from .lane_d_inputs import LaneDInputsConfigError, load_inputs_services
+    else:
+        from .lane_d_inputs import LaneDInputsConfigError, load_inputs_services
 
-            try:
-                lane_d_services = load_inputs_services(runner.cfg, args.lane_d_inputs)
-            except LaneDInputsConfigError as e:
+        try:
+            lane_d_services = load_inputs_services(runner.cfg, args.lane_d_inputs)
+        except LaneDInputsConfigError as e:
+            if armed_at_start:
                 print(e, file=sys.stderr)
                 return 2
+            log.error("lane D inputs %s do not load (%s): an overlay-armed lane D refuses "
+                      "inputs_unavailable", args.lane_d_inputs, e)
     lane_d_dir = Path(runner.cfg.validator.state_db_path).parent
     lane_d_inputs = None
     if lane_d_services is not None:
@@ -531,16 +549,19 @@ def main(argv: list[str] | None = None) -> int:
         lane_d_inputs = build_lane_d_inputs(
             runner.cfg, state_dir=lane_d_dir,
             chain_factory=lambda: ChainClient.from_config(runner.cfg, network=args.network),
-            **lane_d_services)
+            cfg_at=runner.cfg_at, always=True, **lane_d_services)
     runner.lane_d_step = build_lane_d_step(
         runner.cfg, state_dir=lane_d_dir,
         signer=runner.bench_signer,
         chain_factory=lambda: ChainClient.from_config(runner.cfg, network=args.network),
         store=lane_d_store, inputs=lane_d_inputs,
-        bench=None if lane_d_inputs is None else lane_d_inputs.bench)
-    if runner.lane_d_step is not None:
+        bench=None if lane_d_inputs is None else lane_d_inputs.bench,
+        cfg_at=runner.cfg_at, always=True)
+    if armed_at_start:
         log.info("lane D armed from block %d: settlements run off the poll thread",
                  int(runner.cfg.lane_d.from_block))
+    else:
+        log.info("lane D step wired, inert until an adopted overlay arms [lane_d]")
     if runner.cfg.storage.pool_bucket:
         from .pool import load_bucket_pool
 

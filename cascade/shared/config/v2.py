@@ -641,6 +641,10 @@ class LaneBConfig:
     """
 
     from_block: int = 0
+    # containment kill switch (owner 2026-11-24, overlay-settable): 0 = no
+    # end; else the era boundary lane B closes at — the settlement AT it is
+    # lane B's last paid one, every later block is as if lane B were off
+    until_block: int = 0
     share: float = 0.5
     domains: tuple[str, ...] = ()
     remainder: str = "burn"
@@ -783,7 +787,8 @@ class LaneBConfig:
     tau_anchor_domain: float = 0.0
 
     def active(self, block: int | None) -> bool:
-        return self.from_block > 0 and block is not None and int(block) >= self.from_block
+        return (self.from_block > 0 and block is not None and int(block) >= self.from_block
+                and (self.until_block <= 0 or int(block) <= self.until_block))
 
     def merge_guard_at_era(self, era_start: int | None) -> bool:
         """Merge guards apply to the init of an era starting at ``era_start``."""
@@ -898,8 +903,14 @@ def parse_lane_b(lb: dict, *, from_block: int | None = None,
     replay = int(lb.get("replay_settlements", 64))
     fb = (max(0, int(lb.get("from_block", 0) or 0)) if from_block is None
           else max(0, int(from_block)))
+    ub = lb.get("until_block", 0)
+    if type(ub) is not int or ub < 0:
+        raise ValueError(f"[lane_b] until_block must be an integer >= 0 (0 = no end); got {ub!r}")
+    if ub and ub < fb:
+        raise ValueError(f"[lane_b] until_block={ub} must follow from_block")
     cfg = LaneBConfig(
         from_block=fb,
+        until_block=int(ub),
         share=float(lb.get("share", 0.5)),
         domains=tuple(str(d) for d in lb.get("domains", ())),
         remainder=str(lb.get("remainder", "burn")),
