@@ -26,6 +26,10 @@ def test_scheduled_publish_uses_the_reviewed_cli_capacity(command):
     parsed, _ = parser.parse_known_args(shlex.split(match[1].replace('\\\n', ' ')))
     assert parsed.max_series_per_domain == defaults.max_series_per_domain
     assert parsed.max_series_per_domain_freq == defaults.max_series_per_domain_freq
+    # Reviewed values (owner 2026-11-23). The panel cap has no CLI default
+    # (None = the source's built-in 200), so it is pinned on the command itself.
+    assert (parsed.max_series_per_domain, parsed.max_series_per_domain_freq) == (1500, 750)
+    assert parsed.max_panel_series_per_feed == 20
     assert len(COMMANDS) == 1
     assert parsed.lane == 'a'
 

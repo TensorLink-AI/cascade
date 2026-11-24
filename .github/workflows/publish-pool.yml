@@ -207,15 +207,32 @@ jobs:
           #   25 per feed (until 2026-10-03) still let 28 panel feeds supply ~26% of
           #   the series but only ~2.5% of the clusters, and transport filled its
           #   600 from ~50 sources. The KOTH bootstrap resamples whole feeds, so
-          #   evidence scales with distinct sources: 5 per feed makes the same caps
-          #   draw from ~2.4x more feeds and tightens the LCB.
-          # --max-series-per-domain-freq 400: balance by domain AND granularity —
+          #   evidence scales with distinct sources: 5 per feed made the same caps
+          #   draw from ~2.4x more feeds and tightened the LCB.
+          #   Raised 2026-11-23 (owner) 5 -> 20 with the domain caps below. The
+          #   bootstrap cluster key is the feed's source_family (pool metadata
+          #   `source`; cascade/pool/builder.py prepare_series, the default
+          #   --cluster-by source_family), and every panel row of one feed carries
+          #   the same family, so extra panel rows add series but no clusters.
+          #   --selection balanced still deals slots across sources first.
+          #   NOTE: the panel cap is not recorded in provenance.json, so a lane D
+          #   pool_d_build replay of a snapshot must pass the same
+          #   --max-panel-series-per-feed it was published with (20 from now on).
+          # --max-series-per-domain-freq 750: balance by domain AND granularity —
           #   no (domain, freq) cell can dominate, so an hourly flood inside a
           #   domain can't crowd out that domain's daily series either.
-          # --max-series-per-domain 800: outer bound — every domain is already
+          # --max-series-per-domain 1500: outer bound — every domain is already
           #   multi-granularity (4-9 freqs), so the cell cap alone would let one
-          #   domain span cells up to 400 x n_freqs; 800 absolute caps that.
-          #   Keep these overrides aligned with the reviewed CLI defaults.
+          #   domain span cells up to 750 x n_freqs; 1500 absolute caps that.
+          #   Raised 2026-11-23 (owner) from 800 / 400 for a ~10k-series
+          #   snapshot. This replaces the plan to hold the caps until the scarce
+          #   domains (sales) reached 800: small domains are already fully taken,
+          #   and the even-by-domain draw gives a scarce domain everything it
+          #   has and flows the surplus to the larger domains
+          #   (cascade/validator/windows.py, DEC-CA-0032), so higher caps add
+          #   series where the pool has them.
+          #   Keep these overrides aligned with the reviewed CLI defaults
+          #   (cascade/pool/cli.py; tests/unit/test_pool_publish_workflow.py).
           # --selection balanced: when a cap binds, deal its slots round-robin
           #   across SOURCES in an order seeded by the snapshot's effective block,
           #   and take a seeded sample of each feed's panel rows. First-come
@@ -231,9 +248,9 @@ jobs:
           TSFORGE_DIR=./tsforge cascade-pool publish \
             --chain-toml "$TOML" \
             --sources tsbench_forge \
-            --max-panel-series-per-feed 5 \
-            --max-series-per-domain-freq 400 \
-            --max-series-per-domain 800 \
+            --max-panel-series-per-feed 20 \
+            --max-series-per-domain-freq 750 \
+            --max-series-per-domain 1500 \
             --selection balanced \
             --effective-block "$EFFECTIVE_BLOCK"
 
