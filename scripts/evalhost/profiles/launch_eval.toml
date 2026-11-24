@@ -11,3 +11,7 @@ min_vram_mib = 24000
 min_driver = "550.54.14"           # CUDA 12.4 (cu124 wheels) minimum driver
 disk_path = "/root"
 min_disk_free_bytes = 9200000000
+# The release's pinned torch 2.4.1+cu124 lives in pyproject's `train` extra:
+# the sync runs `uv sync --frozen --extra train` (#784: a plain sync left the
+# eval host without torch).
+uv_extras = ["train"]
