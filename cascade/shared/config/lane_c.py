@@ -340,7 +340,6 @@ class LaneCConfig:
         """The expert-lane params; ``k`` > 1 Bonferroni-corrects ``alpha`` to
         ``alpha / k`` (one target's ``k`` judged entries at one settlement)."""
         from ...eval.expert_lane import ExpertLaneParams
-
         from ..rules_menu import family_size
 
         return ExpertLaneParams(

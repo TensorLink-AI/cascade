@@ -40,8 +40,10 @@ def test_w_cmp_draw_uses_the_recorded_dispatch_embargo():
 
 
 def test_w_cmp_embargo_is_overlay_settable_within_bounds():
-    from cascade.shared.config import load_chain_config
+    import cascade.shared.competition_spec  # noqa: F401  (W-CMP)
     from cascade.shared.netconfig_bounds import value_refusals
+
+    from cascade.shared.config import load_chain_config
 
     base = load_chain_config(ROOT / "chain.toml")
     out, why = overlay(base, {"marketcast": {"embargo_days": 35}})
@@ -52,6 +54,8 @@ def test_w_cmp_embargo_is_overlay_settable_within_bounds():
 
 
 def test_w_cmp_trainer_stamps_the_dispatch_embargo_into_the_signed_record():
+    import cascade.shared.competition_spec  # noqa: F401  (W-CMP)
+
     src = (ROOT / "cascade/trainer/lane_c_driver.py").read_text()
     assert 'leg["embargo_days"] = int(mc_.embargo_days)' in src
     assert '"embargo_eval_days")' in src
@@ -59,9 +63,9 @@ def test_w_cmp_trainer_stamps_the_dispatch_embargo_into_the_signed_record():
 
 def _artefact(tmp_path):
     """A tiny WB11 hash-set artefact (written by the WB11 writer) + its pin."""
-    from cascade.eval import contamination as C
-
     import numpy as np
+
+    from cascade.eval import contamination as C
 
     suite = sorted(C.KNOWN_SUITES)[0]
     vals = [float(x) for x in np.random.default_rng(0).normal(size=256)]
@@ -99,6 +103,8 @@ def test_w_cmp_hashset_is_fetched_and_verified_by_content_hash(tmp_path):
 
 def test_w_cmp_hashset_key_parses_and_overlay_accepts_the_pin():
     import copy
+
+    import cascade.shared.competition_spec  # noqa: F401  (W-CMP)
 
     raw = shipped_raw()
     r = copy.deepcopy(raw)

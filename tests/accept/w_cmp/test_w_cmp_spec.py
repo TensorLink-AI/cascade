@@ -32,6 +32,7 @@ def test_w_cmp_marketcast_spec_restates_the_shipped_competition(name):
     """``mkt:market`` as a spec is byte-identical: every MarketCast field, the
     lane-C competitions and the split are unchanged."""
     from cascade.shared.competition_spec import marketcast_spec
+
     from cascade.shared.lane_c import lane_c_split
 
     raw = shipped_raw(name)
@@ -49,6 +50,8 @@ def test_w_cmp_marketcast_spec_restates_the_shipped_competition(name):
 
 
 def test_w_cmp_spec_changes_reach_the_marketcast_judge():
+    import cascade.shared.competition_spec  # noqa: F401  (W-CMP)
+
     raw = shipped_raw()
     got = parse(with_specs(raw, {"mkt": {
         "runner": "marketcast", "gain_margin": 0.02, "alpha": 0.04,
@@ -83,6 +86,8 @@ def test_w_cmp_unknown_or_unbounded_blocks_are_typed_refusals(spec, code):
 
 
 def test_w_cmp_refused_marketcast_spec_burns_never_crashes():
+    import cascade.shared.competition_spec  # noqa: F401  (W-CMP)
+
     from cascade.shared.lane_c import lane_c_split
 
     raw = shipped_raw()
@@ -99,6 +104,8 @@ def test_w_cmp_new_competition_without_a_runner_burns_its_share():
     """A spec for a new id this release cannot host is refused
     ``runner_capacity``; its declared weight stays in the split, so its part
     burns and MarketCast's part is unchanged in absolute terms."""
+    import cascade.shared.competition_spec  # noqa: F401  (W-CMP)
+
     from cascade.shared.lane_c import lane_c_split
 
     raw = shipped_raw()
@@ -116,6 +123,8 @@ def test_w_cmp_new_competition_without_a_runner_burns_its_share():
 
 
 def test_w_cmp_overlay_sets_a_spec_and_refuses_out_of_bounds():
+    import cascade.shared.competition_spec  # noqa: F401  (W-CMP)
+
     from cascade.shared.config import load_chain_config
 
     from .helpers import ROOT

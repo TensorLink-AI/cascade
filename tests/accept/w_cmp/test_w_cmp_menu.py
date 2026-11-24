@@ -25,6 +25,8 @@ def test_w_cmp_menu_defaults_are_todays_rules():
 def test_w_cmp_menu_choices_parse_and_unsupported_ones_are_refused():
     import copy
 
+    import cascade.shared.competition_spec  # noqa: F401  (W-CMP)
+
     raw = shipped_raw()
     r = copy.deepcopy(raw)
     r["lane_b"]["test_family"], r["lane_b"]["pay_curve"] = "plain_lcb", "indefinite_until_beaten"
@@ -53,6 +55,7 @@ def test_w_cmp_family_math():
 
 
 def test_w_cmp_lane_b_plain_lcb_drops_the_per_leg_correction():
+    import cascade.shared.competition_spec  # noqa: F401  (W-CMP)
     import numpy as np
 
     from cascade.eval.expert_lane import ExpertLaneParams, judge_expert_targets
@@ -89,6 +92,8 @@ def test_w_cmp_pay_curves():
 def test_w_cmp_lane_c_win_records_its_curve_and_pays_on_it():
     from dataclasses import replace
 
+    import cascade.shared.competition_spec  # noqa: F401  (W-CMP)
+
     from cascade.shared.lane_c import (
         LaneCState,
         TargetWin,
@@ -124,6 +129,8 @@ def test_w_cmp_lane_c_win_records_its_curve_and_pays_on_it():
 
 def test_w_cmp_lane_b_win_records_its_curve_and_pays_on_it():
     from dataclasses import replace
+
+    import cascade.shared.competition_spec  # noqa: F401  (W-CMP)
 
     from cascade.shared.lane_b import DomainWin, LaneBState, lane_b_payouts
 
