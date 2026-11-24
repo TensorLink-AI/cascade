@@ -206,6 +206,7 @@ def test_house_report_verdict_is_the_king_d_judgement_alone(chains, scenario):
     vs_king = _judge(report, cohort, k1["digest"], cfg)
     for m, rk in zip(cohort["members"], vs_king, strict=True):
         v = verdict_of(report, m)
+        assert "house" not in v, "the verdict carries a house judgement after a miner crown"
         assert v["lcb"] == rk["lcb"] and v["gain"] == rk["gain"]
         king_cleared = bool(v["lcb"] >= float(cfg.d_margin) and v["gain"] > 0.0)
         assert v["cleared"] is king_cleared, "cleared is not the KING_D judgement alone"

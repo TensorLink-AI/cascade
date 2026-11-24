@@ -31,6 +31,12 @@ def _off(cfg):
     return replace(cfg, lane_d=replace(cfg.lane_d, from_block=0))
 
 
+def _genesis(step, boundary):
+    """``step.genesis_for(boundary)``; ``None`` when the step has none."""
+    fn = getattr(step, "genesis_for", None)
+    return None if fn is None else fn(boundary)
+
+
 def _rig(tmp_path, *, lanes_bc=False):
     cfg = h.chain_cfg(tmp_path / "v", lanes_bc=lanes_bc)
     return cfg, h.Rig(tmp_path / "rig", cfg, h.fixture(tmp_path))
@@ -42,7 +48,7 @@ def test_genesis_pays_lane_a_and_burns_nothing(tmp_path, lanes_bc):
     rig.step(h.B1)
     rep = rig.published_report(h.B1)
     assert rep["king_after"]["house"] is True, "fixture: the house holds KING_D at B1"
-    assert rig.step.genesis_for(h.B1) is True
+    assert _genesis(rig.step, h.B1) is True, "the step does not report lane D's genesis"
     at = h.B1 + 5
     got, _ = h.vector_at(cfg, at, step=rig.step)
     want, _ = h.vector_at(_off(cfg), at)
@@ -60,7 +66,7 @@ def test_first_crown_beats_the_house_and_after_it_the_house_is_gone(tmp_path):
     assert rep["crowned"] == rig.fx["x"], "fixture: X is crowned at B2"
     assert [c["king_digest"] for c in rep["cohorts"]] == [house], \
         "the first crown was not judged against the house (the genesis KING_D)"
-    assert rig.step.genesis_for(h.B2) is False
+    assert _genesis(rig.step, h.B2) is False
     assert rig.step.court_for(h.B2) == [h.CHALLENGER_UID]
     rig.step(h.B3)
     rep3 = rig.published_report(h.B3)
