@@ -41,7 +41,7 @@ fine-tuned models with a decision-based measure, not only CRPS.
 3. **Scenarios are targets.** A target is `app:<scenario>`. Each scenario is a
    simulator driven by real data that is recorded **after** the harness was
    committed (forward-only, like MarketCast). Proposed first scenarios:
-   `app:perp` (trading), `app:bess` (battery energy arbitrage) and
+   `app:perp` (risk-managed trading mandate), `app:bess` (battery energy arbitrage) and
    `app:inventory` (replenishment).
 4. **Judged paired against a reference harness.** Every episode is run twice,
    with the miner's harness and with the owner-shipped reference harness, on
@@ -148,29 +148,73 @@ measure: reserving SoC for spikes depends on the upper tail.
 - **Forecaster.** The demand fine-tune's slot holder (`dmd:<suite>`), trained
   on the same forward count series.
 
-### `app:perp` — crypto perp trading on MarketCast bars
+### `app:perp` — risk-managed perp mandate (owner, 2026-11-24: not scored on trading success)
+
+Profit is too noisy to judge, and most of it comes from the direction call,
+which this app does not test. Instead, **the harness is forced to hold a
+position and is scored only on how well it manages that position's risk**.
+Every score term depends on volatility, tails and costs. Those are what the
+MarketCast fine-tune forecasts (its `vol`, `range`, `high` / `low` suites),
+and they are far less noisy than returns.
 
 - **Data.** The MarketCast universe and recorder: Hyperliquid perps, 1h bars,
-  with funding.
-- **Step / action.** Hourly: target weights over a ≤ 10-asset basket, with
-  gross leverage ≤ 2 and net ≤ 1.
+  with funding and spread.
+- **The mandate (forced).** Each episode, the round seed draws a mandate: a
+  basket of 2–8 assets, a fixed direction and weight for each (long or short),
+  a target volatility σ* (10–60 % annualised), a drawdown limit, and a
+  tail-loss budget. The harness cannot change the basket, the directions or
+  the weights. A seeded schedule may also change the mandate mid-episode
+  (a "client flow"), which forces a rebalance.
+- **What the harness controls.** Each hour it sets:
+  * **size:** a gross scale `s_t ∈ [s_floor, s_cap]` (for example
+    [0.25, 2.0]) on the mandate book. It must stay invested: average
+    utilisation below `min_util` (for example 0.6) fails the episode;
+  * **hedge:** an optional position in listed hedge instruments (BTC, ETH
+    perps), `|h| ≤ 0.5 ×` gross;
+  * **execution:** how fast to move to the new size (a partial fill rate), to
+    trade cost against tracking;
+  * **risk declaration:** its 1-hour-ahead VaR and ES of the book at 97.5 %.
 - **Costs.** A taker fee, spread-plus-impact slippage from the recorded
-  `spread` / volume, and funding paid or received.
-- **Episode.** 7 days, from a random start.
-- **Oracle.** None that is useful (unbounded).
-- **Score.** Per-episode log wealth growth minus `λ · CVaR₅%` of hourly
-  returns, less the reference harness's score on the same episode.
-  Clustering is by start day, so the episodes that overlap in market regime
-  count as one observation.
-- **Reference harness.** A vol-targeted position on the forecaster's
-  median / IQR (size ∝ P50 / (P75 − P25)), with a no-trade band.
+  `spread` / volume, and funding.
+- **Episode.** 7 days of hourly steps, from a random start.
+- **Score terms** (per episode, each a loss; lower is better):
+
+  | term | loss | what it rewards |
+  |---|---|---|
+  | vol tracking | `(log(σ_realised / σ*))²` | sizing to the risk target, both over and under |
+  | tail control | drawdown beyond the limit, plus loss beyond the tail budget | cutting size before stress, not after |
+  | risk forecast | Fissler–Ziegel FZ0 loss of the declared (VaR, ES) on the realised hourly book return | honest, calibrated risk numbers (a proper score, so over-wide and over-tight both lose) |
+  | cost | turnover, slippage and funding, in bps of average gross | not churning |
+
+  Each term is summed over the verdict's episodes and divided by the
+  reference harness's sum on the same episodes (paired, cluster bootstrap by
+  start day). The composite gain is the weighted geometric mean of those
+  ratios, as in MarketCast. A pass needs a composite `gain LCB ≥
+  gain_margin` and **no term confidently worse** than the reference
+  (`LCB ≥ −tau`). Without that guard, a harness could win on costs by never
+  rebalancing.
+- **Diagnostics only (not scored).** Book PnL, Sharpe and hit rate are
+  published on each row. There is no reward for them, so there is no reason
+  to chase direction.
+- **Why it is less noisy.** Realised vol over 168 hourly returns has a
+  relative standard error of about 5 %, while the mean return over a week is
+  mostly noise. The FZ0 loss scores every hour, not only the breach hours.
+  The Q5 noise study still sets the episode count.
+- **Gaming checks.**
+  * Going flat fails the utilisation floor.
+  * Declaring a huge ES loses on FZ0.
+  * A hedge that cancels the whole book is capped at 0.5 × gross, and
+    under-shooting σ* costs on tracking.
+  * Timing size to the mandate's direction can add PnL, but PnL is not
+    scored.
+- **Reference harness.** Size `s_t = σ* / σ̂_t`, with σ̂ taken from the
+  forecaster's quantile spread for the book (P90 − P10 over horizon), clipped
+  to bounds. No hedge. A fixed partial fill rate. VaR and ES are read off the
+  same forecast quantiles.
 - **Forecaster.** The `mkt:market` slot holder (the MarketCast fine-tune), or
   the pinned Timestral-28M base before the first holder.
 
-This is the scenario people ask for most, and the hardest to judge. Returns
-are noisy, so it needs many more episodes per verdict. Read the noise budget
-in Q5 before arming it. It is a simulation score, not a profit claim, and the
-docs must say so.
+It is a risk-management score, not a profit claim, and the docs must say so.
 
 Later candidates: `app:hedge` (fuel / power hedging ratio), `app:capacity`
 (cloud autoscaling on `domain:web_cloudops` series), `app:staffing`.
@@ -269,8 +313,8 @@ episode_h  = 24
   naive-forecast run? Requiring it keeps the competition about the model.
   Dropping it widens the field to any good policy.
 - **Q3. Score per scenario.** Use the oracle-normalised capture or regret
-  ratio, or the raw cost ratio? Should `app:perp` use log-growth minus CVaR,
-  or a Sharpe-like score?
+  ratio, or the raw cost ratio? For `app:perp`: the term weights, σ* range,
+  `min_util`, and whether execution / client-flow steps are in v1 or later.
 - **Q4. The energy and demand fine-tunes.** Resolved in principle: each
   vertical uses its own fine-tune (owner, 2026-11-24). Still open: the pinned
   base and suites for `nrg:` and `dmd:` (Timestral-28M again?), and whether
@@ -278,7 +322,9 @@ episode_h  = 24
 - **Q5. Noise budget.** Before any `from_block`, run the reference harness
   against small perturbations of itself on recorded data. Measure how many
   episodes a 1 % gain needs to pass at α/k. This decides
-  `episodes_per_verdict` and whether `app:perp` is viable at all.
+  `episodes_per_verdict`. For `app:perp`, measure each score term's noise
+  separately; a term too noisy to move the composite is dropped or
+  down-weighted.
 - **Q6. Who pays for eval.** Should the main validator pay for forward
   episodes, as MarketCast forecasting does, with the miner's CPU leg
   qualifier as the spam filter? Or should the miner also fund eval
@@ -297,5 +343,5 @@ episode_h  = 24
    us (good, bad, model-blind), to check that the verdicts rank them
    correctly.
 3. Ship the release, then arm each `app:` scenario at an era boundary, after
-   its fine-tune target and its own noise study. `app:bess` is the likely
-   first to pass the noise study; `app:perp` the last.
+   its fine-tune target and its own noise study. With risk scoring, `app:perp`
+   can arm first, because `mkt:market` already exists.
