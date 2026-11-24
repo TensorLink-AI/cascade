@@ -113,6 +113,8 @@ def test_single_domain_commit_and_manifest_bytes_unchanged():
     for x in old["entries"]:
         x.pop("targets")
         x.pop("gpu_n", None)   # WB22: 0 = not recorded, dropped from the body
+        x.pop("train_image_digest", None)   # W-IMG: "" = not recorded, dropped too
+
         for k in ("train_hours", "leg_steps", "leg_guard_seconds"):
             x.pop(k, None)     # WB23: no leg length, dropped from the body
         x["selection"] = {str(k): sorted(v) for k, v in sorted(x["selection"].items())}

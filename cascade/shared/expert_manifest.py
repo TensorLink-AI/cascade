@@ -60,6 +60,12 @@ class ExpertEntry:
     # changes the reduction order). 0 = not recorded — dropped from the
     # canonical body, so an entry without it keeps its bytes.
     gpu_n: int = 0
+    # W-IMG (plan rev6.24 (e), owner 2026-11-24: "we just log what image pin
+    # was used, it's auditable"): the worker image digest the leg ran.
+    # Recorded, never enforced; "" = not recorded (every entry before
+    # ``[v2] image_epoch_from_block``) — dropped from the canonical body.
+    train_image_digest: str = ""
+
     # WB23 (D42, D42b): the miner-chosen leg length fixed at admission — the
     # hours, the steps (real hours on the chosen GPU) and the wall guard. All
     # 0 = a leg funded without ``train_hours``; each is dropped from the
@@ -124,6 +130,8 @@ class ExpertManifest:
                 e["targets"] = list(e["targets"])
             if not e.get("gpu_n"):
                 e.pop("gpu_n", None)          # not recorded: today's bytes
+            if not e.get("train_image_digest"):
+                e.pop("train_image_digest", None)   # W-IMG: not recorded
             for k in ("train_hours", "leg_steps", "leg_guard_seconds"):
                 if not e.get(k):
                     e.pop(k, None)            # WB23: no leg length = today's bytes
