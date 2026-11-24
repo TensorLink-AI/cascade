@@ -758,7 +758,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         gpu_catalog=gpu_catalog,
         lane_b_gpus=lane_b_gpus,
         # WB23: the reference steps of the lane B base contract cap the steps
-        # a train_hours fund fixes (the validator's consensus cap)
+        # a train_hours fund fixes (the validator's consensus cap). The lane B
+        # queue itself is wired by ``lanes.apply`` (EffectiveLanes, #874).
         lane_b_contract=_lane_b_base_contract(cfg),
         resolve_lane_b_reveal=lane_b_resolver,
         lane_b_cfg=lane_b_cfg,

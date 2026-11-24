@@ -124,3 +124,12 @@ only, so no import can fail for the right reason. A scratch control
 satisfied every test: minimal conforming sections appended to the four docs
 passed all 60. Injected stale keys, codes, headers, IPs, a wrong default and
 a refused example each failed.
+
+## rev6.22 (`test_wb20_lane_b_slots_docs.py`)
+
+`docs/MINER.md` states full pay until replaced (no decay, no expiry; ties
+keep the holder; empty slots burn; `since_era`), every-slot testing in two
+max-T families with the bars and cap read from `LaneBConfig`, take-all, and
+multi-target funding with a repeated `--target` (checked against the parser).
+The reward reference blocks are regenerated from `scripts/check_docs.py`
+(B is untiered; the decay example is C's).

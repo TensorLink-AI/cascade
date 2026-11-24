@@ -1378,8 +1378,7 @@ class LaneBDriver:
             from ..validator.expert_lane import apply_judgements
 
             for w in apply_judgements(LaneBState(), judgements, round_id=rid,
-                                      settle_block=block, tiers=lb.full_pay_tiers,
-                                      qualify_only=True):
+                                      settle_block=block, qualify_only=True):
                 qualified.setdefault(w.rebased_pointer, []).append(asdict(w))
         with self._lock:
             if rid in self._abandoned:

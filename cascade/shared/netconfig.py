@@ -26,6 +26,11 @@ can be changed by an OVERLAY the owner signs, instead of a fleet release:
    ``[activation]`` (the tally that adopts overlays) included. The merged
    table is re-parsed by :func:`cascade.shared.config.parse_chain_config`, so
    every load check (era-boundary ``from_block``, seams, lanes) applies.
+   On top of the loader, :mod:`cascade.shared.netconfig_bounds` (rev6.24,
+   W-OV) refuses values outside a per-key overlay envelope, release-only
+   keys inside the allowed tables, uncontent-addressed data references and
+   lane shares the carve would clamp. The envelope is code: no overlay
+   changes it.
 3. **Adoption.** A node that fetched and verified an overlay signals
    ``cfg-<8 hex of its digest>`` as a DEC-CA-0045 note segment
    (:func:`cfg_feature`); 51 % of permit stake locks it in (``align="era"``,
@@ -119,6 +124,14 @@ ALLOWED: dict[str, frozenset[str] | None] = {
         "min_time_blocks", "coverage_tolerance", "coverage_tolerance_over",
         "tail_tolerance", "calibration_z", "zero_scale_frac", "cell_ratio_cap",
         "near_dup_tol", "report_timeout_settlements", "max_infra_deferrals",
+        # rev6.24 (W-OV, owner 2026-11-24): lane C's eval DATA — the asset
+        # universe, the timeframes, the composite's suite weights and the
+        # grid density. Still release-only: the model pins, from_block, the
+        # suite list (it is lane C's slot list), data_sources (each is
+        # code), pool_prefix, context lengths and embargo_days (a recipe is
+        # accepted under one embargo and its gap windows are cut under the
+        # value at the verdict, so a raise would score on training data).
+        "assets", "frequencies", "horizons", "composite_suite_weights", "windows_per_cell",
         # DEC-CA-0074: the embargo eval-draw length, backtest windows per cell
         # and the <= 13 h inconclusive wait (code-bounded by the loader)
         "embargo_eval_days", "backtest_windows_per_cell", "verdict_wait_blocks",
@@ -170,9 +183,12 @@ def overlay_policy() -> dict:
     ``*`` means existing parser-supported keys, not arbitrary new logic. All
     values still pass the loader, cross-field checks and historical guards.
     """
+    from .netconfig_bounds import policy as bounds_policy
+
     return {
         "protocol": PROTOCOL,
-        "overlay_keys": {table: ["*"] if keys is None else sorted(keys)
+        "envelope": bounds_policy(),
+        "overlay_keys":{table: ["*"] if keys is None else sorted(keys)
                          for table, keys in sorted(ALLOWED.items())},
         "release_only_tables": dict(sorted(REFUSED_TABLES.items())),
         "default_policy": "Keys not listed are release-only.",
@@ -229,9 +245,11 @@ def check_overrides(overrides: object) -> dict:
             if (table, key) in (("scoring", "burn_uid"), ("lane_b", "remainder"),
                                 ("lane_c", "remainder"), ("lane_d", "remainder")):
                 bad.append(f"[{table}] {key} (burn destination is release-only)")
-            elif table in ("lane_c", "marketcast") and key in RETIRED_KEYS.get(table, ()):
+            elif (table in ("lane_b", "lane_c", "marketcast")
+                  and key in RETIRED_KEYS.get(table, ())):
                 # the loader ignores a retired key, so an overlay naming one
-                # would silently change nothing (DEC-CA-0073: lane C pay)
+                # would silently change nothing (DEC-CA-0073: lane C pay;
+                # LANE_D_PLAN rev6.22: lane B pay)
                 bad.append(f"[{table}] {key} (retired)")
             elif (table, key) in (("lane_b", "contamination_hashset"),):
                 # LANE_D_PLAN §14.2 (rev5): an overlay never replaces a data pin
@@ -240,6 +258,9 @@ def check_overrides(overrides: object) -> dict:
                 bad.append(f"[{table}.{key}] (nested tables are release-only)")
             elif allowed is not None and key not in allowed:
                 bad.append(f"[{table}] {key} (not an overlay key)")
+    from .netconfig_bounds import key_refusals, pin_refusals
+
+    bad += key_refusals(overrides) + pin_refusals(overrides)
     if bad:
         raise NetConfigError("overlay refused — release-only keys: " + "; ".join(bad))
     return overrides
@@ -398,6 +419,15 @@ def build_config(base: ChainConfig, body: dict, *, applied_block: int = 0) -> Ch
             pass    # the BASE cannot launch either: the service-start check owns that
         else:
             raise NetConfigError(f"merged config refused once the dated launch resolves: {e}") from e
+    # rev6.24 (W-OV): the overlay-only envelope, after the loader accepted
+    # the merged table (a value the loader refuses keeps its loader message)
+    from .netconfig_bounds import share_refusals, value_refusals
+
+    carve = any(_sets(ov, t, k) for t in ("lane_b", "lane_c", "lane_d")
+                for k in ("share", "takes_from"))
+    out_of_bounds = value_refusals(ov) + (share_refusals(cfg) if carve else [])
+    if out_of_bounds:
+        raise NetConfigError("overlay refused — out of bounds: " + "; ".join(out_of_bounds))
     # A key the base table does not carry must change SOMETHING, or it is a
     # typo the loader would silently ignore.
     for table, kv in ov.items():

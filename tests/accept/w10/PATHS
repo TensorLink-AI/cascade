@@ -6,3 +6,6 @@
 cascade/miner/lane_d.py
 # build_parser registers add_lane_d; the module docstring lists the group.
 cascade/miner/cli.py
+# `cascade rules a|b|c|d` (owner 2026-11-24 miner CLI refresh): prints each
+# lane's live rule values from chain.toml; registered in build_parser.
+cascade/miner/rules.py

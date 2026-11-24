@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, replace
 
-from ..eval.expert_lane import full_pay, judge_expert_targets
+from ..eval.expert_lane import judge_expert_slots, judge_expert_targets
 from ..eval.public_guards import MissingPublicGuard, pair_public_rows, sentinel_pairing_kw
 from .expert_lane import _arrays, window_horizon
 
@@ -41,7 +41,9 @@ def judge_acceptance(qualified, *, anchor_scores, before_scores, candidate_score
     Gain is marginal against the accepted checkpoint so far. Every domain,
     horizon and public guard is also checked against the ORIGINAL init, so
     small regressions cannot accumulate. Only previously qualified targets
-    may earn; the original declaration retains its alpha/k correction.
+    may earn (declared or not, rev6.22); the marginal judge is the same
+    every-slot max-T family as qualification, with the original declaration's
+    bars (declared slots at gain_margin, the rest at undeclared_gain_margin).
     ``sentinel`` (W-S2, D35) is the era's §16 suite: not a public guard nor
     a required one; ``None`` (unarmed) is the unchanged judgement.
     """
@@ -69,9 +71,9 @@ def judge_acceptance(qualified, *, anchor_scores, before_scores, candidate_score
     except MissingPublicGuard as e:
         return [], {"reason": f"public guard missing: {e}"}
 
-    def judge(baseline, declared, public, suffix, **kw):
-        return judge_expert_targets(
-            targets=declared, domains=anchor["domains"], clusters=anchor["clusters"],
+    def judge(baseline, _declared, public, suffix, *, fn=judge_expert_targets, **kw):
+        return fn(
+            domains=anchor["domains"], clusters=anchor["clusters"],
             king_qloss=baseline["qloss"], king_abs_target=baseline["abs"], king_mase=baseline["mase"],
             chal_qloss=candidate["qloss"], chal_abs_target=candidate["abs"],
             chal_mase=candidate["mase"], public=public, params=cfg.verdict_params(),
@@ -79,16 +81,18 @@ def judge_acceptance(qualified, *, anchor_scores, before_scores, candidate_score
             horizons=[window_horizon(sid) for sid, _ in anchor["ids"]],
             horizon_targets=cfg.horizon_target_names, **kw)
 
-    marginal = judge(before, targets, pubs[0], "marginal")
-    anchored = judge(anchor, (), pubs[1], "anchor", guards_only=True)
+    marginal = judge(before, targets, pubs[0], "marginal", fn=judge_expert_slots,
+                     slots=tuple(cfg.targets), declared=targets)
+    anchored = judge(anchor, (), pubs[1], "anchor", targets=(), guards_only=True)
     detail = {"reason": anchored.guard_reason or marginal.guard_reason,
               "targets": {t: {"passed": v.passed, "lcb": v.target_lcb,
                                "reason": v.reason} for t, v in marginal.verdicts.items()}}
     if anchored.guard_reason:
         return [], detail
-    wins = [replace(w, target_lcb=marginal.verdicts[w.domain].target_lcb).with_full_pay(
-        full_pay(marginal.verdicts[w.domain].target_lcb, cfg.full_pay_tiers))
-        for w in qualified if marginal.verdicts[w.domain].passed]
+    # rev6.22: untiered — an accepted target's slot pays in full until replaced
+    mv = marginal.verdicts
+    wins = [replace(w, target_lcb=mv[w.domain].target_lcb)
+            for w in qualified if w.domain in mv and mv[w.domain].passed]
     if not wins and not detail["reason"]:
         detail["reason"] = "no qualified target clears marginal gain"
     return wins, detail

@@ -11,7 +11,7 @@ from .test_netconfig_core import E2, base_cfg
 @pytest.mark.parametrize("key,value", [
     ("alpha", 0), ("alpha", 1.1), ("bootstrap_B", 0),
     ("tau_domain", -1), ("tau_public", float("inf")),
-    ("half_life_rounds", float("nan")), ("esft_p", 0),
+    ("undeclared_gain_margin", float("nan")), ("esft_p", 0),
     ("min_public_items", 0), ("min_guard_windows", 0),
     ("leg_hours", 0), ("leg_hours", float("nan")),
     ("affinity_windows", 0), ("open_tokens", -1),

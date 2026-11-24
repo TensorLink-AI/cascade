@@ -168,13 +168,12 @@ def test_reference_fold(world):
 
 
 @pytest.mark.parametrize("recovery", ["catch_up", "on_demand"])
-def test_historical_round_uses_its_overlay_and_pay_tiers(cfg, tmp_path, monkeypatch, recovery):
+def test_historical_round_uses_its_overlay(cfg, tmp_path, monkeypatch, recovery):
     ms, store = _chain(cfg)
     r = _runner(cfg, tmp_path, store)
     base = r.cfg
     cutoff = r._epoch_start_block(ms[3])
-    newer = replace(base, lane_b=replace(base.lane_b, gain_margin=0.2,
-                                         full_pay_tiers=((0.01, 1),)))
+    newer = replace(base, lane_b=replace(base.lane_b, gain_margin=0.2))
     r.netconfig = SimpleNamespace(enabled=True,
         config_at=lambda cfg, block: newer if block >= cutoff else base)
     seen = []
@@ -193,11 +192,11 @@ def test_historical_round_uses_its_overlay_and_pay_tiers(cfg, tmp_path, monkeypa
         assert r.cfg is newer
     assert r.cfg is base
     alice = next(w for w in r._lane_b().history if w.hotkey == "alice")
-    assert alice.full_eras == 10 and alice.tier == 0.05
+    # rev6.22: untiered — no full-pay period is recorded on a win
+    assert alice.full_eras is None and alice.tier is None
     assert (ms[1].round_id, base.lane_b.gain_margin) in seen
     if recovery == "catch_up":
         assert (ms[4].round_id, 0.2) in seen
-        assert r._lane_b().wins["energy"].full_eras == 1
 
 
 def test_missed_settlement_converges(cfg, tmp_path, world):

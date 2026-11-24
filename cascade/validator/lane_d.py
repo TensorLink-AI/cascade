@@ -421,6 +421,16 @@ def _close_house_copies(state: dict, skipped: list[dict]) -> None:
         skipped.append({"digest": str(state["house"]["digest"]), "reason": "duplicate_digest"})
 
 
+def _judging_start_skip(boundary_ts, t_entry, t_king, delay_s: float) -> str | None:
+    """rev6.14 (a): ``None`` when an entry revealed at ``t_entry`` may be
+    drawn, frozen or judged at a boundary stamped ``boundary_ts`` (>= j =
+    max(T_E, T_K) + delay), else its typed skip reason."""
+    if boundary_ts is None:
+        return "boundary_ts_missing"
+    t = max(int(t_entry), int(t_king)) if t_king is not None else int(t_entry)
+    return None if int(boundary_ts) >= t + delay_s else "before_eval_delay"
+
+
 def _king_reveal_ts(state: dict, digest: str) -> int | None:
     if state["king"]["digest"] == digest:
         return int(state["king"]["reveal_ts"])
@@ -886,7 +896,9 @@ def _params(cfg) -> dict:
             # settlement budget and the minimum fresh share.
             "embargo_hours": float(cfg.embargo_hours),
             "max_windows_per_settlement": int(cfg.max_windows_per_settlement),
-            "min_fresh_window_share": float(cfg.min_fresh_window_share)}
+            "min_fresh_window_share": float(cfg.min_fresh_window_share),
+            # rev6.14 (a): the judging start j = T + eval_delay_hours.
+            "eval_delay_hours": float(cfg.eval_delay_hours)}
 
 
 def _pool_record(pools: list[dict], windows_out: dict) -> dict:
@@ -997,8 +1009,18 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
                   prior_pool_dirs=(), expect_prior_sha256: str | None = None,
                   boundary_block_hash: str | None = None, sentinel: str | None = None,
                   bench=None, armed: dict | None = None,
-                  max_channels: int | None = None) -> LaneDSettlement:
+                  boundary_ts: int | None = None,
+                  max_channels: int | None = None,
+                  host: dict | None = None) -> LaneDSettlement:
     """Settle lane D at ``boundary`` (see the module docstring).
+
+    ``boundary_ts`` (rev6.14 (a)) is the boundary block's on-chain
+    ``Timestamp.Now`` (seconds), signed in the report. An entry (and the house
+    challenger) is drawn, frozen or judged only when ``boundary_ts`` >= its
+    judging start ``j = max(T_E, T_K) + 3600 * eval_delay_hours``, else it is
+    skipped ``before_eval_delay``. Without it (the legacy call) nothing is
+    frozen or judged: every open entry is skipped ``boundary_ts_missing``
+    (fail closed).
 
     ``max_channels`` (rev6.18 A4, F2) is ``[generator] max_channels``: the
     channel cap of a multichannel ``(C, L)`` pool window, whose pick
@@ -1036,10 +1058,27 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     :func:`check_armed` (a ``LaneDArmedError`` before anything is read or
     written) and recorded as the report's ``armed_contexts`` /
     ``armed_evidence``; the forecasts are the eval host's at each entry's
-    ``effective_context``. ``None`` (the legacy call) records neither."""
+    ``effective_context``. ``None`` (the legacy call) records neither.
+
+    ``host`` (rev6.18 B7) is the eval host record the W4 handshake verified
+    (:func:`~cascade.eval.lane_d_handshake.check_worker`: environment, GPU
+    model, driver, torch build, fingerprint and the B6 host identity). Every
+    forecast in ``forecasts`` came from that one host (B6). Given, it must be
+    well formed (a ``ValueError`` before anything is read or written) and is
+    signed as the report's ``host``; ``None`` records no host."""
     if not cfg.active(boundary):
         return LaneDSettlement(report=None, pay=None, receipt=None)
+    if boundary_ts is not None and (isinstance(boundary_ts, bool) or not isinstance(boundary_ts, int)
+                                    or boundary_ts < 0):
+        raise ValueError(f"boundary_ts must be a non-negative int timestamp; got {boundary_ts!r}")
     armed_fields = None if armed is None else check_armed(armed, cfg)
+    if host is not None:
+        from ..shared.config.lane_d import host_record_problem
+
+        why = host_record_problem(host)
+        if why:
+            raise ValueError(f"lane D host record refused: {why}")
+        host = {k: str(v) for k, v in host.items()}
     # W5f: the house is the verified record a signed pointer enters
     # (lane_d_house). Anything else is refused before any state, report or
     # pool is read or written (fail closed).
@@ -1147,6 +1186,21 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
             if effective_context(int(rec["context"]), armed_set) is None:
                 skip(dg, "context_below_armed")
                 chosen.remove(dg)
+    # rev6.14 (a): the judging start j = max(T_E, T_K) + eval_delay_hours,
+    # against the signed boundary timestamp; fail closed without it.
+    delay_s = 3600.0 * float(cfg.eval_delay_hours)
+    king_t = _king_reveal_ts(state, str(state["king"]["digest"]))
+    for dg in list(chosen):
+        rec = state["entries"][dg]
+        why = _judging_start_skip(boundary_ts, rec["reveal_ts"], king_t, delay_s)
+        if why is not None:
+            skip(dg, why)
+            chosen.remove(dg)
+    if house_open and not house_held:
+        why = _judging_start_skip(boundary_ts, house_rec["reveal_ts"], king_t, delay_s)
+        if why is not None:
+            skip(hd, why, house_rec)
+            house_open = False
     if house_open and not house_held:
         fc = forecasts.get(hd)
         if fc is not None and any(_fc_ok(fc, wid, h, picks) is False for wid in sorted(pool_ids)):
@@ -1467,11 +1521,19 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     if gate is not None:
         # Present iff the gate ran (absent, never null, otherwise).
         report["gate"] = gate
+    if boundary_ts is not None:
+        # rev6.14 (a): the boundary block's on-chain timestamp the judging
+        # start was applied against (absent, never null, on the legacy call).
+        report["boundary_ts"] = int(boundary_ts)
     if armed_fields is not None:
         # rev6.6: the settlement's armed set and the evidence it was armed
         # on, signed, so satellites verify it (never re-derive it from
         # cfg.contexts). Absent on the legacy call.
         report.update(armed_fields)
+    if host is not None:
+        # rev6.18 B7: the scoring host, signed; the audit checks its env is
+        # qualified at this boundary.
+        report["host"] = host
     report = sign_report(report, signer)
     # Fail closed: a report outside lane-d-report/1 is never returned, and
     # neither the report file nor the state is written (ReportSchemaError
