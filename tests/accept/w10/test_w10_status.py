@@ -21,7 +21,7 @@ from .helpers import (
 ROWS = [
     {"hotkey": "5Habc", "digest": "a" * 64, "state": "ready", "context": 4096,
      "coldkey_at_ready": "5Cold", "ready_block": 10, "ready_expires_block": 7210,
-     "weights_sha256": "b" * 64, "licence": "Apache-2.0",
+     "weights_sha256": "b" * 64, "licence": "MIT",
      "licence_attestation_sha256": "c" * 64},
     {"hotkey": "5Hdef", "digest": "d" * 64, "state": "submitted", "context": 8192,
      "coldkey_at_ready": None, "ready_block": None, "ready_expires_block": None,

@@ -32,7 +32,7 @@ def test_ready_records_the_entry(tmp_path):
     m = Miner(env, "rdy-a", coldkey="ck-a")
     files = checkpoint("a")
     dig = digest_of(manifest(files))
-    r = m.enter(files, licence="OpenMDW-1.1")
+    r = m.enter(files, licence="MIT")
     assert r.status == 200, r
     rec = r.json
     assert rec["status"] == "ready"
@@ -41,7 +41,7 @@ def test_ready_records_the_entry(tmp_path):
     assert rec["ready_block"] == BLOCK
     assert rec["ready_expires_block"] == BLOCK + TTL
     assert rec["weights_sha256"] == weights_sha(files)
-    assert rec["licence"] == "OpenMDW-1.1"
+    assert rec["licence"] == "MIT"
     want_att = hashlib.sha256(service.LICENCE_ATTESTATION.encode("utf-8")).hexdigest()
     assert rec["licence_attestation_sha256"] == want_att
     payload = rec["commit_payload"]
@@ -175,14 +175,14 @@ def test_ready_context_must_match_the_submit(tmp_path):
 def test_licence_constants_follow_d13():
     from cascade.lane_d import service
 
-    assert tuple(service.LICENCES) == ("Apache-2.0", "OpenMDW-1.1")
+    assert tuple(service.LICENCES) == ("MIT",)
     text = service.LICENCE_ATTESTATION
     assert isinstance(text, str) and len(text) >= 80
-    for needle in ("Apache-2.0", "OpenMDW-1.1", "training data", "teacher"):
+    for needle in ("MIT", "training data", "teacher"):
         assert needle in text, needle
 
 
-@pytest.mark.parametrize("licence", ["MIT", "CC-BY-NC-4.0", "", "apache-2.0"])
+@pytest.mark.parametrize("licence", ["Apache-2.0", "OpenMDW-1.1", "CC-BY-NC-4.0", "", "mit"])
 def test_a_non_open_licence_is_refused(tmp_path, licence):
     env = Env(tmp_path)
     m = Miner(env, "lic-a")
@@ -223,7 +223,7 @@ def test_licence_is_recorded_and_survives_restart(tmp_path):
     assert m.enter(files).status == 200
     env.restart()
     row = env.entry(m.hotkey, digest_of(manifest(files)))
-    assert row["licence"] == "Apache-2.0"
+    assert row["licence"] == "MIT"
     assert len(row["licence_attestation_sha256"]) == 64
 
 

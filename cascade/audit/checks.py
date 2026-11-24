@@ -2931,6 +2931,13 @@ def _lane_d_part(n_uids: int, *, share: float, court: list, king_decay: float,
     return out
 
 
+def _lane_d_max_channels(cfg) -> int | None:
+    """``[generator] max_channels`` (rev6.18 A4, F2): the cap the lane D
+    audit re-derives each multichannel window's channel pick with."""
+    v = getattr(getattr(cfg, "generator", None), "max_channels", None)
+    return None if v is None else int(v)
+
+
 @dataclass(frozen=True)
 class LaneDPay:
     """rev6.18 B1/B3: what lane D's share does at one settlement.
@@ -3020,7 +3027,8 @@ def lane_d_pay(receipt: RoundReceipt, cfg: ChainConfig, lane_d) -> LaneDPay:
                                f"the report body is {body[:12]}")
     court = _signed_court(report)
     f = lane_d_findings(report, cfg.lane_d, signer_hotkey=cfg.manifest.validator_hotkey,
-                        prior_reports=None if prior is None else list(prior))
+                        prior_reports=None if prior is None else list(prior),
+                        max_channels=_lane_d_max_channels(cfg))
     alerts = tuple(f"{c}: {d}" for c, d in f.alerts)
     burn = f.burn
     if burn is not None:
