@@ -1,0 +1,12 @@
+# Elastic lane D eval host on Lium (owner 2026-11-24; deploy/laned/elastic.toml):
+# 1x RTX PRO 6000 Blackwell 96 GB. sm_120 cannot run the pinned torch, so it
+# scores only once F5's sm120 environment is QUALIFIED (scoring_envs.toml);
+# until then the elastic controller refuses it (not_qualified).
+# Driver floor 580 (Crusoe 535 / Warsaw 570 failed; OPSLOG history).
+schema = "laned_evalhost_profile/1"
+name = "elastic_rtxpro6000"
+gpu_model = "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
+min_vram_mib = 97000
+min_driver = "580"
+disk_path = "/root"
+min_disk_free_bytes = 9200000000
