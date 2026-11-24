@@ -14,6 +14,9 @@ Four commands, none of which touches a chain, a store or a wallet:
   command (dry run, the default). ``--execute`` runs that command only with
   the ``--confirm`` token the dry run printed for the same inputs; signing
   and publishing are done by ``cascade-validator`` with the owner's wallet.
+  #911: ``--in-force`` names the body nodes run when ``--previous`` (the
+  latest published, seq/prev source) was refused; CHANGE / LANE lines and
+  the implicit lane-off guard (``--allow-lane-off``) are judged against it.
 
 The generators take ``effective_block`` from R1's block arithmetic (the next
 era start after ``--after`` on the live grid, cross-checked, with drift
@@ -343,6 +346,11 @@ def validator_argv(args: argparse.Namespace) -> list[str]:
         argv += ["--wallet-name", args.wallet_name]
     if args.wallet_hotkey is not None:
         argv += ["--wallet-hotkey", args.wallet_hotkey]
+    seq = getattr(args, "in_force_seq", None)
+    if seq is not None:
+        argv += ["--netconfig-in-force-seq", str(seq)]
+    if getattr(args, "allow_lane_off", False):
+        argv.append("--netconfig-allow-lane-off")
     return argv
 
 
@@ -355,6 +363,8 @@ def confirm_token(argv: list[str], digest_hex: str, args: argparse.Namespace) ->
     material = {"argv": argv, "digest": digest_hex,
                 "config": _file_sha(args.config), "overrides": _file_sha(args.overrides),
                 "previous": _file_sha(args.previous) if args.previous else None}
+    if getattr(args, "in_force", None):
+        material["in_force"] = _file_sha(args.in_force)
     raw = json.dumps(material, sort_keys=True, separators=(",", ":")).encode()
     return "ok-" + hashlib.sha256(raw).hexdigest()[:20]
 
@@ -368,11 +378,41 @@ def _publish(args: argparse.Namespace) -> int:
         base = read_base(args.config)
         overrides = read_overrides(args.overrides)
         previous = read_body(args.previous) if args.previous else None
+        in_force_body = read_body(args.in_force) if args.in_force else None
     except Invalid as e:
         print(f"cascade-laned overlay publish: invalid input: {e}", file=sys.stderr)
         return EXIT_INVALID
     eff = int(args.effective_block)
-    plan = nc.plan_overlay(base, overrides, eff, previous, comment=args.comment)
+    pre_errors: list[str] = []
+    args.in_force_seq = None
+    if in_force_body is not None:
+        # #911: seq / prev follow --previous; the checks follow --in-force
+        if previous is None:
+            print("cascade-laned overlay publish: --in-force needs --previous (the latest "
+                  "published body)", file=sys.stderr)
+            return EXIT_INVALID
+        if int(in_force_body["seq"]) > int(previous["seq"]) or (
+                int(in_force_body["seq"]) == int(previous["seq"])
+                and nc.body_digest(in_force_body) != nc.body_digest(previous)):
+            print("cascade-laned overlay publish: --in-force is not an overlay at or before "
+                  "--previous in the published chain", file=sys.stderr)
+            return EXIT_INVALID
+        in_force = in_force_body
+        if nc.body_digest(in_force_body) != nc.body_digest(previous):
+            args.in_force_seq = int(in_force_body["seq"])
+    else:
+        in_force = previous
+        if previous is not None:
+            _, skipped = nc.newest_valid(base, [previous])
+            if skipped:
+                pre_errors.append(
+                    f"{skipped[0]}. Nodes keep the newest overlay that validates in force: "
+                    "pass it as --in-force (seq/prev still follow --previous); if this seq "
+                    "was adopted under an older release (#891), pass --in-force with the "
+                    "--previous file itself")
+    plan = nc.plan_overlay(base, overrides, eff, previous, comment=args.comment,
+                           in_force=in_force, allow_lane_off=args.allow_lane_off)
+    plan.errors[:0] = pre_errors
     try:
         body = nc.next_overlay(overrides, eff, previous, network=nc.network_identity(base),
                                comment=args.comment)
@@ -389,7 +429,13 @@ def _publish(args: argparse.Namespace) -> int:
            f"PREV {plan.body['prev'] or '-'}",
            f"EFFECTIVE_BLOCK {eff}",
            f"DIGEST {digest_hex}",
-           f"NOTE {note}"]
+           f"NOTE {note}",
+           f"IN_FORCE {plan.in_force}"]
+    # #911: CHANGE = effective values vs the config in force (dropped
+    # restatements marked); LANE = lane on/off and share moves; DIFF = vs
+    # chain.toml as typed
+    out += [f"CHANGE {_one_line(c)}" for c in plan.changes] or ["CHANGE (none)"]
+    out += [f"LANE {_one_line(x)}" for x in plan.lanes]
     out += [f"DIFF {d}" for d in diff] or ["DIFF (none)"]
     out += [f"WARNING {_one_line(w)}" for w in plan.warnings]
     argv: list[str] = []
@@ -469,6 +515,12 @@ def add_parser(subparsers: Any) -> argparse.ArgumentParser:
     p.add_argument("--overrides", required=True, help="overrides TOML for --netconfig-overlay")
     p.add_argument("--effective-block", type=_block, required=True, help="an era start")
     p.add_argument("--previous", help="the latest published body (seq N), if any")
+    p.add_argument("--in-force", help="the body nodes run, when --previous was refused "
+                                      "(default: --previous); checks and CHANGE/LANE lines "
+                                      "are judged against it, seq/prev follow --previous")
+    p.add_argument("--allow-lane-off", action="store_true",
+                   help="allow turning a lane the config in force arms off without setting "
+                        "its switch keys (a dropped restatement)")
     p.add_argument("--comment", default="", help="free text carried in the body")
     p.add_argument("--network", help="forwarded to cascade-validator --network")
     p.add_argument("--wallet-name", help="forwarded to cascade-validator --wallet-name")

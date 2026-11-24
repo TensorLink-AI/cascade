@@ -3423,9 +3423,34 @@ that prefix (the trainer's Hippius S3 pair works).
    ```
 
    It prints the next `seq` / `prev`, the digest and its `cfg-<8 hex>` note
-   segment, the merged diff against `chain.toml`, and every check a
-   validator runs (allow-list, merged load checks, era start,
-   retroactivity), then `VALID` or `INVALID`.
+   segment, the overlay it is judged against (`judged against the config in
+   force`), every key whose effective value changes against that config,
+   lane on/off and share moves (`LANE D: ON -> OFF`, `LANE B SHARE: …`), the
+   merged diff against `chain.toml`, and every check a validator runs
+   (allow-list, merged load checks, era start, retroactivity), then `VALID`
+   or `INVALID`.
+
+   **The restate rule (#911).** Read the "changes vs the config in force"
+   block, not the `chain.toml` diff: an overlay replaces the one in force
+   whole, so a key it forgets reverts to `chain.toml`, and the `chain.toml`
+   diff does not show that. Such a line is marked `DROPPED`. After launch
+   step 2, every overlay must restate `[lane_d] from_block` (and the
+   `share` / `takes_from` of each lane you keep), including a lane B or lane C
+   kill. The tool refuses an overlay that turns off a lane the config in
+   force arms without setting one of that lane's switch keys (`from_block`,
+   `until_block`, `share`). To turn a lane off deliberately, set its
+   `until_block` (the kill switch), or pass `--netconfig-allow-lane-off`
+   (wrapper: `--allow-lane-off`).
+
+   **After a refused overlay.** Nodes keep the newest overlay that validates
+   in force. The next overlay still takes `seq` / `prev` from the latest
+   published body (a reused seq is refused as a fork), but its checks are
+   judged against the body in force. By default this is the newest published
+   body that validates on this `chain.toml`, and each newer body that was
+   skipped is printed as a `WARNING`. To name the body in force explicitly,
+   pass `--netconfig-in-force-seq N` (`0` means `chain.toml` alone). Do that
+   when a body was adopted under an older release and this release refuses it
+   (#891).
 4. Publish with the owner wallet:
 
    ```bash
@@ -3468,8 +3493,17 @@ and a base whose `[round]` drifted from the grid is refused. Output goes to
 `--out` as `body.json` and `overrides.toml`.
 
 `publish` is the Approve-tier wrapper around step 4. By default it is a dry
-run. It prints the SEQ, PREV, DIGEST, NOTE, DIFF and CHECK lines, the exact
-validator publish command and a CONFIRM token. Show that output to the owner.
+run. It prints the SEQ, PREV, DIGEST, NOTE, IN_FORCE, CHANGE, LANE, DIFF and
+CHECK lines, the exact validator publish command and a CONFIRM token. CHANGE
+lines are effective changes against the body in force, and dropped
+restatements are marked `DROPPED`. LANE lines show lane on/off and share
+moves. DIFF lines are against `chain.toml` as typed. `--previous` is the
+latest published body. If nodes refused it, the plan is refused until you
+pass `--in-force` with the body they kept, which is the newest one that
+validates. `seq` / `prev` still follow `--previous`, and the printed command
+carries `--netconfig-in-force-seq`. An overlay that implicitly turns off a
+lane the body in force arms is refused unless you pass `--allow-lane-off`
+(see the restate rule above). Show that output to the owner.
 Only after approval, rerun with the same arguments plus `--execute` and
 `--confirm` set to that token. The wrapper then runs the printed command,
 and `cascade-validator` signs with the owner wallet. A refused plan gets no

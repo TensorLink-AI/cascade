@@ -121,6 +121,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--netconfig-publish", action="store_true",
                    help="Sign with --wallet-name/--wallet-hotkey (must be [netconfig] "
                         "owner_hotkey) and publish to config/network/ in the manifest bucket.")
+    p.add_argument("--netconfig-in-force-seq", type=int, default=None,
+                   help="The published seq nodes run (0 = chain.toml alone). Default: the "
+                        "newest published body that validates on this chain.toml (a refused "
+                        "newer one is skipped); seq/prev still follow the latest published.")
+    p.add_argument("--netconfig-allow-lane-off", action="store_true",
+                   help="Publish even though the overlay turns a lane armed by the config "
+                        "in force off without setting its switch keys (a dropped restatement).")
     return p
 
 
@@ -133,6 +140,7 @@ def _netconfig_overlay(args) -> int:
     from ..shared.netconfig import (
         NetConfigError,
         fetch_overlays,
+        newest_valid,
         plan_overlay,
         publish_overlay,
         sign_overlay,
@@ -146,11 +154,13 @@ def _netconfig_overlay(args) -> int:
     with args.netconfig_overlay.open("rb") as fh:
         overrides = tomllib.load(fh)
     previous = None
+    bodies: list[dict] = []
     try:
         store = open_manifest_store(cfg.storage)
         if owner:
             envs = fetch_overlays(store, owner=owner)
-            previous = envs[-1]["body"] if envs else None
+            bodies = [e["body"] for e in envs]
+            previous = bodies[-1] if bodies else None
     except NetConfigError as e:
         print(f"the published overlay chain does not verify: {e}", file=sys.stderr)
         return 2
@@ -172,8 +182,23 @@ def _netconfig_overlay(args) -> int:
                                          wallet_hotkey=args.wallet_hotkey,
                                          wallet_path=args.wallet_path)
         head = int(client.current_block())
+    # #911: judge against the body nodes run, not a refused latest one
+    want = getattr(args, "netconfig_in_force_seq", None)
+    if want is None:
+        in_force, skipped = newest_valid(cfg, bodies)
+    elif int(want) == 0:
+        in_force, skipped = None, []
+    else:
+        hits = [b for b in bodies if int(b["seq"]) == int(want)]
+        if not hits:
+            print(f"--netconfig-in-force-seq {want} is not in the published chain",
+                  file=sys.stderr)
+            return 2
+        in_force, skipped = hits[0], []
     plan = plan_overlay(cfg, overrides, args.netconfig_effective_block, previous,
-                        comment=args.netconfig_comment, head_block=head)
+                        comment=args.netconfig_comment, head_block=head, in_force=in_force,
+                        allow_lane_off=bool(getattr(args, "netconfig_allow_lane_off", False)))
+    plan.warnings[:0] = skipped
     print(plan.render())
     if not plan.ok:
         return 1

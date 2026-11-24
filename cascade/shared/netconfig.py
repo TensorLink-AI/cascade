@@ -1235,6 +1235,10 @@ class OverlayPlan:
     diff: list[str]
     errors: list[str]
     warnings: list[str]
+    # #911: what the plan was judged against and what it changes THERE
+    in_force: str = "chain.toml alone"
+    changes: list[str] = field(default_factory=list)
+    lanes: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -1245,7 +1249,11 @@ class OverlayPlan:
         lines = [f"overlay seq {b['seq']}  prev {str(b['prev'])[:16] if b['prev'] else '-'}  "
                  f"effective_block {b['effective_block']}",
                  f"digest {body_digest(b)}  note segment {cfg_feature_name(b)}",
-                 "", "changes vs chain.toml:"]
+                 f"judged against the config in force: {self.in_force}",
+                 "", "changes vs the config in force (effective values):"]
+        lines += [f"  {d}" for d in self.changes] or ["  (none)"]
+        lines += [f"  {x}" for x in self.lanes]
+        lines += ["", "changes vs chain.toml:"]
         lines += [f"  {d}" for d in self.diff] or ["  (none)"]
         for w in self.warnings:
             lines.append(f"WARNING: {w}")
@@ -1255,37 +1263,194 @@ class OverlayPlan:
         return "\n".join(lines)
 
 
+def newest_valid(cfg: ChainConfig, bodies: list[dict]) -> tuple[dict | None, list[str]]:
+    """#911, owner tool: of the published chain ``bodies`` (oldest first), the
+    newest one :func:`validate_overlay` accepts on ``cfg`` — the body a node
+    on this release keeps signalling / in force when newer ones are refused
+    (:meth:`NetConfigResolver.refresh`) — and one line per newer body skipped.
+    ``None`` = no published body validates (chain.toml alone). Pure."""
+    skipped: list[str] = []
+    for body in reversed(list(bodies)):
+        try:
+            validate_overlay(cfg, body)
+        except NetConfigError as e:
+            skipped.append(f"published seq {body.get('seq')} ({body_digest(body)[:12]}) does "
+                           f"not validate on this chain.toml, so nodes refused it: {e}")
+            continue
+        return body, skipped
+    return None, skipped
+
+
+# #911: the lanes whose on/off state the plan reports, and the keys that
+# switch each one (an overlay that sets none of them turns it off only by
+# dropping a restatement — implicitly). MarketCast is switched with lane C.
+LANE_LABELS = (("lane_b", "LANE B"), ("lane_c", "LANE C"), ("lane_d", "LANE D"),
+               ("marketcast", "MARKETCAST"))
+_LANE_SWITCHES = {
+    "lane_b": (("lane_b", "from_block"), ("lane_b", "until_block"), ("lane_b", "share")),
+    "lane_c": (("lane_c", "from_block"), ("lane_c", "until_block"), ("lane_c", "share")),
+    "lane_d": (("lane_d", "from_block"), ("lane_d", "until_block"), ("lane_d", "share")),
+    "marketcast": (("marketcast", "from_block"), ("marketcast", "until_block"),
+                   ("lane_c", "from_block"), ("lane_c", "until_block"), ("lane_c", "share")),
+}
+_UNSET = "<release default>"
+
+
+def lane_on(cfg: ChainConfig, table: str, block: int) -> bool:
+    """Presentational (owner tool): lane ``table`` is armed to pay at some
+    settlement after ``block`` (started or scheduled, share > 0, not ended at
+    or before ``block``)."""
+    lane = getattr(cfg, table)
+    fb = int(getattr(lane, "from_block", 0) or 0)
+    ub = int(getattr(lane, "until_block", 0) or 0)
+    share = getattr(lane, "share", None)
+    return fb > 0 and (share is None or float(share) > 0) and (ub <= 0 or ub > int(block))
+
+
+def _flat(raw: dict, prefix: str = "") -> dict[tuple[str, str], object]:
+    out: dict[tuple[str, str], object] = {}
+    for table, kv in raw.items():
+        if not isinstance(kv, dict):
+            continue
+        name = f"{prefix}{table}"
+        for key, value in kv.items():
+            if isinstance(value, dict):
+                out.update(_flat({key: value}, prefix=f"{name}."))
+            else:
+                out[(name, key)] = value
+    return out
+
+
+def _resolved_overrides(cfg: ChainConfig, body: dict | None) -> dict:
+    """The overrides a node runs for an in-force ``body`` (#891 resolution,
+    without the loud log line). ``{}`` for ``None``."""
+    if body is None or not isinstance(body.get("overrides"), dict):
+        return {}
+    ov = body["overrides"]
+    return _without(ov, in_force_out_of_bounds(cfg, ov))
+
+
+def _merged(cfg: ChainConfig, overrides: dict) -> dict:
+    if not all(isinstance(kv, dict) for kv in overrides.values()):
+        return effective_raw(cfg)
+    return _carry_lane_c_start(cfg, overrides, merge_raw(effective_raw(cfg), overrides))
+
+
+def effective_changes(cfg: ChainConfig, in_force_overrides: dict,
+                      overrides: dict) -> list[str]:
+    """#911: ``[table] key: in force -> new`` for every key whose EFFECTIVE
+    value changes when ``overrides`` replaces the in-force overlay on ``cfg``
+    — a key the in-force overlay restated and this one drops (it reverts to
+    chain.toml) is marked ``DROPPED``. Pure, presentational."""
+    before = _flat(_merged(cfg, in_force_overrides))
+    after = _flat(_merged(cfg, overrides))
+    out = []
+    for name, key in sorted(set(before) | set(after)):
+        a, b = before.get((name, key), _UNSET), after.get((name, key), _UNSET)
+        if a == b:
+            continue
+        top, _, rest = name.partition(".")
+        first = rest.split(".")[0] if rest else key
+        line = f"[{name}] {key}: {a!r} -> {b!r}".replace(repr(_UNSET), _UNSET)
+        if _sets(in_force_overrides, top, first) and not _sets(overrides, top, first):
+            line += (" (DROPPED: restated by the overlay in force, not by this one; "
+                     "reverts to chain.toml)")
+        out.append(line)
+    return out
+
+
+def lane_switches(cfg: ChainConfig, prev_cfg: ChainConfig, new: ChainConfig,
+                  in_force_overrides: dict, overrides: dict,
+                  block: int) -> tuple[list[str], list[str]]:
+    """#911: (report lines, implicit switch-offs). A lane ON in ``prev_cfg``
+    and OFF in ``new`` is implicit unless ``overrides`` SETS one of its switch
+    keys to a value that changes it (a kill switch, a zero share)."""
+    before = _merged(cfg, in_force_overrides)
+    after = _merged(cfg, overrides)
+    lines: list[str] = []
+    implicit: list[str] = []
+    for table, label in LANE_LABELS:
+        was, now = lane_on(prev_cfg, table, block), lane_on(new, table, block)
+        if was != now:
+            explicit = [f"[{t}] {k}" for t, k in _LANE_SWITCHES[table]
+                        if _sets(overrides, t, k)
+                        and (before.get(t) or {}).get(k) != (after.get(t) or {}).get(k)]
+            line = f"{label}: {'ON' if was else 'OFF'} -> {'ON' if now else 'OFF'}"
+            if was and not explicit:
+                line += " (IMPLICIT: no switch key of this lane is set by this overlay)"
+                implicit.append(label)
+            elif explicit:
+                line += f" (set by {', '.join(explicit)})"
+            lines.append(line)
+        lp, ln = getattr(prev_cfg, table), getattr(new, table)
+        for attr in ("share", "takes_from"):
+            a, b = getattr(lp, attr, None), getattr(ln, attr, None)
+            if a != b:
+                lines.append(f"{label} {attr.upper()}: {a!r} -> {b!r}")
+    return lines, implicit
+
+
+_PREVIOUS = object()
+
+
 def plan_overlay(cfg: ChainConfig, overrides: dict, effective_block: int,
                  previous: dict | None, *, comment: str = "",
-                 head_block: int | None = None) -> OverlayPlan:
+                 head_block: int | None = None, in_force: Any = _PREVIOUS,
+                 allow_lane_off: bool = False) -> OverlayPlan:
     """Build the next overlay and run every check a validator will run on it
     (allow-list, merged load checks, era-start ``effective_block``, and the
-    retroactivity check assuming it applies AT ``effective_block``). Pure."""
+    retroactivity check assuming it applies AT ``effective_block``). Pure.
+
+    ``previous`` (the latest PUBLISHED body) gives ``seq`` / ``prev`` only.
+    ``in_force`` (#911; default ``previous``, ``None`` = chain.toml alone) is
+    the body nodes run when this one takes over — after a refused overlay,
+    the newest one that validates (:func:`newest_valid`). Retroactivity, the
+    effective-change report and the lane switch guard are judged against it.
+    A lane it arms that this overlay turns off without setting a switch key
+    (a dropped restatement) is refused unless ``allow_lane_off``. Owner-side
+    only: nothing here is what a validator runs to accept an overlay."""
     errors: list[str] = []
     warnings: list[str] = []
+    if in_force is _PREVIOUS:
+        in_force = previous
+    label = ("chain.toml alone" if in_force is None else
+             f"seq {in_force.get('seq')} ({body_digest(in_force)[:12]})")
     try:
         body = next_overlay(overrides, effective_block, previous, network=network_identity(cfg), comment=comment)
     except NetConfigError as e:
         body = {"protocol": PROTOCOL, "seq": 1 if previous is None else previous["seq"] + 1,
                 "prev": None if previous is None else body_digest(previous),
                 "effective_block": int(effective_block), "overrides": overrides}
-        return OverlayPlan(body, [], [str(e)], [])
+        return OverlayPlan(body, [], [str(e)], [], in_force=label)
     diff = diff_tables(cfg.raw or {}, merge_raw(cfg.raw or {}, overrides))
+    in_force_ov = _resolved_overrides(cfg, in_force)
+    changes = effective_changes(cfg, in_force_ov, overrides)
+    lanes: list[str] = []
     try:
         new = validate_overlay(cfg, body)
         prev_cfg = cfg
-        if previous is not None:
+        if in_force is not None:
             try:
-                prev_cfg = build_config(cfg, previous)
+                prev_cfg = build_config(cfg, in_force)
             except NetConfigError as e:
-                warnings.append(f"the previous overlay no longer builds on this chain.toml ({e})")
+                warnings.append(f"the overlay in force no longer builds on this chain.toml ({e})")
                 # #891: nodes on this release run it with the out-of-bounds
                 # keys at the release value; judge retroactivity against that
                 try:
-                    prev_cfg = build_config(cfg, previous, in_force=True)
+                    prev_cfg = build_config(cfg, in_force, in_force=True)
                 except NetConfigError:
                     prev_cfg = cfg
         errors += retroactive_changes(prev_cfg, new, int(effective_block))
+        lanes, implicit = lane_switches(cfg, prev_cfg, new, in_force_ov, overrides,
+                                        int(effective_block))
+        for lane in implicit:
+            why = (f"{lane} is armed by the config in force ({label}) and this overlay turns "
+                   "it OFF without setting any of its switch keys (a dropped restatement): "
+                   "restate the in-force keys")
+            if allow_lane_off:
+                warnings.append(why + " — allowed (--allow-lane-off)")
+            else:
+                errors.append(why + ", or pass --allow-lane-off to turn it off on purpose")
     except NetConfigError as e:
         errors.append(str(e))
     if head_block is not None:
@@ -1304,4 +1469,5 @@ def plan_overlay(cfg: ChainConfig, overrides: dict, effective_block: int,
                             "any of its switch blocks before that are then refused")
     warnings.append("validated against chain.toml as typed: blocks the fleet resolved on chain "
                     "(DEC-CA-0045) are re-checked by every validator at adoption")
-    return OverlayPlan(body, diff, errors, warnings)
+    return OverlayPlan(body, diff, errors, warnings, in_force=label, changes=changes,
+                       lanes=lanes)
