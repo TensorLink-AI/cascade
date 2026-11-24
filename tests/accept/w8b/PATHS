@@ -26,3 +26,7 @@ cascade/validator/satellite.py
 # rev6.18 B2: the published-chain replay test reads the chain rules at their
 # new home (the former cascade/satellite/lane_d_replay.py).
 cascade/audit/lane_d_chain.py
+# #913 / #910 (testnet 2026-11-24): the satellite's lane D payee scoping and a
+# rebuilt node following the signed published lane D court, documented in
+# "Lane D: what satellites verify" / "Lane D: rebuilt from empty state".
+docs/VALIDATOR.md
