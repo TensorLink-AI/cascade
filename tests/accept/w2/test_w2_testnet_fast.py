@@ -33,13 +33,9 @@ def test_testnet_file_carries_the_fast_value(key):
     assert table[key] == fast, f"{TESTNET} [lane_d] {key} = {table[key]!r}, fast {fast!r}"
     ld = load_ok(file_raw(TESTNET), " (testnet-fast profile)").lane_d
     assert norm(field(ld, key)) == norm(fast), key
-
-
-@pytest.mark.parametrize("key", sorted(TESTNET_FAST_LANE_D))
-def test_mainnet_file_keeps_the_release_default(key):
-    default, _fast = TESTNET_FAST_LANE_D[key]
-    ld = load_ok(file_raw("chain.toml")).lane_d
-    assert norm(field(ld, key)) == norm(default), key
+    # mainnet keeps the release default
+    main = load_ok(file_raw("chain.toml")).lane_d
+    assert norm(field(main, key)) == norm(default), key
 
 
 @pytest.mark.parametrize("key", sorted(TESTNET_FAST_LANE_D))

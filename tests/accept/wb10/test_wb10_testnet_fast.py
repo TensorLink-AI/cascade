@@ -34,6 +34,8 @@ def test_testnet_fast_lane_b_keeps_the_guard_ratio_and_the_gpu_list():
 
     lb = load_ok(file_raw(TESTNET)).lane_b
     hours, secs = field(lb, "max_leg_hours"), field(lb, "max_leg_seconds")
+    assert (hours, secs) == tuple(v for _d, v in (TESTNET_FAST_LANE_B["max_leg_hours"],
+                                                   TESTNET_FAST_LANE_B["max_leg_seconds"]))
     assert secs == hours * 3600 * field(lb, "guard_factor")
     assert tuple(field(lb, "funded_pod_skus")) == round_skus(TESTNET)
     fast = {k: v for k, (_d, v) in TESTNET_FAST_LANE_B.items()}
