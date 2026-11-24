@@ -702,16 +702,29 @@ def main(argv: Sequence[str] | None = None) -> int:
     # contamination_hashset pin. The artefact ships with the release
     # (benchmarks/contamination/hashset-v<n>.json); a pin no artefact matches
     # leaves it unloaded, and the intake then answers every lane-B fund 503
-    # (fail closed) while lanes A and C keep serving. The pin is release-only
-    # (an overlay cannot set it), so it is loaded whenever lane B may open —
-    # including a lane B an overlay arms later.
+    # (fail closed) while lanes A and C keep serving. It is loaded whenever
+    # lane B may open; DEC-CA-0075: an overlay may name a new pin (+ storage
+    # key) — the intake then fetches and sha256-verifies it on first use.
     lane_b_hashset, fetch_lane_b_repo = None, None
     lane_b_pin = str(getattr(lane_b_cfg, "contamination_hashset", "") or "")
-    if args.lane_b != "off" and cfg is not None and lane_b_pin:
-        from ..interface.contamination_scan import load_pinned_hashset
 
+    def _load_lane_b_hashset(pin: str, key: str):
+        # DEC-CA-0075 (item 3): a release artefact at the pin, else the bytes
+        # at ``key`` in the pool bucket, sha256-verified against the pin
+        from ..interface.contamination_scan import load_pinned_hashset
+        from ..shared.hippius import pool_s3_store
+
+        fetch = None
+        if key and cfg is not None:
+            st = pool_s3_store(cfg.storage)
+            fetch = st.get_bytes
+        return load_pinned_hashset(pin, Path(__file__).resolve().parents[2], key=key,
+                                   fetch=fetch,
+                                   cache_dir=Path(args.queue_path).parent / "_hashsets")
+    if args.lane_b != "off" and cfg is not None and lane_b_pin:
         try:
-            lane_b_hashset = load_pinned_hashset(lane_b_pin, Path(__file__).resolve().parents[2])
+            lane_b_hashset = _load_lane_b_hashset(
+                lane_b_pin, str(getattr(lane_b_cfg, "contamination_hashset_key", "") or ""))
         except (OSError, ValueError) as e:
             log.critical("lane-B contamination hash set NOT loaded (%s): every lane-B fund "
                          "is refused 503 until the pinned artefact ships", e)
@@ -769,6 +782,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         pod_live=ledger_pod_live(Path(args.queue_path).parent / "funded_pods.json"),
         on_withdrawn=withdrawn_clears_approvals(Path(args.queue_path)),
         lane_refresh=lanes,
+        load_lane_b_hashset=_load_lane_b_hashset if args.lane_b != "off" else None,
     )
     # the lanes chain.toml arms now (the static wiring); the hook re-points
     # them per poll at the overlay in force

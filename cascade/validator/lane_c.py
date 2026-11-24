@@ -131,7 +131,9 @@ def _confirmed_win(j: LaneCJudgement, *, round_id: str, settle_block: int,
                      tier=float(fp["tier"]), full_eras=int(fp["full_eras"]),
                      below_floor=bool(fp.get("below_floor", False)),
                      holder_pointer=str(vs.get("pointer", "") or ""),
-                     beats_holder=bool(vs.get("beats", False)))
+                     beats_holder=bool(vs.get("beats", False)),
+                     # DEC-CA-0075: the curve in force at the win, fixed here
+                     curve=str(fp.get("curve", "") or ""))
 
 
 def resolve_outcomes(state: LaneCState, judgements: list[LaneCJudgement], *, round_id: str,

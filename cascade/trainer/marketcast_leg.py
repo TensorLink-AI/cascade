@@ -197,7 +197,10 @@ class MktSampler:
                         continue
                 have = False
                 for cls, syms in assets.items():
-                    if cls not in SUITE_CLASSES.get(base_suite(suite), ()):
+                    classes = (mc.suite_classes(base_suite(suite))
+                               if hasattr(mc, "suite_classes")
+                               else SUITE_CLASSES.get(base_suite(suite), ()))
+                    if cls not in classes:
                         continue
                     for a in syms:
                         if a not in snap.assets(cls):
@@ -666,6 +669,115 @@ def training_relay_plan(store, prefix: str, mc: MarketCastConfig, recipe,
     return relay_plan(store, prefix, relay_rels(hl, training_intervals(mc), t0, t1))
 
 
+def clip_training_snapshot(snap, out_dir, mc: MarketCastConfig, recipe,
+                           not_after: float | None = None) -> dict:
+    """W-CMP2 (DEC-CA-0075): the recipe's real data cut from a competition's
+    STANDARD POOL (``snap``, the MarketCast-runner view) — every bank sliced
+    to :func:`training_span` (``[data.start, data.end + 1 day)`` clipped
+    before the dispatch ``not_after``), written as an unsigned training
+    snapshot (digested into the entry's ``data_digest``). Only the recipe's
+    assets; nothing at or after ``not_after`` ever reaches the pod's
+    training data."""
+    import numpy as np
+
+    from ..pool.marketcast import native_dir, write_snapshot
+
+    t0, t1 = training_span(recipe, not_after)
+    want = {(c, a) for c, syms in dict(recipe.assets).items() for a in syms}
+    meta = snap.meta
+
+    def _slice(bank_t0: int, step: int, cls: str, asset: str, bank: str):
+        arrs = snap.bars(cls, asset, bank=bank)
+        n_all = max((len(v) for v in arrs.values()), default=0)
+        lo = max(0, -(-(t0 - bank_t0) // step))
+        hi = max(lo, min(n_all, (t1 - bank_t0) // step))
+        return bank_t0 + lo * step, {k: np.asarray(v, dtype=np.float64)[lo:hi]
+                                     for k, v in arrs.items()}, hi - lo
+
+    bars: dict = {}
+    b_t0, b_n = int(t0), (int(t1) - int(t0)) // 60
+    for cls in sorted(meta.get("assets", {})):
+        for a in snap.assets(cls):
+            if (cls, a) not in want:
+                continue
+            got_t0, got, n = _slice(int(meta["t0"]), 60, cls, a, "bars")
+            if got and n:
+                b_t0, b_n = got_t0, n
+                bars[(cls, a)] = got
+    coarse, c_t0, c_n = {}, 0, 0
+    c = meta.get("coarse")
+    if c:
+        for cls in sorted(meta.get("assets", {})):
+            for a in snap.assets(cls):
+                if (cls, a) not in want:
+                    continue
+                got_t0, got, n = _slice(int(c["t0"]), 3600, cls, a, "coarse")
+                if got and n:
+                    c_t0, c_n = got_t0 - got_t0 % 86400, n
+                    if got_t0 % 86400:
+                        # write_snapshot's coarse grid starts on a UTC day: pad
+                        pad = (got_t0 % 86400) // 3600
+                        got = {k: np.concatenate([np.full(pad, np.nan), v])
+                               for k, v in got.items()}
+                        c_n = n + pad
+                    coarse[(cls, a)] = got
+    native: dict = {}
+    for iv, rec in sorted((meta.get("native") or {}).items()):
+        step = 60 * int(rec["bar_minutes"])
+        part, nt0, nn = {}, 0, 0
+        for cls in sorted(meta.get("assets", {})):
+            for a in snap.assets(cls):
+                if (cls, a) not in want:
+                    continue
+                got_t0, got, n = _slice(int(rec["t0"]), step, cls, a, native_dir(iv))
+                if got and n:
+                    pad = (got_t0 % 86400) // step
+                    if pad:
+                        got = {k: np.concatenate([np.full(pad, np.nan), v])
+                               for k, v in got.items()}
+                    part[(cls, a)], nt0, nn = got, got_t0 - got_t0 % 86400, n + pad
+        if part:
+            native[iv] = (nt0, nn, part)
+    return write_snapshot(out_dir, t0=int(b_t0) // 60 * 60, minutes=int(max(0, b_n)),
+                          bars=bars, sources=dict(meta.get("sources") or {}),
+                          anchor_block=int(meta["anchor_block"]),
+                          anchor_time=float(meta["anchor_time"]),
+                          block_seconds=float(meta["block_seconds"]),
+                          coarse=coarse or None, coarse_t0=int(c_t0), coarse_steps=int(c_n),
+                          native=native or None)
+
+
+def build_instance_training_snapshot(out_dir, mc: MarketCastConfig, recipe, *, corpus_dir,
+                                     work, not_after: float | None = None,
+                                     get_bytes=None) -> dict:  # pragma: no cover — a pod
+    """W-CMP2: download the competition pool the trainer relayed
+    (``mkt_pool.json``: one GET link + the tar's sha256), verify it, read it
+    through the generic reader and clip it (:func:`clip_training_snapshot`)."""
+    import json
+    import urllib.request
+    from pathlib import Path
+
+    from ..pool.marketcast import load_snapshot
+    from ..shared.hippius import tar_cid_digest, unpack_tar_to_dir
+
+    p = Path(corpus_dir or "") / "mkt_pool.json"
+    plan = json.loads(p.read_text(encoding="utf-8"))
+    if int(plan.get("version", 0)) != 1:
+        raise OSError("unsupported competition pool relay")
+    if get_bytes is None:
+        def get_bytes(url):
+            with urllib.request.urlopen(url, timeout=600) as r:  # noqa: S310 — presigned GET
+                return r.read()
+    data = get_bytes(str(plan["url"]))
+    if tar_cid_digest(data) != str(plan["sha256"]):
+        raise OSError("competition pool tar digest mismatch")
+    d = unpack_tar_to_dir(data, Path(work) / "_mkt_pool")
+    snap = load_snapshot(d, verify_signature=False, select=dict(plan.get("select") or {}),
+                         channels=dict(plan.get("channels") or {}))
+    na = not_after if not_after is not None else (float(plan.get("not_after") or 0) or None)
+    return clip_training_snapshot(snap, out_dir, mc, recipe, not_after=na)
+
+
 def build_training_snapshot(out_dir, mc: MarketCastConfig, recipe, *, post, get,
                             not_after: float | None = None, store=None) -> dict:
     """The recipe's real data: its assets over ``[data.start, data.end + 1
@@ -815,5 +927,6 @@ __all__ = [
     "AUG_DEFAULTS", "Batch", "FinetuneResult", "MktDataUnavailable", "MktLegError",
     "MktSampler", "augment",
     "build_training_snapshot", "finetune", "lr_at", "quantile_loss", "recipe_digest",
+    "clip_training_snapshot", "build_instance_training_snapshot",
     "run_mkt_leg", "load_init_weights", "training_intervals", "training_relay_plan", "training_span",
 ]

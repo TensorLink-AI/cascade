@@ -728,6 +728,14 @@ class LaneBConfig:
     # a suite-target corpus; D38 (a) a stricter repo cap for those entries.
     suite_targets: bool = False
     contamination_hashset: str = ""
+    # DEC-CA-0075 (item 3): where the pinned hash set is fetched from when no
+    # release artefact matches the pin ("" = release artefacts only, today);
+    # the bytes are sha256-verified against the pin before use (fail closed)
+    contamination_hashset_key: str = ""
+    # DEC-CA-0075 rule menu: the lane's test family and pay curve (defaults =
+    # today's rules; a curve other than tiered_decay is recorded on the win)
+    test_family: str = "maxt"
+    pay_curve: str = "indefinite_until_beaten"
     contamination_min_hits: tuple[tuple[str, int], ...] = (("exact", 1), ("normalised", 3))
     suite_target_max_repo_mb: int = 8
     # D39 miner-chosen experts: the per-layer clamp is ceil(min_frac E) ..

@@ -49,7 +49,10 @@ def test_shipped_rule_is_a_13h_verdict_on_the_embargo():
     # the eval-draw knobs are overlay-settable (code-bounded by the loader)
     assert {"embargo_eval_days", "backtest_windows_per_cell",
             "verdict_wait_blocks"} <= N.ALLOWED["marketcast"]
-    assert "embargo_days" not in N.ALLOWED["marketcast"]          # a raise scores trained days
+    # DEC-CA-0075 (owner 2026-11-24): overlay-settable — each leg's
+    # dispatch-time embargo is recorded and used, so a change never scores
+    # a leg on its own training data (tests/accept/w_cmp)
+    assert "embargo_days" in N.ALLOWED["marketcast"]
 
 
 def test_draw_spans_lie_in_the_embargo_no_leg_reads():

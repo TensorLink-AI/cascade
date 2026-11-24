@@ -424,9 +424,12 @@ class MktSnapshot:
             return hit
         out = {}
         prefix = f"{bank}/{cls}/{asset}/"
+        # W-CMP2: a generic standard pool's view names virtual paths (aliases)
+        alias = self.meta.get("aliases") or {}
         for rel in self.meta["files"]:
             if rel.startswith(prefix):
-                out[rel[len(prefix):-4]] = np.load(self.root / rel, allow_pickle=False)
+                out[rel[len(prefix):-4]] = np.load(self.root / alias.get(rel, rel),
+                                                   allow_pickle=False)
         self._cache[key] = out
         return out
 
@@ -456,11 +459,57 @@ class MktSnapshot:
 
 
 def load_snapshot(root: Path | str, *, signer_hotkey: str = "",
-                  verify_signature: bool = True) -> MktSnapshot:
+                  verify_signature: bool = True, schema: str = "",
+                  select: dict | None = None, channels: dict | None = None) -> MktSnapshot:
     """Read + verify a snapshot directory: every listed file's sha256, no
     unlisted bar file, and (``verify_signature``) the body's signature by
-    ``signer_hotkey``. Raises :class:`SnapshotError`."""
+    ``signer_hotkey``. Raises :class:`SnapshotError`.
+
+    DEC-CA-0075 (W-CMP): a directory holding a STANDARD POOL (``pool.json``,
+    :mod:`cascade.shared.std_pool`) is read by the generic reader and
+    projected onto this API (:func:`~cascade.shared.std_pool.mkt_meta_view`):
+    same arrays, same windows; the digest is the pool's. ``schema`` (the
+    competition spec's ``pool.schema``): ``""`` reads either form (today), a
+    standard-pool version reads only that. ``select`` (the spec's tag
+    filter; {} = every series) restricts the view to the matching series."""
     root = Path(root)
+    from ..shared.std_pool import (
+        POOL_FILE,
+        StdPoolError,
+        load_std_pool,
+        pool_mkt_view,
+        select_mkt_view,
+        std_body_from_mkt_meta,
+    )
+
+    is_std = (root / POOL_FILE).is_file() and not (root / SNAPSHOT_FILE).is_file()
+    if schema and not is_std:
+        raise SnapshotError(f"the competition reads standard pool {schema!r}; {root} holds a "
+                            "legacy MarketCast snapshot")
+    if is_std:
+        try:
+            pool = load_std_pool(root, signer_hotkey=signer_hotkey, verify=verify_signature,
+                                 **({"schema": schema} if schema else {}))
+            meta = pool_mkt_view(pool.body, select, channels)
+        except StdPoolError as e:
+            raise SnapshotError(f"standard pool refused: {e}") from e
+        if int(meta.get("version", 0)) != MKT_SNAPSHOT_VERSION:
+            raise SnapshotError("unsupported MarketCast snapshot version in the pool")
+        return MktSnapshot(root, meta, pool.digest)
+    snap = _load_legacy_snapshot(root, signer_hotkey=signer_hotkey,
+                                 verify_signature=verify_signature)
+    if select:
+        try:
+            view = select_mkt_view(snap.meta, std_body_from_mkt_meta(snap.meta), dict(select))
+        except StdPoolError as e:
+            raise SnapshotError(f"snapshot cannot be selected: {e}") from e
+        return MktSnapshot(root, view, snap.digest)
+    return snap
+
+
+def _load_legacy_snapshot(root: Path, *, signer_hotkey: str,
+                          verify_signature: bool) -> MktSnapshot:
+    """The DEC-CA-0064 ``snapshot.json`` form (the special case)."""
     try:
         meta = json.loads((root / SNAPSHOT_FILE).read_text(encoding="utf-8"))
     except Exception as e:  # noqa: BLE001
@@ -796,9 +845,14 @@ class MktSnapshotSource:
     sha256-verified against the index, then verified as a snapshot."""
 
     def __init__(self, store, *, prefix: str, signer_hotkey: str, cache_dir: Path | str,
-                 verify_signature: bool = True) -> None:
+                 verify_signature: bool = True, schema: str = "",
+                 select: dict | None = None, channels: dict | None = None) -> None:
         self.store, self.prefix = store, str(prefix)
         self.signer, self.verify = str(signer_hotkey or ""), bool(verify_signature)
+        # DEC-CA-0075: the competition spec's pool schema, series filter and
+        # channel map
+        self.schema, self.select = str(schema or ""), dict(select or {})
+        self.channels = dict(channels or {})
         self.cache_dir = Path(cache_dir) / self.prefix
         self._cache: dict[str, MktSnapshot] = {}
 
@@ -819,7 +873,9 @@ class MktSnapshotSource:
 
             dest = self.cache_dir / f"snapshot-{meta.effective_block}-{meta.sha256[:12]}"
             fetch_pool_snapshot(self.store, meta, dest)
-            hit = load_snapshot(dest, signer_hotkey=self.signer, verify_signature=self.verify)
+            hit = load_snapshot(dest, signer_hotkey=self.signer, verify_signature=self.verify,
+                                schema=self.schema, select=self.select,
+                                channels=self.channels)
             if len(self._cache) >= 4:
                 self._cache.pop(next(iter(self._cache)))
             self._cache[meta.sha256] = hit

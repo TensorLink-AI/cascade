@@ -369,6 +369,26 @@ def run_mkt_worker(args, cfg, log, *, post=None, get=None, synthetic_fn=None,
     )
 
     mc = cfg.marketcast
+    instance = None
+    try:
+        instance = (json.loads(args.recipe_json) or {}).get("instance") if args.recipe_json \
+            else None
+    except (ValueError, TypeError, AttributeError):
+        instance = None
+    if instance:
+        # W-CMP2 (DEC-CA-0075): a spec instance's leg trains under the
+        # instance's compiled table the trainer relayed (its pool, metrics,
+        # bounds; the same pinned base), on its standard pool
+        from dataclasses import replace as _replace
+
+        from ..shared.config.marketcast import parse_marketcast
+
+        try:
+            mc = _replace(parse_marketcast(dict(instance["table"]), open_classes=True),
+                          from_block=max(1, int(cfg.marketcast.from_block or 1)))
+        except (ValueError, KeyError, TypeError) as e:
+            log.error("--role mkt_finetune: the relayed competition table is invalid: %s", e)
+            return 2
     if not args.local_only or not args.recipe_json or not args.warm_start_ref:
         log.error("--role mkt_finetune requires --local-only, --recipe-json and "
                   "--warm-start-ref")
@@ -416,7 +436,17 @@ def run_mkt_worker(args, cfg, log, *, post=None, get=None, synthetic_fn=None,
             "continuation_protocol": mc.continuation_protocol,
             "seed": int(args.base_seed), "gen_ref": args.gen_ref, "hotkey": args.hotkey,
             "max_seconds": max_s}
-        if not restore_marketcast_data(args, cfg, binding, work / "_mkt_train"):
+        if instance and not restore_marketcast_data(args, cfg, binding, work / "_mkt_train"):
+            # W-CMP2: the instance's standard pool, clipped to the recipe's range
+            from .marketcast_leg import build_instance_training_snapshot
+
+            try:
+                build_instance_training_snapshot(work / "_mkt_train", mc, recipe,
+                                                 corpus_dir=getattr(args, "corpus_dir", None),
+                                                 work=work, not_after=train_time)
+            except OSError as e:
+                raise MktDataUnavailable(f"competition pool relay failed: {e}") from e
+        elif not restore_marketcast_data(args, cfg, binding, work / "_mkt_train"):
             from ..pool.marketcast_relay import fetch_relay, read_relay_file
 
             # the trainer's relay of the bar recording (sub-hour candles the

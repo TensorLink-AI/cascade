@@ -683,14 +683,15 @@ and `open_rule = "cogate"`. At those defaults no consensus surface reads the
 track keys, so no contract, verdict or receipt digest moves. You configure
 nothing beyond keeping `chain.toml` current.
 
-**The hash-set pin is release-only.** `[lane_b] contamination_hashset` pins
-the benchmark hash set the funding intake scans submissions against
-(`sha256:<64 hex>`, or `""` for none). It is release-only. An owner-signed
-overlay that sets it is refused by the network-config loader, the same way
-as the burn destinations. Every other `[lane_b]` track key can change by
-overlay. The pin names a `benchmarks/contamination/hashset-v<n>.json`
-artefact that ships with the release. When no artefact matches the pin, the
-intake fails closed and funds nothing.
+**The hash-set pin is a content hash (DEC-CA-0075).**
+`[lane_b] contamination_hashset` pins the benchmark hash set the funding
+intake scans submissions against (`sha256:<64 hex>`, or `""` for none). It is no longer
+release-only: an owner-signed overlay may set it, together with
+`contamination_hashset_key` (the storage key holding the bytes). A reader
+first looks for a `benchmarks/contamination/hashset-v<n>.json` artefact of
+the release at the pin, else fetches the key and verifies the bytes'
+sha256 against the pin before parsing them. On any mismatch or missing
+artefact the intake fails closed and funds nothing.
 
 **Contamination receipt.** While the pin is set, every lane B fund the intake
 accepts carries a `contamination` receipt, stored on the queue entry:

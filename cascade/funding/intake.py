@@ -475,6 +475,10 @@ class FundingIntake:
         pod_live: Callable[[str], bool] | None = None,
         on_withdrawn: Callable[[str], None] | None = None,
         lane_refresh: Callable[[FundingIntake], None] | None = None,
+        # DEC-CA-0075 (item 3): (pin, key) -> the verified hash set, called
+        # when the [lane_b] pin in force (an adopted overlay) is not the one
+        # loaded; raises on a missing / mismatched artefact (fail closed)
+        load_lane_b_hashset: Callable[[str, str], object] | None = None,
     ) -> None:
         # ``lane_refresh(intake)``: called at every lane-B / lane-C entry point
         # before the lane's on/off check. The production intake (main.py) passes
@@ -524,6 +528,7 @@ class FundingIntake:
         self.lane_b_hashset = None if lane_b_hashset is _UNWIRED else lane_b_hashset
         self.fetch_lane_b_repo = None if fetch_lane_b_repo is _UNWIRED else fetch_lane_b_repo
         self._lane_b_hashset_sha: str | None = None
+        self.load_lane_b_hashset = load_lane_b_hashset
         # RV6 B6: scan receipts by (content-pinned ref, hash-set pin), per
         # intake, bounded (oldest evicted first).
         self._lane_b_scan_lock = threading.Lock()
@@ -1448,6 +1453,18 @@ class FundingIntake:
 
         cfg = self.lane_b_cfg
         pin = self._lane_b_pin()
+        if ((self.lane_b_hashset is None or self._lane_b_hashset_sha != pin)
+                and self.load_lane_b_hashset is not None):
+            # DEC-CA-0075: an overlay named a new pin (+ key): fetch, verify
+            # the sha256 against the pin, then use it; any failure fails closed
+            try:
+                hs = self.load_lane_b_hashset(
+                    pin, str(getattr(cfg, "contamination_hashset_key", "") or ""))
+            except Exception:  # noqa: BLE001 — missing / mismatched: 503 below
+                log.exception("lane-B contamination hash set %s could not be loaded", pin)
+            else:
+                if hs is not None and _hashset_pin(hs) == pin:
+                    self.lane_b_hashset, self._lane_b_hashset_sha = hs, pin
         if self.lane_b_hashset is None or self._lane_b_hashset_sha != pin:
             log.error("lane-B fund refused: contamination hash set %s is not loaded "
                       "(loaded: %s)", pin, self._lane_b_hashset_sha or "none")

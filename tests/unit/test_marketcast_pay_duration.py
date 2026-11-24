@@ -213,7 +213,9 @@ def test_an_ended_holder_is_evicted_by_the_marketcast_fold():
     from cascade.validator import marketcast as vmc
 
     src = inspect.getsource(vmc)
-    assert "era_length_blocks(self.cfg.round, block)),\n                                  holder)" in src
+    # DEC-CA-0075: on the holder's recorded pay curve ([lane_c] for its tail)
+    assert ("era_length_blocks(self.cfg.round, block)),\n                                  "
+            "holder, self.cfg.lane_c)") in src
 
 
 # ── audit ────────────────────────────────────────────────────────────────────

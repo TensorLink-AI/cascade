@@ -612,7 +612,15 @@ def _raw_sha256(path: Path) -> str | None:
     return "sha256:" + h.hexdigest()
 
 
-def load_pinned_hashset(pin: str, root: str | os.PathLike) -> PinnedHashset | None:
+class HashsetMismatch(ValueError):
+    """DEC-CA-0075 (item 3): fetched hash-set bytes whose sha256 is not the
+    pin (typed; every reader fails closed — lane-B funds 503, a suite-target
+    entry is never judged clean)."""
+
+
+def load_pinned_hashset(pin: str, root: str | os.PathLike, *, key: str = "",
+                        fetch=None, cache_dir: str | os.PathLike | None = None
+                        ) -> PinnedHashset | None:
     """The bounded hash set ``[lane_b] contamination_hashset = pin`` names.
 
     ``""`` (unpinned) is ``None``. Otherwise the
@@ -647,10 +655,40 @@ def load_pinned_hashset(pin: str, root: str | os.PathLike) -> PinnedHashset | No
             raise ValueError(f"{p}: hash set version {lookup['version']} does not match its "
                              f"file name (v{n})")
         return PinnedHashset(lookup, pin)
+    if key and fetch is not None:
+        return _fetch_pinned_hashset(pin, key, fetch, cache_dir or (Path(root) / "_hashsets"))
     raise ValueError(f"[lane_b] contamination_hashset {pin} matches no artefact under "
                      f"{d} (looked at {len(candidates)} hashset-v<n>.json file(s))")
 
 
+def _fetch_pinned_hashset(pin: str, key: str, fetch, cache_dir) -> PinnedHashset:
+    """DEC-CA-0075 (item 3): the hash set an overlay names by content hash
+    ``pin`` + storage ``key``: ``fetch(key)`` → bytes, written to
+    ``cache_dir`` and sha256-verified against the pin BEFORE it is parsed;
+    a mismatch raises :class:`HashsetMismatch` (the cached copy is removed),
+    so nothing but the pinned bytes is ever used. A cached file already at
+    the pin is reused without a fetch."""
+    wb11 = _wb11()
+    hexd = pin.split(":", 1)[-1]
+    d = Path(cache_dir)
+    p = d / f"hashset-{hexd}.json"
+    if not (p.is_file() and _raw_sha256(p) == pin):
+        data = fetch(key)
+        if not isinstance(data, (bytes, bytearray)):
+            raise HashsetMismatch(f"hash set {key!r} fetched no bytes")
+        d.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".tmp")
+        tmp.write_bytes(bytes(data))
+        got = _raw_sha256(tmp)
+        if got != pin:
+            tmp.unlink(missing_ok=True)
+            raise HashsetMismatch(f"[lane_b] contamination_hashset_key {key!r} holds {got}, "
+                                  f"not the pinned {pin}: refused (fail closed)")
+        os.replace(tmp, p)
+    lookup = wb11.load_lookup(p, expect_sha256=pin)
+    return PinnedHashset(lookup, pin)
+
+
 __all__ = ["HASHSET_DIR", "MAX_SCAN_WINDOWS", "RESULT_BUDGET_EXCEEDED", "RESULT_CLEAN",
            "RESULT_EMBEDDED", "SCAN_DEADLINE_S", "STOP_CAP", "STOP_DEADLINE", "STOP_WINDOWS",
-           "PinnedHashset", "ScanReceipt", "load_pinned_hashset", "scan_repo"]
+           "HashsetMismatch", "PinnedHashset", "ScanReceipt", "load_pinned_hashset", "scan_repo"]

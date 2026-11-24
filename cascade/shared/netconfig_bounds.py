@@ -186,6 +186,9 @@ BOUNDS: dict[tuple[str, str], Bound] = {
     ("marketcast", "max_infra_deferrals"): _count(0, 100, why=_STALL),
     # lane C eval data (the grid): 66 assets x 6 timeframes x this per suite
     ("marketcast", "windows_per_cell"): _count(1, 512),
+    # DEC-CA-0075: the embargo (recorded per leg at dispatch; the loader also
+    # keeps embargo_eval_days < embargo_days)
+    ("marketcast", "embargo_days"): _count(2, 120, why="the eval draw lies inside it"),
     # DEC-CA-0074 (the loader bounds them too: 1 .. embargo_days - 1, 1 .. 256, <= 3900)
     ("marketcast", "embargo_eval_days"): _count(1, 365),
     ("marketcast", "backtest_windows_per_cell"): _count(1, 256),
@@ -220,8 +223,9 @@ BOUNDS: dict[tuple[str, str], Bound] = {
 }
 
 # Release-only keys inside an overlay-settable table, with the reason the
-# refusal prints. (The burn destinations and [lane_b] contamination_hashset
-# are refused by netconfig.check_overrides itself.)
+# refusal prints. (The burn destinations are refused by
+# netconfig.check_overrides itself; DEC-CA-0075 made [lane_b]
+# contamination_hashset overlay-settable as a sha256-verified content hash.)
 RELEASE_ONLY_KEYS: dict[tuple[str, str], str] = {
     ("scoring", "prior_contract_digest"): "a contract digest is release-only",
     ("eval", "shared_ladder_feature"): "a fork-guard feature name is release-only",

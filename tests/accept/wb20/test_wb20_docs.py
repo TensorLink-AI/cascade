@@ -232,13 +232,16 @@ def test_validator_documents_the_gate_record():
 
 def test_validator_documents_the_pinned_hashset():
     text = _lane_b(h.VALIDATOR)
-    # netconfig's release-only tuple is the rule's home (read as source)
+    # tests-correction (owner 2026-11-24, DEC-CA-0075 item 3): the pin is a
+    # content hash an overlay may set; every reader verifies the sha256
     src = (h.CASCADE / "shared" / "netconfig.py").read_text(encoding="utf-8")
-    assert '("lane_b", "contamination_hashset")' in src, "code truth: release-only hash set"
+    assert '("lane_b", "contamination_hashset")' not in src, (
+        "code truth: the hash-set pin is overlay-settable (DEC-CA-0075)")
     paras = [p for p in h.paragraphs(text) if h.has_token(p, "contamination_hashset")]
-    assert any(re.search(r"release[- ]only", p, re.I) for p in paras), (
-        "VALIDATOR.md lane B: `[lane_b] contamination_hashset` is release-only (not "
-        "overlay-settable); say so in the paragraph that names it")
+    assert any(re.search(r"content hash", p, re.I) and re.search(r"sha256", p, re.I)
+               for p in paras), (
+        "VALIDATOR.md lane B: `[lane_b] contamination_hashset` is a content hash an overlay "
+        "may set, verified by sha256; say so in the paragraph that names it")
     assert not _missing(text, ("declared_rows", "hashset_version")), (
         "VALIDATOR.md lane B: `declared_rows` and `hashset_version` must be named")
 
