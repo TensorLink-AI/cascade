@@ -47,7 +47,7 @@ def settle_pub(tmp: Path) -> dict:
     state = tmp / "state" / "lane_d_state.json"
     state.parent.mkdir(parents=True, exist_ok=True)
     kw = w7a.gate_inputs(w7a.BOUNDARY_1, chain["house"]["digest"])
-    s1 = settle_lane_d(cfg=w7a.lane_d_cfg(), boundary=w7a.BOUNDARY_1, pool_dir=chain["pools"][1],
+    s1 = settle_lane_d(**w7a._rev614_ts(settle_lane_d, w7a.BOUNDARY_1), cfg=w7a.lane_d_cfg(), boundary=w7a.BOUNDARY_1, pool_dir=chain["pools"][1],
                        entries=[dict(e)], house=dict(chain["house"]),
                        forecasts=chain["forecasts"][1], uid_of=dict(uid_of), state_path=state,
                        signer=w7a.fixture_key("signer"), max_channels=chain["max_channels"],
