@@ -411,6 +411,7 @@ Run locally with `-m "not torch"`. Nothing here imports torch.
 Tests: `test_w9_host.py`. `check_lane_d(..., scoring_envs=None)`: a report
 with `host` FAILs (`scoring host: ...`) unless `host_problem` holds at the
 report's boundary against `scoring_envs` (default: the committed
-`deploy/laned/scoring_envs.toml`; unreadable -> WARN). A report without
-`host` is unchanged. Under F1's refusal table this is an alert-class check
-(not one of the four burn checks); F1 classifies its code.
+`deploy/laned/scoring_envs.toml`). A report without
+`host` is unchanged. Refusal code `ld_host`, class **alert** (not one of
+the four B3 pay-stopping checks): logged and alerted, the signed court keeps
+being paid; an unreadable list is an `ld_host` finding too.

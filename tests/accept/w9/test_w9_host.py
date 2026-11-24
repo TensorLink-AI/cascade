@@ -91,6 +91,11 @@ def test_an_unqualified_host_fails(run, host_kw, env_kw, why):
     res = _audit(r, run["cfg"], scoring_envs=_envs(**env_kw))
     assert res.status == "FAIL", f"{why}: {res.status} {res.detail}"
     assert "scoring host" in res.detail
+    from cascade.audit.lane_d import refusal_class
+
+    code = res.detail.split(":", 1)[0]
+    assert code == "ld_host" and refusal_class(code) == "alert", \
+        "B3: the host check alerts and keeps paying; it is not a pay-stopping check"
 
 
 def test_a_report_without_host_is_unchanged(run):

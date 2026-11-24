@@ -11,9 +11,10 @@ cascade/validator/schemas/lane_d_report_1.json
 # W8b's step PUTs each bound record at bench_v/lane_d/<boundary>/<sha256>.json
 # before the report.
 cascade/validator/lane_d_wiring.py
-# W7d's replay: bench_rows=, digest / role / session checks, the four LCBs
+# W7d's replay (rev6.18 B2: moved into the audit, cascade/audit/lane_d_chain.py,
+# reached through check_lane_d(bench_rows=)): bench_rows=, digest / role / session checks, the four LCBs
 # recomputed from the published bytes.
-cascade/satellite/lane_d_replay.py
+cascade/audit/lane_d_chain.py
 # W9's audit: the optional rows key is a valid gate result key (the plan
 # row's PATHS list omitted it; the audit checks result keys exactly).
 cascade/audit/lane_d.py
