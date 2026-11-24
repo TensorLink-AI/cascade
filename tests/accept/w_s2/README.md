@@ -136,5 +136,6 @@ These are left to the builder:
 
 ## rev6.20 (owner 2026-11-24): stage `scored_weights`
 
-`judge_entry` refuses an entry whose `scored_weights` is not the rule's at
-its `train_block`, before any fetch. `test_w_s2_scored_weights_stage.py`.
+`judge_entry` refuses an entry whose `scored_weights` is not `"ema010"`
+(every lane B leg scores its power EMA), before any fetch.
+`test_w_s2_scored_weights_stage.py`.

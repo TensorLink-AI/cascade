@@ -109,7 +109,7 @@ def test_audit_knows_the_levers_stage():
 
 
 def test_settlement_reads_the_leg_record(tmp_path):
-    from cascade.trainer.lane_b_driver import leg_actuals, leg_scored_weights
+    from cascade.trainer.lane_b_driver import _scored_weights_for, leg_actuals
 
     d = tmp_path / "leg"
     d.mkdir()
@@ -118,11 +118,10 @@ def test_settlement_reads_the_leg_record(tmp_path):
                       "schedule": "warmup_constant_ema"},
         "lane_b_leg": {"steps": 7, "tokens": 70, "stop": "hours"}}))
     assert leg_actuals(d) == {"steps": 7, "tokens": 70, "stop": "hours"}
-    assert leg_scored_weights(d) == "ema005"
-    rec = json.loads((d / "config.json").read_text())
-    for s, want in ((0.03, "ema003"), (0.15, "ema015"), (0.2, "ema020"), (0.5, "?")):
-        rec["power_ema"]["scored_sigma_rel"] = s
-        (d / "config.json").write_text(json.dumps(rec))
-        assert leg_scored_weights(d) == want, s
+    lb = h.chain_cfg().lane_b
+    for s, want in ((0.03, "ema003"), (0.15, "ema015"), (0.2, "ema020")):
+        assert _scored_weights_for(lb, {"ema": s}) == want, s
+    assert _scored_weights_for(lb, {}) == "ema010"
+    assert _scored_weights_for(lb, {"ema": 0.5}) == "?"
     (d / "config.json").write_text("{}")
     assert leg_actuals(d) == {}

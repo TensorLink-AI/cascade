@@ -11,7 +11,7 @@ import pytest
 from . import helpers as h
 
 KEYS = {"lr_scale_min": 0.5, "lr_scale_max": 2.0, "max_leg_hours": 12.0,
-        "max_leg_seconds": 54_000, "ema_sigma_rels": (0.03, 0.05, 0.10, 0.15, 0.20)}
+        "max_leg_seconds": 54_000, "sigma_rel_choices": (0.03, 0.05, 0.10, 0.15, 0.20)}
 
 
 def test_keys_ship_at_their_defaults():
@@ -47,10 +47,10 @@ def test_lr_scale_bounds_refusals():
 def test_ema_set_bounds():
     from cascade.shared.config.v2 import parse_lane_b
 
-    assert parse_lane_b({"ema_sigma_rels": [0.01, 0.1, 0.3]}).ema_sigma_rels == (0.01, 0.1, 0.3)
+    assert parse_lane_b({"sigma_rel_choices": [0.01, 0.1, 0.3]}).sigma_rel_choices == (0.01, 0.1, 0.3)
     for bad in ([], [0.05], [0.1, 0.31], [0.005, 0.1], [0.1, 0.1], [0.1, 0.125], "0.1"):
-        with pytest.raises(ValueError, match="ema_sigma_rels"):
-            parse_lane_b({"ema_sigma_rels": bad})
+        with pytest.raises(ValueError, match="sigma_rel_choices"):
+            parse_lane_b({"sigma_rel_choices": bad})
 
 
 def test_twelve_hour_caps_bind_everywhere():

@@ -623,7 +623,7 @@ class LaneBDriver:
         margin = float(getattr(getattr(self.ops, "r", None), "FUNDED_PUBLISH_MARGIN_SECONDS",
                                _LEG_LENGTH_MARGIN_SECONDS) or _LEG_LENGTH_MARGIN_SECONDS)
         now = time.time()
-        era_seconds = _era_seconds(self.cfg.round, int(block))
+        era_seconds = _era_seconds(getattr(self.cfg, "round", None), int(block))
         for hk, e in sorted(funded.items()):
             guard = int(getattr(e, "leg_guard_seconds", 0) or 0)
             hours = float(getattr(e, "train_hours", 0.0) or 0.0)
@@ -1299,11 +1299,7 @@ class LaneBDriver:
             declared = tuple(sub.get("targets") or (sub["domain"],))
             label = leg_label(declared)          # == the domain for a single target
             out = Path(work_dir) / f"rebased-{rid}-{sub['hotkey'][:12]}-{label}"
-            base_dir = self.ops.fetch(leg["base_king_ref"])
             leg_dir = self.ops.fetch(f["leg_pointer"])
-            # plan rev6.20: the leg must have scored what the rule says at its
-            # dispatch block (its checkpoint marker); the rebased checkpoint —
-            # judged and merged — is built from that same weights.safetensors
             # WB27 (plan rev6.21): the levers the leg trained (recorded at
             # dispatch; {} = every default) — the EMA choice picks the width
             levers = dict((leg.get("funding") or {}).get("levers") or {})
@@ -1316,16 +1312,12 @@ class LaneBDriver:
                             sub["hotkey"][:8], sub["domain"])
                 _drop(f, "leg_record_missing", {"train_block": int(f["train_block"])})
                 continue
-            scored = _scored_weights_for(lb, int(f["train_block"]), levers)
-            got = leg_scored_weights(leg_dir)
-            if got != scored:
-                log.warning("lane B: %s/%s scored %r, the rule at block %s says %r — dropped",
-                            sub["hotkey"][:8], sub["domain"], got, f["train_block"], scored)
-                _drop(f, "scored_weights_mismatch", {"scored_weights": got, "expected": scored,
-                                                     "train_block": int(f["train_block"])})
-                continue
+            # plan rev6.20: the receipt check (receipt_contract_ok) bound the pod
+            # to the lane B EMA leg contract, so it scored its (chosen) EMA
+            scored = _scored_weights_for(lb, levers)
             try:
-                rebased = settle_leg(king_dir, base_dir, leg_dir, sel, out,
+                rebased = settle_leg(king_dir, self.ops.fetch(leg["base_king_ref"]),
+                                     leg_dir, sel, out,
                                      refuse_nonfinite=lb.merge_guard_at_settlement(block))
             except MergeError as e:
                 log.warning("lane B: %s/%s refused at settlement: %s", sub["hotkey"][:8],
@@ -1755,16 +1747,16 @@ class LaneBDriver:
         return ptr, chosen
 
 
-def _scored_weights_for(lb, block: int, levers: dict) -> str:
-    """rev6.20's scored-weights rule with the WB27 EMA choice: ``""`` before
-    ``ema_no_cooldown_from_block``; else the chosen width's label."""
+def _scored_weights_for(lb, levers: dict) -> str:
+    """The ``scored_weights`` of a lane B leg: rev6.20's EMA at the WB27 chosen
+    width (``"ema010"`` by default); ``"?"`` for levers that no longer parse."""
     from ..shared.lane_b_levers import LeversError, lane_b_scored_weights_for, levers_from_dict
 
     try:
         parsed = levers_from_dict(levers, lb) if levers else None
     except LeversError:
-        return "?"                 # never equal to a checkpoint marker: dropped
-    return lane_b_scored_weights_for(lb, block, parsed)
+        return "?"
+    return lane_b_scored_weights_for(lb, None, parsed)
 
 
 def leg_actuals(leg_dir) -> dict:
@@ -1783,45 +1775,6 @@ def leg_actuals(leg_dir) -> dict:
                 "stop": str(rec["stop"])}
     except (KeyError, TypeError, ValueError):
         return {}
-
-
-def leg_scored_weights(leg_dir) -> str:
-    """Which weights a finished lane B leg checkpoint scores, from its
-    ``config.json`` ``power_ema`` marker (plan rev6.20): ``"ema010"`` for the
-    lane B EMA / no-cooldown schedule at sigma_rel 0.10, ``""`` for the raw
-    cooled endpoint (no marker, or no readable ``config.json``: today's
-    leg, which the armed rule then refuses), ``"?"`` for any other marker —
-    never equal to an expected value."""
-    import json
-
-    from ..shared.config.lane_b import (
-        LANE_B_EMA_SCHEDULE,
-        LANE_B_EMA_SIGMA_REL,
-        LANE_B_SCORED_EMA,
-    )
-
-    try:
-        meta = json.loads((Path(leg_dir) / "config.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError):
-        return ""
-    marker = meta.get("power_ema") if isinstance(meta, dict) else None
-    if marker is None:
-        return ""
-    if (isinstance(marker, dict) and marker.get("schedule") == LANE_B_EMA_SCHEDULE
-            and marker.get("scored_sigma_rel") == LANE_B_EMA_SIGMA_REL):
-        return LANE_B_SCORED_EMA
-    # WB27 (plan rev6.21, owner 2026-11-24): the miner's chosen EMA width
-    if isinstance(marker, dict) and marker.get("schedule") == LANE_B_EMA_SCHEDULE:
-        from ..shared.config.lane_b import LANE_B_EMA_SIGMA_BOUNDS, lane_b_ema_label
-
-        s = marker.get("scored_sigma_rel")
-        lo, hi = LANE_B_EMA_SIGMA_BOUNDS
-        if (isinstance(s, (int, float)) and not isinstance(s, bool) and lo <= s <= hi
-                and round(s * 100) == s * 100):
-            return lane_b_ema_label(s)
-    return "?"
-
-
 def _latest_commitments(rows) -> dict:
     """hotkey -> its LATEST commitment row (highest ``commit_block``)."""
     out: dict = {}
@@ -1989,13 +1942,14 @@ class RunnerLaneBOps:
                 spec = _leg_spec(self.r.cfg.lane_b, f, int(block))
                 # the same three steps the worker makes on the same spec:
                 # WB23 length, rev6.20 schedule, WB27 levers
-                from ..shared.config.lane_b import lane_b_leg_schedule
                 from ..shared.lane_b_levers import apply_spec_levers, leg_length_contract
 
                 contract = leg_length_contract(self.r.cfg, base, spec)
                 # plan rev6.20: the worker derives the same leg contract
-                # (EMA, no cooldown from [lane_b] ema_no_cooldown_from_block)
-                contract = lane_b_leg_schedule(self.r.cfg.lane_b, contract, int(block))
+                # (every lane B leg: EMA, no cooldown), then the WB27 levers
+                from ..shared.config.lane_b import lane_b_leg_contract
+
+                contract = lane_b_leg_contract(contract)
                 contract = apply_spec_levers(self.r.cfg.lane_b, contract, spec, int(block))
                 label = leg_label(leg.sub.declared)   # the domain for a single target
                 gen = ResolvedGenerator(hotkey=leg.sub.hotkey, uid=leg.sub.uid,
@@ -2127,9 +2081,9 @@ class RunnerLaneBOps:
                         self.r.cfg.lane_b.leg_hours,
                         guard_factor=self.r.cfg.round.heat_guard_factor,
                         guard_floor_seconds=self.r.cfg.round.heat_guard_floor_seconds)
-                    from ..shared.config.lane_b import lane_b_leg_schedule
+                    from ..shared.config.lane_b import lane_b_leg_contract
 
-                    lc = lane_b_leg_schedule(self.r.cfg.lane_b, lc, int(block))
+                    lc = lane_b_leg_contract(lc)
                     entry = self.r.train_one(
                         gen, "challenger", seeds, block, contract=lc,
                         token_budget=lc.train_tokens, repo_suffix=suffix,

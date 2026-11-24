@@ -173,9 +173,9 @@ def power_ema_active(warm_start_dir, expert_selection):
 def lane_b_ema_leg(lr_schedule, expert_selection):
     """Is this a lane B EMA / no-cooldown leg (plan rev6.20, owner
     2026-11-24)? ``True`` iff the leg contract's ``lr_schedule`` is
-    ``"warmup_constant_ema"`` (set only by ``lane_b_leg_schedule`` from
-    ``[lane_b] ema_no_cooldown_from_block``) on an expert leg; ``False`` for
-    ``"wsd"`` (every lane A leg and every lane B leg before the key). Any
+    ``"warmup_constant_ema"`` (set by ``lane_b_leg_contract`` on every lane B
+    leg contract) on an expert leg; ``False`` for ``"wsd"`` (every lane A
+    leg, and an expert leg trained directly on the era contract). Any
     other schedule, or the EMA schedule on a lane A leg, is refused. Pure."""
     if lr_schedule == "wsd":
         return False
@@ -222,6 +222,22 @@ def lane_b_lever_terms(contract, expert_selection, no_cooldown, ema_sigmas, ema_
         raise ValueError(f"pyramid recipe: the lane B EMA choice must be one width in "
                          f"[0.01, 0.30] with power_ema_eval 0; got {chosen!r}, {pick}")
     return lr_scale, chosen, 0
+
+
+def lane_b_context_patches(context_length, expert_selection, patch_size):
+    """Patches per training window: 128 (4096 points) on every leg, or a lane
+    B leg's chosen context (WB27: a power of two in 4096..32768) divided by
+    the patch size. Any other context, or a longer one on a lane A leg, is
+    refused. Pure."""
+    c, p = int(context_length), int(patch_size)
+    if c == 4096:
+        return 4096 // p
+    if expert_selection is None:
+        raise ValueError("pyramid recipe: a context above 4096 is a lane B leg lever")
+    if not 4096 <= c <= 32768 or c & (c - 1) or c % p:
+        raise ValueError(f"pyramid recipe: lane B context_length {c} must be a power of two "
+                         "in [4096, 32768]")
+    return c // p
 
 
 def lane_b_leg_record(step, steps, tokens, duration, max_train_seconds, token_budget=None):
@@ -273,12 +289,23 @@ def save_checkpoint(out, state, cfg, contract, *, power_ema=None, lane_b_leg=Non
 
 def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out_dir,
                   logger=None, warm_start_dir=None, expert_selection=None, continuation=None):
+    # WB27 (plan rev6.21): a lane B leg may train at a longer context. The
+    # model has no length bound (xPos per forward pass); the only 4096 lock is
+    # from_contract's contract-field check, so the model config is built at
+    # 4096 (the checkpoint's moe.context_length stays 4096) and only the batch
+    # window of this leg grows.
+    from dataclasses import replace
+
     from safetensors.torch import load_file
 
     from .continuation import assert_training_runtime, restore_rng, rng_state, training_runtime
     from .moe_trainer import PowerEMA, restore_frozen, route_bias_scale, router_lr_scale
 
-    cfg = CascadeMoEConfig.from_contract(contract)
+    ctx_patches = lane_b_context_patches(contract.context_length, expert_selection,
+                                         contract.patch_size)
+    cfg = CascadeMoEConfig.from_contract(
+        contract if int(contract.context_length) == 4096
+        else replace(contract, context_length=4096))
     if contract.training_steps < 1:
         raise ValueError("cascade_pyramid requires a positive training_steps budget")
     # Recipe values are explicit contract terms; refuse silently ignored alternatives.
@@ -449,8 +476,8 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
     clean = False
     try:
         batches = iter_training_batches(batch_source(timed, contract, patch_size=cfg.patch_size,
-            max_ctx_patches=128, seed=training_seed), patch_size=cfg.patch_size,
-            max_ctx_patches=128, batch_size=contract.batch_size,
+            max_ctx_patches=ctx_patches, seed=training_seed), patch_size=cfg.patch_size,
+            max_ctx_patches=ctx_patches, batch_size=contract.batch_size,
             batch_denomination=contract.batch_denomination)
         for index, batch in enumerate(batches):
             groups = None

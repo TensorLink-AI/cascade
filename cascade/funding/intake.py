@@ -1323,14 +1323,16 @@ class FundingIntake:
             return 400, gpu_err
         # WB23 (D42, D42b): the miner-chosen leg length, refused before
         # anything is queued or vaulted (nothing charged, TB25)
-        length, length_err = self._lane_b_leg_length(headers, choice)
-        if length_err is not None:
-            return 400, length_err
         # WB27 (plan rev6.21): the miner-chosen levers, refused with typed
-        # codes before anything is queued or vaulted (nothing charged)
+        # codes before anything is queued or vaulted (nothing charged); the
+        # context lever sets the tokens per step of the leg length below
         levers, levers_err = self._lane_b_levers(headers, choice)
         if levers_err is not None:
             return 400, levers_err
+        length, length_err = self._lane_b_leg_length(
+            headers, choice, context=(levers.context_length if levers is not None else 4096))
+        if length_err is not None:
+            return 400, length_err
         status, ctx = self._lane_b_request("lane-b-fund", headers, gpu_segment=segment)
         if status is not None:
             return status, ctx
@@ -1397,7 +1399,8 @@ class FundingIntake:
             return 200, self._gpu_reply(body, choice)
         return 202, self._gpu_reply(body, choice)
 
-    def _lane_b_leg_length(self, headers, choice) -> tuple[object | None, dict | None]:
+    def _lane_b_leg_length(self, headers, choice, *,
+                           context: int = 4096) -> tuple[object | None, dict | None]:
         """WB23: ``(LegLength | None, None)`` or ``(None, refusal)``. No
         ``X-Lane-B-Train-Hours`` / ``X-Lane-B-Train-Tokens`` header is
         ``(None, None)``: today's leg.
@@ -1435,10 +1438,20 @@ class FundingIntake:
                                      "drop X-Gpu-Allow-Fallback"}
         rate = lb_gpus.rate(choice.gpu)
         measured = lb_gpus.measured(choice.gpu)
+        contract = self.lane_b_contract
+        if int(context) != 4096:
+            from dataclasses import replace as _r
+
+            # WB27 context lever: each step consumes context/4096 x the points,
+            # so the measured (4096) rate and the tokens per step scale with it
+            if rate is not None:
+                rate = _r(rate, steps_per_s=float(rate.steps_per_s) * 4096 / int(context))
+            if contract is not None:
+                contract = _r(contract, context_length=int(context))
         try:
             if tokens is None and measured:
-                if self.lane_b_contract is not None:
-                    length = lbl.admit_leg_length(cfg, rate, hours, contract=self.lane_b_contract)
+                if contract is not None:
+                    length = lbl.admit_leg_length(cfg, rate, hours, contract=contract)
                 else:
                     length = lbl.LegLength(
                         train_hours=hours,
@@ -1448,11 +1461,11 @@ class FundingIntake:
                             overhead_seconds=float(rate.overhead_seconds),
                             max_leg_seconds=lbl.leg_caps(cfg)[1]))
             else:
-                if self.lane_b_contract is None:
+                if contract is None:
                     return None, {"code": lbl.UNAVAILABLE,
                                   "message": "this intake has no lane B base contract wired"}
                 length = lbl.admit_leg_limits(cfg, rate, train_hours=hours, train_tokens=tokens,
-                                              contract=self.lane_b_contract)
+                                              contract=contract)
                 if not measured:
                     from dataclasses import replace as _replace
 
@@ -1516,13 +1529,15 @@ class FundingIntake:
         except lv.LeversError as e:
             return None, {"code": e.code, "message": e.message}
         if levers is not None and levers.context_length != lv.DEFAULT_CONTEXT:
-            rate = None
-            if self.lane_b_gpus is not None and getattr(choice, "chosen", False):
-                rate = self.lane_b_gpus.rate(choice.gpu)
-            if rate is None or not lv.context_fits(rate, levers.context_length):
+            # a measured GPU must fit the context in its measured memory; an
+            # own-risk (unmeasured) GPU runs it at the miner's own risk
+            chosen = self.lane_b_gpus is not None and getattr(choice, "chosen", False)
+            rate = self.lane_b_gpus.rate(choice.gpu) if chosen else None
+            own_risk = chosen and rate is None and bool(self._lane_b_own_risk_gpu(headers))
+            if not own_risk and (rate is None or not lv.context_fits(rate, levers.context_length)):
                 return None, {"code": lv.CONTEXT_UNFIT,
                               "message": f"context_length {levers.context_length} does not fit "
-                                         "the chosen GPU's measured memory"}
+                                         "the chosen GPU's measured memory (choose a GPU)"}
         return levers, None
 
     def _lane_b_landing_estimate(self, guard_seconds: int) -> dict | None:

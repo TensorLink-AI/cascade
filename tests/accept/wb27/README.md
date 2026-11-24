@@ -11,8 +11,8 @@ signed record and the typed refusals stay. Lane A is byte-identical.
 |---|---|---|---|
 | `lr_scale` | `[lane_b] lr_scale_min` .. `lr_scale_max` (0.5 .. 2.0), ≤ 3 decimals | 1.0 | `lr_scale_out_of_range` |
 | `curriculum` | 1..3 stages `[[name, frac]]`, names `[a-z][a-z0-9_-]{0,23}`, ≤ 2 decimals, sum exactly 1 | one stage | `bad_curriculum` |
-| `context_length` | 4096..32768 powers of two; only 4096 trainable (locked `pyramid_model.py`) | 4096 | `context_length_out_of_range`, `context_length_unsupported`, `context_length_unfit` |
-| `ema` | `[lane_b] ema_sigma_rels` (0.03, 0.05, 0.10, 0.15, 0.20; overlay-settable, code bounds 0.01..0.30) | 0.10 | `ema_out_of_range`, `ema_unarmed` (non-default while rev6.20's `ema_no_cooldown_from_block` is unset) |
+| `context_length` | 4096..`[lane_b] max_context_length` (32768), powers of two; must fit the chosen GPU's measured memory (own-risk GPU: miner's risk) | 4096 | `context_length_out_of_range`, `context_length_unfit` |
+| `ema` | `[lane_b] sigma_rel_choices` (0.03, 0.05, 0.10, 0.15, 0.20; overlay-settable, code bounds 0.01..0.30) | 0.10 | `ema_out_of_range` |
 
 Unknown keys / not an object: `bad_levers`.
 
@@ -24,7 +24,13 @@ Unknown keys / not an object: `bad_levers`.
   merged pod index (stage-tagged children, `s<i>-` shard names); the pod
   reads stage *i* to its cumulative budget share and refuses an index whose
   stages differ from the contract.
-- EMA on a rev6.20 EMA leg → `power_ema_sigma_rels = (σ,)`,
+- context → the leg contract's `context_length`; `train_pyramid` builds the
+  model config at 4096 (the only 4096 lock is `CascadeMoEConfig.from_contract`'s
+  contract-field check, `pyramid_model.py:88-93`; the model has no length
+  bound, xPos per forward) and trains with `context // patch` patches per
+  window (`lane_b_context_patches`); tokens per step and the measured rate
+  scale with it; judges re-derive at the recorded context.
+- EMA on every lane B (rev6.20 EMA) leg → `power_ema_sigma_rels = (σ,)`,
   `power_ema_eval = 0`: only that EMA is computed, scored and merged; the
   entry's `scored_weights` is `ema<σ×100:03d>`; judges re-derive it.
 

@@ -13,15 +13,21 @@ its default = today's leg):
                      own corpus (seed :func:`curriculum_stage_seed`, generator
                      keyword ``curriculum_stage=<name>``), read in order.
                      Default: one stage (today).
-* ``context_length`` 4096 .. 32768, powers of two. Only 4096 is trainable on
-                     the locked architecture (``pyramid_model.py`` pins it),
-                     so any other value on the grid is refused
-                     :data:`CONTEXT_UNSUPPORTED` until the owner opens it.
+* ``context_length`` the leg's training window, 4096 .. ``[lane_b]
+                     max_context_length`` (32768), powers of two. The model
+                     has no length bound (xPos per forward pass; the only
+                     4096 lock is the contract-field check in
+                     ``CascadeMoEConfig.from_contract``, which the lane B leg
+                     builds at 4096): the batch window and the tokens per
+                     step change for that leg only; the checkpoint's
+                     ``moe.context_length`` stays 4096 and judging is
+                     unchanged. A context above 4096 must fit the chosen
+                     GPU's measured memory (:func:`context_fits`).
 * ``ema``            the scored power-EMA width from ``[lane_b]
-                     ema_sigma_rels`` (shipped 0.03 / 0.05 / 0.10 / 0.15 /
+                     sigma_rel_choices`` (shipped 0.03 / 0.05 / 0.10 / 0.15 /
                      0.20; default 0.10, rev6.20's); only that EMA is
-                     computed, scored and merged. A non-default width needs ``[lane_b]
-                     ema_no_cooldown_from_block`` typed (:data:`EMA_UNARMED`).
+                     computed, scored and merged (every lane B leg is a
+                     rev6.20 EMA / no-cooldown leg).
 
 No activation block (owner 2026-11-24: lane B is not rolled out, the levers
 are its default behaviour); the bounds, the signed record and the refusals
@@ -42,14 +48,13 @@ from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 
 __all__ = [
+    "leg_context_contract",
     "BAD_CURRICULUM",
     "BAD_LEVERS",
     "CONTEXT_OUT_OF_RANGE",
     "CONTEXT_UNFIT",
-    "CONTEXT_UNSUPPORTED",
     "DEFAULT_CONTEXT",
     "EMA_OUT_OF_RANGE",
-    "EMA_UNARMED",
     "EMA_WIDTHS",
     "LEVERS_HEADER",
     "LEVER_CODES",
@@ -79,22 +84,18 @@ LR_OUT_OF_RANGE = "lr_scale_out_of_range"
 BAD_CURRICULUM = "bad_curriculum"
 CONTEXT_OUT_OF_RANGE = "context_length_out_of_range"
 CONTEXT_UNFIT = "context_length_unfit"
-CONTEXT_UNSUPPORTED = "context_length_unsupported"
 EMA_OUT_OF_RANGE = "ema_out_of_range"
-EMA_UNARMED = "ema_unarmed"
 LEVER_CODES = (BAD_LEVERS, LR_OUT_OF_RANGE, BAD_CURRICULUM,
-               CONTEXT_OUT_OF_RANGE, CONTEXT_UNFIT, CONTEXT_UNSUPPORTED,
-               EMA_OUT_OF_RANGE, EMA_UNARMED)
+               CONTEXT_OUT_OF_RANGE, CONTEXT_UNFIT,
+               EMA_OUT_OF_RANGE)
 
 MAX_STAGES = 3
 DEFAULT_CONTEXT = 4096
 MAX_CONTEXT = 32768
-# the contexts the locked architecture trains (pyramid_model.from_contract)
-TRAINABLE_CONTEXTS = (DEFAULT_CONTEXT,)
 # memory-fit rule of a context > 4096 (rev6.21 (3); used once it is opened)
 MEMORY_HEADROOM = 0.90
 # the image's POWER_EMA_SIGMA_RELS (pyramid_trainer.py); index = power_ema_eval
-EMA_WIDTHS = (0.03, 0.05, 0.10, 0.15, 0.20)   # the shipped [lane_b] ema_sigma_rels
+EMA_WIDTHS = (0.03, 0.05, 0.10, 0.15, 0.20)   # the shipped [lane_b] sigma_rel_choices
 DEFAULT_EMA = 0.10
 _KEYS = ("lr_scale", "curriculum", "context_length", "ema")
 _STAGE_NAME = re.compile(r"[a-z][a-z0-9_-]{0,23}")
@@ -196,27 +197,21 @@ def _curriculum(v) -> tuple[tuple[str, int], ...]:
     return () if len(stages) == 1 else tuple(stages)
 
 
-def _context(v) -> int:
+def _context(v, lb_cfg=None) -> int:
+    ceiling = min(MAX_CONTEXT, int(getattr(lb_cfg, "max_context_length", MAX_CONTEXT)
+                                   or MAX_CONTEXT))
     if isinstance(v, bool) or not isinstance(v, int) or not (
-            DEFAULT_CONTEXT <= v <= MAX_CONTEXT) or v & (v - 1):
+            DEFAULT_CONTEXT <= v <= ceiling) or v & (v - 1):
         raise LeversError(CONTEXT_OUT_OF_RANGE, f"context_length must be a power of two in "
-                                                f"[{DEFAULT_CONTEXT}, {MAX_CONTEXT}]; got {v!r}")
-    if v not in TRAINABLE_CONTEXTS:
-        raise LeversError(CONTEXT_UNSUPPORTED, f"context_length {v} is not trainable on the "
-                                               "locked architecture (context 4096 only; plan "
-                                               "rev6.21 (3), an owner decision)")
+                                                f"[{DEFAULT_CONTEXT}, {ceiling}]; got {v!r}")
     return int(v)
 
 
 def _ema(v, lb_cfg) -> float:
-    widths = tuple(float(x) for x in getattr(lb_cfg, "ema_sigma_rels", EMA_WIDTHS))
+    widths = tuple(float(x) for x in getattr(lb_cfg, "sigma_rel_choices", EMA_WIDTHS))
     if isinstance(v, bool) or not isinstance(v, (int, float)) or float(v) not in widths:
         raise LeversError(EMA_OUT_OF_RANGE, f"ema must be one of {widths}; got {v!r}")
-    f = float(v)
-    if f != DEFAULT_EMA and not int(getattr(lb_cfg, "ema_no_cooldown_from_block", 0) or 0):
-        raise LeversError(EMA_UNARMED, f"ema {f:g} needs [lane_b] ema_no_cooldown_from_block "
-                                       "(lane B EMA, no cooldown) typed")
-    return f
+    return float(v)
 
 
 def levers_from_dict(d, lb_cfg) -> LegLevers:
@@ -230,7 +225,7 @@ def levers_from_dict(d, lb_cfg) -> LegLevers:
     return LegLevers(
         lr_scale=_lr_scale(d["lr_scale"], lb_cfg) if "lr_scale" in d else 1.0,
         curriculum=_curriculum(d["curriculum"]) if "curriculum" in d else (),
-        context_length=_context(d["context_length"]) if "context_length" in d
+        context_length=_context(d["context_length"], lb_cfg) if "context_length" in d
         else DEFAULT_CONTEXT,
         ema=_ema(d["ema"], lb_cfg) if "ema" in d else DEFAULT_EMA)
 
@@ -264,14 +259,8 @@ def effective_levers(lb_cfg, levers: LegLevers | None, block: int | None) -> Leg
 
 
 def lane_b_scored_weights_for(lb_cfg, block: int | None, levers: LegLevers | None) -> str:
-    """``scored_weights`` a leg dispatched at ``block`` must carry: ``""``
-    before ``ema_no_cooldown_from_block``; else the label of the effective
-    ``ema`` width (``"ema010"`` by default, rev6.20's)."""
-    from .config.lane_b import lane_b_scored_weights
-
-    base = lane_b_scored_weights(lb_cfg, block)
-    if not base:
-        return ""
+    """``scored_weights`` a lane B leg must carry: the label of its EMA width
+    (``"ema010"`` by default, rev6.20's; every lane B leg is an EMA leg)."""
     from .config.lane_b import lane_b_ema_label
 
     return lane_b_ema_label(effective_levers(lb_cfg, levers, block).ema)
@@ -310,6 +299,14 @@ def curriculum_points(token_budget: int, curriculum) -> list[int]:
     return [*out, b - sum(out)]
 
 
+def leg_context_contract(contract, levers: dict | None):
+    """``contract`` at the context a recorded lane B leg trained (its
+    ``levers["context_length"]``, default 4096): what the token limit and the
+    tokens-per-step of a leg are re-derived against."""
+    c = int((levers or {}).get("context_length", DEFAULT_CONTEXT) or DEFAULT_CONTEXT)
+    return contract if c == int(contract.context_length) else replace(contract, context_length=c)
+
+
 def context_fits(rate, context_length: int) -> bool:
     """The memory-fit rule of a context (rev6.21 (3)): the WB19 measured peak
     at 4096 scaled linearly must stay under ``MEMORY_HEADROOM`` of the type's
@@ -338,13 +335,13 @@ def apply_levers(contract, levers: LegLevers):
     if levers.curriculum:
         kw["curriculum"] = tuple((str(n), int(h)) for n, h in levers.curriculum)
     if str(getattr(contract, "lr_schedule", "")) == LANE_B_EMA_SCHEDULE:
-        # the EMA choice applies only to a rev6.20 EMA leg; before
-        # ema_no_cooldown_from_block the leg scores the raw endpoint ("")
-        # and judges expect exactly that (lane_b_scored_weights_for)
+        # every lane B leg is a rev6.20 EMA leg: ONE chosen width (default 0.10)
         kw["power_ema_sigma_rels"] = (float(levers.ema),)
         kw["power_ema_eval"] = 0
     if levers.context_length != DEFAULT_CONTEXT:
-        raise ValueError(f"context_length {levers.context_length} is not trainable")
+        # the leg's training window (batch math + tokens per step change for
+        # this leg only; the model config stays at 4096, see pyramid_trainer)
+        kw["context_length"] = int(levers.context_length)
     if kw.get("curriculum") and str(getattr(contract, "corpus_mode", "")) != "shards":
         raise ValueError("a curriculum needs a corpus_mode='shards' leg contract")
     return replace(contract, **kw) if kw else contract
@@ -372,7 +369,7 @@ def leg_length_contract(cfg, base, spec: dict | None):
 
 
 def apply_spec_levers(lb_cfg, contract, spec: dict | None, block: int):
-    """Step 3 (after rev6.20's ``lane_b_leg_schedule``): the levers of
+    """Step 3 (after rev6.20's ``lane_b_leg_contract``): the levers of
     ``spec`` effective at ``block`` folded into the contract."""
     raw = dict((spec or {}).get("levers") or {})
     levers = levers_from_dict(raw, lb_cfg) if raw else None
@@ -382,12 +379,11 @@ def apply_spec_levers(lb_cfg, contract, spec: dict | None, block: int):
 def lane_b_leg_contract(cfg, base, *, block: int, spec: dict | None = None):
     """The lane B leg contract both the trainer (the receipt digest it
     expects) and the worker (what it trains) derive, in this order: the WB23
-    length (:func:`leg_length_contract`), rev6.20's
-    ``lane_b_leg_schedule`` at ``block``, the WB27 levers effective at
-    ``block`` (:func:`apply_spec_levers`). The trainer and the worker make
-    the same three calls."""
-    from .config.lane_b import lane_b_leg_schedule
+    length (:func:`leg_length_contract`), rev6.20's ``lane_b_leg_contract``
+    (EMA, no cooldown), the WB27 levers (:func:`apply_spec_levers`). The
+    trainer and the worker make the same three calls."""
+    from .config.lane_b import lane_b_leg_contract as ema_leg
 
     contract = leg_length_contract(cfg, base, spec)
-    contract = lane_b_leg_schedule(cfg.lane_b, contract, int(block))
+    contract = ema_leg(contract)
     return apply_spec_levers(cfg.lane_b, contract, spec, int(block))

@@ -34,7 +34,7 @@ def test_levers_admitted_and_recorded(tmp_path):
 @pytest.mark.parametrize("lv,code", [
     ({"lr_scale": 2.5}, "lr_scale_out_of_range"),
     ({"curriculum": [["a", 0.5]]}, "bad_curriculum"),
-    ({"context_length": 8192}, "context_length_unsupported"),
+    ({"context_length": 16384}, "context_length_unfit"),      # 40 GB x 4 > 0.9 x 80 GB
     ({"context_length": 3000}, "context_length_out_of_range"),
     ({"ema": 0.25}, "ema_out_of_range"),
     ({"bogus": 1}, "bad_levers"),
@@ -47,11 +47,23 @@ def test_out_of_range_levers_refused_nothing_charged(tmp_path, lv, code):
     h.nothing_charged(it, q)
 
 
-def test_ema_choice_without_the_ema_schedule_refused(tmp_path):
-    it, q = h.intake(tmp_path, h.chain_cfg())
-    status, body = it.lane_b_fund(h.fund_headers(**{h.LEVERS_HEADER: '{"ema":0.05}'}))
-    assert status == 400 and body["code"] == "ema_unarmed", body
+def test_longer_context_admitted_and_its_steps_scale(tmp_path):
+    cfg = h.chain_cfg()
+    c = h.base_contract(cfg)
+    it, q = h.intake(tmp_path, cfg)
+    # 8192: 40 GB x 2 = 80 GB > 0.9 x 80 GB -> unfit on the fake row
+    status, body = it.lane_b_fund(h.fund_headers(**{h.LEVERS_HEADER: '{"context_length":8192}'}))
+    assert status == 400 and body["code"] == "context_length_unfit", body
     h.nothing_charged(it, q)
+    # an own-risk GPU runs it at the miner's risk; the token limit's steps use
+    # tokens per step at that context
+    status, body = it.lane_b_fund(h.fund_headers(**{
+        h.LEVERS_HEADER: '{"context_length":8192}', h.TOKENS_HEADER: "20e9",
+        "X-Gpu-Type": h.UNMEASURED_SKU}))
+    assert status == 202, body
+    tps = c.batch_size * 8192
+    assert body["steps"] == min(20 * 10**9 // tps, h.want_reference_steps(c, 12.0))
+    assert q.get(h.HK).levers == {"context_length": 8192}
 
 
 def test_twelve_hours_admitted(tmp_path):

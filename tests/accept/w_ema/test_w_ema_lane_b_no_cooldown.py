@@ -91,6 +91,6 @@ def test_scored_ema_width_is_the_owners_sigma_0_10():
 
 def test_worker_expert_role_applies_the_shared_leg_contract_rule():
     """worker.py turns the expert leg's for_hours contract into the lane B
-    leg contract with the one shared helper, keyed on the leg's --block."""
+    leg contract with the one shared helper (every lane B leg)."""
     src = (REPO / "cascade" / "trainer" / "worker.py").read_text(encoding="utf-8")
-    assert "lane_b_leg_schedule(cfg.lane_b, contract, int(args.block))" in src
+    assert "contract = lane_b_leg_contract(contract)" in src

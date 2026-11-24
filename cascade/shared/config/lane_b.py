@@ -47,30 +47,33 @@ LANE_B_TRACK_DEFAULTS: dict[str, object] = {
     "max_leg_hours": 12.0,
     "max_leg_seconds": 54_000,         # 12 h x 1.25
     "guard_factor": 1.25,
-    "ema_no_cooldown_from_block": 0,   # 0 = never (rev6.20; loader: era boundary)
     # plan rev6.21 (WB27): the bounds of the miner-chosen lr_scale lever
     "lr_scale_min": 0.5,
     "lr_scale_max": 2.0,
     # owner 2026-11-24: the miner's EMA choice set (code bounds 0.01-0.30)
-    "ema_sigma_rels": (0.03, 0.05, 0.10, 0.15, 0.20),
+    "sigma_rel_choices": (0.03, 0.05, 0.10, 0.15, 0.20),
+    # owner 2026-11-24: the ceiling of the context_length lever ([training]
+    # has no max_context_length; the deployed file's 32768 is [lane_d]'s)
+    "max_context_length": 32768,
 }
 
 # Lane B EMA, no cooldown (plan rev6.20, owner 2026-11-24: "let's just do EMA,
-# no cooldown"). From ``[lane_b] ema_no_cooldown_from_block`` (0 = never) a
-# lane B leg's contract carries this ``lr_schedule`` (warmup as WSD, then
-# constant LR to the last step, no decay tail) and its scored + merged
-# ``weights.safetensors`` is the image's sigma_rel 0.10 power EMA (the owner's
-# standing scored width, ``pyramid_trainer.POWER_EMA_SIGMA_RELS[POWER_EMA_EVAL]``).
-# The expert manifest entry records ``scored_weights``; judges re-derive it
-# from the entry's ``train_block``. Lane A never takes this schedule.
+# no cooldown"; no activation block, owner 2026-11-24: lanes B/C/D are not
+# rolled out yet, so this IS lane B). Every lane B leg's contract carries this
+# ``lr_schedule`` (warmup as WSD, then constant LR to the last step, no decay
+# tail) and its scored + merged ``weights.safetensors`` is the image's
+# sigma_rel 0.10 power EMA (the owner's standing scored width,
+# ``pyramid_trainer.POWER_EMA_SIGMA_RELS[POWER_EMA_EVAL]``). Every expert
+# manifest entry records ``scored_weights = "ema010"`` and judges refuse any
+# other value. Lane A never takes this schedule.
 LANE_B_EMA_SCHEDULE = "warmup_constant_ema"
 LANE_B_EMA_SIGMA_REL = 0.10
 LANE_B_SCORED_EMA = "ema010"
-# "" = the raw cooled endpoint (W-EMA; dropped from the manifest body)
 # plan rev6.21 (WB27, owner 2026-11-24): the miner chooses the scored width
-# from ``[lane_b] ema_sigma_rels`` (overlay-settable, code bounds below); only
+# from ``[lane_b] sigma_rel_choices`` (overlay-settable, code bounds below); only
 # that EMA is computed, scored and merged. Its label is ``ema<width x 100,
-# 3 digits>`` ("ema003", "ema005", "ema010", "ema015", "ema020").
+# 3 digits>`` ("ema003", "ema005", "ema010", "ema015", "ema020"); the default
+# choice is rev6.20's LANE_B_SCORED_EMA.
 LANE_B_EMA_SIGMA_BOUNDS = (0.01, 0.30)
 LANE_B_EMA_SIGMA_RELS = (0.03, 0.05, 0.10, 0.15, 0.20)
 LANE_B_SCORED_EMA005 = "ema005"
@@ -82,7 +85,8 @@ def lane_b_ema_label(sigma_rel: float) -> str:
 
 
 def lane_b_scored_label_ok(label) -> bool:
-    """``""`` (the raw endpoint) or the label of a width in the code bounds."""
+    """``""`` (a manifest without the field: parseable, refused by the judge)
+    or the label of a width in the code bounds."""
     if label == "":
         return True
     if not isinstance(label, str) or len(label) != 6 or not label.startswith("ema") \
@@ -92,29 +96,21 @@ def lane_b_scored_label_ok(label) -> bool:
     return lo <= int(label[3:]) / 100 <= hi + 1e-12
 
 
-LANE_B_SCORED_WEIGHTS = ("", LANE_B_SCORED_EMA, LANE_B_SCORED_EMA005)   # examples
+# examples of what an entry may carry ("" = the raw cooled endpoint: parseable,
+# refused by the judge); see lane_b_scored_label_ok for the rule
+LANE_B_SCORED_WEIGHTS = ("", LANE_B_SCORED_EMA, LANE_B_SCORED_EMA005)
 
 
-def lane_b_scored_weights(lane_b_cfg, block: int | None) -> str:
-    """The ``scored_weights`` a lane B leg dispatched at ``block`` must carry:
-    ``"ema010"`` from ``ema_no_cooldown_from_block`` (> 0), else ``""``."""
-    n = int(getattr(lane_b_cfg, "ema_no_cooldown_from_block", 0) or 0)
-    return LANE_B_SCORED_EMA if n > 0 and block is not None and int(block) >= n else ""
-
-
-def lane_b_leg_schedule(lane_b_cfg, contract, block: int | None):
-    """The lane B leg contract at dispatch ``block``: ``contract`` unchanged
-    before the key (or while unset), else the same contract with
-    ``lr_schedule = LANE_B_EMA_SCHEDULE``. The ONE rule the trainer (expected
-    receipt digest) and the worker (the contract it trains) both apply."""
-    if not lane_b_scored_weights(lane_b_cfg, block):
-        return contract
+def lane_b_leg_contract(contract):
+    """The lane B leg contract: ``contract`` (the era's contract at the leg's
+    hours, ``for_hours``) with ``lr_schedule = LANE_B_EMA_SCHEDULE``. The ONE
+    rule the trainer (expected receipt digest) and the worker (the contract
+    it trains) both apply. Only the cascade_pyramid trainer implements it."""
     from dataclasses import replace
 
     if str(getattr(contract, "base_arch", "") or "") != "cascade_pyramid":
-        raise ValueError("[lane_b] ema_no_cooldown_from_block: the lane B EMA schedule "
-                         "needs a cascade_pyramid leg contract; got "
-                         f"{getattr(contract, 'base_arch', '')!r}")
+        raise ValueError("lane B legs (EMA, no cooldown) need a cascade_pyramid contract; "
+                         f"got {getattr(contract, 'base_arch', '')!r}")
     return replace(contract, lr_schedule=LANE_B_EMA_SCHEDULE)
 
 
@@ -181,16 +177,16 @@ def _ema_set(v: object) -> tuple[float, ...]:
     with at most 2 decimals, containing 0.10 (the default choice)."""
     lo, hi = LANE_B_EMA_SIGMA_BOUNDS
     if not isinstance(v, (list, tuple)) or not v:
-        raise ValueError(f"[lane_b] ema_sigma_rels must be a non-empty list; got {v!r}")
+        raise ValueError(f"[lane_b] sigma_rel_choices must be a non-empty list; got {v!r}")
     out = []
     for x in v:
-        f = _float("ema_sigma_rels", x)
+        f = _float("sigma_rel_choices", x)
         if not lo <= f <= hi or round(f * 100) != f * 100:
-            raise ValueError(f"[lane_b] ema_sigma_rels entries must be in [{lo}, {hi}] with "
+            raise ValueError(f"[lane_b] sigma_rel_choices entries must be in [{lo}, {hi}] with "
                              f"at most 2 decimals; got {x!r}")
         out.append(f)
     if len(set(out)) != len(out) or LANE_B_EMA_SIGMA_REL not in out:
-        raise ValueError(f"[lane_b] ema_sigma_rels must be unique and contain "
+        raise ValueError(f"[lane_b] sigma_rel_choices must be unique and contain "
                          f"{LANE_B_EMA_SIGMA_REL}; got {v!r}")
     return tuple(out)
 
@@ -250,12 +246,12 @@ def parse_lane_b_track(lb: dict, *,
         "max_leg_seconds": _int("max_leg_seconds",
                                 lb.get("max_leg_seconds", d["max_leg_seconds"]), lo=1),
         "guard_factor": _float("guard_factor", lb.get("guard_factor", d["guard_factor"])),
-        "ema_no_cooldown_from_block": _int(
-            "ema_no_cooldown_from_block",
-            lb.get("ema_no_cooldown_from_block", d["ema_no_cooldown_from_block"]), lo=0),
         "lr_scale_min": _float("lr_scale_min", lb.get("lr_scale_min", d["lr_scale_min"])),
         "lr_scale_max": _float("lr_scale_max", lb.get("lr_scale_max", d["lr_scale_max"])),
-        "ema_sigma_rels": _ema_set(lb.get("ema_sigma_rels", d["ema_sigma_rels"])),
+        "sigma_rel_choices": _ema_set(lb.get("sigma_rel_choices", d["sigma_rel_choices"])),
+        "max_context_length": _int("max_context_length",
+                                   lb.get("max_context_length", d["max_context_length"]),
+                                   lo=4096),
     }
     if out["suite_targets"] and not out["contamination_hashset"]:
         raise ValueError("[lane_b] suite_targets = true needs contamination_hashset pinned "
@@ -278,6 +274,10 @@ def parse_lane_b_track(lb: dict, *,
     if mlh < _LEG_HOURS_STEP or steps != math.floor(steps):
         raise ValueError(f"[lane_b] max_leg_hours must be >= {_LEG_HOURS_STEP} on the "
                          f"{_LEG_HOURS_STEP} h grid; got {mlh}")
+    mcl = out["max_context_length"]
+    if mcl > 32768 or mcl & (mcl - 1):
+        raise ValueError(f"[lane_b] max_context_length must be a power of two in "
+                         f"[4096, 32768]; got {mcl}")
     lr_lo, lr_hi = out["lr_scale_min"], out["lr_scale_max"]
     if not 0.0 < lr_lo <= 1.0 <= lr_hi <= 4.0:
         raise ValueError(f"[lane_b] lr_scale_min/lr_scale_max must satisfy "

@@ -40,6 +40,18 @@ def test_lever_terms_are_lane_b_only():
             f(c, sel, nc, sig, 1)
 
 
+def test_context_window_is_lane_b_only():
+    f = h.trainer_namespace()["lane_b_context_patches"]
+    assert f(4096, None, 32) == 128 and f(4096, SEL, 32) == 128
+    assert f(16384, SEL, 32) == 512 and f(32768, SEL, 32) == 1024
+    for c, sel in ((8192, None), (5000, SEL), (65536, SEL)):
+        with pytest.raises(ValueError):
+            f(c, sel, 32)
+    src = h.trainer_path().read_text(encoding="utf-8")
+    assert "max_ctx_patches=ctx_patches" in src and "max_ctx_patches=128" not in src
+    assert "replace(contract, context_length=4096)" in src     # model config stays 4096
+
+
 def test_leg_record_names_the_limit_that_stopped_it():
     f = h.trainer_namespace()["lane_b_leg_record"]
     assert f(10, 10, 99, 5.0, 100) == {"steps": 10, "tokens": 99, "stop": "steps"}
@@ -142,12 +154,13 @@ def test_cli_levers_and_limits(tmp_path):
     assert json.loads(got) == {"lr_scale": 1.5, "curriculum": [["easy", "0.3"], ["hard", "0.7"]],
                                "ema": 0.05}
     assert lane_b_levers_json(cfg) == ""
+    assert json.loads(lane_b_levers_json(cfg, context_length=8192)) == {"context_length": 8192}
     with pytest.raises(LeversError) as e:
-        lane_b_levers_json(cfg, context_length=8192)
-    assert e.value.code == "context_length_unsupported"
+        lane_b_levers_json(cfg, context_length=65536)
+    assert e.value.code == "context_length_out_of_range"
     with pytest.raises(LeversError) as e:
-        lane_b_levers_json(h.chain_cfg(), ema=0.05)
-    assert e.value.code == "ema_unarmed"
+        lane_b_levers_json(cfg, ema=0.25)
+    assert e.value.code == "ema_out_of_range"
     (tmp_path / "generator.py").write_text(
         "class Generator:\n    def __init__(self, d, *, seed, curriculum_stage=''):\n        pass\n")
     assert generator_declares_curriculum_stage(tmp_path)

@@ -47,8 +47,8 @@ def test_levers_are_the_default_lane_b_behaviour():
     assert not hasattr(lb, "miner_levers_from_block")
     assert lv.parse_levers('{"lr_scale": 1.5}', lb).lr_scale == 1.5
     assert lv.parse_levers('{"curriculum": [["a", 0.5], ["b", 0.5]]}', lb).curriculum
-    # the EMA choice still needs rev6.20's EMA schedule
-    assert _code('{"ema": 0.05}', lb) == "ema_unarmed"
+    # every lane B leg is an EMA leg (#845): the EMA choice needs no key
+    assert lv.parse_levers('{"ema": 0.05}', lb).ema == 0.05
     # every lever at its default stays accepted (a no-op header)
     assert lv.parse_levers('{"lr_scale": 1.0, "context_length": 4096}', lb).is_default
 
@@ -82,7 +82,9 @@ def test_context_length_wire_format_and_refusals():
     lv, lb = h.levers(), _armed_lb()
     assert lv.parse_levers('{"context_length": 4096}', lb).context_length == 4096
     for c in (8192, 16384, 32768):
-        assert _code(json.dumps({"context_length": c})) == "context_length_unsupported", c
+        assert lv.parse_levers(json.dumps({"context_length": c}), lb).context_length == c
+    capped = replace(lb, max_context_length=8192)       # the [lane_b] ceiling
+    assert _code('{"context_length": 16384}', capped) == "context_length_out_of_range"
     for c in (2048, 5000, 65536, "8192", True):
         assert _code(json.dumps({"context_length": c})) == "context_length_out_of_range", c
 
@@ -102,16 +104,14 @@ def test_context_memory_fit_rule():
 def test_ema_choice():
     lv = h.levers()
     lb = _armed_lb()
-    assert lb.ema_sigma_rels == (0.03, 0.05, 0.10, 0.15, 0.20)
-    for w in lb.ema_sigma_rels:
+    assert lb.sigma_rel_choices == (0.03, 0.05, 0.10, 0.15, 0.20)
+    for w in lb.sigma_rel_choices:
         assert lv.parse_levers(json.dumps({"ema": w}), lb).ema == w
     assert lv.parse_levers('{"ema": 0.1}', lb).is_default
-    narrow = replace(lb, ema_sigma_rels=(0.05, 0.10))
+    narrow = replace(lb, sigma_rel_choices=(0.05, 0.10))
     assert _code('{"ema": 0.2}', narrow) == "ema_out_of_range"   # overlay-settable set
     for bad in (0.25, 0.5, 0, "0.05", None):
         assert _code(json.dumps({"ema": bad})) == "ema_out_of_range", bad
-    no_ema = replace(lb, ema_no_cooldown_from_block=0)
-    assert _code('{"ema": 0.05}', no_ema) == "ema_unarmed"
 
 
 def test_malformed_headers():
@@ -159,4 +159,4 @@ def test_entry_levers_check():
         "bad_levers"                                       # not the canonical form
     assert lv.lane_b_scored_weights_for(cfg.lane_b, b, lv.LegLevers(ema=0.05)) == "ema005"
     assert lv.lane_b_scored_weights_for(cfg.lane_b, b, None) == "ema010"
-    assert lv.lane_b_scored_weights_for(cfg.lane_b, b - 1, lv.LegLevers(ema=0.05)) == ""
+    assert lv.lane_b_scored_weights_for(cfg.lane_b, 0, lv.LegLevers(ema=0.05)) == "ema005"

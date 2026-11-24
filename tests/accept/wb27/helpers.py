@@ -16,7 +16,6 @@ import math
 import sys
 import time
 from contextlib import contextmanager
-from dataclasses import replace
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
@@ -33,8 +32,7 @@ UNMEASURED_SKU = "4xL40S"
 HK = "5FakeHotkeyAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 REF = "org/gen@sha256:" + "a" * 64
 CODES = ("bad_levers", "lr_scale_out_of_range", "bad_curriculum",
-         "context_length_out_of_range", "context_length_unfit", "context_length_unsupported",
-         "ema_out_of_range", "ema_unarmed")
+         "context_length_out_of_range", "context_length_unfit", "ema_out_of_range")
 
 
 class _TorchBlocker(importlib.abc.MetaPathFinder):
@@ -81,13 +79,12 @@ def effective_block(cfg=None) -> int:
 
 
 def armed_cfg(*, ema: bool = True, block: int | None = None):
-    """The shipped config with rev6.20's ``ema_no_cooldown_from_block`` typed
-    at an era boundary (the EMA choice needs the EMA schedule); the WB27
-    levers themselves have no activation block (owner 2026-11-24)."""
+    """The shipped config and an era boundary after [v2] from_block: no
+    activation block anywhere in lane B (owner 2026-11-24), so the levers and
+    rev6.20's EMA / no-cooldown rule are the shipped behaviour."""
+    del ema
     cfg = chain_cfg()
-    b = block or effective_block(cfg)
-    lb = replace(cfg.lane_b, ema_no_cooldown_from_block=b if ema else 0)
-    return replace(cfg, lane_b=lb), b
+    return cfg, block or effective_block(cfg)
 
 
 def base_contract(cfg=None):

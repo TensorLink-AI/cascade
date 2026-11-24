@@ -81,13 +81,11 @@ def add_lane_b(sub: argparse._SubParsersAction) -> None:
                         "at most 2 decimals). Your Generator.__init__ must take the "
                         "curriculum_stage keyword (check: verify-repo --curriculum).")
     f.add_argument("--context-length", type=int, default=None, metavar="N",
-                   help="Training context (4096..32768, powers of two). Only 4096 is "
-                        "trainable today; others are refused context_length_unsupported.")
+                   help="Training context of the leg (4096..[lane_b] max_context_length = "
+                        "32768, powers of two); must fit the chosen GPU's measured memory.")
     f.add_argument("--ema", type=float, default=None, metavar="SIGMA",
-                   help="Scored power-EMA width from [lane_b] ema_sigma_rels (shipped 0.03, "
-                        "0.05, 0.10, 0.15, 0.20; default 0.10); only that EMA is computed. "
-                        "A non-default width needs [lane_b] "
-                        "ema_no_cooldown_from_block.")
+                   help="Scored power-EMA width from [lane_b] sigma_rel_choices (shipped 0.03, "
+                        "0.05, 0.10, 0.15, 0.20; default 0.10); only that EMA is computed.")
     from ..funding.providers import add_provider_args
 
     add_provider_args(f)

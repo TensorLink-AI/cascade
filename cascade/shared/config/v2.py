@@ -738,11 +738,6 @@ class LaneBConfig:
     max_leg_hours: float = 12.0       # owner 2026-11-24 (rev6.21)
     max_leg_seconds: int = 54_000     # 12 h x 1.25
     guard_factor: float = 1.25
-    # CONSENSUS (plan rev6.20, owner 2026-11-24): typed era-start block (0 =
-    # never) from which a lane B leg trains with no LR cooldown and is scored
-    # (and merged) on its sigma_rel 0.10 power EMA; the expert entry records
-    # ``scored_weights`` and judges re-derive it from its ``train_block``.
-    ema_no_cooldown_from_block: int = 0
     # CONSENSUS (plan rev6.21, WB27, owner 2026-11-24): the bounds of the
     # miner's lr_scale lever. The levers are the default lane B behaviour (no
     # activation block: lane B is not rolled out); the expert entry records
@@ -751,19 +746,16 @@ class LaneBConfig:
     lr_scale_max: float = 2.0
     # owner 2026-11-24: the lane B EMA choice set (overlay-settable; code
     # bounds 0.01-0.30; contains the default 0.10)
-    ema_sigma_rels: tuple = (0.03, 0.05, 0.10, 0.15, 0.20)
+    sigma_rel_choices: tuple = (0.03, 0.05, 0.10, 0.15, 0.20)
+    # owner 2026-11-24: ceiling of the context_length lever (power of two,
+    # 4096..32768)
+    max_context_length: int = 32768
 
     def leg_caps_at(self, block: int | None) -> tuple[float, int]:
         """``(max_leg_hours, max_leg_seconds)`` binding a leg at ``block``."""
         from .lane_b import lane_b_leg_caps
 
         return lane_b_leg_caps(self, block)
-
-    def scored_weights_at(self, block: int | None) -> str:
-        """``scored_weights`` a lane B leg dispatched at ``block`` carries."""
-        from .lane_b import lane_b_scored_weights
-
-        return lane_b_scored_weights(self, block)
 
     def active(self, block: int | None) -> bool:
         return self.from_block > 0 and block is not None and int(block) >= self.from_block

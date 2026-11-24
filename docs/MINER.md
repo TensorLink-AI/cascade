@@ -1493,10 +1493,18 @@ only a release can change. Read the effective values with
 | `max_leg_hours` | `12.0` | The most training hours a lane B leg may ask for, in 0.5 h steps (owner 2026-11-24: was 6). |
 | `max_leg_seconds` | `54000` | Hard wall-clock cap on a lane B leg (12 h × 1.25). |
 | `guard_factor` | `1.25` | Leg guard: train hours × this factor plus overhead, capped at `max_leg_seconds`. |
-| `ema_no_cooldown_from_block` | `0` | From this era-boundary block (0 = never), a lane B leg trains with no LR cooldown (warmup, then constant LR to the end), and its scored and merged weights are its σ_rel 0.10 power EMA. The expert manifest records this as `scored_weights = "ema010"`. Lane A is unaffected. |
 | `lr_scale_min` | `0.5` | Lower bound of the `lr_scale` leg lever. |
 | `lr_scale_max` | `2.0` | Upper bound of the `lr_scale` leg lever. |
-| `ema_sigma_rels` | `[0.03, 0.05, 0.10, 0.15, 0.20]` | The power-EMA widths a miner may choose with the `ema` lever (each in 0.01 … 0.30, must contain 0.10). |
+| `sigma_rel_choices` | `[0.03, 0.05, 0.10, 0.15, 0.20]` | The power-EMA widths a miner may choose with the `ema` lever (each in 0.01 … 0.30, must contain 0.10). |
+| `max_context_length` | `32768` | Ceiling of the `context_length` lever (a power of two, 4096 … 32768). |
+
+Every lane B leg trains with no learning-rate cooldown: the learning rate
+warms up, then stays at its peak to the last step. Its scored and merged
+weights are its own power EMA (σ_rel 0.10 unless you choose another width
+with the `ema` lever), not the raw endpoint. The expert manifest records
+this on every entry as `scored_weights` (`"ema010"` by default), and
+validators refuse an entry without it. No key turns this on or off. Lane A
+is unaffected.
 
 ### Lane B leg levers and limits
 
@@ -1530,8 +1538,8 @@ and the sandbox still apply.
 |---|---|---|---|
 | `--lr-scale X` | `lr_scale` | `lr_scale_min` … `lr_scale_max` (0.5 … 2.0), at most 3 decimals | 1.0 |
 | `--curriculum easy:0.3,hard:0.7` | `curriculum` | 1 to 3 ordered stages, names `[a-z][a-z0-9_-]{0,23}`, fractions with at most 2 decimals summing to exactly 1 | one stage |
-| `--context-length N` | `context_length` | 4096 … 32768, powers of two | 4096 |
-| `--ema 0.15` | `ema` | one of `ema_sigma_rels` (0.03, 0.05, 0.10, 0.15, 0.20) | 0.10 |
+| `--context-length N` | `context_length` | 4096 … `max_context_length` (32768), powers of two | 4096 |
+| `--ema 0.15` | `ema` | one of `sigma_rel_choices` (0.03, 0.05, 0.10, 0.15, 0.20) | 0.10 |
 
 - `lr_scale` multiplies the leg's base LR (every optimizer group).
 - A curriculum trains stage by stage: each stage is its own corpus,
@@ -1540,14 +1548,15 @@ and the sandbox still apply.
   so on. Your `Generator.__init__` must declare the `curriculum_stage`
   keyword (check with `cascade lane-b verify-repo <dir> --curriculum`);
   otherwise the leg fails as your fault (`generator_curriculum_unsupported`).
-- Only `context_length` 4096 is trainable today: the locked architecture
-  pins it, so any other value is refused `context_length_unsupported`
-  (an owner decision is pending).
+- `context_length` is the leg's training window. Each step then consumes
+  `context ÷ 4096` times the points, so on a measured GPU the steps of an
+  hours-only leg scale down by that factor and a token limit gives fewer
+  steps. The context must fit the chosen GPU's measured memory (WB19 peak ×
+  context ÷ 4096 ≤ 90 % of its memory), else `context_length_unfit`; on an
+  own-risk GPU it is your risk. Judging is unchanged (the scored model reads
+  4096-point histories).
 - `ema` picks the power-EMA width; only that EMA is computed, scored and
-  merged, and the record says which (`scored_weights`, e.g. `ema015`). It
-  applies from `ema_no_cooldown_from_block`; before that the raw endpoint is
-  scored, and a non-default width is refused (`ema_unarmed`) while that key
-  is unset.
+  merged, and the record says which (`scored_weights`, e.g. `ema015`).
 
 The judging guards are unchanged by any lever: other suites, undeclared pool
 domains, horizons, the whole-pool gain and the anchor king.
@@ -1557,11 +1566,9 @@ domains, horizons, the whole-pool gain and the anchor king.
 | `bad_levers` | The levers header is not a JSON object of known keys. |
 | `lr_scale_out_of_range` | `lr_scale` outside the bounds or with more than 3 decimals. |
 | `bad_curriculum` | Wrong stage count, names, fractions, or fractions not summing to 1. |
-| `context_length_out_of_range` | Not a power of two in 4096 … 32768. |
-| `context_length_unsupported` | A context the locked architecture cannot train. |
+| `context_length_out_of_range` | Not a power of two in 4096 … `max_context_length`. |
 | `context_length_unfit` | The context does not fit the chosen GPU's measured memory. |
-| `ema_out_of_range` | `ema` is not in `ema_sigma_rels`. |
-| `ema_unarmed` | A non-default `ema` while `ema_no_cooldown_from_block` is unset. |
+| `ema_out_of_range` | `ema` is not in `sigma_rel_choices`. |
 | `bad_train_tokens` | `--train-tokens` is not a whole number > 0. |
 | `train_tokens_out_of_range` | Fewer tokens than one step. |
 | `bad_train_hours` | Hours off the 0.5 h grid or above `max_leg_hours`. |

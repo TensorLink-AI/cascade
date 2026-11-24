@@ -272,8 +272,8 @@ def main(argv: list[str] | None = None) -> int:
         )
     elif expert_hours is not None:
         # WB27 (plan rev6.21): the trainer's lane B leg spec (WB23 length +
-        # the levers effective at the dispatch block) rides --recipe-json on
-        # the expert role; absent = today's leg (no spec)
+        # the levers) rides --recipe-json on the expert role; absent = today's
+        # leg (no spec)
         lane_b_spec = None
         if args.recipe_json:
             try:
@@ -296,12 +296,12 @@ def main(argv: list[str] | None = None) -> int:
                 guard_factor=cfg.round.heat_guard_factor,
                 guard_floor_seconds=cfg.round.heat_guard_floor_seconds,
             )
-        # plan rev6.20: from [lane_b] ema_no_cooldown_from_block the leg trains
-        # with no cooldown and scores its power EMA — the same rule the
-        # trainer applies to the contract whose digest it expects back
-        from ..shared.config.lane_b import lane_b_leg_schedule
+        # plan rev6.20: every lane B leg trains with no cooldown and scores its
+        # power EMA — the same rule the trainer applies to the contract whose
+        # digest it expects back
+        from ..shared.config.lane_b import lane_b_leg_contract
 
-        contract = lane_b_leg_schedule(cfg.lane_b, contract, int(args.block))
+        contract = lane_b_leg_contract(contract)
         if lane_b_spec:
             # WB27: the miner's levers, the same step the trainer applies
             from ..shared.lane_b_levers import apply_spec_levers
