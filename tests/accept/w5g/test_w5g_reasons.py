@@ -164,6 +164,7 @@ def case_before_eval_delay(tmp_path):
     judged, and stays pending."""
     x = _x()
     cfg = lane_d_cfg()
+    assert hasattr(cfg, "eval_delay_hours"), "rev6.14: [lane_d] eval_delay_hours is parsed"
     j = max(int(x["reveal_ts"]), int(house()["reveal_ts"])) + int(3600 * cfg.eval_delay_hours)
     r = One(tmp_path, [x], cfg=cfg, boundary_ts=j - 1)
     st = json.loads(r.path.read_text())["entries"][x["digest"]]
