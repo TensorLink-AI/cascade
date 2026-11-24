@@ -60,6 +60,7 @@ import numpy as np
 SCHEMA = "cascade-std-pool/1"
 SCHEMAS = (SCHEMA,)
 POOL_FILE = "pool.json"
+SNAPSHOT_FILE = "snapshot.json"     # the MarketCast snapshot body (cascade.pool.marketcast)
 BODY_FIELDS = frozenset({"schema", "pool_id", "series", "files", "signer"})
 OPTIONAL_FIELDS = frozenset({"clock", "source_meta"})
 SERIES_FIELDS = frozenset({"channels", "freq", "tags"})
@@ -291,10 +292,14 @@ MKT_DOMAIN = "market"
 
 
 def _mkt_banks(meta: dict) -> dict[str, tuple[int, int, int]]:
-    """bank dir → (t0, step_seconds, steps) of a MarketCast snapshot meta."""
-    from ..pool.marketcast import native_dir
+    """bank dir → (t0, step_seconds, steps) of a MarketCast snapshot meta.
+    (The bank names are the snapshot layout's — ``n<iv>`` for a native bank —
+    spelled here so this module never imports the pool / feed code.)"""
 
-    out = {"bars": (int(meta["t0"]), 60, int(meta["minutes"]))}
+    def native_dir(iv: str) -> str:
+        return f"n{iv}"
+
+    out ={"bars": (int(meta["t0"]), 60, int(meta["minutes"]))}
     c = meta.get("coarse")
     if c:
         out["coarse"] = (int(c["t0"]), 60 * int(c.get("bar_minutes", 60)), int(c["steps"]))
@@ -450,8 +455,6 @@ def write_std_pool_from_mkt(src_dir: Path | str, out_dir: Path | str, *, wallet=
     """BUILDER: re-emit a MarketCast snapshot directory as a standard pool
     (same array bytes, same relative paths; signed when ``wallet``)."""
     import shutil
-
-    from ..pool.marketcast import SNAPSHOT_FILE
 
     src, out = Path(src_dir), Path(out_dir)
     meta = json.loads((src / SNAPSHOT_FILE).read_text(encoding="utf-8"))

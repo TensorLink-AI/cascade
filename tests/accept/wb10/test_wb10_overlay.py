@@ -95,7 +95,10 @@ def test_wb10_contamination_hashset_overlay_validates_only_as_sha256(name):
                 "prev": None, "effective_block": 2698 * 3600,
                 "overrides": {"lane_b": {"contamination_hashset": v}}}
 
-    out = nc.validate_overlay(base, body(HASHSET_B))
+    try:
+        out = nc.validate_overlay(base, body(HASHSET_B))
+    except nc.NetConfigError as e:
+        raise AssertionError(f"a content-hash pin overlay was refused: {e}") from None
     assert out.lane_b.contamination_hashset == HASHSET_B
     for bad in ("md5:abc", "sha256:XYZ", "hashset-v2.json"):
         try:
