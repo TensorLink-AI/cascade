@@ -46,7 +46,7 @@ class ValidatorCompetition:
 
     def judge(self, runner, manifest, cm, *, rid: str, block: int, era_index: int, st,
               commitments_fn) -> tuple[object, list]:
-        raise NotImplementedError
+        raise TypeError(f"{type(self).__name__} does not define judge() — a competition half must")
 
     def fold(self, st, plan, judgements: list, *, round_id: str, settle_block: int,
              era_index: int) -> list:

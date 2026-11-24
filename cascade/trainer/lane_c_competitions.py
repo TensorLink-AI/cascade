@@ -51,7 +51,7 @@ class TrainerCompetition:
     def live(self, cfg, block: int) -> bool:
         """Whether a leg of this kind may be DISPATCHED at ``block`` (the
         competition's own start/end is checked by the driver too)."""
-        raise NotImplementedError
+        raise TypeError(f"{type(self).__name__} does not define live() — a competition half must")
 
     def admitted_values(self, cfg) -> tuple[str, ...]:
         """The target values a commitment may name now (() = whatever the
@@ -64,13 +64,13 @@ class TrainerCompetition:
 
     def read_recipe(self, ops, tree: Path, *, target: str, submission_time: float | None,
                     train_time: float | None):
-        raise NotImplementedError
+        raise TypeError(f"{type(self).__name__} does not define read_recipe() — a competition half must")
 
     def leg_hours(self, cfg, recipe) -> float | None:
         return None
 
     def train_leg(self, ops, leg: dict, recipe) -> dict:
-        raise NotImplementedError
+        raise TypeError(f"{type(self).__name__} does not define train_leg() — a competition half must")
 
     # ── the optional arbiter report ──
 
