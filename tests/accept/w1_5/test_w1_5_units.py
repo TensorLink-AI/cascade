@@ -96,8 +96,12 @@ CW = (0.80, 0.15, 0.05)
 
 
 def test_lane_d_emission_part_taken_from_lane_a():
+    import inspect
+
     from cascade.shared.emission import lane_d_vector, lane_parts
 
+    assert "court_weights" in inspect.signature(lane_d_vector).parameters, \
+        "lane_d_vector takes no court_weights (rev6.23)"
     king = lane_d_vector(N_UIDS, share=0.25, court_uids=[CHALLENGER_UID], court_weights=CW,
                          burn_uid=BURN_UID)
     assert math.isclose(king[CHALLENGER_UID], 0.25) and math.isclose(sum(king), 0.25)

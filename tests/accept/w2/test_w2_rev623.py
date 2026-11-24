@@ -13,8 +13,18 @@ import pytest
 from .helpers import ARM, SHIPPED, field, load_ok, overrides_refusal, raw_with, refused
 
 
+def _need_rev623() -> None:
+    """rev6.23 is built (on main: an assertion, the right failure)."""
+    from cascade.shared.config.lane_d import LaneDConfig
+
+    assert "court_weights" in LaneDConfig.__dataclass_fields__ and \
+        callable(getattr(LaneDConfig, "crown_bar", None)), \
+        "plan rev6.23 is not built: LaneDConfig has no court_weights / crown_bar"
+
+
 @pytest.mark.parametrize("name", SHIPPED)
 def test_shipped_court_weights_are_80_15_5(name):
+    _need_rev623()
     ld = load_ok(raw_with(name)).lane_d
     assert tuple(field(ld, "court_weights")) == (0.80, 0.15, 0.05)
     assert field(ld, "reward_prior_kings") == 2
@@ -23,6 +33,7 @@ def test_shipped_court_weights_are_80_15_5(name):
 
 @pytest.mark.parametrize("name", SHIPPED)
 def test_lane_d_king_decay_is_retired_and_ignored(name):
+    _need_rev623()
     from cascade.shared.config import RETIRED_KEYS
 
     assert "king_decay" in RETIRED_KEYS.get("lane_d", frozenset()), \
@@ -35,6 +46,7 @@ def test_lane_d_king_decay_is_retired_and_ignored(name):
 @pytest.mark.parametrize("name", SHIPPED)
 def test_lane_a_king_decay_is_untouched(name):
     """``[scoring] king_decay`` still parses and moves lane A's config."""
+    _need_rev623()
     raw = raw_with(name)
     raw["scoring"] = {**raw["scoring"], "king_decay": 0.25}
     assert load_ok(raw).scoring.king_decay == 0.25
@@ -43,6 +55,7 @@ def test_lane_a_king_decay_is_untouched(name):
 @pytest.mark.parametrize("name", SHIPPED)
 @pytest.mark.parametrize("rpk", [0, 1, 3])
 def test_reward_prior_kings_alone_is_a_length_mismatch(name, rpk):
+    _need_rev623()
     assert refused(raw_with(name, {"reward_prior_kings": rpk})), \
         f"reward_prior_kings = {rpk} with 3 court_weights loaded"
     w = [1.0] + [0.0] * rpk
@@ -51,6 +64,7 @@ def test_reward_prior_kings_alone_is_a_length_mismatch(name, rpk):
 
 
 def test_court_weights_and_the_bar_keys_are_overlay_settable():
+    _need_rev623()
     for ov in ({"court_weights": [0.7, 0.2, 0.1]}, {"d_margin_start": 0.05},
                {"d_margin_warmup_settlements": 16},
                {"reward_prior_kings": 1, "court_weights": [0.9, 0.1]}):
@@ -59,6 +73,7 @@ def test_court_weights_and_the_bar_keys_are_overlay_settable():
 
 @pytest.mark.parametrize("name", SHIPPED)
 def test_shipped_crown_bar_defaults(name):
+    _need_rev623()
     ld = load_ok(raw_with(name)).lane_d
     got = tuple(getattr(ld, k, None)
                 for k in ("d_margin_start", "d_margin", "d_margin_warmup_settlements"))
