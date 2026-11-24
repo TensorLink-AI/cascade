@@ -23,10 +23,12 @@ SYSTEMD = REPO / "deploy" / "laned" / "systemd"
 ENV_EXAMPLE = SYSTEMD / "cascade-laned-jobs.env.example"
 UNITS = ("cascade-laned-house-pointer", "cascade-laned-published-weights",
          "cascade-laned-readiness-measure", "cascade-laned-evidence",
-         "cascade-laned-vault-sweep", "cascade-laned-king-check")
+         "cascade-laned-vault-sweep", "cascade-laned-king-check",
+         "cascade-laned-house-source", "cascade-laned-king-publish")
 # job unit -> it may write (signs, installs, deletes): ships --dry-run
 MUTATING = ("cascade-laned-house-pointer", "cascade-laned-published-weights",
-            "cascade-laned-evidence", "cascade-laned-vault-sweep")
+            "cascade-laned-evidence", "cascade-laned-vault-sweep",
+            "cascade-laned-house-source", "cascade-laned-king-publish")
 PYTHON = "/root/cascade/.venv/bin/python"
 
 
@@ -120,6 +122,21 @@ def _parse(argv: list[str]) -> None:
 def test_exec_lines_parse_with_the_real_commands(name):
     for argv in _commands(_unit(name, ".service")):
         _parse(argv)
+
+
+def test_king_publish_starts_on_a_publish_request():
+    """The validator's settlement step leaves lane_d_publish_requests/<b>.json
+    beside lane_d_state.json; the path unit starts the publish job on it."""
+    path = SYSTEMD / "cascade-laned-king-publish.path"
+    assert path.is_file(), "missing template deploy/laned/systemd/cascade-laned-king-publish.path"
+    cp = configparser.ConfigParser(strict=False, interpolation=None, delimiters=("=",))
+    cp.optionxform = str
+    cp.read_string(path.read_text(encoding="utf-8"))
+    state_dir = str(Path(_env()["LANED_STATE"]).parent)
+    assert cp.get("Path", "PathChanged") == f"{state_dir}/lane_d_publish_requests"
+    assert cp.get("Path", "Unit") == "cascade-laned-king-publish.service"
+    unit = (SYSTEMD / "cascade-laned-king-publish.service").read_text(encoding="utf-8")
+    assert "MemoryMax=" in unit and "7 GB box" in unit, "the job says where it may run"
 
 
 def test_env_example_holds_no_secret():

@@ -116,17 +116,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                       minter=HippiusMultipartMinter(vault), cfg=cfg.lane_d, ops=ops,
                       state_dir=state_dir, now=time.time, per_ip_rpm=args.per_ip_rpm,
                       per_hotkey_rpm=args.per_hotkey_rpm)
+    # #842: refresh once at startup, then every queue_poll_seconds, so
+    # reveals and TTL expiries reach the queue file without traffic.
+    app.tick()
+    timer = app.refresh_timer(ops.queue_poll_seconds)
     server = make_server(args.host, args.port, app, server_class=_ThreadingServer,
                          handler_class=_handler_class(args.request_timeout))
     host, port = server.server_address[:2]
     log.info("lane_d_intake_up intake-laned up: %s on %s:%d upload_path=%s vault=%s/%s "
-             "state=%s lane_d_active_from=%d", SERVICE, host, port, UPLOAD_PATH,
-             ops.vault_bucket, ops.vault_prefix, state_dir, int(cfg.lane_d.from_block))
+             "state=%s lane_d_active_from=%d refresh_every_s=%d", SERVICE, host, port,
+             UPLOAD_PATH, ops.vault_bucket, ops.vault_prefix, state_dir,
+             int(cfg.lane_d.from_block), int(ops.queue_poll_seconds))
+    timer.start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         log.info("lane_d_intake_up intake-laned stopping on interrupt")
     finally:
+        timer.stop()
         server.server_close()
         lock.close()
     return 0

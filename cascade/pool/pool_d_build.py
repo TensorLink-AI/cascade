@@ -193,6 +193,38 @@ def _cut(values: np.ndarray, cfg: PoolDBuildConfig) -> tuple[np.ndarray, np.ndar
     return filled.astype(np.float32), target.astype(np.float32)
 
 
+def _dedupe_repeated_ts(ts: np.ndarray, seen: np.ndarray, values: np.ndarray
+                        ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """Collapse exact repeated timestamps (``ts`` sorted ascending, stable).
+
+    Each run of equal timestamps keeps its first row when every copy carries
+    the same value (NaN equals NaN) and the same first-seen time; any
+    disagreement returns ``None`` (the series is refused as
+    ``duplicate_ts_conflict``). Without repeats the inputs come back as-is,
+    so a regular feed's cut is byte-identical to before.
+    """
+    if ts.size < 2 or not bool((ts[1:] == ts[:-1]).any()):
+        return ts, seen, values
+    starts = np.flatnonzero(np.concatenate(([True], ts[1:] != ts[:-1])))
+    run_id = np.cumsum(np.concatenate(([True], ts[1:] != ts[:-1]))) - 1
+    first_vals, first_seen = values[starts][run_id], seen[starts][run_id]
+    same_val = (values == first_vals) | (np.isnan(values) & np.isnan(first_vals))
+    if not bool(same_val.all()) or not bool((seen == first_seen).all()):
+        return None
+    return ts[starts], seen[starts], values[starts]
+
+
+def _series_invariant_refusal(target_ts: Sequence[int], first_seen_ts: Sequence[int],
+                              as_of_ts: int) -> str | None:
+    """The typed refusal for a series cut that breaks a per-series snapshot
+    invariant :func:`validate_pool_d` checks, else ``None``."""
+    if any(b <= a for a, b in zip(target_ts, target_ts[1:], strict=False)):
+        return "target_ts_not_increasing"
+    if any(int(x) >= int(as_of_ts) for x in first_seen_ts):
+        return "first_seen_not_before_as_of"
+    return None
+
+
 def _prior_frontiers(prior_dirs: Sequence[Path | str], as_of_ts: int) -> dict[str, list]:
     out: dict[str, list] = {}
     for d in prior_dirs:
@@ -289,30 +321,46 @@ def build_pool_d(*, forge_dir: Path | str, selection, first_seen_dir: Path | str
             seen_all = np.array([index.first_seen(feed, pj, int(t)) or -1 for t in ts_all],
                                 dtype=np.int64)
             keep = seen_all >= 0
-            sub, ts_arr, seen_arr = sub[keep], ts_all[keep], seen_all[keep]
-            lo, hi = reader._freshest_segment(
-                ts_arr.astype("datetime64[s]") if ts_arr.size else None, int(ts_arr.size),
-                min_len=int(cfg.horizon) + int(cfg.min_context))
+            sub, ts_kept, seen_kept = sub[keep], ts_all[keep], seen_all[keep]
             for sel in wanted[base]:
                 column = _channel_column(entry, sel, sub, excluded)
                 if column is None or column not in sub.columns:
                     refused[sel.pool_d_series_id] = "not_in_forge"
                     continue
                 try:
-                    vals = sub[column].astype(float).to_numpy()[lo:hi]
+                    col_vals = sub[column].astype(float).to_numpy()
                 except (TypeError, ValueError):
                     refused[sel.pool_d_series_id] = "not_in_forge"
                     continue
-                cut = _cut(vals, cfg)
+                # Event / irregular feeds (#841): exact repeated timestamps
+                # collapse to one point when every copy agrees, else the
+                # series is refused. A feed without repeats is unchanged.
+                dd = _dedupe_repeated_ts(ts_kept, seen_kept, col_vals)
+                if dd is None:
+                    refused[sel.pool_d_series_id] = "duplicate_ts_conflict"
+                    continue
+                ts_arr, seen_arr, col_vals = dd
+                lo, hi = reader._freshest_segment(
+                    ts_arr.astype("datetime64[s]") if ts_arr.size else None, int(ts_arr.size),
+                    min_len=int(cfg.horizon) + int(cfg.min_context))
+                cut = _cut(col_vals[lo:hi], cfg)
                 if isinstance(cut, str):
                     refused[sel.pool_d_series_id] = cut
                     continue
                 h_vals, t_vals = cut
                 n_used = h_vals.size + t_vals.size
                 seg_ts, seg_seen = ts_arr[lo:hi][-n_used:], seen_arr[lo:hi][-n_used:]
+                target_ts = [int(t) for t in seg_ts[-cfg.horizon:]]
+                first_seen_ts = [int(s) for s in seg_seen[-cfg.horizon:]]
+                # Per-series snapshot invariants (#841): a series that would
+                # fail validate_pool_d is refused here, typed, and the rest
+                # of the snapshot is built.
+                bad = _series_invariant_refusal(target_ts, first_seen_ts, as_of_ts)
+                if bad is not None:
+                    refused[sel.pool_d_series_id] = bad
+                    continue
                 for t in seg_ts:
                     roots_used.add(index.root_for(feed, pj, int(t)))
-                target_ts = [int(t) for t in seg_ts[-cfg.horizon:]]
                 sid = sel.pool_d_series_id
                 hist[sid], tgt[sid] = h_vals, t_vals
                 series_out.append({
@@ -322,7 +370,7 @@ def build_pool_d(*, forge_dir: Path | str, selection, first_seen_dir: Path | str
                     "freq": freq, "seasonal_period": int(seasonal), "domain": sel.domain,
                     "history_len": int(h_vals.size),
                     "target_ts": target_ts,
-                    "first_seen_ts": [int(s) for s in seg_seen[-cfg.horizon:]],
+                    "first_seen_ts": first_seen_ts,
                     "first_target_ts": target_ts[0], "end_ts": target_ts[-1],
                     "frontier": frontiers.get(sid, []),
                 })
