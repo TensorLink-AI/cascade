@@ -620,6 +620,77 @@ def _check_draw(report: dict) -> None:
                                         "its capacity")
 
 
+PUBLIC_SEED_TAG = "lane_d_public"
+_BLOCK_HASH_RE = re.compile(r"0x[0-9a-f]{64}")
+
+
+def _check_public(report: dict) -> None:
+    """rev6.18 A1/A2/A6 (F3, W5k): each public source once, sorted; its seed
+    is ``<block hash>:lane_d_public:<source>`` on the settlement's block hash
+    (the draw's / gate's when present); per cell the drawn windows are at
+    most the quota and the quota at most the capacity, the quotas sum to at
+    most ``n_windows``; window ids are unique, sorted, of the form
+    ``<source>:<series_id>:<cut>:h<h>`` with ``h = horizon`` and ``min_history
+    <= cut <= length - h``; a series' targets never overlap; every dropped
+    window is a drawn one, listed once."""
+    if "public" not in report:
+        return
+    bhs = {d.get("boundary_block_hash") for d in (report.get("draw"),) if isinstance(d, dict)}
+    bhs |= {g.get("block_hash") for g in (report.get("gate"),) if isinstance(g, dict)}
+    srcs = report["public"]["sources"]
+    names = [s["source"] for s in srcs]
+    if names != sorted(set(names)):
+        raise ReportSchemaError("bad_value", "public.sources", "sources not unique and sorted")
+    for i, s in enumerate(srcs):
+        at = _join(_join("public", "sources"), i)
+        src, h = s["source"], int(s["horizon"])
+        bh, _, tail = s["seed"].partition(":")
+        if (tail != f"{PUBLIC_SEED_TAG}:{src}" or not _BLOCK_HASH_RE.fullmatch(bh)
+                or (bhs and bh not in bhs) or len(bhs) > 1):
+            raise ReportSchemaError("bad_value", _join(at, "seed"),
+                                    "not <boundary_block_hash>:lane_d_public:<source>")
+        if sum(s["quota"].values()) > int(s["n_windows"]):
+            raise ReportSchemaError("bad_value", _join(at, "quota"), "quotas exceed n_windows")
+        for k, q in s["quota"].items():
+            if q > s["capacity"].get(k, 0):
+                raise ReportSchemaError("bad_value", _join(_join(at, "quota"), k),
+                                        "above its capacity")
+        count: dict[str, int] = {}
+        ids = [w["window_id"] for w in s["windows"]]
+        if ids != sorted(set(ids)):
+            raise ReportSchemaError("bad_value", _join(at, "windows"),
+                                    "window ids not unique and sorted")
+        spans: dict[str, list[tuple[int, int]]] = {}
+        for j, w in enumerate(s["windows"]):
+            wat = _join(_join(at, "windows"), j)
+            k = f"{w['family']}|{w['freq']}"
+            count[k] = count.get(k, 0) + 1
+            cut = int(w["cut"])
+            head = f"{src}:"
+            tail = f":{cut}:h{h}"
+            wid = w["window_id"]
+            if (w["h"] != h or not wid.startswith(head) or not wid.endswith(tail)
+                    or len(wid) <= len(head) + len(tail)):
+                raise ReportSchemaError("bad_value", _join(wat, "window_id"),
+                                        "not <source>:<series_id>:<cut>:h<horizon>")
+            if not int(s["min_history"]) <= cut <= int(w["length"]) - h:
+                raise ReportSchemaError("bad_value", _join(wat, "cut"),
+                                        "outside [min_history, length - h]")
+            sid = wid[len(head):-len(tail)]
+            if any(cut < e and a < cut + h for a, e in spans.get(sid, ())):
+                raise ReportSchemaError("bad_value", _join(wat, "cut"),
+                                        "target overlaps another window of its series")
+            spans.setdefault(sid, []).append((cut, cut + h))
+        for k, n in count.items():
+            if n > s["quota"].get(k, 0):
+                raise ReportSchemaError("bad_value", _join(_join(at, "quota"), k),
+                                        "fewer than the cell's drawn windows")
+        dropped = [d["window_id"] for d in s["dropped"]]
+        if dropped != sorted(set(dropped)) or not set(dropped) <= set(ids):
+            raise ReportSchemaError("bad_value", _join(at, "dropped"),
+                                    "dropped windows not unique, sorted and drawn")
+
+
 def _check_host(report: dict) -> None:
     """rev6.18 B7: a ``host`` record's ``identity`` hashes its other
     fields (whether its env is qualified is the audit's check: it depends on
@@ -635,6 +706,7 @@ def _check_host(report: dict) -> None:
 
 def _cross_field(report: dict) -> None:
     """The rules between fields, run after every structural check passes."""
+    _check_public(report)
     _check_armed(report)
     _check_host(report)
     _check_below_armed(report)

@@ -125,7 +125,7 @@ TOP_LEVEL_REQUIRED = ("schema", "boundary", "signer", "signature", "scoring_meth
 # rev6.18 B7: `host`, present iff the settlement was handed the eval host's
 # verified record (README "Scoring host"). rev6.14 (a): `boundary_ts`.
 TOP_LEVEL_OPTIONAL = ("extensions", "gate", "armed_contexts", "armed_evidence", "draw",
-                      "boundary_ts", "host")
+                      "public", "boundary_ts", "host")   # F3 public; rev6.14 (a) boundary_ts; B7 host
 PARAMS_FIELDS = ("share", "takes_from", "remainder", "horizon", "horizons", "contexts",
                  "forward_margin_hours", "max_mirror_lag_hours", "min_windows", "min_clusters",
                  "d_margin", "alpha", "bootstrap_B", "reward_prior_kings",

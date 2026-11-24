@@ -45,6 +45,7 @@
     },
     "gate": {"$ref": "#/$defs/gate"},
     "draw": {"$ref": "#/$defs/draw"},
+    "public": {"$ref": "#/$defs/public"},
     "boundary_ts": {"$ref": "#/$defs/timestamp",
                     "description": "rev6.14 (a): the boundary block's on-chain Timestamp.Now (s); the judging start j = max(T_E, T_K) + 3600 * eval_delay_hours is applied against it. Absent (never null) on a settlement not handed it, which freezes and judges nothing (boundary_ts_missing)."},
     "armed_contexts": {
@@ -353,6 +354,71 @@
         "seed": {"type": "string", "minLength": 1, "description": "f\"{boundary_block_hash}:lane_d_windows\"."},
         "max_windows_per_settlement": {"type": "integer", "minimum": 1},
         "cohorts": {"type": "array", "items": {"$ref": "#/$defs/draw_cohort"}}
+      }
+    },
+    "public": {
+      "type": "object",
+      "description": "rev6.18 A1/A2/A6 (F3, W5k): the settlement's public-source draws, one per source (sorted by source); present iff the public sources were drawn (absent, never null).",
+      "required": ["schema", "sources"],
+      "additionalProperties": false,
+      "properties": {
+        "schema": {"type": "string", "const": "lane-d-public/1"},
+        "sources": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/public_source"}}
+      }
+    },
+    "public_source": {
+      "type": "object",
+      "description": "One public source's draw: the pinned HF revision, the index and file-list hashes (A6), the draw parameters, per-cell capacity and quota, the drawn windows and the windows dropped at read time.",
+      "required": ["source", "repo", "revision", "index_sha256", "files_sha256", "seed", "n_windows",
+                   "horizon", "min_history", "multi_window", "capacity", "quota", "windows",
+                   "dropped"],
+      "additionalProperties": false,
+      "properties": {
+        "source": {"type": "string", "enum": ["gift_eval_pretrain", "rmisc"]},
+        "repo": {"type": "string", "minLength": 1},
+        "revision": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "index_sha256": {"$ref": "#/$defs/digest"},
+        "files_sha256": {"$ref": "#/$defs/digest"},
+        "seed": {"type": "string", "minLength": 1, "description": "f\"{boundary_block_hash}:lane_d_public:{source}\"."},
+        "n_windows": {"type": "integer", "minimum": 0},
+        "horizon": {"type": "integer", "minimum": 1},
+        "min_history": {"type": "integer", "minimum": 1},
+        "multi_window": {"type": "boolean"},
+        "capacity": {
+          "type": "object", "description": "{\"<family>|<freq>\": drawable windows}.",
+          "propertyNames": {"type": "string", "pattern": "^[^|]+[|][^|]+$"},
+          "additionalProperties": {"type": "integer", "minimum": 0}
+        },
+        "quota": {
+          "type": "object", "description": "{\"<family>|<freq>\": windows allotted}.",
+          "propertyNames": {"type": "string", "pattern": "^[^|]+[|][^|]+$"},
+          "additionalProperties": {"type": "integer", "minimum": 0}
+        },
+        "windows": {"type": "array", "items": {"$ref": "#/$defs/public_window"}},
+        "dropped": {"type": "array", "items": {"$ref": "#/$defs/public_dropped"}}
+      }
+    },
+    "public_window": {
+      "type": "object",
+      "required": ["window_id", "ordinal", "family", "freq", "cut", "h", "length"],
+      "additionalProperties": false,
+      "properties": {
+        "window_id": {"type": "string", "minLength": 1, "description": "f\"{source}:{series_id}:{cut}:h{h}\"."},
+        "ordinal": {"type": "integer", "minimum": 0},
+        "family": {"type": "string", "minLength": 1},
+        "freq": {"type": "string", "minLength": 1},
+        "cut": {"type": "integer", "minimum": 1},
+        "h": {"type": "integer", "minimum": 1},
+        "length": {"type": "integer", "minimum": 1}
+      }
+    },
+    "public_dropped": {
+      "type": "object",
+      "required": ["window_id", "reason"],
+      "additionalProperties": false,
+      "properties": {
+        "window_id": {"type": "string", "minLength": 1},
+        "reason": {"type": "string", "enum": ["public_nonfinite_target", "public_short_history", "public_no_channel", "public_no_scale"]}
       }
     },
     "draw_cohort": {

@@ -436,6 +436,28 @@ On main these tests fail on the `settle_mv` / `max_channels` assertions or
 `cannot import name` (`channel_pick` from `cascade.audit.lane_d`,
 `_lane_d_max_channels` from `cascade.audit.checks`, both in PATHS).
 
+## Public sources (rev6.18 F3): `test_w9_public.py`
+
+- `lane_d_findings` / `check_lane_d(..., public_indexes=)`:
+  `{source: index dir}`, the auditor's copies of the W6p indexes.
+- `ld_public_index` (ALERT): each source is a pinned one at its pinned
+  repo and revision (literals in `cascade/audit/lane_d.py`, never imported);
+  with the index: it verifies (canonical lines, `index_sha256` over the
+  uncompressed bytes, `files_sha256` over the manifest's file list) and its
+  revision / `index_sha256` / `files_sha256` are the report's.
+- `ld_draw` (ALERT): the seed is `<block hash>:lane_d_public:<source>` on
+  the report's block hash; the draw constants are the spec's (5000, 128,
+  `[lane_d] horizon`, `multi_window` per source); with the index the
+  capacity, quota and every drawn window are re-derived
+  (`cascade.audit.lane_d.public_redraw`, the W5k rule re-stated) and must
+  match.
+- Neither code burns: a mismatch is logged and alerted, lane D's court stays
+  paid (rev6.18 B3).
+
+On main these tests fail on the lazy fixture (`f3_fixture.py`: no
+`tests/accept/w7a/pub.py`), the `public_indexes` assertion or
+`cannot import name 'public_redraw'`.
+
 ## rev6.22: lane B weights and slot rows (`test_w9_lane_b_slots.py`)
 
 One pay rule: every paid holder has multiplier 1.0 at any age (no TTL), the

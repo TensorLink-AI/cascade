@@ -1,0 +1,546 @@
+#!/usr/bin/env python3
+"""Lane D RMISC allowed-list tooling (LANE_D_PLAN rev6.18 A5; F3, W6p).
+
+The allowed list ``data/lane_d/rmisc_allowed.toml`` names the RMISC folders
+lane D draws public windows from (and publishes as the official training
+source). It is built in four steps; only the first two run anywhere, the
+data compare runs on a builder / pod that holds the data (it is never run on
+the validator box, and nothing here downloads data except ``download``):
+
+1. ``fetch-listings --out listings.json``: Hugging Face METADATA only (repo
+   tree listings at the pinned revisions and each RMISC folder's
+   ``meta.json``; never a data file). ``HF_TOKEN`` is read from the
+   environment when set (never printed).
+2. ``candidates --listings listings.json --out candidates.json``: offline.
+   RMISC folders whose normalised name matches no folder of the exclusion
+   sources (:data:`EXCLUSION_SOURCES`: GIFT-Eval test, GiftEvalPretrain,
+   fev_datasets, chronos_datasets, TIME @ 83e3d0b, BOOM @ 69325b5), minus
+   the KnownOpen / KnownOil duplicates, non-forecasting sets (EEG/EMG/BCI,
+   activity recognition, classification, anomaly; by name, ``meta.json``
+   description, domain and source URL) and licences that forbid
+   redistribution (``meta.json`` ``license``).
+3. ``datacompare`` (OWNER, on a builder/pod; see ``download``): compares
+   DATA, not names: winnowed K-gram hashes of quantised values from a
+   deterministic sample of every candidate folder's series, looked up in
+   the same hashes over every exclusion source's data. A folder whose hit
+   fraction against any source reaches ``--dup-threshold`` is
+   ``duplicate``.
+4. ``finalize --candidates … --datacompare … --out data/lane_d/rmisc_allowed.toml``:
+   the folders that passed every step (unknown licences only with
+   ``--allow-unknown-licence``), written in the canonical TOML format
+   (:func:`cascade.eval.lane_d_public_index.render_allowed_list`).
+   ``validate [FILE]`` checks a list file.
+
+Output formats (JSON, ``schema`` field first):
+
+- ``lane-d-rmisc-listings/1``: ``{"sources": {key: {"repo", "revision",
+  "names": [top-level folders]}}, "rmisc": {"repo", "revision", "folders":
+  [names], "meta": {folder: meta.json object | null}}}``
+- ``lane-d-rmisc-candidates/1``: ``{"rmisc": {"repo", "revision"},
+  "exclusion_sources": [{"key", "repo", "revision", "n_names"}],
+  "n_folders", "candidates": [{"name", "domain", "freq", "licence",
+  "licence_class", "source_url", "near": [names]}], "excluded": [{"name",
+  "reason", "detail"}]}`` (``reason`` one of :data:`EXCLUDE_REASONS`;
+  ``licence_class`` ``ok`` | ``unknown``)
+- ``lane-d-rmisc-datacompare/1``: ``{"params": {...}, "folders": [{"name",
+  "n_series_sampled", "n_hashes", "hits": {source key: n}, "max_hit_fraction",
+  "verdict": "pass" | "duplicate" | "no_data"}]}``
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import sys
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+LISTINGS_SCHEMA = "lane-d-rmisc-listings/1"
+CANDIDATES_SCHEMA = "lane-d-rmisc-candidates/1"
+DATACOMPARE_SCHEMA = "lane-d-rmisc-datacompare/1"
+RMISC_REPO = "nju-zhangsq/RMISC"
+RMISC_REVISION = "d0cdd935300ca9b3b2d6f23e6085db24cb7560c2"
+# key -> (repo, pinned revision). GiftEval / BOOM / TIME are the revisions
+# the bench sidecar pins (benchmarks/cascade_benchmark/datasets.py); the
+# others were the repos' heads when F3 pinned them.
+EXCLUSION_SOURCES: dict[str, tuple[str, str]] = {
+    "gift_eval": ("Salesforce/GiftEval", "30841734ac5cfddbd0c3bad6d09d2b6b32becbb0"),
+    "gift_eval_pretrain": ("Salesforce/GiftEvalPretrain",
+                           "6830b624de7ed2b3d3e5b85bb6959d81dcc5d874"),
+    "fev_datasets": ("autogluon/fev_datasets", "d3e7e720f4158eab03ebcb021f1cce779cd92acc"),
+    "chronos_datasets": ("autogluon/chronos_datasets",
+                         "eeecad0b82a8c237e212ce6f8d1abecb513e2cec"),
+    "time": ("Real-TSF/TIME", "83e3d0b3be28d11c7182bffcc1892d19b36c4da1"),
+    "boom": ("Datadog/BOOM", "69325b544c45ff0d6c43c7a99c49a6601a01725b"),
+}
+EXCLUDE_REASONS = ("duplicate_folder", "name_match", "non_forecasting", "licence_forbids",
+                   "no_meta")
+DUPLICATE_MARKERS = ("KnownOpen", "KnownOil")
+NON_FORECASTING = ("eeg", "emg", "electroencephalog", "electromyog", "brain-computer",
+                   "brain computer", "bci", "motor imagery", "activity recognition",
+                   "human activity", "accelerometer", "gyroscope", "gesture", "gait",
+                   "classification", "anomal", "intrusion", "cybersecurity",
+                   "localisation", "localization", "timeseriesclassification.com")
+LICENCE_FORBIDS = ("no redistribution", "not be redistributed", "not redistribute",
+                   "non-redistributable", "redistribution prohibited", "redistribution is not",
+                   "proprietary", "all rights reserved", "not for redistribution")
+LICENCE_UNKNOWN = ("", "unknown", "n/a", "na", "none", "unspecified", "null", "-")
+HF = "https://huggingface.co"
+
+
+# ── step 1: metadata listings ───────────────────────────────────────────────
+
+def _get(url: str) -> tuple[bytes, dict]:
+    req = urllib.request.Request(url, headers={"User-Agent": "cascade-laned-f3"})
+    tok = os.environ.get("HF_TOKEN")
+    if tok:
+        req.add_header("Authorization", f"Bearer {tok}")
+    with urllib.request.urlopen(req, timeout=60) as r:          # noqa: S310 (https only)
+        return r.read(), dict(r.headers)
+
+
+def hf_tree(repo: str, revision: str, path: str = "", recursive: bool = False) -> list[dict]:
+    """Every entry of a dataset repo's tree at ``revision`` (metadata only,
+    following the API's ``Link: next`` pagination)."""
+    q = "?recursive=1" if recursive else ""
+    url = f"{HF}/api/datasets/{repo}/tree/{revision}" + (f"/{urllib.parse.quote(path)}"
+                                                        if path else "") + q
+    out = []
+    while url:
+        body, headers = _get(url)
+        out += json.loads(body)
+        link = headers.get("Link") or headers.get("link") or ""
+        m = re.search(r'<([^>]+)>;\s*rel="next"', link)
+        url = m.group(1) if m else ""
+    return out
+
+
+def top_level_names(entries: list[dict]) -> list[str]:
+    return sorted({e["path"].split("/", 1)[0] for e in entries
+                   if e.get("type") == "directory" or "/" in e.get("path", "")})
+
+
+def cmd_fetch_listings(args) -> int:
+    sources = {}
+    for key, (repo, rev) in EXCLUSION_SOURCES.items():
+        names = top_level_names(hf_tree(repo, rev))
+        sources[key] = {"repo": repo, "revision": rev, "names": names}
+        print(f"listed {repo}@{rev[:7]}: {len(names)} folders", flush=True)
+    folders = top_level_names(hf_tree(RMISC_REPO, RMISC_REVISION))
+    meta = {}
+    for f in folders:
+        url = f"{HF}/datasets/{RMISC_REPO}/resolve/{RMISC_REVISION}/{urllib.parse.quote(f)}/meta.json"
+        try:
+            meta[f] = json.loads(_get(url)[0])
+        except Exception as e:                                   # noqa: BLE001
+            print(f"no meta.json for {f}: {type(e).__name__}", flush=True)
+            meta[f] = None
+    doc = {"schema": LISTINGS_SCHEMA, "sources": sources,
+           "rmisc": {"repo": RMISC_REPO, "revision": RMISC_REVISION, "folders": folders,
+                     "meta": meta}}
+    Path(args.out).write_text(json.dumps(doc, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+    print(f"wrote {args.out}: {len(folders)} RMISC folders")
+    return 0
+
+
+# ── step 2: candidates (offline) ────────────────────────────────────────────
+
+def norm(name: str) -> str:
+    n = re.sub(r"[^a-z0-9]", "", str(name).lower())
+    return n.replace("withmissing", "")
+
+
+def tokens(name: str) -> list[str]:
+    """Lower-case word tokens: split on non-alphanumerics and camelCase."""
+    s = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(name))
+    s = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", s)
+    return [t for t in re.split(r"[^A-Za-z0-9]+", s.lower()) if t and t != "with"
+            and t != "missing"]
+
+
+def name_matches(name: str, others: list[str]) -> tuple[list[str], list[str]]:
+    """``(matches, near)``: a match is an equal normalised name, a prefix
+    either way of the normalised names (the shorter at least 6 characters)
+    or a token prefix either way (``M4`` ~ ``m4_daily``, ``Covid`` ~
+    ``covid_deaths``); ``near`` (recorded for the data compare, not
+    excluded): a normalised substring (at least 6) or the same first token
+    (at least 3 characters)."""
+    a, ta = norm(name), tokens(name)
+    match, near = [], []
+    for o in others:
+        b, tb = norm(o), tokens(o)
+        if not a or not b:
+            continue
+        short = min(len(a), len(b))
+        k = min(len(ta), len(tb))
+        if (a == b or (short >= 6 and (a.startswith(b) or b.startswith(a)))
+                or (k >= 1 and ta[:k] == tb[:k])):
+            match.append(o)
+        elif (short >= 6 and (a in b or b in a)) or (ta and tb and ta[0] == tb[0]
+                                                    and len(ta[0]) >= 3):
+            near.append(o)
+    return match, near
+
+
+def non_forecasting(name: str, meta: dict) -> str | None:
+    text = " ".join(str(x) for x in (name, meta.get("desp", ""), meta.get("domain", ""),
+                                     meta.get("source", ""), meta.get("name", ""))).lower()
+    words = re.sub(r"[_\-/.]", " ", text)
+    for kw in NON_FORECASTING:
+        if len(kw) <= 3:
+            if re.search(rf"\b{re.escape(kw)}\b", words):
+                return kw
+        elif kw in text:
+            return kw
+    return None
+
+
+def licence_class(lic) -> str:
+    s = str(lic or "").strip().lower()
+    if s in LICENCE_UNKNOWN:
+        return "unknown"
+    if any(p in s for p in LICENCE_FORBIDS):
+        return "forbids"
+    return "ok"
+
+
+def candidates(listings: dict) -> dict:
+    if listings.get("schema") != LISTINGS_SCHEMA:
+        raise SystemExit(f"listings schema {listings.get('schema')!r}")
+    rm = listings["rmisc"]
+    if (rm["repo"], rm["revision"]) != (RMISC_REPO, RMISC_REVISION):
+        raise SystemExit("listings are not of the pinned RMISC revision")
+    srcs = listings["sources"]
+    for key, (repo, rev) in EXCLUSION_SOURCES.items():
+        s = srcs.get(key)
+        if not s or (s["repo"], s["revision"]) != (repo, rev):
+            raise SystemExit(f"listings lack the pinned {repo}@{rev}")
+    from cascade.eval.lane_d_public_index import FAMILY_PREFIXES, family_of
+
+    all_names = [(k, n) for k in sorted(srcs) for n in srcs[k]["names"]]
+    keep, out = [], []
+    for f in sorted(rm["folders"]):
+        meta = rm["meta"].get(f)
+        if any(m in f for m in DUPLICATE_MARKERS):
+            out.append({"name": f, "reason": "duplicate_folder", "detail": "KnownOpen/KnownOil"})
+            continue
+        fam = family_of(f)
+        same = [f"{k}/{n}" for k, n in all_names if fam in FAMILY_PREFIXES and family_of(n) == fam]
+        if same:
+            # A year-split family (cmip6 / era5 / largest) already in a source.
+            out.append({"name": f, "reason": "name_match",
+                        "detail": f"family {fam}: " + ", ".join(same[:3])})
+            continue
+        match, near = [], []
+        for k, n in all_names:
+            m, nr = name_matches(f, [n])
+            match += [f"{k}/{x}" for x in m]
+            near += [f"{k}/{x}" for x in nr]
+        if match:
+            out.append({"name": f, "reason": "name_match", "detail": ", ".join(match[:5])})
+            continue
+        if not isinstance(meta, dict):
+            out.append({"name": f, "reason": "no_meta", "detail": "meta.json missing"})
+            continue
+        kw = non_forecasting(f, meta)
+        if kw:
+            out.append({"name": f, "reason": "non_forecasting", "detail": kw})
+            continue
+        lc = licence_class(meta.get("license"))
+        if lc == "forbids":
+            out.append({"name": f, "reason": "licence_forbids", "detail": str(meta.get("license"))})
+            continue
+        freq = meta.get("freq")
+        keep.append({"name": f, "domain": str(meta.get("domain") or ""),
+                     "freq": ",".join(map(str, freq)) if isinstance(freq, list) else str(freq or ""),
+                     "licence": str(meta.get("license") or ""), "licence_class": lc,
+                     "source_url": str(meta.get("source") or ""), "near": near})
+    return {"schema": CANDIDATES_SCHEMA, "rmisc": {"repo": RMISC_REPO, "revision": RMISC_REVISION},
+            "exclusion_sources": [{"key": k, "repo": r, "revision": v,
+                                   "n_names": len(srcs[k]["names"])}
+                                  for k, (r, v) in EXCLUSION_SOURCES.items()],
+            "n_folders": len(rm["folders"]), "candidates": keep, "excluded": out}
+
+
+def cmd_candidates(args) -> int:
+    doc = candidates(json.loads(Path(args.listings).read_text(encoding="utf-8")))
+    Path(args.out).write_text(json.dumps(doc, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+    by = {}
+    for e in doc["excluded"]:
+        by[e["reason"]] = by.get(e["reason"], 0) + 1
+    print(f"CANDIDATES {len(doc['candidates'])} of {doc['n_folders']} RMISC folders; excluded "
+          + ", ".join(f"{k}={v}" for k, v in sorted(by.items())))
+    return 0
+
+
+# ── step 3: data compare (owner, on a builder/pod) ──────────────────────────
+
+def download_command(key: str, local_dir: str) -> list[str]:
+    """The download the owner runs on the pod before ``datacompare``."""
+    repo, rev = (RMISC_REPO, RMISC_REVISION) if key == "rmisc" else EXCLUSION_SOURCES[key]
+    return ["hf", "download", repo, "--repo-type", "dataset", "--revision", rev,
+            "--local-dir", local_dir]
+
+
+def cmd_download(args) -> int:
+    from huggingface_hub import snapshot_download
+
+    repo, rev = (RMISC_REPO, RMISC_REVISION) if args.source == "rmisc" \
+        else EXCLUSION_SOURCES[args.source]
+    pats = None
+    if args.source == "rmisc" and args.candidates:
+        c = json.loads(Path(args.candidates).read_text(encoding="utf-8"))
+        pats = [f"{x['name']}/*" for x in c["candidates"]]
+    snapshot_download(repo_id=repo, repo_type="dataset", revision=rev, local_dir=args.local_dir,
+                      allow_patterns=pats)
+    print(f"downloaded {repo}@{rev} -> {args.local_dir}")
+    return 0
+
+
+def _quantise(v):
+    import numpy as np
+
+    a = np.asarray(v, dtype=np.float32)
+    bits = a.view(np.int32) & np.int32(-256)            # ~4.5 significant digits
+    return bits.astype(np.int64), np.isfinite(a)
+
+
+def kgram_hashes(values, k: int, mod: int):
+    """Winnowed hashes of every K-gram of finite quantised values: the
+    polynomial hash mod 2^64, kept iff ``hash % mod == 0``."""
+    import numpy as np
+
+    q, ok = _quantise(values)
+    if q.size < k:
+        return np.empty(0, dtype=np.uint64)
+    mult = (np.arange(1, k + 1, dtype=np.uint64) * np.uint64(0x9E3779B97F4A7C15)) | np.uint64(1)
+    win = np.lib.stride_tricks.sliding_window_view(q.astype(np.uint64), k)
+    okw = np.lib.stride_tricks.sliding_window_view(ok, k).all(axis=1)
+    with np.errstate(over="ignore"):
+        h = (win * mult).sum(axis=1, dtype=np.uint64)
+        h ^= h >> np.uint64(29)
+        h *= np.uint64(0xBF58476D1CE4E5B9)
+        h ^= h >> np.uint64(32)
+    h = h[okw]
+    return np.unique(h[h % np.uint64(mod) == 0])
+
+
+def iter_channels(path: Path, max_points: int):
+    """Every numeric sequence of one data file (arrow / parquet / csv): list
+    columns row by row (one per channel), scalar numeric columns whole."""
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    suf = path.suffix.lower()
+    if suf == ".arrow":
+        src = pa.memory_map(str(path), "r")
+        try:
+            t = pa.ipc.open_stream(src).read_all()
+        except pa.ArrowInvalid:
+            t = pa.ipc.open_file(src).read_all()
+    elif suf == ".parquet":
+        import pyarrow.parquet as pq
+        t = pq.read_table(str(path))
+    elif suf == ".csv":
+        import pyarrow.csv as pcsv
+        t = pcsv.read_csv(str(path))
+    else:
+        return
+    for name in t.column_names:
+        col = t.column(name)
+        ty = col.type
+        if pa.types.is_list(ty) or pa.types.is_large_list(ty):
+            for v in col.to_pylist():
+                if not v:
+                    continue
+                chans = v if isinstance(v[0], list) else [v]
+                for ch in chans:
+                    yield np.asarray([np.nan if x is None else x for x in ch[:max_points]],
+                                     dtype=np.float64)
+        elif pa.types.is_integer(ty) or pa.types.is_floating(ty):
+            arr = pc.cast(col, pa.float64()).to_numpy(zero_copy_only=False)
+            for i in range(0, min(arr.size, max_points * 64), max_points):
+                yield arr[i:i + max_points]
+
+
+def data_files(root: Path) -> list[Path]:
+    return sorted(p for p in root.rglob("*") if p.is_file()
+                  and p.suffix.lower() in (".arrow", ".parquet", ".csv"))
+
+
+def cmd_datacompare(args) -> int:
+    import numpy as np
+    from cascade.eval.lane_d_public_index import RMISC_SERIES_COLUMN
+
+    cands = json.loads(Path(args.candidates).read_text(encoding="utf-8"))
+    if cands.get("schema") != CANDIDATES_SCHEMA:
+        raise SystemExit("not a candidates file")
+    k, mod = int(args.k), int(args.mod)
+    roots = dict(x.split("=", 1) for x in args.exclude_root)
+    missing = sorted(set(EXCLUSION_SOURCES) - set(roots))
+    if missing:
+        raise SystemExit(f"--exclude-root missing for {missing} (every source is compared)")
+    folders = []
+    owner: dict[int, set[str]] = {}
+    per_folder: dict[str, np.ndarray] = {}
+    for c in cands["candidates"]:
+        base = Path(args.rmisc_root) / c["name"]
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        hs, n_series = [], 0
+        for f in sorted(base.glob("*.parquet")):
+            t = pq.read_table(str(f))
+            names = list(map(str, t.column(RMISC_SERIES_COLUMN).to_pylist())) \
+                if RMISC_SERIES_COLUMN in t.column_names else ["_all"] * t.num_rows
+            # A deterministic sample: the series with the smallest sha256(name).
+            uniq = sorted(set(names),
+                          key=lambda s: hashlib.sha256(s.encode()).hexdigest())[:args.sample_series]
+            n_series += len(uniq)
+            cols = [x for x in t.column_names if x != RMISC_SERIES_COLUMN
+                    and (pa.types.is_integer(t.column(x).type)
+                         or pa.types.is_floating(t.column(x).type))]
+            vals = {x: t.column(x).cast(pa.float64()).to_numpy(zero_copy_only=False) for x in cols}
+            arr_names = np.asarray(names, dtype=object)
+            for s in uniq:
+                idx = np.flatnonzero(arr_names == s)
+                for col in cols:
+                    hs.append(kgram_hashes(vals[col][idx][:args.max_points], k, mod))
+        arr = np.unique(np.concatenate(hs)) if hs else np.empty(0, dtype=np.uint64)
+        per_folder[c["name"]] = arr
+        for x in arr.tolist():
+            owner.setdefault(x, set()).add(c["name"])
+        folders.append({"name": c["name"], "n_series_sampled": n_series, "n_hashes": int(arr.size)})
+    all_c = np.asarray(sorted(owner), dtype=np.uint64)
+    hits = {f["name"]: {s: set() for s in EXCLUSION_SOURCES} for f in folders}
+    for key in sorted(EXCLUSION_SOURCES):
+        for f in data_files(Path(roots[key])):
+            for ch in iter_channels(f, int(args.exclude_max_points)):
+                h = kgram_hashes(ch, k, mod)
+                if not h.size or not all_c.size:
+                    continue
+                pos = np.searchsorted(all_c, h)
+                pos[pos >= all_c.size] = 0
+                for x in h[all_c[pos] == h].tolist():
+                    for name in owner[x]:
+                        hits[name][key].add(x)
+            print(f"compared {key}: {f}", flush=True)
+    for f in folders:
+        n = max(1, f["n_hashes"])
+        f["hits"] = {s: len(v) for s, v in sorted(hits[f["name"]].items())}
+        f["max_hit_fraction"] = max(f["hits"].values()) / n if f["n_hashes"] else 0.0
+        f["verdict"] = ("no_data" if not f["n_hashes"] else
+                        "duplicate" if f["max_hit_fraction"] >= float(args.dup_threshold)
+                        else "pass")
+    doc = {"schema": DATACOMPARE_SCHEMA,
+           "params": {"k": k, "mod": mod, "sample_series": int(args.sample_series),
+                      "max_points": int(args.max_points),
+                      "exclude_max_points": int(args.exclude_max_points),
+                      "dup_threshold": float(args.dup_threshold),
+                      "candidates_sha256": hashlib.sha256(
+                          Path(args.candidates).read_bytes()).hexdigest()},
+           "folders": folders}
+    Path(args.out).write_text(json.dumps(doc, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+    print("DATACOMPARE " + ", ".join(f"{v}={sum(f['verdict'] == v for f in folders)}"
+                                     for v in ("pass", "duplicate", "no_data")))
+    return 0
+
+
+# ── step 4: finalize / validate ─────────────────────────────────────────────
+
+def finalize(cands: dict, dc: dict, *, allow_unknown_licence: bool, generated_by: str) -> str:
+    from cascade.eval.lane_d_public_index import parse_allowed_list, render_allowed_list
+
+    if cands.get("schema") != CANDIDATES_SCHEMA or dc.get("schema") != DATACOMPARE_SCHEMA:
+        raise SystemExit("finalize needs a candidates file and a datacompare file")
+    verdict = {f["name"]: f for f in dc["folders"]}
+    folders = []
+    for c in cands["candidates"]:
+        v = verdict.get(c["name"])
+        if v is None or v["verdict"] != "pass":
+            continue
+        if c["licence_class"] == "unknown" and not allow_unknown_licence:
+            continue
+        folders.append({"name": c["name"],
+                        "reason": (f"no name match in the exclusion sources; data compare pass "
+                                   f"(max hit fraction {v['max_hit_fraction']:.4f})"),
+                        "licence": c["licence"] or "unknown", "domain": c["domain"] or "unknown",
+                        "freq": c["freq"] or "unknown", "data_check": "pass"})
+    text = render_allowed_list(status="final", folders=folders, generated_by=generated_by)
+    parse_allowed_list(text)
+    return text
+
+
+def cmd_finalize(args) -> int:
+    cands = json.loads(Path(args.candidates).read_text(encoding="utf-8"))
+    dc = json.loads(Path(args.datacompare).read_text(encoding="utf-8"))
+    gen = (f"laned_rmisc_allowlist.py finalize; candidates sha256 "
+           f"{hashlib.sha256(Path(args.candidates).read_bytes()).hexdigest()[:16]}; datacompare "
+           f"sha256 {hashlib.sha256(Path(args.datacompare).read_bytes()).hexdigest()[:16]}")
+    text = finalize(cands, dc, allow_unknown_licence=args.allow_unknown_licence, generated_by=gen)
+    Path(args.out).write_text(text, encoding="utf-8")
+    n = text.count("[[folder]]")
+    print(f"ALLOWED {n} folders -> {args.out}")
+    return 0
+
+
+def cmd_validate(args) -> int:
+    from cascade.eval.lane_d_public_index import ALLOWED_LIST_PATH, load_allowed_list
+
+    path = args.file or str(ALLOWED_LIST_PATH)
+    doc = load_allowed_list(path)
+    print(f"OK {path}: status {doc['status']}, {len(doc['names'])} folders")
+    return 0
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("fetch-listings")
+    p.add_argument("--out", required=True)
+    p.set_defaults(fn=cmd_fetch_listings)
+    p = sub.add_parser("candidates")
+    p.add_argument("--listings", required=True)
+    p.add_argument("--out", required=True)
+    p.set_defaults(fn=cmd_candidates)
+    p = sub.add_parser("download")
+    p.add_argument("--source", required=True, choices=["rmisc", *EXCLUSION_SOURCES])
+    p.add_argument("--local-dir", required=True)
+    p.add_argument("--candidates", help="rmisc: download only the candidate folders")
+    p.set_defaults(fn=cmd_download)
+    p = sub.add_parser("datacompare")
+    p.add_argument("--candidates", required=True)
+    p.add_argument("--rmisc-root", required=True)
+    p.add_argument("--exclude-root", action="append", default=[], metavar="KEY=DIR")
+    p.add_argument("--out", required=True)
+    p.add_argument("--k", type=int, default=16)
+    p.add_argument("--mod", type=int, default=32)
+    p.add_argument("--sample-series", type=int, default=64)
+    p.add_argument("--max-points", type=int, default=16384)
+    p.add_argument("--exclude-max-points", type=int, default=1_000_000)
+    p.add_argument("--dup-threshold", type=float, default=0.02)
+    p.set_defaults(fn=cmd_datacompare)
+    p = sub.add_parser("finalize")
+    p.add_argument("--candidates", required=True)
+    p.add_argument("--datacompare", required=True)
+    p.add_argument("--out", required=True)
+    p.add_argument("--allow-unknown-licence", action="store_true")
+    p.set_defaults(fn=cmd_finalize)
+    p = sub.add_parser("validate")
+    p.add_argument("file", nargs="?")
+    p.set_defaults(fn=cmd_validate)
+    args = ap.parse_args(argv)
+    return int(args.fn(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
