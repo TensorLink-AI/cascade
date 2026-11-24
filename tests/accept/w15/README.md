@@ -77,6 +77,18 @@ compact separators) over **every** regular file of the entry, as
     (a logical counter), **not** derived from file mtimes. Staging leftovers
     from a crash are neither entries nor served. If the reopened budget is
     smaller, LRU unpinned entries are evicted at open until it fits.
+  - **Shared root (testnet E2E fix).** Several processes may open caches on
+    one `root` (two validators on one eval host; every `forecast` request
+    opens its own). Every operation holds an exclusive `fcntl.flock` on
+    **`root/.lane_d_cache.lock`** (`LOCK_FILE`; plus a per-instance thread
+    lock) and re-reads the shared index first, so an instance acts on what
+    the other processes admitted or evicted, never on a stale view. `put`
+    holds the lock through `fill`: a concurrent filler of the same digest
+    waits, then hits (each digest is fetched once), and the staging sweep at
+    open never removes a live fill's staging directory. Entries are
+    published by `os.replace` of a hashed staging directory, the index by
+    `os.replace` of a unique temp file in `root`: a reader never sees a
+    partial entry or index. The lock file is never an entry.
   - **Deterministic.** The same operation sequence on two roots gives the same
     `entries()`, `total_bytes()` and on-disk entry set after every step.
   - Logs (logger `cascade.eval.lane_d_cache`): INFO `lane_d_cache_evict ...
@@ -110,6 +122,7 @@ compact separators) over **every** regular file of the entry, as
 | Pinned set follows king/house changes | `test_pinned_set_follows_king_and_house_changes`, `test_clearing_a_pin_makes_it_evictable` |
 | Resumable | `test_reopen_keeps_entries_bytes_and_lru_order`, `test_reopen_order_does_not_come_from_mtimes`, `test_reopen_ignores_staging_leftovers_from_a_crash`, `test_reopen_with_a_smaller_budget_evicts_lru_but_keeps_pins` |
 | Determinism | `test_same_operations_give_the_same_cache` |
+| Shared root: concurrent processes/threads never fail, never serve partial bytes, fill once | `test_w15_concurrency.py`: `test_two_processes_filling_one_root_never_fail_and_fill_each_digest_once`, `test_racing_processes_under_eviction_pressure_stay_consistent`, `test_opening_a_cache_never_sweeps_a_live_fill`, `test_a_second_instance_sees_the_first_instances_fill`, `test_threads_sharing_one_instance_do_not_interleave`, `test_index_writes_are_atomic_for_a_reader`, `test_the_lock_file_is_never_an_entry` |
 | Path safety | `test_bad_digest_refused_everywhere[*]`, `test_prefetch_refuses_a_grant_with_a_bad_digest_before_any_request` |
 | Prefetch via W4 presigned ingest | `test_prefetch_hit_makes_no_request`, `test_prefetch_refused_by_ingest_admits_nothing[*]`, torch `test_prefetch_miss_ingests_admits_and_then_hits` |
 | Invariant 1 pair | `test_inv1_prefetch_cache_unchanged_when_unarmed` + `test_inv1_prefetch_cache_armed_nonempty_lane_d_effect` |

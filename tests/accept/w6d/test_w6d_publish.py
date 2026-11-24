@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import socket
+import types
 from pathlib import Path
 
 import pytest
@@ -382,3 +383,46 @@ def test_evidence_names_the_pool_d_bucket():
     doc = _evidence_doc()
     assert doc["bucket"] and doc["prefix"]
     assert doc["bucket"] != "fixture"
+
+
+def test_retention_cli_reads_embargo_hours_from_the_chain_config(tmp_path, monkeypatch):
+    """Item 7: `retention` without `--embargo-hours` keeps snapshots for
+    `[lane_d] embargo_hours` of the chain config (the loader's default
+    chain.toml, or `--chain-toml`), never a hard-coded 48."""
+    import cascade.shared.config as config_pkg
+
+    mod, mans, pins, root, _old_wid = _retention_world(tmp_path)
+    seen, used = [], []
+
+    def fake_load(path=None, **_kw):
+        seen.append(path)
+        return types.SimpleNamespace(lane_d=types.SimpleNamespace(embargo_hours=6.0))
+
+    real_plan = mod.retention_plan
+
+    def spy_plan(*a, **kw):
+        used.append(kw.get("embargo_hours"))
+        return real_plan(*a, **kw)
+
+    monkeypatch.setattr(config_pkg, "load_chain_config", fake_load)
+    monkeypatch.setattr(mod, "retention_plan", spy_plan)
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"entries": {
+        "e1": {"status": "pending", "reveal_ts": mans[1]["as_of_ts"] + 48 * 3600,
+               "frozen_set": None}}}))
+    argv = ["retention", "--pins", str(pins), "--local-root", str(root), "--state", str(state)]
+    assert mod.main(argv) == 0
+    assert used == [6.0], f"retention did not use [lane_d] embargo_hours: {used}"
+    assert seen == [None]
+    toml = tmp_path / "chain.toml"
+    toml.write_text("")
+    assert mod.main([*argv, "--chain-toml", str(toml)]) == 0
+    assert seen[-1] == toml and used[-1] == 6.0
+    assert mod.main([*argv, "--embargo-hours", "12"]) == 0           # the flag still wins
+    assert used[-1] == 12.0 and len(seen) == 2
+    # the library default is the loader's, never a second literal
+    from cascade.shared.config.lane_d import LaneDConfig
+
+    monkeypatch.setattr(mod, "retention_plan", real_plan)
+    st = json.loads(state.read_text())
+    assert real_plan(pins, st) == real_plan(pins, st, embargo_hours=LaneDConfig.embargo_hours)

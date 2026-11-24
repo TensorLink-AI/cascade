@@ -19,7 +19,18 @@ through presigned GETs, into a local cache keyed by the entry digest:
   the entries and their order. Staging directories left by a crash are
   removed at open and are never entries.
 
-The cache owns ``root``: one :class:`PrefetchCache` per root at a time.
+* **Shared root, one writer at a time.** Several processes (two validators on
+  one eval host, every ``forecast`` request opening its own cache) may share
+  ``root``. Every operation holds an exclusive ``fcntl.flock`` on
+  ``root/.lane_d_cache.lock`` (plus a thread lock per instance) and first
+  re-reads the index, so each instance acts on the shared state, not on a
+  stale copy. A ``put`` holds the lock through its ``fill``: a second filler
+  of the same digest waits and then hits, and the staging sweep at open never
+  removes a live fill's staging directory (testnet E2E: the sweep and a
+  concurrent replace raised ``FileNotFoundError``). Entries are published by
+  ``os.replace`` of a fully hashed staging directory and the index by
+  ``os.replace`` of a temp file in ``root``, so a reader never sees a partial
+  entry or index.
 
 :func:`prefetch_grant` fills the cache through W4's
 :func:`cascade.eval.lane_d_ingest.ingest_presigned`, so every ingest guard
@@ -35,6 +46,8 @@ WARNING ``lane_d_cache_corrupt``, WARNING ``lane_d_cache_refused <code>``.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import json
 import logging
@@ -42,6 +55,8 @@ import os
 import re
 import shutil
 import stat
+import tempfile
+import threading
 from pathlib import Path
 
 from ..lane_d.intake import manifest_digest
@@ -50,6 +65,7 @@ log = logging.getLogger("cascade.eval.lane_d_cache")
 
 CACHE_CODES = ("bad_digest", "digest_mismatch", "over_budget")
 INDEX_FILE = ".lane_d_cache_index.json"
+LOCK_FILE = ".lane_d_cache.lock"
 INDEX_VERSION = 1
 STAGING_MARK = ".staging-"
 INGEST_SUBDIR = ".ingest"
@@ -150,10 +166,53 @@ class PrefetchCache:
         self._clock = 0
         self._entries: dict[str, tuple[int, int]] = {}   # digest -> (tick, size)
         self._staged = 0
+        self._tlock = threading.RLock()
+        self._depth = 0
         self.root.mkdir(parents=True, exist_ok=True)
-        self._recover()
-        self._fit_budget_at_open()
-        self._save()
+        with self._locked(sync=False):
+            self._recover()
+            self._fit_budget_at_open()
+            self._save()
+
+    @contextlib.contextmanager
+    def _locked(self, *, sync: bool = True):
+        """Hold this instance's thread lock and the root's exclusive
+        ``flock`` (re-entrant within the instance). On the outermost entry
+        the shared index is re-read (``sync``), so the operation sees every
+        other process's admissions and evictions."""
+        with self._tlock:
+            if self._depth:
+                self._depth += 1
+                try:
+                    yield
+                finally:
+                    self._depth -= 1
+                return
+            fd = os.open(self.root / LOCK_FILE,
+                         os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o644)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                self._depth = 1
+                try:
+                    if sync:
+                        self._sync()
+                    yield
+                finally:
+                    self._depth = 0
+            finally:
+                os.close(fd)        # closing the descriptor releases the flock
+
+    def _sync(self) -> None:
+        """Adopt the shared index (another process may have admitted or
+        evicted since this instance last looked). Only entries whose
+        directory exists are kept; an unreadable index keeps the current
+        view."""
+        indexed = self._load_index()
+        if indexed is None:
+            return
+        self._entries = {d: v for d, v in indexed.items() if (self.root / d).is_dir()}
+        if self._entries:
+            self._clock = max(self._clock, max(t for t, _ in self._entries.values()))
 
     # ── public API ──────────────────────────────────────────────────────────
 
@@ -168,16 +227,22 @@ class PrefetchCache:
 
     def entries(self) -> list[str]:
         """Cached digests, least recently used first."""
-        return [d for d, _ in sorted(self._entries.items(), key=lambda kv: kv[1][0])]
+        with self._locked():
+            return [d for d, _ in sorted(self._entries.items(), key=lambda kv: kv[1][0])]
 
     def total_bytes(self) -> int:
-        return sum(size for _, size in self._entries.values())
+        with self._locked():
+            return sum(size for _, size in self._entries.values())
 
     def get(self, digest: str) -> Path | None:
         """The verified entry at ``root/<digest>`` (now most recently used), or
         ``None``. Every call re-hashes every file; a corrupt entry is deleted
         and never served."""
         _check_digest(digest)
+        with self._locked():
+            return self._get(digest)
+
+    def _get(self, digest: str) -> Path | None:
         if digest not in self._entries:
             return None
         path = self.root / digest
@@ -195,12 +260,18 @@ class PrefetchCache:
 
     def put(self, digest: str, fill) -> Path:
         """Admit ``digest`` by running ``fill(staging_dir)``; a verified cached
-        digest is a hit and ``fill`` is not called."""
+        digest is a hit and ``fill`` is not called. The root lock is held
+        through ``fill``, so a concurrent filler of the same digest waits and
+        then hits."""
         try:
             _check_digest(digest)
         except CacheError as e:
             self._refused(e, digest)
             raise
+        with self._locked():
+            return self._put(digest, fill)
+
+    def _put(self, digest: str, fill) -> Path:
         if digest in self._entries:
             hit = self.get(digest)
             if hit is not None:
@@ -229,11 +300,14 @@ class PrefetchCache:
         return final
 
     def ensure(self, digest: str, fill) -> Path:
-        """``get`` the entry, else ``put`` it (a corrupt entry is refetched)."""
-        hit = self.get(digest)
-        if hit is not None:
-            return hit
-        return self.put(digest, fill)
+        """``get`` the entry, else ``put`` it (a corrupt entry is refetched),
+        under one hold of the root lock."""
+        _check_digest(digest)
+        with self._locked():
+            hit = self._get(digest)
+            if hit is not None:
+                return hit
+            return self.put(digest, fill)
 
     # ── internals ───────────────────────────────────────────────────────────
 
@@ -279,18 +353,19 @@ class PrefetchCache:
         log.warning("lane_d_cache_refused %s digest=%s detail=%s", e.code,
                     str(digest)[:80], e.detail)
 
-    def _load_index(self) -> dict[str, tuple[int, int]]:
+    def _load_index(self) -> dict[str, tuple[int, int]] | None:
+        """The index's entries, or ``None`` when it is absent or unreadable."""
         path = self.root / INDEX_FILE
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
         except (FileNotFoundError, ValueError, OSError):
-            return {}
+            return None
         if not isinstance(raw, dict) or raw.get("version") != INDEX_VERSION:
-            return {}
+            return None
         out: dict[str, tuple[int, int]] = {}
         entries = raw.get("entries")
         if not isinstance(entries, dict):
-            return {}
+            return None
         for d, meta in entries.items():
             if not (isinstance(d, str) and _HEX64.fullmatch(d) and isinstance(meta, dict)):
                 continue
@@ -304,12 +379,16 @@ class PrefetchCache:
         return out
 
     def _recover(self) -> None:
-        indexed = self._load_index()
+        indexed = self._load_index() or {}
         on_disk: list[str] = []
         for p in sorted(self.root.iterdir()):
             name = p.name
             if name.startswith(".") and STAGING_MARK in name:
-                _rmtree(p)          # a crash's staging leftover: never an entry
+                # A crash's staging leftover: never an entry. Safe under the
+                # root lock: a live fill holds that lock until it publishes.
+                _rmtree(p)
+            elif name.startswith(f"{INDEX_FILE}.tmp-"):
+                _rmtree(p)          # an index write a crash interrupted
             elif _HEX64.fullmatch(name) and p.is_dir() and not p.is_symlink():
                 on_disk.append(name)
         for d in on_disk:
@@ -348,12 +427,19 @@ class PrefetchCache:
         body = {"version": INDEX_VERSION, "clock": self._clock,
                 "entries": {d: {"tick": t, "size": s}
                             for d, (t, s) in sorted(self._entries.items())}}
-        tmp = self.root / f"{INDEX_FILE}.tmp-{os.getpid()}"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(body, f, sort_keys=True, separators=(",", ":"))
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, self.root / INDEX_FILE)
+        # A unique temp file in root, then an atomic replace: a reader sees the
+        # old index or the new one, never a partial write.
+        fd, tmp = tempfile.mkstemp(prefix=f"{INDEX_FILE}.tmp-", dir=self.root)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(body, f, sort_keys=True, separators=(",", ":"))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.root / INDEX_FILE)
+        except BaseException:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(tmp)
+            raise
 
 
 def prefetch_grant(cache: PrefetchCache, grant: dict, *, contract=None,
