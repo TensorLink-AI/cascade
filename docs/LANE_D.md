@@ -34,7 +34,7 @@ A lane D entry is a standard `cascade_pyramid` checkpoint directory holding
 
 | File | Rule |
 |---|---|
-| `config.json` | The contract's model config; its `"moe"` object must equal the contract's (`config_mismatch` otherwise) |
+| `config.json` | The contract's model config, pinned **whole** at `ready` (`cascade/lane_d/entry_config.py`): top-level keys only from `arch`, `base_arch` (= `cascade_pyramid`), `input_transform`, `moe`, `power_ema`, `quantile_levels` (the pyramid's 21 levels), and `moe` keys exactly `CascadeMoEConfig`'s fields; anything else is `409 config_key_not_allowed` / `config_value_not_allowed` / `config_unreadable`. At ingest its `"moe"` object must equal the contract's (`config_mismatch` otherwise) |
 | `model.py` | Byte-identical to the repo's `cascade/trainer/pyramid_model.py` (`code_mismatch` otherwise) |
 | `forecast_wrapper.py` | Byte-identical to the repo's `cascade/trainer/pyramid_wrapper.py` |
 | `weights.safetensors` | BF16 tensors only, the contract's tensor names and shapes, every value finite |
@@ -56,6 +56,28 @@ worker-image repin.
 Context is not a checkpoint property. At `ready` you declare the context your
 entry is judged at, one of `[lane_d] contexts`. The weights load at any
 context because the positional buffers are non-persistent.
+
+**Why `moe.context_length` stays 4096 at every declared context.** The
+contract pins `"moe": {"context_length": 4096, ...}` and ingest requires the
+entry's `"moe"` to equal it, so a 128k declaration still ships 4096 there.
+That is intended, not a cap: the field is positional *metadata*, not a limit
+the scored model enforces.
+
+- The pyramid model never reads `context_length` (or `max_patches`): time
+  attention uses xPos rotary terms computed per forward from the non-persistent
+  `inv_freq` / `zeta` buffers, so there is no learned position table and no
+  sequence-length bound in the weights.
+- The lane D scorer (`cascade/eval/lane_d_scorer.py` `_load_model`) builds the
+  model from the entry's `"moe"` with `context_length` replaced by the
+  context the entry is run at (its effective context, up to 131072), and feeds
+  each window its own no-pad history up to that context.
+- The only reader that would honour 4096 is the pinned `forecast_wrapper.py`
+  edge-pad, which lane D scoring never uses.
+
+Pinning the field keeps every entry's `config.json` identical to the
+contract's (the `config_mismatch` rule) while the context stays a declared
+scorer setting; quality beyond the 4096-point training rows is what T7 and the
+arming gates measure.
 
 - **Declarable from launch:** `contexts = [4096, 8192, 16384, 32768, 65536,
   131072]` (4k to 128k). You may declare any of them; a value outside
