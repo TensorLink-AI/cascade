@@ -184,8 +184,15 @@ failure W-IMG must prevent. Places that compare against a fixed pin today
 `funding/{step_rates,lane_b_gpus}.py`, `audit/checks.py`. W-IMG's test: an
 epoch whose king and challenger ran image X passes; mixed images in one
 epoch are refused; a new image at the next seed-epoch boundary passes with
-no validator code or config change. **[DECIDE]** owner sign-off on the
-contract change before W-IMG is built.
+no validator code or config change. **DECIDED (owner 2026-11-24, the
+deliberate reproducibility-contract decision; verbatim):** "can we relax
+need for image to be pinned"; "we need a system so that we roll all these
+lanes out, validators only need to update for major upgrades, not if we
+tweak training image or comp rules"; "we just log what image pin was used,
+it's auditable". Lane A keeps the image inside each leg's `contract_digest`
+(duel reproducibility intact); only the fixed config pin goes, replaced by
+the one-image-per-seed-epoch rule, released then activated by a typed
+seed-epoch-boundary block.
 
 ### (f) Emission split A 0 / B 35 / C 15 / D 50 (owner 2026-11-24), by overlay
 
@@ -227,7 +234,7 @@ same against the DEPLOYED mainnet chain.toml with the mainnet file
 | WP | What | Keys / fields | Depends | Runs in | Accept |
 |---|---|---|---|---|---|
 | W-OV | **(rev6.24)** Signed-overlay envelope: `netconfig_bounds` (`BOUNDS`, `RELEASE_ONLY_KEYS`, `PINNED_REF_KEYS`, no-clamp shares), called by `check_overrides` / `build_config`, published by `overlay_policy()`; lane C eval data in `ALLOWED["marketcast"]`; DEC-CA-0057 amendment; the (f) split overrides in `deploy/overlays/` with the lane A = 0 vector test | table (b), (f) | W2 | ci | `scripts/laned/accept W-OV` |
-| W-IMG | **(rev6.24, [DECIDE] before build)** Image recorded per leg (lanes B–D, audit reports it); lane A same-image-within-seed-epoch rule replacing fixed-pin comparisons; image changes only at a seed-epoch boundary; measured-wall gate per recorded image, else the 5 h cap | (e) | W-OV | ci + testnet | `scripts/laned/accept W-IMG` |
+| W-IMG | **(rev6.24, DECIDED owner 2026-11-24, see (e))** Image recorded per leg (lanes B–D, audit reports it); lane A same-image-within-seed-epoch rule replacing fixed-pin comparisons; image changes only at a seed-epoch boundary; measured-wall gate per recorded image, else the 5 h cap | (e) | W-OV | ci + testnet | `scripts/laned/accept W-IMG` |
 
 ## rev6.23 (owner 2026-11-24; main @ b65f25d): lane D court pays 80 / 15 / 5
 
