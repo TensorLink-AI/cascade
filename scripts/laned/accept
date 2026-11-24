@@ -2087,6 +2087,71 @@ def selftest_w3a_nolock_evidence() -> list[str]:
     return failures
 
 
+def selftest_wb19_partial_evidence() -> list[str]:
+    """check_json_evidence (rev6.16): WB19 evidence with passed: false is
+    accepted only when coverage is its sole failing check, the coverage detail
+    names the missing SKUs (none of them measured) and body_sha256 matches."""
+    import copy
+    import hashlib
+
+    failures: list[str] = []
+
+    def seal(d: dict) -> dict:
+        d = {k: v for k, v in d.items() if k != "body_sha256"}
+        d["body_sha256"] = hashlib.sha256(json.dumps(
+            d, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+        return d
+
+    base = seal({
+        "schema": "laned_wb19/1", "wp": "WB19", "passed": False,
+        "checks": [{"name": "coverage", "passed": False,
+                    "detail": "missing expert runs: ['8xH100', '4xH200']"},
+                   {"name": "full_leg", "passed": True, "detail": "skipped"},
+                   {"name": "memory", "passed": True, "detail": "fits"}],
+        "runs": [], "table": {"rows": {"8xH200": {"steps_per_s": 0.05},
+                                       "8xRTX4090": {"steps_per_s": 0.13}}},
+        "lane_a_full_leg": None, "oa8_sha256": None})
+
+    def variant(edit, *, reseal: bool = True) -> str:
+        d = copy.deepcopy(base)
+        edit(d)
+        return json.dumps(seal(d) if reseal else d)
+
+    def check(i: int, **kw):
+        def f(d):
+            d["checks"][i].update(kw)
+        return f
+
+    cases = [
+        ("partial-coverage-only", json.dumps(base), "WB19", True),
+        ("partial-memory-also-fails", variant(check(2, passed=False)), "WB19", False),
+        ("partial-full-leg-fails", variant(check(1, passed=False)), "WB19", False),
+        ("partial-only-memory-fails", variant(lambda d: (d["checks"][0].update(
+            passed=True), d["checks"][2].update(passed=False))), "WB19", False),
+        ("partial-no-missing-named", variant(check(0, detail="missing expert runs: []")),
+         "WB19", False),
+        ("partial-detail-unparseable", variant(check(0, detail="some are missing")),
+         "WB19", False),
+        ("partial-names-a-measured-sku", variant(check(
+            0, detail="missing expert runs: ['8xH200', '8xH100']")), "WB19", False),
+        ("partial-no-rows", variant(lambda d: d["table"].update(rows={})), "WB19", False),
+        ("partial-checks-malformed", variant(lambda d: d.update(checks="coverage")),
+         "WB19", False),
+        ("partial-hand-edited", variant(lambda d: d["table"]["rows"]["8xH200"].update(
+            steps_per_s=9.9), reseal=False), "WB19", False),
+        ("partial-no-sha", variant(lambda d: d.pop("body_sha256"), reseal=False),
+         "WB19", False),
+        ("wb19-passed-true", json.dumps({"wp": "WB19", "passed": True}), "WB19", True),
+        ("other-wp-partial-shape", json.dumps({**base, "wp": "WB22"}), "WB22", False),
+    ]
+    for name, text, wp, want in cases:
+        ok, why = lanedlib.check_json_evidence(text, wp)
+        if ok != want:
+            failures.append(f"wb19-evidence {name}: {'accepted' if ok else 'refused'} ({why}), "
+                            f"want {'accept' if want else 'refuse'}")
+    return failures
+
+
 SELFTEST_CROSS_PLAN = """# plan
 
 | WP | What | Depends | Runs in | Accept |
@@ -2998,6 +3063,7 @@ def cmd_selftest() -> int:
     failures += selftest_verification(ident)
     failures += selftest_evidence(ident)
     failures += selftest_w3a_nolock_evidence()
+    failures += selftest_wb19_partial_evidence()
     failures += selftest_cross(ident)
     failures += selftest_freshness(ident)
     failures += selftest_batch(ident)
