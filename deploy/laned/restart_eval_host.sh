@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Sync the private eval host (a rented pod; the validator reaches it over ssh
 # per eval) to a release: copy the release's tracked files to --remote-dir,
-# `uv sync --frozen`, import-probe the worker. Every ssh pins the pod's host
+# `uv sync --frozen --inexact`, import-probe the worker. Every ssh pins the pod's host
 # key (--known-hosts, StrictHostKeyChecking=yes). First in the S5 order
 # (plan §10.5); rollback §10.8: the same script with the release/previous
 # flags swapped. Always run --dry-run first. See lib.sh.
