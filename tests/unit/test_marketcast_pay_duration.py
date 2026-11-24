@@ -106,8 +106,9 @@ def test_shipped_configs_carry_the_duration_terms_and_no_retired_keys():
         lc = load_chain_config(ROOT / f).lane_c
         assert (lc.full_pay_min_days, lc.full_pay_max_days, lc.full_pay_max_gain) == (
             5.0, 20.0, 0.05)
-    # the lane C activation the owner typed is untouched
-    assert load_chain_config(ROOT / "chain.toml").lane_c.from_block == 9579600
+    # the lane C activation the owner typed (moved to 9586800 by #870) is untouched
+    main = load_chain_config(ROOT / "chain.toml")
+    assert main.lane_c.from_block == 9586800 == main.marketcast.from_block
 
 
 def test_old_keys_are_retired_ignored_at_load_and_refused_in_overlays():
