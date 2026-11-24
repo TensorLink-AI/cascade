@@ -374,7 +374,7 @@ def judge_marketcast_entry(entry: LaneCEntry, rows: MktEntryRows | None, *, mc, 
     vs = holder_gain(rows, mc, k=k, seed=seed)
     if vs is not None:
         rec["vs_holder"] = vs        # owner 2026-11-18: the paired slot test
-    if rows.draw:
+    if getattr(rows, "draw", None):
         # DEC-CA-0073 (c): which rule drew the windows, and the forward /
         # backtest sub-scores (reported; the verdict is the combined set's)
         rec["draw"] = {k_: rows.draw.get(k_) for k_ in ("rule", "block", "block_hash", "phase",
