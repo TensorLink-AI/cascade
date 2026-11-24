@@ -29,6 +29,12 @@ every leg) or, tested loosely, a free pass. Such domains are POOLED into one
 ``"_rest"`` guard instead, so they are still guarded in aggregate; only when
 even the pool is too small is that recorded as unguarded.
 
+Suite targets (WB26; DEC-CA-0071 §2-§3, Amendment rev6.19): a ``suite:<s>``
+target is judged on the whole suite's paired public items — CRPS OR MASE
+``LCB_{α/(2k)} ≥ gain_margin_public`` with a positive point gain, the other
+metric ``LCB_α ≥ −tau_public`` — and its leg also needs the whole-pool point
+gain ≥ 0 (guard 4) and every guard to hold against a fixed anchor king.
+
 Pure numpy, deterministic in ``seed`` (each test derives its own sub-seed), so
 validators and ``cascade-audit`` replay it bit-for-bit.
 """
@@ -63,6 +69,10 @@ class ExpertLaneParams:
     min_target_clusters: int = 5        # distinct sources among the target windows
     min_guard_windows: int = 50
     min_public_items: int = 10
+    # WB26 (DEC-CA-0071 §2-§3, Amendment rev6.19): suite targets only
+    gain_margin_public: float = 0.01    # CRPS OR MASE LCB_{alpha/(2k)} bar
+    tau_anchor_public: float = 0.0      # anchor guard, public metrics
+    tau_anchor_domain: float = 0.0      # anchor guard, pool domains / horizons
 
 
 DEFAULT_PARAMS = ExpertLaneParams()
@@ -81,7 +91,11 @@ class ExpertVerdict:
     unguarded: list[str] = field(default_factory=list)
     target_gain: float = float("nan")    # point estimate of rel on the target windows
     target_clusters: int = 0
-    inconclusive: str = ""               # "" | "windows" | "clusters"
+    inconclusive: str = ""               # "" | "windows" | "clusters" | "items"
+    # WB26: a suite target's either-metric gain record (``{}`` otherwise) and
+    # the leg's suite guards (guard 4 + anchor), copied like ``guard_lcbs``
+    suite: dict = field(default_factory=dict)
+    suite_guards: dict = field(default_factory=dict)
 
 
 def paired_geomean_lcb(king: Sequence[float], chal: Sequence[float], *, alpha: float,
@@ -99,6 +113,18 @@ def paired_geomean_lcb(king: Sequence[float], chal: Sequence[float], *, alpha: f
     idx = np.random.default_rng(_seed_to_int(seed)).integers(0, n, size=(B, n))
     d = (c[idx] - k[idx]).mean(axis=1)          # log geomean ratio chal/king per bag
     return float(np.quantile(1.0 - np.exp(d), alpha))
+
+
+def paired_geomean_point(king: Sequence[float], chal: Sequence[float]) -> float:
+    """The full-sample ``1 − geomean(chal)/geomean(king)`` (the identity bag of
+    :func:`paired_geomean_lcb`). NaN when empty."""
+    k = np.log(np.maximum(np.asarray(king, dtype=np.float64), 1e-12))
+    c = np.log(np.maximum(np.asarray(chal, dtype=np.float64), 1e-12))
+    if k.shape != c.shape or k.ndim != 1:
+        raise ValueError(f"paired 1-D scores required; got {k.shape} vs {c.shape}")
+    if k.size == 0:
+        return float("nan")
+    return float(1.0 - np.exp((c - k).mean()))
 
 
 def paired_point_rel(kq, ka, km, cq, ca, cm, clusters=None) -> float:
@@ -235,6 +261,21 @@ class TargetsVerdict:
 
 
 HORIZON_PREFIX = "horizon:"
+# DEC-CA-0071 §1 (WB26): a suite target ``suite:<s>`` is judged on the whole
+# suite's paired public items ``<s>_crps`` / ``<s>_mase``
+SUITE_PREFIX = "suite:"
+SUITE_METRICS = ("crps", "mase")
+ANCHOR_MISSING = "anchor_missing"
+
+
+def is_suite_target(target: str) -> bool:
+    return str(target).startswith(SUITE_PREFIX)
+
+
+def suite_keys(target: str) -> tuple[str, ...]:
+    """The public guard keys a suite target is judged on (``gift_crps`` …)."""
+    s = str(target)[len(SUITE_PREFIX):]
+    return tuple(f"{s}_{m}" for m in SUITE_METRICS)
 
 
 def _target_mask(target: str, dom: np.ndarray, hz: np.ndarray | None) -> np.ndarray:
@@ -244,6 +285,73 @@ def _target_mask(target: str, dom: np.ndarray, hz: np.ndarray | None) -> np.ndar
             return np.zeros(dom.shape[0], dtype=bool)
         return hz == h
     return dom == target
+
+
+def _nan_max(xs) -> float:
+    xs = [float(x) for x in xs if x is not None and math.isfinite(float(x))]
+    return max(xs) if xs else float("nan")
+
+
+def _suite_gain(v: ExpertVerdict, t: str, public, p: ExpertLaneParams, gain_alpha: float,
+                s: str) -> bool:
+    """WB26 / DEC-CA-0071 Amendment rev6.19: the either-metric gain test of
+    suite target ``t``; fills ``v`` and returns True when conclusive.
+
+    CRPS OR MASE ``LCB_{gain_alpha} ≥ gain_margin_public`` with a strictly
+    positive point gain (``gain_alpha`` = alpha / (2k): Bonferroni over the
+    two metrics on top of the leg's alpha / k); the metric that did not clear
+    must be non-inferior, ``LCB_alpha ≥ −tau_public`` (guard level). The
+    win's ``target_lcb`` (full-pay tier input) is the SMALLER gain LCB among
+    the cleared metrics; with none cleared, the larger of the two."""
+    keys = suite_keys(t)
+    pub = public or {}
+    n_items = min((len(pub[k][0]) for k in keys), default=0) if all(k in pub for k in keys) else 0
+    v.target_n = v.target_clusters = int(n_items)
+    if n_items < p.min_public_items:
+        v.reason = f"inconclusive: {n_items} suite items < {p.min_public_items}"
+        v.inconclusive = "items"
+        return False
+    lcb, gain = {}, {}
+    for m, k in zip(SUITE_METRICS, keys, strict=True):
+        kk, cc = pub[k]
+        lcb[m] = paired_geomean_lcb(kk, cc, alpha=gain_alpha, B=p.B, seed=f"{s}|gain|{t}|{m}")
+        gain[m] = paired_geomean_point(kk, cc)
+    cleared = [m for m in SUITE_METRICS
+               if lcb[m] >= p.gain_margin_public and gain[m] > 0.0]     # NaN fails
+    noninf_metric, noninf_lcb = "", None
+    if len(cleared) == 1:
+        noninf_metric = next(m for m in SUITE_METRICS if m not in cleared)
+        kk, cc = pub[keys[SUITE_METRICS.index(noninf_metric)]]
+        noninf_lcb = paired_geomean_lcb(kk, cc, alpha=p.alpha, B=p.B,
+                                        seed=f"{s}|noninf|{t}|{noninf_metric}")
+    if cleared:
+        v.target_lcb = min(lcb[m] for m in cleared)
+        v.target_gain = min(gain[m] for m in cleared)
+    else:
+        v.target_lcb = _nan_max(lcb.values())
+        v.target_gain = _nan_max(gain.values())
+    v.suite = {
+        "cleared_metric": "both" if len(cleared) == 2 else (cleared[0] if cleared else ""),
+        "crps_lcb": lcb["crps"], "mase_lcb": lcb["mase"],
+        "crps_gain": gain["crps"], "mase_gain": gain["mase"],
+        "noninf_metric": noninf_metric, "noninf_lcb": noninf_lcb,
+        "gain_alpha": float(gain_alpha), "n_items": int(n_items),
+    }
+    return True
+
+
+def _suite_reason(v: ExpertVerdict, p: ExpertLaneParams) -> str:
+    """'' when the suite gain side passes, else why not."""
+    sg = v.suite
+    if not sg.get("cleared_metric"):
+        return (f"no gain: neither CRPS LCB {sg['crps_lcb']:.4f} nor MASE LCB "
+                f"{sg['mase_lcb']:.4f} (with a positive point gain) >= margin "
+                f"{p.gain_margin_public}")
+    ni = sg.get("noninf_lcb")
+    if sg.get("noninf_metric") and not (ni is not None and ni >= -p.tau_public):
+        return (f"regression on {v.target_domain} {sg['noninf_metric']}: LCB "
+                f"{float('nan') if ni is None else ni:.4f} < -{p.tau_public}")
+    return ""
 
 
 def judge_expert_targets(
@@ -259,6 +367,7 @@ def judge_expert_targets(
     horizons: Sequence[int | None] | None = None,
     horizon_targets: Sequence[str] = (),
     guards_only: bool = False,
+    anchor: Mapping | None = None,
 ) -> TargetsVerdict:
     """Judge one lane-B leg on each of its declared ``targets`` (DEC-CA-0059).
 
@@ -268,14 +377,26 @@ def judge_expert_targets(
       gain_margin`` and a positive point gain — at ``alpha / k`` for k
       declared targets (Bonferroni across the leg's own targets, on top of
       any other correction). Seeds ``<seed>|gain|<target>``.
+    * **Suite target** ``suite:<s>`` (WB26, DEC-CA-0071 Amendment rev6.19):
+      the either-metric gain test of :func:`_suite_gain` on the paired
+      ``public`` items ``<s>_crps`` / ``<s>_mase`` at ``alpha / (2k)``; those
+      two keys are never also guards.
     * **Guards, once**, at ``alpha`` (intersection-union: no correction):
       every pool domain not declared (small ones pooled into ``_rest``, as
       today), every configured horizon target not declared
       (``horizon_targets``), and every public metric — each ``LCB ≥ −tau``.
+      A leg declaring a suite target also needs **guard 4** (the whole-pool
+      point gain ≥ 0) and the **anchor guard**: the domain / horizon / public
+      guards re-run against ``anchor`` (``{"pointer", "qloss", "abs", "mase",
+      "public"}``: the anchor king's per-window scores on the SAME windows and
+      its paired ``{name: (anchor_items, chal_items)}``) at
+      ``tau_anchor_domain`` / ``tau_anchor_public``; ``anchor=None`` or a
+      guarded name the anchor lacks fails the guards (``anchor_missing``).
       Any guard failure blocks EVERY target of the leg.
 
     A single domain target with no horizon targets is exactly
-    :func:`judge_expert_leg` (same seeds, guards, order and reasons)."""
+    :func:`judge_expert_leg` (same seeds, guards, order and reasons); a leg
+    with no suite target is judged exactly as before WB26."""
     p = params
     tg = tuple(str(t) for t in targets)
     if (not tg and not guards_only) or len(set(tg)) != len(tg):
@@ -294,9 +415,18 @@ def judge_expert_targets(
             raise ValueError("horizons must label every window")
     s = str(seed)
     out = TargetsVerdict(targets=tg, alpha=pt.alpha)
+    suites = [t for t in tg if is_suite_target(t)]
+    suite_own = {key for t in suites for key in suite_keys(t)}
 
     conclusive = []
     for t in tg:
+        if is_suite_target(t):
+            v = ExpertVerdict(passed=False, reason="", target_domain=t,
+                              target_lcb=float("nan"), target_n=0)
+            out.verdicts[t] = v
+            if _suite_gain(v, t, public, p, pt.alpha / 2.0, s):
+                conclusive.append(v)
+            continue
         tmask = _target_mask(t, dom, hz)
         tn = int(tmask.sum())
         v = ExpertVerdict(passed=False, reason="", target_domain=t,
@@ -326,6 +456,7 @@ def judge_expert_targets(
     guard_n: dict[str, int] = {}
     public_lcbs: dict[str, float] = {}
     unguarded: list[str] = []
+    masks: dict[str, np.ndarray] = {}            # guard name -> its windows (anchor reuse)
     declared = set(tg)
     small = np.zeros(dom.shape[0], dtype=bool)
     for d in sorted({str(x) for x in dom if x not in declared}):
@@ -333,6 +464,7 @@ def judge_expert_targets(
         n = int(m.sum())
         if n >= p.min_guard_windows:
             guard_n[d] = n
+            masks[d] = m
             guard_lcbs[d] = _domain_lcb(m, clusters, kq, ka, km, cq, ca, cm, p, f"{s}|guard|{d}")
         else:
             small |= m
@@ -341,6 +473,7 @@ def judge_expert_targets(
         n = int(small.sum())
         if n >= p.min_guard_windows:
             guard_n[REST_GUARD] = n
+            masks[REST_GUARD] = small
             guard_lcbs[REST_GUARD] = _domain_lcb(
                 small, clusters, kq, ka, km, cq, ca, cm, p, f"{s}|guard|{REST_GUARD}")
             unguarded = []
@@ -351,11 +484,14 @@ def judge_expert_targets(
         n = int(m.sum())
         if n >= p.min_guard_windows:
             guard_n[str(t)] = n
+            masks[str(t)] = m
             guard_lcbs[str(t)] = _domain_lcb(m, clusters, kq, ka, km, cq, ca, cm, p,
                                              f"{s}|guard|{t}")
         else:
             unguarded.append(str(t))
     for name, (kk, c) in sorted((public or {}).items()):
+        if name in suite_own:
+            continue                     # the suite target's own metrics: the gain test
         if len(kk) < p.min_public_items:
             unguarded.append(name)
             continue
@@ -372,20 +508,73 @@ def judge_expert_targets(
             if not lcb >= -p.tau_public:
                 out.guard_reason = f"regression on {name}: LCB {lcb:.4f} < -{p.tau_public}"
                 break
+    suite_guards: dict = {}
+    if suites:
+        suite_guards, why = _suite_leg_guards(
+            anchor, masks, public_lcbs, clusters, (kq, ka, km), (cq, ca, cm), p, s)
+        if not out.guard_reason:
+            out.guard_reason = why
 
     for v in conclusive:
         v.guard_lcbs, v.guard_n = dict(guard_lcbs), dict(guard_n)
         v.public_lcbs, v.unguarded = dict(public_lcbs), list(unguarded)
-        if not v.target_lcb >= pt.gain_margin:            # NaN fails
+        v.suite_guards = dict(suite_guards)
+        if v.suite:
+            v.reason = _suite_reason(v, p)
+        elif not v.target_lcb >= pt.gain_margin:          # NaN fails
             v.reason = f"no gain: target LCB {v.target_lcb:.4f} < margin {pt.gain_margin}"
         elif not v.target_gain > 0.0:                     # a zero effect never passes
             v.reason = f"no gain: target point gain {v.target_gain:.4f} <= 0"
-        elif out.guard_reason:
+        if v.reason:
+            continue
+        if out.guard_reason:
             v.reason = out.guard_reason                    # blocks every target
         else:
             v.passed = True
             v.reason = "merge"
     return out
+
+
+def _suite_leg_guards(anchor, masks, public_lcbs, clusters, king, chal,
+                      p: ExpertLaneParams, s: str) -> tuple[dict, str]:
+    """WB26 guards of a leg declaring a suite target (DEC-CA-0071 §3): guard 4
+    (whole-pool point gain ≥ 0, the contamination tripwire) and the anchor
+    guard (every domain / horizon guard and every public guard of the leg,
+    candidate vs the anchor king). Returns ``(suite_guards record, reason)``;
+    reason ``""`` = both pass."""
+    kq, ka, km = king
+    cq, ca, cm = chal
+    rec: dict = {"pool_gain": paired_point_rel(kq, ka, km, cq, ca, cm, clusters),
+                 "anchor_pointer": "", "anchor_guard_lcbs": {}, "anchor_public_lcbs": {}}
+    why = ""
+    if not rec["pool_gain"] >= 0.0:                       # NaN fails
+        why = f"regression on the whole pool: point gain {rec['pool_gain']:.4f} < 0"
+    if anchor is None:
+        return rec, why or f"{ANCHOR_MISSING}: no anchor king to guard against"
+    rec["anchor_pointer"] = str(anchor.get("pointer") or "")
+    aq, aa, am = (np.asarray(anchor[x], dtype=np.float64) for x in ("qloss", "abs", "mase"))
+    if aq.shape[0] != kq.shape[0]:
+        return rec, why or f"{ANCHOR_MISSING}: anchor windows not paired"
+    for d, m in masks.items():
+        rec["anchor_guard_lcbs"][d] = _domain_lcb(m, clusters, aq, aa, am, cq, ca, cm, p,
+                                                  f"{s}|anchor|guard|{d}")
+    apub = anchor.get("public") or {}
+    for name in public_lcbs:
+        if name not in apub or len(apub[name][0]) < p.min_public_items:
+            return rec, why or f"{ANCHOR_MISSING}: anchor has no paired {name} items"
+        ak, ac = apub[name]
+        rec["anchor_public_lcbs"][name] = paired_geomean_lcb(
+            ak, ac, alpha=p.alpha, B=p.B, seed=f"{s}|anchor|public|{name}")
+    if why:
+        return rec, why
+    for d, lcb in rec["anchor_guard_lcbs"].items():
+        if not lcb >= -p.tau_anchor_domain:
+            return rec, f"regression vs anchor on {d}: LCB {lcb:.4f} < -{p.tau_anchor_domain}"
+    for name, lcb in rec["anchor_public_lcbs"].items():
+        if not lcb >= -p.tau_anchor_public:
+            return rec, (f"regression vs anchor on {name}: LCB {lcb:.4f} < "
+                         f"-{p.tau_anchor_public}")
+    return rec, ""
 
 
 # ── payout ───────────────────────────────────────────────────────────────────

@@ -738,6 +738,12 @@ class LaneBConfig:
     max_leg_hours: float = 6.0
     max_leg_seconds: int = 27_000
     guard_factor: float = 1.25
+    # WB26 (DEC-CA-0071 §2-§3, Amendment rev6.19; CONSENSUS, read only for a
+    # leg declaring a suite target): the either-metric suite gain bar and the
+    # anchor-king guard tolerances
+    gain_margin_public: float = 0.01
+    tau_anchor_public: float = 0.0
+    tau_anchor_domain: float = 0.0
 
     def active(self, block: int | None) -> bool:
         return self.from_block > 0 and block is not None and int(block) >= self.from_block
@@ -797,6 +803,9 @@ class LaneBConfig:
             min_target_clusters=self.min_target_clusters,
             min_guard_windows=self.min_guard_windows,
             min_public_items=self.min_public_items,
+            gain_margin_public=self.gain_margin_public,
+            tau_anchor_public=self.tau_anchor_public,
+            tau_anchor_domain=self.tau_anchor_domain,
         )
 
 

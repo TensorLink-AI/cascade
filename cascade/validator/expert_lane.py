@@ -45,7 +45,12 @@ from pathlib import Path
 
 import numpy as np
 
-from ..eval.expert_lane import ExpertVerdict, TargetsVerdict, judge_expert_targets
+from ..eval.expert_lane import (
+    ExpertVerdict,
+    TargetsVerdict,
+    is_suite_target,
+    judge_expert_targets,
+)
 from ..shared.expert_manifest import ExpertEntry, ExpertManifest
 from ..shared.lane_b import DomainWin, LaneBState
 
@@ -160,11 +165,21 @@ def _arrays(scores) -> dict:
 def judge_entry(entry: ExpertEntry, *, manifest: ExpertManifest, king_pointer: str,
                 king_scores, evaluate: Callable[[str], list], fetch_dir: Callable[[str], Path],
                 cfg, seed: str, recompute_selection: Callable | None = None,
-                strict: bool = False, sentinel: str | None = None) -> ExpertJudgement:
+                strict: bool = False, sentinel: str | None = None,
+                anchor_pointer: str | None = None,
+                anchor_scores: Callable[[], list] | None = None) -> ExpertJudgement:
     """``sentinel`` is the settlement era's LANE_D_PLAN §16 suite (W-S2, D35):
     its ``<suite>_crps`` / ``<suite>_mase`` public guards are not built and
     ``require_public`` minus it is what must pair; every other guard is judged
-    exactly as unarmed. ``None`` (unarmed) is today's judgement."""
+    exactly as unarmed. ``None`` (unarmed) is today's judgement.
+
+    WB26 (DEC-CA-0071 §3 guard 5): an entry declaring a suite target is also
+    guarded against the anchor king ``anchor_pointer`` (the era's promotion
+    member, derived by the caller from the signed training manifest), scored
+    on the same windows through ``anchor_scores()`` (memoised by the caller)
+    and paired on ``public_rows["anchor"]``. A missing anchor, anchor score
+    or anchor row fails the leg's guards (``anchor_missing``). Entries with
+    no suite target never read either."""
     if manifest.king_pointer != king_pointer:
         return ExpertJudgement(entry, False, "stale",
                                f"rebased onto {manifest.king_pointer}, king is {king_pointer}")
@@ -225,6 +240,10 @@ def judge_entry(entry: ExpertEntry, *, manifest: ExpertManifest, king_pointer: s
         except MissingPublicGuard as e:
             return ExpertJudgement(entry, False, "verdict", f"public guard missing: {e}")
     hts = tuple(getattr(cfg, "horizon_target_names", ()) or ())
+    anchor_kw = {}
+    if any(is_suite_target(t) for t in declared):
+        anchor_kw = {"anchor": _anchor_input(rows, k, anchor_pointer, anchor_scores, cfg,
+                                             sentinel)}
     tv = judge_expert_targets(
         targets=declared, domains=k["domains"],
         king_qloss=k["qloss"], king_abs_target=k["abs"], king_mase=k["mase"],
@@ -232,7 +251,7 @@ def judge_entry(entry: ExpertEntry, *, manifest: ExpertManifest, king_pointer: s
         clusters=k["clusters"], public=public, params=cfg.verdict_params(),
         seed=f"{seed}|{entry.miner_hotkey}|{entry.domain}",
         horizons=[window_horizon(sid) for sid, _ in k["ids"]] if hts else None,
-        horizon_targets=hts,
+        horizon_targets=hts, **anchor_kw,
     )
     v = tv.verdicts[declared[0]]
     if len(declared) == 1:
@@ -241,6 +260,28 @@ def judge_entry(entry: ExpertEntry, *, manifest: ExpertManifest, king_pointer: s
     reason = (f"won {won}" if won else (tv.guard_reason or "no target won"))
     return ExpertJudgement(entry, bool(won), "verdict", reason, v, king_pointer=king_pointer,
                            targets=tv)
+
+
+def _anchor_input(rows: dict, king: dict, pointer: str | None,
+                  scores: Callable[[], list] | None, cfg, sentinel: str | None) -> dict | None:
+    """The anchor-guard input of :func:`judge_expert_targets` (WB26), or None
+    (``anchor_missing``) when the anchor, its scores or its rows are absent."""
+    if not pointer or scores is None or not rows.get("anchor"):
+        return None
+    from ..eval.public_guards import MissingPublicGuard, pair_public_rows, sentinel_pairing_kw
+
+    a = _arrays(scores())
+    if a["ids"] != king["ids"]:
+        return None
+    try:
+        pub = pair_public_rows(rows.get("anchor"), rows.get("candidate"),
+                               min_items=cfg.min_public_items,
+                               **sentinel_pairing_kw(rows.get("anchor"), rows.get("candidate"),
+                                                     cfg.require_public, sentinel)).public
+    except MissingPublicGuard:
+        return None
+    return {"pointer": str(pointer), "qloss": a["qloss"], "abs": a["abs"],
+            "mase": a["mase"], "public": pub}
 
 
 def _targets(cfg) -> tuple[str, ...]:
@@ -255,7 +296,19 @@ def judge_manifest(manifest: ExpertManifest, **kw) -> list[ExpertJudgement]:
     the non-finite refusal of stage ``merge`` — callers pass
     ``cfg.merge_guard_at_settlement(settlement block)``; ``sentinel``
     (keyword, default None) is the settlement era's §16 suite, left out of
-    the public guards (W-S2, D35)."""
+    the public guards (W-S2, D35); ``anchor_pointer`` (keyword, default
+    None) is the WB26 anchor king, scored at most once per manifest through
+    ``evaluate`` and only when an entry declares a suite target."""
+    if kw.get("anchor_pointer"):
+        memo: list = []
+        ap, ev = str(kw["anchor_pointer"]), kw["evaluate"]
+
+        def _anchor_scores() -> list:
+            if not memo:
+                memo.append(ev(ap))
+            return memo[0]
+
+        kw = {**kw, "anchor_scores": _anchor_scores}
     return [judge_entry(e, manifest=manifest, **kw) for e in manifest.entries
             if e.domain in _targets(kw["cfg"])]
 
@@ -322,7 +375,27 @@ def judgements_record(judgements: list[ExpertJudgement]) -> list[dict]:
             "target_lcb": None if v is None else v.target_lcb,
             "guard_lcbs": {} if v is None else v.guard_lcbs,
             "public_lcbs": {} if v is None else v.public_lcbs,
+            **_suite_fields(v),
         })
+    return out
+
+
+def _suite_fields(v: ExpertVerdict | None) -> dict:
+    """WB26 report fields of a suite-target verdict (drop-when-empty: a row
+    with no suite target keeps its bytes)."""
+    if v is None:
+        return {}
+    out = {}
+    if v.suite:
+        out["suite_gain"] = {k: _num(x) if isinstance(x, float) else x
+                             for k, x in v.suite.items()}
+        out["inconclusive"] = v.inconclusive
+    elif v.inconclusive == "items":
+        out["inconclusive"] = v.inconclusive
+    if v.suite_guards:
+        sg = dict(v.suite_guards)
+        sg["pool_gain"] = _num(sg.get("pool_gain"))
+        out["suite_guards"] = sg
     return out
 
 
@@ -349,5 +422,6 @@ def _multi_rows(j: ExpertJudgement, declared: tuple[str, ...]) -> list[dict]:
             "target_clusters": None if v is None else int(v.target_clusters),
             "inconclusive": "" if v is None else v.inconclusive,
             "guard_reason": "" if tv is None else tv.guard_reason,
+            **{k: x for k, x in _suite_fields(v).items() if k != "inconclusive"},
         })
     return rows

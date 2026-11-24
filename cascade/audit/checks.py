@@ -3218,13 +3218,19 @@ def _check_lane_b_weights(name: str, receipt: RoundReceipt, cfg: ChainConfig,
 
 
 LANE_B_STAGES = ("stale", "selection", "merge", "verdict", "targets")
+# DEC-CA-0071 §1 (WB26): a suite target's name prefix (= config.v2's
+# ``SUITE_TARGET_PREFIX``; a literal so the audit stays import-light)
+SUITE_TARGET_PREFIX = "suite:"
 
 
 def _lane_b_row_verdict(r: dict, lb, slots: tuple[str, ...]) -> str | None:
     """Why ``r`` (one lane-B verdict row) contradicts ``[lane_b]``, else None.
     A multi-target row (DEC-CA-0059, it names ``targets``) is re-derived in
     full; a single-target row carries no point gain, so only ``passed ⇒``
-    every bar is checked (its bytes are the pre-0059 row)."""
+    every bar is checked (its bytes are the pre-0059 row). A row of a leg
+    declaring a suite target (WB26) also re-derives guard 4 and the anchor
+    guard from ``suite_guards``; a suite-target row is re-derived in full from
+    ``suite_gain`` (:func:`_lane_b_suite_gain_verdict`)."""
     import math
 
     d = str(r.get("domain"))
@@ -3244,6 +3250,20 @@ def _lane_b_row_verdict(r: dict, lb, slots: tuple[str, ...]) -> str | None:
     declared = list(r.get("targets") or [d])
     if any(t in guards for t in declared):
         return f"{d}: a declared target {sorted(set(declared) & set(guards))} is also a guard"
+    suite_leg = any(str(t).startswith(SUITE_TARGET_PREFIX) for t in declared)
+    inc = str(r.get("inconclusive") or "")
+    if suite_leg:
+        own = {f"{str(t)[len(SUITE_TARGET_PREFIX):]}_{m}" for t in declared
+               if str(t).startswith(SUITE_TARGET_PREFIX) for m in ("crps", "mase")}
+        if own & set(pubs):
+            return f"{d}: a declared suite's own metric {sorted(own & set(pubs))} is also a guard"
+        if not inc:
+            ok, why = _lane_b_suite_guards_ok(r, lb, guards, pubs)
+            if why:
+                return f"{d}: {why}"
+            guards_ok = guards_ok and ok
+    if d.startswith(SUITE_TARGET_PREFIX):
+        return _lane_b_suite_gain_verdict(r, lb, d, len(declared), inc, guards_ok)
     if not multi:
         if r.get("passed") and not (lcb_ok and guards_ok):
             return f"{d}: passed with LCB {lcb} / guards {guards} {pubs} below the bars"
@@ -3251,7 +3271,6 @@ def _lane_b_row_verdict(r: dict, lb, slots: tuple[str, ...]) -> str | None:
     k = len(declared)
     if not math.isclose(float(r.get("alpha") or -1.0), lb.alpha / k, rel_tol=1e-12):
         return f"{d}: gain level {r.get('alpha')} != alpha/k = {lb.alpha}/{k}"
-    inc = str(r.get("inconclusive") or "")
     gain = r.get("target_gain")
     if inc:
         want = False
@@ -3267,6 +3286,79 @@ def _lane_b_row_verdict(r: dict, lb, slots: tuple[str, ...]) -> str | None:
     if bool(r.get("passed")) != want:
         return (f"{d}: passed={r.get('passed')} but the re-derived per-target verdict is "
                 f"{want} (LCB {lcb} vs {lb.gain_margin}, gain {gain}, guards ok {guards_ok})")
+    return None
+
+
+def _lane_b_f(x) -> float:
+    return float("nan") if x is None else float(x)
+
+
+def _lane_b_suite_guards_ok(r: dict, lb, guards: dict, pubs: dict) -> tuple[bool, str]:
+    """WB26 (DEC-CA-0071 §3 guards 4-5): ``(ok, malformed reason)`` of a
+    conclusive row of a suite-target leg — the whole-pool point gain ≥ 0 and
+    every domain / horizon / public guard also met against the anchor king
+    (``tau_anchor_domain`` / ``tau_anchor_public``). An anchor record that
+    does not cover the leg's guards is ``anchor_missing``: not ok."""
+    sgd = r.get("suite_guards")
+    if not isinstance(sgd, dict) or "pool_gain" not in sgd:
+        return False, "a suite-target leg row carries no suite_guards (guard 4 / anchor)"
+    a_dom = sgd.get("anchor_guard_lcbs") or {}
+    a_pub = sgd.get("anchor_public_lcbs") or {}
+    anchor_ok = (bool(sgd.get("anchor_pointer")) and set(a_dom) == set(guards)
+                 and set(a_pub) == set(pubs)
+                 and all(_lane_b_f(x) >= -lb.tau_anchor_domain for x in a_dom.values())
+                 and all(_lane_b_f(x) >= -lb.tau_anchor_public for x in a_pub.values()))
+    return _lane_b_f(sgd.get("pool_gain")) >= 0.0 and anchor_ok, ""
+
+
+def _lane_b_suite_gain_verdict(r: dict, lb, d: str, k: int, inc: str,
+                               guards_ok: bool) -> str | None:
+    """WB26 (DEC-CA-0071 Amendment rev6.19): re-derive a suite-target row from
+    ``suite_gain`` — CRPS OR MASE LCB at ``alpha / (2k)`` ≥
+    ``gain_margin_public`` with a positive point gain, the non-cleared metric
+    ``≥ −tau_public``, ``target_lcb`` = the SMALLER cleared LCB, and
+    ``passed`` = cleared ∧ non-inferior ∧ every guard."""
+    import math
+
+    if inc:
+        if inc != "items" or r.get("passed") or r.get("suite_gain"):
+            return f"{d}: inconclusive ({inc}) suite row passed or carries a gain record"
+        return None
+    g = r.get("suite_gain") or {}
+    if not g:
+        return f"{d}: a conclusive suite-target row carries no suite_gain"
+    if int(g.get("n_items") or 0) < lb.min_public_items:
+        return f"{d}: {g.get('n_items')} suite items is inconclusive, row says conclusive"
+    ga = lb.alpha / (2 * k)
+    if not math.isclose(_lane_b_f(g.get("gain_alpha")), ga, rel_tol=1e-12):
+        return f"{d}: suite gain level {g.get('gain_alpha')} != alpha/(2k) = {lb.alpha}/{2 * k}"
+    lcb = {m: _lane_b_f(g.get(f"{m}_lcb")) for m in ("crps", "mase")}
+    gain = {m: _lane_b_f(g.get(f"{m}_gain")) for m in ("crps", "mase")}
+    cleared = [m for m in ("crps", "mase")
+               if lcb[m] >= lb.gain_margin_public and gain[m] > 0.0]
+    want_cm = "both" if len(cleared) == 2 else (cleared[0] if cleared else "")
+    if str(g.get("cleared_metric") or "") != want_cm:
+        return f"{d}: cleared_metric {g.get('cleared_metric')!r} != re-derived {want_cm!r}"
+    noninf_ok = True
+    if len(cleared) == 1:
+        other = "mase" if cleared[0] == "crps" else "crps"
+        if g.get("noninf_metric") != other:
+            return f"{d}: noninf_metric {g.get('noninf_metric')!r} != {other!r}"
+        noninf_ok = _lane_b_f(g.get("noninf_lcb")) >= -lb.tau_public
+    elif g.get("noninf_metric"):
+        return f"{d}: noninf_metric {g.get('noninf_metric')!r} with {len(cleared)} cleared metrics"
+    if cleared:
+        want_lcb = min(lcb[m] for m in cleared)
+        if not math.isclose(_lane_b_f(r.get("target_lcb")), want_lcb,
+                            rel_tol=1e-12, abs_tol=1e-15):
+            return (f"{d}: target_lcb {r.get('target_lcb')} != the smaller cleared LCB "
+                    f"{want_lcb}")
+    if "targets" in r and bool(r.get("guard_reason")) == guards_ok:
+        return f"{d}: guard_reason {r.get('guard_reason')!r} contradicts the guard LCBs"
+    want = bool(cleared) and noninf_ok and guards_ok
+    if bool(r.get("passed")) != want:
+        return (f"{d}: passed={r.get('passed')} but the re-derived suite verdict is {want} "
+                f"(cleared {cleared}, non-inferior {noninf_ok}, guards ok {guards_ok})")
     return None
 
 
@@ -3324,7 +3416,9 @@ def check_lane_b(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
         conc = [r for r in rs if r.get("stage") == "verdict" and not r.get("inconclusive")]
         sig = {(json.dumps(r.get("guard_lcbs") or {}, sort_keys=True),
                 json.dumps(r.get("public_lcbs") or {}, sort_keys=True),
-                str(r.get("guard_reason") or "")) for r in conc}
+                str(r.get("guard_reason") or ""),
+                # WB26: guard 4 + the anchor guard also run once per leg
+                json.dumps(r.get("suite_guards") or {}, sort_keys=True)) for r in conc}
         if len(sig) > 1:
             return _fail(name, f"{hk}: the leg's guards differ between its targets "
                                "(guards must run once per leg)")

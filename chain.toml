@@ -1483,6 +1483,11 @@ funded_pod_skus          = ["8xH200", "8xH100", "4xH200", "4xH100", "8xRTX4090"]
 max_leg_hours            = 6.0
 max_leg_seconds          = 27000       # 6 h x 1.25
 guard_factor             = 1.25
+# WB26 (DEC-CA-0071 Amendment rev6.19): a suite target wins on CRPS OR MASE
+# LCB_{alpha/(2k)} >= gain_margin_public; the anchor-king guard tolerances.
+gain_margin_public       = 0.01
+tau_anchor_public        = 0.0
+tau_anchor_domain        = 0.0
 
 
 [lane_c]

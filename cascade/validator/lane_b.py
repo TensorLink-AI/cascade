@@ -23,6 +23,18 @@ class LaneBTransient(Exception):
     retried next poll (no latch, no receipt) within the read grace."""
 
 
+def lane_b_anchor_pointer(manifest) -> str | None:
+    """WB26 / DEC-CA-0071 §3 guard 5: the anchor king of a settlement — the
+    era's lane-A promotion member from the SIGNED training manifest
+    (``warm_start_base`` when the init carries lane-B merges, else
+    ``warm_start_ckpt``). A lane-B merge never moves it; a warm-start
+    promotion does. None for a random-init era (no anchor: suite targets
+    cannot win)."""
+    base = (str(getattr(manifest, "warm_start_base", "") or "")
+            if getattr(manifest, "warm_start_merges", ()) else "")
+    return base or str(getattr(manifest, "warm_start_ckpt", "") or "") or None
+
+
 @dataclass
 class _LaneBRound:
     """One settlement's lane-B material, judged and ready to fold."""
@@ -248,6 +260,10 @@ class LaneBMixin:
                 # DEC-CA-0050 merge guards: refuse a non-finite expert delta
                 strict=self.cfg.lane_b.merge_guard_at_settlement(block),
                 **sentinel_kw,
+                # WB26 (DEC-CA-0071 §3 guard 5): suite targets armed ⇒ the
+                # anchor king (scored only if an entry declares a suite)
+                **({"anchor_pointer": lane_b_anchor_pointer(manifest)}
+                   if self.cfg.lane_b.suite_targets else {}),
             )
         except Exception as e:  # noqa: BLE001 — fetch/eval failure: retried, never a verdict
             raise LaneBTransient(f"judging {rid} failed: {type(e).__name__}: {e}") from e
