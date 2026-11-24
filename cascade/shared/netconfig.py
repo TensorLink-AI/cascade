@@ -66,7 +66,7 @@ from .activation import (
     resolve_activation,
 )
 from .atomic import read_text_with_backup, write_text_atomic
-from .config import ChainConfig, effective_epoch_blocks, parse_chain_config
+from .config import RETIRED_KEYS, ChainConfig, effective_epoch_blocks, parse_chain_config
 from .config.reliability import DEFAULTS as _RELIABILITY_DEFAULTS
 from .direct_moe import canonical, digest
 from .era import era_length_blocks
@@ -120,7 +120,7 @@ ALLOWED: dict[str, frozenset[str] | None] = {
     # and recipe bounds remain release-only. These controls change how an
     # already-supported, pinned competition is judged, paid or timed out.
     "marketcast": frozenset({
-        "alpha", "bootstrap_B", "gain_margin", "full_pay_tiers", "min_windows", "min_clusters",
+        "alpha", "bootstrap_B", "gain_margin", "min_windows", "min_clusters",
         "min_time_blocks", "coverage_tolerance", "coverage_tolerance_over",
         "tail_tolerance", "calibration_z", "zero_scale_frac", "cell_ratio_cap",
         "near_dup_tol", "report_timeout_settlements", "max_infra_deferrals",
@@ -132,6 +132,9 @@ ALLOWED: dict[str, frozenset[str] | None] = {
         # accepted under one embargo and its gap windows are cut under the
         # value at the verdict, so a raise would score on training data).
         "assets", "frequencies", "horizons", "composite_suite_weights", "windows_per_cell",
+        # DEC-CA-0074: the embargo eval-draw length, backtest windows per cell
+        # and the <= 13 h inconclusive wait (code-bounded by the loader)
+        "embargo_eval_days", "backtest_windows_per_cell", "verdict_wait_blocks",
     }),
 }
 # Recovery controls are trainer-only policy; satellites can ignore their values.
@@ -242,6 +245,10 @@ def check_overrides(overrides: object) -> dict:
             if (table, key) in (("scoring", "burn_uid"), ("lane_b", "remainder"),
                                 ("lane_c", "remainder"), ("lane_d", "remainder")):
                 bad.append(f"[{table}] {key} (burn destination is release-only)")
+            elif table in ("lane_c", "marketcast") and key in RETIRED_KEYS.get(table, ()):
+                # the loader ignores a retired key, so an overlay naming one
+                # would silently change nothing (DEC-CA-0073: lane C pay)
+                bad.append(f"[{table}] {key} (retired)")
             elif (table, key) in (("lane_b", "contamination_hashset"),):
                 # LANE_D_PLAN §14.2 (rev5): an overlay never replaces a data pin
                 bad.append(f"[{table}] {key} (data pin is release-only)")

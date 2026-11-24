@@ -184,7 +184,7 @@ def reproduce_marketcast(receipt, mc, *, reports: dict, quantiles: dict, snapsho
             if e.deferred or e.fault or data is None:
                 continue
             ws = target_windows(snap, mc, e.target.split(":", 1)[1], after=float(e.after),
-                                gap_end=float(getattr(e, "gap_end", 0.0)))
+                                draw=dict(e.draw or {}) or None)
             qs = decode_quantiles(data, [w.steps for w in ws], len(knots))
             ft, covs = forecaster_fn(e.trained_pointer)
             pick = set(sample_ids([w.wid for w in ws], sample, f"{rep.round_id}|{e.hotkey}"))

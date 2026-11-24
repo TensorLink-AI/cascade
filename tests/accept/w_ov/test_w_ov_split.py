@@ -62,13 +62,13 @@ def test_w_ov_split_lane_a_zero_exact_vector():
     assert nb.share_refusals(out) == []
     n, burn = 12, 0
     lb, lc, ld = out.lane_b, out.lane_c, out.lane_d
-    # one paid lane B slot, one paid lane C slot, a 2-member lane D court
+    # one paid lane B slot, one paid lane C slot, a 3-member lane D court
     b_win = SimpleNamespace(uid=3, multiplier=1.0)          # lane_parts reads uid, multiplier
     c_win = LaneCWin(uid=5, target=lc.targets[0], multiplier=1.0)
     a, rest = lane_parts([1, 2], n, king_decay=0.5, burn_uid=burn,
                          lane_b_cfg=lb, wins=[b_win], lane_c_cfg=lc, c_wins=[c_win],
                          c_slot_frac={lc.targets[0]: 1.0},
-                         lane_d_cfg=ld, d_court_uids=[7, 8])
+                         lane_d_cfg=ld, d_court_uids=[7, 8, 9])
     assert a == [0.0] * n                                      # no lane A weight
     vec = [x + y for x, y in zip(a, rest, strict=True)]
     assert all(math.isfinite(v) and v >= 0.0 for v in vec)
@@ -78,7 +78,7 @@ def test_w_ov_split_lane_a_zero_exact_vector():
     want[3] = slot_b
     want[burn] += 0.35 - slot_b                                 # unpaid lane B slots burn
     want[5] = 0.15
-    want[7], want[8] = 0.5 * (1 / 1.5), 0.5 * (0.5 / 1.5)        # king_decay 0.5 court
+    want[7], want[8], want[9] = 0.5 * 0.80, 0.5 * 0.15, 0.5 * 0.05   # court_weights 80/15/5
     for u in range(n):
         assert math.isclose(vec[u], want[u], abs_tol=1e-12), (u, vec[u], want[u])
     # the v2 ladder / carry-over cap re-shape lane A's (empty) pool only

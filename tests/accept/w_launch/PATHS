@@ -1,0 +1,20 @@
+# W-LAUNCH (owner 2026-11-24): lane B / lane C (MarketCast) / lane D start
+# together at the Wed 2026-11-25 launch era start (mainnet 9586800).
+# chain.toml types [lane_c] / [marketcast] from_block (moved from 9579600).
+chain.toml
+# The two-step ready-to-sign launch overlays (mainnet + testnet); lane B and
+# lane D arm here and the A0/B35/C15/D50 split is restated.
+deploy/overlays/launch-20261125.pre.mainnet.toml
+deploy/overlays/launch-20261125.mainnet.toml
+deploy/overlays/launch-20261125.pre.testnet.toml
+deploy/overlays/launch-20261125.testnet.toml
+# Unit tests and docs that pin the shipped lane C / MarketCast block.
+tests/unit/test_lane_c_config.py
+tests/unit/test_lane_c_competitions.py
+tests/unit/test_marketcast.py
+tests/unit/test_marketcast_composite.py
+tests/unit/test_predecision_main.py
+tests/unit/test_validator_bench.py
+tests/unit/test_dec55_crown_tiers.py
+docs/MARKETCAST.md
+docs/AGENT_MINING.md

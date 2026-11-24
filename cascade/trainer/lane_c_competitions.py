@@ -113,9 +113,16 @@ class MarketCastTrainer(TrainerCompetition):
         # the commit time, the pod clipped to train_time (review M12)
         from .marketcast_runner import load_mkt_lineage, read_mkt_recipe
 
+        # DEC-CA-0074 guard (b): the generator is scanned against the embargo
+        # before anything is rented; without a scanner the leg could never be
+        # judged, so it is the operator's side (requeued uncharged)
+        scan = getattr(ops, "mkt_embargo_scan", None)
+        if scan is None:
+            raise RuntimeError("no embargo scanner wired: refusing to dispatch an unjudgeable "
+                               "MarketCast leg")
         return read_mkt_recipe(tree, ops.r.cfg, target=target,
                                submission_time=submission_time, train_time=train_time,
-                               lineage=load_mkt_lineage(ops.r.work_root))
+                               lineage=load_mkt_lineage(ops.r.work_root), embargo_scan=scan)
 
     def leg_hours(self, cfg, recipe) -> float | None:
         # the recipe's own wall (up to [marketcast] max_leg_hours)

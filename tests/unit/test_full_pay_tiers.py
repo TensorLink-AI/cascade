@@ -2,8 +2,9 @@
 
 A lane-B / lane-C win pays its slot in full for the ``full_eras`` of the
 highest ``full_pay_tiers`` threshold its gain LCB meets (fixed at the win,
-recorded on it), then the unchanged decay / TTL. MarketCast ``mkt:`` wins use
-``[marketcast] full_pay_tiers``. The audit re-derives the tier and rejects a
+recorded on it), then the unchanged decay / TTL. Lane C (MarketCast) pays a
+gain-scaled duration instead (DEC-CA-0073, tests/unit/test_marketcast_pay_duration.py);
+its gain-tiered keys are retired. The audit re-derives the tier and rejects a
 forged one."""
 
 from __future__ import annotations
@@ -25,12 +26,7 @@ from cascade.eval.expert_lane import (
 from cascade.shared.config import load_chain_config, parse_lane_b, parse_lane_c
 from cascade.shared.config.v2 import FULL_PAY_TIERS, parse_full_pay_tiers
 from cascade.shared.lane_b import DomainWin, LaneBState, lane_b_payouts
-from cascade.shared.lane_c import (
-    LaneCState,
-    full_pay_tiers_for,
-    lane_c_payouts,
-    target_full_pay,
-)
+from cascade.shared.lane_c import target_full_pay_record
 from cascade.shared.manifest import format_trained_pointer
 from cascade.shared.settlement_state import settlement_state
 
@@ -53,8 +49,9 @@ def test_defaults_are_the_placeholders():
     for f in ("chain.toml", "chain.testnet.toml"):
         c = load_chain_config(ROOT / f)
         assert c.lane_b.full_pay_tiers == TIERS
-        assert c.lane_c.full_pay_tiers == TIERS
-        assert c.marketcast.full_pay_tiers == TIERS
+        # DEC-CA-0073: lane C / MarketCast no longer carry tiers
+        assert not hasattr(c.lane_c, "full_pay_tiers")
+        assert not hasattr(c.marketcast, "full_pay_tiers")
 
 
 @pytest.mark.parametrize("threshold,n,lower", [(0.05, 10, 5), (0.02, 5, 2)])
@@ -159,68 +156,6 @@ def test_multi_target_leg_tiers_each_target_by_its_own_lcb():
 # ── lane C / MarketCast ─────────────────────────────────────────────────────
 
 
-def _mc(tiers):
-    return SimpleNamespace(full_pay_tiers=tiers)
-
-
-def test_lane_c_and_marketcast_tiers():
-    # MarketCast-only lane C: an mkt: win is tiered by [marketcast]'s table
-    lc = parse_lane_c({})
-    mc = _mc(((0.10, 7), (0.01, 1)))
-    assert full_pay_tiers_for("mkt:returns", lc, mc) == ((0.10, 7), (0.01, 1))
-    assert target_full_pay("mkt:returns", 0.05, lc, mc).full_eras == 1
-    with pytest.raises(ValueError):
-        full_pay_tiers_for("mkt:returns", lc, None)
-
-
-@pytest.mark.parametrize("lcb,n", [(0.05, 10), (math.nextafter(0.05, 0), 5), (0.02, 5),
-                                   (math.nextafter(0.02, 0), 2), (0.01, 2)])
-def test_lane_c_confirmed_win_records_its_judge_time_tier(lcb, n):
-    from cascade.validator.lane_c import LaneCJudgement, _confirmed_win
-
-    lc = parse_lane_c({})
-    entry = SimpleNamespace(target="mkt:returns", miner_hotkey="h", miner_uid=3,
-                            trained_pointer="t", recipe_ref="r")
-    j = LaneCJudgement(entry, True, "verdict", "win", gain_lcb=lcb, phase="confirm",
-                       full_pay=target_full_pay("mkt:returns", lcb, lc, _mc(TIERS)).record())
-    w = _confirmed_win(j, round_id="r", settle_block=100, era_index=0)
-    assert (w.gain_lcb, w.full_eras, w.below_floor) == (lcb, n, False)
-    st = LaneCState()
-    st.record(w)
-    p = lane_c_payouts(st, block=100 + n * 10, era_blocks=10, cfg=lc, n_uids=8)[0]
-    assert p["full_eras"] == n and p["multiplier"] == 0.5     # first decayed era
-    if n:
-        p0 = lane_c_payouts(st, block=100 + (n - 1) * 10, era_blocks=10, cfg=lc, n_uids=8)[0]
-        assert p0["multiplier"] == 1.0
-    # a confirm without a tier is refused
-    with pytest.raises(ValueError, match="full-pay tier"):
-        _confirmed_win(replace(j, full_pay=None), round_id="r", settle_block=100,
-                       era_index=0)
-
-
-@pytest.mark.parametrize("lcb,passed,want", [(0.12, True, 7), (0.05, True, 1),
-                                              (0.005, False, None)])
-def test_marketcast_judgement_tiers_by_marketcast_tiers(monkeypatch, lcb, passed, want):
-    from cascade.eval.marketcast import SuiteVerdict
-    from cascade.shared.config.marketcast import MarketCastConfig
-    from cascade.validator import marketcast as vmc
-
-    mc = replace(MarketCastConfig(), full_pay_tiers=((0.10, 7), (0.01, 1)))
-    monkeypatch.setattr(vmc, "verdict_from_rows", lambda *a, **k: SuiteVerdict(
-        "returns", passed, "win" if passed else "gain LCB < margin", 300, 9,
-        gain=lcb + 0.01, gain_lcb=lcb))
-    monkeypatch.setattr(vmc, "base_cov_gain", lambda rows: None)
-    rows = SimpleNamespace(status="ok", after=1.0, fault="", windows=[], near_dup=None)
-    entry = SimpleNamespace(target="mkt:returns", miner_hotkey="h", miner_uid=3,
-                            trained_pointer="t", recipe_ref="r")
-    j = vmc.judge_marketcast_entry(entry, rows, mc=mc, k=1, phase="confirm", seed="s",
-                                   round_block=10, origin_block=10)
-    assert j.passed is passed
-    assert (j.full_pay or {}).get("full_eras") == want
-    if passed:      # [marketcast]'s tiers, not [lane_c]'s (0.05 would be 10 there)
-        assert j.full_pay == target_full_pay("mkt:returns", lcb, parse_lane_c({}), mc).record()
-
-
 # ── audit: forged tier / full_eras / gain_lcb ───────────────────────────────
 
 
@@ -308,7 +243,11 @@ def test_check_lane_c_rejects_a_forged_confirm_tier(cfg):
     lc = parse_lane_c({"from_block": 0})
     lc = replace(lc, from_block=7200 - 1, targets=("domain:energy",))
     acfg = replace(cfg, lane_c=lc)
-    fp = target_full_pay("domain:energy", 0.03, lc).record()
+    from cascade.shared.era import era_length_blocks
+
+    # DEC-CA-0073: lane C records the gain-scaled duration
+    fp = target_full_pay_record("domain:energy", 0.03, lc,
+                                era_blocks=era_length_blocks(acfg.round, 7200))
     row = {"hotkey": "alice", "uid": 9, "target": "domain:energy", "stage": "verdict",
            "passed": True, "reason": "win", "gain_lcb": 0.03, "gain": 0.04, "n": 200,
            "public_lcbs": {}, "trained_pointer": "t", "train_block": 1, "phase": "confirm",
@@ -323,10 +262,10 @@ def test_check_lane_c_rejects_a_forged_confirm_tier(cfg):
                                round_id="r1", lane_c_pay={"wins": [w]})
 
     assert check_lane_c(rc(row, win), acfg).status == "PASS"
-    forged = dict(row, full_pay={"tier": 0.05, "full_eras": 10, "below_floor": False})
-    r = check_lane_c(rc(forged, dict(win, tier=0.05, full_eras=10)), acfg)
+    forged = dict(row, full_pay={"tier": 0.05, "full_eras": 99, "below_floor": False})
+    r = check_lane_c(rc(forged, dict(win, tier=0.05, full_eras=99)), acfg)
     assert r.status == "FAIL" and "forged" in r.detail
-    r = check_lane_c(rc(row, dict(win, full_eras=10)), acfg)
+    r = check_lane_c(rc(row, dict(win, full_eras=99)), acfg)
     assert r.status == "FAIL" and "full_eras" in r.detail
     r = check_lane_c(rc(row, dict(win, gain_lcb=0.2)), acfg)
     assert r.status == "FAIL" and "gain_lcb" in r.detail
@@ -354,8 +293,8 @@ def test_full_pay_tiers_validation(raw, msg):
         parse_full_pay_tiers(raw, section="lane_b", win_ttl_eras=28)
     with pytest.raises(ValueError, match=msg):
         parse_lane_b({"full_pay_tiers": raw})
-    with pytest.raises(ValueError, match=msg):
-        parse_lane_c({"full_pay_tiers": raw})
+    # [lane_c] full_pay_tiers is retired (DEC-CA-0073): ignored, never validated
+    assert not hasattr(parse_lane_c({"full_pay_tiers": raw}), "full_pay_tiers")
 
 
 def test_full_pay_tiers_accepts_equal_full_eras_and_ttl_bound():
@@ -373,27 +312,17 @@ def test_full_rounds_is_replaced_not_read():
         parse_lane_c({"full_rounds": 5})
 
 
-def test_marketcast_tiers_are_bounded_by_the_lane_c_ttl(tmp_path):
-    text = (ROOT / "chain.toml").read_text()
-    assert text.count("full_pay_tiers     = [[0.05, 10], [0.02, 5], [0.01, 2]]") == 1
-    bad = text.replace("full_pay_tiers     = [[0.05, 10], [0.02, 5], [0.01, 2]]",
-                      "full_pay_tiers     = [[0.05, 40], [0.02, 5], [0.01, 2]]")
-    p = tmp_path / "chain.toml"
-    p.write_text(bad)
-    with pytest.raises(ValueError, match="win_ttl_eras"):
-        load_chain_config(p)
-
-
 def test_overlay_consistency():
-    """``full_pay_tiers`` is overlay-settable on [lane_b] / [lane_c] exactly as
-    ``full_rounds`` was (every key of both tables), and on [marketcast]
-    through its explicit runtime-policy allow-list."""
+    """``full_pay_tiers`` is overlay-settable on [lane_b] exactly as
+    ``full_rounds`` was (every key of the table); on [lane_c] / [marketcast]
+    it is retired (DEC-CA-0073) and refused."""
     from cascade.shared.netconfig import ALLOWED, NetConfigError, check_overrides
 
     assert ALLOWED["lane_b"] is None and ALLOWED["lane_c"] is None
-    check_overrides({"lane_b": {"full_pay_tiers": [[0.1, 8], [0.01, 1]]},
-                     "lane_c": {"full_pay_tiers": [[0.1, 8], [0.01, 1]]}})
-    check_overrides({"marketcast": {"full_pay_tiers": [[0.1, 8]]}})
+    check_overrides({"lane_b": {"full_pay_tiers": [[0.1, 8], [0.01, 1]]}})
+    for table in ("lane_c", "marketcast"):
+        with pytest.raises(NetConfigError, match="retired"):
+            check_overrides({table: {"full_pay_tiers": [[0.1, 8]]}})
     with pytest.raises(NetConfigError):
         check_overrides({"marketcast": {"base_ref": "other@pin"}})
 

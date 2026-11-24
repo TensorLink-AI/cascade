@@ -26,13 +26,13 @@ SUITES = ("returns", "vol")
 ROOT = Path(__file__).resolve().parents[2]
 
 
-SHIPPED_FROM = {"chain.toml": 9579600, "chain.testnet.toml": 0}
+SHIPPED_FROM = {"chain.toml": 9586800, "chain.testnet.toml": 0}
 
 
 def test_shipped_configs_are_inert_with_the_defaults():
     for f in ("chain.toml", "chain.testnet.toml"):
         lc = load_chain_config(ROOT / f).lane_c
-        # owner 2026-11-20: mainnet arms lane C at 9579600 (an era boundary);
+        # owner 2026-11-24: mainnet arms lane C at 9586800 (an era boundary);
         # testnet ships it off
         fb = SHIPPED_FROM[f]
         assert lc.from_block == fb and lc.active(10**12) == bool(fb)
@@ -44,8 +44,10 @@ def test_shipped_configs_are_inert_with_the_defaults():
         # the code-level default keeps the per-suite shape
         assert lc.targets == ("mkt:market",)
         assert DEFAULT_TARGETS == ("mkt:returns", "mkt:vol")
-        assert (lc.full_pay_tiers, lc.half_life_rounds, lc.floor, lc.win_ttl_eras) == (
-            ((0.05, 10), (0.02, 5), (0.01, 2)), 1.0, 0.1, 28)
+        # DEC-CA-0073: the gain-scaled full-pay duration (5 .. 20 days)
+        assert (lc.full_pay_min_days, lc.full_pay_max_days, lc.full_pay_max_gain) == (
+            5.0, 20.0, 0.05)
+        assert not hasattr(lc, "win_ttl_eras") and not hasattr(lc, "full_pay_tiers")
         assert (lc.alpha, lc.bootstrap_B, lc.gain_margin, lc.min_target_windows) == \
             (0.05, 10_000, 0.01, 100)
         assert lc.guard_public == () and lc.tau_public == 0.01
@@ -69,7 +71,7 @@ def test_c_from_a_cannot_overallocate_the_remaining_pool():
 
 
 def test_shipped_configs_count_no_active_slot_before_marketcast_arms():
-    """Before [marketcast] from_block (mainnet 9579600, owner 2026-11-20;
+    """Before [marketcast] from_block (mainnet 9586800, owner 2026-11-24;
     testnet off) the shipped mkt: targets load and count no active slot, so
     lane C would burn its whole share; from it, the one composite slot."""
     for f in ("chain.toml", "chain.testnet.toml"):
@@ -125,8 +127,8 @@ def test_competition_registry():
     ({"targets": "mkt:returns"}, "list"),
     ({"targets": ["domain:energy"]}, "forward-only eval"),
     ({"gain_margin": 0.0}, "gain_margin"),
-    ({"floor": 0.0}, "floor"),
-    ({"win_ttl_eras": 3}, "win_ttl_eras"),
+    ({"full_pay_min_days": 30.0}, "full_pay_min_days"),       # DEC-CA-0073
+    ({"full_pay_max_gain": 0.005}, "gain_margin"),
     ({"n_windows": 50}, "min_target_windows"),
     ({"max_steps_fraction": 1.5}, "max_steps_fraction"),
     ({"pool_prefix": "pool_c"}, "pool_prefix is retired"),
