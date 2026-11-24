@@ -23,3 +23,12 @@ docs/MINER_LANE_C_MARKETCAST.md
 docs/MINER_LANE_D.md
 # Stale MarketCast examples (owner 2026-11-24: fix with the lane guides).
 docs/MARKETCAST.md
+# Docs cleanup (owner 2026-11-24): start-here map, archive of superseded
+# docs, and the current docs whose links/status the cleanup touched.
+docs/README.md
+docs/MODEL.md
+docs/V2_DIRECT_MOE.md
+docs/archive/README.md
+docs/archive/MINER_V2_INCENTIVE_INTRO.md
+docs/archive/V2_FAQ.md
+docs/archive/TESTNET_E2E_CHECKLIST.md

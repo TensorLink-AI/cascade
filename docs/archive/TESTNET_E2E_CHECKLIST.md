@@ -1,5 +1,7 @@
 # Testnet end-to-end checklist: lane D (and lane B, sentinel) on netuid 259
 
+> **Archived 2026-11-24.** Historical; not maintained. See [the archive index](README.md) for what replaces it.
+
 Written 2026-11-22 against `main` @ `28a1e98`. Every item cites where it comes
 from: a plan section, row or test id in `docs/plans/LANE_D_PLAN.md` (written
 "plan §x" below), or a `file:line` on main. WP levels are copied from the
