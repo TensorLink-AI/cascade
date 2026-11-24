@@ -57,9 +57,10 @@ recorded values. `[marketcast] embargo_days` becomes overlay-settable in
 
 **(d) Rule menu.** Test families {`plain_lcb`, `maxt`, `bonferroni`}; pay
 curves {`tiered_decay`, `fixed_term` (DEC-CA-0073 5–20 d), `indefinite_until_beaten`}.
-Lane defaults = today: B `bonferroni`/`tiered_decay`; C `bonferroni`/`fixed_term`;
-D `maxt`/`indefinite_until_beaten`. Runs in this release: B and C families
-`plain_lcb`/`bonferroni`, all three curves; D its defaults only. A
+Lane defaults = today: B `maxt`/`indefinite_until_beaten` (rev6.22, #854: two
+max-T families per slot, full pay until replaced); C `bonferroni`/`fixed_term`;
+D `maxt`/`indefinite_until_beaten`. Runs in this release: C families
+`plain_lcb`/`bonferroni`, all three curves; B and D their defaults only. A
 non-default curve is recorded on the win; the audit re-derives it.
 
 **(e) Contamination hash set.** `[lane_b] contamination_hashset` (sha256 pin) +
@@ -86,7 +87,7 @@ relays the instance's pool snapshot to the pod (one presigned link + its
 sha256); the pod clips it to the recipe's range before the dispatch. Lane-C
 pods must run a worker image built from this release to train an instance
 leg (the image changes only at a seed-epoch boundary, W-IMG); validators need
-nothing further. Not in this release: joint `maxt` for lanes B / C, the pool_d
+nothing further. Not in this release: joint `maxt` for lane C (lane B runs its own since rev6.22), the pool_d
 / lane A projections (no lane C competition reads them).
 
 **Consensus.** One release to all validators, satellites and the trainer;
@@ -98,7 +99,7 @@ release; a new data source is a builder job, never a release.
 | WP | What | Keys / fields | Depends | Runs in | Accept |
 |---|---|---|---|---|---|
 | W-CMP | **(rev6.25)** `std_pool` (schema, writer, reader, MarketCast projection + builder); `competition_spec` (registry, parse with typed refusals, bounds, compile onto MarketCast, `marketcast_spec`); `rules_menu` wired into lanes B / C / D and the audit; per-leg embargo record; hash set by content hash + key with fetch-verify and intake reload | (a)–(e) | W-OV | ci | `scripts/laned/accept W-CMP` |
-| W-CMP2 | **(rev6.25, DECIDED owner 2026-11-24: this release)** multi-instance runner (f): spec instances with their own kind / targets / legs / rows / reports / verdicts / slots / payouts / audit; generic standard-pool projection with channel map; trainer pool relay + pod clip; `mkt` byte-identical. Out: joint `maxt` for B / C, pool_d / lane A projections | (a), (b), (f) | W-CMP | ci + testnet | `scripts/laned/accept W-CMP2` |
+| W-CMP2 | **(rev6.25, DECIDED owner 2026-11-24: this release)** multi-instance runner (f): spec instances with their own kind / targets / legs / rows / reports / verdicts / slots / payouts / audit; generic standard-pool projection with channel map; trainer pool relay + pod clip; `mkt` byte-identical. Out: joint `maxt` for lane C, pool_d / lane A projections | (a), (b), (f) | W-CMP | ci + testnet | `scripts/laned/accept W-CMP2` |
 
 ## rev6.24 (owner 2026-11-24; main @ ce27dfb): competition tweaks by signed overlay, with a code envelope
 
