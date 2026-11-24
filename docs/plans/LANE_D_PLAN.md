@@ -1,10 +1,233 @@
 # Plan: lane D "open weights" (anything goes on our architecture), with lane E and lane A flexibility — v3
 
-Status: **PLAN v3, ~~rev6.12~~ ~~rev6.14~~ ~~rev6.15~~ ~~rev6.16~~ ~~rev6.17~~ ~~rev6.18~~ ~~rev6.20~~ rev6.23 (proposed 2026-11-22; ~~rev6.12~~ ~~rev6.14~~ ~~rev6.15~~ ~~rev6.16~~ ~~rev6.17~~ rev6.18 2026-11-23; rev6.20, rev6.23 2026-11-24)**: v2's design, made buildable by an
+Status: **PLAN v3, ~~rev6.12~~ ~~rev6.14~~ ~~rev6.15~~ ~~rev6.16~~ ~~rev6.17~~ ~~rev6.18~~ ~~rev6.20~~ ~~rev6.23~~ rev6.24 (proposed 2026-11-22; ~~rev6.12~~ ~~rev6.14~~ ~~rev6.15~~ ~~rev6.16~~ ~~rev6.17~~ rev6.18 2026-11-23; rev6.20, rev6.23, rev6.24 2026-11-24)**: v2's design, made buildable by an
 autonomous loop. A work package is done **only when its Accept command exits
 0**; **(rev6)** its level is only what `scripts/laned/status` computes (§17),
 never a claim. Owner decisions are marked **[DECIDE]**. Nothing is armed. **No calendar
 dates**: stages are gated (§5).
+
+## rev6.24 (owner 2026-11-24; main @ ce27dfb): competition tweaks by signed overlay, with a code envelope
+
+Owner requests (2026-11-24, verbatim intent): "for lanes A, B, C and D, if we
+need to make tweaks to the competition, we want it so satellite validators do
+not need to update — we need the flexibility"; "for lane C make it 10k
+series"; "validators update ONLY for major upgrades, never for a
+training-image change or competition-rule tweaks"; "we just log what image
+pin was used — it's auditable"; "WHAT DATA is in each lane's eval must also
+be overlay-changeable; only rule LOGIC needs a release"; "emission split
+lane A 0 % / B 35 % / C 15 % / D 50 %". This section is the whole change:
+§14.2's rule stands, with the envelope below added to it.
+
+**Where main already is (verified at ce27dfb).** `ALLOWED` in
+`cascade/shared/netconfig.py` already admits every key of `[scoring]`,
+`[eval]`, `[lane_b]`, `[lane_c]`, `[lane_d]` (wildcards), the listed `[v2]`
+and `[marketcast]` keys and the `[round]` schedule. Satellites already adopt
+new VALUES without code: a receipt stamps `netconfig_seq` / `netconfig_digest`,
+`apply_receipt_overlay` fetches that overlay and rebuilds the config, and
+`derive_weights` runs on it; lane D's signed report also echoes `params`
+(checked against `config_at(boundary)`, burn code `ld_params`). What was
+missing: (1) nothing stops an overlay from setting a value the loader
+accepts but that is dangerous (lane B `gain_margin` 0.0005, lane D
+`bootstrap_B` 10^7, `alpha` 0.4, a lane share the carve silently clamps);
+(2) a few security-root-class keys sit inside the wildcard tables; (3) lane
+C's eval data (`[marketcast]` universe, grid) is release-only.
+
+### (a) The envelope (WP W-OV, one feature PR)
+
+New module `cascade/shared/netconfig_bounds.py`, called by
+`check_overrides` (key presence) and `build_config` (values, after the
+loader so a loader-refused value keeps its loader message):
+
+1. `BOUNDS`: a per-key numeric envelope, overlay-only (it never loosens a
+   loader check). Every shipped value in `chain.toml`, `chain.testnet.toml`
+   and the deployed file (checked 2026-11-24) is inside it, so a restating
+   S0c overlay passes.
+2. `RELEASE_ONLY_KEYS` inside allowed tables, refused by presence.
+3. `PINNED_REF_KEYS`: a data reference an overlay sets must be
+   `<repo>@<revision>` (content-addressed); a bucket prefix is
+   content-addressed by its signed, sha256-verified snapshot index.
+4. Shares: when an overlay touches a lane `share` / `takes_from`, a share
+   the carve would clamp (`lane_pool_shares` clamps silently) is refused.
+
+`overlay_policy()["envelope"]` publishes it. **Never overlay-settable**
+(code): the envelope itself, signature / trust rules, `[netconfig]
+owner_hotkey`, burn destinations, `[training]` / `[v2.training]`, storage
+endpoints, the SDK pin.
+
+**Fork note (stated up front).** An older node lacks the envelope and
+accepts a superset of what a new node accepts. The owner's publish path
+(`plan_overlay`, R7) runs the envelope, so any published overlay is one
+every node accepts. No overlay has been published on mainnet (S0c pending),
+so no adopted history can fall outside it.
+
+### (b) Key table
+
+Class **(a)** = overlay-settable inside the envelope; **(b)** = release-only.
+
+| Lane | Key | Class | Envelope / reason |
+|---|---|---|---|
+| A | `[scoring] bootstrap_B` | a | [200, 50000] |
+| A | `[scoring] bootstrap_alpha` | a | (0, 0.20] |
+| A | `[scoring] king_decay` / `reward_prior_kings` | a | (0, 1] / [0, 8] |
+| A | `[scoring] min_windows` / `min_clusters` | a | [1, 20000] / [0, 1000] |
+| A | `[scoring] win_margin_*` (start, end, start_prev, *_v2), `margin_increment_floor` | a | [0, 0.5] |
+| A | `[scoring] bench_gate_tolerance`, `gift_gate_tolerance` / `bench_gate_min_win_rate` / `bench_gate_min_items` | a | [0, 0.5] / [0, 1] / [1, 10000] |
+| A | `[scoring] cascade_top_k` | a | [1, 16] |
+| A | `[eval] n_windows` / `shared_ladder_windows` / `mix_target_windows` / `num_samples` | a | [100, 20000] / [500, 20000] / [0, 20000] / [8, 1000] |
+| A | `[v2] win_margin_start` / `win_margin_end` / `king_check_margin` / `sentinel_tau` | a | [0, 0.5] / [0, 0.5] / [0, 1] / [0, 0.10] |
+| A | other `[scoring]` / `[eval]` / listed `[v2]` keys (switch blocks, modes, forfeit) | a | loader checks + retroactivity guard (unchanged) |
+| A | `[scoring] prior_contract_digest` | **b** | a contract digest |
+| A | `[eval] shared_ladder_feature` | **b** | a fork-guard feature name |
+| A | `[eval] benchmark_project_dir`, `gift_gate_data_dir` | **b** | operator-local paths |
+| A | `[v2] *_after` image pins, `[training]`, `[v2.training]` | **b** | contract / numerics (see (e)) |
+| B | `share` | a | [0, 0.75] + no clamp |
+| B | `alpha` / `bootstrap_B` / `gain_margin` | a | (0, 0.10] / [200, 50000] / [0.002, 0.25] |
+| B | `min_target_windows`, `min_guard_windows` / `affinity_windows` / `min_target_clusters` | a | [10, 20000] / [16, 20000] / [2, 1000] |
+| B | `tau_domain`, `tau_public` / `traffic_steal_bound` | a | [0, 0.10] / [0, 0.25] |
+| B | `leg_hours`, `max_leg_hours` / `max_leg_seconds` / `guard_factor` | a | (0, 48] / [60, 345600] / [1, 4] |
+| B | `sentinel_max_defer_eras` | a | [0, 100] |
+| B | `full_pay_tiers`, `half_life_rounds`, `floor`, `win_ttl_eras`, `domains`, `suite_targets`, `open_rule`, experts fracs, `funded_pod_skus` | a | loader checks |
+| B | `remainder`, `contamination_hashset` | **b** | burn destination / data pin (unchanged) |
+| C | `share` | a | [0, 0.5] + no clamp |
+| C | `alpha` / `bootstrap_B` / `gain_margin` | a | (0, 0.10] / [200, 50000] / [0.002, 0.25] |
+| C | `n_windows` / `min_target_windows` / `min_target_clusters` | a | [100, 20000] / [10, 20000] / [2, 1000] |
+| C | `tau_public` / `leg_hours` / `legs_per_target` | a | [0, 0.10] / (0, 48] / [1, 16] |
+| C | `targets`, `full_pay_tiers`, payout schedule, competition `weight` / `until_block` | a | loader + competition rule (unchanged) |
+| C | `[marketcast] alpha` / `bootstrap_B` / `gain_margin` / `min_windows` / `min_clusters` / `min_time_blocks` | a | (0, 0.10] / [200, 50000] / [0.002, 0.25] / [50, 20000] / [2, 1000] / [1, 100] |
+| C | `[marketcast] calibration_z` / `cell_ratio_cap` / `near_dup_tol` / `report_timeout_settlements` / `max_infra_deferrals` | a | [1, 10] / (1, 100] / [0, 0.5] / [1, 100] / [0, 100] |
+| C | **(new)** `[marketcast] assets`, `frequencies`, `horizons`, `composite_suite_weights` | a | loader checks (geometry, classes) |
+| C | **(new)** `[marketcast] windows_per_cell` | a | [1, 512] |
+| C | `remainder` | **b** | burn destination (unchanged) |
+| C | `[marketcast] base_ref`, `base_sha256`, `base_arch`, `from_block`, `suites`, `data_sources`, `pool_prefix`, context lengths, `pod_image`, fingerprint | **b** | model / data-source code / arming / image |
+| C | `[marketcast] embargo_days` | **b** | a recipe is accepted under one embargo but its gap windows are cut under the verdict's value: a raise would score on training data. Overlay-settable only once each entry pins its embargo (follow-up) |
+| D | `share` | a | [0, 0.5] + no clamp |
+| D | `alpha` / `bootstrap_B` / `d_margin`, `gain_margin` | a | (0, 0.10] / [200, 50000] / [0.002, 0.25] |
+| D | `min_windows` / `max_windows_per_settlement` / `min_clusters` / `max_entries_per_settlement` | a | [100, 20000] / [1000, 20000] / [2, 1000] / [1, 64] |
+| D | `king_decay` / `reward_prior_kings` / `tau_public` | a | (0, 1] / [0, 8] / [0, 0.10] |
+| D | `embargo_hours` / `forward_margin_hours` / `max_mirror_lag_hours` | a | [0, 168] / [0, 48] / (0, 168] |
+| D | `backtest_weight_cap` / `backtest_ratio_floor` / `max_source_share` | a | [0, 0.25] / [0.5, 1) / (0, 1] |
+| D | rate limits, TTLs (`max_open_per_coldkey`, `max_judged_*`, `max_coldkey_unresolved_settlements`, `max_reveal_delay_days`, `max_bench_holds`, `loser_ttl_eras`, `ready_ttl_blocks`) | a | [1, 64] / [1, 64] / [1, 1000] / [1, 365] / [0, 64] / [0, 1000] / [1, 10^6] |
+| D | `from_block`, `until_block`, `takes_from`, `contexts`, `horizon`, `gate_suites`, `gate_weights`, `lowfreq_freqs`, `confirm_on_king_change` | a | loader checks |
+| D | `pool_prefix`, `real_corpus_ref` | a | data: `real_corpus_ref` must be `<repo>@<rev>` |
+| D | `remainder` / `teacher_ref` / `teacher_api` | **b** | burn destination / model pin / external endpoint |
+| all | the envelope, signature rules, `[netconfig]`, `[storage]`, `[manifest]`, `[chain]`, `[activation]` | **b** | security roots (unchanged) |
+
+Keys other builders are adding (`[lane_d] court_weights`, the decaying
+`d_margin_*`, `eval_delay_hours`, `public_weight`; lane B levers and
+`indefinite_pay_from_block`; MarketCast pay-days) are not on main at
+ce27dfb. They are overlay-settable by the wildcard the day they land; each
+lands with its `BOUNDS` row in the same PR (§14.3 rule 5).
+
+### (c) Eval data by overlay (owner: "only rule LOGIC needs a release")
+
+| Lane | Data key | Today | rev6.24 |
+|---|---|---|---|
+| A | `[eval] window_pool`, `eval_dataset`, `eval_source`, `n_windows`, `shared_ladder_windows` | overlay (wildcard) | overlay; `window_pool` must be `<repo>@<rev>` |
+| A | pool caps per domain | pool publisher (not validator config) | unchanged: the snapshot is signed + sha256 indexed |
+| B | `domains`, `suite_targets`, `require_public`, horizons | overlay (wildcard) | overlay, loader checks |
+| C | `[marketcast] assets`, `frequencies`, `horizons`, `composite_suite_weights`, `windows_per_cell` | release-only | **overlay** (W-OV) |
+| C | `embargo_days`, `data_sources`, `suites` | release-only | release-only (see (b)) |
+| D | `pool_prefix`, `real_corpus_ref`, `min_fresh_window_share`, `max_windows_per_settlement` | overlay (wildcard) | overlay, `real_corpus_ref` content-addressed |
+| D | public sources (GiftEvalPretrain / RMISC revisions, `index_sha256`, `files_sha256`, allowed-list digest, per-source windows, weight split) | not on main (F3, #851) | **(F3 follow-up)** add as `[lane_d]` keys with `PINNED_REF_KEYS` / `BOUNDS` rows when F3 lands; the signed report already carries index hash + revision (rev6.18 A6) |
+| D | live feed catalog / per-feed embargo, per-bin quotas | forge catalog pinned per snapshot (W6b) | unchanged: data in the signed snapshot |
+
+The rule for every data reference: content-addressed (revision + hash), in
+force only from the overlay's apply block (an era start). **Lane A only at
+a seed-epoch boundary** is NOT enforced by an era-start overlay (a seed epoch
+spans eras and is derived from the king history, `era.v2_seed_epoch_start`),
+so a lane A data change by overlay must be published at a seed-epoch start
+by the owner until W-IMG (e) adds the check.
+
+### (d) Lane C "10k series" — not built, owner decision needed
+
+`[lane_c] n_windows` (1000) is **read by nothing**: lane C's only
+competition is MarketCast, and `chain.toml` says "MarketCast does not read
+them" (the `[lane_c]` verdict keys are kept for a future competition).
+Setting it to 10000 changes nothing. MarketCast scores EVERY grid window:
+`[marketcast] windows_per_cell` (48) per (suite label, asset, horizon), so
+`mkt:market` holds up to 7 suites (ohlcv = 4 labels) x 58 assets x 6 horizons
+x 48 = **167,040** windows before the liquidity filter (≈ 16,700 per
+single-label suite; the gap horizons only at dispatch). **[DECIDE]** which
+of: (1) a cap of 10,000 windows per entry drawn by the settlement block hash
+(new consensus code + audit replay; lowers compute), (2) about 10k per
+suite via `windows_per_cell` ≈ 29 (an overlay after W-OV, no code), or (3)
+nothing (already ≥ 10k). W-OV bounds `[lane_c] n_windows` to [100, 20000]
+and its satellite test adopts 10000 by overlay, but no default changes, so
+nothing forks at tonight's lane C arming (9579600).
+
+### (e) Worker images (WP W-IMG, plan only; NOT built in W-OV)
+
+Owner rule as simplified 2026-11-24: lanes B, C, D record the worker image
+digest each leg / eval ran in its signed record and the audit reports it
+(no allowlist). Lane A: every leg compared in one duel / seed epoch (king and
+challengers) runs the SAME image digest, recorded in the contract /
+receipt; validators check equality within the epoch, not a fixed pin; the
+trainer picks the image at a seed-epoch boundary (enforced); the
+measured-wall gate stays per image (no measured wall on the recorded image
+⇒ the 5 h cap).
+
+Why it is a separate WP: it rewrites the reproducibility contract
+(`train_image_digest` is a `[v2.training]` contract term, folded into
+`contract_digest`; the builder safety rule and CLAUDE.md forbid contract
+changes without an explicit owner sign-off), and the seed-epoch boundary is
+state-derived (`era.v2_seed_epoch_start`, warm eras), not a config fact
+`build_config` can check. The 2026-11-01 incident (a repin inside a v2 seed
+epoch made every validator reject king pointers / entry contracts) is the
+failure W-IMG must prevent. Places that compare against a fixed pin today
+(the W-IMG inventory): `trainer/leg_pins.py`, `shared/manifest.py`,
+`trainer/launch_preflight.py`, `trainer/contract.py`,
+`shared/image_qualification.py`, `provision/main.py`,
+`trainer/runner_funded_pods.py`, `audit/rederive.py`, `shared/decided.py`,
+`shared/config/{training,loader,rounds,chain_config,marketcast}.py`,
+`trainer/{runner_operator_pods,rolling,cost_guards,runner_funded_legs,main}.py`,
+`shared/era.py`, `provision/{health,codeprint,core}.py`, `validator/era_gate.py`,
+`funding/{step_rates,lane_b_gpus}.py`, `audit/checks.py`. W-IMG's test: an
+epoch whose king and challenger ran image X passes; mixed images in one
+epoch are refused; a new image at the next seed-epoch boundary passes with
+no validator code or config change. **[DECIDE]** owner sign-off on the
+contract change before W-IMG is built.
+
+### (f) Emission split A 0 / B 35 / C 15 / D 50 (owner 2026-11-24), by overlay
+
+The four shares are overlay keys (`[lane_b] share`, `[lane_c] share` /
+`takes_from`, `[lane_d] share` / `takes_from`; lane A gets the rest). Lane A
+is live with six external validators, so the repo defaults do NOT change
+(A 50 / B 25 / C 25 / D 0); W-OV ships ready-to-sign overrides,
+`deploy/overlays/split-a0-b35-c15-d50.{testnet,mainnet}.toml`: B 0.35,
+C 0.15 from lane A, D 0.50 from lane A ⇒ A = 1 − 0.35 − 0.15 − 0.50 = 0
+exactly (in float too). It applies at an era start (the overlay rule).
+Inside the envelope (B ≤ 0.75, C ≤ 0.5, D ≤ 0.5, no clamp: D's 0.50 is
+exactly A's pool after B and C). The code handles A = 0: `lane_parts`
+scales lane A's court by a 0 pool (no division); the ladder, carry-over cap
+and key slash re-shape that empty pool only; W-OV tests the exact vector.
+
+**Caveat (stated up front):** lane D is carved only while it PAYS
+(`lane_pool_shares` takes C and D only when active). Until `[lane_d]
+from_block` arms, lane D's 50 % stays with lane A: the live split is then
+A 50 / B 35 / C 15. Lane B pays only while it is armed (`[lane_b]
+from_block`, 0 on main): its unpaid slots burn. To reach A 0 the lane D
+arming overlay must restate these keys (overlays are snapshots).
+
+| Row | Value | How |
+|---|---|---|
+| `[lane_b] share` | 0.35 | overlay |
+| `[lane_c] share` / `takes_from` | 0.15 / `lane_a` | overlay |
+| `[lane_d] share` / `takes_from` | 0.50 / `lane_a` | overlay |
+| lane A | 0 (the rest) | derived |
+
+Owner steps: (1) dry run `cascade-validator --chain-toml chain.testnet.toml
+--netconfig-overlay deploy/overlays/split-a0-b35-c15-d50.testnet.toml
+--netconfig-effective-block <next era start ≥ 1 era ahead>` (testnet
+`[netconfig] owner_hotkey` must be set first — R7t); (2) sign + publish
+with `--netconfig-publish`; (3) observe ≥ 51 % `cfg-` lock, adoption at the
+block, receipts stamping `netconfig_seq`, satellite vectors equal; (4) the
+same against the DEPLOYED mainnet chain.toml with the mainnet file
+(after S0c's no-op overlay, §5 row 4).
+
+| WP | What | Keys / fields | Depends | Runs in | Accept |
+|---|---|---|---|---|---|
+| W-OV | **(rev6.24)** Signed-overlay envelope: `netconfig_bounds` (`BOUNDS`, `RELEASE_ONLY_KEYS`, `PINNED_REF_KEYS`, no-clamp shares), called by `check_overrides` / `build_config`, published by `overlay_policy()`; lane C eval data in `ALLOWED["marketcast"]`; DEC-CA-0057 amendment; the (f) split overrides in `deploy/overlays/` with the lane A = 0 vector test | table (b), (f) | W2 | ci | `scripts/laned/accept W-OV` |
+| W-IMG | **(rev6.24, [DECIDE] before build)** Image recorded per leg (lanes B–D, audit reports it); lane A same-image-within-seed-epoch rule replacing fixed-pin comparisons; image changes only at a seed-epoch boundary; measured-wall gate per recorded image, else the 5 h cap | (e) | W-OV | ci + testnet | `scripts/laned/accept W-IMG` |
 
 ## rev6.23 (owner 2026-11-24; main @ b65f25d): lane D court pays 80 / 15 / 5
 
