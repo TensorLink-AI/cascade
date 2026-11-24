@@ -69,10 +69,11 @@ fine-tuned models with a decision-based measure, not only CRPS.
    A vertical we fine-tune for gets an app by writing a data adapter and a
    scenario spec, not a new competition. See **Primitive set**.
 10. **LLMs and decision models are part of the harness stack (owner,
-   2026-11-24).** A harness may call pinned open-weight LLMs hosted next to
-   the forecasters, and may ship its own small decision models. All of them
-   go through one model gateway: typed, budgeted and recorded. See **Models
-   in the harness stack**.
+   2026-11-24).** LLMs come from **Engy** (Bittensor SN53, verifiable LLM
+   inference). Decision models come from **decisionmodels.io**. A harness
+   reaches both, and the vertical's fine-tune, through one model gateway
+   that proxies them from the main validator: typed, budgeted, pinned and
+   recorded. See **Models in the harness stack**.
 
 ## Vertical pairing
 
@@ -367,111 +368,128 @@ forecasting API, so apps that win here can be used outside the subnet.
 
 ## Models in the harness stack: LLMs and decision models
 
-A harness is more than a forecast plus an optimiser. It can also reason over
-text and context with an LLM, and run its own learned policy. Both are
-allowed. They sit around the vertical's fine-tune, not in place of it.
+A harness is more than a forecast plus an optimiser. It can reason over text
+and context with an LLM, and ask a decision model discrete questions. Both
+sit around the vertical's fine-tune, not in place of it.
+
+| role | provider | what it gives the harness |
+|---|---|---|
+| forecasts | our lane-C fine-tune for the vertical (main-validator pod) | quantile forecasts |
+| LLM | **Engy** (Bittensor SN53) | text and tool-use reasoning, with proof of which model ran |
+| decision model | **decisionmodels.io** | probabilities over a typed set of allowed answers, given a state |
 
 ```
-            ┌──────────── harness (miner code, sandboxed) ────────────┐
- obs, spec, │  policy.py  ── decision models (miner weights, CPU)      │ → action
- text feed  │      │                                                   │
-            │      └── model gateway: forecast | llm | (later) others  │
-            └────────────────────┬─────────────────────────────────────┘
-                                 │ every request and reply goes in the transcript
-               vertical fine-tune (GPU pod)    pinned LLMs (GPU pod)
+            ┌──────────── harness (miner code, sandboxed, no network) ─────────┐
+ obs, spec, │  policy.py ── models.forecast | models.llm | models.decide        │ → action
+ text feed  └──────────────────────────────┬────────────────────────────────────┘
+                     model gateway (main validator): pin, budget, cache, record
+               ┌──────────────┬────────────┴──────────────┐
+         fine-tune pod     Engy (SN53)            decisionmodels.io
+                  every request, reply (and Engy proof) goes in the transcript
 ```
+
+> **Provider facts to confirm.** These are taken from public pages
+> (github.com/hanlinai/engy, a third-party listing for decisionmodels.io),
+> not from the providers. The earlier Ephemeris router experiment
+> (`doc:exp-decision-model-router`) also could not reach decisionmodels.io
+> from the sandbox. Before anything below is fixed, the provider facts must
+> be checked against each provider's own API docs. That covers the API
+> shapes, the model names, version pinning and prices.
 
 ### One model gateway
 
-Every model call goes through `fc` (renamed `models` in the kit; `fc` stays
-as an alias):
+The sandbox still has no network. The harness calls `models.*`, and the
+gateway on the main validator makes the outside call. The gateway:
 
-| call | what | budget |
-|---|---|---|
-| `models.forecast(...)` | the vertical's fine-tune, or another listed fine-tune | forecast series × horizon |
-| `models.llm(name, messages, tools=…, max_tokens, schema=…)` | a pinned LLM from the registry | tokens per episode, plus a cadence cap |
-| `models.decide(name, inputs)` | the harness's own decision model, run in-process on CPU | CPU time per step |
+- **Pins.** Each call names a registry entry. The gateway sends the pinned
+  model id, version or hash and fixed decoding settings: temperature 0, or a
+  seed from the round seed.
+- **Budgets.** Tokens and decision-model calls are counted per episode, and
+  cadence caps apply per scenario.
+- **Caches.** Replies are stored by the hash of (pinned model, request). The
+  miner run and the naive-model run share cached replies where their
+  requests match. A judging restart never pays twice or gets a different
+  answer.
+- **Records.** Every request and reply goes in the transcript, with Engy's
+  inference proof where there is one. The auditor replays the harness from
+  the transcript on CPU, with no calls to any provider.
+- **Fails safe.** A provider outage or timeout is a transient: the
+  settlement holds and retries, as in the MarketCast B2 rule. It is never
+  the miner's fault. Repeated outages past `report_timeout` make the round
+  `absent`, not a loss.
+- **Is main-validator only.** Satellites never call the providers. They
+  verify the main validator's report digests and transcripts, the existing
+  arbiter pattern.
 
-The gateway is the only door out of the sandbox. It types every request
-and checks it against the budgets. It writes every request and reply to the
-transcript.
+### LLMs from Engy
 
-### LLMs
+- **Why Engy fits.** Engy's pitch is verifiable inference: a proof that the
+  model requested is the model that ran. That solves the audit problem for
+  LLMs. Each transcript entry stores the proof, and the auditor checks it
+  without regenerating. Spot-check regeneration (the earlier plan) becomes a
+  fallback for calls without a proof.
+- **Registry.** `[harness.providers.engy]` lists the allowed models by
+  Engy's model id and weights hash. Only models whose training cutoff is
+  before the competition's `from_block` are allowed.
+- **No tools beyond the gateway.** Requests go out with no provider-side
+  tools (no web search, no browsing). An LLM can only see what the harness
+  passes it. This matters more than with a self-hosted model: judging runs
+  **after** the episode's data exists, so a model with web access could look
+  the outcome up.
+- **What an LLM can read.** The observation, plus forward-recorded text
+  feeds: the event calendar with descriptions, the mandate or operating
+  brief written as text, and later licensed headlines. All text is data: the
+  simulator validates the action whatever the LLM said.
+- **Tool use.** The kit's primitives are exposed as tool schemas
+  (`cascade.harness.agent`). An Engy LLM can run an agent loop inside a
+  step, for example forecast, check the tail, then size, and every tool call
+  is a gateway call against the same budgets.
+- **Cadence.** For example, one LLM step per hour for `app:perp`, per 2 h
+  for `app:bess` and per day for `app:inventory`, plus a token budget per
+  episode. The LLM plans, and fast numeric code acts every step.
 
-- **Pinned, open-weight, validator-hosted.** A registry (`[harness.llm]`)
-  names each LLM by repo and revision, as Timestral is pinned. The LLMs run on
-  the main validator's pod (a vLLM-type server next to the `mkt_worker`
-  forecasters, held with the same `MktLease`). There are no external LLM APIs
-  in v1:
-  * they change silently;
-  * they cannot be replayed or audited;
-  * hosted tools such as web search could leak the future into a
-    forward-only test.
+### Decision models from decisionmodels.io
 
-  Every pinned LLM's training cutoff must be before the competition's
-  `from_block`. With no tools beyond the gateway, it cannot know the episode.
-- **Deterministic decoding.** Greedy, or seeded sampling from the round seed;
-  fixed batch-invariant kernels on a fixed pod type; a fixed
-  `max_tokens`. Replies go in the transcript, so the auditor's harness replay
-  needs no GPU. Trust in the replies themselves comes from a **spot-check**:
-  the auditor (or any validator with a GPU) regenerates a random, seeded
-  sample of LLM calls. Any mismatch beyond a token-level tolerance flags the
-  round. This is the same idea as the MarketCast re-forecast tolerance.
-- **What an LLM can read.** Anything the harness passes it from the
-  observation, plus scenario text feeds recorded forward like any series:
-  * the event calendar, with descriptions (FOMC, CPI, grid notices,
-    holidays);
-  * the mandate or operating brief written as text (the variants are
-    rendered as prose as well as numbers);
-  * later, licensed headline feeds.
+- **What they are for.** As listed, a call sends a *state* and *typed
+  questions* and gets back a probability for each allowed answer. That maps
+  onto the discrete choices inside a harness, for example:
+  * which regime this is (calm / trending / stressed);
+  * which decision kernel to use now;
+  * which forecaster, horizon or context length to ask (the Ephemeris
+    router experiment, task #30);
+  * whether to hedge, rebalance or order (yes / no or a few buckets);
+  * which tier of the mandate brief applies.
 
-  All text is data: the simulator validates the harness's action whatever
-  the LLM said.
-- **Tool use.** The kit exposes its primitives as tool schemas
-  (`cascade.harness.agent`): forecast, quantile and risk read-outs, the
-  decision kernels, and the calibrator. An LLM can then run an agent loop
-  inside a step, for example "forecast this spread, check the tail, size
-  the hedge", with every tool call a gateway call against the same budgets.
-  This is the "software that uses the fine-tune to make calls" in its fullest
-  form.
-- **Cadence.** LLM calls are expensive next to forecasts. Each scenario sets a
-  cadence: for example at most one LLM step per hour of episode time for
-  `app:perp`, per 2 h for `app:bess` (5-min steps), and per day for
-  `app:inventory`. There is also a token budget per episode. Typical use:
-  the LLM plans or reclassifies the regime at that cadence, and fast
-  numeric code acts every step.
-- **Later: our own LLM fine-tunes.** If lane C later fine-tunes LLMs per
-  vertical, they join the registry exactly as forecasters do. The harness
-  calls the slot holder, under the same pairing and change rules.
-
-### Decision models (miner-supplied)
-
-- **Allowed.** Small learned models a harness ships in its tree: an RL
-  policy, a regime classifier, gradient-boosted trees, a small net. The cap
-  is for example 50 MB in total. Formats are `safetensors` or `.npz` run by
-  kit code, or ONNX with `onnxruntime` pinned and single-threaded on CPU. No
-  pickles.
-- **Trained offline on history.** The kit's environments run in backtest mode
-  on public recorded data (`cascade harness backtest`). Miners can train
-  policies against the same simulator, costs and variants that judge them.
-  The forward-only rule still holds, because judging is on episodes after
-  commit.
-- **Not a second forecaster.** A decision model could hide its own price
-  forecaster. Three rules limit that:
-  * the model-lift gate (it must beat its own naive-forecast run);
-  * the novel-use forecast-value gate;
-  * a published **attribution** row: the score with the vertical fine-tune
-    against the score with forecasts zeroed to naive, with the decision
-    model held fixed.
-
-  A harness whose gain does not depend on the fine-tune does not pass.
+  The harness turns the probabilities into an action with kit primitives,
+  for example a probability-weighted kernel blend.
+- **Kit call.** `models.decide(name, state, questions)` returns
+  `{question: {answer: p}}`. `state` is built with kit helpers from the
+  observation and forecasts. Forecast quantiles are a natural input, which
+  keeps the fine-tune in the loop.
+- **Registry.** `[harness.providers.decisionmodels]` pins the model names
+  and versions. The listing names `s1-fast`, `s1-pro`, `s1-vision` and
+  `Quyet-1.0-Large`, said to be Apache-2.0: to confirm.
+- **Determinism and audit.** Replies (probabilities) go in the transcript,
+  and the harness replays from them. To trust the replies themselves, the
+  auditor re-queries a seeded sample. Probabilities must match within a
+  tolerance, so the provider must be deterministic for a pinned version
+  (to confirm). If it is not, and if the models really are open weights,
+  the fallback is to self-host the pinned weights on the main-validator pod
+  behind the same gateway call.
+- **Miner-shipped decision models.** Shipping weights in the tree (an RL
+  policy, trees, a small net, run on CPU) is no longer the main path. Q10
+  asks whether to keep it alongside decisionmodels.io. Either way, the
+  model-lift gate, the forecast-value gate and an attribution row (the
+  score with the fine-tune against forecasts zeroed to naive, other models
+  held fixed) make sure the gain still depends on the fine-tune.
 
 ### Who pays
 
-Forecasts stay on the main validator, as in MarketCast. LLM tokens are
-metered per entry. Q10 asks whether the miner pays for them: a metered
-charge on the funded key, or an LLM pod rented on the miner's key for that
-entry's eval. An entry with no LLM calls costs the same as before.
+Forecasts stay on the main validator, as in MarketCast. Engy and
+decisionmodels.io calls cost real money per token or per call. Proposal:
+meter every external call per entry, and charge it to the miner's funded
+key, capped by the episode budgets. An entry that makes no external calls
+costs the same as before (Q10).
 
 ## Rewarding creative use of forecasts
 
@@ -614,14 +632,14 @@ means the call is refused, not that the episode fails.
 
 - **Sandbox.** The same static guard and network-isolated sandbox as
   generators (`cascade/interface/static_guard.py`): no network, no clock, no
-  filesystem outside the tree, single-threaded BLAS, numpy / scipy (plus a
-  pinned `onnxruntime` for decision models) only, and a per-step CPU-time
-  limit (for example 200 ms; over the limit = a no-op action plus a
-  penalty). Code is capped (for example 2 MB). Decision-model weights are
-  capped (for example 50 MB, safetensors / npz / ONNX, no pickles). The
-  only way out of the sandbox is the model gateway.
-- **Determinism.** Same observations and model replies (forecasts and LLM
-  outputs) give the same actions, byte for byte. The validator records every forecast request and
+  filesystem outside the tree, single-threaded BLAS, numpy / scipy only,
+  and a per-step CPU-time limit (for example 200 ms; over the limit = a
+  no-op action plus a penalty). Code is capped (for example 2 MB). The only
+  way out of the sandbox is the model gateway (forecasts, Engy,
+  decisionmodels.io).
+- **Determinism.** Same observations and model replies (forecasts, Engy
+  replies, decision-model probabilities) give the same actions, byte for
+  byte. The validator records every forecast request and
   reply in a per-episode transcript (hashed into the receipt row). The
   auditor replays the harness on CPU from the transcript, without a GPU.
   This is the DEC-CA-0064 B3 pattern: you can check a verdict without
@@ -641,7 +659,7 @@ means the call is refused, not that the episode fails.
 | kind | `cascade/shared/config/lane_c.py` | `register_competition_kind("app", eval="paired episode decision score", forward_only=True, parse_value=check_scenario)` |
 | kit | `cascade/harness/` (new: `data`, `forecast`, `decide`, `env`) | the primitive set, with golden-vector tests per primitive; published as a standalone package for miners |
 | scenarios | `cascade/harness/scenarios/<name>.toml` + `adapters/` | one spec per scenario, plus its data adapter and forward recorder |
-| LLM serving | `cascade/validator/llm_worker.py` (new) | pinned LLM registry, deterministic decoding, token metering; on the `mkt` pod via `MktLease(owner="app")` |
+| model gateway | `cascade/validator/harness_gateway.py` (new) | Engy and decisionmodels.io clients: registry pinning, budgets, request-hash cache, transcript (with Engy proofs), transient handling, per-entry metering |
 | agent tools | `cascade/harness/agent.py` | kit primitives as tool schemas for LLM tool use |
 | sandbox runner | `cascade/eval/harness/runner.py` | runs `Harness` in the sandbox, proxies `fc.forecast`, writes the transcript |
 | trainer half | `cascade/trainer/lane_c_competitions.py` | `HarnessTrainer`: `read_recipe` checks the tree. `train_leg` is a short CPU leg (DEC-CA-0053 CPU tier, on the miner's key): static guard, a smoke run, and a **historical qualifier** (it must beat the reference on public backtest episodes, so junk is filtered before it costs validator GPU). It then freezes the pointer. `leg_hours` ≈ 0.25 |
@@ -672,13 +690,19 @@ novel_max_corr       = 0.5
 hard_tier_fraction   = 0.3
 step_cpu_ms          = 200
 tree_max_bytes       = 2_000_000
-weights_max_bytes    = 50_000_000
 
-[harness.llm]                    # pinned registry; cutoff must precede from_block
-models       = ["<open-weight-llm>@<rev>"]   # to choose (Q10)
-decoding     = "greedy"
+[harness.providers.engy]         # LLMs; cutoff must precede from_block
+models             = ["<engy-model-id>@<weights-hash>"]   # to choose (Q10)
+decoding           = "greedy"
+tools              = "gateway-only"   # no provider-side web or browse tools
 tokens_per_episode = 20000
-spot_check_fraction = 0.02
+require_proof      = true
+
+[harness.providers.decisionmodels]
+models               = ["<model>@<version>"]   # e.g. s1-fast, to confirm
+calls_per_episode    = 500
+spot_check_fraction  = 0.02
+prob_tolerance       = 1e-6
 
 [harness.bess]
 model      = "nrg:aemo"   # paired fine-tune target; its holder (or pinned base) is the forecaster
@@ -724,12 +748,11 @@ episode_h  = 24
   slots scored across every scenario of a template, including one added after
   commit? And what weight should they get against the per-scenario slots?
 
-- **Q10. LLMs.** Which open-weight LLMs go in the registry, and at what
-  size? Size sets the pod and the cost. Does the miner pay for LLM tokens
-  (a metered charge, or an eval pod on their key)? Should external LLM APIs
-  stay out for good, or come later as unscored and unaudited extras? Should
-  miners be allowed to ship a LoRA adapter for a pinned LLM, under the
-  weights cap?
+- **Q10. Engy and decisionmodels.io.** Which models do we pin from each? Do
+  both support version pinning and deterministic replies, and does every
+  Engy reply carry a proof? Who pays: metered to the miner, as proposed, or
+  absorbed by us? Is there a commercial or partner agreement (rate limits,
+  data terms)? Should miner-shipped decision weights stay as a second path?
 
 ## Rollout
 
@@ -737,7 +760,8 @@ episode_h  = 24
    first scenarios as specs on it. If a scenario needs a one-off module, the
    kit is missing a primitive.
    Build the model gateway and the transcript format in the same step: the
-   forecast path first, the LLM path once Q10 is settled.
+   forecast path first, then the Engy and decisionmodels.io clients once
+   their API facts are confirmed (Q10).
 1. Build `app:perp` plumbing on `mkt:market` first: it is the only vertical
    whose fine-tune exists, so the forecaster pairing can be tested end to
    end. In parallel, build the `nrg:` fine-tune and `app:bess` together, since
