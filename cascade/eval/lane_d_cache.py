@@ -31,6 +31,13 @@ through presigned GETs, into a local cache keyed by the entry digest:
   ``os.replace`` of a fully hashed staging directory and the index by
   ``os.replace`` of a temp file in ``root``, so a reader never sees a partial
   entry or index.
+* **Shared pins and leases.** KING_D and the house are published to
+  ``root/.lane_d_cache_pins.json`` (latest setter wins) and an entry being
+  fetched or scored is held by :meth:`PrefetchCache.lease`, a lease file
+  ``root/.lane_d_lease-<digest>-<pid>-<token>.json`` with the owner pid and
+  an expiry. Eviction, by any process, skips the instance's own pins, the
+  shared pins and every live lease; a lease whose pid is gone or whose
+  expiry passed is stale and is reclaimed (deleted) by the next scan.
 
 :func:`prefetch_grant` fills the cache through W4's
 :func:`cascade.eval.lane_d_ingest.ingest_presigned`, so every ingest guard
@@ -57,6 +64,8 @@ import shutil
 import stat
 import tempfile
 import threading
+import time
+import uuid
 from pathlib import Path
 
 from ..lane_d.intake import manifest_digest
@@ -66,6 +75,10 @@ log = logging.getLogger("cascade.eval.lane_d_cache")
 CACHE_CODES = ("bad_digest", "digest_mismatch", "over_budget")
 INDEX_FILE = ".lane_d_cache_index.json"
 LOCK_FILE = ".lane_d_cache.lock"
+PINS_FILE = ".lane_d_cache_pins.json"
+LEASE_PREFIX = ".lane_d_lease-"
+LEASE_TTL_S = 6 * 3600          # a scoring lease outlives any one forecast / sweep
+TMP_MARK = ".tmp-"
 INDEX_VERSION = 1
 STAGING_MARK = ".staging-"
 INGEST_SUBDIR = ".ingest"
@@ -142,6 +155,22 @@ def tree_digest(directory: str | os.PathLike) -> tuple[str, int] | None:
     return manifest_digest({"files": files}), total
 
 
+def _pid_alive(pid: int) -> bool:
+    """Whether ``pid`` names a live process on this host (the root is a
+    local directory, so lease owners are local)."""
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def _rmtree(path: Path) -> None:
     if path.is_symlink() or path.is_file():
         path.unlink()
@@ -171,6 +200,8 @@ class PrefetchCache:
         self.root.mkdir(parents=True, exist_ok=True)
         with self._locked(sync=False):
             self._recover()
+            if pins:
+                self._write_shared_pins()
             self._fit_budget_at_open()
             self._save()
 
@@ -222,8 +253,45 @@ class PrefetchCache:
 
     def set_pinned(self, *, king_d: str | None, house: str | None) -> None:
         """Replace the pinned set (KING_D and the house). A pin may name an
-        entry not yet cached; the previous pins become ordinary entries."""
-        self._pinned = frozenset(p for p in (_pin(king_d), _pin(house)) if p)
+        entry not yet cached; the previous pins become ordinary entries.
+        The set is also published to the root (``PINS_FILE``, latest setter
+        wins), so every process sharing the root honours it."""
+        pins = frozenset(p for p in (_pin(king_d), _pin(house)) if p)
+        with self._locked():
+            self._pinned = pins
+            self._write_shared_pins()
+
+    @contextlib.contextmanager
+    def lease(self, digest: str, *, ttl_s: float = LEASE_TTL_S):
+        """Hold ``digest`` against eviction by any process sharing the root
+        while the ``with`` body runs (fetch and score). The lease is a file
+        ``root/.lane_d_lease-<digest>-<pid>-<token>.json`` with the owner pid
+        and an expiry; it may be taken before the entry is cached. It is
+        removed on exit; a lease whose pid is gone or whose expiry passed is
+        stale and reclaimed by the next eviction scan."""
+        _check_digest(digest)
+        if isinstance(ttl_s, bool) or not isinstance(ttl_s, (int, float)) or not ttl_s > 0:
+            raise ValueError(f"ttl_s must be a positive number; got {ttl_s!r}")
+        name = f"{LEASE_PREFIX}{digest}-{os.getpid()}-{uuid.uuid4().hex}.json"
+        body = {"digest": digest, "pid": os.getpid(), "expires": time.time() + float(ttl_s)}
+        with self._locked():
+            self._atomic_write(name, body)
+        try:
+            yield
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(self.root / name)
+
+    def leased(self) -> frozenset:
+        """Digests held by a live lease of any process (stale ones reclaimed)."""
+        with self._locked():
+            return self._live_leases()
+
+    def protected(self) -> frozenset:
+        """Everything eviction must skip: this instance's pins, the shared
+        pins and every live lease."""
+        with self._locked():
+            return self._pinned | self._shared_pins() | self._live_leases()
 
     def entries(self) -> list[str]:
         """Cached digests, least recently used first."""
@@ -329,10 +397,11 @@ class PrefetchCache:
             raise CacheError("over_budget", f"{size} bytes > budget {self.budget_bytes}")
         need = self.total_bytes() + size - self.budget_bytes
         victims: list[str] = []
+        keep = self.protected() if need > 0 else frozenset()
         for d in self.entries():
             if need <= 0:
                 break
-            if d in self._pinned or d == digest:
+            if d in keep or d == digest:
                 continue
             victims.append(d)
             need -= self._entries[d][1]
@@ -387,8 +456,8 @@ class PrefetchCache:
                 # A crash's staging leftover: never an entry. Safe under the
                 # root lock: a live fill holds that lock until it publishes.
                 _rmtree(p)
-            elif name.startswith(f"{INDEX_FILE}.tmp-"):
-                _rmtree(p)          # an index write a crash interrupted
+            elif name.startswith(".") and TMP_MARK in name:
+                _rmtree(p)          # an index / pins / lease write a crash interrupted
             elif _HEX64.fullmatch(name) and p.is_dir() and not p.is_symlink():
                 on_disk.append(name)
         for d in on_disk:
@@ -412,10 +481,11 @@ class PrefetchCache:
 
     def _fit_budget_at_open(self) -> None:
         over = self.total_bytes() - self.budget_bytes
+        keep = self.protected() if over > 0 else frozenset()
         for d in self.entries():
             if over <= 0:
                 break
-            if d in self._pinned:
+            if d in keep:
                 continue
             over -= self._entries[d][1]
             self._evict(d)
@@ -427,19 +497,64 @@ class PrefetchCache:
         body = {"version": INDEX_VERSION, "clock": self._clock,
                 "entries": {d: {"tick": t, "size": s}
                             for d, (t, s) in sorted(self._entries.items())}}
-        # A unique temp file in root, then an atomic replace: a reader sees the
-        # old index or the new one, never a partial write.
-        fd, tmp = tempfile.mkstemp(prefix=f"{INDEX_FILE}.tmp-", dir=self.root)
+        self._atomic_write(INDEX_FILE, body)
+
+    def _atomic_write(self, name: str, body: dict) -> None:
+        """``body`` as JSON at ``root/name`` via a unique temp file in root
+        and ``os.replace``: a reader sees the old file or the new one, never a
+        partial write."""
+        fd, tmp = tempfile.mkstemp(prefix=f"{name}{TMP_MARK}", dir=self.root)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(body, f, sort_keys=True, separators=(",", ":"))
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp, self.root / INDEX_FILE)
+            os.replace(tmp, self.root / name)
         except BaseException:
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(tmp)
             raise
+
+    def _write_shared_pins(self) -> None:
+        self._atomic_write(PINS_FILE, {"pins": sorted(self._pinned), "pid": os.getpid(),
+                                       "set_at": time.time()})
+
+    def _shared_pins(self) -> frozenset:
+        """The root's published pins (KING_D and the house as last set by any
+        process); empty when absent or unreadable."""
+        try:
+            raw = json.loads((self.root / PINS_FILE).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return frozenset()
+        pins = raw.get("pins") if isinstance(raw, dict) else None
+        if not isinstance(pins, list):
+            return frozenset()
+        return frozenset(p for p in pins if isinstance(p, str) and _HEX64.fullmatch(p))
+
+    def _live_leases(self) -> frozenset:
+        """Digests under a live lease; stale lease files (owner pid gone,
+        expiry passed, or unreadable) are removed. Called under the lock."""
+        live: set[str] = set()
+        now = time.time()
+        for p in self.root.iterdir():
+            name = p.name
+            if not name.startswith(LEASE_PREFIX) or TMP_MARK in name:
+                continue
+            try:
+                raw = json.loads(p.read_text(encoding="utf-8"))
+                digest, pid, expires = raw["digest"], raw["pid"], raw["expires"]
+                ok = (isinstance(digest, str) and _HEX64.fullmatch(digest) is not None
+                      and type(pid) is int and isinstance(expires, (int, float))
+                      and not isinstance(expires, bool))
+            except (OSError, ValueError, KeyError, TypeError):
+                ok = False
+            if ok and now < float(expires) and _pid_alive(pid):
+                live.add(digest)
+                continue
+            log.info("lane_d_cache_lease_reclaimed file=%s", name)
+            with contextlib.suppress(FileNotFoundError):
+                p.unlink()
+        return frozenset(live)
 
 
 def prefetch_grant(cache: PrefetchCache, grant: dict, *, contract=None,
