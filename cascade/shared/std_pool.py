@@ -361,6 +361,91 @@ def select_mkt_view(view: dict, body: dict, select: dict) -> dict:
     return {**view, "files": files, "assets": {c: v for c, v in assets.items() if v}}
 
 
+# W-CMP2: a standard pool from ANY builder, projected onto the MarketCast
+# snapshot API: each series' grid step names its bank (1 m = the minute bars,
+# 1 h = the coarse bank, 5 m / 15 m = the native banks), its ``class`` tag
+# (else ``domain``) the asset class, its ``asset`` tag (else the last id
+# component) the symbol, and each channel a field (renamed by the spec's
+# ``channels`` map: metric channel -> pool channel). Every series of one bank
+# must share one grid (a builder aligns them).
+_STEP_BANKS = {60: ("bars", ""), 3600: ("coarse", ""), 300: ("n5m", "5m"), 900: ("n15m", "15m")}
+
+
+def generic_mkt_view(body: dict, select: dict | None = None,
+                     channels: dict | None = None) -> dict:
+    """The MarketCast snapshot meta (with ``aliases``: virtual path -> the
+    pool's file) of a standard pool that carries no MarketCast source meta."""
+    clock = body.get("clock")
+    if not clock:
+        raise StdPoolError("a pool read by the MarketCast runner needs its block clock")
+    inv = {pool_ch: metric_ch for metric_ch, pool_ch in dict(channels or {}).items()}
+    grids: dict[str, tuple[int, int, int]] = {}
+    files: dict[str, str] = {}
+    aliases: dict[str, str] = {}
+    assets: dict[str, list[str]] = {}
+    sources: dict[str, str] = {}
+    for sid in sorted(body["series"]):
+        rec = body["series"][sid]
+        tags = rec["tags"]
+        if select and not all(tags.get(k) == v for k, v in select.items()):
+            continue
+        g = rec.get("grid")
+        if not g or int(g["step_seconds"]) not in _STEP_BANKS:
+            continue                    # explicit timestamps / unsupported step: not judged
+        bank, _iv = _STEP_BANKS[int(g["step_seconds"])]
+        grid = (int(g["t0"]), int(g["step_seconds"]), int(g["steps"]))
+        if grids.setdefault(bank, grid) != grid:
+            raise StdPoolError(f"series {sid!r}: bank {bank} grid {grid} differs from "
+                               f"{grids[bank]} (a builder aligns one grid per step)")
+        cls = str(tags.get("class") or tags.get("domain") or "")
+        asset = str(tags.get("asset") or sid.rsplit("/", 1)[-1])
+        if not cls or "/" in cls or "/" in asset:
+            raise StdPoolError(f"series {sid!r}: class / asset tags are not path-safe")
+        for ch, real in sorted(rec["channels"].items()):
+            fld = inv.get(ch, ch)
+            v = f"{bank}/{cls}/{asset}/{fld}.npy"
+            files[v] = body["files"][real]
+            aliases[v] = real
+        if bank == "bars" or asset not in assets.get(cls, ()):
+            assets.setdefault(cls, [])
+            if asset not in assets[cls]:
+                assets[cls].append(asset)
+        sources.setdefault(cls, str(tags.get("source", "")))
+    if not grids:
+        raise StdPoolError("no series of the pool lies on a 1m / 5m / 15m / 1h grid")
+    t0, step, n = grids.get("bars") or grids.get("coarse") or next(iter(grids.values()))
+    minutes = n * step // 60
+    meta: dict = {"version": 1, "t0": int(t0), "minutes": int(minutes),
+                  "end": int(t0) + 60 * int(minutes),
+                  "anchor_block": int(clock["anchor_block"]),
+                  "anchor_time": float(clock["anchor_time"]),
+                  "block_seconds": float(clock["block_seconds"]),
+                  "sources": dict(sorted(sources.items())),
+                  "assets": {c: sorted(v) for c, v in sorted(assets.items())},
+                  "files": dict(sorted(files.items())), "cross_check": {},
+                  "signer": str(body.get("signer", "")), "aliases": aliases}
+    if "coarse" in grids:
+        c0, _s, cn = grids["coarse"]
+        meta["coarse"] = {"t0": int(c0), "steps": int(cn), "bar_minutes": 60}
+        if "bars" not in grids:
+            meta["end"] = max(int(meta["end"]), int(c0) + 3600 * int(cn))
+    nat = {iv: grids[b] for b, iv in (("n5m", "5m"), ("n15m", "15m")) if b in grids}
+    if nat:
+        meta["native"] = {iv: {"t0": int(g0), "steps": int(gn), "bar_minutes": gs // 60}
+                          for iv, (g0, gs, gn) in sorted(nat.items())}
+    return meta
+
+
+def pool_mkt_view(body: dict, select: dict | None = None,
+                  channels: dict | None = None) -> dict:
+    """THE projection the MarketCast runner reads a standard pool through: a
+    MarketCast builder's pool (its own source meta) or any builder's pool
+    (:func:`generic_mkt_view`)."""
+    if (body.get("source_meta") or {}).get("marketcast_snapshot"):
+        return mkt_meta_view(body, select)
+    return generic_mkt_view(body, select, channels)
+
+
 def write_std_pool_from_mkt(src_dir: Path | str, out_dir: Path | str, *, wallet=None) -> dict:
     """BUILDER: re-emit a MarketCast snapshot directory as a standard pool
     (same array bytes, same relative paths; signed when ``wallet``)."""
@@ -381,7 +466,7 @@ def write_std_pool_from_mkt(src_dir: Path | str, out_dir: Path | str, *, wallet=
     return body
 
 
-__all__ = ["MKT_DOMAIN", "MKT_POOL_ID", "POOL_FILE", "SCHEMA", "SCHEMAS", "StdPool",
+__all__ = ["generic_mkt_view", "pool_mkt_view", "MKT_DOMAIN", "MKT_POOL_ID", "POOL_FILE", "SCHEMA", "SCHEMAS", "StdPool",
            "StdPoolError", "canonical_body", "check_body", "load_std_pool", "mkt_meta_view",
            "pool_digest", "sign_body", "std_body_from_mkt_meta", "verify_signature",
            "write_std_pool", "write_std_pool_from_mkt"]

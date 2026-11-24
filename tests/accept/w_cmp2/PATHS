@@ -1,0 +1,30 @@
+# W-CMP2 (plan rev6.25, DEC-CA-0075; owner 2026-11-24 "build W-CMP2 for THIS
+# release"): the multi-instance lane C runner. A new competition (a new
+# domain, its standard pool from a builder job, plus a spec) launches by
+# overlay; each instance has its own legs, judge, verdicts, payouts and audit.
+# Spec layer: any id is an instance of the marketcast runner.
+cascade/shared/competition_spec.py
+cascade/shared/config/loader.py
+cascade/shared/config/lane_c.py
+cascade/shared/config/marketcast.py
+cascade/shared/lane_c.py
+cascade/shared/netconfig.py
+# The generic standard-pool projection (any builder's pool, channel map).
+cascade/shared/std_pool.py
+cascade/pool/marketcast.py
+# The validator: the MarketCast judge keyed by instance; the halves.
+cascade/validator/marketcast.py
+cascade/validator/lane_c_competitions.py
+cascade/shared/marketcast_report.py
+# The trainer: instance halves, per-leg table, pool relay, pod training data.
+cascade/trainer/lane_c_competitions.py
+cascade/trainer/lane_c_driver.py
+cascade/trainer/marketcast_runner.py
+cascade/trainer/marketcast_leg.py
+cascade/trainer/runner_funded_legs.py
+cascade/trainer/worker.py
+# The audit: every instance replayed.
+cascade/audit/checks.py
+cascade/audit/main.py
+# W-CMP's own tests follow the multi-instance runner (a new id now runs).
+tests/accept/w_cmp/test_w_cmp_spec.py

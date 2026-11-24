@@ -71,7 +71,56 @@ class MarketCastValidator(ValidatorCompetition):
         return fold_mkt_plan(st, plan)   # labels computed at judge time
 
 
+class SpecInstanceValidator(ValidatorCompetition):
+    """W-CMP2 (DEC-CA-0075): a lane-C spec INSTANCE of the multi-instance
+    MarketCast runner — the same judge, rows, verdicts and fold as
+    ``mkt``, on the instance's compiled table, its own reports
+    (``reports[<id>]``), state (``comp[<id>]``) and targets ``<id>:<name>``."""
+
+    generic_fold = False
+
+    def __init__(self, kind: str) -> None:
+        self.kind = str(kind)
+
+    def judge(self, runner, manifest, cm, *, rid, block, era_index, st, commitments_fn):
+        from ..shared.config.lane_c import mc_for
+        from .lane_c import LaneCJudgement
+        from .marketcast import MktCtx, mkt_context
+
+        mc = mc_for(runner.cfg, self.kind)
+        if mc is None:
+            # not configured at this settlement: its entries are refused,
+            # never judged (its state stays for a later re-configuration)
+            js = [LaneCJudgement(e, False, "target", f"competition {self.kind!r} is not "
+                                 "configured at this settlement", phase="judge", k=1,
+                                 alpha=0.05, mkt={"inconclusive": ""})
+                  for e in (cm.entries if cm is not None else ())
+                  if kind_of(e.target) == self.kind]
+            return None, js
+        with mkt_context(MktCtx(self.kind, mc)):
+            return runner._mkt_settle(manifest, cm, rid=rid, block=block,
+                                      era_index=era_index, st=st,
+                                      commitments_fn=commitments_fn)
+
+    def fold(self, st, plan, judgements, *, round_id, settle_block, era_index):
+        from .marketcast import MktCtx, fold_mkt_plan
+
+        return fold_mkt_plan(st, plan, MktCtx(self.kind, None))
+
+
 VALIDATOR_COMPETITIONS: dict[str, ValidatorCompetition] = {}
+_SPEC_INSTANCES: dict[str, SpecInstanceValidator] = {}
+
+
+def _spec_instance(kind: str) -> SpecInstanceValidator | None:
+    from ..shared.config.lane_c import SPEC_KINDS
+
+    if kind not in SPEC_KINDS:
+        return None
+    hit = _SPEC_INSTANCES.get(kind)
+    if hit is None:
+        hit = _SPEC_INSTANCES[kind] = SpecInstanceValidator(kind)
+    return hit
 
 
 def register_validator_competition(comp: ValidatorCompetition) -> ValidatorCompetition:
@@ -88,16 +137,22 @@ def register_validator_competition(comp: ValidatorCompetition) -> ValidatorCompe
 
 def validator_competition(target_or_kind: str) -> ValidatorCompetition | None:
     s = str(target_or_kind or "")
-    return VALIDATOR_COMPETITIONS.get(kind_of(s) if ":" in s else s)
+    k = kind_of(s) if ":" in s else s
+    return VALIDATOR_COMPETITIONS.get(k) or _spec_instance(k)
 
 
 def judging_order() -> list[ValidatorCompetition]:
     """MarketCast first (its rows lead the receipt, as before), then every
-    other kind by name — a fixed order every validator shares."""
-    return sorted(VALIDATOR_COMPETITIONS.values(), key=lambda c: (c.kind != MKT_KIND, c.kind))
+    other kind by name — a fixed order every validator shares (spec
+    instances included, W-CMP2)."""
+    from ..shared.config.lane_c import SPEC_KINDS
+
+    comps = list(VALIDATOR_COMPETITIONS.values()) + [
+        _spec_instance(k) for k in sorted(SPEC_KINDS) if k not in VALIDATOR_COMPETITIONS]
+    return sorted(comps, key=lambda c: (c.kind != MKT_KIND, c.kind))
 
 
 register_validator_competition(MarketCastValidator())
 
-__all__ = ["VALIDATOR_COMPETITIONS", "MarketCastValidator", "ValidatorCompetition",
+__all__ = ["SpecInstanceValidator", "VALIDATOR_COMPETITIONS", "MarketCastValidator", "ValidatorCompetition",
            "judging_order", "register_validator_competition", "validator_competition"]

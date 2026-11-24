@@ -20,7 +20,7 @@ def test_w_cmp_registry_lists_the_blocks():
     assert reg["menu"]["test_families"] == ["plain_lcb", "maxt", "bonferroni"]
     assert reg["menu"]["pay_curves"] == ["tiered_decay", "fixed_term",
                                          "indefinite_until_beaten"]
-    assert reg["runners"] == {"marketcast": ["mkt"]}
+    assert reg["runners"] == {"marketcast": ["*"]}           # W-CMP2: multi-instance
     assert "cascade-std-pool/1" in reg["pool_schemas"]
     from cascade.shared import netconfig as nc
 
@@ -98,10 +98,11 @@ def test_w_cmp_refused_marketcast_spec_burns_never_crashes():
     assert rec["refused"][0]["id"] == "mkt" and rec["refused"][0]["refused"] == "unknown_block"
 
 
-def test_w_cmp_new_competition_without_a_runner_burns_its_share():
-    """A spec for a new id this release cannot host is refused
-    ``runner_capacity``; its declared weight stays in the split, so its part
-    burns and MarketCast's part is unchanged in absolute terms."""
+def test_w_cmp_new_competition_that_cannot_run_burns_its_share():
+    """A spec for a new id that does not name what a new competition needs
+    (its pool, metrics, universe, timeframes, horizons, start) is refused;
+    its declared weight stays in the split, so its part burns and
+    MarketCast's part is unchanged in absolute terms."""
     import cascade.shared.competition_spec  # noqa: F401  (W-CMP)
     from cascade.shared.lane_c import lane_c_split
 
@@ -109,7 +110,7 @@ def test_w_cmp_new_competition_without_a_runner_burns_its_share():
     base = parse(raw)
     cfg = parse(with_specs(raw, {"energy": {"runner": "marketcast", "weight": 1.0,
                                             "select": {"domain": "energy"}}}))
-    assert cfg.lane_c.spec_refusal("energy").code == "runner_capacity"
+    assert cfg.lane_c.spec_refusal("energy").code == "bad_value"
     assert cfg.lane_c.refused_weight == 1.0
     blk = 10**9
     _c0, s0 = lane_c_split(base.lane_c, blk, 3600, base.marketcast)

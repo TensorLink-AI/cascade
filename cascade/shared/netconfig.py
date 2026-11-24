@@ -498,8 +498,11 @@ def lane_c_competition_changes(base: ChainConfig, new: ChainConfig) -> list[str]
 
     from .config.lane_c import COMPETITION_OVERLAY_KEYS, LaneCCompetition
 
-    a = {c.kind: c for c in base.lane_c.competition_list}
-    b = {c.kind: c for c in new.lane_c.competition_list}
+    # W-CMP2 (DEC-CA-0075): a SPEC INSTANCE is added, changed or removed by
+    # its spec (its start is guarded by retroactive_changes)
+    inst = {t[0] for t in tuple(base.lane_c.instances) + tuple(new.lane_c.instances)}
+    a = {c.kind: c for c in base.lane_c.competition_list if c.kind not in inst}
+    b = {c.kind: c for c in new.lane_c.competition_list if c.kind not in inst}
     if set(a) != set(b):
         return [f"[lane_c] competitions {sorted(a)} -> {sorted(b)}: adding or removing a "
                 "competition is release-only (a new competition kind is code)"]
@@ -547,6 +550,15 @@ def retroactive_changes(prev: ChainConfig, new: ChainConfig, apply_block: int) -
         if was != now and (0 < now < apply_block or 0 < was < apply_block):
             out.append(f"[lane_c.competitions.{c.kind}] until_block {was} -> {now} crosses a "
                        f"block before the one the overlay applies at ({apply_block})")
+    # W-CMP2: a spec instance's start never lies before the apply block when
+    # it is added or moved (no retroactive competition)
+    old_f = {c.kind: int(c.from_block) for c in prev.lane_c.competition_list}
+    inst = {t[0] for t in new.lane_c.instances}
+    for c in new.lane_c.competition_list:
+        if c.kind in inst and old_f.get(c.kind) != int(c.from_block) and \
+                0 < int(c.from_block) < apply_block:
+            out.append(f"[lane_c.specs.{c.kind}] from_block {c.from_block} lies before the "
+                       f"block the overlay applies at ({apply_block})")
     probes = {0, max(0, apply_block - 1)}
     for c in (prev, new):
         act = int(c.round.epoch_activation_block or 0)

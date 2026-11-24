@@ -201,7 +201,21 @@ def gain_margin_for(target: str, cfg, mc=None) -> float:
         if mc is None:
             raise ValueError(f"an {target!r} win needs [marketcast] for its gain margin")
         return float(mc.gain_margin)
+    inst = _instance_mc(cfg, target)
+    if inst is not None:
+        # W-CMP2: a spec instance's own margin
+        return float(inst.gain_margin)
     return float(cfg.gain_margin)
+
+
+def _instance_mc(cfg, target: str):
+    """W-CMP2: the compiled spec instance judging ``target`` (None = not one)."""
+    from .config.lane_c import SPEC_KINDS, kind_of
+
+    k = kind_of(target)
+    if k not in SPEC_KINDS or not hasattr(cfg, "instance_mc"):
+        return None
+    return cfg.instance_mc(k)
 
 
 def duration_full_pay(gain_lcb: float | None, *, margin: float, min_days: float,
@@ -241,6 +255,9 @@ def pay_curve_for(target: str, cfg, mc=None) -> str:
     else ``[lane_c] pay_curve``."""
     if is_mkt_target(target) and mc is not None:
         return str(getattr(mc, "pay_curve", "fixed_term") or "fixed_term")
+    inst = _instance_mc(cfg, target)
+    if inst is not None:
+        return str(getattr(inst, "pay_curve", "fixed_term") or "fixed_term")
     return str(getattr(cfg, "pay_curve", "fixed_term") or "fixed_term")
 
 

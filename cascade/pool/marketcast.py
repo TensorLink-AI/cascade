@@ -424,9 +424,12 @@ class MktSnapshot:
             return hit
         out = {}
         prefix = f"{bank}/{cls}/{asset}/"
+        # W-CMP2: a generic standard pool's view names virtual paths (aliases)
+        alias = self.meta.get("aliases") or {}
         for rel in self.meta["files"]:
             if rel.startswith(prefix):
-                out[rel[len(prefix):-4]] = np.load(self.root / rel, allow_pickle=False)
+                out[rel[len(prefix):-4]] = np.load(self.root / alias.get(rel, rel),
+                                                   allow_pickle=False)
         self._cache[key] = out
         return out
 
@@ -457,7 +460,7 @@ class MktSnapshot:
 
 def load_snapshot(root: Path | str, *, signer_hotkey: str = "",
                   verify_signature: bool = True, schema: str = "",
-                  select: dict | None = None) -> MktSnapshot:
+                  select: dict | None = None, channels: dict | None = None) -> MktSnapshot:
     """Read + verify a snapshot directory: every listed file's sha256, no
     unlisted bar file, and (``verify_signature``) the body's signature by
     ``signer_hotkey``. Raises :class:`SnapshotError`.
@@ -474,7 +477,7 @@ def load_snapshot(root: Path | str, *, signer_hotkey: str = "",
         POOL_FILE,
         StdPoolError,
         load_std_pool,
-        mkt_meta_view,
+        pool_mkt_view,
         select_mkt_view,
         std_body_from_mkt_meta,
     )
@@ -487,7 +490,7 @@ def load_snapshot(root: Path | str, *, signer_hotkey: str = "",
         try:
             pool = load_std_pool(root, signer_hotkey=signer_hotkey, verify=verify_signature,
                                  **({"schema": schema} if schema else {}))
-            meta = mkt_meta_view(pool.body, select)
+            meta = pool_mkt_view(pool.body, select, channels)
         except StdPoolError as e:
             raise SnapshotError(f"standard pool refused: {e}") from e
         if int(meta.get("version", 0)) != MKT_SNAPSHOT_VERSION:
@@ -843,11 +846,13 @@ class MktSnapshotSource:
 
     def __init__(self, store, *, prefix: str, signer_hotkey: str, cache_dir: Path | str,
                  verify_signature: bool = True, schema: str = "",
-                 select: dict | None = None) -> None:
+                 select: dict | None = None, channels: dict | None = None) -> None:
         self.store, self.prefix = store, str(prefix)
         self.signer, self.verify = str(signer_hotkey or ""), bool(verify_signature)
-        # DEC-CA-0075: the competition spec's pool schema and series filter
+        # DEC-CA-0075: the competition spec's pool schema, series filter and
+        # channel map
         self.schema, self.select = str(schema or ""), dict(select or {})
+        self.channels = dict(channels or {})
         self.cache_dir = Path(cache_dir) / self.prefix
         self._cache: dict[str, MktSnapshot] = {}
 
@@ -869,7 +874,8 @@ class MktSnapshotSource:
             dest = self.cache_dir / f"snapshot-{meta.effective_block}-{meta.sha256[:12]}"
             fetch_pool_snapshot(self.store, meta, dest)
             hit = load_snapshot(dest, signer_hotkey=self.signer, verify_signature=self.verify,
-                                schema=self.schema, select=self.select)
+                                schema=self.schema, select=self.select,
+                                channels=self.channels)
             if len(self._cache) >= 4:
                 self._cache.pop(next(iter(self._cache)))
             self._cache[meta.sha256] = hit

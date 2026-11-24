@@ -109,6 +109,58 @@ for _k in ("domain", "freq", "horizon"):
                               forward_only=False)
 del _k
 
+# ── W-CMP2 (DEC-CA-0075): spec INSTANCES of the marketcast runner ───────────
+#
+# A lane-C competition spec ``[lane_c.specs.<id>]`` with any id but ``mkt`` is
+# a new competition hosted by the multi-instance MarketCast runner: its kind is
+# the id (targets ``<id>:<name>``), registered here when a config naming it is
+# parsed (a kind registered once stays registered; whether it is CONFIGURED at
+# a block is the config's business, so every node judges identically).
+SPEC_KINDS: set[str] = set()
+_INSTANCE_VALUE_RE = re.compile(r"^[a-z0-9_.\-]{1,32}$")
+
+
+def _instance_value(v: str) -> str:
+    if not _INSTANCE_VALUE_RE.match(str(v)):
+        raise ValueError(f"spec-instance target value {v!r} must be [a-z0-9_.-]{{1,32}}")
+    return str(v)
+
+
+def register_spec_kind(kind: str) -> CompetitionKind:
+    """Register spec instance ``kind`` (idempotent). A kind already registered
+    as something else (MarketCast's ``mkt``, a retired DEC-CA-0056 kind, a
+    code competition) is refused."""
+    k = str(kind)
+    if k in SPEC_KINDS:
+        return COMPETITION_KINDS[k]
+    if k in COMPETITION_KINDS:
+        raise ValueError(f"lane-C spec id {k!r} is already a competition kind of this release")
+    ck = register_competition_kind(k, eval="marketcast runner spec instance (DEC-CA-0075)",
+                                   forward_only=True, parse_value=_instance_value)
+    SPEC_KINDS.add(k)
+    return ck
+
+
+def is_mkt_family(target_or_kind: object) -> bool:
+    """Whether a target (or kind) is run by the MarketCast runner: ``mkt`` or
+    a spec instance."""
+    s = str(target_or_kind or "").strip()
+    k = kind_of(s) if ":" in s else s
+    return k == MKT_KIND or k in SPEC_KINDS
+
+
+def mc_for(cfg, target_or_kind: object):
+    """The MarketCast-shaped config judging ``target`` (or ``kind``):
+    ``[marketcast]`` for ``mkt``, the compiled instance for a spec instance
+    configured in ``cfg``, else None."""
+    s = str(target_or_kind or "").strip()
+    k = kind_of(s) if ":" in s else s
+    if k == MKT_KIND:
+        return getattr(cfg, "marketcast", None)
+    lc = getattr(cfg, "lane_c", None)
+    return lc.instance_mc(k) if lc is not None and hasattr(lc, "instance_mc") else None
+
+
 # The shipped targets: one per default [marketcast] suite.
 DEFAULT_TARGETS: tuple[str, ...] = tuple(f"{MKT_KIND}:{s}" for s in MKT_DEFAULT_SUITES)
 
@@ -288,6 +340,19 @@ class LaneCConfig:
     decay_floor: float = 0.1
     decay_ttl_eras: int = 56
 
+    # W-CMP2: the compiled spec instances ``((id, MarketCastConfig), ...)``,
+    # id order; their targets are in ``targets``, their competitions in
+    # ``competitions``
+    instances: tuple = ()        # ((id, MarketCastConfig, compiled table JSON), ...)
+
+    def instance_mc(self, kind: str):
+        return next((t[1] for t in self.instances if t[0] == str(kind)), None)
+
+    def instance_table(self, kind: str) -> str:
+        """The instance's compiled [marketcast]-shaped table (canonical JSON;
+        the pod trains under it) — "" = not an instance here."""
+        return next((t[2] for t in self.instances if t[0] == str(kind)), "")
+
     def spec(self, sid: str):
         return next((s for s in self.specs if s.id == str(sid)), None)
 
@@ -466,7 +531,7 @@ def parse_lane_c(lc: dict, *, v2_from_block: int = 0, era_blocks: int = 0,
                  mkt_suites: tuple[str, ...] | None = None,
                  kind_from_blocks: dict[str, int] | None = None,
                  era_blocks_at: Callable[[int], int] | None = None,
-                 specs: tuple = ((), ())) -> LaneCConfig:
+                 specs: tuple = ((), ()), instances: tuple = ()) -> LaneCConfig:
     """Parse + guard ``[lane_c]`` (absent section ⇒ inert defaults).
 
     ``era_blocks`` (the era length on the grid in force at ``from_block``) and
@@ -543,7 +608,7 @@ def parse_lane_c(lc: dict, *, v2_from_block: int = 0, era_blocks: int = 0,
     family, curve = parse_lane_menu("lane_c", lc)
     specs_ok, specs_bad = specs
     cfg = LaneCConfig(
-        specs=tuple(specs_ok), spec_refusals=tuple(specs_bad),
+        specs=tuple(specs_ok), spec_refusals=tuple(specs_bad), instances=tuple(instances),
         refused_weight=_refused_weight(lc.get("specs"), specs_bad, lc.get("competitions")),
         test_family=family, pay_curve=curve,
         decay_half_life_eras=_num(lc.get("decay_half_life_eras", 1.0), "decay_half_life_eras"),
@@ -654,5 +719,6 @@ __all__ = [
     "FORWARD_ONLY_REQUIRED", "FROM_BLOCK_TABLES", "LANE_C_REMAINDERS", "LANE_C_TAKES_FROM",
     "LaneCCompetition", "LaneCConfig", "MKT_KIND", "PUBLIC_SUITES", "RECIPE_SCHEDULES",
     "WIND_DOWN_MODES", "check_target", "is_mkt_target", "kind_of", "parse_lane_c",
-    "parse_target", "register_competition_kind",
+    "parse_target", "register_competition_kind", "SPEC_KINDS", "is_mkt_family", "mc_for",
+    "register_spec_kind",
 ]

@@ -47,10 +47,18 @@ lets unknown NAMES through as a typed refusal, so a node one release behind
 burns that one competition's share instead of rejecting the whole overlay.
 
 What still needs a release: a new BLOCK (a new metric, test family, pay
-curve, pool schema version or runner). Today the ``marketcast`` runner hosts
-one competition (``mkt``); a second concurrent competition on the generic
-runner is the W-CMP2 capability (plan rev6.25) — until it ships, a spec for
-any other id is refused ``runner_capacity`` (its share burns).
+curve, pool schema version or runner).
+
+W-CMP2 (plan rev6.25, owner 2026-11-24): the ``marketcast`` runner is
+MULTI-INSTANCE. ``mkt`` is its legacy instance (its tables are ``[marketcast]``
+and ``[lane_c.competitions.mkt]``); any other id is a spec INSTANCE — its own
+targets ``<id>:<name>``, legs, rows, reports (``reports[<id>]`` in the lane-C
+manifest), verdicts, slots, payouts and audit, keyed by the id. An instance
+spec must name its pool, metrics, universe, timeframes, horizons and
+``from_block`` (:data:`INSTANCE_REQUIRED`); everything else inherits the
+deployed ``[marketcast]`` table (the model pins, the recipe bounds, the
+verdict statistics). ``channels`` maps a metric's channel name to the pool's
+(``{close = "load"}``: an energy pool's load series is read as the close).
 """
 
 from __future__ import annotations
@@ -58,6 +66,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from dataclasses import dataclass
 
 from .rules_menu import LANE_DEFAULTS, PAY_CURVES, TEST_FAMILIES
@@ -86,11 +95,25 @@ GUARD_METRICS: tuple[str, ...] = ("mase", "qlike", "tail")
 POOL_SCHEMAS: tuple[str, ...] = ("",) + tuple(STD_POOL_SCHEMAS)
 # Runners: the judge / leg code a spec is executed by, and the competition
 # ids each can host in this release.
-RUNNERS: dict[str, tuple[str, ...]] = {"marketcast": ("mkt",)}
+# ids each runner hosts: "*" = any id matching :data:`SPEC_ID_RE` that is
+# not reserved (W-CMP2: the marketcast runner is multi-instance)
+RUNNERS: dict[str, tuple[str, ...]] = {"marketcast": ("*",)}
+LEGACY_INSTANCE = "mkt"
+# ids that name another lane-C kind (retired DEC-CA-0056 kinds) or a table
+RESERVED_IDS = frozenset({"domain", "freq", "horizon", "lane_a", "lane_b", "lane_c", "lane_d",
+                          "market", "burn"})
+SPEC_ID_RE = re.compile(r"^[a-z][a-z0-9_]{1,23}$")
 SPEC_KEYS: tuple[str, ...] = (
     "runner", "pool", "select", "universe", "timeframes", "horizons", "metrics", "score",
     "guards", "metric_weights", "gain_margin", "alpha", "test_family", "pay_curve", "weight",
-    "until_block", "embargo_days", "embargo_eval_days")
+    "until_block", "embargo_days", "embargo_eval_days", "from_block", "channels")
+# what a NEW instance must name (the legacy ``mkt`` inherits [marketcast])
+INSTANCE_REQUIRED: tuple[str, ...] = ("pool", "metrics", "universe", "timeframes", "horizons",
+                                      "from_block")
+# keys only an instance sets (mkt's start / channels are [marketcast]'s own)
+INSTANCE_ONLY: tuple[str, ...] = ("from_block", "channels")
+# channel names the series metrics read (SERIES_METRICS values)
+CHANNEL_NAMES = ("open", "high", "low", "close", "volume", "funding", "price")
 POOL_KEYS: tuple[str, ...] = ("prefix", "signer", "schema")
 
 REFUSAL_CODES = ("unknown_key", "unknown_block", "runner_capacity", "bad_value",
@@ -122,6 +145,7 @@ SPEC_BOUNDS: dict[str, SpecBound] = {
     "alpha": SpecBound(0.0, 0.10, lo_open=True),
     "weight": SpecBound(0.0, 100.0),
     "until_block": SpecBound(0, 10**12, integer=True),
+    "from_block": SpecBound(1, 10**12, integer=True),
     "embargo_days": SpecBound(2, 120, integer=True),
     "embargo_eval_days": SpecBound(1, 119, integer=True),
 }
@@ -213,11 +237,28 @@ def _parse(sid: str, raw: object) -> CompetitionSpec:
     if runner not in RUNNERS:
         raise _Bad("unknown_block", f"runner {runner!r} is not in this release "
                                     f"({sorted(RUNNERS)})")
-    if sid not in RUNNERS[runner]:
-        raise _Bad("runner_capacity", f"runner {runner!r} hosts {list(RUNNERS[runner])} in "
-                                      f"this release; {sid!r} needs the generic runner "
-                                      "(W-CMP2)")
+    hosts = RUNNERS[runner]
+    if sid != LEGACY_INSTANCE and (sid not in hosts and "*" not in hosts
+                                   or sid in RESERVED_IDS or not SPEC_ID_RE.match(sid)):
+        raise _Bad("runner_capacity", f"runner {runner!r} cannot host id {sid!r} (ids are "
+                                      "[a-z][a-z0-9_]{1,23}, not reserved)")
+    if sid == LEGACY_INSTANCE:
+        extra = [k for k in INSTANCE_ONLY if k in raw]
+        if extra:
+            raise _Bad("unknown_key", f"{extra} are instance keys; mkt's start and channels "
+                                      "are [marketcast]'s own")
+    else:
+        miss = [k for k in INSTANCE_REQUIRED if k not in raw]
+        if miss:
+            raise _Bad("bad_value", f"a new competition must name {miss}")
     vals: dict[str, object] = {"runner": runner}
+    if "channels" in raw:
+        ch = _str_table(raw["channels"], "channels", of_lists=False)
+        bad = [k for k in ch if k not in CHANNEL_NAMES]
+        if bad:
+            raise _Bad("unknown_block", f"channels maps {bad}; metric channels are "
+                                        f"{list(CHANNEL_NAMES)}")
+        vals["channels"] = dict(sorted(ch.items()))
     if "pool" in raw:
         p = raw["pool"]
         if not isinstance(p, dict) or set(p) - set(POOL_KEYS):
@@ -233,6 +274,8 @@ def _parse(sid: str, raw: object) -> CompetitionSpec:
                                         f"this release ({list(POOL_SCHEMAS)})")
         if "prefix" in pool and not pool["prefix"].strip():
             raise _Bad("bad_value", "pool.prefix must be non-empty")
+        if sid != LEGACY_INSTANCE and not pool.get("prefix"):
+            raise _Bad("bad_value", "a new competition must name pool.prefix")
         vals["pool"] = dict(sorted(pool.items()))
     if "select" in raw:
         vals["select"] = dict(sorted(_str_table(raw["select"], "select", of_lists=False).items()))
@@ -352,6 +395,34 @@ def compile_marketcast(spec: CompetitionSpec | None, mc_raw: dict, comp_raw: dic
     return mc, comp
 
 
+# [marketcast] keys a spec INSTANCE never inherits from the legacy table: its
+# data (it names its own), the market feeds and relays, its start, and the
+# legacy competition's own derived lists
+_NOT_INHERITED = ("from_block", "suites", "assets", "frequencies", "horizons", "data_sources",
+                  "pool_prefix", "pool_signer", "pool_schema", "pool_select", "pool_channels",
+                  "refused", "bar_relay", "native_intervals", "native_history_days",
+                  "composite", "composite_suite_weights", "forward_horizons", "gap_horizons",
+                  "min_dollar_volume_24h", "event_times")
+
+
+def compile_instance(spec: CompetitionSpec, mc_raw: dict) -> tuple[dict, dict]:
+    """W-CMP2: ``(instance [marketcast]-shaped raw table, its
+    [lane_c.competitions.<id>] raw)`` of a spec INSTANCE: the legacy table's
+    model pins, recipe bounds and verdict statistics, with the spec's data,
+    metrics and rules written over them. Parsed with
+    ``parse_marketcast(..., open_classes=True)`` by the loader."""
+    base = {k: v for k, v in dict(mc_raw or {}).items() if k not in _NOT_INHERITED}
+    base["min_dollar_volume_24h"] = 0.0      # no market volume in a non-market pool
+    out, comp = compile_marketcast(spec, base, {})
+    v = dict(spec.values)
+    out["composite"] = len(list(v.get("metrics") or ())) >= 2
+    if "channels" in v:
+        out["pool_channels"] = dict(v["channels"])
+    comp = dict(comp or {})
+    comp["from_block"] = int(v["from_block"])
+    return out, comp
+
+
 def marketcast_spec(cfg) -> dict:
     """The ``[lane_c.specs.mkt]`` table that restates ``cfg``'s MarketCast
     competition exactly (every spec key). Compiling it back is the identity
@@ -401,7 +472,8 @@ def registry() -> dict:
                                                         LANE_DEFAULTS["lane_c"], strict=True))}
 
 
-__all__ = ["GUARD_METRICS", "POOL_SCHEMAS", "REFUSAL_CODES", "RUNNERS", "SCORES",
+__all__ = ["INSTANCE_REQUIRED", "LEGACY_INSTANCE", "RESERVED_IDS", "compile_instance",
+           "GUARD_METRICS", "POOL_SCHEMAS", "REFUSAL_CODES", "RUNNERS", "SCORES",
            "SERIES_METRICS", "SPEC_BOUNDS", "SPEC_KEYS", "CompetitionSpec", "SpecRefusal",
            "bound_refusals", "compile_marketcast", "marketcast_spec", "parse_spec",
            "parse_specs", "registry", "spec_digest", "specs_record"]

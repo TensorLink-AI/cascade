@@ -341,13 +341,14 @@ class LaneCDriver:
                 import time
 
                 leg["train_time"] = float(getattr(self.ops, "now", time.time)())
-                from ..shared.config.lane_c import is_mkt_target
+                from ..shared.config.lane_c import is_mkt_family, mc_for
 
-                if is_mkt_target(target):
+                mc_ = mc_for(self.cfg, target) if is_mkt_family(target) else None
+                if mc_ is not None:
                     # DEC-CA-0075 (item 2): the embargo in force at DISPATCH
                     # rides the trainer-signed record; the verdict, draw and
-                    # scan use it, never a later config
-                    mc_ = self.cfg.marketcast
+                    # scan use it, never a later config (W-CMP2: the
+                    # target's own competition's)
                     leg["embargo_days"] = int(mc_.embargo_days)
                     leg["embargo_eval_days"] = int(mc_.embargo_eval_days)
                 if ck:
@@ -635,12 +636,12 @@ class LaneCDriver:
         ``"absent"``, ``rid`` joining the awaited list while the kind is live.
         Caller holds the lock."""
         from ..shared.marketcast_report import REPORT_ABSENT
-        from .lane_c_competitions import TRAINER_COMPETITIONS
+        from .lane_c_competitions import all_trainer_competitions
 
         read = getattr(self.ops, "read_report", None)
         reports: dict = {}
         awaits: dict = {}
-        for kind, comp in sorted(TRAINER_COMPETITIONS.items()):
+        for kind, comp in sorted(all_trainer_competitions().items()):
             if kind == "mkt" or comp.report_key(str(rid)) is None:
                 continue
             prev = list(self.st.awaits.get(kind) or ())
@@ -922,25 +923,30 @@ class RunnerLaneCOps:
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
-    def mkt_embargo_scan(self, tree, *, train_time: float) -> dict:  # pragma: no cover — bucket glue
+    def mkt_embargo_scan(self, tree, *, train_time: float,
+                         mc=None) -> dict:  # pragma: no cover — bucket glue
         """DEC-CA-0074 guard (b): the embargo receipt of ``tree`` (None = no
-        generator) against the signed ``pool_mkt`` snapshot active now."""
+        generator) against the signed pool snapshot active now — the legacy
+        ``pool_mkt``, or (W-CMP2) a spec instance's pool when ``mc`` is its
+        compiled table."""
         from ..pool.marketcast import MktSnapshotSource
         from ..shared.hippius import pool_s3_store
         from ..shared.marketcast_embargo import scan_receipt
 
         cfg = self.r.cfg
-        mc = cfg.marketcast
+        mc = cfg.marketcast if mc is None else mc
         # DEC-CA-0075: the pool the competition spec names
         signer = str(mc.pool_signer or "") or str(cfg.netconfig.owner_hotkey or "")
-        key = (mc.pool_prefix, signer, mc.pool_schema, tuple(mc.pool_select))
-        src = self.__dict__.get("_mkt_scan_src")
-        if src is None or self.__dict__.get("_mkt_scan_key", key) != key:
-            src = self._mkt_scan_src = MktSnapshotSource(
+        key = (mc.pool_prefix, signer, mc.pool_schema, tuple(mc.pool_select),
+               tuple(getattr(mc, "pool_channels", ())))
+        srcs = self.__dict__.setdefault("_mkt_scan_srcs", {})
+        src = srcs.get(key)
+        if src is None:
+            src = srcs[key] = MktSnapshotSource(
                 pool_s3_store(cfg.storage), prefix=mc.pool_prefix, signer_hotkey=signer,
                 cache_dir=Path(self.r.work_root) / "_mkt_scan",
-                schema=mc.pool_schema, select=dict(mc.pool_select))
-            self._mkt_scan_key = key
+                schema=mc.pool_schema, select=dict(mc.pool_select),
+                channels=dict(getattr(mc, "pool_channels", ())))
         got = src.snapshot_for(int(self.client.current_block()))
         if got is None:
             raise RuntimeError(f"no {mc.pool_prefix} snapshot to scan the embargo against")

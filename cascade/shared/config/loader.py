@@ -149,6 +149,29 @@ def parse_ckpt_transport(r: dict) -> dict:
             "ckpt_r2_prefix": prefix}
 
 
+def _compile_spec_instance(spec, mc_raw: dict):
+    """W-CMP2: ``(instance MarketCastConfig, its competition table)`` of an
+    accepted non-``mkt`` spec; ``ValueError`` when it cannot run."""
+    from dataclasses import replace as _replace
+
+    from ..competition_spec import compile_instance
+    from .lane_c import register_spec_kind
+    from .marketcast import draw_problems, parse_marketcast
+
+    register_spec_kind(spec.id)
+    inst_raw, comp = compile_instance(spec, mc_raw)
+    mc_i = parse_marketcast(inst_raw, open_classes=True)
+    mc_i = _replace(mc_i, from_block=int(comp["from_block"]))
+    why = draw_problems(mc_i)
+    if not mc_i.base_sha256 or not mc_i.base_ref:
+        why = ["the base model is not pinned"] + list(why)
+    if why:
+        raise ValueError("; ".join(why))
+    import json as _json
+
+    return mc_i, comp, _json.dumps(inst_raw, sort_keys=True, separators=(",", ":"))
+
+
 def parse_chain_config(raw: dict) -> ChainConfig:
     """Parse an already-loaded ``chain.toml`` table (``tomllib`` shape).
 
@@ -418,6 +441,70 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
         if _r.id == "mkt":
             mc_raw = {**mc_raw, "refused": _r.code}
     marketcast = parse_marketcast(mc_raw)
+    # W-CMP2 (DEC-CA-0075): every other accepted spec is an INSTANCE of the
+    # multi-instance MarketCast runner — its own kind, targets, competition
+    # and compiled table (the legacy [marketcast] model pins and bounds, its
+    # own data / metrics / rules). One that cannot compile is refused (typed,
+    # its share burns), never a load failure.
+    _instances: list = []
+    _inst_targets: list = []
+    _inst_comps: dict = {}
+    _ok_after: list = []
+    _bad_after: list = list(_specs_bad)
+    for _sp in _specs_ok:
+        if _sp.id == "mkt":
+            _ok_after.append(_sp)
+            continue
+        try:
+            _mi = _compile_spec_instance(_sp, raw.get("marketcast", {}) or {})
+            # its start / end on the era grid, inside lane C (else the lane-C
+            # parser would refuse the whole table: a refusal, never a failure)
+            _fb_i = int(_mi[1]["from_block"])
+            _ub_i = int(_mi[1].get("until_block", 0) or 0)
+            for _nm, _b in (("from_block", _fb_i), ("until_block", _ub_i)):
+                _eb_i = max(1, _ebp if (_eab and _ebp and 0 < _b < _eab) else _eb) * max(
+                    1, _era_settlements)
+                if _b and _b % _eb_i:
+                    raise ValueError(f"{_nm}={_b} is not an era boundary (era {_eb_i})")
+            _lcf0 = int(lc_raw.get("from_block", 0) or 0) if isinstance(lc_raw, dict) else 0
+            if not _lcf0 or _fb_i < _lcf0:
+                raise ValueError(f"from_block={_fb_i} must be >= [lane_c] from_block "
+                                 f"({_lcf0 or 'unset'})")
+            if _ub_i and _ub_i <= _fb_i:
+                raise ValueError(f"until_block={_ub_i} must be after from_block={_fb_i}")
+        except ValueError as _exc:
+            from ..competition_spec import SpecRefusal
+
+            _r = SpecRefusal(_sp.id, "bad_value", f"instance does not compile: {_exc}")
+            import logging
+
+            logging.getLogger("cascade.config").error(
+                "lane-C competition spec %r REFUSED (%s): %s — it judges nothing and its share "
+                "burns", _r.id, _r.code, _r.reason)
+            _bad_after.append(_r)
+            continue
+        _mc_i, _comp_i, _tbl_i = _mi
+        _instances.append((_sp.id, _mc_i, _tbl_i))
+        _inst_targets += [f"{_sp.id}:{n}" for n in _mc_i.target_names]
+        _inst_comps[_sp.id] = _comp_i
+        _ok_after.append(_sp)
+    _specs_ok, _specs_bad = tuple(_ok_after), tuple(sorted(_bad_after, key=lambda r: r.id))
+    if _instances:
+        from .lane_c import DEFAULT_TARGETS as _LC_DEFAULT_TARGETS
+
+        _comps0 = lc_raw.get("competitions") if isinstance(lc_raw, dict) else None
+        _comps1 = dict(_comps0 or {})
+        if not _comps0:
+            # the derived default made explicit (one weight-1 competition per
+            # configured kind), so the instances can join it
+            _t0 = lc_raw.get("targets", _LC_DEFAULT_TARGETS) if isinstance(lc_raw, dict) else ()
+            for _k in sorted({str(t).partition(":")[0] for t in (_t0 or ())}):
+                _comps1.setdefault(_k, {})
+        _comps1.update(_inst_comps)
+        _t = list(lc_raw.get("targets", _LC_DEFAULT_TARGETS) if isinstance(lc_raw, dict)
+                  else _LC_DEFAULT_TARGETS)
+        lc_raw = {**lc_raw, "targets": _t + [t for t in _inst_targets if t not in _t],
+                  "competitions": _comps1}
     _lc_from = int(lc_raw.get("from_block", 0) or 0) if isinstance(lc_raw, dict) else 0
     _lc_grid = _ebp if (_eab and _ebp and 0 < _lc_from < _eab) else _eb
     lane_c = parse_lane_c(
@@ -433,7 +520,11 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
         kind_from_blocks={"mkt": int(marketcast.from_block)},
         era_blocks_at=lambda b: max(1, _ebp if (_eab and _ebp and 0 < b < _eab) else _eb)
         * max(1, _era_settlements),
-        specs=(_specs_ok, _specs_bad))
+        specs=(_specs_ok, _specs_bad), instances=tuple(_instances))
+    for _k, _mi, _t in lane_c.instances:
+        if not float(_mi.gain_margin) < float(lane_c.full_pay_max_gain):
+            raise ValueError(f"[lane_c.specs.{_k}] gain_margin={_mi.gain_margin} must be < "
+                             f"[lane_c] full_pay_max_gain={lane_c.full_pay_max_gain}")
     # DEC-CA-0073: an mkt: win's pay-duration ramp starts at
     # [marketcast] gain_margin, so it must lie below [lane_c] full_pay_max_gain
     if not float(marketcast.gain_margin) < float(lane_c.full_pay_max_gain):
