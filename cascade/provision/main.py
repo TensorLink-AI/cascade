@@ -319,7 +319,8 @@ def digest_env_command(digest: str, *, user: str = "root") -> str:
 
 
 def make_config_push(render: RenderSettings, *, box_chain_toml: str,
-                     pod_user: str, image_digest: str = "") -> callable:
+                     pod_user: str, image_digest: str = "",
+                     stage_images: dict | None = None, work_dir: str = "") -> callable:
     """Post-health-gate hook: push the BOX's deployed chain.toml onto every
     freshly gated pod (all stages), replacing the image-baked copy — and pin
     ``CASCADE_TRAIN_IMAGE_DIGEST`` into the pod's ``/etc/environment`` +
@@ -339,10 +340,38 @@ def make_config_push(render: RenderSettings, *, box_chain_toml: str,
     digest before this hook could matter); the
     push keeps the OTHER sections honest without an image rotation.
     Best-effort: a failed push leaves the baked copy — exactly the pre-hook
-    behaviour."""
+    behaviour.
+
+    ``stage_images`` (stage → worker image ref, ``"*"`` = every other stage):
+    a pod whose release has a legacy profile gets the WORKER CONFIG its
+    loader parses (:mod:`cascade.shared.worker_config`; kept tables verbatim,
+    written under ``work_dir``) instead of the full file, which an older
+    loader refuses. No entry / no profile ⇒ the full deployed file."""
     import os
 
     pinned = _sha256_of(image_digest)
+    images = dict(stage_images or {})
+
+    def _source_for(stage: str) -> str:
+        image = str(images.get(stage, images.get("*", "")) or "")
+        if not image:
+            return box_chain_toml
+        from ..shared.atomic import write_text_atomic
+        from ..shared.worker_config import worker_toml_for_image
+
+        try:
+            text, profile = worker_toml_for_image(
+                Path(box_chain_toml).read_text(encoding="utf-8"), image)
+        except (OSError, ValueError) as e:
+            log.warning("worker config for %s pods not derived (%s); pushing the full "
+                        "chain.toml", stage, e)
+            return box_chain_toml
+        if not profile:
+            return box_chain_toml
+        local = Path(work_dir or ".") / "_worker_config" / profile / "chain.deployed.toml"
+        local.parent.mkdir(parents=True, exist_ok=True)
+        write_text_atomic(local, text)
+        return str(local)
 
     def _push_digest_env(addr, stage: str, user: str) -> None:
         """Best-effort env pin — a failure leaves the pod exactly pre-hook
@@ -375,7 +404,7 @@ def make_config_push(render: RenderSettings, *, box_chain_toml: str,
                 "-i", os.path.expanduser(render.key_path),
                 "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
                 "-o", "ConnectTimeout=15",
-                box_chain_toml, f"{user}@{addr.ip}:{dest}"]
+                _source_for(stage), f"{user}@{addr.ip}:{dest}"]
         try:
             proc = subprocess.run(argv, capture_output=True, text=True, timeout=30)
         except Exception as e:  # noqa: BLE001 — best-effort: never gate a healthy pod
@@ -687,7 +716,14 @@ def _run(args) -> int:
         bootstrap=bootstrap,
         prewarm=make_config_push(render, box_chain_toml=str(args.chain_toml),
                                  pod_user=str(top.get("pod_user", "root")),
-                                 image_digest=cfg.training.train_image_digest),
+                                 image_digest=cfg.training.train_image_digest,
+                                 # the release each stage's pods run: the fleet
+                                 # image (the gate's code fingerprint), MarketCast
+                                 # pods their own (worker config per release)
+                                 stage_images={"*": cfg.round.funded_pod_image,
+                                               "mkt": cfg.marketcast.pod_image
+                                               or cfg.round.funded_pod_image},
+                                 work_dir=str(work_root)),
         static_hosts_text=static_hosts_text,
         static_hosts_path=static_path,
         ssh_probe=lambda ip, port: wait_ssh_reachable(ip, port, timeout=300.0),
