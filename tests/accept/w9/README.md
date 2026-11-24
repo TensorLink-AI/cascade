@@ -306,8 +306,8 @@ code. The checks run in this order:
   pool `1 - b - c - d`, where `d = min(share, max(0, 1 - b - c))` for
   `takes_from = "lane_a"`. Lane D's part is added from the signed
   `pay.court` alone:
-  - slot `i` is worth `cfg.lane_d.king_decay ** i`, normalised over the
-    slots, times `pay.share`;
+  - slot `i` is worth `cfg.lane_d.court_weights[i]` (rev6.23: 0.80 /
+    0.15 / 0.05), normalised over the slots, times `pay.share`;
   - a slot whose `uid` is null, out of range or repeated burns to
     `cfg.scoring.burn_uid`;
   - an empty court burns the whole share.
@@ -406,6 +406,16 @@ report PASSes.
 
 Run locally with `-m "not torch"`. Nothing here imports torch.
 
+## Scoring host (rev6.18)
+
+Tests: `test_w9_host.py`. `check_lane_d(..., scoring_envs=None)`: a report
+with `host` FAILs (`scoring host: ...`) unless `host_problem` holds at the
+report's boundary against `scoring_envs` (default: the committed
+`deploy/laned/scoring_envs.toml`). A report without
+`host` is unchanged. Refusal code `ld_host`, class **alert** (not one of
+the four B3 pay-stopping checks): logged and alerted, the signed court keeps
+being paid; an unreadable list is an `ld_host` finding too.
+
 ## Multichannel windows (rev6.18 F2): `test_w9_multivariate.py`
 
 - `check_lane_d(..., max_channels=)`: `[generator] max_channels` at the
@@ -467,3 +477,18 @@ share would hold verdicts ~24 h. The default (loader, both shipped files) is
 **0.2**; fresh windows are still drawn first and always included. The tests
 that pinned the 0.5 default now pin 0.2. Lane D is not rolled out, so there is
 no activation key.
+
+## rev6.22: lane B weights and slot rows (`test_w9_lane_b_slots.py`)
+
+One pay rule: every paid holder has multiplier 1.0 at any age (no TTL), the
+re-derived `age` and `since_era`, a finite `gain_lcb`, and equals its holder
+in `state_post`; tampering with any of them FAILs. A judged leg has one row
+per slot; `check_lane_b` re-derives each row for its family (`declared` at
+`gain_margin`, `undeclared` at `undeclared_gain_margin`) and binds one
+critical value per family. A wrong bar, family, declared flag, verdict, a
+second critical value in one family, or a missing slot FAILs. Rows come from
+the validator's `judgements_record` over a real `judge_expert_slots` verdict.
+
+## rev6.14 (a): judging start vs eligibility boundary (owner 2026-11-23)
+
+The audit re-derives the judging start (`frozen_before_eval_delay` FAILs, a judged cohort without `boundary_ts` FAILs) and judges eligibility at `b = T + forward_margin_hours` (default 0). `test_w9_rev614.py`.

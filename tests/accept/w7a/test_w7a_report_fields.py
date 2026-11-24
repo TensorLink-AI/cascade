@@ -57,7 +57,11 @@ def _expected_params(cfg) -> dict:
         "max_mirror_lag_hours": float(cfg.max_mirror_lag_hours),
         "min_windows": int(cfg.min_windows), "min_clusters": int(cfg.min_clusters),
         "d_margin": float(cfg.d_margin), "alpha": float(cfg.alpha),
-        "bootstrap_B": int(cfg.bootstrap_B), "king_decay": float(cfg.king_decay),
+        "bootstrap_B": int(cfg.bootstrap_B),
+        # rev6.23: the crown bar keys and the court weights (king_decay retired).
+        "d_margin_start": float(cfg.d_margin_start),
+        "d_margin_warmup_settlements": int(cfg.d_margin_warmup_settlements),
+        "court_weights": [float(w) for w in cfg.court_weights],
         "reward_prior_kings": int(cfg.reward_prior_kings),
         "max_entries_per_settlement": int(cfg.max_entries_per_settlement),
         "max_judged_per_coldkey_per_settlement": int(cfg.max_judged_per_coldkey_per_settlement),

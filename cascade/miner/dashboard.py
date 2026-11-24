@@ -227,6 +227,9 @@ def _full_pay(w: dict) -> str:
     n = w.get("full_eras")
     if n is None:
         return ""
+    if "target" in w:
+        # a lane-C win (DEC-CA-0073): full pay for n eras, then the slot ends
+        return f", full {n} eras then ends (gain-scaled duration)"
     tier = _as_float(w.get("tier"))
     return (f", full {n} eras" + (f" (tier {tier:g})" if tier is not None else "")
             + (" BELOW the lowest tier" if w.get("below_floor") else ""))

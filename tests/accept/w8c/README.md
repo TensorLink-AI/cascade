@@ -337,3 +337,7 @@ miner's own fault is NaN on every kept public window (`checkpoint_fault` in
 the settlement). `test_w8c_public.py` pins it, including the host end
 (`public_scores_entry`). The fault tests import `_forecast_ok` from
 `cascade.validator.lane_d` (A7 deletes `lane_d_lowfreq`).
+
+## rev6.14 (a): judging start vs eligibility boundary (owner 2026-11-23)
+
+Option A (orchestrator 2026-11-23): the source reads the boundary block's on-chain timestamp with its chain reader and returns it as `LaneDInputs.boundary_ts` (W8b passes it to `settle_lane_d`); unreadable is `boundary_ts_unreadable`, never a guessed time. The fake reader answers a boundary block with W8b's fixture clock. `test_w8c_rev614.py`.

@@ -15,6 +15,7 @@ from .helpers import (
     SHIPPED,
     UNTIL_BLOCK,
     W2_KEYS,
+    co_for,
     field,
     load_ok,
     norm,
@@ -44,7 +45,7 @@ def test_w2_allowed_has_lane_d():
 @pytest.mark.parametrize("key", OVERLAY_KEYS)
 def test_w2_every_tuning_key_passes_check_overrides(key):
     value = MUTATIONS[key][1]
-    why = overrides_refusal({"lane_d": {key: value}})
+    why = overrides_refusal({"lane_d": {**co_for(key, value), key: value}})
     assert why is None, f"[lane_d] {key} refused by check_overrides: {why}"
 
 
@@ -54,7 +55,7 @@ def test_w2_every_tuning_key_overlay_takes_effect(name, key):
     """Each key set by a signed overlay (with the activation keys) validates
     and lands in the built config."""
     b = OVERLAY_VALUE.get(key, MUTATIONS[key][1])
-    ov = {**ARM, key: b}
+    ov = {**ARM, **co_for(key, b), key: b}
     if key == "gate_suites":
         # unequal, so the weights are not a no-op restatement of the default
         ov["gate_weights"] = {s: float(i + 1) for i, s in enumerate(b)}

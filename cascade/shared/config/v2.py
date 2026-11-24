@@ -158,6 +158,27 @@ class V2Config:
     # tick and raises an operator alert while it is true. Default false: an
     # unqualified after release is refused (no post-switch rent/dispatch).
     image_after_unqualified_override: bool = False
+    # W-IMG (plan rev6.24 (e), owner 2026-11-24; CONSENSUS, release-then-
+    # activate): the image-per-seed-epoch rule. From the first v2 SEED EPOCH
+    # starting at or after this block (an era start; a block inside a seed
+    # epoch defers the rule to the next seed-epoch start, never splits one),
+    # every leg of a seed epoch (king and challengers) shares ONE worker image
+    # digest — the settlement's ``contract_body`` image — and it changes only
+    # at a seed-epoch boundary. The image is chosen by the trainer per seed
+    # epoch (the ``*_after`` release binds at the next seed-epoch start,
+    # ``image_after_epoch_block``), never a validator config pin; it stays
+    # inside each leg's ``contract_digest``. Needs
+    # ``image_decoupled_from_block`` (the entries publish their image from
+    # it) at or before it. Lanes B-D record the image per leg / eval from the
+    # same block (drop-when-default before it). 0 = off: today's rule,
+    # byte-identical.
+    image_epoch_from_block: int = 0
+    # W-IMG TRAINER-ONLY: the seed-epoch start block the ``*_after`` release
+    # binds at (the generalised DEC-CA-0067 switch). Written by the trainer
+    # when it binds (persisted beside its state, ``image_epoch_state.json``);
+    # a typed value is the owner override. Must be an era start at or after
+    # ``image_epoch_from_block``. Validators never read it. 0 = unbound.
+    image_after_epoch_block: int = 0
     # Emission burns (CONSENSUS on the weight vector, see
     # cascade.shared.emission). ``prelaunch_burn``: the fraction of every
     # pre-v2 vector sent to ``burn_uid`` by a validator on this release.
@@ -386,7 +407,7 @@ def parse_v2_economics(v2raw: dict) -> dict:
     if readiness and (not readiness.isascii() or not readiness.isalnum() or len(readiness) > 12):
         raise ValueError("v2 prelaunch_burn_readiness must be up to 12 ASCII letters/digits")
     out.update(launch_at_utc=launch, commit_open_at_utc=opening, prelaunch_burn_readiness=readiness)
-    for k in ("random_init_eras", "reign_warm_start_blocks", "prelaunch_burn_from_block", "commit_from_block", "eval_n_windows", "init_epoch_bind_from_block", "image_decoupled_from_block", "eval_n_windows_after"):
+    for k in ("random_init_eras", "reign_warm_start_blocks", "prelaunch_burn_from_block", "commit_from_block", "eval_n_windows", "init_epoch_bind_from_block", "image_decoupled_from_block", "eval_n_windows_after", "image_epoch_from_block", "image_after_epoch_block"):
         raw = v2raw.get(k, 0)
         if isinstance(raw, bool) or not isinstance(raw, int):
             raise ValueError(f"[v2] {k} must be an integer; got {raw!r}")
@@ -600,11 +621,13 @@ class LaneBConfig:
     """``[lane_b]`` — the domain-expert competition (DEC-CA-0050).
 
     CONSENSUS terms (every validator must agree; replayed by cascade-audit):
-    ``from_block`` (0 = lane B off — the deployed state), ``share``, the decay
-    (``full_pay_tiers`` / ``half_life_rounds`` / ``floor`` — counted in ERAS of
-    ``[round] era_settlements`` settlements), the payout expiry
-    ``win_ttl_eras``, ``remainder``, ``domains`` (one emission slot each) and
-    the verdict parameters.
+    ``from_block`` (0 = lane B off — the deployed state), ``share``,
+    ``remainder``, ``domains`` (one emission slot each) and the verdict
+    parameters. Pay (LANE_D_PLAN rev6.22, owner 2026-11-24): a held slot pays
+    its full slot share every settlement — no decay, no TTL — until a newer
+    accepted merge takes it; the old gain-tiered decay / TTL keys
+    (``full_pay_tiers``, ``half_life_rounds``, ``floor``, ``win_ttl_eras``)
+    are retired (``RETIRED_KEYS``).
     TRAINER POLICY (no consensus impact): the opening gate, expert selection,
     leg limits and budgets.
 
@@ -620,18 +643,6 @@ class LaneBConfig:
     from_block: int = 0
     share: float = 0.5
     domains: tuple[str, ...] = ()
-    # payout schedule in ERAS (owner-tunable): 100 % for the first
-    # ``full_eras`` eras after the merging settlement — GAIN-TIERED (owner
-    # 2026-10-20): the ``full_eras`` of the highest ``full_pay_tiers``
-    # threshold the win's target gain LCB meets, fixed at the win and
-    # recorded on it — then halving every ``half_life_rounds`` eras down to
-    # ``floor``; at ``win_ttl_eras`` the win stops paying (its slot burns) —
-    # the merged weights stay in the king forever. 0 = no expiry (paid at the
-    # floor until replaced).
-    full_pay_tiers: tuple[tuple[float, int], ...] = FULL_PAY_TIERS
-    half_life_rounds: float = 1.0
-    floor: float = 0.1
-    win_ttl_eras: int = 28
     remainder: str = "burn"
     # verdict (cascade.eval.expert_lane.ExpertLaneParams)
     alpha: float = 0.05
@@ -668,11 +679,16 @@ class LaneBConfig:
     max_base_age_eras: int = 2
     leg_hours: float = 3.0
     affinity_windows: int = 256
-    # DEC-CA-0059: a commitment may declare 1 .. ``max_domains_per_leg``
-    # targets (CONSENSUS: validators refuse an entry declaring more). One leg
-    # trains the union of their expert selections under ONE leg budget; each
-    # target is judged at ``alpha / k`` and paid as its own slot.
-    max_domains_per_leg: int = 3
+    # DEC-CA-0059 + LANE_D_PLAN rev6.22 (owner 2026-11-24): a commitment may
+    # declare 1 .. ``max_domains_per_leg`` targets (CONSENSUS: validators
+    # refuse an entry declaring more). One leg trains the union of their
+    # expert selections under ONE leg budget. Every leg is then TESTED ON
+    # EVERY SLOT (one max-T family, :func:`cascade.eval.expert_lane.
+    # judge_expert_slots`): a declared slot is claimed at ``gain_margin``, any
+    # other slot at the stricter ``undeclared_gain_margin``; one miner may
+    # hold every slot.
+    max_domains_per_leg: int = 4
+    undeclared_gain_margin: float = 0.02
     # DEC-CA-0059 horizon targets: one slot per ``[eval] scored_horizons``
     # rung (``horizon:<h>``), filled by ``load_chain_config`` — empty
     # ``scored_horizons`` (testnet) ⇒ no horizon targets, the slot list is
@@ -683,12 +699,9 @@ class LaneBConfig:
     # a validator missing lane-B history (new, long downtime, lost state)
     # re-judges at most this many past settlements' expert manifests, in
     # chain order, at their own blocks / windows / king pointers. Unset in
-    # chain.toml ⇒ derived to cover the payout TTL, ``(win_ttl_eras + 1) ×
-    # era_settlements`` (see :func:`lane_b_replay_cover`), so a rebuilt
-    # validator holds every still-paying win by construction; an explicit
-    # value below that is refused at load.
-    # Once acceptance is active this is only a legacy replay bound: recovery
-    # walks the complete ledger because accepted deltas outlive payout TTLs.
+    # chain.toml ⇒ 64. Once acceptance is active this is only a legacy replay
+    # bound: recovery walks the complete ledger (accepted deltas, and since
+    # rev6.22 their slots' pay, never expire).
     replay_settlements: int = 64
     # Merge guards (CONSENSUS, typed era-start block; chain.toml ``"v2"`` =
     # ``[v2] from_block``, the default; 0 = never): from it validators refuse
@@ -715,6 +728,14 @@ class LaneBConfig:
     # a suite-target corpus; D38 (a) a stricter repo cap for those entries.
     suite_targets: bool = False
     contamination_hashset: str = ""
+    # DEC-CA-0075 (item 3): where the pinned hash set is fetched from when no
+    # release artefact matches the pin ("" = release artefacts only, today);
+    # the bytes are sha256-verified against the pin before use (fail closed)
+    contamination_hashset_key: str = ""
+    # DEC-CA-0075 rule menu: the lane's test family and pay curve (defaults =
+    # today's rules; a curve other than tiered_decay is recorded on the win)
+    test_family: str = "maxt"
+    pay_curve: str = "indefinite_until_beaten"
     contamination_min_hits: tuple[tuple[str, int], ...] = (("exact", 1), ("normalised", 3))
     suite_target_max_repo_mb: int = 8
     # D39 miner-chosen experts: the per-layer clamp is ceil(min_frac E) ..
@@ -738,6 +759,10 @@ class LaneBConfig:
     max_leg_hours: float = 6.0
     max_leg_seconds: int = 27_000
     guard_factor: float = 1.25
+    # WB26 (DEC-CA-0071 §3 guards 4-5; CONSENSUS, read only when a suite slot
+    # clears): the anchor-king guard tolerances
+    tau_anchor_public: float = 0.0
+    tau_anchor_domain: float = 0.0
 
     def active(self, block: int | None) -> bool:
         return self.from_block > 0 and block is not None and int(block) >= self.from_block
@@ -797,6 +822,9 @@ class LaneBConfig:
             min_target_clusters=self.min_target_clusters,
             min_guard_windows=self.min_guard_windows,
             min_public_items=self.min_public_items,
+            undeclared_gain_margin=self.undeclared_gain_margin,
+            tau_anchor_public=self.tau_anchor_public,
+            tau_anchor_domain=self.tau_anchor_domain,
         )
 
 
@@ -834,7 +862,8 @@ def parse_lane_b(lb: dict, *, from_block: int | None = None,
     ``from_block`` (``load_chain_config``) is the first settlement block,
     derived from ``[lane_b] from_block + 1``; ``None`` reads the dict's own
     key verbatim (direct construction).
-    ``era_settlements`` sizes the default ``replay_settlements`` to the TTL.
+    ``era_settlements`` is accepted for call compatibility (it sized the
+    retired TTL's replay cover).
     ``horizons`` (``load_chain_config``: ``[eval] scored_horizons``) are the
     DEC-CA-0059 horizon targets; ``None`` reads the dict's own ``horizons``
     key (direct construction in tests), absent ⇒ none. ``v2_from_block``
@@ -848,28 +877,13 @@ def parse_lane_b(lb: dict, *, from_block: int | None = None,
     _refuse_full_rounds(lb, "lane_b")
     track = parse_lane_b_track(lb, round_funded_pod_skus=round_funded_pod_skus,
                                generator_max_repo_mb=generator_max_repo_mb)
-    ttl = int(lb.get("win_ttl_eras", 28))
-    cover = lane_b_replay_cover(ttl, era_settlements)
-    if "replay_settlements" in lb:
-        replay = int(lb["replay_settlements"])
-        if cover and era_settlements and replay < cover:
-            raise ValueError(
-                f"[lane_b] replay_settlements={replay} does not cover the payout TTL "
-                f"(win_ttl_eras={ttl} × era_settlements={era_settlements} + one era "
-                f"= {cover}): a rebuilt validator would miss still-paying wins")
-    else:
-        replay = cover if (cover and era_settlements) else 64
+    replay = int(lb.get("replay_settlements", 64))
     fb = (max(0, int(lb.get("from_block", 0) or 0)) if from_block is None
           else max(0, int(from_block)))
     cfg = LaneBConfig(
         from_block=fb,
         share=float(lb.get("share", 0.5)),
         domains=tuple(str(d) for d in lb.get("domains", ())),
-        full_pay_tiers=parse_full_pay_tiers(lb.get("full_pay_tiers", FULL_PAY_TIERS),
-                                            section="lane_b", win_ttl_eras=ttl),
-        half_life_rounds=float(lb.get("half_life_rounds", 1.0)),
-        floor=float(lb.get("floor", 0.1)),
-        win_ttl_eras=ttl,
         remainder=str(lb.get("remainder", "burn")),
         alpha=float(lb.get("alpha", 0.05)),
         bootstrap_B=int(lb.get("bootstrap_B", 10_000)),
@@ -893,7 +907,8 @@ def parse_lane_b(lb: dict, *, from_block: int | None = None,
         max_base_age_eras=int(lb.get("max_base_age_eras", 2)),
         leg_hours=float(lb.get("leg_hours", 3.0)),
         affinity_windows=int(lb.get("affinity_windows", 256)),
-        max_domains_per_leg=int(lb.get("max_domains_per_leg", 3)),
+        max_domains_per_leg=int(lb.get("max_domains_per_leg", 4)),
+        undeclared_gain_margin=float(lb.get("undeclared_gain_margin", 0.02)),
         horizons=tuple(int(h) for h in (lb.get("horizons", ()) if horizons is None
                                         else horizons) or ()),
         horizon_targets=bool(lb.get("horizon_targets", True)),
@@ -913,12 +928,8 @@ def parse_lane_b(lb: dict, *, from_block: int | None = None,
                          f"got {cfg.leg_funding!r}")
     if not 0.0 <= cfg.share <= 1.0:
         raise ValueError(f"[lane_b] share must be in [0, 1]; got {cfg.share}")
-    if not 0.0 < cfg.floor <= 1.0:
-        raise ValueError(f"[lane_b] floor must be in (0, 1]; got {cfg.floor}")
     import math
 
-    if not math.isfinite(cfg.half_life_rounds) or cfg.half_life_rounds <= 0:
-        raise ValueError("[lane_b] half_life_rounds must be > 0")
     if not 0.0 < cfg.alpha < 1.0:
         raise ValueError("[lane_b] alpha must be in (0, 1)")
     if cfg.bootstrap_B < 1:
@@ -939,9 +950,6 @@ def parse_lane_b(lb: dict, *, from_block: int | None = None,
             or set(cfg.require_public) - {"gift", "boom", "time", "fev"}):
         raise ValueError("[lane_b] require_public must be unique supported suites "
                          "(gift, boom, time, fev)")
-    if cfg.win_ttl_eras < 0:
-        raise ValueError(f"[lane_b] win_ttl_eras={cfg.win_ttl_eras} must be 0 (no expiry) "
-                         "or > 0")
     if cfg.remainder not in LANE_B_REMAINDERS:
         raise ValueError(f"[lane_b] remainder must be one of {LANE_B_REMAINDERS}")
     if len(set(cfg.domains)) != len(cfg.domains):
@@ -969,6 +977,11 @@ def parse_lane_b(lb: dict, *, from_block: int | None = None,
         raise ValueError(f"[lane_b] gain_margin must be in (0, 1) — a zero bar merges an "
                          f"unchanged expert (identical scores give LCB = 0); got "
                          f"{cfg.gain_margin}")
+    if not (math.isfinite(cfg.undeclared_gain_margin)
+            and cfg.gain_margin <= cfg.undeclared_gain_margin < 1.0):
+        raise ValueError(f"[lane_b] undeclared_gain_margin must be in [gain_margin="
+                         f"{cfg.gain_margin}, 1) (an undeclared slot is never claimed at a "
+                         f"lower bar than a declared one); got {cfg.undeclared_gain_margin}")
     if cfg.min_target_windows < 1 or cfg.min_target_clusters < 1:
         raise ValueError("[lane_b] min_target_windows and min_target_clusters must be >= 1")
     if not 1 <= cfg.min_experts <= cfg.max_experts:

@@ -185,6 +185,7 @@ from .lane_d_state import (
     CONFIRM_MIGRATION_EXTENSION,
     CONFIRM_MIGRATION_TAG,
     HOUSE_ENTRY_KEY,
+    KING_TENURE_KEY,
     PRIOR_STATE_EXTENSION,
     LaneDReceiptError,
     LaneDStateError,
@@ -203,6 +204,8 @@ from .lane_d_state import (
 )
 
 POOL_SCHEMA = "pool_d/1"
+# W-IMG (plan rev6.24 (e)): the eval host code identity a settlement ran on
+EVAL_IMAGE_EXTENSION = "eval_image"
 OPEN_STATUSES = ("pending", "hold")
 
 
@@ -351,7 +354,7 @@ def _breakdown(x: np.ndarray, labels: list[str]) -> dict:
 
 
 def judge_cohort(king: tuple, members: list[tuple], *, clusters: list, cfg, seed: str,
-                 public: dict | None = None) -> list[dict]:
+                 public: dict | None = None, bar: float | None = None) -> list[dict]:
     """rev6.18 A3 (F4): ``[{"lcb", "gain", "cleared", "halves", "sources",
     "domains"}]`` per member against the bar ``king`` (module docstring,
     item 5).
@@ -364,7 +367,13 @@ def judge_cohort(king: tuple, members: list[tuple], *, clusters: list, cfg, seed
     the combined statistic's on the gain scale ``1 − exp(−L)``; ``halves``
     the live and public point gains, ``sources`` per source (``live``,
     ``gift_eval_pretrain``, ``rmisc``) and ``domains`` per cluster
-    (``live|<source>``, ``<source>|<family>``), each ``{"n", "gain"}``."""
+    (``live|<source>``, ``<source>|<family>``), each ``{"n", "gain"}``.
+
+    ``bar`` is the settlement's crown bar (rev6.23,
+    :meth:`LaneDConfig.crown_bar`), ``None`` = ``cfg.d_margin`` (the bar's
+    floor); a member clears iff ``lcb >= bar`` and every half's point gain
+    is positive."""
+    bar = float(cfg.d_margin) if bar is None else float(bar)
     floor = float(cfg.window_ratio_floor)
     w = float(cfg.public_weight)
     xl = [clamped_log_ratios(*king, *m, floor=floor) for m in members]
@@ -393,7 +402,7 @@ def judge_cohort(king: tuple, members: list[tuple], *, clusters: list, cfg, seed
             big_l += w * l_pub
             ok = ok and halves["public"]["gain"] > 0.0
         out.append({"lcb": float(lcb), "gain": log_gain(big_l),
-                    "cleared": bool(float(lcb) >= float(cfg.d_margin) and ok),
+                    "cleared": bool(float(lcb) >= bar and ok),
                     "halves": halves, "sources": dict(sorted(sources.items())),
                     "domains": domains})
     return out
@@ -449,6 +458,16 @@ def _close_house_copies(state: dict, skipped: list[dict]) -> None:
         rec.pop("gate_hold", None)
         rec.update(status="closed", reason="duplicate_digest")
         skipped.append({"digest": str(state["house"]["digest"]), "reason": "duplicate_digest"})
+
+
+def _judging_start_skip(boundary_ts, t_entry, t_king, delay_s: float) -> str | None:
+    """rev6.14 (a): ``None`` when an entry revealed at ``t_entry`` may be
+    drawn, frozen or judged at a boundary stamped ``boundary_ts`` (>= j =
+    max(T_E, T_K) + delay), else its typed skip reason."""
+    if boundary_ts is None:
+        return "boundary_ts_missing"
+    t = max(int(t_entry), int(t_king)) if t_king is not None else int(t_entry)
+    return None if int(boundary_ts) >= t + delay_s else "before_eval_delay"
 
 
 def _king_reveal_ts(state: dict, digest: str) -> int | None:
@@ -908,7 +927,12 @@ def _params(cfg) -> dict:
             "max_mirror_lag_hours": float(cfg.max_mirror_lag_hours),
             "min_windows": int(cfg.min_windows), "min_clusters": int(cfg.min_clusters),
             "d_margin": float(cfg.d_margin), "alpha": float(cfg.alpha),
-            "bootstrap_B": int(cfg.bootstrap_B), "king_decay": float(cfg.king_decay),
+            "bootstrap_B": int(cfg.bootstrap_B),
+            # rev6.23: the tenure-decaying crown bar (d_margin is its end) and
+            # the explicit court weights (they replace king_decay).
+            "d_margin_start": float(cfg.d_margin_start),
+            "d_margin_warmup_settlements": int(cfg.d_margin_warmup_settlements),
+            "court_weights": [float(w) for w in cfg.court_weights],
             "reward_prior_kings": int(cfg.reward_prior_kings),
             "max_entries_per_settlement": int(cfg.max_entries_per_settlement),
             "max_judged_per_coldkey_per_settlement":
@@ -928,7 +952,9 @@ def _params(cfg) -> dict:
             # settlement budget and the minimum fresh share.
             "embargo_hours": float(cfg.embargo_hours),
             "max_windows_per_settlement": int(cfg.max_windows_per_settlement),
-            "min_fresh_window_share": float(cfg.min_fresh_window_share)}
+            "min_fresh_window_share": float(cfg.min_fresh_window_share),
+            # rev6.14 (a): the judging start j = T + eval_delay_hours.
+            "eval_delay_hours": float(cfg.eval_delay_hours)}
 
 
 def _pool_record(pools: list[dict], windows_out: dict) -> dict:
@@ -1154,10 +1180,21 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
                   prior_pool_dirs=(), expect_prior_sha256: str | None = None,
                   boundary_block_hash: str | None = None, sentinel: str | None = None,
                   bench=None, armed: dict | None = None,
+                  boundary_ts: int | None = None,
                   max_channels: int | None = None,
                   public_indexes: dict | None = None,
-                  public_scores: dict | None = None) -> LaneDSettlement:
+                  public_scores: dict | None = None,
+                  host: dict | None = None,
+                  eval_identity: dict | None = None) -> LaneDSettlement:
     """Settle lane D at ``boundary`` (see the module docstring).
+
+    ``boundary_ts`` (rev6.14 (a)) is the boundary block's on-chain
+    ``Timestamp.Now`` (seconds), signed in the report. An entry (and the house
+    challenger) is drawn, frozen or judged only when ``boundary_ts`` >= its
+    judging start ``j = max(T_E, T_K) + 3600 * eval_delay_hours``, else it is
+    skipped ``before_eval_delay``. Without it (the legacy call) nothing is
+    frozen or judged: every open entry is skipped ``boundary_ts_missing``
+    (fail closed).
 
     ``public_indexes`` (rev6.18 A1/A2/A6, F3) is ``{source: index dir}`` of the
     public sources (W6p indexes) and ``public_scores`` (F4) the eval host's
@@ -1210,10 +1247,32 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     :func:`check_armed` (a ``LaneDArmedError`` before anything is read or
     written) and recorded as the report's ``armed_contexts`` /
     ``armed_evidence``; the forecasts are the eval host's at each entry's
-    ``effective_context``. ``None`` (the legacy call) records neither."""
+    ``effective_context``. ``None`` (the legacy call) records neither.
+
+    ``host`` (rev6.18 B7) is the eval host record the W4 handshake verified
+    (:func:`~cascade.eval.lane_d_handshake.check_worker`: environment, GPU
+    model, driver, torch build, fingerprint and the B6 host identity). Every
+    forecast in ``forecasts`` came from that one host (B6). Given, it must be
+    well formed (a ``ValueError`` before anything is read or written) and is
+    signed as the report's ``host``; ``None`` records no host.
+
+    ``eval_identity`` (W-IMG, plan rev6.24 (e)): the eval host's code
+    identity the forecasts ran on, recorded under ``extensions`` as
+    :data:`EVAL_IMAGE_EXTENSION` (logged, never consensus). ``None`` (every
+    settlement before ``[v2] image_epoch_from_block``) records nothing."""
     if not cfg.active(boundary):
         return LaneDSettlement(report=None, pay=None, receipt=None)
+    if boundary_ts is not None and (isinstance(boundary_ts, bool) or not isinstance(boundary_ts, int)
+                                    or boundary_ts < 0):
+        raise ValueError(f"boundary_ts must be a non-negative int timestamp; got {boundary_ts!r}")
     armed_fields = None if armed is None else check_armed(armed, cfg)
+    if host is not None:
+        from ..shared.config.lane_d import host_record_problem
+
+        why = host_record_problem(host)
+        if why:
+            raise ValueError(f"lane D host record refused: {why}")
+        host = {k: str(v) for k, v in host.items()}
     # W5f: the house is the verified record a signed pointer enters
     # (lane_d_house). Anything else is refused before any state, report or
     # pool is read or written (fail closed).
@@ -1258,6 +1317,12 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     migrated = migrate_confirm_pending(state)
     refresh_house(state, house)
     king_before = _king_record(state["king"])
+    # rev6.23 (owner 2026-11-24): the crown bar decays with KING_D's tenure,
+    # the lane D settlements it has held the crown before this one (a house
+    # KING_D counts; a house refresh in place does not reset it). Absent in
+    # a state written before rev6.23: 0.
+    tenure = int(state.get(KING_TENURE_KEY, 0))
+    crown_bar = cfg.crown_bar(tenure)
     pools = _load_pools(pool_dir, prior_pool_dirs, int(cfg.horizon))
     # rev6.18 A4 (F2): multichannel windows reduced to their scored channels
     # (a no-op on a univariate pool).
@@ -1329,6 +1394,21 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
             if effective_context(int(rec["context"]), armed_set) is None:
                 skip(dg, "context_below_armed")
                 chosen.remove(dg)
+    # rev6.14 (a): the judging start j = max(T_E, T_K) + eval_delay_hours,
+    # against the signed boundary timestamp; fail closed without it.
+    delay_s = 3600.0 * float(cfg.eval_delay_hours)
+    king_t = _king_reveal_ts(state, str(state["king"]["digest"]))
+    for dg in list(chosen):
+        rec = state["entries"][dg]
+        why = _judging_start_skip(boundary_ts, rec["reveal_ts"], king_t, delay_s)
+        if why is not None:
+            skip(dg, why)
+            chosen.remove(dg)
+    if house_open and not house_held:
+        why = _judging_start_skip(boundary_ts, house_rec["reveal_ts"], king_t, delay_s)
+        if why is not None:
+            skip(hd, why, house_rec)
+            house_open = False
     if house_open and not house_held:
         fc = forecasts.get(hd)
         if (fc is not None and any(_fc_ok(fc, wid, h, picks) is False
@@ -1450,7 +1530,8 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
         if pub is not None:
             pub_scored.update(scored)
         res = judge_cohort(scores[kd], [scores[m] for m in members],
-                           clusters=clusters, cfg=cfg, seed=seed, public=pub_in(kd))
+                           clusters=clusters, cfg=cfg, seed=seed, public=pub_in(kd),
+                           bar=crown_bar)
         if len(bars) > 1:
             # The same max-T judgment with the house as the bar: a member
             # clears only if it clears both. ``judge_cohort`` needs a
@@ -1459,7 +1540,8 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
             # the KING_D ``lcb`` / ``gain`` and records the house judgement
             # as ``house``, so a satellite re-derives both from the rows.
             vs_house = judge_cohort(scores[hd], [scores[m] for m in members],
-                                    clusters=clusters, cfg=cfg, seed=seed, public=pub_in(hd))
+                                    clusters=clusters, cfg=cfg, seed=seed, public=pub_in(hd),
+                                    bar=crown_bar)
             res = [{**r, "cleared": bool(r["cleared"] and rh["cleared"]),
                     "house": {"digest": hd, "lcb": rh["lcb"], "gain": rh["gain"],
                               "cleared": bool(rh["cleared"])}}
@@ -1606,6 +1688,9 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
         for v in verdicts:
             if v["digest"] == best["digest"]:
                 v["outcome"] = "crowned"
+    # rev6.23: a crown (a miner, or the house retaking) restarts the tenure;
+    # the next settlement is the new KING_D's first after its crowning.
+    state[KING_TENURE_KEY] = 1 if passing else tenure + 1
     court = _court(state, cfg, uid_of)
     pay = {"share": float(cfg.share), "court_uids": [s["uid"] for s in court]}
     pool_rec = _pool_record(pools, windows_out)
@@ -1633,6 +1718,8 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
         "windows": [windows_out[k] for k in sorted(windows_out)],
         "verdicts": verdicts, "rows": rows, "rows_sha256": rows_sha256(rows),
         "pay": {"share": pay["share"], "court": court},
+        # rev6.23: the tenure the bar was taken at and the bar applied.
+        "crown_bar": {"tenure": tenure, "margin": crown_bar},
         # RV7 B1: the state this settlement ran from, under the signature, so
         # recovery can check a persisted report against the state as loaded.
         "extensions": {PRIOR_STATE_EXTENSION: prior_sha,
@@ -1640,7 +1727,11 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
                        # confirm_pending state (never consensus).
                        **({CONFIRM_MIGRATION_EXTENSION: {"tag": CONFIRM_MIGRATION_TAG,
                                                          "entries": migrated}}
-                          if migrated else {})},
+                          if migrated else {}),
+                       # W-IMG: the eval image the forecasts ran on (logged)
+                       **({EVAL_IMAGE_EXTENSION: {k: str(v) for k, v in
+                                                  sorted(dict(eval_identity).items())}}
+                          if eval_identity else {})},
     }
     if draws:
         # W5j: the settlement's draw record, present iff a cohort was drawn
@@ -1665,11 +1756,20 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
                               "crps": float(c[i]), "mase": float(m_[i])})
         report["public"] = {**pub["record"](pub["draws"], pub["dropped"]),
                             "rows": prows, "rows_sha256": rows_sha256(prows)}
+
+    if boundary_ts is not None:
+        # rev6.14 (a): the boundary block's on-chain timestamp the judging
+        # start was applied against (absent, never null, on the legacy call).
+        report["boundary_ts"] = int(boundary_ts)
     if armed_fields is not None:
         # rev6.6: the settlement's armed set and the evidence it was armed
         # on, signed, so satellites verify it (never re-derive it from
         # cfg.contexts). Absent on the legacy call.
         report.update(armed_fields)
+    if host is not None:
+        # rev6.18 B7: the scoring host, signed; the audit checks its env is
+        # qualified at this boundary.
+        report["host"] = host
     report = sign_report(report, signer)
     # Fail closed: a report outside lane-d-report/1 is never returned, and
     # neither the report file nor the state is written (ReportSchemaError

@@ -130,7 +130,12 @@ def _expected_params(cfg) -> dict:
             "forward_margin_hours": float(cfg.forward_margin_hours),
             "min_windows": int(cfg.min_windows), "min_clusters": int(cfg.min_clusters),
             "d_margin": float(cfg.d_margin), "alpha": float(cfg.alpha),
-            "bootstrap_B": int(cfg.bootstrap_B), "king_decay": float(cfg.king_decay),
+            "bootstrap_B": int(cfg.bootstrap_B),
+            # rev6.23: the tenure-decaying crown bar (d_margin is its end) and
+            # the explicit court weights (they replace king_decay).
+            "d_margin_start": float(cfg.d_margin_start),
+            "d_margin_warmup_settlements": int(cfg.d_margin_warmup_settlements),
+            "court_weights": [float(w) for w in cfg.court_weights],
             "reward_prior_kings": int(cfg.reward_prior_kings),
             "max_entries_per_settlement": int(cfg.max_entries_per_settlement),
             "max_judged_per_coldkey_per_settlement":
@@ -152,7 +157,9 @@ def _expected_params(cfg) -> dict:
             # settlement budget and the minimum fresh share.
             "embargo_hours": float(cfg.embargo_hours),
             "max_windows_per_settlement": int(cfg.max_windows_per_settlement),
-            "min_fresh_window_share": float(cfg.min_fresh_window_share)}
+            "min_fresh_window_share": float(cfg.min_fresh_window_share),
+            # rev6.14 (a): the judging start j = T + eval_delay_hours.
+            "eval_delay_hours": float(cfg.eval_delay_hours)}
 
 
 def _body_digest(report: dict) -> str:
@@ -227,7 +234,7 @@ def _judge(report: dict, cfg, scores: dict, bar: str, members: list[str],
             big_l += w * p_
         ok = all(g > 0.0 for _, g in halves.values())
         out.append({"lcb": float(lcb), "gain": log_gain(big_l),
-                    "cleared": bool(float(lcb) >= float(cfg.d_margin) and ok),
+                    "cleared": bool(float(lcb) >= _report_bar(report, cfg) and ok),
                     "halves": halves, "sources": sources, "domains": domains})
     return out
 
@@ -239,6 +246,52 @@ def _gains_problem(stated, want: dict) -> bool:
         return True
     return any(not isinstance(stated[k], dict) or stated[k].get("n") != n
                or not _close(stated[k].get("gain"), g) for k, (n, g) in want.items())
+
+
+def crown_bar_of(cfg, tenure: int) -> float:
+    """rev6.23, re-derived from the parsed ``[lane_d]`` keys (never the
+    producer's): ``d_margin_start`` at tenure 0, falling linearly to
+    ``d_margin`` at ``d_margin_warmup_settlements`` and flat after."""
+    w = int(cfg.d_margin_warmup_settlements)
+    t = max(0, int(tenure))
+    start, end = float(cfg.d_margin_start), float(cfg.d_margin)
+    if t >= w:
+        return end
+    return start - (start - end) * t / w
+
+
+def _crown_bar_problem(report: dict, cfg) -> str | None:
+    """rev6.23: ``crown_bar`` is ``{tenure, margin}`` with ``margin`` the bar
+    re-derived from the config at ``tenure`` (the tenure itself is a chain
+    rule: :func:`_continuity_problem`)."""
+    cb = report.get("crown_bar")
+    if not isinstance(cb, dict) or set(cb) != {"tenure", "margin"}:
+        return f"crown_bar {cb!r} is not {{tenure, margin}}"
+    t = cb["tenure"]
+    if not _int_value(t) or t < 0:
+        return f"crown_bar.tenure {t!r} is not an int >= 0"
+    want = crown_bar_of(cfg, t)
+    if not _close(cb["margin"], want):
+        return f"crown_bar.margin {cb['margin']!r} != {want!r} re-derived at tenure {t}"
+    return None
+
+
+def _report_bar(report: dict, cfg) -> float:
+    """The bar a verdict clears against: re-derived at the report's stated
+    tenure (checked by :func:`_crown_bar_problem` before any cohort)."""
+    return crown_bar_of(cfg, int(report["crown_bar"]["tenure"]))
+
+
+def next_tenure(prior: dict) -> int | None:
+    """rev6.23: the tenure the settlement after ``prior`` must state: 1
+    after a crown (a miner crowned, or the house retaking from a miner), else
+    the prior tenure + 1; ``None`` when ``prior`` carries no ``crown_bar``."""
+    cb = prior.get("crown_bar")
+    if not isinstance(cb, dict) or not _int_value(cb.get("tenure")):
+        return None
+    kb, ka = prior.get("king_before") or {}, prior.get("king_after") or {}
+    retake = bool(ka.get("house")) and not bool(kb.get("house"))
+    return 1 if (prior.get("crowned") is not None or retake) else int(cb["tenure"]) + 1
 
 
 def _bars(kd: str, hd: str, members) -> list[str]:
@@ -1002,6 +1055,36 @@ def _draw_problems(report: dict, cfg, windows: dict) -> list[str]:
     return out
 
 
+def _judging_start_problems(report: dict, cfg) -> list[str]:
+    """rev6.14 (a), re-derived: every cohort was frozen at a boundary stamped
+    at or after its judging start t_max + 3600 * eval_delay_hours (the signed
+    ``boundary_ts``); a ``before_eval_delay`` skip names an entry whose
+    start max(T_E, T_K) + delay is after it; ``boundary_ts_missing`` only
+    without it."""
+    out = []
+    delay = 3600.0 * float(cfg.eval_delay_hours)
+    bts = report.get("boundary_ts")
+    if "boundary_ts" in report and (isinstance(bts, bool) or not isinstance(bts, int)):
+        return [f"boundary_ts {bts!r} is not a timestamp"]
+    for c in report.get("cohorts") or []:
+        if bts is None:
+            out.append(f"cohort {c['index']}: frozen without the boundary timestamp")
+        elif bts < int(c["t_max"]) + delay:
+            out.append(f"cohort {c['index']}: frozen_before_eval_delay: boundary_ts {bts} < "
+                       f"t_max {c['t_max']} + {cfg.eval_delay_hours} h")
+    reveal = {e["digest"]: int(e["reveal_ts"]) for e in report.get("entries") or []}
+    kt = int(report["king_before"]["reveal_ts"])
+    for sk in report.get("skipped") or []:
+        if sk.get("reason") == "boundary_ts_missing" and bts is not None:
+            out.append(f"{str(sk.get('digest'))[:12]}: boundary_ts_missing with a boundary_ts")
+        elif sk.get("reason") == "before_eval_delay":
+            t = reveal.get(sk.get("digest"))
+            if bts is None or t is None or bts >= max(t, kt) + delay:
+                out.append(f"{str(sk.get('digest'))[:12]}: before_eval_delay after its judging "
+                           f"start")
+    return out
+
+
 def _row_order_problem(report: dict, rows: list) -> str | None:
     """README rule 8: the rows in the canonical order (cohorts by index, each
     cohort's ``window_ids`` in order, per window ``[king, house?, *members]``)."""
@@ -1039,6 +1122,12 @@ def _continuity_problem(report: dict, priors, entries: dict) -> str | None:
             continue
         return (f"king_before {str(kb.get('digest'))[:12]} is not where the report at {b} "
                 f"left KING_D ({str((ka or {}).get('digest'))[:12]})")
+    # rev6.23: KING_D's tenure continues from the latest earlier report.
+    want_t = next_tenure(next(p for b, p in earlier if b == latest))
+    got_t = (report.get("crown_bar") or {}).get("tenure")
+    if want_t is not None and got_t != want_t:
+        return (f"crown_bar.tenure {got_t!r} does not continue the report at {latest} "
+                f"(want {want_t})")
     for b, p in sorted(earlier, key=lambda x: x[0]):
         ph = p.get("house")
         if isinstance(ph, dict) and ph.get("digest") == house["digest"] and ph != house:
@@ -1642,6 +1731,9 @@ REFUSAL_CODES: dict[str, str] = {
     "ld_snapshot": ALERT,
     "ld_public_index": ALERT,
     "ld_bench": ALERT,
+    # rev6.18 B5/B7 (F5): the signed host's environment is not qualified at
+    # the boundary (not one of the four pay-stopping checks).
+    "ld_host": ALERT,
 }
 TRANSIENT_CODE = "ld_verifier_unavailable"
 # The cascade-ops follower tag of an alert-class finding (W11).
@@ -1685,7 +1777,8 @@ class LaneDFindings:
 
 def lane_d_findings(report: dict, cfg, *, signer_hotkey: str, prior_reports=None,
                     era_sentinel=_UNSET, pool_dirs=None, bench_rows=None, uid_of=None,
-                    chain=None, max_channels=None, public_indexes=None) -> LaneDFindings:
+                    chain=None, max_channels=None, public_indexes=None,
+                    scoring_envs=None) -> LaneDFindings:
     """Run every check of :func:`check_lane_d` and return its findings
     (rev6.18 B3). Same arguments as :func:`check_lane_d`.
 
@@ -1753,6 +1846,8 @@ def lane_d_findings(report: dict, cfg, *, signer_hotkey: str, prior_reports=None
                           if (report.get("params") or {}).get(k) != want.get(k))
             f.add("ld_params", f"stated params differ from config on {diff}")
             return f
+        if "host" in report:
+            alert("ld_host", lambda: _host_problem(report["host"], boundary, scoring_envs))
         # RV7 B2 (c): the bootstrap seed is the boundary's and the pool's,
         # never a free choice the producer could grind.
         want_seed = f"lane-d/1:{boundary}:{report['pool']['sha256']}"
@@ -1802,11 +1897,19 @@ def lane_d_findings(report: dict, cfg, *, signer_hotkey: str, prior_reports=None
                                        f"{len(models)} models on {pub['n_windows']} kept "
                                        f"public windows")
                 return f
+        # rev6.23: the crown bar applied is the config's at the stated
+        # tenure; every verdict below clears against it.
+        if one("ld_params", _crown_bar_problem(report, cfg)):
+            return f
         problems, confirms = [], {}
         for c in cohorts:
             problems += _cohort_problems(report, cfg, c, rows_by, windows, entries, confirms,
                                          pub)
         if many("ld_cohort", problems):
+            return f
+        # rev6.14 (a): no cohort frozen before its judging start (signed
+        # boundary_ts), and the two judging-start skips are honest.
+        if many("ld_cohort", _judging_start_problems(report, cfg)):
             return f
         alert("ld_row_order", lambda: _row_order_problem(report, rows))
         alert("ld_clock", lambda: _clock_problems(report, cfg, windows))
@@ -2000,9 +2103,25 @@ def _chain_findings(report: dict, cfg, signer_hotkey: str, prior_reports, chain)
             for code, paths in by_code.items()]
 
 
+def _host_problem(host, boundary: int, envs) -> str | None:
+    """rev6.18 B5/B7: the signed ``host`` names an environment qualified at
+    ``boundary`` with a GPU, driver and torch build it allows (an
+    unreadable list is a finding too: the auditor cannot vouch for it)."""
+    from ..shared.config.lane_d import ScoringEnvError, host_problem, load_scoring_envs
+
+    if envs is None:
+        try:
+            envs = load_scoring_envs()
+        except ScoringEnvError as e:
+            return f"scoring host: cannot read the scoring environment list ({e})"
+    why = host_problem(host, envs, int(boundary))
+    return None if why is None else f"scoring host: {why}"
+
+
 def check_lane_d(report: dict, cfg, *, signer_hotkey: str, prior_reports=None,
                  era_sentinel=_UNSET, pool_dirs=None, bench_rows=None, uid_of=None,
-                 chain=None, max_channels=None, public_indexes=None) -> CheckResult:
+                 chain=None, max_channels=None, public_indexes=None,
+                 scoring_envs=None) -> CheckResult:
     """PASS on a genuine report; FAIL when the signature, ``rows_sha256``,
     a stated parameter or the verdict re-derived from the rows disagrees,
     or the crown's provenance does not hold (RV7 B2). rev6.18 B3: the FAIL
@@ -2030,11 +2149,15 @@ def check_lane_d(report: dict, cfg, *, signer_hotkey: str, prior_reports=None,
     against the report's revision / ``index_sha256`` / ``files_sha256``
     (``ld_public_index``) and its draw re-derived from the index and the
     block hash (``ld_draw``); ``None`` checks the report's public block
-    alone (pins, seed, constants)."""
+    alone (pins, seed, constants).
+    ``scoring_envs``
+    (rev6.18 B5/B7): the scoring environment list a signed ``host`` is
+    checked against at the report's boundary (default: the release's
+    committed ``deploy/laned/scoring_envs.toml``; ``ld_host``, alert)."""
     f = lane_d_findings(report, cfg, signer_hotkey=signer_hotkey, prior_reports=prior_reports,
                         era_sentinel=era_sentinel, pool_dirs=pool_dirs, bench_rows=bench_rows,
                         uid_of=uid_of, chain=chain, max_channels=max_channels,
-                        public_indexes=public_indexes)
+                        public_indexes=public_indexes, scoring_envs=scoring_envs)
     if f.findings:
         code, detail = f.findings[0]
         return _fail(NAME, f"{code}: {detail}")

@@ -42,7 +42,7 @@ read from a local file with `--receipt`.
 
 **Choose a check:** [quick start](#quick-start) · [interpret results](#reading-the-output)
 · [what replay proves](#what-each-tier-proves) · [MarketCast](#marketcast-rows-dec-ca-0064)
-· [B/C reward tiers](#gain-tiered-full-pay-period-lane-b--lane-c-owner-2026-10-20)
+· [B slots and pay](#lane-b-slots-and-pay-lane_d_plan-rev622-owner-2026-11-24) · [C reward tiers](#gain-tiered-full-pay-period-lane-c-owner-2026-10-20)
 · [trusted signers](#trust-anchors).
 
 ## Quick start
@@ -343,10 +343,15 @@ and the lane-C manifests the rows name. It checks:
   The main validator's snapshot anchor never sets it; a train block more
   than an hour off the anchor is noted;
 - with the published snapshot (`--mkt-snapshots DIR` on `cascade-audit
-  marketcast`): the report's window set EQUALS the forward-only set
-  `snapshot_windows` re-cuts — nothing omitted, nothing added. Without it,
-  every window must start after `after`, end by the snapshot's end, and no
-  (asset, horizon) cell hold more than `windows_per_cell`;
+  marketcast`): the report's window set EQUALS the set the entry's signed
+  DEC-CA-0074 draw re-cuts (`snapshot_windows`) — nothing omitted, nothing
+  added. Always: the draw is the rule's (re-derived from `train_time`, the
+  row's `round_block`, the phase and `fresh_after`), its block hash the
+  chain's (`--network`; `--no-chain` WARNs), every backtest window lies
+  wholly in the draw's embargo span and the phase's half, every forward
+  window is a `forward_horizons` window after `after` and by the forward
+  end, and no cell holds more than the draw's `n` backtests /
+  `forward_n` forwards;
 - with the snapshot and the sidecar (sha256 bound in the signed report):
   every per-window loss and coverage tally is recomputed on CPU from the
   snapshot's targets and the published float32 quantiles
@@ -446,24 +451,42 @@ row of a competition past its end other than an `ended` row (not passed,
 outcome `""` or `dropped`), and any `ended` row of a competition that has
 not ended.
 
-## Gain-tiered full-pay period (lane B / lane C, owner 2026-10-20)
+## Lane B slots and pay (LANE_D_PLAN rev6.22, owner 2026-11-24)
 
-A lane-B / lane-C win pays in full for the `full_eras` of the highest
-`full_pay_tiers` threshold its gain LCB meets (`[lane_b]` / `[lane_c]`;
-`[marketcast]` for an `mkt:` target), fixed at the win. The audit never
-trusts the recorded tier:
+A lane-B slot holder is paid its full slot share every settlement — no
+decay, no TTL — until a newer accepted merge takes the slot. Every judged
+leg is tested on every slot in two max-T families (declared targets among
+themselves at `gain_margin`, every other slot among themselves at
+`undeclared_gain_margin`); one row per tested slot.
 
-- `check_lane_b` — a slot won at this settlement: the payout record's
-  `gain_lcb` equals the winning row's `target_lcb` (per target of a
-  multi-target leg), and `tier` / `full_eras` / `below_floor` re-derive from
-  it (`cascade.eval.expert_lane.full_pay_mismatch`).
+- `check_lane_b` — per slot row: `declared` / `family` match the leg's
+  declaration, the `gain_bar` is the family's, the level is `alpha`, an
+  inconclusive row never passes, and `passed` re-derives from the recorded
+  CRPS/MASE family LCBs, point gains, the other metric's non-inferiority LCB
+  and the guards; a judged leg has one row per slot and one critical value
+  per family; a slot won at this settlement carries the winning row's
+  `target_lcb` as its `gain_lcb`.
+- `_lane_b_paid_wins` (the payout replay behind `check_weights` /
+  `derive_weights`) — every paid win has multiplier 1.0, the re-derived
+  `age` and `since_era`, a finite `gain_lcb`, and equals its holder in the
+  receipt's `state_post`.
+
+## Gain-tiered full-pay period (lane C, owner 2026-10-20)
+
+A lane-C win pays in full for the `full_eras` of the highest
+`full_pay_tiers` threshold its gain LCB meets (`[lane_c]`; `[marketcast]`
+for an `mkt:` target), fixed at the win. The audit never trusts the
+recorded tier:
+
 - `check_lane_c` — a passing confirm row's `full_pay` re-derives from its
-  `gain_lcb` under the target's tiers; the slot paid at this settlement
+  `gain_lcb` under the gain-scaled duration rule (DEC-CA-0073, on the era
+  length at that settlement); the slot paid at this settlement
   carries the confirmed row's `gain_lcb` and `full_pay`.
-- `_lane_b_paid_wins` / `_lane_c_paid_wins` (the payout replay behind
+- `_lane_c_paid_wins` (the payout replay behind
   `check_weights` and `derive_weights`, so satellites run it too) — every
-  paid win carries the four fields; `full_eras` is an integer in `[0,
-  win_ttl_eras]`; a win made at this settlement re-derives under this
+  paid win carries the four fields; lane B's `full_eras` is an integer in
+  `[0, win_ttl_eras]`; a lane-C win pays 1.0 and FAILs at or past its own
+  `full_eras` (DEC-CA-0073: the slot ends, no decay); a win made at this settlement re-derives under this
   receipt's tiers; an OLDER win is not re-derived under today's tiers (a
   signed overlay may have changed them since) but must be self-consistent
   (`below_floor` ⟺ `gain_lcb < tier`) and equal its slot in the receipt's

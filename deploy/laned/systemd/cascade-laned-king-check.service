@@ -4,8 +4,10 @@
 # and mirror copies (--vault-dir, --mirror hub=DIR r2=DIR hf=DIR in a drop-in)
 # the full check_one_digest also re-hashes the vault and the mirrors.
 # Read-only: it writes nothing. Exit 1 with lane_d_ops_king_unpublished
-# (critical) when a crowned king is missing or disagrees: publishing it is an
-# owner step (the king publication path is not wired into the validator).
+# (critical) when a crowned king is missing or disagrees: the
+# cascade-laned-king-publish job publishes it (started by the validator's
+# publish request for each crowning); a red check after it ran is an owner
+# look.
 
 [Unit]
 Description=cascade lane D king publication check (read-only)

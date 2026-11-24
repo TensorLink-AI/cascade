@@ -10,3 +10,5 @@ cascade/shared/netconfig.py
 # [lane_d] defaults only; from_block stays 0 (nothing armed).
 chain.toml
 chain.testnet.toml
+# rev6.18 D24 (F4): the retired backtest keys leave the W-OV overlay envelope.
+cascade/shared/netconfig_bounds.py

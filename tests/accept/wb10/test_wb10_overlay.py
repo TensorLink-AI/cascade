@@ -73,30 +73,40 @@ def test_wb10_every_new_key_overlay_takes_effect(name, key):
     assert out.scoring == base.scoring
 
 
-def test_wb10_contamination_hashset_overlay_is_refused_as_release_only():
-    """rev5: overlays can't replace release-only data pins; the refusal names
-    the key and leaves the other lane B keys settable."""
+def test_wb10_contamination_hashset_overlay_is_a_content_hash():
+    """Owner 2026-11-24 (DEC-CA-0075 item 3, tests-correction of the rev5
+    release-only pin): an overlay names the hash set by CONTENT HASH (+ its
+    storage key) — accepted by the allow-list, every reader verifies the
+    fetched bytes against the pin; other lane B keys stay settable."""
     why = overrides_refusal({"lane_b": {"contamination_hashset": HASHSET_B,
+                                        "contamination_hashset_key": "contamination/hs.json",
                                         "open_rule": "tokens_king_check"}})
-    assert why is not None, "an overlay setting [lane_b] contamination_hashset was accepted"
-    assert "[lane_b] contamination_hashset" in why and "release-only" in why, why
-    assert "open_rule" not in why, f"open_rule must stay overlay-settable: {why}"
+    assert why is None, why
 
 
 @pytest.mark.parametrize("name", SHIPPED)
-def test_wb10_contamination_hashset_overlay_never_validates(name):
+def test_wb10_contamination_hashset_overlay_validates_only_as_sha256(name):
     from cascade.shared import netconfig as nc
 
     base = _base(name)
-    body = {"protocol": nc.PROTOCOL, "network": nc.network_identity(base), "seq": 1,
-            "prev": None, "effective_block": 2698 * 3600,
-            "overrides": {"lane_b": {"contamination_hashset": HASHSET_B}}}
+
+    def body(v):
+        return {"protocol": nc.PROTOCOL, "network": nc.network_identity(base), "seq": 1,
+                "prev": None, "effective_block": 2698 * 3600,
+                "overrides": {"lane_b": {"contamination_hashset": v}}}
+
     try:
-        nc.validate_overlay(base, body)
+        out = nc.validate_overlay(base, body(HASHSET_B))
     except nc.NetConfigError as e:
-        assert "release-only" in str(e), f"refused for another reason: {e}"
-    else:
-        raise AssertionError("validate_overlay adopted a [lane_b] contamination_hashset overlay")
+        raise AssertionError(f"a content-hash pin overlay was refused: {e}") from None
+    assert out.lane_b.contamination_hashset == HASHSET_B
+    for bad in ("md5:abc", "sha256:XYZ", "hashset-v2.json"):
+        try:
+            nc.validate_overlay(base, body(bad))
+        except nc.NetConfigError as e:
+            assert "contamination_hashset" in str(e), e
+        else:
+            raise AssertionError(f"a non-content-hash pin {bad!r} was adopted")
 
 
 def test_wb10_remainder_stays_release_only():

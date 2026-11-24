@@ -1,0 +1,28 @@
+# Owner 2026-11-24: emission split lane A 0 % / B 35 % / C 15 % / D 50 %
+# (LANE_D_PLAN rev6.24 (f)). MAINNET (netuid 91) — only after the testnet
+# overlay was adopted and observed. Overrides for
+# `cascade-validator --netconfig-overlay`; dry run first against the
+# DEPLOYED chain.toml, then the owner signs with --netconfig-publish
+# (Approve-tier; six external validators adopt it by the 51 % cfg- tally):
+#
+#   cascade-validator --chain-toml chain.toml \
+#     --netconfig-overlay deploy/overlays/split-a0-b35-c15-d50.mainnet.toml \
+#     --netconfig-effective-block <next era start, >= 1 era ahead>
+#
+# Overlays are SNAPSHOTS: a later overlay must restate these keys or the
+# split returns to chain.toml's (A 50 / B 25 / C 25). Lane C and lane D carve
+# from lane A, so A = 1 - 0.35 - 0.15 - 0.50 = 0 — only while lane D PAYS:
+# until [lane_d] from_block arms (0 on main), lane D's 50 % stays with lane A
+# (A 50 / B 35 / C 15).
+# W-OV envelope: B <= 0.75, C <= 0.5, D <= 0.5 and no share the carve clamps.
+
+[lane_b]
+share = 0.35
+
+[lane_c]
+share      = 0.15
+takes_from = "lane_a"
+
+[lane_d]
+share      = 0.5
+takes_from = "lane_a"

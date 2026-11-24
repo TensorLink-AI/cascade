@@ -15,7 +15,7 @@ from types import SimpleNamespace
 import pytest
 
 from cascade.shared.config.lane_c import COMPETITION_KINDS, register_competition_kind
-from cascade.shared.lane_c import LaneCState, target_full_pay
+from cascade.shared.lane_c import LaneCState, target_full_pay_record
 from cascade.shared.lane_c_manifest import (
     LaneCEntry,
     LaneCManifest,
@@ -94,7 +94,8 @@ class ToyValidator(ValidatorCompetition):
                 js.append(LaneCJudgement(entry=e, passed=True, stage="verdict", reason="ok",
                                          gain_lcb=0.05, gain=0.06, phase="confirm",
                                          base_pointer=p.base_pointer,
-                                         full_pay=target_full_pay(e.target, 0.05, lc).record()))
+                                         full_pay=target_full_pay_record(
+                                             e.target, 0.05, lc, era_blocks=7200)))
         for e in (cm.entries if cm is not None else ()):
             if e.target.startswith(TOY + ":"):
                 js.append(LaneCJudgement(entry=e, passed=True, stage="verdict", reason="ok",

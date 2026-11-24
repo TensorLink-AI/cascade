@@ -21,7 +21,11 @@ step, in order:
 7. for a new king with W-S1 armed, the W3b3 sentinel sweep (never gating);
 8. the persisted signed report byte for byte, then its receipt record, then
    the latest-receipt pointer;
-9. ``status/lane_d.json`` (W17, which embeds the W-S3 sentinel board).
+9. for a crowning, the W13 ``laned_king_publish_request/1`` beside the state
+   (``lane_d_publish_requests/<boundary>.json``, with the sentinel record):
+   the king-publish ops job copies the king to the mirrors and re-signs the
+   index; nothing heavy runs here and a failure never withholds pay;
+10. ``status/lane_d.json`` (W17, which embeds the W-S3 sentinel board).
 
 FAIL CLOSED: any unreadable input in 2-6 raises :class:`LaneDWiringError`
 before anything is written, published or swept; the W19 worker retries the
@@ -47,6 +51,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import threading
 from collections.abc import Callable, Mapping
@@ -112,9 +117,14 @@ class LaneDInputs:
     (``{hotkey: uid}``) and the ``house`` pointer record. ``armed`` (rev6.6)
     is the settlement's W5d armed record, passed to ``settle_lane_d(armed=)``
     (``None``: the legacy call, no armed fields in the report).
+    ``boundary_ts`` (rev6.14 (a)) is the boundary block's on-chain timestamp,
+    passed to ``settle_lane_d(boundary_ts=)`` (``None``: nothing is frozen or
+    judged, ``boundary_ts_missing``).
     ``channel_block_hash`` (rev6.18 A4, F2) is the block hash the source
     picked the channels of an over-cap multichannel window with (``None``
-    when no window needed one); it must be the settlement's own.
+    when no window needed one); it must be the settlement's own. ``host``
+    (rev6.18 B7) is the verified eval host's record, passed to
+    ``settle_lane_d(host=)`` (``None``: no ``host`` in the report).
     ``public_indexes`` / ``public_scores`` (rev6.18 A3, F4): the public
     half, passed to ``settle_lane_d`` (``None`` at ``public_weight = 0``)."""
 
@@ -125,9 +135,33 @@ class LaneDInputs:
     house: Mapping
     prior_pool_dirs: tuple = ()
     armed: Mapping | None = None
+    boundary_ts: int | None = None
     channel_block_hash: str | None = None
     public_indexes: Mapping | None = None
     public_scores: Mapping | None = None
+    host: Mapping | None = None
+    # W-IMG: the eval host's code identity the forecasts came from
+    # ({"git_head", "package_hash"}; None = not known)
+    eval_identity: Mapping | None = None
+
+
+def _eval_identity_of(cfg: Any, inp: Any, boundary: int) -> dict | None:
+    """W-IMG (plan rev6.24 (e)): the eval host's identity the settlement's
+    forecasts ran on, recorded in the signed report from ``[v2]
+    image_epoch_from_block`` (logged, never enforced; ``None`` before it so
+    every earlier report keeps its bytes)."""
+    from ..shared.era import image_record_at
+
+    ident = getattr(inp, "eval_identity", None)
+    if not ident or not image_record_at(cfg, int(boundary)):
+        return None
+    return {k: str(v) for k, v in dict(ident).items()}
+
+
+def _host_of(inp: Any) -> dict | None:
+    """``inp.host`` as a plain dict (``None`` when absent)."""
+    host = getattr(inp, "host", None)
+    return None if host is None else dict(host)
 
 
 def _armed_of(inp: Any) -> dict | None:
@@ -304,9 +338,13 @@ class LaneDStep:
                               signer=self.signer, prior_pool_dirs=tuple(inp.prior_pool_dirs),
                               expect_prior_sha256=expect, boundary_block_hash=block_hash,
                               sentinel=sentinel, bench=bench, armed=_armed_of(inp),
+                              boundary_ts=getattr(inp, "boundary_ts", None),
                               max_channels=_max_channels(self.cfg),
                               public_indexes=_mapping_of(inp, "public_indexes"),
-                              public_scores=_mapping_of(inp, "public_scores"))
+                              public_scores=_mapping_of(inp, "public_scores"),
+                              **({} if _host_of(inp) is None else {"host": _host_of(inp)}),
+                              **({"eval_identity": ident} if (ident := _eval_identity_of(
+                                  self.cfg, inp, int(boundary))) else {}))
         except Exception as e:  # noqa: BLE001 — LaneDStateError, schema, pool or crash
             raise LaneDWiringError("settle_refused",
                                    f"settlement {boundary} refused ({e})") from e
@@ -376,8 +414,9 @@ class LaneDStep:
             self._put(bench_rows_key(boundary, digest), data.decode("ascii"))
 
     def _sentinel_sweep(self, s: LaneDSettlement, *, era: int, era_hash: str,
-                        bench: Any) -> None:
-        """W3b3: the era's sentinel for a new king. Never gates, never raises."""
+                        bench: Any) -> dict | None:
+        """W3b3: the era's sentinel for a new king. Never gates, never raises.
+        Returns the published sentinel record (``None`` when none was)."""
         try:
             out = sweep_and_publish(s.report, era_block=era, era_block_hash=era_hash,
                                     sentinel_suites=self.cfg.v2.sentinel_suites,
@@ -386,10 +425,41 @@ class LaneDStep:
         except Exception as e:  # noqa: BLE001 — the sentinel is recorded, never gating
             log.warning("lane D settlement %s: sentinel sweep failed (%s); the crown and "
                         "pay stand", s.report.get("boundary"), e)
-            return
+            return None
         if out is not None and not out["published"]:
             log.warning("lane D settlement %s: sentinel record %s not published",
                         s.report.get("boundary"), out["key"])
+            return None
+        return None if out is None else out["record"]
+
+    def _request_publication(self, boundary: int, s: LaneDSettlement,
+                             sentinel_record: dict | None) -> None:
+        """W13: once a crowning settlement is published, leave the
+        ``laned_king_publish_request/1`` the king-publish job (ops_jobs
+        ``king-publish``) consumes: it copies the king from the vault to the
+        Hub, R2 and HF mirrors and re-signs ``champions/lane_d/index.json``.
+        The weights never move in this process. Non-consensus telemetry:
+        written once (an existing request is kept), never raises."""
+        if s.report.get("crowned") is None:
+            return
+        try:
+            from ..lane_d.publish import publish_request, publish_request_path
+
+            path = publish_request_path(self.state_path, boundary)
+            if path.exists():
+                return
+            doc = publish_request(s.report, sentinel_record)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+            tmp.write_text(json.dumps(doc, sort_keys=True) + "\n", encoding="utf-8")
+            os.replace(tmp, path)
+        except Exception as e:  # noqa: BLE001 — publication is an ops job, never pay
+            log.warning("lane_d_king_publish_request_failed settlement %d: the publish "
+                        "request was not written (%s); king-check will flag the king", boundary,
+                        e)
+            return
+        log.info("lane_d_king_publish_requested settlement %d crowned %s: %s", boundary,
+                 str(s.report["crowned"])[:16], path)
 
     def _publish_status(self, boundary: int, s: LaneDSettlement, house: Mapping, *,
                         era: int, era_hash: str | None) -> None:
@@ -415,6 +485,7 @@ class LaneDStep:
                          bench=None)
         self._check_prior(s, latest)
         self._publish(settled, s)
+        self._request_publication(settled, s, None)
         return s.receipt
 
     def __call__(self, boundary: int) -> LaneDSettlement | None:
@@ -473,15 +544,18 @@ class LaneDStep:
                 return s
             self._check_prior(s, latest)
             self._publish(b, s)
+            self._request_publication(b, s, None)
             self._publish_status(b, s, inp.house, era=era, era_hash=era_hash)
             return s
         session = self._bench_session(b)
         s = self._settle(b, inp,
                          expect=None if latest is None else latest["posterior_state_sha256"],
                          block_hash=block_hash, sentinel=sentinel, bench=session)
+        record = None
         if s.report.get("crowned") is not None and era_hash is not None and session is not None:
-            self._sentinel_sweep(s, era=era, era_hash=era_hash, bench=session)
+            record = self._sentinel_sweep(s, era=era, era_hash=era_hash, bench=session)
         self._publish(b, s)
+        self._request_publication(b, s, record)
         self._publish_status(b, s, inp.house, era=era, era_hash=era_hash)
         return s
 

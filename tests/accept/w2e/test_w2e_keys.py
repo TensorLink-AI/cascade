@@ -70,10 +70,15 @@ def test_w2e_public_weight_is_not_tied_to_d_margin(name):
 
 
 @pytest.mark.parametrize("name", SHIPPED)
-def test_w2e_forward_margin_hours_stays_6(name):
-    """rev6.10 (a): "delay eval by 6 hours" is the existing default."""
+def test_w2e_forward_margin_hours_defaults_to_0(name):
+    """rev6.14 (a): the eligibility / fresh boundary is b = T +
+    forward_margin_hours with default 0 (6 -> 0); "delay eval by 6 hours" is
+    the new eval_delay_hours (6). The shipped tables state both."""
     ld = load_ok(raw_with(name, drop=("forward_margin_hours",))).lane_d
-    assert float(ld.forward_margin_hours) == 6.0
+    assert float(ld.forward_margin_hours) == 0.0
+    table = shipped_raw(name).get("lane_d") or {}
+    assert same(table.get("forward_margin_hours"), 0.0), table.get("forward_margin_hours")
+    assert same(table.get("eval_delay_hours"), 6.0), table.get("eval_delay_hours")
 
 
 @pytest.mark.parametrize("name", SHIPPED)

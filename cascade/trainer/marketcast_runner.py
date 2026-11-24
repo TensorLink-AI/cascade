@@ -48,6 +48,14 @@ class MktLegRecipe:
     # recipe's ``init`` against its lineage (:func:`resolve_mkt_init`)
     init_pointer: str = ""
     init_sha256: str = ""
+    # DEC-CA-0074 guard (b): the trainer's pre-rent embargo contamination
+    # receipt (cascade.shared.marketcast_embargo.scan_receipt); it rides the
+    # leg's trainer-signed marketcast record, never the pod's recipe
+    embargo_scan: tuple[tuple[str, object], ...] = ()
+    # W-CMP2 (DEC-CA-0075): a spec instance's leg — ``{"kind", "table"}`` JSON
+    # (the instance's compiled [marketcast]-shaped table the pod trains under);
+    # "" = the legacy ``mkt`` (the recipe bytes unchanged)
+    instance: str = ""
 
     @property
     def leg_hours(self) -> float:
@@ -62,7 +70,8 @@ class MktLegRecipe:
                            "has_generator": bool(self.has_generator),
                            **({"train_time": float(self.train_time)} if self.train_time else {}),
                            **({"init_pointer": self.init_pointer,
-                               "init_sha256": self.init_sha256} if self.init_pointer else {})},
+                               "init_sha256": self.init_sha256} if self.init_pointer else {}),
+                           **({"instance": json.loads(self.instance)} if self.instance else {})},
                           sort_keys=True, separators=(",", ":"))
 
 
@@ -127,15 +136,44 @@ def resolve_mkt_init(init: str, lineage: dict, *, submission_time: float | None)
     return str(init), str(rec.get("checkpoint_sha256", ""))
 
 
+def embargo_scan_or_refuse(d: Path, has_generator: bool, scan, *, train_time: float | None
+                           ) -> tuple[tuple[str, object], ...]:
+    """DEC-CA-0074 guard (b), before anything is rented: the receipt of
+    ``scan(tree | None, train_time=...)`` (a tree is scanned only when it
+    ships a generator). ``embedded`` / ``budget_exceeded`` is
+    :class:`~cascade.trainer.finetune.RecipeError` ``embargo_series_embedded``
+    (miner fault); no scanner wired or a scan that raises is the operator's
+    side (the caller requeues uncharged): an unscanned leg could never be
+    judged (the trainer's :class:`~cascade.trainer.lane_c_competitions.
+    MarketCastTrainer` refuses without one)."""
+    from .finetune import RecipeError
+
+    if not train_time:
+        raise RuntimeError("no dispatch train_time to scan the embargo against")
+    rec = dict(scan(Path(d) if has_generator else None, train_time=float(train_time)))
+    if rec.get("result") in ("embedded", "budget_exceeded"):
+        what = ("embeds embargoed market bars" if rec["result"] == "embedded"
+                else "carries more numeric data than the embargo scan reads")
+        raise RecipeError(f"embargo_series_embedded: the generator tree {what} "
+                          f"({rec.get('window_id') or rec['result']}); generators may not ship "
+                          f"the embargoed history MarketCast is judged on")
+    if rec.get("result") not in ("clean", "no_generator"):
+        raise RuntimeError(f"embargo scan gave {rec.get('result')!r}")
+    return tuple(sorted(rec.items()))
+
+
 def read_mkt_recipe(d: Path, cfg, *, target: str, submission_time: float | None = None,
-                    train_time: float | None = None, lineage: dict | None = None
-                    ) -> MktLegRecipe:
+                    train_time: float | None = None, lineage: dict | None = None,
+                    embargo_scan=None, instance: str = "") -> MktLegRecipe:
     """``marketcast.json`` at the root of the fetched tree, validated with
     the shared rule; :class:`~cascade.trainer.finetune.RecipeError` (miner
     fault) on anything wrong. ``submission_time`` (the commitment's time on
     the dispatch clock) enforces ``data.end <= submission − embargo_days``
     HERE, on the trainer, before anything is rented (review M12) — the miner
-    CLI's check is advisory."""
+    CLI's check is advisory. ``embargo_scan`` (DEC-CA-0074,
+    :func:`embargo_scan_or_refuse`) scans the generator against the embargo
+    (None = no scan: the miner CLI's local check; the trainer always passes
+    one, :class:`~cascade.trainer.lane_c_competitions.MarketCastTrainer`)."""
     from ..shared.marketcast_recipe import MARKETCAST_RECIPE_FILE, parse_marketcast_recipe
     from .finetune import RecipeError
 
@@ -150,9 +188,39 @@ def read_mkt_recipe(d: Path, cfg, *, target: str, submission_time: float | None 
     except (ValueError, OSError) as e:
         raise RecipeError(f"{MARKETCAST_RECIPE_FILE}: {e}") from e
     ip, isha = resolve_mkt_init(rc.init, lineage or {}, submission_time=submission_time)
+    scan = (embargo_scan_or_refuse(d, gen, embargo_scan, train_time=train_time)
+            if embargo_scan is not None else ())
     return MktLegRecipe(target=str(target), has_generator=gen,
                         payload=json.dumps(obj, sort_keys=True, separators=(",", ":")),
-                        train_time=float(train_time or 0.0), init_pointer=ip, init_sha256=isha)
+                        train_time=float(train_time or 0.0), init_pointer=ip, init_sha256=isha,
+                        embargo_scan=scan, instance=str(instance or ""))
+
+
+# ── W-CMP2: the MarketCast table of the leg running on this thread ──────────
+
+
+def leg_mc(runner):
+    """The MarketCast-shaped table of the leg on this thread: a spec
+    instance's (set by :func:`train_mkt_leg`), else ``[marketcast]``."""
+    loc = runner.__dict__.get("_leg_local_obj") if hasattr(runner, "__dict__") else None
+    mc = getattr(loc, "mkt_cfg", None) if loc is not None else None
+    return mc if mc is not None else runner.cfg.marketcast
+
+
+class _leg_mc_scope:  # noqa: N801 — a context manager
+    def __init__(self, runner, mc) -> None:
+        import threading
+
+        self.loc = runner.__dict__.setdefault("_leg_local_obj", threading.local())
+        self.mc = mc
+
+    def __enter__(self):
+        self.saved = getattr(self.loc, "mkt_cfg", None)
+        self.loc.mkt_cfg = self.mc
+        return self.mc
+
+    def __exit__(self, *exc) -> None:
+        self.loc.mkt_cfg = self.saved
 
 
 def base_weights_path(runner) -> Path:  # pragma: no cover — Hub download
@@ -190,7 +258,7 @@ def verify_harvested_mkt_checkpoint(runner, dest: Path, receipt, *,
     )
     from ..shared.marketcast_recipe import meta_problem
 
-    mc = runner.cfg.marketcast
+    mc = leg_mc(runner)
     m = dict(receipt.marketcast or {})
     w = Path(dest) / WEIGHTS_FILE
     if not w.is_file():
@@ -271,12 +339,12 @@ def mkt_contract_block_kw(cfg, era) -> dict:
     checks the pod's worker code, pushes the post-switch chain.toml and the
     worker resolves (and verifies) the after image — the rent already used the
     era's pins (``funded_contract``). Any other leg: no key (byte-identical)."""
-    from ..shared.era import image_after_armed, image_decoupled_era
+    from ..shared.era import image_after_era
 
     if getattr(getattr(cfg, "marketcast", None), "pod_image", ""):
         return {}       # its own image ([marketcast] pod_image): never the fleet's after pins
     start = int(getattr(era, "start_block", 0) or 0)
-    if image_after_armed(cfg) and image_decoupled_era(cfg, start):
+    if image_after_era(cfg, start):
         return {"contract_block": start}
     return {}
 
@@ -303,7 +371,8 @@ def mkt_bars_store(storage, bucket: str):
         secret_key_env="MKT_BARS_S3_SECRET_KEY" if own else base.secret_key_env))
 
 
-def mkt_relay_corpus(cfg, finetune_recipe: str, *, store=None) -> dict:
+def mkt_relay_corpus(cfg, finetune_recipe: str, *, store=None, mc=None,
+                     pool_store=None, block: int | None = None) -> dict:
     """``{"corpus_files": {mkt_bars.json: ...}}`` dispatch kwargs relaying
     the bar recording to a MarketCast pod (:mod:`cascade.pool.
     marketcast_relay`), ``{}`` with ``[marketcast] bar_relay`` off. The
@@ -314,7 +383,12 @@ def mkt_relay_corpus(cfg, finetune_recipe: str, *, store=None) -> dict:
     from ..shared.marketcast_recipe import parse_marketcast_recipe
     from .marketcast_leg import training_relay_plan
 
-    mc = cfg.marketcast
+    wrap0 = json.loads(finetune_recipe)
+    if wrap0.get("instance"):
+        # W-CMP2: a spec instance trains on its own STANDARD POOL (the pool
+        # snapshot active now, clipped on the pod to the recipe's range)
+        return instance_pool_corpus(cfg, wrap0, mc=mc, store=pool_store, block=block)
+    mc = cfg.marketcast if mc is None else mc
     if not mc.bar_relay:
         return {}
     bucket, prefix = mc.bar_relay.split("/", 1)
@@ -329,7 +403,38 @@ def mkt_relay_corpus(cfg, finetune_recipe: str, *, store=None) -> dict:
     return {"corpus_files": {RELAY_FILE: json.dumps(plan, sort_keys=True)}}
 
 
-def train_mkt_leg(ops, leg: dict, recipe: MktLegRecipe) -> dict:  # pragma: no cover — pods
+POOL_RELAY_FILE = "mkt_pool.json"
+POOL_RELAY_VERSION = 1
+
+
+def instance_pool_corpus(cfg, wrap: dict, *, mc=None, store=None,
+                         block: int | None = None) -> dict:
+    """W-CMP2: ``{"corpus_files": {mkt_pool.json: ...}}`` — one time-limited
+    GET link to the instance's standard-pool snapshot active at ``block``
+    (its tar sha256, the spec's ``select`` / ``channels``, the dispatch time
+    the pod clips to). The pod holds no credential; it verifies the tar."""
+    import json as _json
+
+    from ..generation.transfer import presign
+    from ..pool.marketcast_relay import RELAY_EXPIRES_S
+    from ..shared.hippius import pool_s3_store, read_pool_index, select_snapshot
+
+    mc = mc if mc is not None else cfg.marketcast
+    st = store if store is not None else pool_s3_store(cfg.storage)
+    index = read_pool_index(st, mc.pool_prefix)
+    meta = select_snapshot(index, int(block if block is not None else 10**12)) if index else None
+    if meta is None:
+        raise RuntimeError(f"no {mc.pool_prefix} pool snapshot to train the leg on")
+    prim = getattr(st, "primary", st)
+    plan = {"version": POOL_RELAY_VERSION, "url": presign(prim, "get_object", meta.key, RELAY_EXPIRES_S),
+            "sha256": meta.sha256, "select": dict(mc.pool_select),
+            "channels": dict(getattr(mc, "pool_channels", ())),
+            "not_after": float(wrap.get("train_time", 0.0) or 0.0)}
+    return {"corpus_files": {POOL_RELAY_FILE: _json.dumps(plan, sort_keys=True)}}
+
+
+def train_mkt_leg(ops, leg: dict, recipe: MktLegRecipe, *, mc=None,
+                  kind: str = "mkt") -> dict:  # pragma: no cover — pods
     """One MarketCast leg on the MINER's key through the lane-C funded path
     (``RunnerLaneCOps``): returns the driver's result dict, with the
     ``marketcast`` record for the manifest entry."""
@@ -352,12 +457,13 @@ def train_mkt_leg(ops, leg: dict, recipe: MktLegRecipe) -> dict:  # pragma: no c
     r._mkt_harvested.pop(leg["hotkey"], None)
     from .leg_pins import mkt_leg_scope
 
+    leg_cfg = mc if mc is not None else r.cfg.marketcast
     try:
-        with mkt_leg_scope(r):
+        with mkt_leg_scope(r), _leg_mc_scope(r, leg_cfg):
             entry = r._run_funded_leg(
                 r._dispatcher(), gen, seeds, int(leg["started_block"]), contract,
                 leg_suffix(leg["target"], int(leg["uid"])),
-                warm_start_ref=r.cfg.marketcast.base_ref, era_index=era.index,
+                warm_start_ref=leg_cfg.base_ref, era_index=era.index,
                 **mkt_contract_block_kw(r.cfg, era),
                 role="mkt_finetune", finetune_recipe=recipe.to_json(), bench=False,
                 funded_queue=ops.queue(),
@@ -392,12 +498,19 @@ def train_mkt_leg(ops, leg: dict, recipe: MktLegRecipe) -> dict:  # pragma: no c
     record_mkt_lineage(r.work_root, entry.trained_pointer, train_time=recipe.train_time,
                        checkpoint_sha256=str(mkt.get("checkpoint_sha256", "")),
                        init_pointer=recipe.init_pointer)
+    from ..shared.config import image_digest
+
+    # W-IMG: the worker image the leg ran — its own [marketcast] pod_image
+    # release when set, else its contract's pin (the leg's pods run it)
+    mc = getattr(r.cfg, "marketcast", None)
+    image = image_digest(str(getattr(mc, "pod_image", "") or "")) or image_digest(
+        str(getattr(contract, "train_image_digest", "") or ""))
     return {"trained_pointer": entry.trained_pointer, "corpus_digest": entry.corpus_digest,
             "train_block": int(entry.train_block), "gpu_name": str(entry.gpu_name or ""),
-            "marketcast": dict(mkt)}
+            "marketcast": dict(mkt), **({"train_image_digest": image} if image else {})}
 
 
-__all__ = ["LINEAGE_FILE", "load_mkt_lineage", "record_mkt_lineage", "resolve_mkt_init",
+__all__ = ["POOL_RELAY_FILE", "instance_pool_corpus", "leg_mc", "LINEAGE_FILE", "load_mkt_lineage", "record_mkt_lineage", "resolve_mkt_init",
            "MktLegRecipe", "has_generator_tree", "mkt_leg_contract", "mkt_leg_hours",
            "read_mkt_recipe", "train_mkt_leg",
            "verify_harvested_mkt_checkpoint"]

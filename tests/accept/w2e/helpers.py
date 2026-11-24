@@ -36,6 +36,8 @@ W2E_DEFAULTS: dict[str, object] = {
     # rev6.18 A3 (owner 2026-11-23): 50% live + 50% public; ratio clamp [0.5, 2].
     "public_weight": 0.5,
     "window_ratio_floor": 0.5,
+    # rev6.14 (a): the judging start j = T + eval_delay_hours.
+    "eval_delay_hours": 6.0,
 }
 # rev6.18 D24 / A7 (owner 2026-11-24 / 2026-11-23): retired, ignored by the loader.
 RETIRED = ("backtest_weight_cap", "backtest_ratio_floor", "lowfreq_freqs")
@@ -48,6 +50,7 @@ MUTATIONS: dict[str, tuple[object, object, dict]] = {
     "min_fresh_window_share": (0.75, 0.25, {}),
     "public_weight": (0.3, 0.7, {}),
     "window_ratio_floor": (0.25, 0.75, {}),
+    "eval_delay_hours": (3.0, 12.0, {}),
 }
 
 REFUSED: dict[str, list[object]] = {
@@ -56,6 +59,7 @@ REFUSED: dict[str, list[object]] = {
     "min_fresh_window_share": [-0.1, 1.5, True, "0.5"],
     "public_weight": [-0.01, 1.0, 1.5, True, "0.5"],
     "window_ratio_floor": [0.0, 1.0, -0.1, 1.5, True, "0.5"],
+    "eval_delay_hours": [-1.0, -0.5, True, "6"],
 }
 ACCEPTED: dict[str, list[object]] = {
     "embargo_hours": [0.0, 6.0, 48.0, 72.0],
@@ -63,6 +67,7 @@ ACCEPTED: dict[str, list[object]] = {
     "min_fresh_window_share": [0.0, 0.5, 1.0],
     "public_weight": [0.0, 0.5, 0.99],
     "window_ratio_floor": [0.01, 0.5, 0.99],
+    "eval_delay_hours": [0.0, 6.0, 24.0],
 }
 
 # Overlay values that differ from the default and from ARM.
@@ -72,6 +77,7 @@ OVERLAY_VALUE: dict[str, object] = {
     "min_fresh_window_share": 0.75,
     "public_weight": 0.3,
     "window_ratio_floor": 0.6,
+    "eval_delay_hours": 12.0,
 }
 
 

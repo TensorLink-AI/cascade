@@ -132,7 +132,7 @@ Top level (all required): `schema`, `boundary`, `signer`, `signature`,
 
 | object | required fields (the tests check these; more are the builder's choice, but they must be in the schema) |
 |---|---|
-| `params` | `share`, `takes_from`, `remainder`, `horizon`, `horizons` (§14.3 horizon list, `[horizon]` today), `contexts`, `forward_margin_hours`, `max_mirror_lag_hours`, `min_windows`, `min_clusters`, `d_margin`, `alpha`, `bootstrap_B`, `king_decay`, `reward_prior_kings`, `confirm_on_king_change`, `max_entries_per_settlement`, `max_judged_per_coldkey_per_settlement`, `scoring_levels`, `gate_suites` (§14.3 suite list), `tau_public`, `lowfreq_freqs`, **(RV4)** `gate_weights` (`{suite: weight}` as parsed: keys ⊆ `gate_suites`, a suite absent from the table is absent here; finite numbers ≥ 0), `max_source_share` (number in (0, 1]), `min_long_series` (int ≥ 0). Each equals the parsed `[lane_d]` value (lists as JSON lists) |
+| `params` | `share`, `takes_from`, `remainder`, `horizon`, `horizons` (§14.3 horizon list, `[horizon]` today), `contexts`, `forward_margin_hours`, `max_mirror_lag_hours`, `min_windows`, `min_clusters`, `d_margin`, **(rev6.23)** `d_margin_start`, `d_margin_warmup_settlements`, `alpha`, `bootstrap_B`, ~~`king_decay`~~ **(rev6.23)** `court_weights` (JSON list), `reward_prior_kings`, `confirm_on_king_change`, `max_entries_per_settlement`, `max_judged_per_coldkey_per_settlement`, `scoring_levels`, `gate_suites` (§14.3 suite list), `tau_public`, `lowfreq_freqs`, **(RV4)** `gate_weights` (`{suite: weight}` as parsed: keys ⊆ `gate_suites`, a suite absent from the table is absent here; finite numbers ≥ 0), `max_source_share` (number in (0, 1]), `min_long_series` (int ≥ 0). Each equals the parsed `[lane_d]` value (lists as JSON lists) |
 | `pool` | `snapshot`, `sha256`, `horizon` (the newest snapshot's), `first_seen_roots`: the B12 daily Merkle roots the snapshots rely on, sorted, from pool metadata `first_seen_roots` (the sorted union of `snapshots[].first_seen_roots`), **(RV4)** `snapshots` |
 | `pool.snapshots[]` | **(RV4)** `snapshot`, `sha256` (64-hex), `first_seen_roots` (64-hex list) |
 | `entries[]` | `digest`, `hotkey`, `coldkey` (A8: as recorded at `ready`, `null` if unresolved), `context` (§14.3 per-entry context), `ready_block`, `reveal_block`, `reveal_ts`, `status`, `reason` |
@@ -648,6 +648,16 @@ passed every W7a, W5e and W5a test (462).
 **Order:** the W7a implementation needs W2e's keys and lands after W5e's
 (the audit's honest fixtures crown at the first verdict).
 
+### Scoring host (rev6.18 B7)
+
+Tests: `test_w7a_host.py`. `settle_lane_d(..., host=None)` (keyword-only)
+takes the verified eval host record; given, it must pass
+`host_record_problem` (else `ValueError` before anything is written) and is
+signed as the top-level `host` (schema `$defs.host`: exactly `env`,
+`gpu_model`, `driver`, `torch_build`, `fingerprint`, `identity`).
+`validate_report` re-checks the identity (`bad_value` at `host`).
+`LaneDInputs.host` (W8b) carries it to `settle_lane_d`. Absent without a host.
+
 ## Multichannel windows (rev6.18 F2): `test_w7a_multivariate.py`, `mv.py`
 
 `mv.py` is the multichannel chain fixture the F2 tests of W5d/W5e/W7a/W9
@@ -717,3 +727,7 @@ share would hold verdicts ~24 h. The default (loader, both shipped files) is
 **0.2**; fresh windows are still drawn first and always included. The tests
 that pinned the 0.5 default now pin 0.2. Lane D is not rolled out, so there is
 no activation key.
+
+## rev6.14 (a): judging start vs eligibility boundary (owner 2026-11-23)
+
+The report signs the optional top-level `boundary_ts` (the boundary block's on-chain `Timestamp.Now`; absent, never null, on the legacy call) and echoes `params.eval_delay_hours`; `SKIP_REASONS` gains `before_eval_delay` and `boundary_ts_missing`. `validate_report` refuses a cohort with `boundary_ts < t_max + 3600 * eval_delay_hours` (`bad_value` at `cohorts[i]`), a judged cohort without `boundary_ts` (`missing_field`), a `boundary_ts_missing` skip on a stamped settlement, a `before_eval_delay` skip whose start has passed, and `forward_margin_hours > eval_delay_hours`. `test_w7a_rev614.py`.

@@ -214,7 +214,8 @@ def test_t8_entry_and_king_t_in_both_orders_uses_the_max(tmp_path, order):
 def test_forward_margin_hours_is_read_from_cfg(tmp_path):
     rec = case("eligible", BOUND, "m", "srcA")    # first target at bound + 3 h
     _assert_eligible(_one(tmp_path, rec))
-    wide = lane_d_cfg(forward_margin_hours=MARGIN_H + 12.0)
+    # rev6.14 (a): the margin may not exceed eval_delay_hours.
+    wide = lane_d_cfg(forward_margin_hours=MARGIN_H + 12.0, eval_delay_hours=MARGIN_H + 12.0)
     _assert_refused(_one(tmp_path, rec, cfg=wide, name="pool2"), "before_margin")
 
 

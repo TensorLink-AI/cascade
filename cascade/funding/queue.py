@@ -298,6 +298,13 @@ class FundedEntry:
     operator_requeues: int = 0
     # The cause the count above is counting (a normalised error prefix).
     operator_fault_cause: str = ""
+    # WB23 (D42, D42b): the miner-chosen lane B leg length fixed at the fund
+    # (``X-Lane-B-Train-Hours``): hours, steps from the chosen GPU's measured
+    # rate, the wall guard. 0 = no train_hours (today's leg); files written
+    # before WB23 load with zeros.
+    train_hours: float = 0.0
+    leg_steps: int = 0
+    leg_guard_seconds: int = 0
     # WB14 / LB2 lane B miner-declared expert rows: ``{MoE ordinal: sorted
     # expert indices}`` as parsed by
     # :func:`cascade.trainer.declared_rows.parse_declared_rows` at intake;
@@ -380,6 +387,9 @@ _ROWS_FIELD_DEFAULTS = {"declared_rows": None, "queued_declared_rows": None}
 # WB13 contamination receipts, likewise written only when set (an unpinned
 # intake's entries serialise exactly as before).
 _CONTAMINATION_FIELD_DEFAULTS = {"contamination": None, "queued_contamination": None}
+# WB23 leg length, likewise written only when set (an entry funded without
+# train_hours serialises exactly as before).
+_LEG_FIELD_DEFAULTS = {"train_hours": 0.0, "leg_steps": 0, "leg_guard_seconds": 0}
 
 
 def _receipt_copy(value) -> dict | None:
@@ -405,6 +415,14 @@ def _gpu_fields(choice) -> dict:
     return {"gpu": str(choice.gpu or ""),
             "gpu_allow_fallback": bool(choice.allow_fallback) if choice.gpu else False,
             "gpu_max_price_per_hour": float(choice.max_price_per_hour) if choice.gpu else 0.0}
+
+
+def _leg_length_fields(length) -> dict:
+    """``replace()`` kwargs for a fund's WB23 leg length (None = cleared)."""
+    if length is None:
+        return {"train_hours": 0.0, "leg_steps": 0, "leg_guard_seconds": 0}
+    return {"train_hours": float(length.train_hours), "leg_steps": int(length.steps),
+            "leg_guard_seconds": int(length.guard_seconds)}
 
 
 LABEL_MAX_CHARS = 32
@@ -551,6 +569,9 @@ class FundedQueue:
                 queued_declared_rows=_rows_from_json(item.get("queued_declared_rows")),
                 contamination=_receipt_copy(item.get("contamination")),
                 queued_contamination=_receipt_copy(item.get("queued_contamination")),
+                train_hours=float(item.get("train_hours", 0.0) or 0.0),
+                leg_steps=int(item.get("leg_steps", 0) or 0),
+                leg_guard_seconds=int(item.get("leg_guard_seconds", 0) or 0),
                 extra=extra,
             )
             entries[entry.hotkey] = entry
@@ -586,7 +607,8 @@ class FundedQueue:
             row = asdict(e)
             extra = row.pop("extra", None) or {}
             for k, default in (*_GPU_FIELD_DEFAULTS.items(), *_ROWS_FIELD_DEFAULTS.items(),
-                               *_CONTAMINATION_FIELD_DEFAULTS.items()):
+                               *_CONTAMINATION_FIELD_DEFAULTS.items(),
+                               *_LEG_FIELD_DEFAULTS.items()):
                 if row.get(k) == default:
                     row.pop(k, None)
             for k, v in extra.items():
@@ -617,8 +639,12 @@ class FundedQueue:
 
     def add(self, hotkey: str, ref: str, reveal_block: int, *,
             label: str = "", gpu_choice=None, max_total_spend_usd=_KEEP,
-            declared_rows=_KEEP, contamination=_KEEP) -> str:
+            declared_rows=_KEEP, contamination=_KEEP, leg_length=_KEEP) -> str:
         """Fund (or re-fund) a submission; returns the outcome for the caller.
+
+        ``leg_length`` (WB23, lane B; a ``lane_b_leg.LegLength`` or None = no
+        ``train_hours``) follows ``gpu_choice``'s rule: the latest fund wins
+        and it steers the NEXT leg only. ``_KEEP`` (lanes A, C) leaves it.
 
         ``declared_rows`` (WB14, lane B; parsed rows or None = none declared)
         REPLACES the entry's rows on every accepted outcome except onto an
@@ -650,6 +676,7 @@ class FundedQueue:
         budget = ({} if max_total_spend_usd is _KEEP else {
             "max_total_spend_usd": (float(max_total_spend_usd)
                                     if max_total_spend_usd is not None else None)})
+        length = {} if leg_length is _KEEP else _leg_length_fields(leg_length)
         keep_rows = declared_rows is _KEEP
         rows = {} if keep_rows else {"declared_rows": _rows_copy(declared_rows)}
         keep_receipt = contamination is _KEEP
@@ -668,7 +695,7 @@ class FundedQueue:
                                               queued_declared_rows=None,
                                               queued_contamination=None,
                                               label=label or prev.label,
-                                              **_gpu_fields(gpu_choice), **budget)
+                                              **_gpu_fields(gpu_choice), **length, **budget)
                     self._save(entries)
                     return "already-queued"
                 entries[hotkey] = replace(prev, queued_ref=ref,
@@ -680,7 +707,7 @@ class FundedQueue:
                                               prev.queued_contamination if keep_receipt
                                               else _receipt_copy(contamination)),
                                           last_active=now, label=label or prev.label,
-                                          **_gpu_fields(gpu_choice), **budget)
+                                          **_gpu_fields(gpu_choice), **length, **budget)
                 self._save(entries)
                 return "queued-behind"
             if prev is not None and prev.status in _PARKED:
@@ -696,7 +723,7 @@ class FundedQueue:
                     funded_at=now, last_active=now, status="queued",
                     operator_billed=False, operator_requeues=0, operator_fault_cause="",
                     infra_streak=0, not_before=0.0,
-                    label=label or prev.label, **_gpu_fields(gpu_choice), **budget, **rows),
+                    label=label or prev.label, **_gpu_fields(gpu_choice), **length, **budget, **rows),
                     "queued", now, force=True)
                 self._save(entries)
                 return "queued" if same else "replaced"
@@ -707,7 +734,7 @@ class FundedQueue:
                     # The rows of an entry a live round is training stay put.
                     entries[hotkey] = replace(prev, last_active=now,
                                               label=label or prev.label,
-                                              **_gpu_fields(gpu_choice), **budget,
+                                              **_gpu_fields(gpu_choice), **length, **budget,
                                               **(rows if prev.status == "queued" else {}))
                     self._save(entries)
                     return "already-queued"
@@ -718,12 +745,12 @@ class FundedQueue:
                 entries[hotkey] = replace(
                     prev, ref=ref, reveal_block=int(reveal_block),
                     funded_at=now, last_active=now, status="queued",
-                    label=label or prev.label, **_gpu_fields(gpu_choice), **budget, **rows)
+                    label=label or prev.label, **_gpu_fields(gpu_choice), **length, **budget, **rows)
                 self._save(entries)
                 return "replaced" if prev.ref != ref else "queued"
             entries[hotkey] = FundedEntry(
                 hotkey=hotkey, ref=ref, reveal_block=int(reveal_block),
-                funded_at=now, last_active=now, label=label, **_gpu_fields(gpu_choice), **budget,
+                funded_at=now, last_active=now, label=label, **_gpu_fields(gpu_choice), **length, **budget,
                 **rows)
             self._save(entries)
             return "queued"
@@ -1439,13 +1466,15 @@ class LaneBQueue(FundedQueue):
 
     def add_lane_b(self, hotkey: str, targets, ref: str, reveal_block: int, *,
                    label: str = "", gpu_choice=None, declared_rows=_KEEP,
-                   contamination=_KEEP) -> str:
+                   contamination=_KEEP, leg_length=None) -> str:
         """``declared_rows``: the parsed WB14 rows of this fund (None = none
         declared, ESFT picks); ``contamination``: the WB13 intake receipt
-        (``_KEEP`` = unpinned, nothing recorded); see :meth:`FundedQueue.add`."""
+        (``_KEEP`` = unpinned, nothing recorded); ``leg_length``: the WB23
+        ``LegLength`` fixed at this fund (None = no train_hours, today's leg);
+        see :meth:`FundedQueue.add`."""
         return self.add(hotkey, lane_b_entry_ref(targets, ref), int(reveal_block), label=label,
                         gpu_choice=gpu_choice, declared_rows=declared_rows,
-                        contamination=contamination)
+                        contamination=contamination, leg_length=leg_length)
 
     def queued(self, *, now: float | None = None) -> list[FundedEntry]:
         """Startable entries, earliest reveal first: ``queued`` and not
@@ -1456,7 +1485,13 @@ class LaneBQueue(FundedQueue):
 
     def public_view(self) -> dict:
         view = super().public_view()
+        current = {e.hotkey: e for e in self.entries()}
         for row in view.get("entries", []):
+            e = current.get(row.get("hotkey"))
+            if e is not None and e.train_hours > 0:
+                # WB23: the leg length the miner chose (steps fixed at the fund)
+                row.update(train_hours=float(e.train_hours), leg_steps=int(e.leg_steps),
+                           leg_guard_seconds=int(e.leg_guard_seconds))
             try:
                 targets, row["ref"] = split_lane_b_ref(row["ref"])
                 row["targets"] = list(targets)

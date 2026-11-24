@@ -242,16 +242,33 @@ def report_digest(report) -> str:
 # ── settlement calls ────────────────────────────────────────────────────────
 
 
+_FIXTURE_CLOCK = object()
+
+
+def fixture_boundary_ts(b) -> int:
+    """rev6.14 (a): the fixture's on-chain timestamp of boundary block `b`,
+    far after every fixture T + eval_delay_hours (12 s per block)."""
+    return 2_000_000_000 + 12 * int(b)
+
+
 def settle(cfg, b, pool_dir, entries, house_rec, fc, uid_of, state_path, *,
-           hash_=None, bench=None, prior=(), armed=None):
+           hash_=None, bench=None, prior=(), armed=None, boundary_ts=_FIXTURE_CLOCK):
     """`settle_lane_d` with the W5e gate inputs (`bench=None` or
     `hash_=None` = the gate cannot run: fail closed, `bench_hold`).
-    ``armed`` (rev6.6) is the W5d armed record, passed only when given."""
+    ``armed`` (rev6.6) is the W5d armed record, passed only when given.
+    ``boundary_ts`` (rev6.14 (a)): the fixture clock unless given; ``None``
+    is the legacy call (fail closed, ``boundary_ts_missing``)."""
     from cascade.validator.lane_d import settle_lane_d
 
     kw = {"prior_pool_dirs": [Path(p) for p in prior]} if prior else {}
     if armed is not None:
         kw["armed"] = armed
+    if boundary_ts is _FIXTURE_CLOCK:
+        boundary_ts = fixture_boundary_ts(b)
+    import inspect
+
+    if "boundary_ts" in inspect.signature(settle_lane_d).parameters:
+        kw["boundary_ts"] = boundary_ts
     return settle_lane_d(cfg=cfg, boundary=b, pool_dir=pool_dir,
                          entries=[dict(e) for e in entries], house=dict(house_rec),
                          forecasts=fc, uid_of=dict(uid_of), state_path=state_path,

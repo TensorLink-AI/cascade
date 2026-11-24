@@ -1,0 +1,33 @@
+# Wed 2026-11-25 launch, STEP 2 of 2 (seq N+1; seq N =
+# launch-20261125.pre.mainnet.toml): the full launch snapshot — lane D armed
+# at the launch era start 9586800 (= 2663 x 3600, the first mainnet era
+# boundary after Wed 18:00 UTC; ~22:28 UTC at 12 s/block) plus a
+# byte-identical restatement of step 1 (the R3 lint's `non-lane-d` rule).
+# MAINNET (netuid 91). Owner decision 2026-11-24: lane B expert legs, lane C
+# MarketCast and lane D all start together at 9586800.
+#
+# Dry run against the DEPLOYED chain.toml, with step 1 as the previous
+# version, then lint, then the owner signs (Approve-tier; 51 % cfg- tally
+# over the six external validators — publish >= 1 era ahead of 9586800):
+#
+#   cascade-validator --chain-toml chain.toml \
+#     --netconfig-overlay deploy/overlays/launch-20261125.mainnet.toml \
+#     --netconfig-effective-block 9586800
+#
+# Emission split from 9586800 (#859 split-a0-b35-c15-d50, owner 2026-11-24):
+# A 0 / B 35 / C 15 / D 50 — lanes C and D carve from lane A.
+# Overlays are SNAPSHOTS: every later overlay must restate all of these keys.
+# Do NOT change one table here without the same change in step 1.
+
+[lane_b]
+from_block = 9586800
+share      = 0.35
+
+[lane_c]
+share      = 0.15
+takes_from = "lane_a"
+
+[lane_d]
+from_block = 9586800
+share      = 0.5
+takes_from = "lane_a"

@@ -35,9 +35,10 @@ KING_D_UID = 6
 PRIOR_1_UID = 5
 PRIOR_2_UID = 7
 
-# D1/D48: 0.25 of the total, taken from lane A. D7: 2 prior kings, decay 0.5.
+# D1/D48: 0.25 of the total, taken from lane A. D7: 2 prior kings; rev6.23
+# (owner 2026-11-24): court_weights 0.80 / 0.15 / 0.05.
 ARMED = {"from_block": ARM_BLOCK, "share": 0.25, "takes_from": "lane_a",
-         "remainder": "burn", "reward_prior_kings": 2, "king_decay": 0.5}
+         "remainder": "burn", "reward_prior_kings": 2, "court_weights": [0.80, 0.15, 0.05]}
 
 # Exact float tolerance for armed goldens (the order of float operations is
 # the builder's choice; the values are exact fractions).

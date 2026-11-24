@@ -21,7 +21,14 @@ sources only:
 6. every needed checkpoint's forecasts on every pinned window at its
    ``effective_context`` under that set, computed on the lane D eval host
    (:mod:`cascade.eval.lane_d_forecasts`) behind the W4 handshake. Only
-   histories leave the box, never a target (D12);
+   histories leave the box, never a target (D12). rev6.18 B5-B7: with the
+   scoring environment list (``scoring_envs``) the handshake also checks the
+   host's environment is qualified at the boundary (``env_unqualified``
+   otherwise) and the host record rides out as ``LaneDInputs.host`` (the
+   signed report's ``host``); every model of the settlement is forecast on
+   that one host, and the B6 score cache
+   (:mod:`cascade.validator.lane_d_score_cache`) reuses only forecasts the
+   same host identity and code computed: a host change re-scores the cohort.
 7. (rev6.18 A3, F4) at ``[lane_d] public_weight > 0``: the settlement's
    public draw (:func:`~cascade.validator.lane_d_public.draw_public` per
    pinned source, from the box's ``public_indexes`` and the boundary block
@@ -93,12 +100,14 @@ INPUTS_ERROR_CODES = (
     "chain_unavailable",        # the source's chain reader cannot be built
     "intake_unreadable",        # the intake queue file is unreadable or malformed
     "reveal_unreadable",        # a reveal block's timestamp is unreadable
+    "boundary_ts_unreadable",   # rev6.14 (a): the boundary block's timestamp is unreadable
     "metagraph_unreadable",     # the registered hotkeys are unreadable
     "state_unreadable",         # lane_d_state.json is refused
     "house_unavailable",        # the W5f pointer is missing, forged or wrongly signed
     "pool_unavailable",         # no pin, or a pinned snapshot does not load
     "pool_digest_mismatch",     # a pinned snapshot does not hash to its pin
     "handshake_mismatch",       # the eval host runs other code (W4, T19)
+    "env_unqualified",          # rev6.18 B5/B7: the host's scoring env is not qualified
     "forecasts_unavailable",    # the eval host failed (or a bar's checkpoint faulted)
     "forecast_malformed",       # KING_D's or the house's forecasts are malformed
     # rev6.6: the settlement's armed context set (W5d armed_record)
@@ -153,6 +162,20 @@ def _rows_of(history) -> int:
     return int(shape[0]) if len(shape) == 2 and int(shape[0]) > 1 else 1
 
 
+def _row_keys(windows: list[dict], rows: list[int]) -> list[str]:
+    """B6 score-cache keys, one per forecast row: ``<window_id>:<history
+    sha256[:16]>`` (``#<channel>`` appended for a k-channel window)."""
+    import hashlib
+
+    out = []
+    for w, k in zip(windows, rows, strict=True):
+        h = np.ascontiguousarray(np.asarray(w["history"], dtype=np.float64))
+        d = hashlib.sha256(repr(h.shape).encode() + h.tobytes()).hexdigest()[:16]
+        base = f"{w['window_id']}:{d}"
+        out += [base] if k == 1 else [f"{base}#{j}" for j in range(k)]
+    return out
+
+
 def _per_window(arr: np.ndarray, ids: list[str], rows: list[int]) -> dict:
     """The eval host's ``(Σ rows, h, 9)`` reply split per window: ``(h, 9)``
     for a one-row window, ``(k, h, 9)`` for a k-channel one."""
@@ -172,10 +195,13 @@ class LaneDInputsSource:
                  eval_host: Any, house_pointer, house_signer_ss58: str,
                  readiness: Callable[[], bytes], t7: Callable[[], bytes],
                  bench_host: Callable | None = None, expected_identity=None,
-                 public_indexes: Mapping | None = None):
+                 public_indexes: Mapping | None = None,
+                 scoring_envs=None, score_cache=None):
         self.cfg = cfg
         # rev6.18 A3 (F4): {source: index dir} on the box (W6p indexes).
         self._public_indexes = dict(public_indexes or {})
+        self._scoring_envs = None if scoring_envs is None else tuple(scoring_envs)
+        self._score_cache = score_cache
         self._readiness = readiness
         self._t7 = t7
         self.state_path = Path(state_dir) / STATE_FILE
@@ -469,9 +495,14 @@ class LaneDInputsSource:
                 out.append({"window_id": wid, "history": w["history"]})
         return out
 
-    def _forecasts(self, need: dict[str, int], bars: frozenset[str], windows: list[dict],
-                   state: dict, house: dict, armed: Sequence[int]) -> dict:
-        from ..eval.lane_d_handshake import HandshakeMismatch, check_handshake
+    def _hello(self, boundary: int):
+        """The verified eval host: ``(code identity, host record | None)``."""
+        from ..eval.lane_d_handshake import (
+            CODE_FIELDS,
+            HandshakeMismatch,
+            check_handshake,
+            check_worker,
+        )
 
         try:
             hello = self._eval_host.hello()
@@ -479,9 +510,27 @@ class LaneDInputsSource:
             raise LaneDInputsError("forecasts_unavailable",
                                    f"eval host hello failed ({e})") from e
         try:
-            check_handshake(hello, expected=self._expected_identity)
+            if self._scoring_envs is None:
+                return check_handshake(hello, expected=self._expected_identity), None
+            return check_worker(hello, envs=self._scoring_envs, boundary=int(boundary),
+                                expected=self._expected_identity)
         except HandshakeMismatch as e:
-            raise LaneDInputsError("handshake_mismatch", str(e)) from e
+            code = ("handshake_mismatch" if set(e.fields) & set(CODE_FIELDS)
+                    else "env_unqualified")
+            raise LaneDInputsError(code, str(e)) from e
+
+    def _forecasts(self, need: dict[str, int], bars: frozenset[str], windows: list[dict],
+                   state: dict, house: dict, armed: Sequence[int], boundary: int
+                   ) -> tuple[dict, dict | None]:
+        ident, host = self._hello(boundary)
+        # W-IMG: the identity the forecasts ran on (recorded in the report)
+        self._eval_identity = {"git_head": str(getattr(ident, "git_head", "") or ""),
+                               "package_hash": str(getattr(ident, "package_hash", "") or "")}
+        cache, ns = self._score_cache, None
+        if cache is not None and host is not None:
+            from .lane_d_score_cache import namespace
+
+            ns = namespace(host["identity"], ident.package_hash)
         pin = getattr(self._eval_host, "set_pinned", None)
         if callable(pin):
             pin(king_d=str(state["king"]["digest"]), house=str(house["digest"]))
@@ -494,9 +543,21 @@ class LaneDInputsSource:
         # k-channel window (window-major).
         per = [_rows_of(w["history"]) for w in windows]
         n = sum(per)
+        # B6: cache rows are keyed by the window id AND its history bytes (a
+        # recurring id with another history, or another channel pick, is
+        # another key), one key per forecast row.
+        row_keys = [] if ns is None else _row_keys(windows, per)
         out: dict[str, dict] = {}
+        used = []
         for dg in sorted(need):
             bar = dg in bars
+            if ns is not None:
+                used.append((dg, int(need[dg]), horizon))
+                hit = cache.get(ns, dg, context=need[dg], horizon=horizon,
+                                window_ids=row_keys)
+                if hit is not None:
+                    out[dg] = _per_window(hit, ids, per)
+                    continue
             try:
                 got = self._eval_host.forecast(dg, context=need[dg], horizon=horizon,
                                                windows=[dict(w) for w in windows])
@@ -524,8 +585,13 @@ class LaneDInputsSource:
                             dg[:16])
                 out[dg] = self._fault(ids, horizon, per)
                 continue
+            if ns is not None:
+                cache.put(ns, dg, context=need[dg], horizon=horizon, window_ids=row_keys,
+                          quantiles=arr)
             out[dg] = _per_window(arr, ids, per)
-        return out
+        if ns is not None:
+            cache.retain(ns, used)
+        return out, host
 
     def _public(self, reader: Any, boundary: int, need: dict[str, int],
                 bars: frozenset[str], armed: Sequence[int]) -> tuple[dict | None, dict | None]:
@@ -612,6 +678,15 @@ class LaneDInputsSource:
             raise LaneDInputsError("not_active", f"lane D does not settle at {b}")
         reader = self._reader()
         entries = self._entries(reader, b)
+        # rev6.14 (a): the boundary block's on-chain Timestamp.Now, the same on
+        # every validator; the judging start is applied against it (never a
+        # guessed or local time).
+        try:
+            boundary_ts = int(reader.block_timestamp(b))
+        except Exception as e:  # noqa: BLE001 — never a guessed time
+            self._readers.pop(threading.get_ident(), None)
+            raise LaneDInputsError("boundary_ts_unreadable",
+                                   f"boundary block {b} timestamp unreadable ({e})") from e
         uid_of = self._uid_of(reader)
         house = self._house()
         state = self._state(house)
@@ -620,7 +695,7 @@ class LaneDInputsSource:
         ctxs = tuple(armed["armed_contexts"])
         windows = self._windows(pools, b)
         need, bars = self._needed(entries, state, house, ctxs)
-        forecasts = self._forecasts(need, bars, windows, state, house, ctxs)
+        forecasts, host = self._forecasts(need, bars, windows, state, house, ctxs, b)
         public_indexes, public_scores = self._public(reader, b, need, bars, ctxs)
         # W3b6a: the bench host sweeps each digest at the context it is
         # forecast at (the same map, once per settlement).
@@ -630,7 +705,9 @@ class LaneDInputsSource:
         dirs = [d for d, _ in pools]
         return LaneDInputs(pool_dir=dirs[-1], entries=entries, forecasts=forecasts,
                            uid_of=uid_of, house=house, prior_pool_dirs=tuple(dirs[:-1]),
-                           armed=armed, channel_block_hash=self.channel_block_hash,
+                           armed=armed, boundary_ts=boundary_ts,
+                           channel_block_hash=self.channel_block_hash,
+                           host=host, eval_identity=getattr(self, "_eval_identity", None),
                            public_indexes=public_indexes, public_scores=public_scores)
 
 
@@ -638,13 +715,18 @@ def build_lane_d_inputs(cfg: Any, *, state_dir, intake_state_dir,
                         chain_factory: Callable[[], Any], pool, eval_host, house_pointer,
                         house_signer_ss58: str, readiness: Callable[[], bytes],
                         t7: Callable[[], bytes], bench_host: Callable | None = None,
-                        expected_identity=None,
-                        public_indexes: Mapping | None = None) -> LaneDInputsSource | None:
+                        expected_identity=None, scoring_envs=None,
+                        score_cache=None, public_indexes: Mapping | None = None
+                        ) -> LaneDInputsSource | None:
     """The lane D inputs source for ``cfg`` (the full ``ChainConfig``), or
     ``None`` while ``[lane_d] from_block = 0`` (nothing is called, read or
     created). Building an armed source reads nothing. ``readiness`` / ``t7``
     (rev6.6) return the pinned ``laned_readiness/1`` / ``laned_t7/1``
-    document bytes, read once per settlement (:class:`DocumentFile`)."""
+    document bytes, read once per settlement (:class:`DocumentFile`).
+    ``scoring_envs`` (rev6.18 B5) is the qualified scoring environment list
+    and ``score_cache`` the B6
+    :class:`~cascade.validator.lane_d_score_cache.ScoreCache` (production
+    passes both, :func:`load_inputs_services`)."""
     if int(getattr(getattr(cfg, "lane_d", None), "from_block", 0) or 0) <= 0:
         return None
     return LaneDInputsSource(cfg, state_dir=state_dir, intake_state_dir=intake_state_dir,
@@ -652,6 +734,7 @@ def build_lane_d_inputs(cfg: Any, *, state_dir, intake_state_dir,
                              house_pointer=house_pointer, house_signer_ss58=house_signer_ss58,
                              readiness=readiness, t7=t7, bench_host=bench_host,
                              expected_identity=expected_identity,
+                             scoring_envs=scoring_envs, score_cache=score_cache,
                              public_indexes=public_indexes)
 
 
@@ -895,7 +978,8 @@ class SSHEvalHost:
 INPUTS_FILE_KEYS = ("intake_state_dir", "pool_pins", "house_pointer", "house_signer_ss58",
                     "eval_hosts", "eval_host_name", "eval_cache_dir", "eval_cache_budget_bytes",
                     "eval_device", "eval_timeout_seconds", "grant_expires_seconds",
-                    "readiness", "t7", "bench_hosts", "public_indexes", "eval_public_root")
+                    "readiness", "t7", "bench_hosts", "public_indexes", "eval_public_root",
+                    "scoring_envs", "score_cache_dir")
 _REQUIRED_KEYS = ("intake_state_dir", "pool_pins", "house_pointer", "house_signer_ss58",
                   "eval_hosts", "eval_cache_dir", "eval_cache_budget_bytes", "readiness", "t7")
 
@@ -922,6 +1006,9 @@ def load_inputs_services(cfg: Any, path) -> dict:
         eval_public_root = "/root/lane_d_public"    # rev6.18 F4: the public mirror ON the host
         public_indexes = { gift_eval_pretrain = "/abs/idx/gift", rmisc = "/abs/idx/rmisc" }
                                                     # rev6.18 F4: the W6p indexes on the box
+        scoring_envs = "/abs/scoring_envs.toml"   # optional (rev6.18 B5): default the
+                                                  # release's deploy/laned/scoring_envs.toml
+        score_cache_dir = "/abs/lane_d_score_cache"  # optional (B6): no cache without it
 
     Returns the keyword arguments. ``bench_host`` is the W3b6a
     :class:`~cascade.validator.lane_d_bench_host.SSHBenchHost` on
@@ -968,6 +1055,17 @@ def load_inputs_services(cfg: Any, path) -> dict:
                        device=raw.get("eval_device", "cuda"),
                        timeout_s=float(raw.get("eval_timeout_seconds", 3600)), grants=grants,
                        public_root=raw.get("eval_public_root", ""))
+    from ..shared.config.lane_d import ScoringEnvError, load_scoring_envs
+
+    try:
+        envs = load_scoring_envs(raw.get("scoring_envs") or None)
+    except ScoringEnvError as e:
+        raise LaneDInputsConfigError(f"lane D inputs file {p}: {e}") from e
+    score_cache = None
+    if raw.get("score_cache_dir"):
+        from .lane_d_score_cache import ScoreCache
+
+        score_cache = ScoreCache(raw["score_cache_dir"])
     bench = None
     if raw.get("bench_hosts"):
         from .lane_d_bench_host import SSHBenchHost, bench_settings
@@ -979,7 +1077,8 @@ def load_inputs_services(cfg: Any, path) -> dict:
             "eval_host": host, "house_pointer": Path(raw["house_pointer"]),
             "house_signer_ss58": raw["house_signer_ss58"], "bench_host": bench,
             "readiness": DocumentFile(raw["readiness"]), "t7": DocumentFile(raw["t7"]),
-            "public_indexes": {str(k): Path(v) for k, v in pidx.items()}}
+            "public_indexes": {str(k): Path(v) for k, v in pidx.items()},
+            "scoring_envs": envs, "score_cache": score_cache}
 
 
 __all__ = ["INPUTS_ERROR_CODES", "DocumentFile", "LaneDInputsConfigError", "LaneDInputsError",

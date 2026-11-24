@@ -1,0 +1,17 @@
+# Retired WPs (accept --help, RETIRED rule; status, side state `retired`).
+#
+# One WP per line: `<WP> <owner decision reference>`; `#` starts a comment.
+# A retired WP is dropped by an owner decision and never built: its PATHS
+# never count for the FEATURE rule's scope (a PR needs no laned:<WP> label of
+# it), a laned:<WP> label of it is inert (MODE retired, nothing runs), it is
+# never a CROSS or merge-group WP and the status board shows it RETIRED. The
+# only change a PR may make to its tests/accept/<wp>/ is deleting files
+# (with laned:tests-correction). `accept` and `status` read this file at the
+# base / board ref, never from the PR, and only a W0c PR may edit
+# scripts/laned/, so a PR can never retire a WP to dodge its Accept.
+#
+# W5i (slow-cadence backtest windows): plan rev6.18 (D24), owner 2026-11-24,
+# DECIDED: "the slow-cadence backtest windows (W5i) are dropped; the public
+# half replaces them"; §3.0 W5i row RETIRED, not built. F4 deletes the
+# backtest config keys and the audit's two-part combined_log_ratio.
+W5i  plan rev6.18 (D24), owner 2026-11-24: backtest windows dropped, W5i retired (not built)

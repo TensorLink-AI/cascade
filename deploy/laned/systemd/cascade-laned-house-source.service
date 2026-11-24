@@ -1,0 +1,23 @@
+# TEMPLATE (validator host): verify the laned_house_source/1 the owner built on
+# a pod (python -P -m cascade.lane_d.house_source build: the D47 BF16 cast of
+# the lane A king and its D46 reveal_ts) against its .provenance.json (stdlib
+# re-hash, no weights read) and install both where the house-pointer job reads
+# them (LANED_HOUSE_SOURCE). A source the provenance does not prove is refused
+# (exit 1); an installed one is never rewritten when unchanged.
+#
+# Ships in --dry-run; going live is a drop-in without --dry-run. Log tag
+# lane_d_ops_house_source_*.
+
+[Unit]
+Description=cascade lane D house source install (dry-run template)
+
+[Service]
+Type=oneshot
+WorkingDirectory=/
+Environment=PYTHONPATH=/root/cascade
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/cascade-laned-jobs.env
+ExecStart=/root/cascade/.venv/bin/python -P -m cascade.lane_d.ops_jobs house-source --source ${LANED_HOUSE_SOURCE_STAGE} --dest ${LANED_HOUSE_SOURCE} --log-file ${LANED_LOG} --dry-run
+Nice=19
+MemoryMax=256M
+NoNewPrivileges=true

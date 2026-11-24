@@ -46,7 +46,8 @@ def test_w2e_overlay_public_weight_and_clamp_have_no_cross_key_rule(name):
     overlay lowering d_margin is adopted at any w; their own ranges are
     re-checked at adoption."""
     base = load_ok(shipped_raw(name))
-    out = validate_ok(base, {"lane_d": {**ARM, "public_weight": 0.9, "d_margin": 0.001}})
+    # d_margin 0.005: inside the W-OV overlay envelope [0.002, 0.25] (#859).
+    out = validate_ok(base, {"lane_d": {**ARM, "public_weight": 0.9, "d_margin": 0.005}})
     assert same(field(out.lane_d, "public_weight"), 0.9)
     assert validate_refused(base, {"lane_d": {**ARM, "public_weight": 1.0}})
     assert validate_refused(base, {"lane_d": {**ARM, "window_ratio_floor": 1.0}})

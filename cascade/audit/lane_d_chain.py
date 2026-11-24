@@ -386,7 +386,12 @@ def expected_params(cfg) -> dict:
             "max_mirror_lag_hours": float(cfg.max_mirror_lag_hours),
             "min_windows": int(cfg.min_windows), "min_clusters": int(cfg.min_clusters),
             "d_margin": float(cfg.d_margin), "alpha": float(cfg.alpha),
-            "bootstrap_B": int(cfg.bootstrap_B), "king_decay": float(cfg.king_decay),
+            "bootstrap_B": int(cfg.bootstrap_B),
+            # rev6.23: the tenure-decaying crown bar (d_margin is its end) and
+            # the explicit court weights (they replace king_decay).
+            "d_margin_start": float(cfg.d_margin_start),
+            "d_margin_warmup_settlements": int(cfg.d_margin_warmup_settlements),
+            "court_weights": [float(w) for w in cfg.court_weights],
             "reward_prior_kings": int(cfg.reward_prior_kings),
             "max_entries_per_settlement": int(cfg.max_entries_per_settlement),
             "max_judged_per_coldkey_per_settlement":
@@ -403,13 +408,30 @@ def expected_params(cfg) -> dict:
             # settlement budget and the minimum fresh share.
             "embargo_hours": float(cfg.embargo_hours),
             "max_windows_per_settlement": int(cfg.max_windows_per_settlement),
-            "min_fresh_window_share": float(cfg.min_fresh_window_share)}
+            "min_fresh_window_share": float(cfg.min_fresh_window_share),
+            # rev6.14 (a): the judging start j = T + eval_delay_hours.
+            "eval_delay_hours": float(cfg.eval_delay_hours)}
+
+
+def crown_bar_at(cfg, tenure: int) -> float:
+    """rev6.23: the crown bar at KING_D's ``tenure`` (lane D settlements it
+    has held the crown): ``d_margin_start`` at 0, linear to ``d_margin``
+    at ``d_margin_warmup_settlements``, flat after."""
+    w = int(cfg.d_margin_warmup_settlements)
+    t = max(0, int(tenure))
+    start, end = float(cfg.d_margin_start), float(cfg.d_margin)
+    if t >= w:
+        return end
+    return start - (start - end) * t / w
 
 
 def court_shares(cfg, n_slots: int) -> list[float]:
-    """§1.4 pay: slot ``i`` of an ``n_slots`` court is worth
-    ``share * king_decay**i / sum_j king_decay**j``."""
-    raw = [float(cfg.king_decay) ** i for i in range(n_slots)]
+    """§1.4 pay (rev6.23, owner 2026-11-24): slot ``i`` of an ``n_slots``
+    court is worth ``share * court_weights[i] / sum_{j < n_slots}
+    court_weights[j]`` (a short court renormalises over its slots; a slot
+    past ``court_weights`` weighs 0)."""
+    weights = [float(w) for w in cfg.court_weights]
+    raw = [weights[i] if i < len(weights) else 0.0 for i in range(n_slots)]
     total = sum(raw)
     return [float(cfg.share) * w / total for w in raw] if total > 0 else [0.0] * n_slots
 
@@ -425,14 +447,15 @@ def _by_label(x: np.ndarray, labels: list[str]) -> dict:
 
 
 def _judge(cfg, scores: dict, bar: str, members: list[str], clusters: list[str],
-           seed: str, pub: dict | None = None) -> list[dict]:
+           seed: str, pub: dict | None = None, *, crown_bar: float) -> list[dict]:
     """rev6.18 A3 (F4), re-derived here from the plan (never the producer's
     or the per-report audit's code; only the generic bootstrap primitives):
     per member ``{lcb, gain, cleared, halves, sources, domains}`` against
     ``bar``. Per window ``log clamp(s_bar / s_member, f, 1/f)`` (``f`` =
     ``window_ratio_floor``), live clusters = source, public clusters =
     ``<source>|<family>``, ``L = (1 − w) L_live + w L_pub``, one two-part
-    max-T bootstrap; a clear is ``LCB ≥ d_margin`` and every half's point
+    max-T bootstrap; a clear is ``LCB ≥ crown_bar`` (rev6.23: the bar at
+    KING_D's re-derived tenure, :func:`crown_bar_at`) and every half's point
     gain > 0. Values of the maps are ``(n, gain)``."""
     floor, w = float(cfg.window_ratio_floor), float(cfg.public_weight)
     xl = [clamped_log_ratios(*scores[bar], *scores[m], floor=floor) for m in members]
@@ -457,7 +480,7 @@ def _judge(cfg, scores: dict, bar: str, members: list[str], clusters: list[str],
             domains.update(_by_label(xp[j], list(pub["clusters"])))
             total += w * pv
         out.append({"lcb": float(lcb), "gain": log_gain(total),
-                    "cleared": bool(float(lcb) >= float(cfg.d_margin)
+                    "cleared": bool(float(lcb) >= float(crown_bar)
                                     and all(g > 0.0 for _, g in halves.values())),
                     "halves": halves, "sources": sources, "domains": domains})
     return out
@@ -747,6 +770,8 @@ class _Chain:
     entries: dict = field(default_factory=dict)
     # W5f: the open house challenger {digest, reveal_ts, status}, or None
     house_entry: dict | None = None
+    # rev6.23: KING_D's tenure at the next settlement (0 at genesis)
+    tenure: int = 0
 
 
 def _house_key(digest: str) -> str:
@@ -825,6 +850,11 @@ class _Settlement:
         self._guarded("boundary", self.check_top)
         self._guarded("params", lambda: _compare(self.d, "params", expected_params(self.cfg),
                                                  self.r.get("params")))
+        # rev6.23: the tenure is the chain's, the bar the config's at it.
+        self._guarded("crown_bar", lambda: _compare(
+            self.d, "crown_bar", {"tenure": self.chain.tenure,
+                                  "margin": crown_bar_at(self.cfg, self.chain.tenure)},
+            self.r.get("crown_bar")))
         self._guarded("rows_sha256", self.check_rows_sha)
         self._guarded("armed_evidence", self.check_armed)
         self._guarded("house", self.check_house)
@@ -837,6 +867,7 @@ class _Settlement:
         self._guarded("public", self.index_public)
         self._guarded("cohorts", self.check_cohorts)
         self._guarded("draw", self.check_draw)
+        self._guarded("skipped", self.check_judging_start_skips)
         self._guarded("gate", self.check_gate)
         self._guarded("verdicts", self.check_outcomes)
         self._guarded("king_after", self.check_crown)
@@ -1187,6 +1218,29 @@ class _Settlement:
         if set(self.windows) != window_union:
             self.d.add("windows")
 
+    def check_judging_start_skips(self) -> None:
+        """rev6.14 (a): a ``before_eval_delay`` skip names an entry whose
+        judging start max(T_E, T_K) + eval_delay_hours is after the signed
+        ``boundary_ts``; ``boundary_ts_missing`` appears only without it."""
+        r, d = self.r, self.d
+        bts = r.get("boundary_ts")
+        if "boundary_ts" in r and not _is_int(bts):
+            d.add("boundary_ts")
+            return
+        delay = 3600.0 * float(self.cfg.eval_delay_hours)
+        kt = int(self.king_before["reveal_ts"]) if self.king_before is not None else None
+        for i, sk in enumerate(r.get("skipped") or []):
+            if not isinstance(sk, dict):
+                continue
+            why = sk.get("reason")
+            if why == "boundary_ts_missing" and bts is not None:
+                d.add(f"skipped[{i}].reason")
+            elif why == "before_eval_delay":
+                e = self.entries.get(sk.get("digest"))
+                t = int(e[1]["reveal_ts"]) if e is not None else None
+                if bts is None or t is None or kt is None or bts >= max(t, kt) + delay:
+                    d.add(f"skipped[{i}].reason")
+
     def check_draw(self) -> None:
         """W5j: the draw record (present iff a cohort was drawn: a cohort and a
         boundary block hash) is bound to its block hash, the budget and the
@@ -1297,6 +1351,13 @@ class _Settlement:
         t_max = max([king_ts, *reveal.values()])
         if not _same(c.get("t_max"), t_max):
             d.add(f"{at}.t_max")
+        # rev6.14 (a): never frozen before the judging start j = t_max +
+        # eval_delay_hours, against the signed boundary timestamp.
+        bts = self.r.get("boundary_ts")
+        if not _is_int(bts):
+            d.add("boundary_ts")
+        elif bts < t_max + 3600.0 * float(cfg.eval_delay_hours):
+            d.add(f"{at}.frozen_before_eval_delay")
         wids = c["window_ids"]
         if not isinstance(wids, list) or not all(isinstance(w, str) for w in wids):
             d.add(f"{at}.window_ids")
@@ -1370,7 +1431,8 @@ class _Settlement:
                 self.pub is None or any(dg not in self.pub["scores"] for dg in [*bars, *members])):
             d.add("public")
             return len(wids) * (len(bars) + len(members))
-        judged = {bar: _judge(cfg, scores, bar, members, clusters, self.seed, self.pub)
+        judged = {bar: _judge(cfg, scores, bar, members, clusters, self.seed, self.pub,
+                              crown_bar=crown_bar_at(cfg, self.chain.tenure))
                   for bar in bars}
         for n, (m, key) in enumerate(zip(members, keys, strict=True)):
             j = by_digest[m]
@@ -1713,6 +1775,9 @@ class _Settlement:
             got = ({k: king.get(k) for k in self.king_after} if isinstance(king, dict)
                    and set(self.king_after) <= set(king) else king)
             _compare(d, "state.king", self.king_after, got)
+        if not _same(state.get("king_tenure"), self.chain.tenure + 1
+                     if self.crown_key is None else 1):
+            d.add("state.king_tenure")
         pk = state.get("prior_kings")
         got_pk = ([{k: p.get(k) for k in ("digest", "hotkey", "house", "reveal_ts")}
                    if isinstance(p, dict) else p for p in pk] if isinstance(pk, list) else pk)
@@ -1760,6 +1825,8 @@ class _Settlement:
         c.king = dict(self.king_after) if self.king_after is not None else c.king
         c.house = self.house["digest"] if self.house is not None else c.house
         c.prior_kings = [dict(k) for k in self.prior_kings]
+        # rev6.23: a crown (or a house retake) restarts KING_D's tenure.
+        c.tenure = 1 if self.crown_key is not None else self.chain.tenure + 1
         for dg in self.dropped_holds:
             c.holds.pop(dg, None)
             c.pending.pop(dg, None)
@@ -1927,4 +1994,4 @@ def replay_chain(reports, receipts, cfg, *, signer_ss58: str,
 
 __all__ = ["MATCH", "MISMATCH", "RECEIPT_SCHEMA", "REPORT_SCHEMA", "STATE_SCHEMA", "STATUSES",
            "UNVERIFIABLE", "UNVERIFIABLE_REASONS", "SettlementReplay", "check_gate_rows",
-           "court_shares", "expected_params", "gate_draw", "replay_chain"]
+           "court_shares", "crown_bar_at", "expected_params", "gate_draw", "replay_chain"]

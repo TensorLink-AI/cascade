@@ -186,48 +186,54 @@ index marks the king `takedown`.
 **Forward-only windows.** A window is eligible for entry E against king K
 only if every target point has **both** a data timestamp **and** a first-seen
 time (when our mirror first ingested it) after the wall time of
-max(T_E, T_K) plus `[lane_d] forward_margin_hours` (6 h). The feed's
+max(T_E, T_K) plus `[lane_d] forward_margin_hours` (0 h since rev6.14: data
+after your submission is fresh; the embargo rules add older data; the 6 h
+wait is the separate judging delay, `eval_delay_hours`). The feed's
 measured mirror lag must also be within `max_mirror_lag_hours`. A series
-without both timestamps is never eligible.
+without both timestamps is never eligible. Judging waits: nothing of an entry
+is drawn, frozen or judged before max(T_E, T_K) plus `eval_delay_hours`
+(6 h), measured against the boundary block's on-chain timestamp.
 
 The forward-only rule sets the expected latency, and latency depends on data
 frequency. Evidence accumulates over every daily `pool_d` snapshot since T
 and freezes at the first settlement that meets the floors, `min_windows`
 (1000) and `min_clusters` (20 sources). Five-minute and hourly feeds fill the
 floors in days; daily and slower series rarely reach a forward-only set at
-h = 64, so they mostly enter through the public half below.
-Expect about one extra day for the forward margin and then the mandatory
-confirmation duel (FAQ).
+h = 64. The 48 h embargo top-up (`embargo_hours`) fills the live half
+sooner: at least `min_fresh_window_share` (0.2) of the live windows are fresh,
+and the rest may be embargo windows. Judging starts no earlier than
+`eval_delay_hours` (6 h) after max(T_E, T_K), and the crown is decided at the
+first verdict (FAQ).
 
-**Verdict: 50% live, 50% public.** Two halves are scored with lane A's
-quantile head. The **live half** is the cohort's forward-only windows above
-(fresh plus the 48 h embargo top-up; fresh windows are always drawn first and
-included, and at least `[lane_d] min_fresh_window_share = 0.2` of the set is
-fresh, so a first verdict can land about 6 h after you commit). The **public half** is 10000 windows
-drawn each settlement from the block hash out of `Salesforce/GiftEvalPretrain`
-and the allowed `nju-zhangsq/RMISC` folders (5000 each, the same windows for
-the king, the house and every challenger). Per window the ratio of the king's
-CRPS/MASE geomean to yours is clamped to `[0.5, 2]`
-(`[lane_d] window_ratio_floor = 0.5`), so one window can at most halve or
-double its effect; its log is averaged over each half, and the combined score
-is `(1 − w)·live + w·public` with `[lane_d] public_weight = 0.5`. One paired
-cluster bootstrap (clusters: source for live windows, dataset family for
-public ones, resampled within each half) gives a max-T LCB over the cohort.
-You clear only if **all three** hold: the combined `LCB ≥ d_margin`
-(`d_margin = 0.01`, at `alpha = 0.05`), your point gain on the live half is
-positive, and your point gain on the public half is positive: you must
-improve on public pretrain data as well as on live data. The report shows
-your gain per half, per source (live, GiftEvalPretrain, RMISC) and per domain.
-Several entries freezing in one settlement form a cohort judged with max-T
-on their shared window set. When a miner
+**Live half and public half.** Half of the score is the live forward windows
+above. The other half is public: 5000 windows each from
+`Salesforce/GiftEvalPretrain` and `nju-zhangsq/RMISC` per settlement, drawn by
+the settlement block hash from the whole dataset (multivariate sets are scored
+as `(C, L)` panels). Each window's score ratio is clamped to [0.5, 2]
+(`window_ratio_floor` = 0.5) and log-averaged into L_live and L_public, and the combined score is
+`L = (1 − public_weight) · L_live + public_weight · L_public` with
+`public_weight` = 0.5. A challenger must also gain on each half on its own.
+
+**Verdict.** A two-part paired cluster bootstrap of the combined score L
+(live clusters = source, public clusters = source and family) with lane A's
+quantile head scoring. The challenger clears if the LCB on the 1 − exp(−L)
+scale is `≥` the crown bar in force at the settlement (at `alpha = 0.05`),
+and both the live and the public point gains are strictly positive. The bar decays with the
+current KING_D's tenure (the lane D settlements it has held the crown, the
+house included): `d_margin_start` (0.03) at tenure 0, falling linearly to
+`d_margin` (0.01) over `d_margin_warmup_settlements` (32 settlements, about
+4 days at 3 h each), flat after. A new crown restarts it. The signed report
+records the tenure and the bar applied (`crown_bar`) and your gain per half, per
+source (live, GiftEvalPretrain, RMISC) and per domain. Several entries freezing in one settlement
+form a cohort judged with max-T on their shared window set. When a miner
 holds KING_D, each member must also clear the current house on the same set.
 An entry is
 judged once; a loser is never re-judged on new windows.
 
-**Confirmation.** A candidate that clears must clear again on the next
-disjoint eligible window set before it is crowned (`confirm_pending` in
-between). If the king changes in between, `confirm_on_king_change =
-"restart"` restarts the duel against the new king.
+**Crowned at the first verdict.** There is no confirmation stage. An entry
+that clears the bar, the gate and (when a miner holds KING_D) the house is
+crowned at that settlement's verdict. A clear held only by a bench outage
+is `bench_hold` and is decided when the sweep runs.
 
 ## The house, the gate, the sentinel
 
@@ -245,9 +251,9 @@ satisfy `LCB ≥ -tau_public` (`tau_public = 0.01`) against both KING_D and the
 house, run paired on one host in one sweep. A loss is `gate_regression`; a
 sweep that errors, returns partial results or NaN is the miner's
 `checkpoint_fault`; a bench host outage holds the crowning (`bench_hold`)
-for at most `max_bench_holds` settlements. (There is no separate
-low-frequency check any more: the public half covers slow cadences.) Public
-gate suites never pay and are never targets.
+for at most `max_bench_holds` settlements. There is no separate
+low-frequency check: the public half covers slow-cadence series. Public
+bench suites never pay and are never targets.
 
 **The sentinel** is the cross-lane rotating held-out suite: each era one suite
 is held out for every lane and never gates. It is swept for each new KING_D
@@ -256,13 +262,17 @@ and only published, so the board shows whether lane D generalises.
 ## Pay and the court
 
 KING_D is paid from lane D's `share` of emissions. The court is KING_D plus
-up to `reward_prior_kings` (2) prior **miner** kings, decayed by
-`king_decay` (0.5) inside lane D's share. Unpaid share (a house king, an
+up to `reward_prior_kings` (2) prior **miner** kings, paid by the explicit
+`court_weights` `[0.80, 0.15, 0.05]` inside lane D's share: 80% to KING_D,
+15% to the newest prior king, 5% to the next. A court with fewer slots splits
+over the slots it has (KING_D alone takes all of it; KING_D plus one prior
+king take 0.80/0.95 and 0.15/0.95). Prior kings keep being paid with no time
+limit. Unpaid share (a house king, an
 empty or deregistered slot) burns; the remainder destination is release-only
 (`remainder = "burn"`). The shipped default is `share = 0.0` and
 `takes_from = "lane_b"`; the activation overlay sets the live split. Check
-signed reports and on-chain weights for payment: queue state, a first clear
-or `confirm_pending` are not paid wins.
+signed reports and on-chain weights for payment: queue state or a held
+(`bench_hold`) clear is not a paid win.
 
 Every settlement the main validator signs a `lane-d-report/1` report (see
 [VALIDATOR.md](VALIDATOR.md#lane-d-what-satellites-verify)); satellites
@@ -319,17 +329,22 @@ with one typed reason, and the queue shows it:
 - `context_below_armed`: the declared context is in `contexts`, but no armed
   variant is at or below it this settlement. The entry stays `pending` and is
   never run above its declaration.
+- `before_eval_delay`: the settlement's boundary (its on-chain timestamp) is
+  before the entry's judging start, max(T_E, T_K) plus `eval_delay_hours`
+  (6 h). The entry stays `pending`; nothing of it is drawn, frozen or judged.
+- `boundary_ts_missing`: the validator had no on-chain timestamp for the
+  boundary, so nothing was frozen or judged this settlement (fail closed).
 - `checkpoint_fault`: the checkpoint failed ingest, scoring or its gate sweep.
 - `mirror_lag_exceeded`: the feeds behind the entry's windows lag too much.
 - `lane_closed`: the kill switch `until_block` was reached: nothing is
   judged and every open entry closes.
 
-**When will I be crowned?** Not at the first clear. The confirmation duel
-means a candidate that clears waits for the next disjoint eligible window set
-(the next freeze of new forward windows) and must clear again: about 1–4
-days more depending on data frequency, at the earliest a later settlement.
-Until then its status is `confirm_pending`. A king change in between restarts
-the duel under the default rule.
+**When will I be crowned?** At the first verdict that clears. There is no
+confirmation duel and no second clear: the settlement that first freezes
+enough eligible windows for your entry decides it, so the latency is the time
+your data frequency needs to fill the floors, not a later settlement on top.
+A bench outage can hold the decision (`bench_hold`) for up to
+`max_bench_holds` settlements.
 
 **What are the two clocks?** Each target point has a data time (the
 timestamp the feed gives it) and a first-seen time (when our mirror first

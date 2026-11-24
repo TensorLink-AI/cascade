@@ -11,6 +11,10 @@ cascade/audit/lane_d.py
 # signed report and the W7c receipt record, without the producer's lane D
 # emission functions.
 cascade/audit/checks.py
+# rev6.18 B5/B7 (F5): check_lane_d checks report.host against the
+# scoring environment list at the boundary (host_problem; audit/lane_d.py
+# is listed above).
+cascade/shared/config/lane_d.py
 # rev6.18 B1/B3: the lane D refusal codes (REFUSAL_CODES, lane_d_findings),
 # lane D's burn scoped to its share (derive_weights, lane_d_pay, the lane_d
 # tier-0 row) and the audit's fetch of the lane D record (audit_receipt).
@@ -19,3 +23,6 @@ cascade/audit/main.py
 # the generic two-part statistic both share.
 cascade/audit/lane_d_chain.py
 cascade/eval/bootstrap.py
+# rev6.22: the slot-row tests drive the every-slot judge and its verdict rows.
+cascade/eval/expert_lane.py
+cascade/validator/expert_lane.py

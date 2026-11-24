@@ -124,6 +124,11 @@ AREAS = {
     # Lane D loop evidence (rv*.md review notes, s0b_notes.json, w*.json):
     # records read by people and the loop tools, never by a service — no restart.
     "evidence": (r"^evidence/",),
+    # Lane D public-source inputs (rev6.18 A5, F3: data/lane_d/rmisc_allowed.toml):
+    # read by the owner-run mirror/index tools only. Validators bind the
+    # resulting index by its hash in the signed report, never this file — no
+    # service restart.
+    "lane_d_data": (r"^data/lane_d/",),
 }
 SERVICES = ("trainer", "validator", "intake-laned", "eval-host")
 # Services that serve or depend on the validator's scoring: no restart while a

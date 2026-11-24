@@ -93,3 +93,6 @@ share would hold verdicts ~24 h. The default (loader, both shipped files) is
 **0.2**; fresh windows are still drawn first and always included. The tests
 that pinned the 0.5 default now pin 0.2. Lane D is not rolled out, so there is
 no activation key.
+## rev6.14 (a): judging start vs eligibility boundary (owner 2026-11-23)
+
+New key `eval_delay_hours` (default 6.0, >= 0, parsed, mutation- and round-trip-tested, shipped in both tables); `forward_margin_hours` defaults to 0.0 (6 -> 0) and the shipped tables state 0.0; the loader refuses `forward_margin_hours > eval_delay_hours` (b <= j). Tests: `test_w2e_forward_margin_hours_defaults_to_0`, `test_w2e_forward_margin_above_eval_delay_is_refused` and the table rows.

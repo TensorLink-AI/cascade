@@ -52,11 +52,14 @@ and DEC-CA-0063), where public-benchmark gaming pressure cannot crown a king.
 A suite target wins when, against the current king on that suite's items
 (GIFT has 97 configs), all three of these hold:
 
-- **CRPS improves significantly.** The per-item paired bootstrap of the
+- ~~**CRPS improves significantly.** The per-item paired bootstrap of the
   geomean ratio (`paired_geomean_lcb`) gives `LCB_α ≥ gain_margin_public`,
-  default 0.01.
-- **MASE does not regress.** On the same suite, `LCB_α(MASE) ≥ −tau_public`.
-  A leg cannot buy probabilistic accuracy with point accuracy.
+  default 0.01.~~ **Superseded by Amendment rev6.19 (owner 2026-11-24):
+  CRPS OR MASE improves significantly.**
+- ~~**MASE does not regress.** On the same suite, `LCB_α(MASE) ≥ −tau_public`.
+  A leg cannot buy probabilistic accuracy with point accuracy.~~
+  **Superseded by Amendment rev6.19: the metric that did not improve does
+  not regress.**
 - **There is enough evidence.** The point gain is strictly positive and the
   suite has at least `min_public_items` items. Otherwise the result is
   `inconclusive`, never a merge.
@@ -293,3 +296,39 @@ Copied from plan §17.4 (rows D35–D42 and D42b).
 | D41 | decided | (a) `open_tokens` + a passing lane A king check | S | owner (default), 2026-11-21 |
 | D42 | decided | Cheaper GPUs via `[lane_b] funded_pod_skus`; miner-chosen leg ≤ 6 h | S | owner, 2026-11-21 |
 | D42b | decided | (a) real hours on the chosen GPU | S | owner, 2026-11-21 |
+
+## Amendment rev6.19 (accepted, owner 2026-11-24)
+
+Owner decision (2026-11-24, plan rev6.19): the
+suite-target gain test becomes "improve EITHER CRPS OR MASE by ≥ 1% on the
+targeted public suite". It replaces the §2 bullets "CRPS improves
+significantly" and "MASE does not regress" (struck above). The full text is
+plan `docs/plans/LANE_D_PLAN.md` rev6.19 (G); the §17.4 register is the
+authority if the two ever differ.
+
+A suite target wins when, on the whole suite against the current king:
+
+- **Either metric clears.** CRPS `LCB_{α/2} ≥ gain_margin_public` OR MASE
+  `LCB_{α/2} ≥ gain_margin_public` (default 0.01), with a strictly positive
+  point gain on a metric that cleared. A leg declaring k targets tests each
+  metric at α/(2k).
+- **The other metric does not regress.** The metric that did not clear
+  needs `LCB_α ≥ −tau_public`, the existing non-inferiority bound, at the
+  guard level (intersection-union, no correction). This is the
+  conservative reading of the owner's rule: a leg still cannot buy one
+  metric with the other.
+- **Enough evidence,** unchanged: at least `min_public_items` items, else
+  `inconclusive`.
+
+**Multiple testing.** Bonferroni α/2 per metric, composed with the
+existing Bonferroni α/k across a leg's targets (`judge_expert_targets`).
+Lane B has no joint max-T across metrics, so Bonferroni is the choice
+consistent with the code.
+
+**Unchanged.** Every §3 guard (other suites, every pool domain, every
+horizon, whole-pool point gain ≥ 0, the fixed anchor king), §4 pay and §5
+capacity. Domain and horizon targets keep their single-statistic gain test.
+
+**Recorded on the verdict:** which metric cleared (`cleared_metric`), both
+gain LCBs (`crps_lcb`, `mase_lcb`), both point gains, the non-cleared
+metric's non-inferiority LCB, and the gain level α/(2k).

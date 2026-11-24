@@ -774,9 +774,15 @@ def _mkt_corpus(runner, role: str, finetune_recipe, corpus: dict) -> dict:
     as its ``corpus_files``; every other leg's corpus unchanged."""
     if role != "mkt_finetune" or not finetune_recipe or corpus:
         return corpus
-    from .marketcast_runner import mkt_relay_corpus
+    from .marketcast_runner import leg_mc, mkt_relay_corpus
 
-    return mkt_relay_corpus(runner.cfg, finetune_recipe)
+    # W-CMP2: the leg's own competition table (a spec instance's pool)
+    blk = None
+    try:
+        blk = int(runner.client.current_block()) if getattr(runner, "client", None) else None
+    except Exception:  # noqa: BLE001 — the latest snapshot then
+        blk = None
+    return mkt_relay_corpus(runner.cfg, finetune_recipe, mc=leg_mc(runner), block=blk)
 
 
 def _shards_leg(contract, corpus: dict) -> bool:

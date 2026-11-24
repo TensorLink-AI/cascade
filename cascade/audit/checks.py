@@ -484,6 +484,82 @@ def check_numerics_contract(receipt: RoundReceipt, cfg: ChainConfig,
                      + notes)
 
 
+def _receipt_epoch_image(receipt: RoundReceipt, cfg: ChainConfig):
+    """``(in_force, seed_epoch_start_block, image, entries)`` of a receipt
+    under the W-IMG rule (:func:`cascade.shared.era.image_epoch_rule_at`),
+    read from the embedded signed manifest alone."""
+    from ..shared.config import image_digest
+    from ..shared.era import EraSpec, image_epoch_rule_at, seed_epoch_start_block
+    from ..shared.manifest import contract_payload
+
+    man = receipt.manifest or {}
+    try:
+        era = EraSpec.from_json(man.get("era")) if man.get("era") is not None else None
+    except ValueError:
+        era = None
+    boundary = int(receipt.epoch_start_block)
+    if era is None or not image_epoch_rule_at(cfg, boundary, era):
+        return False, 0, "", []
+    body = man.get("contract_body")
+    source = body if isinstance(body, dict) else receipt_training(receipt, cfg)
+    image = image_digest(str(contract_payload(source).get("train_image_digest", "") or ""))
+    entries = [e for e in (man.get("entries") or []) if isinstance(e, dict)]
+    return True, seed_epoch_start_block(cfg.round, era), image, entries
+
+
+def check_image_epoch(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
+    """W-IMG (plan rev6.24 (e), owner 2026-11-24), replayed per receipt: from
+    the seed epoch ``[v2] image_epoch_from_block`` admits, every entry of the
+    settlement ran the ONE image its declared contract names (no fixed pin;
+    the image stays inside each leg's ``training_contract_digest``, which
+    ``numerics-contract`` re-derives). Joined to the Tier-0 run only when
+    the rule is configured, so every other receipt's output is unchanged.
+    Cross-settlement continuity is :func:`check_image_epoch_chain`."""
+    from ..shared.config import image_digest
+
+    name = "image-epoch"
+    in_force, epoch, image, entries = _receipt_epoch_image(receipt, cfg)
+    if not in_force:
+        return _ok(name, "one-image-per-seed-epoch rule not in force for this settlement")
+    if receipt.status == "rejected" and not receipt.manifest:
+        return _ok(name, "rejected round without a manifest body")
+    if not image:
+        return _fail(name, "the settlement's contract names no train_image_digest")
+    for e in entries:
+        got = image_digest(str(e.get("train_image_digest", "") or ""))
+        if got != image:
+            return _fail(name, f"{e.get('role')} uid{e.get('miner_uid')} ran image "
+                               f"{(got or '<none>')[:19]}…, the seed epoch's is {image[:19]}…")
+    return _ok(name, f"every entry of seed epoch @{epoch} ran image {image[:19]}… "
+                     f"({len(entries)} entr{'y' if len(entries) == 1 else 'ies'})")
+
+
+def check_image_epoch_chain(receipts, cfg: ChainConfig) -> CheckResult:
+    """W-IMG across settlements (``receipts`` in chain order): the image of a
+    seed epoch never changes inside it — every accepted receipt of one seed
+    epoch (keyed statelessly by its era stamp's seed block) declares the same
+    image; a new image appears only with a new seed epoch."""
+    name = "image-epoch-chain"
+    seen: dict[int, tuple[str, str]] = {}
+    n = 0
+    for rc in receipts:
+        if getattr(rc, "status", "") == "rejected":
+            continue
+        in_force, epoch, image, _ = _receipt_epoch_image(rc, cfg)
+        if not in_force or not image:
+            continue
+        n += 1
+        prev = seen.get(epoch)
+        if prev is not None and prev[0] != image:
+            return _fail(name, f"seed epoch @{epoch} ran image {prev[0][:19]}… at round "
+                               f"{prev[1]} but {image[:19]}… at round "
+                               f"{getattr(rc, 'round_id', '?')} (image changed mid-epoch)")
+        seen.setdefault(epoch, (image, str(getattr(rc, "round_id", "?"))))
+    if not n:
+        return _ok(name, "no settlement under the one-image-per-seed-epoch rule")
+    return _ok(name, f"{n} settlement(s) over {len(seen)} seed epoch(s), one image each")
+
+
 def check_era(receipt: RoundReceipt, cfg: ChainConfig, client: object | None = None) -> CheckResult:
     """DEC-CA-0043 era envelope, replayed under the receipt's own block.
 
@@ -2381,7 +2457,7 @@ def check_king_check(receipt: RoundReceipt, cfg: ChainConfig,
 
 
 def _paid_full_pay_why(w: dict, tiers, *, at_win: bool, ttl: int,
-                       state_entry: list | None) -> str | None:
+                       state_entry: list | None, mismatch=None) -> str | None:
     """Why a payout record's win carries a forged / inconsistent gain-tiered
     full-pay period (owner 2026-10-20), else None. Every paid win carries
     ``gain_lcb`` / ``tier`` / ``full_eras`` / ``below_floor``; ``full_eras``
@@ -2404,7 +2480,9 @@ def _paid_full_pay_why(w: dict, tiers, *, at_win: bool, ttl: int,
     if lcb is None or not math.isfinite(float(lcb)):
         return f"gain_lcb {lcb!r} is not finite"
     if at_win:
-        why = full_pay_mismatch(w, tiers)
+        # ``mismatch`` (DEC-CA-0073, lane C): the gain-scaled duration's
+        # re-derivation, in place of the gain-tiered one
+        why = mismatch(w) if mismatch is not None else full_pay_mismatch(w, tiers)
         if why:
             return f"full-pay tier forged: {why}"
     elif bool(w.get("below_floor")) != (float(lcb) < float(w.get("tier") or 0.0)):
@@ -2421,14 +2499,17 @@ def _paid_full_pay_why(w: dict, tiers, *, at_win: bool, ttl: int,
 def _lane_b_paid_wins(receipt: RoundReceipt, cfg: ChainConfig,
                       n_uids: int) -> tuple[list, str | None]:
     """The receipt's ``lane_b_pay`` wins re-derived from ``[lane_b]``:
-    ``(wins, None)``, or ``([], why)`` on the first inconsistency (decay clock,
-    era length, unknown/duplicate domain, out-of-range uid, age, expiry,
-    multiplier)."""
+    ``(wins, None)``, or ``([], why)`` on the first inconsistency (payout
+    clock, era length, unknown/duplicate slot, out-of-range uid, age,
+    ``since_era``, multiplier, the holder against ``state_post``).
+
+    One rule (LANE_D_PLAN rev6.22, owner 2026-11-24): a held slot pays its
+    full slot share — multiplier 1.0, no decay, no TTL — until replaced."""
     import math
 
-    from ..eval.expert_lane import LaneBWin, reward_multiplier
+    from ..eval.expert_lane import LaneBWin
     from ..shared.era import era_length_blocks
-    from ..shared.lane_b import lane_b_slots, win_expired
+    from ..shared.lane_b import lane_b_slots, since_era
 
     lb = cfg.lane_b
     # DEC-CA-0059: one slot per lane-B target (domains + horizon targets)
@@ -2438,7 +2519,7 @@ def _lane_b_paid_wins(receipt: RoundReceipt, cfg: ChainConfig,
     post = post if isinstance(post, dict) and "lane_b" in post else None
     block = int(pay.get("block", -1))
     if block != int(receipt.epoch_start_block):
-        return [], (f"lane-B decay clock at block {block}, but the settlement "
+        return [], (f"lane-B payout clock at block {block}, but the settlement "
                     f"is {receipt.epoch_start_block}")
     eb = int(era_length_blocks(cfg.round, block))
     if int(pay.get("era_blocks", -1)) != eb:
@@ -2461,25 +2542,30 @@ def _lane_b_paid_wins(receipt: RoundReceipt, cfg: ChainConfig,
         seen.add(d)
         if not 0 <= uid < n_uids:
             return [], f"lane-B payout to out-of-range uid {uid}"
-        age = max(0, (block - int(w.get("merge_block", 0))) // eb)
+        mb = int(w.get("merge_block", -1))
+        if not 0 <= mb <= block:
+            return [], f"domain {d}: merge block {mb} is not at or before the settlement"
+        age = max(0, (block - mb) // eb)
         if int(w.get("age", -1)) != age:
             return [], (f"domain {d}: recorded age {w.get('age')} != {age} "
-                        f"eras since block {w.get('merge_block')}")
-        if win_expired(age, lb):
-            return [], (f"domain {d}: win paid at age {age} eras, past "
-                        f"win_ttl_eras={lb.win_ttl_eras}")
-        why = _paid_full_pay_why(
-            w, lb.full_pay_tiers, at_win=int(w.get("merge_block", -1)) == block,
-            ttl=int(lb.win_ttl_eras),
-            state_entry=None if post is None else (post.get("lane_b") or {}).get(d))
-        if why:
-            return [], f"domain {d}: {why}"
-        mult = reward_multiplier(age, full_eras=int(w["full_eras"]),
-                                 half_life_rounds=lb.half_life_rounds, floor=lb.floor)
-        if not math.isclose(float(w.get("multiplier", -1.0)), mult, rel_tol=1e-12,
-                            abs_tol=1e-15):
-            return [], f"domain {d}: multiplier {w.get('multiplier')} != {mult} at age {age}"
-        wins.append(LaneBWin(uid=uid, domain=d, multiplier=mult))
+                        f"eras since block {mb}")
+        want_era = since_era(mb, era_blocks=eb, round_cfg=cfg.round)
+        got_era = w.get("since_era")
+        if isinstance(got_era, bool) or got_era != want_era:
+            return [], (f"domain {d}: since_era {got_era!r} != {want_era} (the era of "
+                        f"merge block {mb})")
+        if isinstance(w.get("multiplier"), bool) or w.get("multiplier") != 1.0:
+            return [], (f"domain {d}: multiplier {w.get('multiplier')!r} != 1.0 (a held "
+                        "slot pays in full, rev6.22)")
+        lcb = w.get("gain_lcb")
+        if isinstance(lcb, bool) or not isinstance(lcb, (int, float)) or not math.isfinite(lcb):
+            return [], f"domain {d}: gain_lcb {lcb!r} is not finite"
+        entry = None if post is None else (post.get("lane_b") or {}).get(d)
+        if post is not None and (not entry or [entry[0], int(entry[2])]
+                                 != [w.get("hotkey"), mb]):
+            return [], (f"domain {d}: paid holder {w.get('hotkey')!r}@{mb} is not the "
+                        f"settlement state's {entry[:3] if entry else None}")
+        wins.append(LaneBWin(uid=uid, domain=d, multiplier=1.0))
     return wins, None
 
 
@@ -2490,7 +2576,7 @@ def _lane_c_paid_wins(receipt: RoundReceipt, cfg: ChainConfig,
     inconsistency (lane C not active, payout clock, era length, share / slot
     count, unknown / duplicate target, uid range, age, expiry, multiplier)."""
     from ..shared.era import era_length_blocks
-    from ..shared.lane_c import LaneCWin, full_pay_tiers_for, target_multiplier, win_expired
+    from ..shared.lane_c import LaneCWin, full_pay_record_mismatch
 
     lc = cfg.lane_c
     pay = receipt.lane_c_pay or {}
@@ -2540,14 +2626,26 @@ def _lane_c_paid_wins(receipt: RoundReceipt, cfg: ChainConfig,
         if int(w.get("age", -1)) != age:
             return [], (f"target {t}: recorded age {w.get('age')} != {age} eras since block "
                         f"{w.get('win_block')}")
-        if win_expired(age, lc):
-            return [], f"target {t}: win paid at age {age} eras, past win_ttl_eras={lc.win_ttl_eras}"
+        # DEC-CA-0073: full pay for the win's recorded gain-scaled duration
+        # (re-derived at the win), then the slot ends — no decay, no TTL
+        mc_ = getattr(cfg, "marketcast", None)
         why = _paid_full_pay_why(
-            w, full_pay_tiers_for(t, lc, getattr(cfg, "marketcast", None)),
-            at_win=int(w.get("win_block", -1)) == block, ttl=int(lc.win_ttl_eras),
-            state_entry=None if post is None else (post or {}).get(t))
+            w, None, at_win=int(w.get("win_block", -1)) == block, ttl=0,
+            state_entry=None if post is None else (post or {}).get(t),
+            mismatch=lambda r, t=t, mc_=mc_: full_pay_record_mismatch(r, t, lc, mc_,
+                                                                       era_blocks=eb))
         if why:
             return [], f"target {t}: {why}"
+        # DEC-CA-0075: on the win's recorded pay curve (legacy fixed_term:
+        # exactly the DEC-CA-0073 rule)
+        from ..shared.rules_menu import curve_expired, curve_multiplier
+
+        curve = str(w.get("curve", "") or "") or "fixed_term"
+        held_w = SimpleNamespace(full_eras=int(w["full_eras"]), curve=curve)
+        if curve_expired(curve, age, full_eras=int(w["full_eras"]),
+                         ttl_eras=int(getattr(lc, "decay_ttl_eras", 0) or 0)):
+            return [], (f"target {t}: win paid at age {age} eras, past its full-pay duration "
+                        f"({w['full_eras']} eras) on its {curve} curve — the slot has ended")
         if bool(w.get("wind_down", False)) != (t in winding):
             return [], (f"target {t}: wind_down flag {w.get('wind_down')} but its competition "
                         f"is {'' if t in winding else 'not '}winding down at {block}")
@@ -2561,7 +2659,10 @@ def _lane_c_paid_wins(receipt: RoundReceipt, cfg: ChainConfig,
                             f"period ({w.get('full_eras')} eras) or the wind-down window")
             mult = 1.0
         else:
-            mult = target_multiplier(age, lc, int(w["full_eras"]))
+            mult = curve_multiplier(curve, age, full_eras=held_w.full_eras,
+                                    half_life_rounds=float(getattr(lc, "decay_half_life_eras",
+                                                                   1.0)),
+                                    floor=float(getattr(lc, "decay_floor", 0.1)))
         if not math.isclose(float(w.get("multiplier", -1.0)), mult, rel_tol=1e-12,
                             abs_tol=1e-15):
             return [], f"target {t}: multiplier {w.get('multiplier')} != {mult} at age {age}"
@@ -2854,7 +2955,7 @@ def _lane_vector_want(receipt: RoundReceipt, cfg: ChainConfig, got_pol,
             scale = (pool_a - share_d) / pool_a
             a = [x * scale for x in a]
         d = _lane_d_part(n_uids, share=share_d, court=d_court,
-                         king_decay=float(cfg.lane_d.king_decay), burn_uid=burn)
+                         court_weights=cfg.lane_d.court_weights, burn_uid=burn)
         b = [x + y for x, y in zip(b, d, strict=True)]
     kept_apart = pay is not None or c_pay is not None or d_court is not None
     want = emission_vector(a, b if kept_apart else None, got_pol,
@@ -2904,21 +3005,26 @@ def _lane_d_carve(cfg: ChainConfig, b_cfg, c_cfg) -> tuple[float, str | None]:
                  f"not re-derived by the audit")
 
 
-def _lane_d_part(n_uids: int, *, share: float, court: list, king_decay: float,
+def _lane_d_part(n_uids: int, *, share: float, court: list, court_weights,
                  burn_uid: int) -> list[float]:
     """Lane D's part, summing to ``share``: slot ``i`` of ``court`` (uids,
-    king first) is worth ``king_decay ** i`` normalised over the slots; a
-    null, non-integer, out-of-range or repeated uid burns to ``burn_uid``;
-    an empty court burns the whole share."""
+    king first) is worth ``court_weights[i]`` (rev6.23: ``[lane_d]
+    court_weights``, 0.80 / 0.15 / 0.05) normalised over the slots the court
+    has; a null, non-integer, out-of-range or repeated uid burns to
+    ``burn_uid``; an empty court (or one whose slots weigh 0) burns the
+    whole share; a slot past ``court_weights`` weighs 0."""
     out = [0.0] * n_uids
     s = float(share)
     if s == 0.0:
         return out
-    if not court:
+    weights = [float(w) for w in court_weights]
+    # A slot past court_weights (a court longer than 1 + reward_prior_kings,
+    # refused by check_lane_d's ld_court) weighs 0: it is never paid.
+    raw = [weights[i] if i < len(weights) else 0.0 for i in range(len(court))]
+    total = sum(raw)
+    if not court or total <= 0.0:
         out[burn_uid] += s
         return out
-    raw = [float(king_decay) ** i for i in range(len(court))]
-    total = sum(raw)
     seen: set[int] = set()
     for uid, w in zip(court, raw, strict=True):
         amt = s * w / total
@@ -3167,12 +3273,12 @@ def _check_lane_b_weights(name: str, receipt: RoundReceipt, cfg: ChainConfig,
     """DEC-CA-0050 weight check, selected by ``cfg.lane_b.active(block)``.
 
     With the receipt's ``lane_b_pay`` record (every vector a lane-B validator
-    sets) the vector is REBUILT exactly: the decay clock is this settlement's
-    block, each paid win's age (in ERAS of the grid in force) and multiplier
-    re-derive from ``[lane_b]``, no win at or past ``win_ttl_eras`` is paid,
-    each domain slot pays ``share / n_domains × multiplier``
-    (never more), and the unpaid lane-B share goes to ``burn_uid`` (or back to
-    lane A under ``remainder = "lane_a"``). Without the record (a validator
+    sets) the vector is REBUILT exactly: the payout clock is this
+    settlement's block, each paid win's age and ``since_era`` (in ERAS of the
+    grid in force) re-derive, each held slot pays ``share / n_slots`` in full
+    (rev6.22: no decay, no TTL), and the unpaid lane-B share (empty slots)
+    goes to ``burn_uid`` (or back to lane A under ``remainder = "lane_a"``).
+    Without the record (a validator
     whose push fell back to the legacy vector, e.g. ``force_burn``) only the
     decomposition is checked: every lane-A recipient holds at least
     ``(1 − share) ×`` its court share and no non-burn uid draws more lane-B
@@ -3228,6 +3334,88 @@ def _check_lane_b_weights(name: str, receipt: RoundReceipt, cfg: ChainConfig,
 LANE_B_STAGES = ("stale", "selection", "merge", "verdict", "targets")
 
 
+def _lane_b_slot_row_verdict(r: dict, lb, slots: tuple[str, ...]) -> str | None:
+    """Why one rev6.22 every-slot row (it carries ``gain_bar``) contradicts
+    ``[lane_b]``, else None: the bar is ``gain_margin`` for a declared slot
+    and ``undeclared_gain_margin`` otherwise; the family level is ``alpha``;
+    an inconclusive row (floors, or a suite without items) never passes; a
+    conclusive row passes iff some metric's family LCB clears the bar with a
+    positive point gain, the other metric's marginal LCB is non-inferior and
+    every guard holds."""
+    import math
+
+    d = str(r.get("domain"))
+    declared = list(r.get("targets") or [])
+    if bool(r.get("declared")) != (d in declared):
+        return f"{d}: declared={r.get('declared')!r} but the leg declares {declared}"
+    if r.get("family") != ("declared" if d in declared else "undeclared"):
+        return f"{d}: test family {r.get('family')!r} does not match its declaration"
+    want_bar = lb.gain_margin if d in declared else lb.undeclared_gain_margin
+    if not math.isclose(float(r.get("gain_bar") or -1.0), want_bar, rel_tol=1e-12):
+        return f"{d}: bar {r.get('gain_bar')} != {want_bar} ({'declared' if d in declared else 'undeclared'})"
+    if not math.isclose(float(r.get("alpha") or -1.0), lb.alpha, rel_tol=1e-12):
+        return f"{d}: family level {r.get('alpha')} != alpha {lb.alpha} (each max-T family)"
+    inc = str(r.get("inconclusive") or "")
+    guards = r.get("guard_lcbs") or {}
+    pubs = r.get("public_lcbs") or {}
+    if inc:
+        if r.get("passed") or r.get("gain_metric"):
+            return f"{d}: inconclusive ({inc}) row passed"
+        return None
+    suite = d.startswith("suite:")
+    if not suite:
+        n, cl = int(r.get("target_n") or 0), int(r.get("target_clusters") or 0)
+        if n < lb.min_target_windows or cl < lb.min_target_clusters:
+            return f"{d}: {n} windows / {cl} clusters is inconclusive, row says conclusive"
+    elif int(r.get("target_n") or 0) < lb.min_public_items:
+        return f"{d}: {r.get('target_n')} items is inconclusive, row says conclusive"
+    lcbs, gains, nis = (r.get(k) or {} for k in ("metric_lcbs", "metric_gains", "metric_ni_lcbs"))
+    metrics = ("crps", "mase")
+    if any(m not in lcbs or lcbs[m] is None or gains.get(m) is None or nis.get(m) is None
+           for m in metrics):
+        return f"{d}: a conclusive row lacks its CRPS/MASE LCBs, gains or non-inferiority LCBs"
+    tau = lb.tau_public if suite else lb.tau_domain
+    cleared = [m for m in metrics if float(lcbs[m]) >= want_bar and float(gains[m]) > 0.0
+               and all(float(nis[o]) >= -tau for o in metrics if o != m)]
+    guards_ok = (all(float(v) >= -lb.tau_domain for v in guards.values())
+                 and all(float(v) >= -lb.tau_public for v in pubs.values()))
+    if bool(r.get("guard_reason")) == guards_ok:
+        return f"{d}: guard_reason {r.get('guard_reason')!r} contradicts the guard LCBs"
+    want = bool(cleared) and guards_ok
+    sgd = r.get("suite_guards")
+    if suite and want:
+        # WB26 (DEC-CA-0071 §3 guards 4-5): a suite slot that clears is
+        # claimable only if guard 4 and the anchor guard hold
+        if not isinstance(sgd, dict) or "pool_gain" not in sgd:
+            return f"{d}: a cleared suite slot carries no suite_guards (guard 4 / anchor guard)"
+        want = _lane_b_suite_guards_ok(sgd, lb, guards, pubs)
+    elif sgd:
+        return f"{d}: suite_guards on a row that is not a cleared, guarded suite slot"
+    if bool(r.get("passed")) != want:
+        return (f"{d}: passed={r.get('passed')} but the re-derived slot verdict is {want} "
+                f"(LCBs {lcbs} vs bar {want_bar}, guards ok {guards_ok})")
+    if want and (r.get("gain_metric") not in cleared
+                 or float(r.get("target_lcb")) != float(lcbs[r.get("gain_metric")])):
+        return f"{d}: gain_metric {r.get('gain_metric')!r} / target_lcb do not match {cleared}"
+    return None
+
+
+def _lane_b_suite_guards_ok(sgd: dict, lb, guards: dict, pubs: dict) -> bool:
+    """WB26 (DEC-CA-0071 §3 guards 4-5) from a suite slot's ``suite_guards``:
+    the whole-pool point gain ``>= 0``, and the anchor record covers every
+    guard of the leg with each ``>= -tau_anchor_*``. An anchor record that
+    does not cover the guards (``anchor_missing``) is not ok."""
+    def _f(x) -> float:
+        return float("nan") if x is None else float(x)
+
+    a_dom = sgd.get("anchor_guard_lcbs") or {}
+    a_pub = sgd.get("anchor_public_lcbs") or {}
+    return (_f(sgd.get("pool_gain")) >= 0.0 and bool(sgd.get("anchor_pointer"))
+            and set(a_dom) == set(guards) and set(a_pub) == set(pubs)
+            and all(_f(x) >= -lb.tau_anchor_domain for x in a_dom.values())
+            and all(_f(x) >= -lb.tau_anchor_public for x in a_pub.values()))
+
+
 def _lane_b_row_verdict(r: dict, lb, slots: tuple[str, ...]) -> str | None:
     """Why ``r`` (one lane-B verdict row) contradicts ``[lane_b]``, else None.
     A multi-target row (DEC-CA-0059, it names ``targets``) is re-derived in
@@ -3243,6 +3431,8 @@ def _lane_b_row_verdict(r: dict, lb, slots: tuple[str, ...]) -> str | None:
         return f"{d}: unknown stage {r.get('stage')!r}"
     if r.get("stage") != "verdict":
         return f"{d}: a {r.get('stage')}-stage row passed" if r.get("passed") else None
+    if "gain_bar" in r:
+        return _lane_b_slot_row_verdict(r, lb, slots)
     lcb = r.get("target_lcb")
     lcb_ok = lcb is not None and not math.isnan(float(lcb)) and float(lcb) >= lb.gain_margin
     guards = r.get("guard_lcbs") or {}
@@ -3325,7 +3515,22 @@ def check_lane_b(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
                 or any(t not in slots for t in declared) or len(set(declared)) != len(declared)):
             return _fail(name, f"{hk}: declared targets {declared} are not 1.."
                                f"{lb.max_domains_per_leg} configured slots")
-        if sorted(str(r.get("domain")) for r in rs) != sorted(declared) or any(
+        if any("gain_bar" in r for r in rs):
+            # rev6.22: a judged leg is tested on EVERY slot, one row each
+            if (sorted(str(r.get("domain")) for r in rs) != sorted(slots)
+                    or not all("gain_bar" in r for r in rs)
+                    or any(list(r.get("targets") or []) != declared for r in rs)):
+                return _fail(name, f"{hk}: rows {[r.get('domain') for r in rs]} do not cover "
+                                   f"every slot {list(slots)} once each")
+            # two families (owner 2026-11-24): declared slots among themselves,
+            # undeclared slots among themselves — one critical value each
+            for fam in ("declared", "undeclared"):
+                crit = {json.dumps(r.get("maxt_crit")) for r in rs
+                        if r.get("family") == fam and not r.get("inconclusive")}
+                if len(crit) > 1:
+                    return _fail(name, f"{hk}: the {fam} rows carry different max-T "
+                                       "critical values (one per family)")
+        elif sorted(str(r.get("domain")) for r in rs) != sorted(declared) or any(
                 list(r.get("targets") or []) != declared for r in rs):
             return _fail(name, f"{hk}: rows {[r.get('domain') for r in rs]} do not cover the "
                                f"declared targets {declared} once each")
@@ -3338,6 +3543,11 @@ def check_lane_b(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
                                "(guards must run once per leg)")
         if any(r.get("guard_reason") for r in conc) and any(r.get("passed") for r in rs):
             return _fail(name, f"{hk}: a guard failed but a target of the leg passed")
+        # WB26: guard 4 + the anchor guard also run once per leg
+        if len({json.dumps(r["suite_guards"], sort_keys=True) for r in conc
+                if r.get("suite_guards")}) > 1:
+            return _fail(name, f"{hk}: the leg's suite guards differ between its suite slots "
+                               "(guard 4 / the anchor guard run once per leg)")
     best: dict[str, float] = {}
     for r in rows:
         if r.get("passed"):
@@ -3360,17 +3570,11 @@ def check_lane_b(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
             if max(float(r.get("target_lcb")) for r in mine) < best[d]:
                 return _fail(name, f"slot {d} went to {w.get('hotkey')!r}, not the best "
                                    f"passing target LCB {best[d]}")
-            # gain-tiered full-pay (owner 2026-10-20): the tier is derived from
-            # THIS row's target LCB (per target of a multi-target leg) — the
-            # pay record's gain_lcb must be it, and its tier re-derives from it
+            # the pay record's gain_lcb is THIS row's target LCB (per target
+            # of a multi-target leg); rev6.22: no tier to re-derive from it
             if w.get("gain_lcb") is None or float(w.get("gain_lcb")) != best[d]:
                 return _fail(name, f"slot {d}: pay record gain_lcb {w.get('gain_lcb')!r} != "
                                    f"the winning row's target LCB {best[d]}")
-            from ..eval.expert_lane import full_pay_mismatch
-
-            why = full_pay_mismatch(w, lb.full_pay_tiers)
-            if why:
-                return _fail(name, f"slot {d}: full-pay tier forged: {why}")
         elif d in best:
             return _fail(name, f"slot {d} has a passing row at this settlement but is still "
                                f"paid to the win from block {w.get('merge_block')}")
@@ -3456,10 +3660,8 @@ def _lane_b_acceptance_pay(receipt, cfg):
             source = approved.get(win["domain"])
             if source is None or source["hotkey"] != win["hotkey"]:
                 return "paid qualification has no accepted merge"
-            if any(win.get(k) != source.get(sk) for k, sk in (
-                    ("gain_lcb", "target_lcb"), ("tier", "tier"),
-                    ("full_eras", "full_eras"), ("below_floor", "below_floor"))):
-                return "payout differs from the accepted marginal gain/tier"
+            if win.get("gain_lcb") != source.get("target_lcb"):
+                return "payout differs from the accepted marginal gain"
     return None
 
 
@@ -3556,7 +3758,7 @@ def check_lane_c(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
         t, stage = str(r.get("target")), str(r.get("stage"))
         phase, outcome = str(r.get("phase", "judge")), str(r.get("outcome", "") or "")
         who = f"row {r.get('hotkey')} ({phase})"
-        terms = _lane_c_row_terms(t, lc, cfg.marketcast)
+        terms = _lane_c_row_terms(t, lc, _family_mc(cfg, t))
         if stage not in LANE_C_STAGES + (MKT_STAGES if terms["mkt"] else ()):
             return _fail(name, f"{who}: unknown stage {stage!r}")
         if phase not in ("judge", "confirm") or outcome not in LANE_C_OUTCOMES:
@@ -3581,6 +3783,10 @@ def check_lane_c(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
             return _fail(name, f"{who}: an infra drop past max_infra_deferrals is {outcome!r}")
         k = 1 if (phase != "judge" or registered) else (
             _mkt_owner_k(r, mkt_fams) if terms["mkt"] else ks.get(_lane_c_group(r), 1))
+        # DEC-CA-0075: the competition's test family (bonferroni = today)
+        from ..shared.rules_menu import family_size
+
+        k = family_size(terms["family"], k)
         want_alpha = float(terms["alpha"]) / k
         if r.get("alpha") is None or not math.isclose(float(r["alpha"]), want_alpha,
                                                       rel_tol=1e-12):
@@ -3639,14 +3845,17 @@ def check_lane_c(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
             return _fail(name, f"{who} passed without the public guard "
                                f"{missing} configured for {t}")
         if phase == "confirm":
-            # gain-tiered full-pay (owner 2026-10-20): the tier a confirmed
-            # win records, re-derived from this row's gain LCB
-            from ..eval.expert_lane import full_pay_mismatch
-            from ..shared.lane_c import full_pay_tiers_for
+            # the gain-scaled full-pay duration a confirmed win records
+            # (DEC-CA-0073), re-derived from this row's gain LCB on the era
+            # grid in force at this settlement
+            from ..shared.era import era_length_blocks
+            from ..shared.lane_c import full_pay_record_mismatch
 
             fp = dict(r.get("full_pay") or {})
             fp["gain_lcb"] = lcb
-            why = full_pay_mismatch(fp, full_pay_tiers_for(t, lc, cfg.marketcast))
+            why = full_pay_record_mismatch(
+                fp, t, lc, _family_mc(cfg, t),
+                era_blocks=int(era_length_blocks(cfg.round, boundary)))
             if why:
                 return _fail(name, f"{who}: full-pay tier forged: {why}")
         if phase == "judge":
@@ -3689,6 +3898,30 @@ def check_lane_c(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
                      f"record{note}")
 
 
+def _instance_inputs(inputs: dict | None, kind: str | None) -> dict:
+    """The replay inputs of one MarketCast-runner instance (W-CMP2): its own
+    snapshots (``instance_snapshots[kind]``), the shared rest."""
+    d = {k: v for k, v in dict(inputs or {}).items() if k != "instance_snapshots"}
+    if kind is not None:
+        d["snapshots"] = dict((inputs or {}).get("instance_snapshots", {}).get(kind, {}))
+    return d
+
+
+def _is_family(target) -> bool:
+    """W-CMP2: a row of the MarketCast runner (``mkt`` or a spec instance)."""
+    from ..shared.config.lane_c import is_mkt_family
+
+    return is_mkt_family(str(target or ""))
+
+
+def _family_mc(cfg, target):
+    """The MarketCast-shaped table judging ``target`` (``[marketcast]`` for
+    a non-family target, as before)."""
+    from ..shared.config.lane_c import is_mkt_family, mc_for
+
+    return mc_for(cfg, target) if is_mkt_family(str(target)) else cfg.marketcast
+
+
 def _mkt_owner(r: dict) -> str:
     return str(dict(r.get("mkt") or {}).get("owner") or f"hk:{r.get('hotkey')}")
 
@@ -3699,7 +3932,7 @@ def _mkt_owner_families(rows) -> dict[tuple, dict[str, int]]:
     the coldkey the trainer stamped, else the hotkey)."""
     out: dict[tuple, dict[str, int]] = {}
     for r in rows:
-        if str(r.get("target", "")).startswith("mkt:") and str(r.get("phase", "judge")) == "judge":
+        if _is_family(r.get("target", "")) and str(r.get("phase", "judge")) == "judge":
             o = out.setdefault(_lane_c_group(r), {})
             o[_mkt_owner(r)] = o.get(_mkt_owner(r), 0) + 1
     return out
@@ -3718,7 +3951,7 @@ def _lane_c_group(r: dict) -> tuple:
     whether it was a registration row (a settlement may apply several
     MarketCast rounds)."""
     t = str(r.get("target"))
-    if not t.startswith("mkt:"):
+    if not _is_family(t):
         return (t,)
     mk = dict(r.get("mkt") or {})
     return (t, str(mk.get("round", "")), str(mk.get("at", "")))
@@ -3727,12 +3960,14 @@ def _lane_c_group(r: dict) -> tuple:
 def _lane_c_row_terms(target: str, lc, mc) -> dict:
     """The verdict terms a lane-C row is checked against: ``[lane_c]``'s,
     or ``[marketcast]``'s for a DEC-CA-0064 ``mkt:`` row."""
-    if str(target).startswith("mkt:") and mc is not None:
+    if _is_family(target) and mc is not None:
         return {"mkt": True, "alpha": float(mc.alpha), "margin": float(mc.gain_margin),
-                "min_windows": int(mc.min_windows), "min_clusters": int(mc.min_clusters)}
+                "min_windows": int(mc.min_windows), "min_clusters": int(mc.min_clusters),
+                "family": str(getattr(mc, "test_family", "bonferroni"))}
     return {"mkt": False, "alpha": float(lc.alpha), "margin": float(lc.gain_margin),
             "min_windows": int(lc.min_target_windows),
-            "min_clusters": int(lc.min_target_clusters)}
+            "min_clusters": int(lc.min_target_clusters),
+            "family": str(getattr(lc, "test_family", "bonferroni"))}
 
 
 def _lane_c_carry_key(r: dict) -> tuple:
@@ -3784,18 +4019,18 @@ def check_lane_c_chain(receipts, cfg: ChainConfig) -> CheckResult:
         rows = list(getattr(rc, "lane_c", None) or ())
         if any(r.get("error") == "no_king" for r in rows):
             # the pending set waits for a king; MarketCast never does
-            bad = _mkt_chain_step(mkt_open, [r for r in rows if "error" not in r and str(
-                r.get("target", "")).startswith("mkt:")], str(getattr(rc, "round_id", "")))
+            bad = _mkt_chain_step(mkt_open, [r for r in rows if "error" not in r and _is_family(
+                r.get("target", ""))], str(getattr(rc, "round_id", "")))
             if bad:
                 return _fail(name, bad)
             continue
         rid = str(getattr(rc, "round_id", "") or "")
         vrows = [r for r in rows if "error" not in r]
-        bad = _mkt_chain_step(mkt_open, [r for r in vrows
-                                         if str(r.get("target", "")).startswith("mkt:")], rid)
+        bad = _mkt_chain_step(mkt_open, [r for r in vrows if _is_family(r.get("target", ""))],
+                              rid)
         if bad:
             return _fail(name, bad)
-        vrows = [r for r in vrows if not str(r.get("target", "")).startswith("mkt:")]
+        vrows = [r for r in vrows if not _is_family(r.get("target", ""))]
         got_confirm = {_lane_c_carry_key(r): str(r.get("origin_round", ""))
                        for r in vrows if r.get("phase") == "confirm"}
         got_carried = {_lane_c_carry_key(r): str(r.get("origin_round", ""))
@@ -4116,6 +4351,11 @@ def _mkt_train_time(r: dict, m: dict, cfg: ChainConfig, manifests: dict | None,
                     cache[("owner", e.miner_hotkey, e.trained_pointer)] = mkt_owner(e)
                     cache[("init", e.miner_hotkey, e.trained_pointer)] = str(
                         dict(e.marketcast or {}).get("init_pointer", "") or "")
+                    from ..validator.marketcast import EMBARGO_RECORD_KEYS
+
+                    cache[("embargo", e.miner_hotkey, e.trained_pointer)] = {
+                        k: v for k, v in dict(e.marketcast or {}).items()
+                        if k in EMBARGO_RECORD_KEYS}
                     t = dict(e.marketcast or {}).get("train_time")
                     return (float(t), "manifest") if t is not None else (None, "manifest")
     t = m.get("train_time")
@@ -4130,7 +4370,7 @@ def _mkt_init_lineage(init: str, train_time: float, cfg: ChainConfig, manifests:
     this entry's): the trainer's own lineage check, re-derived from signed
     records. ``""`` = verified, a reason = the lineage is broken, None = no
     signed manifest the auditor holds settles it (reported as missing)."""
-    from ..shared.config.lane_c import is_mkt_target
+    from ..shared.config.lane_c import is_mkt_family
     from ..shared.lane_c_manifest import load_lane_c_manifest, verify_lane_c_manifest
 
     seen = False
@@ -4147,7 +4387,7 @@ def _mkt_init_lineage(init: str, train_time: float, cfg: ChainConfig, manifests:
             continue
         seen = True
         for e in cm.entries:
-            if e.trained_pointer == init and is_mkt_target(e.target):
+            if e.trained_pointer == init and is_mkt_family(e.target):
                 t = dict(e.marketcast or {}).get("train_time")
                 if t is not None and float(t) < float(train_time):
                     return ""
@@ -4156,10 +4396,20 @@ def _mkt_init_lineage(init: str, train_time: float, cfg: ChainConfig, manifests:
                                   f"manifest the auditor holds")
 
 
+class _AuditEntry:
+    """The one field :func:`~cascade.validator.marketcast.entry_draw` reads
+    (the trainer-signed ``train_time``), for the audit's draw re-derivation."""
+
+    def __init__(self, train_time: float | None, embargo: dict | None = None) -> None:
+        self.marketcast = {} if train_time is None else {"train_time": float(train_time)}
+        # DEC-CA-0075: the embargo the trainer recorded at the leg's dispatch
+        self.marketcast.update(embargo or {})
+
+
 def check_marketcast(receipt: RoundReceipt, cfg: ChainConfig,
                      reports: dict | None = None, *, lane_c_manifests: dict | None = None,
-                     quantiles: dict | None = None, snapshots: dict | None = None
-                     ) -> CheckResult:
+                     quantiles: dict | None = None, snapshots: dict | None = None,
+                     block_hashes: dict | None = None, kind: str = "mkt") -> CheckResult:
     """DEC-CA-0064 MarketCast replay (joins :func:`run_tier0` ONLY at a
     settlement where ``[marketcast]`` is active, so earlier audit output is
     byte-identical). Nothing here trusts the main validator's arithmetic.
@@ -4173,11 +4423,17 @@ def check_marketcast(receipt: RoundReceipt, cfg: ChainConfig,
       (``train_time`` from the trainer-signed lane-C manifest that carried
       the entry, ``lane_c_manifests``: ``{round: text}``; and on a confirm,
       ≥ the recorded ``fresh_after``) — never the snapshot anchor;
+    * DEC-CA-0074: the entry's signed draw is the rule's (re-derived from
+      ``train_time``, the round block, the phase and ``fresh_after``), its
+      block hash the chain's (``block_hashes``: ``{block: hash}``; WARN
+      without); every backtest window lies wholly in the draw's embargo
+      span and the phase's half, every forward window after the dispatch
+      + margin on a ``forward_horizons`` horizon; no cell holds more than
+      ``n`` backtests / ``windows_per_cell`` forwards;
     * with the published snapshot (``snapshots``: ``{digest: MktSnapshot}``)
-      the report's window set must EQUAL the forward-only set
-      :func:`~cascade.pool.marketcast.snapshot_windows` re-cuts (nothing
-      omitted, nothing added); without it, every window must be forward-only
-      and no (asset, horizon) cell hold more than ``windows_per_cell``;
+      the report's window set must EQUAL the set the draw re-cuts
+      (:func:`~cascade.pool.marketcast.snapshot_windows`: nothing omitted,
+      nothing added);
     * with the quantile sidecar (``quantiles``: ``{key: bytes}``, sha256
       bound in the signed report) AND the snapshot, every per-window loss
       and coverage tally is recomputed on CPU from the snapshot targets and
@@ -4200,19 +4456,27 @@ def check_marketcast(receipt: RoundReceipt, cfg: ChainConfig,
 
     PASS needs every input; a missing one WARNs with what was not verified.
     While inactive, a receipt may carry no ``mkt:`` row."""
-    name = "marketcast"
-    mc = cfg.marketcast
+    # W-CMP2 (DEC-CA-0075): the same replay per instance of the MarketCast
+    # runner — ``mkt`` (legacy: name "marketcast", [marketcast]) or a spec
+    # instance ``<kind>`` (name "marketcast:<kind>", its compiled table)
+    from ..shared.config.lane_c import kind_of, mc_for
+
+    name = "marketcast" if kind == "mkt" else f"marketcast:{kind}"
+    mc = mc_for(cfg, kind)
     boundary = int(receipt.epoch_start_block)
     rows = getattr(receipt, "lane_c", None) or ()
-    mkt = [r for r in rows if str(r.get("target", "")).startswith("mkt:")]
+    mkt = [r for r in rows if kind_of(str(r.get("target", ""))) == kind]
+    if mc is None:
+        return (_fail(name, f"rows of competition {kind!r}, which is not configured")
+                if mkt else _skip(name, f"competition {kind!r} not configured"))
     if not mc.active(boundary):
-        if getattr(receipt, "marketcast", None) is not None or mkt:
+        if (kind == "mkt" and getattr(receipt, "marketcast", None) is not None) or mkt:
             return _fail(name, "MarketCast record on a settlement while [marketcast] is inert")
         return _skip(name, "MarketCast not active at this settlement")
     if not mkt:
         return _ok(name, "no MarketCast rows at this settlement")
     from ..eval.marketcast import COVERAGE_GATE_SUITES
-    from ..pool.marketcast import gap_span, target_windows
+    from ..pool.marketcast import target_windows, window_half, window_kind
     from ..shared.config.marketcast import base_suite
     from ..shared.marketcast_report import (
         GUARD_FIELDS,
@@ -4322,11 +4586,23 @@ def check_marketcast(receipt: RoundReceipt, cfg: ChainConfig,
         if want_after is None or not usable:
             return _fail(name, f"{who}: windows start after {ent.after}, the trainer's dispatch "
                                f"time gives {want_after}")
-        want_gap = (float(tt) if str(r.get("phase", ent.phase)) == "judge"
-                    and tuple(getattr(mc, "gap_horizons", ())) else 0.0)
-        if float(ent.gap_end) != want_gap:
-            return _fail(name, f"{who}: gap windows end by {ent.gap_end}, the trainer's dispatch "
-                               f"time gives {want_gap}")
+        from ..validator.marketcast import _draw_mismatch
+
+        draw = dict(ent.draw or {})
+        if m.get("round_block") is None:
+            return _fail(name, f"{who}: the row records no round_block to re-derive its draw")
+        rb = int(m["round_block"])
+        emb = mcache.get(("embargo", str(r.get("hotkey")), str(r.get("trained_pointer"))))
+        why_d = _draw_mismatch(_AuditEntry(tt, emb), ent, mc,
+                               phase=str(r.get("phase", ent.phase)),
+                               block=rb, fresh_after=float(m.get("fresh_after", 0.0) or 0.0))
+        if why_d:
+            return _fail(name, f"{who}: the report's window draw: {why_d}")
+        if block_hashes is None or rb not in block_hashes:
+            _miss("block hash (chain)")
+        elif str(block_hashes[rb]).lower() != str(draw.get("block_hash", "")).lower():
+            return _fail(name, f"{who}: the draw's block hash {draw.get('block_hash')} is not "
+                               f"block {rb}'s on chain ({block_hashes[rb]})")
         # red-team F4: the near-duplicate record and the stage it implies
         from ..validator.marketcast import near_duplicate_of
 
@@ -4350,37 +4626,40 @@ def check_marketcast(receipt: RoundReceipt, cfg: ChainConfig,
             return _fail(name, f"{who}: fine-tune loss non-finite on {nonfinite[:2]} — that "
                                f"entry is a fault, not a verdict")
         cells: dict[tuple, int] = {}
-        gaps = tuple(getattr(mc, "gap_horizons", ()))
         for w in ent.windows:
-            if w.horizon in gaps:
-                # owner 2026-11-18: a gap window sits inside the embargo gap
-                lo, hi = gap_span(mc, float(ent.gap_end)) if ent.gap_end else (0.0, -1.0)
-                if not (w.start > lo and w.end <= hi):
-                    return _fail(name, f"{who}: gap window {w.wid} is outside the embargo "
-                                       f"gap before {ent.gap_end}")
-            elif not (w.start > float(ent.after) and w.end <= int(snap_rec.get("end", 0))):
-                return _fail(name, f"{who}: window {w.wid} is not forward-only "
-                                   f"(after {ent.after}, snapshot end {snap_rec.get('end')})")
-            c = (w.suite_label, w.cluster, w.horizon)
+            kind = window_kind(draw, w.start)
+            if kind == "backtest":
+                # DEC-CA-0074: wholly inside the embargo span, in the phase's half
+                if not (w.start > float(draw["lo"]) and w.end <= float(draw["hi"])
+                        and window_half(w.wid) == int(draw["half"])):
+                    return _fail(name, f"{who}: backtest window {w.wid} is outside the draw's "
+                                       f"embargo span / half")
+            elif not (w.horizon in tuple(draw.get("forward_horizons", ()))
+                      and w.start > float(draw["forward_after"])
+                      and w.end <= min(float(draw["forward_hi"]), int(snap_rec.get("end", 0)))):
+                return _fail(name, f"{who}: window {w.wid} is not a forward window of the draw "
+                                   f"(after {draw['forward_after']}, snapshot end "
+                                   f"{snap_rec.get('end')})")
+            c = (kind, w.suite_label, w.cluster, w.horizon)
             cells[c] = cells.get(c, 0) + 1
-        over = [c for c, n in cells.items() if n > int(mc.windows_per_cell)]
+        over = [c for c, n in cells.items()
+                if n > int(draw["n"] if c[0] == "backtest" else draw["forward_n"])]
         if over:
-            return _fail(name, f"{who}: {over[:2]} hold more than windows_per_cell="
-                               f"{mc.windows_per_cell} windows")
+            return _fail(name, f"{who}: {over[:2]} hold more windows than the draw allows "
+                               f"(n={draw['n']}, forward_n={draw['forward_n']})")
         suite = str(r["target"]).split(":", 1)[1]
         snap = (snapshots or {}).get(str(snap_rec.get("digest", "")))
         if snap is None:
             _miss("snapshot")
         else:
-            want = target_windows(snap, mc, suite, after=float(ent.after),
-                                  gap_end=float(ent.gap_end))
+            want = target_windows(snap, mc, suite, after=float(ent.after), draw=draw)
             got_ids = [w.wid for w in ent.windows]
             want_ids = [w.wid for w in want]
             if got_ids != want_ids:
                 gone = sorted(set(want_ids) - set(got_ids))
                 extra = sorted(set(got_ids) - set(want_ids))
                 return _fail(name, f"{who}: the report's windows are not the snapshot's "
-                                   f"forward-only set (omitted {gone[:2]}{'…' if len(gone) > 2 else ''}"
+                                   f"drawn set (omitted {gone[:2]}{'…' if len(gone) > 2 else ''}"
                                    f" {len(gone)}, added {extra[:2]} {len(extra)})")
             data = (quantiles or {}).get(ent.quantiles_key) if ent.quantiles_key else None
             if data is None:
@@ -4518,6 +4797,12 @@ def check_marketcast(receipt: RoundReceipt, cfg: ChainConfig,
     return _ok(name, detail)
 
 
+def _image_epoch_configured(cfg: ChainConfig) -> bool:
+    from ..shared.era import image_epoch_from
+
+    return bool(image_epoch_from(cfg))
+
+
 def run_tier0(
     receipt: RoundReceipt, cfg: ChainConfig, client: object | None = None,
     *, funded_roster: dict | None = None, bench: dict | None = None,
@@ -4548,6 +4833,7 @@ def run_tier0(
         *([check_numerics_contract(receipt, cfg, client)]
           if (int(getattr(cfg.v2, "image_decoupled_from_block", 0) or 0)
               or int(getattr(receipt, "image_decoupled_block", 0) or 0)) else []),
+        *([check_image_epoch(receipt, cfg)] if _image_epoch_configured(cfg) else []),
         check_contract_declaration(receipt, cfg),
         check_base_arch_digest(receipt, cfg),
         check_commit_cutoff(receipt, client),
@@ -4561,8 +4847,14 @@ def run_tier0(
         check_transition(receipt),
         check_lane_b(receipt, cfg),
         check_lane_c(receipt, cfg),
-        *([check_marketcast(receipt, cfg, marketcast_reports, **(marketcast_inputs or {}))]
+        *([check_marketcast(receipt, cfg, marketcast_reports,
+                            **_instance_inputs(marketcast_inputs, None))]
           if cfg.marketcast.active(int(receipt.epoch_start_block)) else []),
+        # W-CMP2: every spec instance of the MarketCast runner active here
+        *[check_marketcast(receipt, cfg, marketcast_reports,
+                           **_instance_inputs(marketcast_inputs, _k), kind=_k)
+          for _k, _m, _t in tuple(getattr(cfg.lane_c, "instances", ()) or ())
+          if _m.active(int(receipt.epoch_start_block))],
         check_king_check(receipt, cfg, king_bench),
         # LANE_D_PLAN §16: only where a sentinel is in play (armed era or a
         # recorded draw), so every unarmed receipt's output is unchanged

@@ -3,8 +3,11 @@ per-settlement runbook, §10.7 monitoring, §1.4 house, §1.2 retention, §11.1)
 
 Every job is one idempotent command: re-running it with nothing new is a
 no-op, ``--dry-run`` prints what it would write and writes nothing, and it
-never reads the chain, rents, deploys or touches a bucket (inputs are local
-files the operator or another job already fetched). The systemd TEMPLATES in
+never reads the chain, rents or deploys. Only ``king-publish`` and
+``takedown`` touch a bucket or repo (the existing public mirrors and the
+public manifest store, never a new one), and only without ``--dry-run`` and
+without ``--vault-dir`` / ``--mirror`` (the local filesystem mode testnet and
+the tests use); every other input is a local file. The systemd TEMPLATES in
 ``deploy/laned/systemd/`` schedule them; nothing here installs anything.
 
 Jobs:
@@ -29,6 +32,20 @@ Jobs:
 * ``king-check``: every crowned persisted report against the signed lane D
   index (and, given local copies, the vault and the mirrors): §11.1 "one
   digest, one identity" via :func:`cascade.lane_d.publish.check_one_digest`.
+* ``house-source``: verify a ``laned_house_source/1`` produced on a pod by
+  ``python -P -m cascade.lane_d.house_source build`` (D47 BF16 cast, D46 T)
+  against its ``laned_house_provenance/1`` (stdlib re-hash, no weights read)
+  and install both atomically where ``house-pointer`` reads them.
+* ``king-publish``: for every crowned persisted report not yet in the signed
+  index (the validator's settlement step leaves a
+  ``laned_king_publish_request/1`` per crowning), copy the king from the vault
+  to the Hub, R2 and HF mirrors (:func:`cascade.lane_d.publish.publish_king`,
+  read-back re-hash), re-sign ``champions/lane_d/index.json`` with the
+  validator hotkey, put it on the public store and write the local copy
+  ``king-check`` reads. Holds one checkpoint in memory (~2.5 GB): run it where
+  that fits (testnet-ctl / the builder VM), not on a loaded box.
+* ``takedown``: B13, unpublish one king from the Hub and HF mirrors and
+  re-sign the index (``--reason licence|rights``).
 
 Exit codes (every job): 0 done / nothing to do / dry-run planned; 1 an input
 is unreadable or invalid, or a check found a problem (nothing written);
@@ -77,6 +94,18 @@ LOG_TAGS: dict[str, str] = {
     "lane_d_ops_king_ok": "info",
     "lane_d_ops_king_unpublished": "critical",
     "lane_d_ops_king_check_failed": "error",
+    "lane_d_ops_house_source_current": "info",
+    "lane_d_ops_house_source_planned": "info",
+    "lane_d_ops_house_source_installed": "warning",
+    "lane_d_ops_house_source_refused": "error",
+    "lane_d_ops_king_publish_current": "info",
+    "lane_d_ops_king_publish_planned": "info",
+    "lane_d_ops_king_published": "warning",
+    "lane_d_ops_king_publish_blocked": "error",
+    "lane_d_ops_king_publish_failed": "error",
+    "lane_d_ops_takedown_planned": "info",
+    "lane_d_ops_takedown_done": "warning",
+    "lane_d_ops_takedown_failed": "error",
 }
 
 
@@ -340,12 +369,18 @@ def _mirrors(specs: list[str]) -> dict:
     from .publish import MIRRORS
     from .storage import FilesystemStorage
 
+    class FsMirror(FilesystemStorage):
+        """A filesystem mirror copy: the storage adapter plus ``delete``."""
+
+        def delete(self, key: str) -> None:
+            self._path(key).unlink(missing_ok=True)
+
     out = {}
     for spec in specs:
         name, sep, root = spec.partition("=")
         if not sep or name not in MIRRORS or not root:
             raise JobError(f"--mirror {spec!r}: want NAME=DIR, NAME one of {MIRRORS}")
-        out[name] = FilesystemStorage(root)
+        out[name] = FsMirror(root)
     return out
 
 
@@ -399,6 +434,233 @@ class _CheckFailed(Exception):
         self.out = out
 
 
+# ── house-source (D46 / D47, produced on a pod) ──────────────────────────────
+
+
+def house_source(args) -> dict:
+    from .house_source import HouseSourceError, check_house_documents, provenance_path
+
+    src = _read_json(args.source, "house source")
+    prov = _read_json(provenance_path(args.source), "house provenance")
+    try:
+        checked = check_house_documents(src, prov)
+    except HouseSourceError as e:
+        raise JobError(f"{args.source}: {e}") from None
+    dest = Path(args.dest)
+    data = (json.dumps(checked, sort_keys=True) + "\n").encode()
+    pdata = (json.dumps(prov, sort_keys=True, indent=1) + "\n").encode()
+    out = {"job": "house-source", "king_pointer": checked["king_pointer"],
+           "digest": checked["digest"], "reveal_ts": checked["reveal_ts"],
+           "reveal_block": prov["reveal_block"], "dest": str(dest)}
+    if _bytes_or_none(dest) == data and _bytes_or_none(provenance_path(dest)) == pdata:
+        log.info("lane_d_ops_house_source_current %s is current (house %s for %s)", dest,
+                 checked["digest"], checked["king_pointer"])
+        return {**out, "action": "current"}
+    if args.dry_run:
+        log.info("lane_d_ops_house_source_planned would install house %s (T=%d) for %s at %s",
+                 checked["digest"], checked["reveal_ts"], checked["king_pointer"], dest)
+        return {**out, "action": "planned"}
+    _write_atomic(provenance_path(dest), pdata)
+    _write_atomic(dest, data)
+    log.warning("lane_d_ops_house_source_installed house %s (T=%d) for %s at %s",
+                checked["digest"], checked["reveal_ts"], checked["king_pointer"], dest)
+    return {**out, "action": "installed"}
+
+
+# ── king-publish / takedown (W13) ────────────────────────────────────────────
+
+
+def _local_index(path: Path, signer_ss58: str) -> dict | None:
+    from .publish import verify_index
+
+    if not Path(path).exists():
+        return None
+    index = _read_json(path, "lane D index")
+    if not verify_index(index, signer_ss58):
+        raise JobError(f"{path} does not verify under {signer_ss58}; the job never re-signs "
+                       "over an index it cannot verify")
+    return index
+
+
+def _licence(intake_dir: Path, digest: str, hotkey: str) -> str:
+    from .service import LICENCES, QUEUE_FILENAME
+
+    doc = _read_json(Path(intake_dir) / QUEUE_FILENAME, "intake queue")
+    rows = [r for r in (doc.get("entries") if isinstance(doc, dict) else None) or []
+            if isinstance(r, dict) and r.get("digest") == digest and r.get("hotkey") == hotkey]
+    lic = rows[0].get("licence") if rows else None
+    if not isinstance(lic, str) or lic not in LICENCES:
+        raise JobBlocked(f"king {digest[:16]}: the intake has no ready licence record for it "
+                         f"(want one of {list(LICENCES)}); publish it by hand after checking")
+    return lic
+
+
+def _request(state_path: Path, boundary: int, digest: str) -> dict | None:
+    from .publish import PUBLISH_REQUEST_SCHEMA, publish_request_path
+
+    path = publish_request_path(state_path, boundary)
+    if not path.exists():
+        return None
+    req = _read_json(path, "publish request")
+    if not isinstance(req, dict) or req.get("schema") != PUBLISH_REQUEST_SCHEMA \
+            or req.get("boundary") != boundary or req.get("digest") != digest:
+        raise JobError(f"{path} is not the {PUBLISH_REQUEST_SCHEMA} of {boundary}/{digest[:16]}")
+    return req
+
+
+def _fs_or_live(args, cfg_needed: bool):
+    from .storage import FilesystemStorage
+
+    cfg = None
+    if cfg_needed:
+        if args.chain_toml is None:
+            raise JobError("live publication needs --chain-toml (the [storage] names)")
+        from ..shared.config import load_chain_config
+
+        cfg = load_chain_config(args.chain_toml)
+    vault = FilesystemStorage(args.vault_dir) if args.vault_dir else None
+    return cfg, vault
+
+
+def _mirrors_for(args, cfg, king: dict) -> dict:
+    if args.mirror:
+        return _mirrors(args.mirror)
+    from .mirrors import open_live_mirrors
+
+    return open_live_mirrors(cfg, context=int(king["context"]), hotkey=str(king["hotkey"]),
+                             digest=str(king["digest"]))
+
+
+def _index_store(args, cfg):
+    from .storage import FilesystemStorage
+
+    if args.index_store_dir:
+        return FilesystemStorage(args.index_store_dir)
+    from .mirrors import open_index_store
+
+    return open_index_store(cfg)
+
+
+def _signer(args):
+    from ..shared.chain import open_wallet
+
+    wallet = open_wallet(args.wallet_name, args.wallet_hotkey, args.wallet_path)
+    key = getattr(wallet, "hotkey", wallet)
+    if str(key.ss58_address) != args.signer_ss58:
+        raise JobError(f"the wallet hotkey {key.ss58_address} is not the pinned index signer "
+                       f"{args.signer_ss58}; nothing written")
+    return wallet
+
+
+def _write_index(args, index: dict, cfg) -> None:
+    from .publish import index_bytes, publish_index
+
+    publish_index(index, _index_store(args, cfg), args.signer_ss58)
+    _write_atomic(Path(args.index), index_bytes(index))
+
+
+def king_publish(args) -> dict:
+    from ..validator.lane_d_report import verify_report
+    from .publish import PublishError, build_index, king_entry, publish_king, sentinel_entry
+
+    index = _local_index(args.index, args.signer_ss58)
+    have = {k["digest"]: k for k in (index or {}).get("kings") or ()}
+    planned: list[dict] = []
+    for report in _reports(args.state):
+        crowned, b = report.get("crowned"), report.get("boundary")
+        if crowned is None:
+            continue
+        if not verify_report(report, args.signer_ss58):
+            raise JobError(f"report {b} does not verify under {args.signer_ss58}")
+        if crowned in have:
+            if have[crowned].get("crown_block") != b:
+                raise JobError(f"king {crowned[:16]} is indexed at crown block "
+                               f"{have[crowned].get('crown_block')}, the report says {b}")
+            continue
+        req = _request(args.state, b, crowned)
+        try:
+            sentinel = sentinel_entry(report, None if req is None else req.get("sentinel"))
+        except PublishError as e:
+            raise JobBlocked(f"settlement {b}: {e} (the settlement step's publish request "
+                             "carries it; re-run after the sentinel record is in place)") from None
+        hotkey = next((e.get("hotkey") for e in report.get("entries") or ()
+                       if isinstance(e, dict) and e.get("digest") == crowned), None)
+        licence = _licence(args.intake_state_dir, crowned, str(hotkey))
+        try:
+            planned.append(king_entry(report, licence=licence, sentinel=sentinel))
+        except PublishError as e:
+            raise JobError(f"settlement {b}: {e}") from None
+    out = {"job": "king-publish", "indexed": len(have),
+           "planned": [{"digest": k["digest"], "crown_block": k["crown_block"],
+                        "hotkey": k["hotkey"], "context": k["context"]} for k in planned]}
+    if not planned:
+        log.info("lane_d_ops_king_publish_current every crowned settlement is in %s (%d kings)",
+                 args.index, len(have))
+        return {**out, "action": "current"}
+    if args.dry_run:
+        log.info("lane_d_ops_king_publish_planned would publish %d king(s): %s", len(planned),
+                 [k["digest"][:16] for k in planned])
+        return {**out, "action": "planned", "entries": planned}
+    live = not args.mirror or not args.vault_dir or not args.index_store_dir
+    cfg, vault = _fs_or_live(args, cfg_needed=live)
+    if vault is None:
+        from .mirrors import open_live_vault
+
+        vault = open_live_vault(cfg)
+    signer = _signer(args)
+
+    def alert(doc: dict) -> None:
+        log.error("lane_d_ops_king_publish_failed mirror alert %s", json.dumps(doc, sort_keys=True))
+
+    published = []
+    for king in planned:
+        try:
+            res = publish_king(hotkey=king["hotkey"], digest=king["digest"], vault=vault,
+                               mirrors=_mirrors_for(args, cfg, king), alert=alert)
+        except PublishError as e:
+            raise JobError(f"king {king['digest'][:16]}: {e}") from None
+        published.append(res)
+    kings = [*(index or {}).get("kings", ()), *planned]
+    new_index = build_index(kings, signer)
+    _write_index(args, new_index, cfg)
+    log.warning("lane_d_ops_king_published %d king(s) on the mirrors; index re-signed with %d "
+                "king(s)", len(planned), len(new_index["kings"]))
+    return {**out, "action": "published", "mirrors": published}
+
+
+def takedown_job(args) -> dict:
+    from .publish import PublishError, takedown
+
+    index = _local_index(args.index, args.signer_ss58)
+    if index is None:
+        raise JobError(f"{args.index} is absent: nothing is published")
+    king = next((k for k in index["kings"] if k["digest"] == args.digest), None)
+    if king is None:
+        raise JobError(f"{args.digest} is not in the index")
+    out = {"job": "takedown", "digest": args.digest, "reason": args.reason, "block": args.block,
+           "hotkey": king["hotkey"], "context": king["context"]}
+    if isinstance(king.get("takedown"), dict):
+        log.info("lane_d_ops_takedown_planned %s is already taken down (%s)", args.digest[:16],
+                 king["takedown"])
+        return {**out, "action": "current"}
+    if args.dry_run:
+        log.info("lane_d_ops_takedown_planned would unpublish %s from the Hub and HF (%s, block "
+                 "%d)", args.digest[:16], args.reason, args.block)
+        return {**out, "action": "planned"}
+    cfg, _ = _fs_or_live(args, cfg_needed=not args.mirror or not args.index_store_dir)
+    mirrors = _mirrors_for(args, cfg, king)
+    try:
+        new_index = takedown(index, digest=args.digest, reason=args.reason, block=args.block,
+                             mirrors={k: v for k, v in mirrors.items() if k in ("hub", "hf")},
+                             signer=_signer(args))
+    except PublishError as e:
+        raise JobError(str(e)) from None
+    _write_index(args, new_index, cfg)
+    log.warning("lane_d_ops_takedown_done %s unpublished from the Hub and HF (%s); index "
+                "re-signed", args.digest[:16], args.reason)
+    return {**out, "action": "taken_down"}
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def _log_failed(job: str, e: Exception) -> None:
@@ -408,6 +670,12 @@ def _log_failed(job: str, e: Exception) -> None:
         log.error("lane_d_ops_evidence_refused %s; nothing written", e)
     elif job == "vault-ledger":
         log.error("lane_d_ops_ledger_failed %s; nothing written", e)
+    elif job == "house-source":
+        log.error("lane_d_ops_house_source_refused %s; nothing installed", e)
+    elif job == "king-publish":
+        log.error("lane_d_ops_king_publish_failed %s; the index is unchanged", e)
+    elif job == "takedown":
+        log.error("lane_d_ops_takedown_failed %s; the index is unchanged", e)
     else:
         log.error("lane_d_ops_king_check_failed %s", e)
 
@@ -426,8 +694,11 @@ def _run(args) -> int:
     job = args.job
     try:
         out = args.job_func(args)
-    except JobBlocked as e:              # only house-pointer blocks on an owner step
-        log.error("lane_d_ops_house_resign_blocked %s", e)
+    except JobBlocked as e:              # house-pointer and king-publish block on an owner step
+        if job == "king-publish":
+            log.error("lane_d_ops_king_publish_blocked %s", e)
+        else:
+            log.error("lane_d_ops_house_resign_blocked %s", e)
         print(json.dumps({"job": job, "action": "blocked", "reason": str(e)}, sort_keys=True))
         return EXIT_BLOCKED
     except _CheckFailed as e:
@@ -496,6 +767,45 @@ def add_parser(subparsers) -> None:
     k.add_argument("--mirror", action="append", default=[], help="NAME=DIR local mirror copy")
     common(k)
     k.set_defaults(job_func=king_check)
+
+    s = jobs.add_parser("house-source", help="verify and install a pod-built laned_house_source/1")
+    s.add_argument("--source", type=Path, required=True,
+                   help="the produced laned_house_source/1 (its .provenance.json beside it)")
+    s.add_argument("--dest", type=Path, required=True,
+                   help="where house-pointer reads it (--house-source)")
+    common(s)
+    s.set_defaults(job_func=house_source)
+
+    def publication(sp, *, index_help: str):
+        sp.add_argument("--index", type=Path, required=True, help=index_help)
+        sp.add_argument("--signer-ss58", required=True, help="the pinned report / index signer")
+        sp.add_argument("--chain-toml", type=Path, default=None,
+                        help="the deployed chain.toml ([storage] names for the live clients)")
+        sp.add_argument("--vault-dir", type=Path, default=None,
+                        help="filesystem vault (testnet / tests); default the live vault")
+        sp.add_argument("--mirror", action="append", default=[],
+                        help="NAME=DIR filesystem mirror (testnet / tests); default the live "
+                             "Hub, R2 and HF mirrors")
+        sp.add_argument("--index-store-dir", type=Path, default=None,
+                        help="filesystem public store for the index; default the manifest store")
+        sp.add_argument("--wallet-name", default=None)
+        sp.add_argument("--wallet-hotkey", default=None)
+        sp.add_argument("--wallet-path", default=None)
+        common(sp)
+
+    kp = jobs.add_parser("king-publish", help="publish crowned kings and re-sign the index")
+    kp.add_argument("--state", type=Path, required=True, help="lane_d_state.json")
+    kp.add_argument("--intake-state-dir", type=Path, required=True,
+                    help="the intake state dir (the ready licence record)")
+    publication(kp, index_help="the local champions/lane_d/index.json copy king-check reads")
+    kp.set_defaults(job_func=king_publish)
+
+    td = jobs.add_parser("takedown", help="B13: unpublish one king from the Hub and HF")
+    td.add_argument("--digest", required=True)
+    td.add_argument("--reason", required=True, choices=("licence", "rights"))
+    td.add_argument("--block", type=int, required=True, help="the block of the claim")
+    publication(td, index_help="the local champions/lane_d/index.json copy")
+    td.set_defaults(job_func=takedown_job)
 
 
 def main(argv: list[str] | None = None) -> int:

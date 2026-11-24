@@ -52,6 +52,13 @@ known but lack the WP never is (lanedlib.impl_commit_index). Labels: the
 the WP's L1 commit too (`combined_commit`). The git-only rules above apply
 only to commits with no PR number or unknown labels.
 
+RETIRED WPs (scripts/laned/retired_wps at REF, accept --help RETIRED rule):
+dropped by an owner decision, never built. Such a WP stays at L0 whatever its
+ledger rows or merges (so the push job never re-accepts it), its side state
+is `retired`, its JSON entry carries `retired` (the decision reference), it
+counts toward no stage, it blocks no dependant, and STATUS.md shows RETIRED in
+its Level column.
+
 Ci-only WPs pass L4 automatically (§17.1). L4 for external WPs and an
 execution-stage gate need the evidence blob at REF to
 have been verified by a green push/accept run (`accept <WP> --evidence F`,
@@ -88,7 +95,7 @@ STAGE_ORDER = ("S0", "S0a", "S0b", "S0c", "S1", "S2", "S2b", "S3", "S4", "S5", "
                "SB0", "SB1", "SB2", "SB3", "SB4", "SB5", "S7", "S8")
 # §5 row 12c: the SB1 build set and the SB0 decision set.
 SB1_WPS = ("WB10", "WB11", "WB12", "WB13", "WB14", "WB15", "WB16", "WB17", "WB18",
-           "WB22", "WB23", "W-S1", "W-S2")
+           "WB22", "WB23", "WB26", "W-S1", "W-S2")
 SB0_DECISIONS = ("D35", "D36", "D37", "D38", "D39", "D40", "D41", "D42", "D42b")
 T_ROW = re.compile(r"^T\d+[a-z]?$")
 
@@ -318,6 +325,7 @@ class Board:
         self.levels: dict[str, int] = {}
         self.detail: dict[str, dict] = {}
         self.verification_wps = lanedlib.parse_verification_wps(tree.show(lanedlib.VERIFICATION_WPS_PATH))
+        self.retired = lanedlib.parse_retired_wps(tree.show(lanedlib.RETIRED_WPS_PATH))
         self._paths_sets: dict[str, list[str]] | None = None
         self._subjects: dict[str, str] | None = None
         self._pr_labels: dict[int, set[str]] | None = None
@@ -417,6 +425,10 @@ class Board:
         d = lanedlib.wp_dir(wp)
         det: dict = {}
         self.detail[wp] = det
+        if wp in self.retired:
+            # RETIRED rule: never built; no run or merge lifts it
+            det["retired"] = self.retired[wp]
+            return 0
         paths_text = self.tree.show(f"tests/accept/{d}/PATHS")
         xf_runs = [r for r in self.runs if r.get("wp") == wp and r.get("mode") == "expect-fail"
                    and r.get("conclusion") == "success"]
@@ -505,6 +517,8 @@ class Board:
     # -- side states ---------------------------------------------------------
     def side_state(self, wp: str) -> str | None:
         info = self.plan["wps"][wp]
+        if wp in self.retired:
+            return "retired"
         if info["parked"]:
             return "parked"
         blocked = self.tree.show(f"evidence/blocked/{lanedlib.wp_dir(wp)}.md")
@@ -521,7 +535,8 @@ class Board:
                 return "blocked:owner"
         if self.levels[wp] < 2:
             for dep in self.plan["wps"]:
-                if dep != wp and lanedlib.has_token(info["depends"], dep) and self.levels[dep] < 2:
+                if dep != wp and dep not in self.retired and lanedlib.has_token(info["depends"], dep) \
+                        and self.levels[dep] < 2:
                     return "blocked:dependency"
         return None
 
@@ -574,7 +589,8 @@ def compute(tree: RefTree, plan: dict, runs: list[dict], tag_glob: str | None) -
                 f"{', '.join(names) if len(names) <= 6 else str(len(names)) + ' WPs'} at >= L{n}"
                 + (f" (below: {', '.join(low)})" if low else ""))
 
-    group = lambda g: [w for w, i in wps.items() if i["group"] == g and not i["parked"]]  # noqa: E731
+    group = lambda g: [w for w, i in wps.items()  # noqa: E731
+                       if i["group"] == g and not i["parked"] and w not in board.retired]
     build = group("build") + group("laned_core")
     exec_for = {}
     for w, i in wps.items():
@@ -730,7 +746,9 @@ def render_md(data: dict) -> str:
         "",
         "| WP | Level | State |",
         "|---|---|---|",
-        *[f"| {wp} | {v['level']} | {v['side_state'] or '-'} |" for wp, v in data["wps"].items()],
+        *[f"| {wp} | {'RETIRED' if v.get('retired') else v['level']} | "
+          f"{v['side_state'] + ': ' + v['retired'] if v.get('retired') else v['side_state'] or '-'} |"
+          for wp, v in data["wps"].items()],
         "",
         "## Open decisions and owner inputs",
         "",

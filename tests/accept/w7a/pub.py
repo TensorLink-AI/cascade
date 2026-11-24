@@ -152,7 +152,8 @@ def settle_pub(tmp: Path, *, public_weight: float = 0.5, quality: dict | None = 
         if scores_hook is not None:
             scores_hook(scores)
         extra["public_scores"] = scores
-    s1 = settle_lane_d(cfg=cfg, boundary=w7a.BOUNDARY_1, pool_dir=chain["pools"][1],
+    s1 = settle_lane_d(**w7a._rev614_ts(settle_lane_d, w7a.BOUNDARY_1), cfg=cfg,
+                       boundary=w7a.BOUNDARY_1, pool_dir=chain["pools"][1],
                        entries=[dict(e)], house=dict(chain["house"]),
                        forecasts=chain["forecasts"][1], uid_of=dict(uid_of), state_path=state,
                        signer=w7a.fixture_key("signer"), max_channels=chain["max_channels"],

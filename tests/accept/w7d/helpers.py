@@ -408,7 +408,7 @@ class Chain:
             kw.update(boundary_block_hash=block_hash(f"b{n}"), sentinel=None,
                       bench=SweepSession(f"w7d-sess-b{n}", host))
         b = boundary(n)
-        s = settle_lane_d(cfg=self.cfg, boundary=b, pool_dir=self.pools[n - 1],
+        s = settle_lane_d(**_rev614_ts(settle_lane_d, b), cfg=self.cfg, boundary=b, pool_dir=self.pools[n - 1],
                           entries=[dict(e) for e in entries],
                           house=dict(house if house is not None else self.h0),
                           forecasts=self.forecasts, uid_of=dict(self.uids),
@@ -722,8 +722,20 @@ def satellite_modules() -> list[Path]:
 
 def court_shares(cfg, court: list[dict]) -> list[tuple[str, int | None, float]]:
     """§1.4 pay, re-derived here: slot i of the court is worth
-    `king_decay**i` of `share`, normalised; a slot without a uid burns."""
-    raw = [float(cfg.king_decay) ** i for i in range(len(court))]
+    `court_weights[i]` of `share` (rev6.23, owner 2026-11-24: 0.80 / 0.15 /
+    0.05), normalised over the court's slots; a slot without a uid burns."""
+    raw = [float(w) for w in cfg.court_weights][:len(court)]
     total = sum(raw)
     return [(s["digest"], s["uid"], float(cfg.share) * w / total)
             for s, w in zip(court, raw, strict=True)]
+
+
+def _rev614_ts(settle, boundary) -> dict:
+    """rev6.14 (a): the fixture's on-chain boundary timestamp (far after every
+    fixture T + eval_delay_hours, 12 s per block), passed only where
+    ``settle_lane_d`` takes it."""
+    import inspect
+
+    if "boundary_ts" not in inspect.signature(settle).parameters:
+        return {}
+    return {"boundary_ts": 2_000_000_000 + 12 * int(boundary)}

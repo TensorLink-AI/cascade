@@ -207,3 +207,66 @@ The package stays torch-free.
 - `test_w4_torch.py` is marked `torch`. The production box must never run
   it: run `-m "not torch"` locally (also inside `LANED_PYTEST_CMD`). CI
   installs torch.
+
+## Scoring environments (rev6.18 B5/B7)
+
+Plan rev6.18 B5, B7 (owner 2026-11-23: lane D may be scored on any GPU,
+including RTX PRO 6000 Blackwell). Tests: `test_w4_envs.py`.
+
+- **`deploy/laned/scoring_envs.toml`** is the committed list (`[[env]]`
+  only). Each entry: `name`, `status` (`qualified` | `candidate`),
+  `from_block`, `until_block`, `lock` + `lock_sha256`, `torch_build`
+  (`<torch.__version__>/cuda-<torch.version.cuda>`), `gpu_models` (exact
+  nvidia-smi names), `driver_min`, `driver_max` (`""` = none), `evidence`.
+  Launch list: `cu124-torch241` (qualified reference, the release venv) and
+  `sm120-torch212` (RTX PRO 6000 Blackwell, candidate until its B5 evidence).
+  A qualified entry's lock hashes to `lock_sha256`. Lane A's `uv.lock` /
+  `torch==2.4.1+cu124` contract is untouched.
+- **`cascade.shared.config.lane_d`**: `parse_scoring_envs` /
+  `load_scoring_envs` (`ScoringEnvError`, a `ValueError`, on any defect),
+  `ScoringEnv.qualified_at(boundary)` (qualified and
+  `from_block < boundary <= until_block` when set), `host_identity`,
+  `host_problem(host, envs, boundary)`, `host_record_problem(host)`.
+- **Handshake**: `HANDSHAKE_FIELDS` = `CODE_FIELDS` + `ENV_FIELDS`
+  (`env`, `torch_build`, `gpu_model`, `driver`, `fingerprint` = sha256 of
+  the GPU UUID). `probe_environment(env=None, *, envs, smi, torch_build)`;
+  `worker_hello(root, *, environment=None)` (legacy three fields without it);
+  the `lane_d_forecasts hello [--env NAME]` CLI always probes.
+  `check_worker(hello, *, envs, boundary, expected)` -> `(CodeIdentity, host)`:
+  code identity first (`check_handshake`), then the environment; refusal is
+  CRITICAL `lane_d_handshake_env_refused` + `HandshakeMismatch` naming env
+  fields only.
+- **Qualifying a new environment**: the procedure in the file header (PR with
+  a candidate entry; W0b + golden set vs `cu124-torch241`, rel. diff <= 1e-3,
+  identical crowns; A9 timing; `evidence/lane_d_env_<name>.json`; owner merge
+  with `from_block` after the release ships).
+
+## Qualifying a scoring environment (B5)
+
+Owner 2026-11-24: lane D's eval host is a 1x RTX PRO 6000 Blackwell
+(`sm120-torch212`). Tests: `test_w4_env_qual.py` (no torch).
+
+- **`sm120-torch212` lock**: `deploy/laned/envs/sm120-torch212/{pyproject.toml,uv.lock}`
+  (torch 2.12.1 = the PyPI cu130 wheel of `benchmarks/uv.lock`; numpy and
+  safetensors at the release `uv.lock` versions; `qualify` group = pytest).
+  The entry pins `lock` + `lock_sha256` and `torch_build =
+  "2.12.1+cu130/cuda-13.0"` (the wheel's `torch.__version__` carries the
+  `+cu130` tag; F5's `"2.12.1/cuda-13.0"` could never match a hello). Status
+  stays `candidate`.
+- **`cascade.eval.lane_d_env_qual`**: `golden` (deterministic pick of
+  `HALF_MIN` = 500 live + 500 public windows from `pool_d/1` directories,
+  hashed), `forecast` (pod: every checkpoint at every `CONTEXTS` value, the
+  host record probed and checked against the entry), `compare` (both runs
+  scored with `score_window`; cohort replayed with `judge_cohort`, model 0 =
+  KING_D, clusters = source, at `d_margin` and `d_margin_start`; W0b junit;
+  A9 `laned_t7/1` pod doc at `A9_WINDOWS` x `A9_MODELS`), `check`.
+- **`evidence_problem(doc, env, envs=)`** recomputes every verdict from the
+  per-window scores in the file: lock and torch build of the entry, host in
+  the entry's GPU/driver range, reference = qualified `cu124-torch241` with
+  the release lock, both halves, >= 3 distinct checkpoints, all launch
+  contexts, per-window rel. diff <= `REL_TOL` (1e-3), identical crowns, the
+  required W0b torch tests passed (none skipped), A9 rows re-derived and
+  passing on that GPU. No flag in the file is trusted.
+- **Committed gate**: every `qualified` entry whose evidence is not
+  `reference` must have a committed evidence file that `evidence_problem`
+  accepts.

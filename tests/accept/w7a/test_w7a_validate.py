@@ -124,6 +124,7 @@ def test_scoring_method_other_than_quantile_head_is_refused(scratch, method):
 @pytest.mark.parametrize("name", TOP_LEVEL_REQUIRED[1:])
 def test_every_required_top_level_field_is_required(scratch, name):
     r = _s2(scratch)
+    assert name in r, f"the report has no {name}"
     del r[name]
     _refused(scratch, r, "missing_field", name)
 

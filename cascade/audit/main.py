@@ -118,6 +118,10 @@ def _build_parser() -> argparse.ArgumentParser:
                             "points (default 1.0).")
     mkt_p.add_argument("--device", default="cpu",
                        help="--reproduce forecast device (default cpu).")
+    mkt_p.add_argument("--network", default="finney",
+                       help="Bittensor network the window draws' block hashes are read from.")
+    mkt_p.add_argument("--no-chain", action="store_true",
+                       help="Skip the block-hash check of the window draws (it WARNs).")
     mkt_p.add_argument("--workdir", type=Path, default=Path("./_audit_work/marketcast"))
     mkt_p.add_argument("--json", action="store_true")
     dec_p = sub.add_parser(
@@ -585,13 +589,15 @@ def fetch_marketcast_reports(receipt: RoundReceipt, store) -> dict:
 
 
 def fetch_marketcast_inputs(receipt: RoundReceipt, reports: dict, store, *,
-                            snapshot_dir: Path | None = None) -> dict:
+                            snapshot_dir: Path | None = None, client=None,
+                            select: dict | None = None, instances: tuple = ()) -> dict:
     """DEC-CA-0064: the rest of what :func:`~cascade.audit.checks.
     check_marketcast` recomputes from — the trainer-signed lane-C manifests
     that carried each entry (``train_time``), the quantile sidecars the
     reports bind, and the verified snapshots found under ``snapshot_dir``
-    (one snapshot directory per child). Anything unreadable is left out (the
-    check WARNs on it)."""
+    (one snapshot directory per child) and — with a chain ``client`` — the
+    hash of every block a signed window draw names (DEC-CA-0074). Anything
+    unreadable is left out (the check WARNs on it)."""
     from ..shared.lane_c_manifest import lane_c_manifest_key
     from ..shared.marketcast_report import load_mkt_report
 
@@ -602,12 +608,17 @@ def fetch_marketcast_inputs(receipt: RoundReceipt, reports: dict, store, *,
             with contextlib.suppress(Exception, SystemExit):
                 manifests[er] = store.get_text(lane_c_manifest_key(er))
     quantiles: dict = {}
+    block_hashes: dict = {}
     for text in reports.values():
         try:
             rep = load_mkt_report(text)
         except (ValueError, KeyError, TypeError):
             continue
         for e in rep.entries:
+            b = dict(e.draw or {}).get("block")
+            if client is not None and isinstance(b, int) and b not in block_hashes:
+                with contextlib.suppress(Exception):
+                    block_hashes[b] = str(client.block_hash(int(b)))
             # the entry's sidecar and (red-team F4) its near-dup reference's
             for qk in (e.quantiles_key, str(dict(e.near_dup or {}).get("quantiles_key", ""))):
                 if qk and qk not in quantiles:
@@ -619,11 +630,31 @@ def fetch_marketcast_inputs(receipt: RoundReceipt, reports: dict, store, *,
 
         for d in sorted(Path(snapshot_dir).iterdir()):
             try:
-                snap = load_snapshot(d, verify_signature=False)
+                # DEC-CA-0075: the competition spec's series filter
+                snap = load_snapshot(d, verify_signature=False, select=select)
             except SnapshotError:
                 continue
             snapshots[snap.digest] = snap
-    return {"lane_c_manifests": manifests, "quantiles": quantiles, "snapshots": snapshots}
+    # W-CMP2: each spec instance reads its pools through its own select /
+    # channel map (its snapshots keyed apart from MarketCast's)
+    inst_snaps: dict = {}
+    if instances and snapshot_dir is not None and Path(snapshot_dir).is_dir():
+        from ..pool.marketcast import SnapshotError, load_snapshot
+
+        for kind, mc_i, _t in instances:
+            got: dict = {}
+            for d in sorted(Path(snapshot_dir).iterdir()):
+                try:
+                    snap = load_snapshot(d, verify_signature=False,
+                                         select=dict(mc_i.pool_select),
+                                         channels=dict(getattr(mc_i, "pool_channels", ())))
+                except SnapshotError:
+                    continue
+                got[snap.digest] = snap
+            inst_snaps[kind] = got
+    return {"lane_c_manifests": manifests, "quantiles": quantiles, "snapshots": snapshots,
+            **({"instance_snapshots": inst_snaps} if inst_snaps else {}),
+            **({"block_hashes": block_hashes} if client is not None else {})}
 
 
 def audit_receipt(
@@ -693,10 +724,15 @@ def audit_receipt(
         # init's sha256-pinned task rows the report names
         king_bench = {**king_bench,
                       "rows": validator_bench_rows(king_bench["report"], reader) or {}}
+    _blk = int(receipt.epoch_start_block)
+    _insts = tuple(getattr(cfg.lane_c, "instances", ()) or ())
     mkt_reports = (fetch_marketcast_reports(receipt, reader)
-                   if cfg.marketcast.active(int(receipt.epoch_start_block)) else None)
+                   if cfg.marketcast.active(_blk) or any(m.active(_blk) for _k, m, _t in _insts)
+                   else None)
     mkt_inputs = (fetch_marketcast_inputs(receipt, mkt_reports, reader,
-                                          snapshot_dir=mkt_snapshot_dir)
+                                          snapshot_dir=mkt_snapshot_dir, client=client,
+                                          select=dict(cfg.marketcast.pool_select),
+                                          instances=_insts)
                   if mkt_reports else None)
     pays_d = cfg.lane_d.active(int(receipt.epoch_start_block))
     if lane_d is _FETCH:
@@ -943,8 +979,16 @@ def _marketcast(args) -> int:  # pragma: no cover — network / storage glue
     cfg = apply_receipt_activation(cfg, receipt)
     reader = _BucketReader(cfg)
     reports = fetch_marketcast_reports(receipt, reader)
-    inputs = fetch_marketcast_inputs(receipt, reports, reader, snapshot_dir=args.mkt_snapshots)
-    results = [check_marketcast(receipt, cfg, reports, **inputs)]
+    client = None if args.no_chain else _chain_client(cfg, args.network)
+    inputs = fetch_marketcast_inputs(receipt, reports, reader, snapshot_dir=args.mkt_snapshots,
+                                     client=client, select=dict(cfg.marketcast.pool_select),
+                                     instances=tuple(getattr(cfg.lane_c, "instances", ())))
+    from .checks import _instance_inputs
+
+    results = [check_marketcast(receipt, cfg, reports, **_instance_inputs(inputs, None))]
+    # W-CMP2: every spec instance of the MarketCast runner
+    results += [check_marketcast(receipt, cfg, reports, **_instance_inputs(inputs, k), kind=k)
+                for k, _m, _t in tuple(getattr(cfg.lane_c, "instances", ()) or ())]
     if args.reproduce:
         from ..pool.marketcast_feeds import http_post_json
         from .marketcast_reproduce import reproduce_marketcast, timestral_forecaster_fn

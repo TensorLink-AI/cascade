@@ -408,7 +408,7 @@ class Chain:
         fc = self.forecasts if forecasts is None else forecasts
         if cfg is None:
             cfg = lane_d_cfg(min_windows=self.min_windows)
-        return settle_lane_d(cfg=cfg, boundary=boundary(n),
+        return settle_lane_d(**_rev614_ts(settle_lane_d, boundary(n)), cfg=cfg, boundary=boundary(n),
                              pool_dir=self.pools[n - 1], entries=[dict(self.x)],
                              house=dict(self.house), forecasts=fc, uid_of=dict(self.uid_of),
                              state_path=state_path, signer=self.signer, **kw)
@@ -495,3 +495,14 @@ def chain_fingerprint(chain: Chain, state_path: Path, upto: int) -> dict:
         out["bodies"].append(body_sha(s.report))
         out["states"].append(sha(state_path.read_bytes()))
     return out
+
+
+def _rev614_ts(settle, boundary) -> dict:
+    """rev6.14 (a): the fixture's on-chain boundary timestamp (far after every
+    fixture T + eval_delay_hours, 12 s per block), passed only where
+    ``settle_lane_d`` takes it."""
+    import inspect
+
+    if "boundary_ts" not in inspect.signature(settle).parameters:
+        return {}
+    return {"boundary_ts": 2_000_000_000 + 12 * int(boundary)}

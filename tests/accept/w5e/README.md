@@ -12,6 +12,11 @@ green.
 
 ### Verdict
 
+- **(rev6.23)** The bar is the crown bar in force at the settlement
+  (`crown_bar.bar`): `d_margin_start` at KING_D's tenure 0 (the house's
+  too), linear to `d_margin` at `d_margin_warmup_settlements`, flat after;
+  a crown restarts the tenure (`test_w5e_crown_bar.py`). Below, `d_margin`
+  means that bar.
 - A member clears iff `LCB_α ≥ d_margin` (inclusive) **and** its point gain
   is strictly positive. The LCB is the paired cluster bootstrap (clusters =
   source), max-T over the cohort, and doesn't depend on `d_margin`.

@@ -65,7 +65,8 @@ SKIP_REASONS = ("pending_floor", "coldkey_cap_settlement", "coldkey_unresolved",
                 "coldkey_changed", "king_unscored", "bench_hold", "deregistered",
                 "ready_expired", "reveal_delay_exceeded", "duplicate_digest",
                 "hotkey_has_open_entry", "context_not_armed", "checkpoint_fault",
-                "mirror_lag_exceeded", "lane_closed", "context_below_armed")
+                "mirror_lag_exceeded", "lane_closed", "context_below_armed",
+                "before_eval_delay", "boundary_ts_missing")
 # ``gate_regression``: a judged loss on the §1.3b gate, so an entry reason
 # and never a skip reason. rev6.18 A7: ``lowfreq_regression`` is gone.
 ENTRY_REASONS = SKIP_REASONS + ("lost_duel", "gate_regression", "crowned")
@@ -457,6 +458,35 @@ DRAW_SEED_TAG = "lane_d_windows"
 _SUBSCORE_RTOL = 1e-9
 
 
+def _check_judging_start(report: dict) -> None:
+    """rev6.14 (a): every cohort was frozen at a boundary stamped at or after
+    its judging start ``t_max + 3600 * eval_delay_hours`` (so never without
+    ``boundary_ts``); a ``before_eval_delay`` skip names an entry whose start
+    is still after ``boundary_ts``; ``boundary_ts_missing`` only without it."""
+    delay = 3600.0 * float(report["params"]["eval_delay_hours"])
+    if float(report["params"]["forward_margin_hours"]) > float(report["params"]["eval_delay_hours"]):
+        raise ReportSchemaError("bad_value", "params.forward_margin_hours",
+                                "above params.eval_delay_hours (b > j)")
+    bts = report.get("boundary_ts")
+    for i, c in enumerate(report["cohorts"]):
+        if bts is None:
+            raise ReportSchemaError("missing_field", "boundary_ts",
+                                    "a cohort was frozen without the boundary timestamp")
+        if bts < int(c["t_max"]) + delay:
+            raise ReportSchemaError("bad_value", _join("cohorts", i),
+                                    "frozen before its judging start (eval_delay_hours)")
+    reveal = {e["digest"]: int(e["reveal_ts"]) for e in report["entries"]}
+    king_t = int(report["king_before"]["reveal_ts"])
+    for i, sk in enumerate(report["skipped"]):
+        at = _join(_join("skipped", i), "reason")
+        if sk["reason"] == "boundary_ts_missing" and bts is not None:
+            raise ReportSchemaError("bad_value", at, "boundary_ts is present")
+        if sk["reason"] == "before_eval_delay":
+            t = reveal.get(sk["digest"])
+            if bts is None or t is None or bts >= max(t, king_t) + delay:
+                raise ReportSchemaError("bad_value", at, "the judging start has passed")
+
+
 def _check_below_armed(report: dict) -> None:
     """rev6.15: a ``context_below_armed`` skip (or entry reason) needs the
     signed armed set, and no armed variant may be <= the entry's declared
@@ -697,11 +727,26 @@ def _check_public(report: dict) -> None:
                                     "dropped windows not unique, sorted and drawn")
 
 
+def _check_host(report: dict) -> None:
+    """rev6.18 B7: a ``host`` record's ``identity`` hashes its other
+    fields (whether its env is qualified is the audit's check: it depends on
+    the boundary and the committed environment list)."""
+    if "host" not in report:
+        return
+    from ..shared.config.lane_d import host_record_problem
+
+    why = host_record_problem(report["host"])
+    if why:
+        raise ReportSchemaError("bad_value", "host", why)
+
+
 def _cross_field(report: dict) -> None:
     """The rules between fields, run after every structural check passes."""
     _check_public(report)
     _check_armed(report)
+    _check_host(report)
     _check_below_armed(report)
+    _check_judging_start(report)
     _check_windows_embargo(report)
     _check_window_channels(report)
     _check_cohort_split(report)

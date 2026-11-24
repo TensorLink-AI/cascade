@@ -185,8 +185,13 @@ re-derives everything that follows from it.
 | C5 pay: `pay.share == cfg.share`. The court is `[king_after] + prior_kings[:reward_prior_kings]`, king first, by recency. Each slot is `{digest, hotkey (None for the house), uid, burn_reason}`: `uid` is `uid_of[boundary][hotkey]` when the metagraph is given, and `burn_reason` is `None` iff `uid` is an int, else `house_king` (house slot) or `deregistered` | `pay.share`, `pay.court…` |
 | C6 held: a gate result whose digest has no verdict in this report is a held candidate only if an earlier report of the chain left that digest with a cleared, held first verdict (outcome `cleared`, gate absent or `bench_hold`). Nothing in between may have decided it, and its entry must be open (`hold` / `bench_hold`, rev6.11 (b)) in the previous report | `gate…` |
 
-**Pay shares.** Slot `i` of the court is worth `share * king_decay**i /
-sum_j king_decay**j`. A `None` uid burns. The shares sum to `share`. The
+**Pay shares.** Slot `i` of the court is worth `share * court_weights[i] /
+sum_{j < n} court_weights[j]` (rev6.23, owner 2026-11-24: 0.80 / 0.15 /
+0.05; `king_decay` retired). **(rev6.23) Crown bar.** The replay carries
+KING_D's tenure (0 at genesis, 1 after a crown or house retake, else + 1),
+requires each report's `crown_bar` to be `{tenure, margin}` at that tenure
+with the config's bar, judges every verdict against it, and checks the
+state snapshot's `king_tenure` is the next one. A `None` uid burns. The shares sum to `share`. The
 tests check them against an independent computation and against the
 producer's `emission.lane_d_vector` (the test may import it, the replay may
 not).
@@ -468,3 +473,7 @@ share would hold verdicts ~24 h. The default (loader, both shipped files) is
 **0.2**; fresh windows are still drawn first and always included. The tests
 that pinned the 0.5 default now pin 0.2. Lane D is not rolled out, so there is
 no activation key.
+
+## rev6.14 (a): judging start vs eligibility boundary (owner 2026-11-23)
+
+The replay re-derives the judging start from the signed `boundary_ts` and the T values: a cohort frozen before `t_max + 3600 * eval_delay_hours` is a MISMATCH at `cohorts[i].frozen_before_eval_delay`, a judged cohort without `boundary_ts` a MISMATCH at `boundary_ts`, and the params echo carries `eval_delay_hours`. Every fixture settlement passes the fixture clock. `test_w7d_rev614.py`.

@@ -6,7 +6,8 @@
   "type": "object",
   "required": ["schema", "boundary", "signer", "signature", "scoring_method", "params", "seed",
                "pool", "house", "king_before", "king_after", "crowned", "prior_kings", "entries",
-               "judged", "skipped", "cohorts", "windows", "verdicts", "rows", "rows_sha256", "pay"],
+               "judged", "skipped", "cohorts", "windows", "verdicts", "rows", "rows_sha256", "pay",
+               "crown_bar"],
   "additionalProperties": false,
   "properties": {
     "schema": {"type": "string", "const": "lane-d-report/1"},
@@ -32,14 +33,27 @@
     "rows": {"type": "array", "items": {"$ref": "#/$defs/row"}},
     "rows_sha256": {"$ref": "#/$defs/digest"},
     "pay": {"$ref": "#/$defs/pay"},
+    "crown_bar": {
+      "type": "object",
+      "description": "rev6.23: KING_D's tenure (lane D settlements it has held the crown, the house included) and the crown bar applied: d_margin_start falling linearly to d_margin over d_margin_warmup_settlements.",
+      "required": ["tenure", "margin"],
+      "additionalProperties": false,
+      "properties": {
+        "tenure": {"type": "integer", "minimum": 0},
+        "margin": {"type": "number", "exclusiveMinimum": 0}
+      }
+    },
     "gate": {"$ref": "#/$defs/gate"},
     "draw": {"$ref": "#/$defs/draw"},
     "public": {"$ref": "#/$defs/public"},
+    "boundary_ts": {"$ref": "#/$defs/timestamp",
+                    "description": "rev6.14 (a): the boundary block's on-chain Timestamp.Now (s); the judging start j = max(T_E, T_K) + 3600 * eval_delay_hours is applied against it. Absent (never null) on a settlement not handed it, which freezes and judges nothing (boundary_ts_missing)."},
     "armed_contexts": {
       "type": "array", "minItems": 1, "items": {"type": "integer", "minimum": 1},
       "description": "rev6.6: the variants armed at this settlement (ascending, a subset of params.contexts), present together with armed_evidence; absent on a settlement not handed the armed record."
     },
     "armed_evidence": {"$ref": "#/$defs/armed_evidence"},
+    "host": {"$ref": "#/$defs/host"},
     "extensions": {
       "type": "object",
       "description": "Open and never consensus: satellites must not read verdict, eligibility or weight inputs from it."
@@ -77,6 +91,20 @@
         "armed": {"type": "boolean"}
       }
     },
+    "host": {
+      "type": "object",
+      "description": "rev6.18 B7: the eval host every forecast of this settlement was computed on (B6: one host per cohort): its scoring environment (deploy/laned/scoring_envs.toml name, qualified at this boundary), GPU model and driver (nvidia-smi), torch build ('<torch.__version__>/cuda-<torch.version.cuda>'), fingerprint (sha256 of the GPU UUID) and identity (the B6 host identity: sha256 over the five, cascade.shared.config.lane_d.host_identity). Absent on a settlement not handed the host record.",
+      "required": ["env", "gpu_model", "driver", "torch_build", "fingerprint", "identity"],
+      "additionalProperties": false,
+      "properties": {
+        "env": {"type": "string", "minLength": 1},
+        "gpu_model": {"type": "string", "minLength": 1},
+        "driver": {"type": "string", "minLength": 1},
+        "torch_build": {"type": "string", "minLength": 1},
+        "fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "identity": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
     "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "timestamp": {"type": "integer", "minimum": 0},
     "entry_status": {"type": "string",
@@ -86,13 +114,15 @@
                              "coldkey_changed", "king_unscored", "bench_hold", "deregistered",
                              "ready_expired", "reveal_delay_exceeded", "duplicate_digest",
                              "hotkey_has_open_entry", "context_not_armed", "checkpoint_fault",
-                             "mirror_lag_exceeded", "lane_closed", "context_below_armed"]},
+                             "mirror_lag_exceeded", "lane_closed", "context_below_armed",
+                             "before_eval_delay", "boundary_ts_missing"]},
     "entry_reason": {"type": "string",
                      "enum": ["pending_floor", "coldkey_cap_settlement", "coldkey_unresolved",
                               "coldkey_changed", "king_unscored", "bench_hold", "deregistered",
                               "ready_expired", "reveal_delay_exceeded", "duplicate_digest",
                               "hotkey_has_open_entry", "context_not_armed", "checkpoint_fault",
                               "mirror_lag_exceeded", "lane_closed", "context_below_armed",
+                              "before_eval_delay", "boundary_ts_missing",
                               "lost_duel",
                               "gate_regression", "crowned"]},
     "burn_reason": {"type": "string", "enum": ["house_king", "deregistered"]},
@@ -130,13 +160,14 @@
       "description": "§14.3 item 2: every [lane_d] value a satellite needs, as parsed.",
       "required": ["share", "takes_from", "remainder", "horizon", "horizons", "contexts",
                    "forward_margin_hours", "max_mirror_lag_hours", "min_windows", "min_clusters",
-                   "d_margin", "alpha", "bootstrap_B", "king_decay", "reward_prior_kings",
+                   "d_margin", "d_margin_start", "d_margin_warmup_settlements", "alpha",
+                   "bootstrap_B", "court_weights", "reward_prior_kings",
                    "max_entries_per_settlement",
                    "max_judged_per_coldkey_per_settlement", "scoring_levels", "gate_suites",
                    "tau_public", "public_weight", "window_ratio_floor", "gate_weights",
                    "max_source_share",
                    "min_long_series", "embargo_hours", "max_windows_per_settlement",
-                   "min_fresh_window_share"],
+                   "min_fresh_window_share", "eval_delay_hours"],
       "additionalProperties": false,
       "properties": {
         "share": {"type": "number", "minimum": 0},
@@ -152,7 +183,10 @@
         "d_margin": {"type": "number"},
         "alpha": {"type": "number", "minimum": 0},
         "bootstrap_B": {"type": "integer", "minimum": 1},
-        "king_decay": {"type": "number", "minimum": 0},
+        "d_margin_start": {"type": "number"},
+        "d_margin_warmup_settlements": {"type": "integer", "minimum": 1},
+        "court_weights": {"type": "array", "minItems": 1,
+                          "items": {"type": "number", "minimum": 0}},
         "reward_prior_kings": {"type": "integer", "minimum": 0},
         "max_entries_per_settlement": {"type": "integer", "minimum": 0},
         "max_judged_per_coldkey_per_settlement": {"type": "integer", "minimum": 0},
@@ -178,7 +212,9 @@
         "max_windows_per_settlement": {"type": "integer", "minimum": 1,
                                        "description": "rev6.10 (b) / W5j: the settlement's judged-window budget."},
         "min_fresh_window_share": {"type": "number", "minimum": 0, "maximum": 1,
-                                   "description": "rev6.12 (b): the least share of fresh windows in a frozen set."}
+                                   "description": "rev6.12 (b): the least share of fresh windows in a frozen set."},
+        "eval_delay_hours": {"type": "number", "minimum": 0,
+                             "description": "rev6.14 (a): the judging start j = T + eval_delay_hours (>= forward_margin_hours)."}
       }
     },
     "pool": {
