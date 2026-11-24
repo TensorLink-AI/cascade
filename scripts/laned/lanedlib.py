@@ -9,8 +9,10 @@ Stdlib only.
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import itertools
 import json
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -127,9 +129,57 @@ def check_json_evidence(text: str | None, wp: str) -> tuple[bool, str]:
         return False, f"evidence wp={data.get('wp')!r}, expected {wp!r}"
     if wp == "W3a" and w3a_nolock_path_verified(data):
         return True, "ok"
+    if wp == "WB19" and data.get("passed") is False:
+        why = wb19_partial_problem(data)
+        return (True, "ok (partial WB19 evidence, rev6.16)") if why is None else (False, why)
     if data.get("passed") is not True:
         return False, "evidence does not record passed: true"
     return True, "ok"
+
+
+_WB19_MISSING = re.compile(r"missing expert runs: \[(.*)\]")
+
+
+def wb19_partial_problem(data: dict) -> str | None:
+    """Partial WB19 evidence (owner 2026-11-23, plan rev6.16) records
+    ``passed: false`` by design. It is accepted only when ``coverage`` is
+    its sole failing check, that check's detail names the missing SKUs (a
+    non-empty list, none of which has a table row), and ``body_sha256``
+    matches the body. WB19's own ``test_evidence_*`` tests re-derive the
+    candidate list from the shipped chain.toml and OA8; this is the
+    tooling's shape check. None = accepted, else the refusal reason."""
+    checks = data.get("checks")
+    if not isinstance(checks, list) or not checks or not all(
+            isinstance(c, dict) and isinstance(c.get("name"), str)
+            and isinstance(c.get("passed"), bool) for c in checks):
+        return "partial WB19 evidence: checks malformed"
+    failing = [c for c in checks if not c["passed"]]
+    if [c["name"] for c in failing] != ["coverage"]:
+        return ("partial WB19 evidence: coverage must be the sole failing check (failing: "
+                + ", ".join(sorted(c["name"] for c in failing)) + ")")
+    m = _WB19_MISSING.search(str(failing[0].get("detail", "")))
+    missing = re.findall(r"'([^']+)'", m.group(1)) if m else []
+    if not missing:
+        return "partial WB19 evidence: the coverage detail names no missing SKU"
+    table = data.get("table")
+    rows = table.get("rows") if isinstance(table, dict) else None
+    if not isinstance(rows, dict) or not rows:
+        return "partial WB19 evidence: no measured rows"
+    measured = {str(k).lower() for k in rows}
+    named_measured = sorted(s for s in missing if s.lower() in measured)
+    if named_measured:
+        return (f"partial WB19 evidence: coverage names measured SKU(s) as missing: "
+                f"{named_measured}")
+    sha = data.get("body_sha256")
+    body = {k: v for k, v in data.items() if k != "body_sha256"}
+    try:
+        want = hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":"),
+                                         allow_nan=False).encode()).hexdigest()
+    except ValueError:
+        return "partial WB19 evidence: body is not canonical JSON"
+    if sha != want:
+        return "partial WB19 evidence: body_sha256 does not match the body"
+    return None
 
 
 def w3a_nolock_path_verified(data: dict) -> bool:
@@ -370,21 +420,38 @@ def is_coupled_impl_commit(files: list[str], group: list[list[str]]) -> bool:
 
 def impl_commit_index(history: list[tuple[str, list[str]]], wp: str, paths: list[str],
                       others: list[list[str]] | None = None,
-                      coupled: list[list[list[str]]] | None = None) -> int | None:
-    """The L2 commit (plan §17.1): the first commit after the one that added
-    the WP's PATHS file that changes something outside tests/accept/ and only
-    paths inside PATHS, i.e. the WP's implementation merge. With ``others``
-    (every other WP's PATHS) a batch implementation merge counts too
-    (is_batch_impl_commit); with ``coupled`` (per declared coupled set holding
-    the WP, every member's PATHS) a coupled implementation merge counts too
-    (is_coupled_impl_commit). None when absent."""
+                      coupled: list[list[list[str]]] | None = None,
+                      subjects: dict[str, str] | None = None,
+                      pr_labels: dict[int, set[str]] | None = None) -> int | None:
+    """The L2 commit (plan §17.1).
+
+    LABELLED rule (rev6.17): a commit whose subject ends ``(#N)`` with N's
+    labels known (``pr_labels``: from the GitHub PR list and the ledger's PR
+    rows) is the WP's L2 commit iff the PR carried ``laned:<WP>`` AND the
+    commit changes at least one non-test path (outside tests/) its PATHS
+    match. A known PR without the label is never the WP's L2, whatever paths
+    it touches (#817: broad PATHS made W5i read L2 from another WP's merge).
+    It may be the commit that adds the PATHS file (a combined PR).
+
+    Legacy git-only rule (a commit with no PR number or unknown labels): the
+    first commit after the one that added the WP's PATHS file that changes
+    something outside tests/accept/ and only paths inside PATHS. With
+    ``others`` (every other WP's PATHS) a batch implementation merge counts
+    too (is_batch_impl_commit); with ``coupled`` (per declared coupled set
+    holding the WP, every member's PATHS) a coupled implementation merge
+    counts too (is_coupled_impl_commit). None when absent."""
     rel = f"tests/accept/{wp_dir(wp)}/PATHS"
     start = next((i for i, (_, files) in enumerate(history) if rel in files), None)
     if start is None:
         return None
-    for i in range(start + 1, len(history)):
-        files = history[i][1]
-        if not files or all(f.startswith("tests/accept/") for f in files):
+    for i in range(start, len(history)):
+        sha, files = history[i]
+        labels = labels_of_commit(subjects, pr_labels, sha)
+        if labels is not None:
+            if wp in labels and any(not is_test_path(f) and path_matches(f, paths) for f in files):
+                return i
+            continue
+        if i == start or not files or all(f.startswith("tests/accept/") for f in files):
             continue
         if all(path_matches(f, paths) for f in files) or is_batch_impl_commit(files, paths, others) \
                 or any(is_coupled_impl_commit(files, g) for g in coupled or ()):
@@ -393,7 +460,170 @@ def impl_commit_index(history: list[tuple[str, list[str]]], wp: str, paths: list
 
 
 # ---------------------------------------------------------------------------
-# Coupled batches (one implementation PR for WPs whose code must land together)
+# Feature PRs (rev6.17): the squash merge of a green laned:* PR, by PR number
+# ---------------------------------------------------------------------------
+
+# The GitHub squash / merge-queue subject ends with "(#<PR number>)".
+PR_SUBJECT = re.compile(r"\(#(\d+)\)\s*$")
+# A PR label that is a flag, never a WP: lets a combined (tests + code) PR
+# delete or weaken existing assertions of its WPs' tests (accept --check-pr).
+CORRECTION_LABEL = "tests-correction"
+# PR-run ledger modes whose green result attributes the PR's squash merge.
+PR_MERGE_MODES = ("accept", "combined")
+LEDGER_REFS = ("origin/laned/build-state", "laned/build-state")
+LEDGER_FILE = "status/ci_runs.json"
+
+
+def pr_number(subject: str) -> int | None:
+    m = PR_SUBJECT.search(subject or "")
+    return int(m.group(1)) if m else None
+
+
+def labels_of_commit(subjects: dict[str, str] | None, pr_labels: dict[int, set[str]] | None,
+                     sha: str) -> set[str] | None:
+    """The laned WP labels of the PR whose squash merge is ``sha`` (subject
+    ``... (#N)``), or None when unknown (no PR number, or N not in ``pr_labels``)."""
+    if not subjects or pr_labels is None:
+        return None
+    n = pr_number(subjects.get(sha, ""))
+    return pr_labels.get(n) if n is not None else None
+
+
+def parse_pr_labels(text: str | None) -> dict[int, set[str]]:
+    """``{PR number: {WP, ...}}`` from ``gh pr list --json number,labels``
+    output (a list of ``{"number", "labels": [{"name"}]}``) or a plain
+    ``{"<N>": ["laned:W1", ...]}`` map. Only ``laned:<WP>`` labels count
+    (the laned:tests-correction flag is not a WP); a PR with none maps to an
+    empty set (known: carries no WP label)."""
+    try:
+        data = json.loads(text) if text else None
+    except json.JSONDecodeError:
+        return {}
+    items: list[tuple[object, object]] = []
+    if isinstance(data, list):
+        items = [(d.get("number"), [x.get("name") if isinstance(x, dict) else x
+                                    for x in d.get("labels") or []])
+                 for d in data if isinstance(d, dict)]
+    elif isinstance(data, dict):
+        items = list(data.items())
+    out: dict[int, set[str]] = {}
+    for n, labels in items:
+        try:
+            num = int(n)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            continue
+        out[num] = {str(lab).split(":", 1)[1] for lab in labels or []  # type: ignore[union-attr]
+                    if isinstance(lab, str) and lab.startswith("laned:") and lab != f"laned:{CORRECTION_LABEL}"}
+    return out
+
+
+def pr_labels_from_runs(runs: list[dict]) -> dict[int, set[str]]:
+    """``{PR number: {WP, ...}}`` from ledger rows with a ``pr`` field (the PR
+    job records a row per laned:<WP> label)."""
+    out: dict[int, set[str]] = {}
+    for r in runs:
+        pr = r.get("pr")
+        if isinstance(pr, int) and not isinstance(pr, bool) and isinstance(r.get("wp"), str) \
+                and r.get("event") == "pull_request":
+            out.setdefault(pr, set()).add(r["wp"])
+    return out
+
+
+def merge_pr_labels(*maps: dict[int, set[str]]) -> dict[int, set[str]]:
+    out: dict[int, set[str]] = {}
+    for m in maps:
+        for n, labels in m.items():
+            out.setdefault(n, set()).update(labels)
+    return out
+
+
+def pr_labels_file() -> dict[int, set[str]]:
+    """``$LANED_PR_LABELS`` (``gh pr list --state merged --json number,labels``
+    written by the workflow), or none."""
+    env = os.environ.get("LANED_PR_LABELS")
+    if not env or not Path(env).is_file():
+        return {}
+    return parse_pr_labels(Path(env).read_text(encoding="utf-8"))
+
+
+def first_parent_subjects(root: Path, ref: str) -> dict[str, str]:
+    """``{sha: subject}`` along ``ref``'s first-parent line."""
+    out = git(root, "log", "--first-parent", "--format=%H%x09%s", ref, check=False).stdout
+    subjects: dict[str, str] = {}
+    for line in out.splitlines():
+        sha, _, subject = line.partition("\t")
+        if sha:
+            subjects[sha] = subject
+    return subjects
+
+
+def green_pr_numbers(runs: list[dict], wp: str, modes: tuple[str, ...] = PR_MERGE_MODES) -> set[int]:
+    """PR numbers whose LAST pull_request ledger row for ``wp`` (any of
+    ``modes``, or a check-pr row) is a green row in one of ``modes``: a PR
+    that went red (or failed check-pr) after a green run never counts."""
+    last: dict[int, dict] = {}
+    for r in runs:
+        pr = r.get("pr")
+        if (r.get("wp") != wp or r.get("event") != "pull_request"
+                or r.get("mode") not in (*PR_MERGE_MODES, "check-pr")
+                or not isinstance(pr, int) or isinstance(pr, bool)):
+            continue
+        if pr not in last or str(r.get("created_at", "")) >= str(last[pr].get("created_at", "")):
+            last[pr] = r
+    return {pr for pr, r in last.items() if r.get("mode") in modes and r.get("conclusion") == "success"}
+
+
+def pr_merge_index(history: list[tuple[str, list[str]]], subjects: dict[str, str], wp: str,
+                   paths: list[str], prs: set[int], need_tests: bool = False) -> int | None:
+    """The first first-parent commit that is the squash merge (subject
+    ``... (#N)``) of a PR in ``prs`` and changes a path the WP owns: one its
+    PATHS match or one under tests/accept/<wp>/ (with ``need_tests``: some
+    file under tests/accept/<wp>/). At or after the commit adding the PATHS
+    file (a combined PR may add it in the same merge). None when absent."""
+    if not prs:
+        return None
+    own = f"tests/accept/{wp_dir(wp)}/"
+    rel = own + "PATHS"
+    start = next((i for i, (_, files) in enumerate(history) if rel in files), None)
+    if start is None:
+        return None
+    for i in range(start, len(history)):
+        sha, files = history[i]
+        m = PR_SUBJECT.search(subjects.get(sha, ""))
+        if not m or int(m.group(1)) not in prs:
+            continue
+        tests = any(f.startswith(own) for f in files)
+        if (tests if need_tests else tests or any(path_matches(f, paths) for f in files)):
+            return i
+    return None
+
+
+def ledger_runs(root: Path) -> list[dict]:
+    """The CI results ledger (``status/ci_runs.json`` on laned/build-state):
+    ``$LANED_LEDGER`` (a file) when set, else the first of LEDGER_REFS that
+    has it, else none. Used by ``accept`` to see feature-PR L2 merges."""
+    env = os.environ.get("LANED_LEDGER")
+    text: str | None = None
+    if env:
+        p = Path(env)
+        text = p.read_text(encoding="utf-8") if p.is_file() else None
+    else:
+        for ref in LEDGER_REFS:
+            proc = git(root, "show", f"{ref}:{LEDGER_FILE}", check=False)
+            if proc.returncode == 0:
+                text = proc.stdout
+                break
+    try:
+        data = json.loads(text) if text else {}
+    except json.JSONDecodeError:
+        return []
+    runs = data.get("runs") if isinstance(data, dict) else None
+    return [r for r in runs if isinstance(r, dict)] if isinstance(runs, list) else []
+
+
+# ---------------------------------------------------------------------------
+# Coupled batches (legacy since rev6.17: still read for L2 attribution of
+# merges made under the COUPLED rule; check-pr no longer needs them)
 # ---------------------------------------------------------------------------
 
 COUPLED_BATCHES_PATH = "scripts/laned/coupled_batches"
