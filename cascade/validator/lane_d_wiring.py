@@ -114,7 +114,9 @@ class LaneDInputs:
     (``None``: the legacy call, no armed fields in the report).
     ``channel_block_hash`` (rev6.18 A4, F2) is the block hash the source
     picked the channels of an over-cap multichannel window with (``None``
-    when no window needed one); it must be the settlement's own."""
+    when no window needed one); it must be the settlement's own.
+    ``public_indexes`` / ``public_scores`` (rev6.18 A3, F4): the public
+    half, passed to ``settle_lane_d`` (``None`` at ``public_weight = 0``)."""
 
     pool_dir: Any
     entries: list
@@ -124,12 +126,21 @@ class LaneDInputs:
     prior_pool_dirs: tuple = ()
     armed: Mapping | None = None
     channel_block_hash: str | None = None
+    public_indexes: Mapping | None = None
+    public_scores: Mapping | None = None
 
 
 def _armed_of(inp: Any) -> dict | None:
     """``inp.armed`` as a plain dict (``None`` when absent: the legacy call)."""
     armed = getattr(inp, "armed", None)
     return None if armed is None else dict(armed)
+
+
+def _mapping_of(inp: Any, name: str) -> dict | None:
+    """``inp.<name>`` as a plain dict (``None`` when absent: rev6.18 F4's
+    public half off, or an older inputs source)."""
+    v = getattr(inp, name, None)
+    return None if v is None else dict(v)
 
 
 def _max_channels(cfg: Any) -> int | None:
@@ -293,7 +304,9 @@ class LaneDStep:
                               signer=self.signer, prior_pool_dirs=tuple(inp.prior_pool_dirs),
                               expect_prior_sha256=expect, boundary_block_hash=block_hash,
                               sentinel=sentinel, bench=bench, armed=_armed_of(inp),
-                              max_channels=_max_channels(self.cfg))
+                              max_channels=_max_channels(self.cfg),
+                              public_indexes=_mapping_of(inp, "public_indexes"),
+                              public_scores=_mapping_of(inp, "public_scores"))
         except Exception as e:  # noqa: BLE001 — LaneDStateError, schema, pool or crash
             raise LaneDWiringError("settle_refused",
                                    f"settlement {boundary} refused ({e})") from e

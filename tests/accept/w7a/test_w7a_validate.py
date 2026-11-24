@@ -147,23 +147,27 @@ def test_every_params_field_is_required(scratch, name):
     ("windows", 0, "mirror_lag_hours"), ("windows", 0, "feed"),
     ("entries", 0, "coldkey"), ("entries", 0, "reason"),
     ("cohorts", 0, "first_seen_roots"), ("cohorts", 0, "refused"),
-    ("verdicts", 0, "lowfreq"),
+    ("verdicts", 0, "halves"), ("verdicts", 0, "sources"), ("verdicts", 0, "domains"),
     ("pool", None, "first_seen_roots"),
 ])
 def test_nested_fields_are_required(scratch, path):
     r = _s2(scratch)
     top, idx, key = path
     obj = r[top] if idx is None else r[top][idx]
+    assert key in obj, f"the report has no {top}.{key}"
     del obj[key]
     field = f"{top}.{key}" if idx is None else f"{top}[{idx}].{key}"
     _refused(scratch, r, "missing_field", field)
 
 
 def test_nested_lowfreq_and_court_fields_are_required(scratch):
-    for key in ("result", "freqs", "n_windows", "tau_public"):
+    # rev6.18 A7 / A8 (F4): the removed lowfreq block's fields become the
+    # live half's point-gain fields.
+    for key in ("n", "gain"):
         r = _s2(scratch)
-        del r["verdicts"][0]["lowfreq"][key]
-        _refused(scratch, r, "missing_field", f"verdicts[0].lowfreq.{key}")
+        assert "halves" in r["verdicts"][0], "F4: verdicts carry their per-half point gains"
+        del r["verdicts"][0]["halves"]["live"][key]
+        _refused(scratch, r, "missing_field", f"verdicts[0].halves.live.{key}")
     r = _s2(scratch)
     del r["pay"]["court"][0]["burn_reason"]
     _refused(scratch, r, "missing_field", "pay.court[0].burn_reason")
@@ -222,7 +226,8 @@ def test_inv11_null_entry_reason_is_refused(scratch):
     (("entries", 0, "reason"), "lost_confirmation"),
     (("verdicts", 0, "outcome"), "confirm_pending"),
     (("verdicts", 0, "outcome"), "confirmed"),
-    (("verdicts", 0, "lowfreq", "result"), "skipped"),
+    (("verdicts", 0, "halves", "live", "n"), 0),
+    (("entries", 0, "reason"), "lowfreq_regression"),
     (("pool", "sha256"), "abc"),
     (("pool", "first_seen_roots", 0), "not-a-root"),
     (("rows_sha256",), "Z" * 64),
@@ -231,6 +236,7 @@ def test_values_outside_the_enum_or_format_are_refused(scratch, path, value):
     r = _s2(scratch)
     obj = r
     for p in path[:-1]:
+        assert isinstance(obj, list) or p in obj, f"the report has no {path[:-1]}"
         obj = obj[p]
     obj[path[-1]] = value
     field = path[0] + "".join(f"[{p}]" if isinstance(p, int) else f".{p}" for p in path[1:])

@@ -753,7 +753,8 @@ The fields added for lane D replay:
 | `skipped` | top level | One typed skip reason per digest; must match `entries[].reason`, and no open entry may be silently omitted |
 | `coldkey` | `entries[]` | The coldkey recorded at `ready` (null while unresolved); replayed at the same trust level as the rows, so no archive node is needed |
 | `confirmation` | `verdicts[]` | Stage, rule, first-clear set and the king at the first clear; the confirmation set must be disjoint from the first |
-| `lowfreq` | `verdicts[]` | The low-frequency check result; its LCBs are re-derived against `-tau_public` for `pass` and `fail` |
+| `halves` | `verdicts[]` | rev6.18 A3/A8: the live (forward) and public half point gains with their window counts; with `sources` (live, GiftEvalPretrain, RMISC) and `domains` (bootstrap clusters) re-derived from the signed rows, as are the combined `lcb` / `gain` and the clear (`LCB ≥ d_margin` and both halves' gains > 0) |
+| `rows` / `rows_sha256` | `public` | rev6.18 A3: every judged model's score on every kept public window (drawn minus dropped); the digest is re-derived (burn class `ld_rows_sha256`) and the rows feed the verdict re-derivation |
 | `min_target_ts` | `windows[]` | The data-time clock: the earliest target point's timestamp, which must be after max(T) plus `forward_margin_hours` |
 | `min_first_seen_ts` | `windows[]` | The first-seen clock: the earliest first-seen time over the target points, which must be after the same bound |
 | `mirror_lag_hours` | `windows[]` | The feed's measured mirror lag, checked against `max_mirror_lag_hours` |

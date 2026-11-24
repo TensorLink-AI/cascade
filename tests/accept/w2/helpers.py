@@ -68,7 +68,6 @@ W2_DEFAULTS: dict[str, object] = {
     "max_judged_per_coldkey_per_settlement": 2,
     "max_coldkey_unresolved_settlements": 4,
     "max_reveal_delay_days": 14,
-    "lowfreq_freqs": None,             # "daily and slower" (checked separately)
     "ready_ttl_blocks": None,          # no plan default: a positive integer
     "max_source_share": 0.25,
 }
@@ -132,7 +131,6 @@ MUTATIONS: dict[str, tuple[object, object, dict]] = {
     "max_judged_per_coldkey_per_settlement": (1, 3, {}),
     "max_coldkey_unresolved_settlements": (6, 2, {}),
     "max_reveal_delay_days": (7, 21, {}),
-    "lowfreq_freqs": (["W"], ["D", "W"], {}),
     "ready_ttl_blocks": (1800, 2700, {}),
     "max_source_share": (0.5, 0.1, {}),
 }
@@ -174,7 +172,6 @@ REFUSED: dict[str, list[object]] = {
     "max_judged_per_coldkey_per_settlement": [0, -1, True],
     "max_coldkey_unresolved_settlements": [0, -1, True],
     "max_reveal_delay_days": [0, -1, True],
-    "lowfreq_freqs": [[], [""], [1], "D"],
     "ready_ttl_blocks": [0, -1, True, 1.5],
     "max_source_share": [0.0, -0.1, 1.5, True],
 }

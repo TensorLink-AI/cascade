@@ -417,11 +417,13 @@ def test_retired_keys_load_and_are_ignored(tmp_path):
         ValidatorConfig,
         load_chain_config,
     )
+    from cascade.shared.config.lane_d import LaneDConfig
 
     live = {"round": {f.name for f in dataclasses.fields(RoundConfig)},
             "telemetry": {f.name for f in dataclasses.fields(TelemetryConfig)},
             "eval": {f.name for f in dataclasses.fields(EvalConfig)},
-            "validator": {f.name for f in dataclasses.fields(ValidatorConfig)}}
+            "validator": {f.name for f in dataclasses.fields(ValidatorConfig)},
+            "lane_d": {f.name for f in dataclasses.fields(LaneDConfig)}}
     for section, keys in RETIRED_KEYS.items():
         assert not keys & live[section], f"[{section}] retired key is a live field"
 
@@ -432,7 +434,10 @@ def test_retired_keys_load_and_are_ignored(tmp_path):
     extra = {"round": "\n".join(f"{k} = 1" for k in sorted(RETIRED_KEYS["round"])
                                 if f"\n{k} " not in text and f"\n{k}=" not in text),
              "telemetry": "\n".join(f"{k} = 1" for k in sorted(RETIRED_KEYS["telemetry"])
-                                    if f"\n{k} " not in text)}
+                                    if f"\n{k} " not in text),
+             # rev6.18 F4 (A7, D24): a deployed file still carries these
+             "lane_d": "\n".join(f"{k} = 1" for k in sorted(RETIRED_KEYS["lane_d"])
+                                 if f"\n{k} " not in text)}
     for section, lines in extra.items():
         if lines:
             text = text.replace(f"\n[{section}]\n", f"\n[{section}]\n{lines}\n", 1)

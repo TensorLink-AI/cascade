@@ -126,3 +126,11 @@ builder admits `share = 1.0`; these tests don't require that.
 Mainnet eras are 3600 blocks (900 × 4) and testnet eras 600 (150 × 4), so the
 blocks below are era boundaries on both: `from_block` 9 720 000 / 9 723 600,
 `until_block` 9 806 400 / 9 828 000, overlay `effective_block` 9 712 800.
+
+## Correction (rev6.18 A7, F4; owner 2026-11-23)
+
+"The low-frequency check A10 is removed." `lowfreq_freqs` is no longer a
+`[lane_d]` key: it leaves `W2_DEFAULTS`, `MUTATIONS`, `REFUSED` and the
+overlay values, and `test_w2_lowfreq_freqs_default_is_daily_and_slower`
+becomes `test_w2_lowfreq_freqs_is_retired` (the loader ignores the key, listed
+in `RETIRED_KEYS["lane_d"]`; the shipped files drop the line).

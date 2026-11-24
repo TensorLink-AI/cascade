@@ -23,3 +23,7 @@ cascade/audit/lane_d_chain.py
 # rev6.18 A4 (F2): the wiring passes [generator] max_channels to settle_lane_d
 # and refuses inputs whose channels were picked by another block hash.
 cascade/validator/lane_d_wiring.py
+# rev6.18 A3 (F4): the generic two-part max-T statistic and the clamp.
+cascade/eval/bootstrap.py
+# rev6.18 A3 (F4): the public draw the settlement binds the scores to.
+cascade/validator/lane_d_public.py

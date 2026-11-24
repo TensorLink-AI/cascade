@@ -11,7 +11,7 @@ from pathlib import Path
 from .chain_config import ChainConfig
 from .generation import parse_generation
 from .lane_c import parse_lane_c
-from .lane_d import parse_lane_d
+from .lane_d import RETIRED_LANE_D_F4_KEYS, parse_lane_d
 from .marketcast import check_marketcast_arming, parse_marketcast
 from .money import parse_money_safety, parse_validator_cache
 from .reliability import parse_reliability
@@ -98,6 +98,8 @@ RETIRED_KEYS: dict[str, frozenset[str]] = {
         "dedup_max_tokens", "duel_from_block", "funded_activation_block",
     }),
     "telemetry": frozenset({"scratch_shadow_every_rounds"}),
+    # rev6.18 F4 (A7, D24): the W5i backtest keys and the A10 slice.
+    "lane_d": RETIRED_LANE_D_F4_KEYS,
     # Parsed by older releases (hf_cache_seconds was REQUIRED there), read by none.
     "eval": frozenset({"eval_source"}),
     "validator": frozenset({"hf_cache_seconds"}),

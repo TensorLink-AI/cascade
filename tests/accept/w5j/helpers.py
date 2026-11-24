@@ -31,6 +31,13 @@ STEP = {"10s": 10, "1min": 60, "5min": 300, "15min": 900, "H": 3600}
 T0 = 1_790_000_000
 
 
+# rev6.18 F4 (A3): these fixtures pin the live-only rule: the public half off
+# (public_weight = 0, a spec setting) and no per-window ratio clamp in effect
+# (a floor far below any fixture ratio), so their pre-F4 numbers stand. F4's
+# own tests (tests/accept/w5e/test_w5e_combined.py) pin the combined rule.
+LIVE_ONLY = {"public_weight": 0.0, "window_ratio_floor": 1e-9}
+
+
 def lane_d_cfg(**over):
     """The real parse of an armed [lane_d] table with small floors."""
     from cascade.shared.config.lane_d import parse_lane_d
@@ -39,7 +46,7 @@ def lane_d_cfg(**over):
            "remainder": "burn", "horizon": HORIZON, "min_windows": 24, "min_clusters": 4,
            "max_source_share": 0.25, "bootstrap_B": 200,
            "max_windows_per_settlement": 60, "min_fresh_window_share": 0.5}
-    return parse_lane_d({**raw, **over}, era_blocks_at=lambda _block: ERA)
+    return parse_lane_d({**raw, **LIVE_ONLY, **over}, era_blocks_at=lambda _block: ERA)
 
 
 def seed_string(block_hash: str) -> str:

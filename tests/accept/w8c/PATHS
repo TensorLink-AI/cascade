@@ -18,3 +18,7 @@ cascade/validator/main.py
 # rev6.6 armed contexts (README "Armed contexts"): W8b's LaneDInputs gains
 # the optional `armed` record and the step passes it to settle_lane_d(armed=).
 cascade/validator/lane_d_wiring.py
+# rev6.18 A7 (F4): the forecast check the fault tests use moved into lane_d.py.
+cascade/validator/lane_d.py
+# rev6.18 A3 (F4): the public draw the inputs source runs.
+cascade/validator/lane_d_public.py

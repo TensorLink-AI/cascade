@@ -200,7 +200,8 @@ def _verdict(king_rows, member_rows, windows):
 
     from cascade.validator.lane_d import judge_cohort
 
-    cfg = SimpleNamespace(alpha=0.05, bootstrap_B=200, d_margin=0.0)
+    cfg = SimpleNamespace(alpha=0.05, bootstrap_B=200, d_margin=0.0, public_weight=0.0,
+                          window_ratio_floor=1e-9)  # rev6.18 F4: the live-only rule
     arr = lambda rows: (np.array([rows[w][0] for w in windows]),  # noqa: E731
                         np.array([rows[w][1] for w in windows]))
     names = sorted(member_rows)

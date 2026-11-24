@@ -7,6 +7,7 @@ import pytest
 
 from .helpers import (
     MUTATIONS,
+    RETIRED,
     SHIPPED,
     W2E_DEFAULTS,
     W2E_KEYS,
@@ -39,15 +40,33 @@ def test_w2e_max_windows_default_is_5000_not_2000(name):
 
 
 @pytest.mark.parametrize("name", SHIPPED)
-def test_w2e_backtest_cap_default_is_on_and_meets_the_inequality(name):
-    """Owner 2026-11-23: backtest_weight_cap defaults to 0.05 (ON at launch),
-    which the rev6.9 (a) check admits at the default floor and d_margin:
-    1 - 0.85 ** 0.05 ~ 0.0081 < 0.01."""
-    ld = load_ok(raw_with(name, drop=("backtest_weight_cap",))).lane_d
-    cap = field(ld, "backtest_weight_cap")
-    assert same(cap, 0.05), f"backtest_weight_cap default {cap!r}, owner says 0.05"
-    floor = float(field(ld, "backtest_ratio_floor"))
-    assert 1.0 - floor ** float(cap) < float(ld.d_margin)
+def test_w2e_backtest_and_lowfreq_keys_are_retired(name):
+    """rev6.18 D24 (owner 2026-11-24: backtest dropped) and A7 (owner
+    2026-11-23: A10 removed). Correction of the rev6.15 (b) test that pinned
+    backtest_weight_cap = 0.05: the keys are deleted. The shipped files carry
+    none of them; a deployed table that still does loads and ignores them,
+    even at values the deleted rev6.9 inequality refused; the loader lists
+    them in RETIRED_KEYS["lane_d"]."""
+    from cascade.shared.config import RETIRED_KEYS
+
+    table = shipped_raw(name).get("lane_d") or {}
+    assert not set(RETIRED) & set(table), f"{name} [lane_d] still carries {set(RETIRED) & set(table)}"
+    ld = load_ok(raw_with(name, {"backtest_weight_cap": 0.5, "backtest_ratio_floor": 0.1,
+                                 "lowfreq_freqs": ["D"]}), " with the retired keys").lane_d
+    for k in RETIRED:
+        assert not hasattr(ld, k), f"LaneDConfig still parses the retired key {k!r}"
+    assert set(RETIRED) <= set(RETIRED_KEYS.get("lane_d") or ()), (
+        "RETIRED_KEYS['lane_d'] does not list the rev6.18 F4 keys")
+
+
+@pytest.mark.parametrize("name", SHIPPED)
+def test_w2e_public_weight_is_not_tied_to_d_margin(name):
+    """rev6.18 A3: public_weight is NOT subject to the deleted backtest loader
+    rule: any w in [0, 1) loads at any d_margin."""
+    ld = load_ok(raw_with(name, {"public_weight": 0.95, "d_margin": 0.0001,
+                                 "window_ratio_floor": 0.01})).lane_d
+    assert same(field(ld, "public_weight"), 0.95)
+    assert same(field(ld, "window_ratio_floor"), 0.01)
 
 
 @pytest.mark.parametrize("name", SHIPPED)

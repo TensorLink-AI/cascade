@@ -22,9 +22,12 @@ included), the cross-field rules of :func:`_cross_field` (snapshot binding,
 a crowned report carries a gate record (W5e, RV5) holding a ``pass`` for the
 crowned digest, the gate record's consistency with the report, the
 W5c house bar's ``house_digest`` / ``verdicts[].house`` binding,
-``gate_weights`` keys, the W3b5 ``verdicts[].lowfreq`` LCBs present exactly
-for ``pass``/``fail`` and consistent with ``tau_public``), and
-``rows_sha256`` is the canonical digest of ``rows`` (checked last). The
+``gate_weights`` keys, rev6.18 F4's per-half / per-source / per-domain
+point gains (:func:`_check_halves`: the public half present exactly at
+``public_weight > 0``, a clear needs ``lcb >= d_margin`` and both halves'
+gains > 0) and the public rows' coverage), and ``rows_sha256`` is the
+canonical digest of ``rows`` and ``public.rows_sha256`` of ``public.rows``
+(checked last). The
 signature is :func:`verify_report`'s job.
 
 Light imports only: this module sits on the validator package's import path.
@@ -63,10 +66,9 @@ SKIP_REASONS = ("pending_floor", "coldkey_cap_settlement", "coldkey_unresolved",
                 "ready_expired", "reveal_delay_exceeded", "duplicate_digest",
                 "hotkey_has_open_entry", "context_not_armed", "checkpoint_fault",
                 "mirror_lag_exceeded", "lane_closed", "context_below_armed")
-# ``gate_regression``: a judged loss on the §1.3b gate (like
-# ``lowfreq_regression``), so an entry reason and never a skip reason.
-ENTRY_REASONS = SKIP_REASONS + ("lost_duel", "lowfreq_regression", "gate_regression",
-                                "crowned")
+# ``gate_regression``: a judged loss on the §1.3b gate, so an entry reason
+# and never a skip reason. rev6.18 A7: ``lowfreq_regression`` is gone.
+ENTRY_REASONS = SKIP_REASONS + ("lost_duel", "gate_regression", "crowned")
 BURN_REASONS = ("house_king", "deregistered")
 # The §1.3b paired gate's outcomes and references: W3b2's
 # ``lane_d_bench.OUTCOMES`` / ``REFS`` (stated here, not imported, to keep this
@@ -74,10 +76,9 @@ BURN_REASONS = ("house_king", "deregistered")
 GATE_OUTCOMES = ("pass", "gate_regression", "checkpoint_fault", "bench_hold")
 GATE_REFS = ("king_d", "house")
 # rev6.11 (b): a crown is decided at the first verdict; ``cleared`` is a
-# first clear that passed A10 and was not crowned (held by the gate, or a
-# passing non-best candidate).
+# first clear that was not crowned (held by the gate, or a passing non-best
+# candidate).
 CONFIRMATION_STAGES = ("first",)
-LOWFREQ_RESULTS = ("pass", "fail", "no_windows", "not_candidate")
 VERDICT_OUTCOMES = ("lost", "cleared", "crowned")
 SCHEMA_ERROR_CODES = ("not_object", "unknown_schema", "missing_field", "unknown_field",
                       "bad_type", "bad_value", "rows_sha256_mismatch")
@@ -342,36 +343,71 @@ def _check_house(report: dict) -> None:
                                     "not the cohort's house_digest")
 
 
-def _check_lowfreq(report: dict) -> None:
-    """W3b5 (A10): a verdict's ``lowfreq.lcb`` is present iff its result is
-    ``pass`` or ``fail``; an evaluated block has at least one window and an
-    empty one (``no_windows``) none; ``fail`` iff some LCB is below
-    ``-tau_public``; and a ``fail`` is a cleared first verdict that is
-    ``lost`` (never crowned or held)."""
+def _gain_close(a, b) -> bool:
+    return math.isclose(float(a), float(b), rel_tol=1e-9, abs_tol=1e-12)
+
+
+def _check_halves(report: dict) -> None:
+    """rev6.18 A3/A8 (F4): per verdict (and its house judgement) the public
+    half is present iff ``params.public_weight > 0``; ``sources.live`` is
+    the live half; the public sources' and the domains' window counts add up
+    to their halves'; a clear has ``lcb >= d_margin`` and every half's gain
+    > 0. The ``public`` block is present iff ``public_weight > 0`` and its
+    rows name only kept public windows, each judged digest on every one."""
+    w = float(report["params"]["public_weight"])
+    dm = float(report["params"]["d_margin"])
+    if (w > 0.0) != ("public" in report):
+        raise ReportSchemaError("missing_field" if w > 0.0 else "unknown_field", "public",
+                                "the public block is present iff public_weight > 0")
     for i, v in enumerate(report["verdicts"]):
-        at = _join(_join("verdicts", i), "lowfreq")
-        lf = v["lowfreq"]
-        evaluated = lf["result"] in ("pass", "fail")
-        if evaluated and "lcb" not in lf:
-            raise ReportSchemaError("missing_field", _join(at, "lcb"))
-        if not evaluated and "lcb" in lf:
-            raise ReportSchemaError("unknown_field", _join(at, "lcb"),
-                                    f"result {lf['result']} carries no LCBs")
-        if evaluated and lf["n_windows"] < 1:
-            raise ReportSchemaError("bad_value", _join(at, "n_windows"),
-                                    "an evaluated slice has at least one window")
-        if lf["result"] == "no_windows" and lf["n_windows"] != 0:
-            raise ReportSchemaError("bad_value", _join(at, "n_windows"), "no_windows is empty")
-        if not evaluated:
-            continue
-        worst = min(float(lf["lcb"][r][m]) for r in GATE_REFS for m in ("crps", "mase"))
-        want = "fail" if worst < -float(lf["tau_public"]) else "pass"
-        if lf["result"] != want:
-            raise ReportSchemaError("bad_value", _join(at, "result"),
-                                    f"the worst LCB {worst} gives {want}")
-        if want == "fail" and not (v["cleared"] and v["outcome"] == "lost"):
-            raise ReportSchemaError("bad_value", _join(_join("verdicts", i), "outcome"),
-                                    "a lowfreq fail is a cleared verdict that is lost")
+        at = _join("verdicts", i)
+        hv, src, dom = v["halves"], v["sources"], v["domains"]
+        if ("public" in hv) != (w > 0.0):
+            raise ReportSchemaError("bad_value", _join(at, "halves"),
+                                    "a public half is present iff public_weight > 0")
+        if v["cleared"] and not (float(v["lcb"]) >= dm
+                                 and all(float(x["gain"]) > 0.0 for x in hv.values())):
+            raise ReportSchemaError("bad_value", _join(at, "cleared"),
+                                    "a clear needs lcb >= d_margin and a gain > 0 on every half")
+        house = v.get("house")
+        if house is not None and house["cleared"] and float(house["lcb"]) < dm:
+            raise ReportSchemaError("bad_value", _join(_join(at, "house"), "cleared"),
+                                    "a house clear needs lcb >= d_margin")
+        if set(src) - {"live"} and w <= 0.0 or "live" not in src \
+                or src["live"] != hv["live"]:
+            raise ReportSchemaError("bad_value", _join(at, "sources"),
+                                    "sources.live is the live half; public sources only at "
+                                    "public_weight > 0")
+        n_pub = sum(x["n"] for k, x in src.items() if k != "live")
+        if w > 0.0 and n_pub != hv["public"]["n"]:
+            raise ReportSchemaError("bad_value", _join(at, "sources"),
+                                    "the public sources' windows are not the public half's")
+        n_live_dom = sum(x["n"] for k, x in dom.items() if k.startswith("live|"))
+        n_pub_dom = sum(x["n"] for k, x in dom.items() if not k.startswith("live|"))
+        if n_live_dom != hv["live"]["n"] or n_pub_dom != (hv["public"]["n"] if w > 0.0 else 0):
+            raise ReportSchemaError("bad_value", _join(at, "domains"),
+                                    "the domains' windows are not their halves'")
+    if w <= 0.0:
+        return
+    kept = []
+    for s_ in report["public"]["sources"]:
+        gone = {d["window_id"] for d in s_["dropped"]}
+        kept += [x["window_id"] for x in s_["windows"] if x["window_id"] not in gone]
+    kept.sort()
+    rows = report["public"]["rows"]
+    digests = sorted({r["digest"] for r in rows})
+    want = [(wid, dg) for wid in kept for dg in digests]
+    if [(r["window_id"], r["digest"]) for r in rows] != want:
+        raise ReportSchemaError("bad_value", "public.rows",
+                                "not every scored digest on every kept public window, in "
+                                "window_id then digest order")
+    judged = set()
+    for c in report["cohorts"]:
+        judged |= {c["king_digest"], *c["members"],
+                   *([c["house_digest"]] if "house_digest" in c else [])}
+    if set(digests) != judged:
+        raise ReportSchemaError("bad_value", "public.rows",
+                                "the public rows' digests are not the judged cohorts' models")
 
 
 def _check_gate_weights(report: dict) -> None:
@@ -674,7 +710,7 @@ def _cross_field(report: dict) -> None:
     _check_gate_weights(report)
     _check_snapshots(report)
     _check_house(report)
-    _check_lowfreq(report)
+    _check_halves(report)
     if report["crowned"] is not None and not isinstance(report.get("gate"), dict):
         # W5e (RV5): nothing crowns ungated (the schema's top-level
         # conditional states the same rule).
@@ -699,6 +735,9 @@ def validate_report(report) -> None:
     _cross_field(report)
     if rows_sha256(report["rows"]) != report["rows_sha256"]:
         raise ReportSchemaError("rows_sha256_mismatch", "rows_sha256")
+    if "public" in report and rows_sha256(report["public"]["rows"]) \
+            != report["public"]["rows_sha256"]:
+        raise ReportSchemaError("rows_sha256_mismatch", "public.rows_sha256")
 
 
 def canonical_json(obj) -> bytes:
@@ -796,7 +835,7 @@ def pinned_report_signer(cfg) -> str:
 
 
 __all__ = ["BURN_REASONS", "CONFIRMATION_STAGES", "ENTRY_REASONS",
-           "ENTRY_STATUSES", "GATE_OUTCOMES", "GATE_REFS", "LOWFREQ_RESULTS", "REPORT_SCHEMA", "SCHEMA_ERROR_CODES",
+           "ENTRY_STATUSES", "GATE_OUTCOMES", "GATE_REFS", "REPORT_SCHEMA", "SCHEMA_ERROR_CODES",
            "SCHEMA_PATH", "SIGNATURE_PATTERN", "SIGNATURE_SCHEME", "SKIP_REASONS",
            "VERDICT_OUTCOMES", "WINDOW_REFUSAL_REASONS", "ReportSchemaError", "canonical_body",
            "canonical_json", "load_schema", "pinned_report_signer", "rows_sha256",

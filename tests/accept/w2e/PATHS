@@ -10,3 +10,5 @@ cascade/shared/netconfig.py
 # [lane_d] defaults only; from_block stays 0 (nothing armed).
 chain.toml
 chain.testnet.toml
+# rev6.18 F4: the retired-keys unit test covers [lane_d] too.
+tests/unit/test_config.py

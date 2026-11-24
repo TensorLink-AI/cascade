@@ -692,3 +692,19 @@ with W9.
 
 On main these tests fail on the `public_indexes` assertion or the schema's
 top-level property set (`TOP_LEVEL_OPTIONAL` now lists `public`).
+
+## Schema minor (rev6.18 F4: A3, A7, A8, D24)
+
+`lane-d-report/1` gains, per verdict, `halves` (`live`, and at
+`public_weight > 0` `public`: `{n, gain}`), `sources` (`live`,
+`gift_eval_pretrain`, `rmisc`) and `domains` (`live|<source>`,
+`<source>|<family>`), every gain `1 - exp(-mean clamped log-ratio)`; the
+`public` block gains `rows` (every judged digest on every kept public window,
+window_id then digest order) and `rows_sha256`; `params` gains
+`public_weight` and `window_ratio_floor`. Removed: the A10 `lowfreq` block,
+`lowfreq_regression`, `params.lowfreq_freqs` (A7), the backtest window kind
+and bins (D24). `validate_report` binds them (`_check_halves`; the public
+rows digest is checked with `rows_sha256`). The house judgement keeps its
+four fields. `test_w7a_f4_fields.py` pins it; the A10 field tests are
+corrected (owner decisions A7 / D24), and `pub.py` gains the index-only
+public fixture (no pyarrow) and the eval host's public scores.

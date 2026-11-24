@@ -447,3 +447,14 @@ On main these tests fail on the `settle_mv` / `max_channels` assertions or
 On main these tests fail on the lazy fixture (`f3_fixture.py`: no
 `tests/accept/w7a/pub.py`), the `public_indexes` assertion or
 `cannot import name 'public_redraw'`.
+
+## Combined rule (rev6.18 F4)
+
+`check_lane_d` re-derives the A3 rule from the signed rows
+(`test_w9_combined.py`): the cohort's live rows plus `public.rows` on the
+kept public windows. Burn class (rev6.18 B3): `public.rows_sha256` not
+binding the rows is `ld_rows_sha256`; a missing / extra public model is
+`ld_rows_count`; a verdict whose `lcb`, `gain`, `cleared`, `halves`,
+`sources` or `domains` does not re-derive, or a report without its public
+half at `public_weight > 0`, is `ld_cohort`. The W5i `combined_log_ratio`
+and the A10 rule are removed (`test_w9_rev611.py` correction).

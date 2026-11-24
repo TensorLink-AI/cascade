@@ -61,3 +61,26 @@ floor 0.85 and `d_margin` 0.01 the rev6.9 (a) check admits it
 carry 0.05; `test_w2e_backtest_cap_default_is_on_and_meets_the_inequality`
 pins it; the overlay value moves to 0.03 so it still differs from the
 default. Every other assertion is unchanged.
+
+## Correction (rev6.18 F4; owner 2026-11-23 A3, owner 2026-11-24 D24)
+
+The backtest windows are dropped (D24) and the public half replaces them
+(A3). `backtest_weight_cap` and `backtest_ratio_floor` are **deleted**: the
+loader no longer parses them or checks the rev6.9 (a) inequality, and lists
+them (with A7's `lowfreq_freqs`) in `RETIRED_KEYS["lane_d"]`, so a
+deployed table that still carries them loads and ignores them. Two keys
+replace them in `W2E_DEFAULTS`:
+
+| key | default | type / range | refused |
+|---|---|---|---|
+| `public_weight` | `0.5` | float in `[0, 1)` (0 = the public half off) | negative, `>= 1`, bool, string |
+| `window_ratio_floor` | `0.5` | float in `(0, 1)` (each per-window ratio clamped to `[floor, 1/floor]`) | `<= 0`, `>= 1`, bool, string |
+
+Neither is tied to any other key (`public_weight` is NOT subject to the
+deleted backtest rule). The inequality tests become
+`test_w2e_backtest_inequality_is_gone` (the former refusals load),
+`test_w2e_backtest_and_lowfreq_keys_are_retired` replaces the 0.05-default
+pin, and the two overlay-inequality tests become
+`test_w2e_overlay_public_weight_and_clamp_have_no_cross_key_rule`. Both
+shipped files carry the two new keys at their defaults and none of the
+retired ones.

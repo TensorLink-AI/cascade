@@ -195,15 +195,29 @@ frequency. Evidence accumulates over every daily `pool_d` snapshot since T
 and freezes at the first settlement that meets the floors, `min_windows`
 (1000) and `min_clusters` (20 sources). Five-minute and hourly feeds fill the
 floors in days; daily and slower series rarely reach a forward-only set at
-h = 64, which is why the low-frequency check below uses the private pool.
+h = 64, so they mostly enter through the public half below.
 Expect about one extra day for the forward margin and then the mandatory
 confirmation duel (FAQ).
 
-**Verdict.** A paired cluster bootstrap of the CRPS/MASE geomean ratio
-(clusters = source) with lane A's quantile head scoring. The challenger
-clears if `LCB ≥ d_margin` (`d_margin = 0.01`, at `alpha = 0.05`) and the
-point gain is strictly positive. Several entries freezing in one settlement
-form a cohort judged with max-T on their shared window set. When a miner
+**Verdict: 50% live, 50% public.** Two halves are scored with lane A's
+quantile head. The **live half** is the cohort's forward-only windows above
+(fresh plus the 48 h embargo top-up). The **public half** is 10000 windows
+drawn each settlement from the block hash out of `Salesforce/GiftEvalPretrain`
+and the allowed `nju-zhangsq/RMISC` folders (5000 each, the same windows for
+the king, the house and every challenger). Per window the ratio of the king's
+CRPS/MASE geomean to yours is clamped to `[0.5, 2]`
+(`[lane_d] window_ratio_floor = 0.5`), so one window can at most halve or
+double its effect; its log is averaged over each half, and the combined score
+is `(1 − w)·live + w·public` with `[lane_d] public_weight = 0.5`. One paired
+cluster bootstrap (clusters: source for live windows, dataset family for
+public ones, resampled within each half) gives a max-T LCB over the cohort.
+You clear only if **all three** hold: the combined `LCB ≥ d_margin`
+(`d_margin = 0.01`, at `alpha = 0.05`), your point gain on the live half is
+positive, and your point gain on the public half is positive: you must
+improve on public pretrain data as well as on live data. The report shows
+your gain per half, per source (live, GiftEvalPretrain, RMISC) and per domain.
+Several entries freezing in one settlement form a cohort judged with max-T
+on their shared window set. When a miner
 holds KING_D, each member must also clear the current house on the same set.
 An entry is
 judged once; a loser is never re-judged on new windows.
@@ -229,10 +243,9 @@ satisfy `LCB ≥ -tau_public` (`tau_public = 0.01`) against both KING_D and the
 house, run paired on one host in one sweep. A loss is `gate_regression`; a
 sweep that errors, returns partial results or NaN is the miner's
 `checkpoint_fault`; a bench host outage holds the crowning (`bench_hold`)
-for at most `max_bench_holds` settlements. Every crowning candidate also runs
-the low-frequency check on the private pool's daily-and-slower slice
-(`lowfreq_freqs`): a loss there is `lowfreq_regression`. Public suites never
-pay and are never targets.
+for at most `max_bench_holds` settlements. (There is no separate
+low-frequency check any more: the public half covers slow cadences.) Public
+gate suites never pay and are never targets.
 
 **The sentinel** is the cross-lane rotating held-out suite: each era one suite
 is held out for every lane and never gates. It is swept for each new KING_D

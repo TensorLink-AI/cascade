@@ -53,6 +53,9 @@ OPEN_STATUSES = ("pending", "hold")
 # closed reason is ``closed_unjudged``.
 _CLOSED_LEDGER = {"deregistered": "voided", "ready_expired": "ready_expired"}
 _VERDICT_FIELDS = ("digest", "king_digest", "stage", "outcome", "lcb", "gain")
+# rev6.18 A8 (F4): each verdict's per-half and per-source point gains (absent
+# on a report signed before F4).
+_VERDICT_GAINS = ("halves", "sources")
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 # §1.2: nothing URL- or credential-shaped is ever published.
 _FORBIDDEN = ("://", "X-Amz-", "x-amz-", "Signature=", "Credential=", "presigned")
@@ -136,7 +139,9 @@ def _board(report: dict | None) -> dict | None:
     return {"boundary": int(report["boundary"]), "crowned": report.get("crowned"),
             "judged": json.loads(json.dumps(report.get("judged", []))),
             "skipped": json.loads(json.dumps(report.get("skipped", []))),
-            "verdicts": [{f: v[f] for f in _VERDICT_FIELDS} for v in report["verdicts"]],
+            "verdicts": [{**{f: v[f] for f in _VERDICT_FIELDS},
+                          **{f: json.loads(json.dumps(v[f])) for f in _VERDICT_GAINS if f in v}}
+                         for v in report["verdicts"]],
             "gate": None if gate is None else json.loads(json.dumps(gate))}
 
 

@@ -35,9 +35,13 @@ LANE_D_DTYPES = ("BF16",)
 LANE_D_CONFIRM_ON_KING_CHANGE = ("restart", "original")
 # §16 suite names (data, not a closed list: any non-empty unique names load).
 LANE_D_GATE_SUITES = ("gift", "boom", "time", "fev")
-# A10 "daily and slower": the pandas-style base codes of
-# cascade/eval/seasonality.py from daily down to yearly.
-LANE_D_LOWFREQ_FREQS = ("D", "W", "M", "ME", "MS", "Q", "QE", "QS", "A", "Y", "YE")
+# rev6.18 F4 (A7, D24): keys a deployed [lane_d] table may still carry that no
+# code reads any more: the W5i backtest cap / floor (D24, backtest dropped)
+# and the A10 low-frequency slice (A7, the check removed). The parser
+# ignores them (listed in the loader's RETIRED_KEYS) so such a file loads;
+# never re-use one of these names for a knob.
+RETIRED_LANE_D_F4_KEYS = frozenset({"backtest_weight_cap", "backtest_ratio_floor",
+                                    "lowfreq_freqs"})
 
 
 @dataclass(frozen=True)
@@ -70,16 +74,16 @@ class LaneDConfig:
     embargo_hours: float = 48.0
     max_windows_per_settlement: int = 5000
     min_fresh_window_share: float = 0.5
-    # W2e (rev6.9 (a)): slow-cadence backtest scoring weight cap (0 = off) and
-    # its ratio floor; cap > 0 needs 1 - floor ** cap < d_margin. Owner
-    # 2026-11-23: 0.05, ON at launch (1 - 0.85 ** 0.05 ~ 0.0081 < 0.01).
-    backtest_weight_cap: float = 0.05
-    backtest_ratio_floor: float = 0.85
-    # Rotating external-benchmark gate (§1.3b, D2b) and the A10 slice.
+    # W2e (rev6.18 A3, F4): the public half's weight in the combined score
+    # L = (1 - w) L_live + w L_pub (0 = the public half off: not drawn, its
+    # point-gain condition not applied) and the per-window ratio clamp
+    # [floor, 1 / floor]. Both overlay-settable; no cross-key rule.
+    public_weight: float = 0.5
+    window_ratio_floor: float = 0.5
+    # Rotating external-benchmark gate (§1.3b, D2b).
     gate_suites: tuple[str, ...] = LANE_D_GATE_SUITES
     gate_weights: tuple[tuple[str, float], ...] = tuple((s, 1.0) for s in LANE_D_GATE_SUITES)
     tau_public: float = 0.01
-    lowfreq_freqs: tuple[str, ...] = LANE_D_LOWFREQ_FREQS
     # Court (§1.4, D7).
     reward_prior_kings: int = 2
     king_decay: float = 0.5
@@ -267,7 +271,6 @@ def parse_lane_d(raw: object, *, era_blocks_at: Callable[[int], int] | None = No
                          f"{LANE_D_CONFIRM_ON_KING_CHANGE}; got {coc!r}")
     suites = _names(ld.get("gate_suites", list(LANE_D_GATE_SUITES)), "gate_suites")
     gate_w = _gate_weights(ld.get("gate_weights"), suites)
-    lowfreq = _names(ld.get("lowfreq_freqs", list(LANE_D_LOWFREQ_FREQS)), "lowfreq_freqs")
 
     # DEC-CA-0062 keys.
     targets = _str_list(ld.get("targets", ()), "targets")
@@ -304,14 +307,13 @@ def parse_lane_d(raw: object, *, era_blocks_at: Callable[[int], int] | None = No
     fresh = _float(ld.get("min_fresh_window_share", 0.5), "min_fresh_window_share")
     if not 0.0 <= fresh <= 1.0:
         raise ValueError(f"[lane_d] min_fresh_window_share must be in [0, 1]; got {fresh!r}")
-    bt_cap = _float(ld.get("backtest_weight_cap", 0.05), "backtest_weight_cap")
-    if not 0.0 <= bt_cap < 1.0:
-        raise ValueError(f"[lane_d] backtest_weight_cap must be in [0, 1); got {bt_cap!r}")
-    bt_floor = _open_unit(ld.get("backtest_ratio_floor", 0.85), "backtest_ratio_floor")
-    if bt_cap > 0.0 and not (1.0 - bt_floor ** bt_cap) < d_margin:
-        raise ValueError(f"[lane_d] backtest_weight_cap={bt_cap} needs 1 - backtest_ratio_floor"
-                         f" ** backtest_weight_cap < d_margin (rev6.9 (a)); got "
-                         f"{1.0 - bt_floor ** bt_cap:.6f} >= {d_margin}")
+    # rev6.18 A3 (F4): the public half's weight, range [0, 1), and the
+    # per-window ratio clamp floor, range (0, 1). Not tied to any other key
+    # (D24: the backtest cap and its loader inequality are deleted).
+    public_weight = _float(ld.get("public_weight", 0.5), "public_weight")
+    if not 0.0 <= public_weight < 1.0:
+        raise ValueError(f"[lane_d] public_weight must be in [0, 1); got {public_weight!r}")
+    ratio_floor = _open_unit(ld.get("window_ratio_floor", 0.5), "window_ratio_floor")
     margin = float(ld.get("gain_margin", 0.01))
     if not 0.0 < margin < 1.0:
         raise ValueError(f"[lane_d] gain_margin must be in (0, 1); got {margin}")
@@ -328,9 +330,9 @@ def parse_lane_d(raw: object, *, era_blocks_at: Callable[[int], int] | None = No
         alpha=_open_unit(ld.get("alpha", 0.05), "alpha"),
         bootstrap_B=_int(ld.get("bootstrap_B", 10_000), "bootstrap_B", lo=100),
         embargo_hours=embargo, max_windows_per_settlement=max_windows,
-        min_fresh_window_share=fresh, backtest_weight_cap=bt_cap,
-        backtest_ratio_floor=bt_floor,
-        gate_suites=suites, gate_weights=gate_w, tau_public=tau, lowfreq_freqs=lowfreq,
+        min_fresh_window_share=fresh, public_weight=public_weight,
+        window_ratio_floor=ratio_floor,
+        gate_suites=suites, gate_weights=gate_w, tau_public=tau,
         reward_prior_kings=_int(ld.get("reward_prior_kings", 2), "reward_prior_kings", lo=0),
         king_decay=_half_open_unit(ld.get("king_decay", 0.5), "king_decay"),
         confirm_on_king_change=coc,
@@ -370,11 +372,11 @@ __all__ = [
     "LANE_D_CONTEXTS",
     "LANE_D_DTYPES",
     "LANE_D_GATE_SUITES",
-    "LANE_D_LOWFREQ_FREQS",
     "LANE_D_MAX_CONTEXT",
     "LANE_D_MAX_HORIZON",
     "LANE_D_REMAINDERS",
     "LANE_D_TAKES_FROM",
+    "RETIRED_LANE_D_F4_KEYS",
     "LaneDConfig",
     "parse_lane_d",
 ]

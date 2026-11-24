@@ -293,3 +293,32 @@ Plan rev6.18 A4 (DEC-CA-0041). Fixture: `tests/accept/w7a/mv.py`.
 On main these tests fail on the `max_channels` assertion of `mv.settle_mv`,
 `cannot import name '_max_channels'` (`lane_d_wiring`, in PATHS) or an
 assertion wrapping the old `_windows` signature.
+
+## Combined rule (rev6.18 F4; owner 2026-11-23 A3, 2026-11-24 D24)
+
+`test_w5e_combined.py` pins the rev6.18 A3 winning rule:
+
+- per window, `x = log clamp(s_bar / s_member, f, 1/f)` with the lane D
+  per-window geomean `s = sqrt(max(crps, 1e-12) * max(mase, 1e-9))` and
+  `f = [lane_d] window_ratio_floor` (default 0.5: ratio in [0.5, 2]);
+- live half = the cohort's forward windows (clusters = source); public half
+  = the settlement's kept public windows (clusters = `<source>|<family>`);
+- `L = (1 - w) L_live + w L_pub`, `w = [lane_d] public_weight` (0.5);
+- ONE max-T bootstrap over the cohort (`cascade.eval.bootstrap.parts_maxt_lcbs`):
+  per replicate each half's clusters are resampled within that half (one
+  `(B, g)` draw per half, live first), the halves recombined with `w`; the
+  band is the studentised centred max-T of `cohort_maxt_lcbs` on the gain
+  scale `1 - exp(-T)`. One part of weight 1 with no clamp IS
+  `cohort_maxt_lcbs` on the lane D geomean (pinned);
+- a member clears iff `LCB >= d_margin` AND live point gain > 0 AND
+  (`w > 0`) public point gain > 0; then the unchanged §1.3b gate;
+- `w > 0` without the public half (no indexes / scores / block hash) is
+  `LaneDPublicError` (`public_missing`), scores not covering exactly the
+  kept public windows are `public_mismatch` (both before anything is
+  written); a member with a non-finite public score is `checkpoint_fault`.
+
+The existing W5e fixtures (and those of W1.5, W3b3, W5a-c, W5f, W5g, W5j,
+W7a-d, W8, W17) run the live-only rule: `LIVE_ONLY = {public_weight: 0,
+window_ratio_floor: 1e-9}` in their `lane_d_cfg` (w = 0 is a spec setting:
+the public half off; the floor keeps every fixture ratio unclamped), so
+their pre-F4 numbers stand. Correction label: `laned:tests-correction`.

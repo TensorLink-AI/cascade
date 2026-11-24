@@ -47,8 +47,11 @@ def test_step_settles_each_armed_boundary_with_the_row_inputs(tmp_path):
     assert s2["gate"]["block_hash"] == h.block_hash(h.B2)
     assert s2["gate"]["sentinel"] is None
     crowning = [v for v in s2["verdicts"] if v["digest"] == rig.fx["x"]]
-    assert crowning and crowning[0]["lowfreq"]["result"] in ("pass", "no_windows"), \
-        "the W3b5 low-frequency check runs on the crowning (confirm-stage) verdict"
+    # rev6.18 A7 / A8 (F4): no A10 block; the crowning verdict carries its
+    # per-half point gains (correction of the W3b5 lowfreq assertion).
+    assert crowning and "lowfreq" not in crowning[0] \
+        and (crowning[0].get("halves") or {}).get("live", {}).get("gain", 0) > 0, \
+        "the crowning verdict carries a positive live half (and no A10 block)"
 
 
 def test_step_passes_the_era_sentinel_drawn_from_the_era_start_hash(tmp_path):

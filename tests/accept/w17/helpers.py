@@ -65,7 +65,9 @@ KING_KEYS = {"digest", "hotkey", "house", "since_boundary", "tenure_blocks"}
 DOC_KEYS = {"schema", "lane", "block", "era", "boundary", "reason_enum", "floors", "king",
             "house", "prior_kings", "queue", "board", "sentinel"}
 BOARD_KEYS = {"boundary", "crowned", "judged", "skipped", "verdicts", "gate"}
-VERDICT_KEYS = {"digest", "king_digest", "stage", "outcome", "lcb", "gain"}
+# rev6.18 A8 (F4): the board also shows each verdict's per-half and per-source
+# point gains (`halves`, `sources`).
+VERDICT_KEYS = {"digest", "king_digest", "stage", "outcome", "lcb", "gain", "halves", "sources"}
 WALL_CLOCK_KEYS = ("as_of", "generated_at", "timestamp", "updated_at", "published_at")
 LEDGER_KEYS = {"schema", "era", "entries", "disputes"}
 LEDGER_ENTRY_KEYS = {"hotkey", "digest", "status", "closed_era"}
@@ -128,7 +130,7 @@ ARMED_LANE_D = {"from_block": ARM_BLOCK, "share": 0.25, "takes_from": "lane_a",
                 "remainder": "burn", "contexts": [4096, 8192, 16384],
                 "horizon": w7c.HORIZON, "forward_margin_hours": w7c.MARGIN_H,
                 "max_mirror_lag_hours": 6.0, "min_windows": 24, "min_clusters": 4,
-                "bootstrap_B": 200}
+                "bootstrap_B": 200, **w7c.LIVE_ONLY}
 
 
 def chain_cfg(*, armed: bool = True, sentinel: bool = False, **lane_over):

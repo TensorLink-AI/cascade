@@ -54,14 +54,14 @@ def test_w2_gate_weights_default_is_equal_over_gate_suites(name):
 
 
 @pytest.mark.parametrize("name", SHIPPED)
-def test_w2_lowfreq_freqs_default_is_daily_and_slower(name):
-    """A10: the low-frequency slice is "daily and slower"."""
-    ld = load_ok(raw_with(name, drop=("lowfreq_freqs",))).lane_d
-    v = norm(field(ld, "lowfreq_freqs"))
-    assert isinstance(v, tuple) and v, f"lowfreq_freqs default {v!r}"
-    assert all(isinstance(f, str) and f for f in v), v
-    assert "D" in v, f"lowfreq_freqs default {v!r} lacks daily"
-    assert not {"H", "min", "T", "S"} & set(v), f"lowfreq_freqs default {v!r} has sub-daily"
+def test_w2_lowfreq_freqs_is_retired(name):
+    """rev6.18 A7 (owner 2026-11-23: "The low-frequency check A10 is
+    removed"). Correction of the A10 "daily and slower" default test: the key
+    is no longer parsed; a table that still carries it loads and ignores it,
+    and the shipped files no longer carry it."""
+    assert "lowfreq_freqs" not in (shipped_raw(name).get("lane_d") or {})
+    ld = load_ok(raw_with(name, {"lowfreq_freqs": ["D", "W"]})).lane_d
+    assert not hasattr(ld, "lowfreq_freqs"), "LaneDConfig still parses lowfreq_freqs"
 
 
 @pytest.mark.parametrize("name", SHIPPED)

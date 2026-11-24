@@ -77,11 +77,11 @@ SKIP_REASONS = ("pending_floor", "coldkey_cap_settlement", "coldkey_unresolved",
 # listed in both entries[].reason and skipped[].reason.
 # `checkpoint_fault` and `bench_hold` (W3b2 outcomes) are skip reasons: a
 # faulty candidate is refused, a held one is not judged this settlement.
-# `gate_regression` (RV4) is a judged loss on the §1.3b gate, like
-# `lowfreq_regression`: an entry reason, never a skip reason.
-# rev6.11 (b): no `confirm_pending` / `lost_confirmation`; a loss is `lost_duel`.
-ENTRY_REASONS = SKIP_REASONS + ("lost_duel", "lowfreq_regression", "gate_regression",
-                                "crowned")
+# `gate_regression` (RV4) is a judged loss on the §1.3b gate: an entry
+# reason, never a skip reason. rev6.11 (b): no `confirm_pending` /
+# `lost_confirmation`; a loss is `lost_duel`. rev6.18 A7 (F4, owner
+# 2026-11-23): the A10 check is removed, so no `lowfreq_regression`.
+ENTRY_REASONS = SKIP_REASONS + ("lost_duel", "gate_regression", "crowned")
 BURN_REASONS = ("house_king", "deregistered")
 # W5a's REFUSAL_REASONS (tests/accept/w5a/README.md "Reasons"), in precedence
 # order: `unlisted_feed` (W5a) comes right after `missing_clock`.
@@ -92,7 +92,6 @@ WINDOW_REFUSAL_REASONS = ("missing_clock", "unlisted_feed", "forecast_product", 
 # / `confirmed` are gone (README "Correction (rev6.11)").
 REMOVED_STAGE = "confirm"
 REMOVED_OUTCOMES = ("confirm_pending", "confirmed")
-LOWFREQ_RESULTS = ("pass", "fail", "no_windows", "not_candidate")
 # The §1.3b paired gate (W3b2 `lane_d_bench.OUTCOMES` and `REFS`), RV4.
 GATE_OUTCOMES = ("pass", "gate_regression", "checkpoint_fault", "bench_hold")
 GATE_REFS = ("king_d", "house")
@@ -107,7 +106,6 @@ ENUM_DEFS = {
     "skip_reason": ("SKIP_REASONS", SKIP_REASONS),
     "burn_reason": ("BURN_REASONS", BURN_REASONS),
     "window_refusal_reason": ("WINDOW_REFUSAL_REASONS", WINDOW_REFUSAL_REASONS),
-    "lowfreq_result": ("LOWFREQ_RESULTS", LOWFREQ_RESULTS),
     "gate_outcome": ("GATE_OUTCOMES", GATE_OUTCOMES),
     "gate_ref": ("GATE_REFS", GATE_REFS),
 }
@@ -126,7 +124,10 @@ PARAMS_FIELDS = ("share", "takes_from", "remainder", "horizon", "horizons", "con
                  "d_margin", "alpha", "bootstrap_B", "king_decay", "reward_prior_kings",
                  "max_entries_per_settlement",
                  "max_judged_per_coldkey_per_settlement", "scoring_levels", "gate_suites",
-                 "tau_public", "lowfreq_freqs",
+                 "tau_public",
+                 # rev6.18 A3 (F4): the public half's weight and the ratio clamp
+                 # (A7: `lowfreq_freqs` is gone).
+                 "public_weight", "window_ratio_floor",
                  # RV4: the gate draw's weights (W3b1), W5b's source cap (B14),
                  # the context-arming floor (§1.7).
                  "gate_weights", "max_source_share", "min_long_series",
@@ -159,8 +160,9 @@ WINDOW_FIELDS = ("window_id", "source", "feed", "min_target_ts", "min_first_seen
                  "freq", "embargo_hours", "min_release_ts", "rule", "embargo_window",
                  "timeframe", "bin", "kind", "freq_class", "h", "origin")
 WINDOW_RULES = ("embargo", "embargo0")
-WINDOW_KINDS = ("forward", "backtest")
-WINDOW_BINS = ("forward", "short", "medium", "long")
+# rev6.18 D24 (F4, owner 2026-11-24): forward windows only (no backtest).
+WINDOW_KINDS = ("forward",)
+WINDOW_BINS = ("forward",)
 FREQ_CLASSES = ("subdaily", "daily", "weekly", "monthly", "quarterly", "yearly")
 # rev6.12 (b): per entry, the fresh and the embargo sub-score.
 SUBSCORE_FIELDS = ("n", "geomean")
@@ -168,9 +170,11 @@ SUBSCORE_FIELDS = ("n", "geomean")
 DRAW_FIELDS = ("boundary_block_hash", "seed", "max_windows_per_settlement", "cohorts")
 DRAW_COHORT_FIELDS = ("index", "quota", "capacity", "candidates_sha256")
 # rev6.11: no `confirmation` block; `stage` fixed to `first` or dropped.
+# rev6.18 A8 (F4): the per-half / per-source / per-domain point gains replace
+# the A10 `lowfreq` block (A7).
 VERDICT_FIELDS = ("digest", "king_digest", "cohort", "lcb", "gain", "cleared",
-                  "outcome", "lowfreq", "fresh", "embargo")
-LOWFREQ_FIELDS = ("result", "freqs", "n_windows", "tau_public")
+                  "outcome", "halves", "sources", "domains", "fresh", "embargo")
+POINT_GAIN_FIELDS = ("n", "gain")
 ROW_FIELDS = ("window_id", "digest", "cohort", "crps", "mase")
 COURT_FIELDS = ("digest", "hotkey", "uid", "burn_reason")
 
@@ -193,11 +197,18 @@ FRONTIER_AS_OF = {snap: start - 3 * HOUR for snap, start in SNAPSHOT_START.items
 FRONTIER_END_LAG = HOUR
 
 
+# rev6.18 F4 (A3): these fixtures pin the live-only rule: the public half off
+# (public_weight = 0, a spec setting) and no per-window ratio clamp in effect
+# (a floor far below any fixture ratio), so their pre-F4 numbers stand. F4's
+# own tests (tests/accept/w5e/test_w5e_combined.py) pin the combined rule.
+LIVE_ONLY = {"public_weight": 0.0, "window_ratio_floor": 1e-9}
+
+
 def lane_d_cfg(**over):
     """The real W2 parse of ``ARMED`` with ``over`` applied."""
     from cascade.shared.config.lane_d import parse_lane_d
 
-    return parse_lane_d({**ARMED, **over}, era_blocks_at=lambda _block: ERA)
+    return parse_lane_d({**ARMED, **LIVE_ONLY, **over}, era_blocks_at=lambda _block: ERA)
 
 
 def text_digest(text: str) -> str:

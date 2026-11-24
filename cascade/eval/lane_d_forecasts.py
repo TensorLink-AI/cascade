@@ -25,6 +25,11 @@ box's SSH transport (:class:`cascade.validator.lane_d_inputs.SSHEvalHost`):
 
 * ``hello`` prints the W4 :func:`~cascade.eval.lane_d_handshake.worker_hello`
   as one JSON line;
+* ``public --cache-dir D --budget-bytes N --public-root R`` (rev6.18 A3,
+  F4) reads one JSON :data:`PUBLIC_REQUEST_SCHEMA` request (one digest, the
+  settlement's public draws) and prints one :data:`PUBLIC_REPLY_SCHEMA` line:
+  the digest's per-window scores on the drawn series this host reads from
+  its public mirror, plus the windows dropped at read time;
 * ``forecast --cache-dir D --budget-bytes N`` reads one request (an ``.npz``
   of the window histories plus a JSON ``meta`` record, :data:`REQUEST_SCHEMA`)
   from stdin and prints one :data:`REPLY_SCHEMA` JSON line: the quantiles, or
@@ -267,6 +272,115 @@ def serve_forecast(raw: bytes, *, cache_dir, budget_bytes: int, device: str,
     return {"schema": REPLY_SCHEMA, "ok": True, "quantiles": q.tolist()}
 
 
+# ── rev6.18 A3 (F4): the public half on the eval host ───────────────────────
+
+PUBLIC_REQUEST_SCHEMA = "lane-d-public-request/1"
+PUBLIC_REPLY_SCHEMA = "lane-d-public-reply/1"
+PUBLIC_INDEX_DIR = "index"
+PUBLIC_DATA_DIR = "data"
+
+
+def _split_rows(arr: np.ndarray, windows: Sequence[Mapping]) -> dict:
+    """``{window_id: (h, 9) | (k, h, 9)}`` of a window-major forecast array."""
+    out, i = {}, 0
+    for w, k in zip(windows, _forecast_rows([w["history"] for w in windows]), strict=True):
+        out[w["window_id"]] = arr[i] if k == 1 else arr[i:i + k]
+        i += k
+    return out
+
+
+def public_scores_entry(cache: PrefetchCache, digest: str, draws: Sequence[Mapping], *,
+                        public_root, context: int, horizon: int, contexts,
+                        block_hash: str | None, max_channels: int,
+                        grant: Mapping | None = None, contract=None, expect=None,
+                        device: str = "cpu", forecast: Callable | None = None) -> dict:
+    """One checkpoint's per-window scores on the settlement's public draws
+    (rev6.18 A3, F4): each source's drawn series are read from this host's
+    mirror (``<public_root>/<source>/data``, its index at ``.../index``:
+    :func:`~cascade.validator.lane_d_public.read_public_windows`, F2's
+    channel rule with ``block_hash`` / ``max_channels``), forecast at
+    ``context`` (:func:`forecast_entry`, each history cut to its last
+    ``context`` points) and scored by the lane D per-window API
+    (:func:`~cascade.validator.lane_d_public.score_public_windows`).
+    ``{"scores": {source: [{window_id, family, crps, mase}]}, "dropped":
+    {source: [{window_id, reason}]}}``; the drops depend on the data only, so
+    they are the same for every digest. Raises :class:`LaneDForecastError`."""
+    from ..validator.lane_d_public import read_public_windows, score_public_windows
+
+    root = Path(public_root)
+    windows, dropped = [], {}
+    for d in draws:
+        src = str(d["source"])
+        try:
+            ws, drops = read_public_windows(dict(d), index_dir=root / src / PUBLIC_INDEX_DIR,
+                                            data_root=root / src / PUBLIC_DATA_DIR,
+                                            block_hash=block_hash, max_channels=int(max_channels))
+        except Exception as e:  # noqa: BLE001 — this host's mirror, never the miner's bytes
+            raise LaneDForecastError("forecast_failed",
+                                     f"public {src}: mirror read failed ({type(e).__name__}: "
+                                     f"{e})") from e
+        windows += ws
+        dropped[src] = drops
+    windows.sort(key=lambda w: w["window_id"])
+    cut = [{"window_id": w["window_id"],
+            "history": np.asarray(w["history"])[..., -int(context):]} for w in windows]
+    arr = forecast_entry(cache, digest, cut, context=context, horizon=horizon,
+                         contexts=contexts, grant=grant, contract=contract, expect=expect,
+                         device=device, forecast=forecast) if cut else np.zeros((0, horizon, 9))
+    per = score_public_windows(windows, {digest: _split_rows(arr, cut)}).get(digest, {})
+    return {"scores": {src: per.get(src, []) for src in sorted(dropped)}, "dropped": dropped}
+
+
+def serve_public(raw: bytes, *, cache_dir, budget_bytes: int, device: str, public_root,
+                 chain_toml=None) -> dict:
+    """Answer one :data:`PUBLIC_REQUEST_SCHEMA` request (JSON): the
+    :data:`PUBLIC_REPLY_SCHEMA` record. ``ValueError`` on a malformed request."""
+    try:
+        meta = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise ValueError(f"malformed lane D public request ({e})") from e
+    if not isinstance(meta, dict) or meta.get("schema") != PUBLIC_REQUEST_SCHEMA:
+        raise ValueError(f"not a {PUBLIC_REQUEST_SCHEMA} request")
+    digest = meta.get("digest")
+    if not isinstance(digest, str):
+        raise ValueError(f"request digest must be a str; got {digest!r}")
+    context, horizon = _int_field(meta, "context"), _int_field(meta, "horizon")
+    max_channels = _int_field(meta, "max_channels")
+    contexts = meta.get("contexts")
+    if not isinstance(contexts, list) or not all(type(c) is int for c in contexts):
+        raise ValueError(f"request contexts must be a list of int; got {contexts!r}")
+    draws = meta.get("draws")
+    if not isinstance(draws, list) or not all(isinstance(d, dict) for d in draws):
+        raise ValueError("request draws must be a list of objects")
+    pinned = meta.get("pinned") or {}
+    grant = meta.get("grant")
+    if not isinstance(pinned, dict) or (grant is not None and not isinstance(grant, dict)):
+        raise ValueError("request pinned / grant must be objects")
+    cache = PrefetchCache(cache_dir, budget_bytes=int(budget_bytes),
+                          king_d=pinned.get("king_d") or None, house=pinned.get("house") or None)
+    try:
+        contract = None
+        if grant is not None and digest not in cache.entries():
+            try:
+                contract = _lane_d_contract(chain_toml)
+            except Exception as e:  # noqa: BLE001 — this host's config, not the miner's bytes
+                raise LaneDForecastError("checkpoint_unavailable",
+                                         f"no lane D contract to ingest against ({e})") from e
+        got = public_scores_entry(cache, digest, draws, public_root=public_root,
+                                  context=context, horizon=horizon, contexts=tuple(contexts),
+                                  block_hash=meta.get("block_hash"),
+                                  max_channels=max_channels, grant=grant, contract=contract,
+                                  device=device)
+    except LaneDForecastError as e:
+        log.warning("lane_d_public_refused %s digest=%s detail=%s", e.code, digest, e.detail)
+        return {"schema": PUBLIC_REPLY_SCHEMA, "ok": False, "code": e.code, "detail": e.detail}
+    except CacheError as e:
+        return {"schema": PUBLIC_REPLY_SCHEMA, "ok": False, "code": "checkpoint_refused",
+                "detail": str(e)}
+    log.info("lane_d_public_ok digest=%s context=%d", digest, context)
+    return {"schema": PUBLIC_REPLY_SCHEMA, "ok": True, **got}
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python -m cascade.eval.lane_d_forecasts",
                                 description="lane D eval host: handshake and forecasts")
@@ -279,6 +393,14 @@ def _build_parser() -> argparse.ArgumentParser:
     f.add_argument("--budget-bytes", type=int, required=True, help="the cache byte budget")
     f.add_argument("--device", default="cuda")
     f.add_argument("--chain-toml", type=Path, default=None,
+                   help="this host's chain.toml (the contract a cache miss ingests against)")
+    q = sub.add_parser("public", help="answer one public-half scoring request read from stdin")
+    q.add_argument("--cache-dir", type=Path, required=True, help="the W15 prefetch cache root")
+    q.add_argument("--budget-bytes", type=int, required=True, help="the cache byte budget")
+    q.add_argument("--device", default="cuda")
+    q.add_argument("--public-root", type=Path, required=True,
+                   help="the public mirror root: <root>/<source>/{index,data}")
+    q.add_argument("--chain-toml", type=Path, default=None,
                    help="this host's chain.toml (the contract a cache miss ingests against)")
     return p
 
@@ -294,9 +416,14 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(worker_hello(args.root), sort_keys=True))
         return 0
     try:
-        reply = serve_forecast(sys.stdin.buffer.read(), cache_dir=args.cache_dir,
-                               budget_bytes=args.budget_bytes, device=args.device,
-                               chain_toml=args.chain_toml)
+        if args.cmd == "public":
+            reply = serve_public(sys.stdin.buffer.read(), cache_dir=args.cache_dir,
+                                 budget_bytes=args.budget_bytes, device=args.device,
+                                 public_root=args.public_root, chain_toml=args.chain_toml)
+        else:
+            reply = serve_forecast(sys.stdin.buffer.read(), cache_dir=args.cache_dir,
+                                   budget_bytes=args.budget_bytes, device=args.device,
+                                   chain_toml=args.chain_toml)
     except ValueError as e:
         print(f"lane D forecast request refused: {e}", file=sys.stderr)
         return 2
@@ -305,9 +432,10 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-__all__ = ["FORECAST_ERROR_CODES", "MINER_FAULT_CODES", "REPLY_SCHEMA", "REQUEST_SCHEMA",
+__all__ = ["FORECAST_ERROR_CODES", "MINER_FAULT_CODES", "PUBLIC_REPLY_SCHEMA",
+           "PUBLIC_REQUEST_SCHEMA", "REPLY_SCHEMA", "REQUEST_SCHEMA",
            "LaneDForecastError", "decode_request", "encode_request", "forecast_entry",
-           "main", "serve_forecast"]
+           "main", "public_scores_entry", "serve_forecast", "serve_public"]
 
 
 if __name__ == "__main__":

@@ -15,3 +15,7 @@ cascade/audit/checks.py
 # lane D's burn scoped to its share (derive_weights, lane_d_pay, the lane_d
 # tier-0 row) and the audit's fetch of the lane D record (audit_receipt).
 cascade/audit/main.py
+# rev6.18 A3 (F4): the chain-mode replay re-derives the combined rule too, and
+# the generic two-part statistic both share.
+cascade/audit/lane_d_chain.py
+cascade/eval/bootstrap.py

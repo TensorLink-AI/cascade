@@ -85,7 +85,7 @@ from types import MappingProxyType
 
 import numpy as np
 
-from cascade.eval.bootstrap import _seed_to_int, cohort_maxt_lcbs
+from cascade.eval.bootstrap import _seed_to_int, clamped_log_ratios, log_gain, parts_maxt_lcbs
 from cascade.shared.sr25519 import SignatureVerifierUnavailable, verify_hotkey
 
 MATCH = "MATCH"
@@ -131,7 +131,7 @@ _COHORT_KEYS = frozenset({"index", "king_digest", "king_reveal_ts", "stage", "me
                           "window_ids", "set_sha256", "first_seen_roots", "refused",
                           "fresh_windows", "embargo_windows"})
 _VERDICT_KEYS = frozenset({"digest", "king_digest", "stage", "cohort", "lcb", "gain", "cleared",
-                           "outcome", "lowfreq", "fresh", "embargo"})
+                           "outcome", "halves", "sources", "domains", "fresh", "embargo"})
 # W5j: the draw record (top level, present iff a cohort was drawn).
 _DRAW_KEYS = frozenset({"boundary_block_hash", "seed", "max_windows_per_settlement", "cohorts"})
 _DRAW_COHORT_KEYS = frozenset({"index", "quota", "capacity", "candidates_sha256"})
@@ -394,7 +394,8 @@ def expected_params(cfg) -> dict:
             "scoring_levels": [float(q) for q in SCORING_LEVELS],
             "gate_suites": [str(s) for s in cfg.gate_suites],
             "tau_public": float(cfg.tau_public),
-            "lowfreq_freqs": [str(f) for f in cfg.lowfreq_freqs],
+            "public_weight": float(cfg.public_weight),
+            "window_ratio_floor": float(cfg.window_ratio_floor),
             "gate_weights": dict(_gate_weight_pairs(cfg)),
             "max_source_share": float(cfg.max_source_share),
             "min_long_series": int(cfg.min_long_series),
@@ -416,48 +417,100 @@ def court_shares(cfg, n_slots: int) -> list[float]:
 # ── the statistic ───────────────────────────────────────────────────────────
 
 
-def combined_log_ratio(r_fwd: float, r_bt: float, *, n_fwd: int, n_bt: int, cap: float,
-                       floor: float) -> float:
-    """rev6.9 (W5i) combination of the forward and backtest ratios, re-derived
-    here: ``(1 - c) * log(r_fwd) + c * log(clamp(r_bt, floor, 1 / floor))``
-    with ``c = min(cap, n_bt / (n_bt + n_fwd))`` (``c = 0`` without backtest
-    windows). With ``c = 0`` it is exactly ``log(r_fwd)``, so memorising the
-    backtest gains at most ``1 - floor ** cap``."""
-    c = 0.0 if int(n_bt) == 0 else min(float(cap), int(n_bt) / (int(n_bt) + int(n_fwd)))
-    if c <= 0.0:
-        return math.log(float(r_fwd))
-    clamped = min(max(float(r_bt), float(floor)), 1.0 / float(floor))
-    return (1.0 - c) * math.log(float(r_fwd)) + c * math.log(clamped)
-
-
-def _parts(crps: np.ndarray, mase: np.ndarray):
-    """Bootstrap inputs whose per-window weighted quantile loss is ``crps``."""
-    return ((crps / 2.0)[:, None], np.ones(len(crps), dtype=np.float64), mase)
-
-
-def _geomean(crps: np.ndarray, mase: np.ndarray) -> float:
-    """sqrt(geomean(CRPS) * geomean(MASE)) with the floors 1e-12 / 1e-9."""
-    g_crps = math.exp(float(np.mean(np.log(np.maximum(crps, 1e-12)))))
-    g_mase = math.exp(float(np.mean(np.log(np.maximum(mase, 1e-9)))))
-    return math.sqrt(g_crps * g_mase)
+def _by_label(x: np.ndarray, labels: list[str]) -> dict:
+    """``{label: (n, gain)}`` of per-window log-ratios grouped by label."""
+    lab = np.asarray(labels, dtype=object)
+    return {str(k): (int((lab == k).sum()), log_gain(float(np.mean(x[lab == k]))))
+            for k in sorted(set(labels))}
 
 
 def _judge(cfg, scores: dict, bar: str, members: list[str], clusters: list[str],
-           seed: str) -> list[tuple[float, float, bool]]:
-    """``(lcb, gain, cleared)`` per member against ``bar``: the max-T LCB
-    over the cohort, the full-sample relative gain, and the clear
-    ``lcb >= d_margin and gain > 0``."""
-    lcbs = cohort_maxt_lcbs(_parts(*scores[bar]), [_parts(*scores[m]) for m in members],
-                            alpha=float(cfg.alpha), B=int(cfg.bootstrap_B), seed=seed,
-                            clusters=clusters)
-    bg = _geomean(*scores[bar])
-    denom = bg if abs(bg) >= 1e-9 else 1e-9
+           seed: str, pub: dict | None = None) -> list[dict]:
+    """rev6.18 A3 (F4), re-derived here from the plan (never the producer's
+    or the per-report audit's code; only the generic bootstrap primitives):
+    per member ``{lcb, gain, cleared, halves, sources, domains}`` against
+    ``bar``. Per window ``log clamp(s_bar / s_member, f, 1/f)`` (``f`` =
+    ``window_ratio_floor``), live clusters = source, public clusters =
+    ``<source>|<family>``, ``L = (1 − w) L_live + w L_pub``, one two-part
+    max-T bootstrap; a clear is ``LCB ≥ d_margin`` and every half's point
+    gain > 0. Values of the maps are ``(n, gain)``."""
+    floor, w = float(cfg.window_ratio_floor), float(cfg.public_weight)
+    xl = [clamped_log_ratios(*scores[bar], *scores[m], floor=floor) for m in members]
+    parts = [(xl, list(clusters), 1.0 - w)]
+    xp = None
+    if w > 0.0:
+        xp = [clamped_log_ratios(*pub["scores"][bar], *pub["scores"][m], floor=floor)
+              for m in members]
+        parts.append((xp, list(pub["clusters"]), w))
+    lcbs = parts_maxt_lcbs(parts, alpha=float(cfg.alpha), B=int(cfg.bootstrap_B), seed=seed)
     out = []
-    for m, lcb in zip(members, lcbs, strict=True):
-        gain = (bg - _geomean(*scores[m])) / denom
-        out.append((float(lcb), float(gain),
-                    bool(float(lcb) >= float(cfg.d_margin) and gain > 0.0)))
+    for j, lcb in enumerate(lcbs):
+        lv = float(np.mean(xl[j]))
+        halves = {"live": (int(xl[j].size), log_gain(lv))}
+        sources = {"live": halves["live"]}
+        domains = _by_label(xl[j], [f"live|{c}" for c in clusters])
+        total = (1.0 - w) * lv
+        if xp is not None:
+            pv = float(np.mean(xp[j]))
+            halves["public"] = (int(xp[j].size), log_gain(pv))
+            sources.update(_by_label(xp[j], list(pub["sources"])))
+            domains.update(_by_label(xp[j], list(pub["clusters"])))
+            total += w * pv
+        out.append({"lcb": float(lcb), "gain": log_gain(total),
+                    "cleared": bool(float(lcb) >= float(cfg.d_margin)
+                                    and all(g > 0.0 for _, g in halves.values())),
+                    "halves": halves, "sources": sources, "domains": domains})
     return out
+
+
+def _gains_problem(stated, want: dict) -> bool:
+    """A stated ``{key: {n, gain}}`` map that is not the re-derived one."""
+    if not isinstance(stated, dict) or set(stated) != set(want):
+        return True
+    return any(not isinstance(stated[k], dict) or stated[k].get("n") != n
+               or not _close(stated[k].get("gain"), g) for k, (n, g) in want.items())
+
+
+def _public_half(report: Mapping, cfg) -> dict | None:
+    """rev6.18 A3 (F4): the public half from the report's signed public rows
+    on the kept public windows (drawn minus dropped), or ``None`` when
+    ``public_weight = 0``. Raises ``ValueError`` on a public block that is
+    missing (w > 0), present (w = 0), unbound by its ``rows_sha256``, or
+    does not give every scored digest one finite row per kept window."""
+    if float(cfg.public_weight) <= 0.0:
+        if "public" in report:
+            raise ValueError("a public block at public_weight = 0")
+        return None
+    pub = report["public"]
+    rows = list(pub["rows"])
+    if _sha(_canonical(rows)) != pub["rows_sha256"]:
+        raise ValueError("public.rows_sha256 does not bind public.rows")
+    kept = {}
+    for src in pub["sources"]:
+        gone = {d["window_id"] for d in src["dropped"]}
+        for x in src["windows"]:
+            if x["window_id"] not in gone:
+                kept[x["window_id"]] = (src["source"], x["family"])
+    order = sorted(kept)
+    if not order:
+        raise ValueError("no kept public window")
+    got: dict[str, dict[str, tuple[float, float]]] = {}
+    for r in rows:
+        c, m = float(r["crps"]), float(r["mase"])
+        if r["window_id"] not in kept or not (math.isfinite(c) and math.isfinite(m)
+                                              and c >= 0.0 and m >= 0.0):
+            raise ValueError("a public row off the kept windows or not finite")
+        if r["window_id"] in got.setdefault(r["digest"], {}):
+            raise ValueError("a duplicate public row")
+        got[r["digest"]][r["window_id"]] = (c, m)
+    scores = {}
+    for dg, by in got.items():
+        if sorted(by) != order:
+            raise ValueError(f"{dg[:12]} does not cover every kept public window")
+        scores[dg] = (np.asarray([by[x][0] for x in order], dtype=np.float64),
+                      np.asarray([by[x][1] for x in order], dtype=np.float64))
+    return {"scores": scores, "clusters": [f"{kept[x][0]}|{kept[x][1]}" for x in order],
+            "sources": [kept[x][0] for x in order]}
 
 
 # ── the §1.3b gate ──────────────────────────────────────────────────────────
@@ -713,7 +766,6 @@ class _Verdict:
     king_ts: int
     windows: list
     stated_lcb: float = 0.0
-    lowfreq_fail: bool = False
     outcome: str = "lost"
 
 
@@ -756,6 +808,8 @@ class _Settlement:
         self.body_sha = _body_sha(report)
         # Re-derived by check_top; the stated values until then.
         self.seed = str(report.get("seed"))
+        # rev6.18 A3 (F4): the settlement's public half (signed public rows).
+        self.pub = None
         self.roots = None
         self.snapshot_shas: set = set()
         self.cands: list[dict] = []
@@ -780,6 +834,7 @@ class _Settlement:
         self._guarded("entries", self.check_duplicates)
         self._guarded("windows", self.index_windows)
         self._guarded("rows", self.index_rows)
+        self._guarded("public", self.index_public)
         self._guarded("cohorts", self.check_cohorts)
         self._guarded("draw", self.check_draw)
         self._guarded("gate", self.check_gate)
@@ -787,6 +842,14 @@ class _Settlement:
         self._guarded("king_after", self.check_crown)
         self._guarded("pay", self.check_pay)
         self._guarded("entries", self.check_entry_progress)
+
+    def index_public(self) -> None:
+        """rev6.18 A3 (F4): the public half from the signed public rows."""
+        try:
+            self.pub = _public_half(self.r, self.cfg)
+        except ValueError:
+            self.pub = None
+            self.d.add("public")
 
     # ── report-level fields ─────────────────────────────────────────────────
 
@@ -1303,33 +1366,39 @@ class _Settlement:
                 crps.append(float(row["crps"]))
                 mase.append(float(row["mase"]))
             scores[dg] = (np.asarray(crps, dtype=np.float64), np.asarray(mase, dtype=np.float64))
-        judged = {bar: _judge(cfg, scores, bar, members, clusters, self.seed) for bar in bars}
+        if float(cfg.public_weight) > 0.0 and (
+                self.pub is None or any(dg not in self.pub["scores"] for dg in [*bars, *members])):
+            d.add("public")
+            return len(wids) * (len(bars) + len(members))
+        judged = {bar: _judge(cfg, scores, bar, members, clusters, self.seed, self.pub)
+                  for bar in bars}
         for n, (m, key) in enumerate(zip(members, keys, strict=True)):
             j = by_digest[m]
             covered.add(m)
-            lcb, gain, cleared = judged[kd][n]
+            jd = judged[kd][n]
+            lcb, cleared = jd["lcb"], jd["cleared"]
             if len(bars) > 1:
-                cleared = cleared and judged[bars_house][n][2]
+                cleared = cleared and judged[bars_house][n]["cleared"]
             v = verdicts_of(self.r)[j]
             # rev6.12 (b): the fresh and embargo sub-scores from the rows.
             for name, emb in (("fresh", False), ("embargo", True)):
                 idx = [x for x, wid in enumerate(wids) if self.windows[wid]["embargo_window"] is emb]
                 if not _subscore_ok(v.get(name), scores[m], idx):
                     d.add(f"verdicts[{j}].{name}")
-            lf_fail = self._verdict(j, v, key, stage, kd, i, (lcb, gain),
-                                    judged[bars_house][n] if len(bars) > 1 else None, cleared)
+            self._verdict(j, v, key, stage, kd, i, jd,
+                          judged[bars_house][n] if len(bars) > 1 else None, cleared)
             stated = float(v["lcb"]) if _is_num(v.get("lcb")) else lcb
             self.verdicts.append(_Verdict(index=j, digest=m, key=key, stage=stage,
                                           cleared=cleared,
                                           lcb=lcb, set_sha256=set_sha, king=kd,
                                           king_ts=king_ts, windows=list(wids),
-                                          stated_lcb=stated, lowfreq_fail=lf_fail))
+                                          stated_lcb=stated))
         return len(wids) * (len(bars) + len(members))
 
     def _verdict(self, j: int, v: dict, m: str, stage: str, kd: str, cohort: int,
-                 vs_king: tuple[float, float], vs_house, cleared: bool) -> bool:
-        """Check verdict ``j``; returns whether its A10 slice re-derives
-        ``fail`` (a final loss that never reaches the gate)."""
+                 vs_king: dict, vs_house, cleared: bool) -> None:
+        """Check verdict ``j`` against its re-derived judgements (rev6.18 F4:
+        with its per-half / per-source / per-domain point gains)."""
         at = f"verdicts[{j}]"
         d = self.d
         keys = _VERDICT_KEYS | ({"house"} if vs_house is not None else set())
@@ -1341,10 +1410,13 @@ class _Settlement:
             d.add(f"{at}.stage")
         if not _same(v.get("cohort"), cohort):
             d.add(f"{at}.cohort")
-        if not _close(v.get("lcb"), vs_king[0]):
+        if not _close(v.get("lcb"), vs_king["lcb"]):
             d.add(f"{at}.lcb")
-        if not _close(v.get("gain"), vs_king[1]):
+        if not _close(v.get("gain"), vs_king["gain"]):
             d.add(f"{at}.gain")
+        for name in ("halves", "sources", "domains"):
+            if _gains_problem(v.get(name), vs_king[name]):
+                d.add(f"{at}.{name}")
         if v.get("cleared") is not cleared:
             d.add(f"{at}.cleared")
         if vs_house is not None:
@@ -1356,55 +1428,19 @@ class _Settlement:
                     d.add(_key(f"{at}.house", k))
                 if hv.get("digest") != self.house["digest"]:
                     d.add(f"{at}.house.digest")
-                if not _close(hv.get("lcb"), vs_house[0]):
+                if not _close(hv.get("lcb"), vs_house["lcb"]):
                     d.add(f"{at}.house.lcb")
-                if not _close(hv.get("gain"), vs_house[1]):
+                if not _close(hv.get("gain"), vs_house["gain"]):
                     d.add(f"{at}.house.gain")
-                if hv.get("cleared") is not vs_house[2]:
+                if hv.get("cleared") is not vs_house["cleared"]:
                     d.add(f"{at}.house.cleared")
-        # rev6.11 (b): a cleared first verdict is the crowning candidate.
-        return self._lowfreq(at, v.get("lowfreq"), cleared)
-
-    def _lowfreq(self, at: str, lf, candidate: bool) -> bool:
-        """W3b5 (A10): a crowning candidate's low-frequency slice is
-        ``no_windows`` (empty, no LCB) or ``pass``/``fail`` with four LCBs,
-        ``fail`` iff some LCB < ``-tau_public``; every other verdict is
-        ``not_candidate`` with an empty slice. Returns the re-derived ``fail``."""
-        d, cfg = self.d, self.cfg
-        tau = float(cfg.tau_public)
-        base = {"result", "freqs", "n_windows", "tau_public"}
-        if not isinstance(lf, dict) or not base <= set(lf) <= base | {"lcb"} \
-                or lf.get("freqs") != [str(f) for f in cfg.lowfreq_freqs] \
-                or not _same(lf.get("tau_public"), tau) or not _is_int(lf.get("n_windows")):
-            d.add(f"{at}.lowfreq")
-            return False
-        result, n = lf.get("result"), lf["n_windows"]
-        if not candidate:
-            if result != "not_candidate" or n != 0 or "lcb" in lf:
-                d.add(f"{at}.lowfreq")
-            return False
-        if result == "no_windows":
-            if n != 0 or "lcb" in lf:
-                d.add(f"{at}.lowfreq")
-            return False
-        lcb = lf.get("lcb")
-        if result not in ("pass", "fail") or n <= 0 or not (
-                isinstance(lcb, dict) and set(lcb) == set(GATE_REFS)
-                and all(isinstance(lcb[r], dict) and set(lcb[r]) == set(GATE_METRICS)
-                        and all(_finite(lcb[r][m]) for m in GATE_METRICS) for r in GATE_REFS)):
-            d.add(f"{at}.lowfreq")
-            return result == "fail"
-        fail = any(float(lcb[r][m]) < -tau for r in GATE_REFS for m in GATE_METRICS)
-        if result != ("fail" if fail else "pass"):
-            d.add(f"{at}.lowfreq.result")
-        return fail
 
     # ── the gate, outcomes and the crown ────────────────────────────────────
 
     def _candidates(self) -> list[dict]:
         out = [{"digest": v.digest, "key": v.key, "lcb": v.lcb, "held": False}
                for v in self.verdicts
-               if v.cleared and not v.lowfreq_fail]
+               if v.cleared]
         out += [{"digest": self._dg(k), "key": k, "lcb": float(self.chain.holds[k]["lcb"]),
                  "held": True} for k in self.held]
         for c in out:
@@ -1508,7 +1544,7 @@ class _Settlement:
         self.crown = None if self.retake or not passing else passing[0]["digest"]
         verdicts = verdicts_of(self.r)
         for v in self.verdicts:
-            if not v.cleared or v.lowfreq_fail:
+            if not v.cleared:
                 v.outcome = "lost"
             else:
                 o = self._gate_outcome(v.digest)
@@ -1586,9 +1622,7 @@ class _Settlement:
                 want[v.key] = ("crowned", "crowned")
             elif v.outcome == "lost":
                 o = self._gate_outcome(v.digest) if v.cleared else None
-                if v.cleared and v.lowfreq_fail:
-                    want[v.key] = ("lost", "lowfreq_regression")
-                elif o == "checkpoint_fault":
+                if o == "checkpoint_fault":
                     want[v.key] = ("closed", "checkpoint_fault")
                 elif o == "gate_regression":
                     want[v.key] = ("lost", "gate_regression")
@@ -1737,7 +1771,7 @@ class _Settlement:
                             "set_sha256": v.set_sha256, "lcb": v.stated_lcb,
                             "king_d": self.king_before["digest"]})
                    for v in self.verdicts
-                   if v.cleared and not v.lowfreq_fail]
+                   if v.cleared]
         decided += [(k, c.holds[k]) for k in self.held if k in c.holds]
         for key, record in decided:
             o = self._gate_outcome(self._dg(key))
@@ -1893,4 +1927,4 @@ def replay_chain(reports, receipts, cfg, *, signer_ss58: str,
 
 __all__ = ["MATCH", "MISMATCH", "RECEIPT_SCHEMA", "REPORT_SCHEMA", "STATE_SCHEMA", "STATUSES",
            "UNVERIFIABLE", "UNVERIFIABLE_REASONS", "SettlementReplay", "check_gate_rows",
-           "combined_log_ratio", "court_shares", "expected_params", "gate_draw", "replay_chain"]
+           "court_shares", "expected_params", "gate_draw", "replay_chain"]

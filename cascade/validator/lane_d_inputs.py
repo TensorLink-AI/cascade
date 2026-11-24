@@ -21,7 +21,19 @@ sources only:
 6. every needed checkpoint's forecasts on every pinned window at its
    ``effective_context`` under that set, computed on the lane D eval host
    (:mod:`cascade.eval.lane_d_forecasts`) behind the W4 handshake. Only
-   histories leave the box, never a target (D12).
+   histories leave the box, never a target (D12);
+7. (rev6.18 A3, F4) at ``[lane_d] public_weight > 0``: the settlement's
+   public draw (:func:`~cascade.validator.lane_d_public.draw_public` per
+   pinned source, from the box's ``public_indexes`` and the boundary block
+   hash) and every needed checkpoint's per-window scores on it, computed on
+   the eval host from ITS public mirror (``public`` request: the box sends
+   only the drawn window list; public data is public, so the host reads the
+   series and scores them). Returned as ``LaneDInputs.public_indexes`` /
+   ``public_scores`` (W8b passes both to ``settle_lane_d``, which re-draws
+   and binds the scores to the draw). A miner's own fault scores NaN on
+   every public window (the settlement closes it, ``checkpoint_fault``);
+   any other failure, or drops that differ between digests, is
+   ``public_unavailable``.
 
 ``source.bench(boundary)`` is the boundary's bench
 :class:`~cascade.validator.lane_d_bench.SweepSession` (``None`` without a
@@ -94,6 +106,8 @@ INPUTS_ERROR_CODES = (
     "t7_unavailable",           # the pinned laned_t7/1 document is unreadable
     "armed_invalid",            # armed_record refuses a document
     "no_armed_context",         # no variant passes both gates: nothing can be scored
+    # rev6.18 A3 (F4): the public half
+    "public_unavailable",       # public_weight > 0 and no indexes / host public scores
 )
 
 STATE_FILE = "lane_d_state.json"
@@ -157,8 +171,11 @@ class LaneDInputsSource:
                  chain_factory: Callable[[], Any], pool: Callable[[int], Sequence[Mapping]],
                  eval_host: Any, house_pointer, house_signer_ss58: str,
                  readiness: Callable[[], bytes], t7: Callable[[], bytes],
-                 bench_host: Callable | None = None, expected_identity=None):
+                 bench_host: Callable | None = None, expected_identity=None,
+                 public_indexes: Mapping | None = None):
         self.cfg = cfg
+        # rev6.18 A3 (F4): {source: index dir} on the box (W6p indexes).
+        self._public_indexes = dict(public_indexes or {})
         self._readiness = readiness
         self._t7 = t7
         self.state_path = Path(state_dir) / STATE_FILE
@@ -510,6 +527,74 @@ class LaneDInputsSource:
             out[dg] = _per_window(arr, ids, per)
         return out
 
+    def _public(self, reader: Any, boundary: int, need: dict[str, int],
+                bars: frozenset[str], armed: Sequence[int]) -> tuple[dict | None, dict | None]:
+        """rev6.18 A3 (F4): ``(public_indexes, public_scores)`` (module
+        docstring, item 7); ``(None, None)`` at ``public_weight = 0``."""
+        if float(getattr(self.cfg.lane_d, "public_weight", 0.0) or 0.0) <= 0.0:
+            return None, None
+        if not self._public_indexes:
+            raise LaneDInputsError("public_unavailable",
+                                   "public_weight > 0 but no public_indexes are configured")
+        ask = getattr(self._eval_host, "public_scores", None)
+        if not callable(ask):
+            raise LaneDInputsError("public_unavailable",
+                                   "the eval host cannot score the public half")
+        from ..eval.lane_d_public_index import PUBLIC_SOURCES
+        from .lane_d_public import draw_public
+
+        try:
+            block_hash = str(reader.block_hash(int(boundary)))
+        except Exception as e:  # noqa: BLE001 — the draw's input
+            raise LaneDInputsError("chain_unavailable",
+                                   f"boundary {boundary} block hash unreadable ({e})") from e
+        idx = {str(k): v for k, v in self._public_indexes.items()}
+        if sorted(idx) != sorted(PUBLIC_SOURCES):
+            raise LaneDInputsError("public_unavailable", f"public_indexes name {sorted(idx)}, "
+                                   f"not {sorted(PUBLIC_SOURCES)}")
+        horizon = int(self.cfg.lane_d.horizon)
+        try:
+            draws = [draw_public(idx[src], source=src, boundary_block_hash=block_hash,
+                                 horizon=horizon) for src in sorted(idx)]
+        except Exception as e:  # noqa: BLE001 — an unreadable index is infrastructure
+            raise LaneDInputsError("public_unavailable", f"public draw failed ({e})") from e
+        cap = int(getattr(getattr(self.cfg, "generator", None), "max_channels", 1) or 1)
+        scores: dict[str, dict] = {}
+        dropped = None
+        faulted = []
+        for dg in sorted(need):
+            try:
+                got = ask(dg, context=need[dg], horizon=horizon, draws=draws,
+                          block_hash=block_hash, max_channels=cap)
+            except LaneDForecastError as e:
+                if dg in bars or e.code not in MINER_FAULT_CODES:
+                    raise LaneDInputsError("public_unavailable", f"{dg[:16]}: {e}") from e
+                log.warning("lane D entry %s: checkpoint fault on the public half (%s); the "
+                            "settlement closes it", dg[:16], e.code)
+                faulted.append(dg)
+                continue
+            except Exception as e:  # noqa: BLE001 — the host, never the miner
+                raise LaneDInputsError("public_unavailable",
+                                       f"{dg[:16]}: eval host public scoring failed ({e})") from e
+            if not isinstance(got, dict) or not isinstance(got.get("scores"), dict) \
+                    or not isinstance(got.get("dropped"), dict):
+                raise LaneDInputsError("public_unavailable", f"{dg[:16]}: malformed public reply")
+            if dropped is None:
+                dropped = got["dropped"]
+            elif got["dropped"] != dropped:
+                raise LaneDInputsError("public_unavailable", f"{dg[:16]}: the public drops "
+                                       f"differ between digests (the data, not the model)")
+            scores[dg] = got["scores"]
+        dropped = dropped or {}
+        for dg in faulted:
+            # NaN on every kept window: settle_lane_d closes the entry.
+            scores[dg] = {d["source"]: [
+                {"window_id": w["window_id"], "family": w["family"], "crps": float("nan"),
+                 "mase": float("nan")} for w in d["windows"]
+                if w["window_id"] not in {x["window_id"] for x in dropped.get(d["source"], [])}]
+                for d in draws}
+        return idx, {"scores": scores, "dropped": dropped}
+
     @staticmethod
     def _fault(ids: list[str], horizon: int, per: list[int] | None = None) -> dict:
         """A faulted entry's record: malformed (non-finite) on every window, so
@@ -536,6 +621,7 @@ class LaneDInputsSource:
         windows = self._windows(pools, b)
         need, bars = self._needed(entries, state, house, ctxs)
         forecasts = self._forecasts(need, bars, windows, state, house, ctxs)
+        public_indexes, public_scores = self._public(reader, b, need, bars, ctxs)
         # W3b6a: the bench host sweeps each digest at the context it is
         # forecast at (the same map, once per settlement).
         set_contexts = getattr(self._bench_host, "set_contexts", None)
@@ -544,14 +630,16 @@ class LaneDInputsSource:
         dirs = [d for d, _ in pools]
         return LaneDInputs(pool_dir=dirs[-1], entries=entries, forecasts=forecasts,
                            uid_of=uid_of, house=house, prior_pool_dirs=tuple(dirs[:-1]),
-                           armed=armed, channel_block_hash=self.channel_block_hash)
+                           armed=armed, channel_block_hash=self.channel_block_hash,
+                           public_indexes=public_indexes, public_scores=public_scores)
 
 
 def build_lane_d_inputs(cfg: Any, *, state_dir, intake_state_dir,
                         chain_factory: Callable[[], Any], pool, eval_host, house_pointer,
                         house_signer_ss58: str, readiness: Callable[[], bytes],
                         t7: Callable[[], bytes], bench_host: Callable | None = None,
-                        expected_identity=None) -> LaneDInputsSource | None:
+                        expected_identity=None,
+                        public_indexes: Mapping | None = None) -> LaneDInputsSource | None:
     """The lane D inputs source for ``cfg`` (the full ``ChainConfig``), or
     ``None`` while ``[lane_d] from_block = 0`` (nothing is called, read or
     created). Building an armed source reads nothing. ``readiness`` / ``t7``
@@ -563,7 +651,8 @@ def build_lane_d_inputs(cfg: Any, *, state_dir, intake_state_dir,
                              chain_factory=chain_factory, pool=pool, eval_host=eval_host,
                              house_pointer=house_pointer, house_signer_ss58=house_signer_ss58,
                              readiness=readiness, t7=t7, bench_host=bench_host,
-                             expected_identity=expected_identity)
+                             expected_identity=expected_identity,
+                             public_indexes=public_indexes)
 
 
 # ── the production collaborators ─────────────────────────────────────────────
@@ -668,8 +757,10 @@ class SSHEvalHost:
     def __init__(self, hosts_path, *, cache_dir: str, budget_bytes: int, contexts,
                  host_name: str = "", device: str = "cuda", timeout_s: float = 3600.0,
                  grants: Callable[[str], dict | None] | None = None,
-                 run: Callable | None = None):
+                 run: Callable | None = None, public_root: str = ""):
         self.hosts_path = Path(hosts_path)
+        # rev6.18 A3 (F4): the public mirror root ON the eval host.
+        self.public_root = str(public_root or "")
         self.host_name = host_name
         self.cache_dir = cache_dir
         self.budget_bytes = int(budget_bytes)
@@ -766,10 +857,45 @@ class SSHEvalHost:
         return np.asarray(reply["quantiles"], dtype=np.float64)
 
 
+    def public_scores(self, digest: str, *, context: int, horizon: int, draws,
+                      block_hash: str, max_channels: int) -> dict:
+        """rev6.18 A3 (F4): ``digest``'s per-window scores on the public
+        ``draws``, read and scored on the eval host from its public mirror
+        (``public`` request, JSON; the drawn window list only)."""
+        from ..eval.lane_d_forecasts import PUBLIC_REPLY_SCHEMA, PUBLIC_REQUEST_SCHEMA
+
+        host = self._host
+        if host is None:
+            raise RuntimeError("lane D eval host: public scores before a matching hello")
+        if not self.public_root:
+            raise RuntimeError("lane D eval host: no eval_public_root configured")
+        grant = None
+        if self._grants is not None:
+            try:
+                grant = self._grants(digest)
+            except Exception as e:  # noqa: BLE001 — a cache hit still scores
+                log.warning("lane D entry %s: no presigned grant (%s)", digest[:16], e)
+        meta = {"schema": PUBLIC_REQUEST_SCHEMA, "digest": digest, "context": int(context),
+                "horizon": int(horizon), "contexts": list(self.contexts),
+                "max_channels": int(max_channels), "block_hash": block_hash,
+                "draws": list(draws), "pinned": dict(self._pinned), "grant": grant}
+        args = ["public", "--cache-dir", self.cache_dir, "--budget-bytes",
+                str(self.budget_bytes), "--device", self.device,
+                "--public-root", self.public_root]
+        if host.chain_toml:
+            args += ["--chain-toml", host.chain_toml]
+        reply = json.loads(self._ssh(host, args, json.dumps(meta, sort_keys=True).encode()))
+        if not isinstance(reply, dict) or reply.get("schema") != PUBLIC_REPLY_SCHEMA:
+            raise RuntimeError(f"{host.name}: not a {PUBLIC_REPLY_SCHEMA} reply")
+        if not reply.get("ok"):
+            raise LaneDForecastError(str(reply.get("code")), str(reply.get("detail") or ""))
+        return {"scores": reply.get("scores"), "dropped": reply.get("dropped")}
+
+
 INPUTS_FILE_KEYS = ("intake_state_dir", "pool_pins", "house_pointer", "house_signer_ss58",
                     "eval_hosts", "eval_host_name", "eval_cache_dir", "eval_cache_budget_bytes",
                     "eval_device", "eval_timeout_seconds", "grant_expires_seconds",
-                    "readiness", "t7", "bench_hosts")
+                    "readiness", "t7", "bench_hosts", "public_indexes", "eval_public_root")
 _REQUIRED_KEYS = ("intake_state_dir", "pool_pins", "house_pointer", "house_signer_ss58",
                   "eval_hosts", "eval_cache_dir", "eval_cache_budget_bytes", "readiness", "t7")
 
@@ -793,6 +919,9 @@ def load_inputs_services(cfg: Any, path) -> dict:
         readiness = "/abs/laned_readiness.json"     # rev6.6: laned_readiness/1 (DocumentFile)
         t7 = "/abs/t7.json"                         # rev6.6: laned_t7/1 pod evidence
         bench_hosts = "/abs/lane_d_bench_hosts.toml"  # optional (W3b6a): [[host]] bench pod
+        eval_public_root = "/root/lane_d_public"    # rev6.18 F4: the public mirror ON the host
+        public_indexes = { gift_eval_pretrain = "/abs/idx/gift", rmisc = "/abs/idx/rmisc" }
+                                                    # rev6.18 F4: the W6p indexes on the box
 
     Returns the keyword arguments. ``bench_host`` is the W3b6a
     :class:`~cascade.validator.lane_d_bench_host.SSHBenchHost` on
@@ -809,12 +938,16 @@ def load_inputs_services(cfg: Any, path) -> dict:
     if unknown or missing:
         raise LaneDInputsConfigError(f"lane D inputs file {p}: unknown keys {unknown}, "
                                      f"missing keys {missing}")
-    strs = [k for k in INPUTS_FILE_KEYS if k in raw and not k.endswith(("_bytes", "_seconds"))]
+    strs = [k for k in INPUTS_FILE_KEYS if k in raw and not k.endswith(("_bytes", "_seconds"))
+            and k != "public_indexes"]
     bad = [k for k in strs if not isinstance(raw[k], str) or (k != "eval_host_name"
                                                              and not raw[k])]
     nums = [k for k in ("eval_cache_budget_bytes", "eval_timeout_seconds",
                         "grant_expires_seconds") if k in raw]
     bad += [k for k in nums if not _is_int(raw[k]) or raw[k] <= 0]
+    pidx = raw.get("public_indexes", {})
+    if not isinstance(pidx, dict) or not all(isinstance(v, str) and v for v in pidx.values()):
+        bad.append("public_indexes")
     if bad:
         raise LaneDInputsConfigError(f"lane D inputs file {p}: bad values for {sorted(bad)}")
     from ..lane_d.hippius_vault import VaultClient, VaultEndpoint
@@ -833,7 +966,8 @@ def load_inputs_services(cfg: Any, path) -> dict:
                        contexts=cfg.lane_d.contexts,
                        host_name=raw.get("eval_host_name", "") or ops.eval_host,
                        device=raw.get("eval_device", "cuda"),
-                       timeout_s=float(raw.get("eval_timeout_seconds", 3600)), grants=grants)
+                       timeout_s=float(raw.get("eval_timeout_seconds", 3600)), grants=grants,
+                       public_root=raw.get("eval_public_root", ""))
     bench = None
     if raw.get("bench_hosts"):
         from .lane_d_bench_host import SSHBenchHost
@@ -843,7 +977,8 @@ def load_inputs_services(cfg: Any, path) -> dict:
     return {"intake_state_dir": intake, "pool": PinFilePool(raw["pool_pins"]),
             "eval_host": host, "house_pointer": Path(raw["house_pointer"]),
             "house_signer_ss58": raw["house_signer_ss58"], "bench_host": bench,
-            "readiness": DocumentFile(raw["readiness"]), "t7": DocumentFile(raw["t7"])}
+            "readiness": DocumentFile(raw["readiness"]), "t7": DocumentFile(raw["t7"]),
+            "public_indexes": {str(k): Path(v) for k, v in pidx.items()}}
 
 
 __all__ = ["INPUTS_ERROR_CODES", "DocumentFile", "LaneDInputsConfigError", "LaneDInputsError",

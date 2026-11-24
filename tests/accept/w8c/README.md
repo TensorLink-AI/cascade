@@ -322,3 +322,18 @@ crown nothing and that uid 6 is KING_D's court slot at B1, B2 and B3 (it
 checked B2 only). Nothing is weakened. On main the old code still runs the
 confirmation stage (X is crowned at B2), so the changed test fails on an
 assertion until the W5e implementation lands.
+
+## Public half (rev6.18 F4)
+
+At `public_weight > 0` the source draws the public sources from the box's
+`public_indexes` (inputs file table `public_indexes = {source = dir}`) and
+the boundary block hash, asks the eval host (`public_scores`: SSH `python -m
+cascade.eval.lane_d_forecasts public --public-root R`, R from the inputs
+file's `eval_public_root`) for every needed digest's per-window scores on
+the drawn series it reads from its own mirror, and returns
+`LaneDInputs.public_indexes` / `public_scores`. `public_unavailable`: no
+indexes, the host fails, or the read-time drops differ between digests. A
+miner's own fault is NaN on every kept public window (`checkpoint_fault` in
+the settlement). `test_w8c_public.py` pins it, including the host end
+(`public_scores_entry`). The fault tests import `_forecast_ok` from
+`cascade.validator.lane_d` (A7 deletes `lane_d_lowfreq`).
