@@ -13,6 +13,11 @@ version skew, restarts inside the validator's scoring window):
 The settlement window is placed on the grid of the chain config being deployed
 (``--chain-toml``, else ``<root>/chain.toml``; mainnet 900 blocks, testnet 150).
 With neither file the 900-block mainnet grid is assumed and a note says so.
+The blackout around a boundary (20 min before, 15 after on mainnet's 3 h
+settlement) scales down with a shorter settlement (testnet's 30 min: 3.3 / 2.5
+min), and the block clock is the newest sample of the validator log
+(``--validator-log``, default ``<root>/validator.log``) and ``trainer.log``; a
+sample older than 2 h is a ``clock`` REFUSE.
 
 SERVICE is trainer, validator, intake-laned (the lane D intake, cascade/lane_d/)
 or eval-host (the private eval pod running cascade/validator/private_worker.py).
@@ -43,6 +48,25 @@ SETTLEMENT_BLOCKS = 900
 BLOCK_SECONDS = 12.0
 PRE_SETTLEMENT_MIN = 20          # owner rule: no restart in the ~20 min before a settlement
 POST_SETTLEMENT_MIN = 15         # manifest publish + validator pick-up after the boundary
+# The blackout scales with the settlement length in force (#787): the two
+# minute counts above are the mainnet values at its 3 h (900-block)
+# settlement, i.e. 1/9 before and 1/12 after a boundary. A shorter settlement
+# (testnet: 150 blocks = 30 min) gets the same fractions, so a restart window
+# always exists; a longer one keeps the fixed minutes (never more).
+REFERENCE_SETTLEMENT_MIN = SETTLEMENT_BLOCKS * BLOCK_SECONDS / 60      # 180
+# A block sample older than this is refused as `clock` (#787: a 3-day-old
+# trainer.log placed the window from a stale extrapolation). The validator logs
+# a block every weight re-assert (180 blocks, ~36 min), so 2 h leaves room
+# for a skipped re-assert or two.
+MAX_SAMPLE_AGE_MIN = 120
+
+
+def blackout_minutes(settlement_blocks: int) -> tuple[float, float]:
+    """(minutes refused before a boundary, minutes refused after it) for a
+    settlement of ``settlement_blocks`` blocks: the mainnet minutes scaled by
+    the settlement length, capped at the mainnet minutes."""
+    scale = min(1.0, settlement_blocks * BLOCK_SECONDS / 60 / REFERENCE_SETTLEMENT_MIN)
+    return PRE_SETTLEMENT_MIN * scale, POST_SETTLEMENT_MIN * scale
 
 # ── blast radius ─────────────────────────────────────────────────────────────
 
@@ -151,6 +175,13 @@ def last_block_sample(lines: list[str]) -> tuple[datetime, int] | None:
     return None
 
 
+def freshest_block_sample(*line_sets: list[str]) -> tuple[datetime, int] | None:
+    """The NEWEST block sample over every log (#787: the trainer.log fallback
+    was used even when it was days older than the chain), None without one."""
+    samples = [s for s in (last_block_sample(ls) for ls in line_sets) if s is not None]
+    return max(samples, key=lambda s: s[0]) if samples else None
+
+
 @dataclass(frozen=True)
 class Grid:
     """The settlement grid of the chain config being deployed: ``[round]``
@@ -174,6 +205,12 @@ class Grid:
         else:
             start = block // self.epoch_blocks * self.epoch_blocks
         return start, start + self.epoch_blocks
+
+    def length_at(self, block: int) -> int:
+        """The settlement length (blocks) of the grid in force at ``block``."""
+        if self.activation_block > 0 and self.epoch_blocks_prev > 0 and block < self.activation_block:
+            return self.epoch_blocks_prev
+        return self.epoch_blocks
 
 
 DEFAULT_GRID = Grid(SETTLEMENT_BLOCKS)
@@ -329,15 +366,22 @@ def gate(*, service: str, areas: dict[str, list[str]], diff_text: str, now: date
                        "must reach validators via the signed overlay, not only our copy")
     if freeze_window(now):
         v.no("freeze", "Wed 22:00 – Thu 08:00 UTC: no restarts")
-    sample = last_block_sample(validator_lines) or last_block_sample(trainer_lines)
+    sample = freshest_block_sample(validator_lines, trainer_lines)
+    age_min = (now - sample[0]).total_seconds() / 60 if sample is not None else 0.0
     if sample is None:
         v.no("clock", "no recent chain block in the logs — cannot place the settlement window")
+    elif age_min > MAX_SAMPLE_AGE_MIN:
+        v.no("clock", f"newest chain block in the logs (block {sample[1]}) is {age_min:.0f} min "
+                      f"old (> {MAX_SAMPLE_AGE_MIN} min) — cannot place the settlement window; "
+                      "point --validator-log at the running validator's log")
     else:
         to_next, since = minutes_to_next_settlement(sample, now, grid)
-        if to_next < PRE_SETTLEMENT_MIN:
+        now_blk = sample[1] + (now - sample[0]).total_seconds() / BLOCK_SECONDS
+        pre, post = blackout_minutes(grid.length_at(int(now_blk)))
+        if to_next < pre:
             v.no("settlement", f"settlement in {to_next:.0f} min (no restarts in the last "
-                               f"{PRE_SETTLEMENT_MIN} min before a boundary)")
-        elif since < POST_SETTLEMENT_MIN:
+                               f"{pre:.0f} min before a boundary)")
+        elif since < post:
             v.no("settlement", f"settlement {since:.0f} min ago — manifest publish / pick-up "
                                "still in progress")
         else:
@@ -472,6 +516,10 @@ def main(argv: list[str] | None = None) -> int:
                    help="the chain config being deployed, for the settlement grid ([round] "
                         "epoch_blocks; testnet: chain.testnet.toml). Default <root>/chain.toml; "
                         f"with neither, the mainnet {SETTLEMENT_BLOCKS}-block grid (noted)")
+    c.add_argument("--validator-log", type=Path, default=None,
+                   help="the running validator's log (block clock + scoring guard). Default "
+                        "<root>/validator.log; testnet's main validator logs elsewhere "
+                        "(e.g. val0.log)")
     vp = sub.add_parser("verify")
     vp.add_argument("--service", choices=SERVICES, required=True)
     vp.add_argument("--release", type=Path, required=True,
@@ -505,7 +553,7 @@ def main(argv: list[str] | None = None) -> int:
     areas = classify(paths)
     v = gate(service=a.service, areas=areas, diff_text=diff_text, now=now,
              trainer_lines=tail(a.root / "trainer.log"),
-             validator_lines=tail(a.root / "validator.log"),
+             validator_lines=tail(a.validator_log or a.root / "validator.log"),
              work=a.root / "_train_work", on_main=on_main, acks=set(a.ack), grid=grid)
     v.notes.insert(0, grid_note)
     print(f"{a.service} {a.rev_from[:9]}..{a.rev_to[:9]}: {len(paths)} file(s); areas: "
