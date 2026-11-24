@@ -71,6 +71,11 @@ class LaneDConfig:
     # closes after ``until_block`` (0 = no end; the T21 kill switch).
     from_block: int = 0
     until_block: int = 0
+    # DEC-CA-0075 rule menu: lane D runs the max-T crown test and pays the
+    # court until beaten; the keys exist so the choice is explicit and
+    # recorded (other menu entries are refused for lane D in this release)
+    test_family: str = "maxt"
+    pay_curve: str = "indefinite_until_beaten"
     # Emissions: ``share`` of the total, carved from ``takes_from`` (D1/D48
     # move it to lane_a by overlay); the unpaid remainder burns (D21).
     share: float = 0.0
@@ -332,7 +337,11 @@ def parse_lane_d(raw: object, *, era_blocks_at: Callable[[int], int] | None = No
                          f" ** backtest_weight_cap < d_margin (rev6.9 (a)); got "
                          f"{1.0 - bt_floor ** bt_cap:.6f} >= {d_margin}")
     notes = ld.get("notes", {})
+    from ..rules_menu import parse_lane_menu
+
+    family, curve = parse_lane_menu("lane_d", ld)
     return LaneDConfig(
+        test_family=family, pay_curve=curve,
         from_block=fb, until_block=ub, share=share, takes_from=takes, remainder=rem,
         contexts=contexts, horizon=horizon, dtypes=dtypes,
         forward_margin_hours=fwd,

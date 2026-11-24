@@ -212,14 +212,35 @@ def entry_after(entry: LaneCEntry, mc, *, fresh_after: float = 0.0) -> float:
     return max(t + float(mc.start_margin_seconds), float(fresh_after or 0.0))
 
 
+# DEC-CA-0075 (item 2): the embargo in force at the leg's DISPATCH, stamped
+# by the trainer into the signed ``marketcast`` record; the draw / scan /
+# verdict read these, never the verdict-time config, so an overlay that
+# changes ``[marketcast] embargo_days`` / ``embargo_eval_days`` never scores
+# a leg on windows inside its own training data.
+EMBARGO_RECORD_KEYS = ("embargo_days", "embargo_eval_days")
+
+
+def entry_embargo_mc(entry, mc):
+    """``mc`` with the entry's RECORDED dispatch-time embargo (legacy entry
+    without the record: ``mc`` unchanged — the value then was the config's)."""
+    from dataclasses import replace
+
+    rec = dict(getattr(entry, "marketcast", None) or {})
+    got = {k: int(rec[k]) for k in EMBARGO_RECORD_KEYS
+           if type(rec.get(k)) is int and int(rec[k]) > 0}
+    return replace(mc, **got) if got else mc
+
+
 def entry_draw(entry: LaneCEntry, mc, *, phase: str, block: int, block_hash: str,
                fresh_after: float = 0.0) -> dict:
     """DEC-CA-0073: the entry's signed draw record at round ``block``
     (:func:`cascade.pool.marketcast.embargo_draw`): backtests from the
     embargo before its trainer-stamped dispatch, forwards after
-    :func:`entry_after`."""
+    :func:`entry_after`. DEC-CA-0075: on the embargo RECORDED at the leg's
+    dispatch (:func:`entry_embargo_mc`)."""
     from ..pool.marketcast import embargo_draw
 
+    mc = entry_embargo_mc(entry, mc)
     t = mkt_train_time(entry)
     if t is None:
         raise ValueError("no train_time on the entry's marketcast record")
@@ -789,17 +810,24 @@ class MarketCastMixin:
         fn = self.mkt_snapshot_fn
         if fn is not None:
             return fn(block)
+        mc = self.cfg.marketcast
+        # DEC-CA-0075: the competition spec names the pool (prefix + signer +
+        # schema + series filter); a spec change takes a new source
+        signer = str(mc.pool_signer or "") or self._mkt_main_hotkey()
+        key = (mc.pool_prefix, signer, mc.pool_schema, tuple(mc.pool_select))
         src = getattr(self, "_mkt_source_obj", None)
-        if src is None:
+        if src is None or getattr(self, "_mkt_source_key", key) != key:
             from ..pool.marketcast import MktSnapshotSource
             from ..shared.hippius import pool_s3_store
 
             src = MktSnapshotSource(
-                pool_s3_store(self.cfg.storage), prefix=self.cfg.marketcast.pool_prefix,
-                signer_hotkey=self._mkt_main_hotkey(),
+                pool_s3_store(self.cfg.storage), prefix=mc.pool_prefix,
+                signer_hotkey=signer,
                 cache_dir=Path(getattr(self, "cache_dir", None) or "./_eval_pool"),
-                verify_signature=bool(self.verify_signatures))
+                verify_signature=bool(self.verify_signatures),
+                schema=mc.pool_schema, select=dict(mc.pool_select))
             self._mkt_source_obj = src
+            self._mkt_source_key = key
         return src.snapshot_for(block)
 
     def _mkt_block_hash(self, block: int) -> str:
@@ -976,7 +1004,7 @@ class MarketCastMixin:
             # DEC-CA-0073: the holder's full-pay duration ran out — the slot ends
             expired = win_expired(work.eras_since(holder, block,
                                                  era_length_blocks(self.cfg.round, block)),
-                                  holder)
+                                  holder, self.cfg.lane_c)
             unregistered = registration is not None and self._mkt_registration(
                 registration, holder.hotkey, max(0, block - 1), rid=rid) is None
             if expired or unregistered:
@@ -1175,6 +1203,10 @@ class MarketCastMixin:
         cands = [_unpack(c) for c in item["candidates"]]
         # red-team F6: the family counts OWNERS (coldkeys), weighted Bonferroni
         ks = mkt_family_sizes([e for e, ph, _p in cands if ph == "judge"])
+        # DEC-CA-0075: the competition spec's test family (bonferroni = today)
+        from ..shared.rules_menu import family_size
+
+        ks = {key: family_size(mc.test_family, v) for key, v in ks.items()}
         info = {"report_key": mkt_report_key(R), "report_sha256": sha, "round": R,
                 "round_block": B}
         if item.get("expired"):
@@ -1585,6 +1617,7 @@ def fold_mkt_plan(st, plan: MktPlan | None) -> list:
 
 __all__ = [
     "MKT_COMPUTE_ATTEMPTS", "MarketCastMixin", "MktFault", "MktPlan", "anchor_time",
-    "compute_entry_rows", "holder_record", "entry_after", "entry_draw", "embargo_scan_problem", "fold_mkt_plan", "judge_marketcast_entry",
+    "compute_entry_rows", "holder_record", "entry_after", "entry_draw", "entry_embargo_mc",
+    "EMBARGO_RECORD_KEYS", "embargo_scan_problem", "fold_mkt_plan", "judge_marketcast_entry",
     "mkt_prechecks", "mkt_train_time", "snapshot_record", "suite_of",
 ]

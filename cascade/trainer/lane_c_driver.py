@@ -326,6 +326,15 @@ class LaneCDriver:
                 import time
 
                 leg["train_time"] = float(getattr(self.ops, "now", time.time)())
+                from ..shared.config.lane_c import is_mkt_target
+
+                if is_mkt_target(target):
+                    # DEC-CA-0075 (item 2): the embargo in force at DISPATCH
+                    # rides the trainer-signed record; the verdict, draw and
+                    # scan use it, never a later config
+                    mc_ = self.cfg.marketcast
+                    leg["embargo_days"] = int(mc_.embargo_days)
+                    leg["embargo_eval_days"] = int(mc_.embargo_eval_days)
                 if ck:
                     # red-team F6: the owner the validators' family counts
                     leg["coldkey"] = ck
@@ -426,7 +435,10 @@ class LaneCDriver:
                                        **({"coldkey": str(leg["coldkey"])}
                                           if leg.get("coldkey") else {}),
                                        **({"embargo_scan": dict(leg["embargo_scan"])}
-                                          if leg.get("embargo_scan") else {})}}
+                                          if leg.get("embargo_scan") else {}),
+                                       **{k: int(leg[k]) for k in ("embargo_days",
+                                                                   "embargo_eval_days")
+                                          if k in leg}}}
                        if result.get("marketcast") else {}),
                     # any other competition's entry data (rides the manifest)
                     **({"competition": dict(result["competition"])}
@@ -904,12 +916,16 @@ class RunnerLaneCOps:
 
         cfg = self.r.cfg
         mc = cfg.marketcast
+        # DEC-CA-0075: the pool the competition spec names
+        signer = str(mc.pool_signer or "") or str(cfg.netconfig.owner_hotkey or "")
+        key = (mc.pool_prefix, signer, mc.pool_schema, tuple(mc.pool_select))
         src = self.__dict__.get("_mkt_scan_src")
-        if src is None:
+        if src is None or self.__dict__.get("_mkt_scan_key", key) != key:
             src = self._mkt_scan_src = MktSnapshotSource(
-                pool_s3_store(cfg.storage), prefix=mc.pool_prefix,
-                signer_hotkey=str(cfg.netconfig.owner_hotkey or ""),
-                cache_dir=Path(self.r.work_root) / "_mkt_scan")
+                pool_s3_store(cfg.storage), prefix=mc.pool_prefix, signer_hotkey=signer,
+                cache_dir=Path(self.r.work_root) / "_mkt_scan",
+                schema=mc.pool_schema, select=dict(mc.pool_select))
+            self._mkt_scan_key = key
         got = src.snapshot_for(int(self.client.current_block()))
         if got is None:
             raise RuntimeError(f"no {mc.pool_prefix} snapshot to scan the embargo against")

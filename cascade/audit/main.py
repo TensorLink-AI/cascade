@@ -589,7 +589,8 @@ def fetch_marketcast_reports(receipt: RoundReceipt, store) -> dict:
 
 
 def fetch_marketcast_inputs(receipt: RoundReceipt, reports: dict, store, *,
-                            snapshot_dir: Path | None = None, client=None) -> dict:
+                            snapshot_dir: Path | None = None, client=None,
+                            select: dict | None = None) -> dict:
     """DEC-CA-0064: the rest of what :func:`~cascade.audit.checks.
     check_marketcast` recomputes from — the trainer-signed lane-C manifests
     that carried each entry (``train_time``), the quantile sidecars the
@@ -629,7 +630,8 @@ def fetch_marketcast_inputs(receipt: RoundReceipt, reports: dict, store, *,
 
         for d in sorted(Path(snapshot_dir).iterdir()):
             try:
-                snap = load_snapshot(d, verify_signature=False)
+                # DEC-CA-0075: the competition spec's series filter
+                snap = load_snapshot(d, verify_signature=False, select=select)
             except SnapshotError:
                 continue
             snapshots[snap.digest] = snap
@@ -707,7 +709,8 @@ def audit_receipt(
     mkt_reports = (fetch_marketcast_reports(receipt, reader)
                    if cfg.marketcast.active(int(receipt.epoch_start_block)) else None)
     mkt_inputs = (fetch_marketcast_inputs(receipt, mkt_reports, reader,
-                                          snapshot_dir=mkt_snapshot_dir, client=client)
+                                          snapshot_dir=mkt_snapshot_dir, client=client,
+                                          select=dict(cfg.marketcast.pool_select))
                   if mkt_reports else None)
     pays_d = cfg.lane_d.active(int(receipt.epoch_start_block))
     if lane_d is _FETCH:
@@ -956,7 +959,7 @@ def _marketcast(args) -> int:  # pragma: no cover — network / storage glue
     reports = fetch_marketcast_reports(receipt, reader)
     client = None if args.no_chain else _chain_client(cfg, args.network)
     inputs = fetch_marketcast_inputs(receipt, reports, reader, snapshot_dir=args.mkt_snapshots,
-                                     client=client)
+                                     client=client, select=dict(cfg.marketcast.pool_select))
     results = [check_marketcast(receipt, cfg, reports, **inputs)]
     if args.reproduce:
         from ..pool.marketcast_feeds import http_post_json

@@ -63,6 +63,9 @@ class ExpertLaneParams:
     min_target_clusters: int = 5        # distinct sources among the target windows
     min_guard_windows: int = 50
     min_public_items: int = 10
+    # DEC-CA-0075 rule menu: True = ``bonferroni`` across a leg's own targets
+    # (today), False = ``plain_lcb`` (each target at ``alpha``)
+    bonferroni: bool = True
 
 
 DEFAULT_PARAMS = ExpertLaneParams()
@@ -281,7 +284,7 @@ def judge_expert_targets(
     if (not tg and not guards_only) or len(set(tg)) != len(tg):
         raise ValueError(f"targets must be non-empty and unique; got {tg!r}")
     k = len(tg)
-    pt = p if k <= 1 else replace(p, alpha=p.alpha / k)
+    pt = p if (k <= 1 or not p.bonferroni) else replace(p, alpha=p.alpha / k)
     dom = np.asarray(list(domains), dtype=object)
     kq, ka, km = (np.asarray(a, dtype=np.float64) for a in (king_qloss, king_abs_target, king_mase))
     cq, ca, cm = (np.asarray(a, dtype=np.float64) for a in (chal_qloss, chal_abs_target, chal_mase))

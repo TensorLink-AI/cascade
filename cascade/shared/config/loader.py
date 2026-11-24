@@ -391,8 +391,33 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
     # 2026-10-20: the shipped targets must load with it off; active_targets
     # then counts none of them and lane C's share burns). Its cross-table
     # arming checks run below.
-    marketcast = parse_marketcast(raw.get("marketcast", {}))
     lc_raw = raw.get("lane_c", {}) or {}
+    # DEC-CA-0075 (W-CMP): declarative lane-C competitions. A spec composed
+    # of registry blocks compiles onto its runner's tables (MarketCast:
+    # [marketcast] + [lane_c.competitions.mkt]) and is then parsed by the
+    # SAME parsers; a refused spec (unknown block, no runner) never raises —
+    # its competition is inert and its share burns (typed, logged).
+    from ..competition_spec import compile_marketcast, parse_specs
+
+    _specs_ok, _specs_bad = parse_specs(lc_raw.get("specs") if isinstance(lc_raw, dict)
+                                        else None)
+    mc_raw = raw.get("marketcast", {}) or {}
+    _mkt_spec = next((sp for sp in _specs_ok if sp.id == "mkt"), None)
+    if _mkt_spec is not None:
+        _comps = lc_raw.get("competitions") if isinstance(lc_raw, dict) else None
+        mc_raw, _mkt_comp = compile_marketcast(
+            _mkt_spec, mc_raw, (_comps or {}).get("mkt") if isinstance(_comps, dict) else None)
+        if _mkt_comp is not None:
+            lc_raw = {**lc_raw, "competitions": {**(_comps or {}), "mkt": _mkt_comp}}
+    for _r in _specs_bad:
+        import logging
+
+        logging.getLogger("cascade.config").error(
+            "lane-C competition spec %r REFUSED (%s): %s — it judges nothing and its share "
+            "burns", _r.id, _r.code, _r.reason)
+        if _r.id == "mkt":
+            mc_raw = {**mc_raw, "refused": _r.code}
+    marketcast = parse_marketcast(mc_raw)
     _lc_from = int(lc_raw.get("from_block", 0) or 0) if isinstance(lc_raw, dict) else 0
     _lc_grid = _ebp if (_eab and _ebp and 0 < _lc_from < _eab) else _eb
     lane_c = parse_lane_c(
@@ -407,7 +432,8 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
         # is an era boundary on the grid in force at it
         kind_from_blocks={"mkt": int(marketcast.from_block)},
         era_blocks_at=lambda b: max(1, _ebp if (_eab and _ebp and 0 < b < _eab) else _eb)
-        * max(1, _era_settlements))
+        * max(1, _era_settlements),
+        specs=(_specs_ok, _specs_bad))
     # DEC-CA-0073: an mkt: win's pay-duration ramp starts at
     # [marketcast] gain_margin, so it must lie below [lane_c] full_pay_max_gain
     if not float(marketcast.gain_margin) < float(lane_c.full_pay_max_gain):

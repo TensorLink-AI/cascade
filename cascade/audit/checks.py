@@ -2467,17 +2467,26 @@ def _lane_b_paid_wins(receipt: RoundReceipt, cfg: ChainConfig,
         if int(w.get("age", -1)) != age:
             return [], (f"domain {d}: recorded age {w.get('age')} != {age} "
                         f"eras since block {w.get('merge_block')}")
-        if win_expired(age, lb):
+        # DEC-CA-0075: the win's recorded pay curve (legacy tiered_decay)
+        from ..shared.rules_menu import curve_expired, curve_multiplier
+
+        curve = str(w.get("curve", "") or "") or "tiered_decay"
+        if curve == "tiered_decay" and win_expired(age, lb):
             return [], (f"domain {d}: win paid at age {age} eras, past "
                         f"win_ttl_eras={lb.win_ttl_eras}")
+        if curve != "tiered_decay" and curve_expired(
+                curve, age, full_eras=int(w.get("full_eras") or 0)):
+            return [], f"domain {d}: win paid at age {age} eras, past its {curve} term"
         why = _paid_full_pay_why(
             w, lb.full_pay_tiers, at_win=int(w.get("merge_block", -1)) == block,
             ttl=int(lb.win_ttl_eras),
             state_entry=None if post is None else (post.get("lane_b") or {}).get(d))
         if why:
             return [], f"domain {d}: {why}"
-        mult = reward_multiplier(age, full_eras=int(w["full_eras"]),
-                                 half_life_rounds=lb.half_life_rounds, floor=lb.floor)
+        mult = (reward_multiplier(age, full_eras=int(w["full_eras"]),
+                                  half_life_rounds=lb.half_life_rounds, floor=lb.floor)
+                if curve == "tiered_decay"
+                else curve_multiplier(curve, age, full_eras=int(w["full_eras"])))
         if not math.isclose(float(w.get("multiplier", -1.0)), mult, rel_tol=1e-12,
                             abs_tol=1e-15):
             return [], f"domain {d}: multiplier {w.get('multiplier')} != {mult} at age {age}"
@@ -2552,9 +2561,16 @@ def _lane_c_paid_wins(receipt: RoundReceipt, cfg: ChainConfig,
                                                                        era_blocks=eb))
         if why:
             return [], f"target {t}: {why}"
-        if age >= int(w["full_eras"]):
+        # DEC-CA-0075: on the win's recorded pay curve (legacy fixed_term:
+        # exactly the DEC-CA-0073 rule)
+        from ..shared.rules_menu import curve_expired, curve_multiplier
+
+        curve = str(w.get("curve", "") or "") or "fixed_term"
+        held_w = SimpleNamespace(full_eras=int(w["full_eras"]), curve=curve)
+        if curve_expired(curve, age, full_eras=int(w["full_eras"]),
+                         ttl_eras=int(getattr(lc, "decay_ttl_eras", 0) or 0)):
             return [], (f"target {t}: win paid at age {age} eras, past its full-pay duration "
-                        f"({w['full_eras']} eras) — the slot has ended")
+                        f"({w['full_eras']} eras) on its {curve} curve — the slot has ended")
         if bool(w.get("wind_down", False)) != (t in winding):
             return [], (f"target {t}: wind_down flag {w.get('wind_down')} but its competition "
                         f"is {'' if t in winding else 'not '}winding down at {block}")
@@ -2568,7 +2584,10 @@ def _lane_c_paid_wins(receipt: RoundReceipt, cfg: ChainConfig,
                             f"period ({w.get('full_eras')} eras) or the wind-down window")
             mult = 1.0
         else:
-            mult = 1.0
+            mult = curve_multiplier(curve, age, full_eras=held_w.full_eras,
+                                    half_life_rounds=float(getattr(lc, "decay_half_life_eras",
+                                                                   1.0)),
+                                    floor=float(getattr(lc, "decay_floor", 0.1)))
         if not math.isclose(float(w.get("multiplier", -1.0)), mult, rel_tol=1e-12,
                             abs_tol=1e-15):
             return [], f"target {t}: multiplier {w.get('multiplier')} != {mult} at age {age}"
@@ -3593,6 +3612,10 @@ def check_lane_c(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
             return _fail(name, f"{who}: an infra drop past max_infra_deferrals is {outcome!r}")
         k = 1 if (phase != "judge" or registered) else (
             _mkt_owner_k(r, mkt_fams) if terms["mkt"] else ks.get(_lane_c_group(r), 1))
+        # DEC-CA-0075: the competition's test family (bonferroni = today)
+        from ..shared.rules_menu import family_size
+
+        k = family_size(terms["family"], k)
         want_alpha = float(terms["alpha"]) / k
         if r.get("alpha") is None or not math.isclose(float(r["alpha"]), want_alpha,
                                                       rel_tol=1e-12):
@@ -3744,10 +3767,12 @@ def _lane_c_row_terms(target: str, lc, mc) -> dict:
     or ``[marketcast]``'s for a DEC-CA-0064 ``mkt:`` row."""
     if str(target).startswith("mkt:") and mc is not None:
         return {"mkt": True, "alpha": float(mc.alpha), "margin": float(mc.gain_margin),
-                "min_windows": int(mc.min_windows), "min_clusters": int(mc.min_clusters)}
+                "min_windows": int(mc.min_windows), "min_clusters": int(mc.min_clusters),
+                "family": str(getattr(mc, "test_family", "bonferroni"))}
     return {"mkt": False, "alpha": float(lc.alpha), "margin": float(lc.gain_margin),
             "min_windows": int(lc.min_target_windows),
-            "min_clusters": int(lc.min_target_clusters)}
+            "min_clusters": int(lc.min_target_clusters),
+            "family": str(getattr(lc, "test_family", "bonferroni"))}
 
 
 def _lane_c_carry_key(r: dict) -> tuple:
@@ -4131,6 +4156,11 @@ def _mkt_train_time(r: dict, m: dict, cfg: ChainConfig, manifests: dict | None,
                     cache[("owner", e.miner_hotkey, e.trained_pointer)] = mkt_owner(e)
                     cache[("init", e.miner_hotkey, e.trained_pointer)] = str(
                         dict(e.marketcast or {}).get("init_pointer", "") or "")
+                    from ..validator.marketcast import EMBARGO_RECORD_KEYS
+
+                    cache[("embargo", e.miner_hotkey, e.trained_pointer)] = {
+                        k: v for k, v in dict(e.marketcast or {}).items()
+                        if k in EMBARGO_RECORD_KEYS}
                     t = dict(e.marketcast or {}).get("train_time")
                     return (float(t), "manifest") if t is not None else (None, "manifest")
     t = m.get("train_time")
@@ -4175,8 +4205,10 @@ class _AuditEntry:
     """The one field :func:`~cascade.validator.marketcast.entry_draw` reads
     (the trainer-signed ``train_time``), for the audit's draw re-derivation."""
 
-    def __init__(self, train_time: float | None) -> None:
+    def __init__(self, train_time: float | None, embargo: dict | None = None) -> None:
         self.marketcast = {} if train_time is None else {"train_time": float(train_time)}
+        # DEC-CA-0075: the embargo the trainer recorded at the leg's dispatch
+        self.marketcast.update(embargo or {})
 
 
 def check_marketcast(receipt: RoundReceipt, cfg: ChainConfig,
@@ -4357,7 +4389,9 @@ def check_marketcast(receipt: RoundReceipt, cfg: ChainConfig,
         if m.get("round_block") is None:
             return _fail(name, f"{who}: the row records no round_block to re-derive its draw")
         rb = int(m["round_block"])
-        why_d = _draw_mismatch(_AuditEntry(tt), ent, mc, phase=str(r.get("phase", ent.phase)),
+        emb = mcache.get(("embargo", str(r.get("hotkey")), str(r.get("trained_pointer"))))
+        why_d = _draw_mismatch(_AuditEntry(tt, emb), ent, mc,
+                               phase=str(r.get("phase", ent.phase)),
                                block=rb, fresh_after=float(m.get("fresh_after", 0.0) or 0.0))
         if why_d:
             return _fail(name, f"{who}: the report's window draw: {why_d}")

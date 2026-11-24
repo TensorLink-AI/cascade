@@ -88,6 +88,19 @@ def _hashset(v: object) -> str:
     return v
 
 
+_HASHSET_KEY_RE = re.compile(r"^[A-Za-z0-9_.\-]+(?:/[A-Za-z0-9_.\-]+)*$")
+
+
+def _hashset_key(v: object) -> str:
+    """DEC-CA-0075: the storage key of the pinned hash set ("" = release
+    artefacts only). A plain relative key in the pool bucket; the bytes it
+    holds are only ever used when their sha256 equals the pin."""
+    if not isinstance(v, str) or (v and (not _HASHSET_KEY_RE.match(v) or ".." in v.split("/"))):
+        raise ValueError(f'[lane_b] contamination_hashset_key must be "" or a relative '
+                         f"storage key; got {v!r}")
+    return v
+
+
 def _min_hits(v: object) -> tuple[tuple[str, int], ...]:
     if not isinstance(v, dict) or set(v) != set(LANE_B_CONTAMINATION_HIT_KINDS):
         raise ValueError("[lane_b] contamination_min_hits must be a table "
@@ -151,7 +164,11 @@ def parse_lane_b_track(lb: dict, *,
         "max_leg_seconds": _int("max_leg_seconds",
                                 lb.get("max_leg_seconds", d["max_leg_seconds"]), lo=1),
         "guard_factor": _float("guard_factor", lb.get("guard_factor", d["guard_factor"])),
+        "contamination_hashset_key": _hashset_key(lb.get("contamination_hashset_key", "")),
     }
+    from ..rules_menu import parse_lane_menu
+
+    out["test_family"], out["pay_curve"] = parse_lane_menu("lane_b", lb)
     if out["suite_targets"] and not out["contamination_hashset"]:
         raise ValueError("[lane_b] suite_targets = true needs contamination_hashset pinned "
                          "(the contamination check gates every suite-target entry)")

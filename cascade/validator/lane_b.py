@@ -375,7 +375,8 @@ class LaneBMixin:
                     wins = apply_judgements(st, r.judgements, round_id=r.round_id,
                                             settle_block=r.block,
                                             tiers=self.cfg.lane_b.full_pay_tiers,
-                                            qualify_only=qualify_only)
+                                            qualify_only=qualify_only,
+                                            curve=_lane_b_curve(self.cfg.lane_b))
                 for merge, accepted, block in r.acceptances:
                     st.accept(merge, accepted, block)
                 for w in wins:
@@ -426,8 +427,17 @@ class LaneBMixin:
             r = self._lane_b_judge_round(m)
             apply_judgements(st, r.judgements, round_id=r.round_id, settle_block=r.block,
                              tiers=self.cfg.lane_b.full_pay_tiers,
-                             qualify_only=self.cfg.lane_b.acceptance_at_settlement(r.block))
+                             qualify_only=self.cfg.lane_b.acceptance_at_settlement(r.block),
+                             curve=_lane_b_curve(self.cfg.lane_b))
             for merge, accepted, block in r.acceptances:
                 st.accept(merge, accepted, block)
         st.mark_applied(r.round_id, r.block, in_chain=False)
         self._persist_lane_b()
+
+
+def _lane_b_curve(lb) -> str:
+    """DEC-CA-0075: what a new lane-B win records for ``[lane_b] pay_curve``
+    ("" = the legacy tiered_decay, byte-identical)."""
+    from ..shared.rules_menu import curve_record
+
+    return curve_record(str(getattr(lb, "pay_curve", "tiered_decay")), "lane_b")

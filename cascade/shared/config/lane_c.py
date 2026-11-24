@@ -267,6 +267,37 @@ class LaneCConfig:
     # configured competition, in kind order; () = derived — one weight-1,
     # never-ending competition per kind in ``targets`` (:attr:`competition_list`)
     competitions: tuple[LaneCCompetition, ...] = ()
+    # DEC-CA-0075 (W-CMP), CONSENSUS: the declarative competition specs
+    # (``[lane_c.specs.<id>]``, :mod:`cascade.shared.competition_spec`) —
+    # accepted ones (compiled onto their runner's tables at load) and typed
+    # refusals; ``refused_weight`` = the declared weights of refused specs
+    # that are no configured competition, counted in the split so their
+    # share BURNS instead of flowing to the others. The rule menu
+    # (:mod:`cascade.shared.rules_menu`) picks of competitions without a spec
+    # of their own (defaults = today's rules).
+    specs: tuple = ()
+    spec_refusals: tuple = ()
+    refused_weight: float = 0.0
+    test_family: str = "bonferroni"
+    pay_curve: str = "fixed_term"
+    # the ``tiered_decay`` curve's tail (DEC-CA-0075; read only by a win
+    # recorded on that curve): after its full-pay duration the multiplier
+    # halves every ``decay_half_life_eras`` down to ``decay_floor``, and the
+    # slot ends at ``decay_ttl_eras`` eras after the win
+    decay_half_life_eras: float = 1.0
+    decay_floor: float = 0.1
+    decay_ttl_eras: int = 56
+
+    def spec(self, sid: str):
+        return next((s for s in self.specs if s.id == str(sid)), None)
+
+    def spec_refusal(self, sid: str):
+        return next((r for r in self.spec_refusals if r.id == str(sid)), None)
+
+    def specs_record(self) -> dict:
+        from ..competition_spec import specs_record
+
+        return specs_record(self.specs, self.spec_refusals)
 
     @property
     def competition_list(self) -> tuple[LaneCCompetition, ...]:
@@ -310,8 +341,10 @@ class LaneCConfig:
         ``alpha / k`` (one target's ``k`` judged entries at one settlement)."""
         from ...eval.expert_lane import ExpertLaneParams
 
+        from ..rules_menu import family_size
+
         return ExpertLaneParams(
-            alpha=self.alpha / max(1, int(k)), B=self.bootstrap_B,
+            alpha=self.alpha / family_size(self.test_family, k), B=self.bootstrap_B,
             gain_margin=self.gain_margin, tau_public=self.tau_public,
             min_target_windows=self.min_target_windows,
             min_target_clusters=self.min_target_clusters,
@@ -411,11 +444,30 @@ def _parse_competitions(raw, targets: tuple[str, ...], *, lane_c_from: int,
     return tuple(out)
 
 
+def _refused_weight(raw_specs, refused, comps_raw) -> float:
+    """The share weight refused specs leave to BURN: each refused spec that
+    is no configured competition counts its declared ``weight`` (1.0 when
+    absent or unreadable). A refused spec that IS a configured competition
+    (``mkt``) already burns through its own inert slot."""
+    comps = set(comps_raw or {}) if isinstance(comps_raw, dict) else set()
+    total = 0.0
+    for r in refused:
+        if r.id in comps or r.id == MKT_KIND:
+            continue
+        w = (raw_specs or {}).get(r.id, {}) if isinstance(raw_specs, dict) else {}
+        v = w.get("weight", 1.0) if isinstance(w, dict) else 1.0
+        ok = (not isinstance(v, bool) and isinstance(v, (int, float))
+              and math.isfinite(float(v)) and 0.0 <= float(v) <= 100.0)
+        total += float(v) if ok else 1.0
+    return total
+
+
 def parse_lane_c(lc: dict, *, v2_from_block: int = 0, era_blocks: int = 0,
                  era_settlements: int = 0, lane_b_share: float | None = None,
                  mkt_suites: tuple[str, ...] | None = None,
                  kind_from_blocks: dict[str, int] | None = None,
-                 era_blocks_at: Callable[[int], int] | None = None) -> LaneCConfig:
+                 era_blocks_at: Callable[[int], int] | None = None,
+                 specs: tuple = ((), ())) -> LaneCConfig:
     """Parse + guard ``[lane_c]`` (absent section ⇒ inert defaults).
 
     ``era_blocks`` (the era length on the grid in force at ``from_block``) and
@@ -487,7 +539,17 @@ def parse_lane_c(lc: dict, *, v2_from_block: int = 0, era_blocks: int = 0,
                              f"of {PUBLIC_SUITES}; got {list(ss)}")
         if ss:
             guard.append((spec, ss))
+    from ..rules_menu import parse_lane_menu
+
+    family, curve = parse_lane_menu("lane_c", lc)
+    specs_ok, specs_bad = specs
     cfg = LaneCConfig(
+        specs=tuple(specs_ok), spec_refusals=tuple(specs_bad),
+        refused_weight=_refused_weight(lc.get("specs"), specs_bad, lc.get("competitions")),
+        test_family=family, pay_curve=curve,
+        decay_half_life_eras=_num(lc.get("decay_half_life_eras", 1.0), "decay_half_life_eras"),
+        decay_floor=_num(lc.get("decay_floor", 0.1), "decay_floor"),
+        decay_ttl_eras=_num(lc.get("decay_ttl_eras", 56), "decay_ttl_eras", integer=True),
         from_block=fb,
         share=_num(lc.get("share", 0.25), "share"),
         takes_from=str(lc.get("takes_from", "lane_b")),
@@ -546,6 +608,10 @@ def parse_lane_c(lc: dict, *, v2_from_block: int = 0, era_blocks: int = 0,
                          "in (0, 1]")
     if cfg.replay_settlements < 0:
         raise ValueError("[lane_c] replay_settlements must be >= 0")
+    if (not 0.0 < cfg.decay_half_life_eras <= 1000.0 or not 0.0 <= cfg.decay_floor <= 1.0
+            or not 1 <= cfg.decay_ttl_eras <= 10_000):
+        raise ValueError("[lane_c] need decay_half_life_eras in (0, 1000], decay_floor in "
+                         "[0, 1] and decay_ttl_eras in [1, 10000]")
     # the gain-scaled pay duration (DEC-CA-0073)
     for k in ("full_pay_min_days", "full_pay_max_days", "full_pay_max_gain"):
         if not math.isfinite(getattr(cfg, k)):

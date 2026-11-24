@@ -472,10 +472,26 @@ class MarketCastConfig:
     embargo_eval_days: int = 28
     backtest_windows_per_cell: int = 48
     forward_horizons: tuple[str, ...] = ()   # parse default: DEFAULT_FORWARD_HORIZONS enabled
+    # DEC-CA-0075 (W-CMP): MarketCast as a declarative lane-C competition
+    # spec (``[lane_c.specs.mkt]``, :mod:`cascade.shared.competition_spec`).
+    # The pool's signer ("" / "owner" = the main validator's hotkey, today's
+    # rule), its schema ("" = legacy snapshot OR standard pool, today; a
+    # standard-pool version = that version only), the standard-pool tags a
+    # series must carry ({} = every series), the rule menu picks, and the
+    # typed refusal of the spec ("" = accepted; set ⇒ MarketCast is inert at
+    # every block and its share burns).
+    pool_signer: str = ""
+    pool_schema: str = ""
+    pool_select: tuple[tuple[str, str], ...] = ()
+    test_family: str = "bonferroni"
+    pay_curve: str = "fixed_term"
+    refused: str = ""
 
     def active(self, block: int | None) -> bool:
-        """Whether MarketCast judges a settlement at ``block``."""
-        return bool(self.from_block > 0 and block is not None and int(block) >= self.from_block)
+        """Whether MarketCast judges a settlement at ``block`` (never while
+        its competition spec is refused, DEC-CA-0075)."""
+        return bool(self.from_block > 0 and block is not None and int(block) >= self.from_block
+                    and not self.refused)
 
     @property
     def wait_blocks(self) -> int:
@@ -723,6 +739,33 @@ def _per_suite(raw, name: str, default: dict, suites: tuple[str, ...]):
     missing = [s for s in suites if s not in out]
     if missing:
         raise ValueError(f"[marketcast] {name} is missing enabled suites {missing}")
+    return out
+
+
+def _parse_spec_fields(mc: dict) -> dict:
+    """DEC-CA-0075: the spec-compiled keys (``pool_signer``, ``pool_schema``,
+    ``pool_select``, ``test_family``, ``pay_curve``, ``refused``); absent =
+    today's rule."""
+    from ..competition_spec import POOL_SCHEMAS
+    from ..rules_menu import check_choice
+
+    out: dict = {}
+    for k in ("pool_signer", "pool_schema", "refused"):
+        v = mc.get(k, "")
+        if not isinstance(v, str):
+            raise ValueError(f"[marketcast] {k} must be a string; got {v!r}")
+        out[k] = "" if (k == "pool_signer" and v == "owner") else v
+    if out["pool_schema"] not in POOL_SCHEMAS:
+        raise ValueError(f"[marketcast] pool_schema must be one of {POOL_SCHEMAS}; "
+                         f"got {out['pool_schema']!r}")
+    sel = mc.get("pool_select", {})
+    if not isinstance(sel, dict) or not all(isinstance(a, str) and isinstance(b, str) and b
+                                            for a, b in sel.items()):
+        raise ValueError(f"[marketcast] pool_select must be a table tag -> value; got {sel!r}")
+    out["pool_select"] = tuple(sorted(sel.items()))
+    out["test_family"], out["pay_curve"] = check_choice(
+        "lane_c", test_family=mc.get("test_family", "bonferroni"),
+        pay_curve=mc.get("pay_curve", "fixed_term"))
     return out
 
 
@@ -1070,6 +1113,7 @@ def parse_marketcast(raw: object) -> MarketCastConfig:
         baseline_gate=bgate, event_times=tuple(sorted(evs)),
         native_intervals=nat, native_history_days=tuple(sorted(nhd.items())),
         embargo_eval_days=fed, backtest_windows_per_cell=bwpc, forward_horizons=fh,
+        **_parse_spec_fields(mc),
     )
     unscorable = scorability_problems(cfg_out)
     if unscorable:

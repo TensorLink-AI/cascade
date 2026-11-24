@@ -57,6 +57,9 @@ class DomainWin:
     commit_block: int = 0
     targets: tuple[str, ...] = ()
     qualified_block: int = 0
+    # DEC-CA-0075: the pay curve the win was recorded under ("" = lane B's
+    # legacy tiered_decay; a later overlay never changes a recorded one)
+    curve: str = ""
 
     def __post_init__(self):
         object.__setattr__(self, "targets", tuple(self.targets))
@@ -68,10 +71,21 @@ class DomainWin:
                        below_floor=bool(fp.below_floor))
 
     def full_pay_record(self) -> dict:
-        """``{gain_lcb, tier, full_eras, below_floor}`` — what the payout
-        record and the settlement state stamp."""
+        """``{gain_lcb, tier, full_eras, below_floor}`` (+ ``curve`` when not
+        the legacy one) — what the payout record and the settlement state
+        stamp."""
         return {"gain_lcb": float(self.target_lcb), "tier": self.tier,
-                "full_eras": self.full_eras, "below_floor": bool(self.below_floor)}
+                "full_eras": self.full_eras, "below_floor": bool(self.below_floor),
+                **({"curve": self.curve} if self.curve else {})}
+
+
+def _win_dict(w: DomainWin) -> dict:
+    """A win as the state file stores it (``curve`` only when recorded: a
+    legacy win's bytes are unchanged)."""
+    d = asdict(w)
+    if not d.get("curve"):
+        d.pop("curve", None)
+    return d
 
 
 def win_full_eras(win) -> int:
@@ -186,12 +200,12 @@ class LaneBState:
         return max(0, (int(block) - int(win.merge_block)) // int(era_blocks))
 
     def to_json(self) -> str:
-        return json.dumps({"wins": {d: asdict(w) for d, w in sorted(self.wins.items())},
-                           "history": [asdict(w) for w in self.history],
+        return json.dumps({"wins": {d: _win_dict(w) for d, w in sorted(self.wins.items())},
+                           "history": [_win_dict(w) for w in self.history],
                            "applied": dict(sorted(self.applied.items())),
                            "settled_block": self.settled_block,
                            "last_round": self.last_round,
-                           "qualifications": [asdict(w) for w in self.qualifications],
+                           "qualifications": [_win_dict(w) for w in self.qualifications],
                            "accepted": dict(sorted(self.accepted.items()))}, sort_keys=True)
 
     @classmethod
@@ -269,10 +283,20 @@ def lane_b_payouts(state: LaneBState, *, block: int, era_blocks: int, cfg, n_uid
         if uid is None or not 0 <= int(uid) < n_uids:
             continue
         age = state.eras_since(w, block, era_blocks)
-        if win_expired(age, cfg):
-            continue
-        m = reward_multiplier(age, full_eras=win_full_eras(w),
-                              half_life_rounds=cfg.half_life_rounds, floor=cfg.floor)
+        # DEC-CA-0075: on the win's recorded curve (legacy = tiered_decay,
+        # exactly the rule before: TTL, then reward_multiplier)
+        from .rules_menu import curve_expired, curve_multiplier, recorded_curve
+
+        curve = recorded_curve(w, "lane_b")
+        if curve == "tiered_decay":
+            if win_expired(age, cfg):
+                continue
+            m = reward_multiplier(age, full_eras=win_full_eras(w),
+                                  half_life_rounds=cfg.half_life_rounds, floor=cfg.floor)
+        else:
+            if curve_expired(curve, age, full_eras=win_full_eras(w)):
+                continue
+            m = curve_multiplier(curve, age, full_eras=win_full_eras(w))
         out.append({"domain": d, "hotkey": w.hotkey, "uid": int(uid),
                     "merge_block": int(w.merge_block), "age": int(age), "multiplier": m,
                     **w.full_pay_record()})

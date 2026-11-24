@@ -171,12 +171,26 @@ class TargetWin:
     # against on the same windows, and whether it beat it there
     holder_pointer: str = ""
     beats_holder: bool = False
+    # DEC-CA-0075: the pay curve the win was confirmed under ("" = lane C's
+    # legacy fixed_term; recorded so a later overlay never changes it)
+    curve: str = ""
 
     def full_pay_record(self) -> dict:
-        """``{gain_lcb, tier, full_eras, below_floor}`` — what the payout
-        record and the settlement state stamp."""
+        """``{gain_lcb, tier, full_eras, below_floor}`` (+ ``curve`` when not
+        the legacy one) — what the payout record and the settlement state
+        stamp."""
         return {"gain_lcb": float(self.gain_lcb), "tier": self.tier,
-                "full_eras": self.full_eras, "below_floor": bool(self.below_floor)}
+                "full_eras": self.full_eras, "below_floor": bool(self.below_floor),
+                **({"curve": self.curve} if self.curve else {})}
+
+
+def _win_dict(w: TargetWin) -> dict:
+    """A win as the state file stores it (``curve`` only when recorded, so a
+    legacy win's bytes are unchanged)."""
+    d = asdict(w)
+    if not d.get("curve"):
+        d.pop("curve", None)
+    return d
 
 
 def gain_margin_for(target: str, cfg, mc=None) -> float:
@@ -221,15 +235,29 @@ def duration_full_pay(gain_lcb: float | None, *, margin: float, min_days: float,
             "below_floor": bool(x is None or Fraction(x) < m)}
 
 
+def pay_curve_for(target: str, cfg, mc=None) -> str:
+    """DEC-CA-0075: the pay curve a NEW win on ``target`` is confirmed under —
+    the MarketCast spec's (``[marketcast] pay_curve``) for an ``mkt:`` target,
+    else ``[lane_c] pay_curve``."""
+    if is_mkt_target(target) and mc is not None:
+        return str(getattr(mc, "pay_curve", "fixed_term") or "fixed_term")
+    return str(getattr(cfg, "pay_curve", "fixed_term") or "fixed_term")
+
+
 def target_full_pay_record(target: str, gain_lcb: float | None, cfg, mc=None, *,
                            era_blocks: int) -> dict:
     """CONSENSUS: the full-pay record of a confirmed win on ``target``
     (:func:`duration_full_pay` on ``[lane_c]``'s terms, ramped from
     :func:`gain_margin_for`; ``era_blocks`` = the era length in force at the
-    confirming settlement)."""
-    return duration_full_pay(
+    confirming settlement), plus ``curve`` when the win's pay curve
+    (:func:`pay_curve_for`) is not the legacy ``fixed_term``."""
+    from .rules_menu import curve_record
+
+    rec = duration_full_pay(
         gain_lcb, margin=gain_margin_for(target, cfg, mc), min_days=cfg.full_pay_min_days,
         max_days=cfg.full_pay_max_days, max_gain=cfg.full_pay_max_gain, era_blocks=era_blocks)
+    c = curve_record(pay_curve_for(target, cfg, mc), "lane_c")
+    return {**rec, "curve": c} if c else rec
 
 
 def full_pay_record_mismatch(rec: dict, target: str, cfg, mc=None, *,
@@ -240,6 +268,8 @@ def full_pay_record_mismatch(rec: dict, target: str, cfg, mc=None, *,
     if not all(k in rec for k in ("gain_lcb", "tier", "full_eras")):
         return "carries no gain_lcb / tier / full_eras"
     want = target_full_pay_record(target, rec.get("gain_lcb"), cfg, mc, era_blocks=era_blocks)
+    if str(rec.get("curve", "") or "") != str(want.get("curve", "") or ""):
+        return f"curve {rec.get('curve')!r} != {want.get('curve')!r} in force at the win"
     for k in ("tier", "full_eras", "below_floor"):
         got = rec.get(k, False if k == "below_floor" else None)
         if got != want[k] or isinstance(got, bool) != isinstance(want[k], bool):
@@ -385,8 +415,8 @@ class LaneCState:
         return max(0, (int(block) - int(win.win_block)) // int(era_blocks))
 
     def to_json(self) -> str:
-        d = {"slots": {t: asdict(w) for t, w in sorted(self.slots.items())},
-             "history": [asdict(w) for w in self.history],
+        d = {"slots": {t: _win_dict(w) for t, w in sorted(self.slots.items())},
+             "history": [_win_dict(w) for w in self.history],
              "applied": dict(sorted(self.applied.items())),
              "settled_block": self.settled_block,
              "last_round": self.last_round,
@@ -458,14 +488,20 @@ class LaneCWin:
     multiplier: float
 
 
-def win_expired(age_eras: int, win) -> bool:
+def win_expired(age_eras: int, win, cfg=None) -> bool:
     """Whether a win of age ``age_eras`` has stopped paying (DEC-CA-0073):
     its recorded full-pay duration ``full_eras`` has run out — the slot
-    burns and the holder is evicted. None ``full_eras`` = untiered: refused."""
+    burns and the holder is evicted. None ``full_eras`` = untiered: refused.
+    DEC-CA-0075: on the win's RECORDED pay curve (legacy = ``fixed_term``,
+    exactly the rule above); ``tiered_decay`` ends at ``[lane_c]
+    decay_ttl_eras`` (``cfg``), ``indefinite_until_beaten`` never."""
+    from .rules_menu import curve_expired, recorded_curve
+
     n = getattr(win, "full_eras", None)
     if n is None:
         raise ValueError("lane-C win carries no full-pay duration (full_eras)")
-    return int(age_eras) >= int(n)
+    return curve_expired(recorded_curve(win, "lane_c"), int(age_eras), full_eras=int(n),
+                         ttl_eras=int(getattr(cfg, "decay_ttl_eras", 0) or 0))
 
 
 # ── concurrent competitions (owner 2026-10-20) ───────────────────────────────
@@ -567,7 +603,9 @@ def lane_c_split(cfg, block: int, era_blocks: int, mc=None) -> tuple[list[dict],
     burns). ``slot_frac``: ``{target: fraction of lane C's share}`` for every
     slot-bearing target. Its values sum to <= 1; the rest of the share burns."""
     comps = cfg.competition_list
-    total = sum(float(c.weight) for c in comps)
+    # DEC-CA-0075: a refused competition spec's weight stays in the total, so
+    # its part BURNS (0.0 = no refused spec: byte-identical)
+    total = sum(float(c.weight) for c in comps) + float(getattr(cfg, "refused_weight", 0.0))
     recs: list[dict] = []
     slot: dict[str, float] = {}
     for c in comps:
@@ -607,7 +645,7 @@ def lane_c_payouts(state: LaneCState, *, block: int, era_blocks: int, cfg, n_uid
         if uid is None or not 0 <= int(uid) < n_uids:
             continue
         age = state.eras_since(w, block, era_blocks)
-        if win_expired(age, w):
+        if win_expired(age, w, cfg):
             continue
         row = {"target": t, "hotkey": w.hotkey, "uid": int(uid),
                "win_block": int(w.win_block), "age": int(age)}
@@ -617,7 +655,14 @@ def lane_c_payouts(state: LaneCState, *, block: int, era_blocks: int, cfg, n_uid
             row["multiplier"] = 1.0
             row["wind_down"] = True
         else:
-            row["multiplier"] = 1.0          # full pay until the duration ends
+            # full pay until the duration ends (DEC-CA-0075: on the win's
+            # recorded curve; legacy fixed_term = 1.0)
+            from .rules_menu import curve_multiplier, recorded_curve
+
+            row["multiplier"] = curve_multiplier(
+                recorded_curve(w, "lane_c"), int(age), full_eras=w.full_eras,
+                half_life_rounds=float(getattr(cfg, "decay_half_life_eras", 1.0)),
+                floor=float(getattr(cfg, "decay_floor", 0.1)))
         out.append({**row, **w.full_pay_record()})
     return out
 
@@ -740,7 +785,7 @@ __all__ = [
     "PendingEntry",
     "RECIPE_FILE", "RECIPE_KEYS", "Recipe",
     "TargetWin", "active_targets", "duration_full_pay", "full_pay_record_mismatch",
-    "gain_margin_for", "competition_closed", "competition_from_block",
+    "gain_margin_for", "pay_curve_for", "competition_closed", "competition_from_block",
     "competition_past_end", "competition_started", "competition_state",
     "lane_c_pay_record", "lane_c_payouts", "lane_c_shares", "lane_c_split", "lane_c_vector",
     "lane_pool_shares",

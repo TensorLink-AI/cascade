@@ -715,6 +715,14 @@ class LaneBConfig:
     # a suite-target corpus; D38 (a) a stricter repo cap for those entries.
     suite_targets: bool = False
     contamination_hashset: str = ""
+    # DEC-CA-0075 (item 3): where the pinned hash set is fetched from when no
+    # release artefact matches the pin ("" = release artefacts only, today);
+    # the bytes are sha256-verified against the pin before use (fail closed)
+    contamination_hashset_key: str = ""
+    # DEC-CA-0075 rule menu: the lane's test family and pay curve (defaults =
+    # today's rules; a curve other than tiered_decay is recorded on the win)
+    test_family: str = "bonferroni"
+    pay_curve: str = "tiered_decay"
     contamination_min_hits: tuple[tuple[str, int], ...] = (("exact", 1), ("normalised", 3))
     suite_target_max_repo_mb: int = 8
     # D39 miner-chosen experts: the per-layer clamp is ceil(min_frac E) ..
@@ -797,6 +805,8 @@ class LaneBConfig:
             min_target_clusters=self.min_target_clusters,
             min_guard_windows=self.min_guard_windows,
             min_public_items=self.min_public_items,
+            # DEC-CA-0075: the lane's test family (bonferroni = today)
+            bonferroni=self.test_family == "bonferroni",
         )
 
 

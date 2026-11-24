@@ -261,7 +261,8 @@ def judge_manifest(manifest: ExpertManifest, **kw) -> list[ExpertJudgement]:
 
 
 def apply_judgements(state: LaneBState, judgements: list[ExpertJudgement], *, round_id: str,
-                     settle_block: int, tiers=None, qualify_only: bool = False) -> list[DomainWin]:
+                     settle_block: int, tiers=None, qualify_only: bool = False,
+                     curve: str = "") -> list[DomainWin]:
     """Record one win per domain (best target LCB, ties to the earliest commit
     block, then hotkey). Returns the wins recorded. Each win is tiered by its
     OWN target LCB (DEC-CA-0059: per target of a multi-target leg) under
@@ -293,6 +294,7 @@ def apply_judgements(state: LaneBState, judgements: list[ExpertJudgement], *, ro
                       selection={str(k): list(v) for k, v in j.entry.selection.items()},
                       **({"commit_block": j.entry.commit_block, "targets": j.entry.declared,
                           "qualified_block": int(settle_block)} if qualify_only else {})
+                      **({"curve": str(curve)} if curve else {}),
                       ).with_full_pay(full_pay(float(v.target_lcb), tiers))
         if qualify_only:
             state.qualify(w)
