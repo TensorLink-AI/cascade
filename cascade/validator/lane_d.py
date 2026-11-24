@@ -1340,6 +1340,10 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     # ``refresh_house`` when a new house meets a miner KING_D. It is judged
     # like an entry but lives outside ``entries`` (it has no hotkey and is
     # never paid); each judging job carries the records it judges.
+    # DEC-CA-0076 (owner 2026-11-24): after the first miner crown the house
+    # never challenges; an entry left by older code is dropped.
+    if not state["king"].get("house"):
+        state.pop(HOUSE_ENTRY_KEY, None)
     house_rec = state.get(HOUSE_ENTRY_KEY)
     hd = str(state["house"]["digest"])
     _close_house_copies(state, skipped)
@@ -1442,11 +1446,10 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     pub_scored: set[str] = set()
     for kd, stage, members, recs, is_house in jobs:
         king_ts = _king_reveal_ts(state, kd)
-        # Change 3: when a miner holds KING_D, the current house is a second
-        # bar on the same set (a copy of a fresh house must not win). Its
-        # forecasts are required: a house that cannot be scored fails closed.
-        # The house challenger is judged against KING_D alone.
-        bars = [kd] if kd == hd or is_house else [kd, hd]
+        # DEC-CA-0076 (owner 2026-11-24): KING_D is the only bar. At genesis
+        # it is the house; after the first miner crown the house is no
+        # second bar (W5c change 3 retired).
+        bars = [kd]
         if king_ts is None or any(forecasts.get(b) is None or not _pub_ready(pub_of(b))
                                   for b in bars):
             for m in members:

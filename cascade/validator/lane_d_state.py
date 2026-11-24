@@ -414,11 +414,11 @@ def migrate_confirm_pending(state: dict) -> list[str]:
 def refresh_house(state: dict, house: dict) -> None:
     """§1.4: the house follows lane A's king digest. While the house holds
     KING_D the throne moves with it in place (no duel; ``prior_kings`` is
-    untouched and the old house is never a prior king). A miner KING_D keeps
-    its throne and the new house enters as a challenger: its entry record is
-    :data:`HOUSE_ENTRY_KEY` (replacing an older house's), unless its digest
-    is KING_D's or a prior king's (it is already judged as that). Re-applying
-    the same pointer changes nothing."""
+    untouched and the old house is never a prior king). Owner 2026-11-24
+    (DEC-CA-0076): the house is the bar for lane D's genesis only — once a
+    miner holds KING_D the house is gone from the competition: a new house
+    pointer is recorded and enters NO challenger (no house entry, no
+    retake). Re-applying the same pointer changes nothing."""
     h = {"digest": str(house["digest"]), "reveal_ts": int(house["reveal_ts"])}
     if state["house"]["digest"] == h["digest"]:
         return
@@ -426,10 +426,6 @@ def refresh_house(state: dict, house: dict) -> None:
     state.pop(HOUSE_ENTRY_KEY, None)
     if state["king"].get("house"):
         state["king"] = {**h, "hotkey": None, "house": True}
-        return
-    known = {state["king"]["digest"], *(p["digest"] for p in state["prior_kings"])}
-    if h["digest"] not in known:
-        state[HOUSE_ENTRY_KEY] = house_entry(h)
 
 
 # ── the persisted report ────────────────────────────────────────────────────

@@ -295,10 +295,10 @@ def next_tenure(prior: dict) -> int | None:
 
 
 def _bars(kd: str, hd: str, members) -> list[str]:
-    """The bars a cohort is judged against: KING_D, plus the house as a
-    second bar when a miner holds KING_D and the house is not the
-    challenger (W5f: the house is never its own second bar)."""
-    return [kd] if kd == hd or hd in members else [kd, hd]
+    """The bars a cohort is judged against: KING_D only (DEC-CA-0076, owner
+    2026-11-24: the house is the bar at genesis because it holds KING_D,
+    and no second bar after the first miner crown)."""
+    return [kd]
 
 
 def _house_problems(idx: int, m: str, hv, hd: str, want: dict) -> list[str]:
@@ -1930,16 +1930,16 @@ def lane_d_findings(report: dict, cfg, *, signer_hotkey: str, prior_reports=None
             return f
         alert("ld_judged_set", lambda: _judged_set_problems(report, cfg, entries))
         before, after = report["king_before"], report["king_after"]
+        if after.get("house") and (not before.get("house") or report.get("prior_kings")):
+            # DEC-CA-0076 (owner 2026-11-24): the house holds KING_D at
+            # genesis only; once a miner was crowned it never retakes.
+            f.add("ld_crown", "the house holds KING_D after a miner crown (DEC-CA-0076: the "
+                              "house is lane D's genesis bar only and never retakes)")
+            return f
         if crown is not None and crown == report["house"]["digest"]:
-            # W5f (§2 item 2, T10): the house retakes KING_D from a miner.
-            if (report.get("crowned") is not None or after["digest"] != crown
-                    or not after["house"] or after.get("hotkey") is not None
-                    or before["house"]):
-                f.add("ld_crown", f"house retake {crown[:12]}: crowned "
-                                  f"{report.get('crowned')!r}, king_after "
-                                  f"{str(after['digest'])[:12]} (house={after['house']}), "
-                                  f"king_before house={before['house']}")
-                return f
+            f.add("ld_crown", f"house retake {crown[:12]}: the house never retakes KING_D "
+                              f"(DEC-CA-0076)")
+            return f
         elif crown is not None:
             if report.get("crowned") != crown or after["digest"] != crown or after["house"]:
                 f.add("ld_crown", f"crowned {report.get('crowned')!r}; re-derived {crown!r}")
