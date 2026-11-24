@@ -53,7 +53,7 @@ def test_rmisc_size_and_mirror_need_a_final_allowed_list(tmp_path):
     m = _load(MIRROR, "laned_public_mirror_accept2")
     root, _ = fx.rmisc_mirror(tmp_path)
     listing = _listing(tmp_path, root)
-    with pytest.raises(SystemExit, match="placeholder"):
+    with pytest.raises(SystemExit, match="pending"):
         m.main(["size", "--source", fx.RMISC, "--listing", str(listing)])
     idx = importlib.import_module("cascade.eval.lane_d_public_index")
     allowed = tmp_path / "allowed.toml"

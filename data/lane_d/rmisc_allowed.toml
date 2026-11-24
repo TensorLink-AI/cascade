@@ -3,5 +3,5 @@
 schema = "lane-d-rmisc-allowed/1"
 repo = "nju-zhangsq/RMISC"
 revision = "d0cdd935300ca9b3b2d6f23e6085db24cb7560c2"
-status = "placeholder"
-generated_by = "placeholder: the owner run of scripts/laned_rmisc_allowlist.py finalize replaces this file (A5)"
+status = "pending"
+generated_by = "pending: the owner's run of scripts/laned_rmisc_allowlist.py finalize replaces this file (A5)"

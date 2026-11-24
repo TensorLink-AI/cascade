@@ -62,7 +62,7 @@ def datasets_for(source: str, listing: list[dict], allowed: str | None) -> list[
         return tops
     doc = idx.load_allowed_list(allowed)
     if doc["status"] != "final":
-        raise SystemExit("RMISC allowed list is a placeholder: run "
+        raise SystemExit("RMISC allowed list is still pending (status pending): run "
                          "scripts/laned_rmisc_allowlist.py first (A5)")
     missing = sorted(set(doc["names"]) - set(tops))
     if missing:
@@ -189,7 +189,7 @@ def cmd_index(args) -> int:
     else:
         doc = idx.load_allowed_list(args.allowed)
         if doc["status"] != "final":
-            raise SystemExit("RMISC allowed list is a placeholder (A5 not done)")
+            raise SystemExit("RMISC allowed list is still pending (A5 not done)")
         ds = list(doc["names"])
     m = idx.build_index(root, source=args.source, datasets=ds, out_dir=args.index_dir)
     print(f"INDEX {args.source} series={m['n_series']} index_sha256={m['index_sha256']} "

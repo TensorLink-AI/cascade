@@ -230,7 +230,7 @@ def iter_index(index_dir) -> Iterator[dict]:
 # The RMISC allowed list (A5)
 # ---------------------------------------------------------------------------
 
-ALLOWED_STATUSES = ("placeholder", "final")
+ALLOWED_STATUSES = ("pending", "final")
 ALLOWED_FOLDER_FIELDS = ("name", "reason", "licence", "domain", "freq", "data_check")
 
 
@@ -260,7 +260,7 @@ def render_allowed_list(*, status: str, folders: list[dict], generated_by: str,
 
 def parse_allowed_list(text: str) -> dict:
     """Parse and validate an allowed list (``ValueError`` on any defect):
-    the schema, the pinned RMISC repo and revision, ``status`` placeholder
+    the schema, the pinned RMISC repo and revision, ``status`` pending
     (no folder) or final (at least one); each folder carries every field as
     a non-empty string, names unique, sorted, never a KnownOpen / KnownOil
     duplicate folder, ``data_check`` = ``pass``."""
@@ -282,8 +282,8 @@ def parse_allowed_list(text: str) -> dict:
     folders = doc.get("folder", [])
     if not isinstance(folders, list):
         raise ValueError("allowed list: folder must be an array of tables")
-    if status == "placeholder" and folders:
-        raise ValueError("allowed list: a placeholder lists no folder")
+    if status == "pending" and folders:
+        raise ValueError("allowed list: a pending list names no folder")
     if status == "final" and not folders:
         raise ValueError("allowed list: a final list names at least one folder")
     names = []

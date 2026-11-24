@@ -168,13 +168,13 @@ def test_read_series_reads_only_the_row_groups_of_that_series(tmp_path, monkeypa
     assert np.array_equal(out, fx.series_values("TwoPart", names.index("p3"), 360, 3))
 
 
-def test_the_repo_allowed_list_is_a_valid_placeholder():
+def test_the_repo_allowed_list_is_a_valid_pending():
     idx = _idx()
     assert idx.ALLOWED_LIST_PATH.as_posix().endswith("data/lane_d/rmisc_allowed.toml")
     doc = idx.load_allowed_list()
-    assert doc["status"] in ("placeholder", "final")
+    assert doc["status"] in ("pending", "final")
     assert doc["revision"] == idx.PUBLIC_SOURCES[fx.RMISC].revision
-    if doc["status"] == "placeholder":
+    if doc["status"] == "pending":
         assert doc["names"] == []
 
 
@@ -194,7 +194,7 @@ def test_the_allowed_list_format_round_trips_and_refuses_defects():
         idx.render_allowed_list(status="final", folders=[_folder("A", data_check="duplicate")],
                                 generated_by="t"),
         idx.render_allowed_list(status="final", folders=[], generated_by="t"),
-        idx.render_allowed_list(status="placeholder", folders=[_folder("A")], generated_by="t"),
+        idx.render_allowed_list(status="pending", folders=[_folder("A")], generated_by="t"),
         idx.render_allowed_list(status="final", folders=[_folder("A")], generated_by="t",
                                 revision="0" * 40),
         text.replace('status = "final"', 'status = "draft"'),

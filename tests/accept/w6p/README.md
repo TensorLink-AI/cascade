@@ -28,10 +28,10 @@ written by pyarrow; nothing is downloaded). Nothing here imports torch.
   cover its ranges.
 - The allowed list `data/lane_d/rmisc_allowed.toml` (`parse_allowed_list`):
   `schema = "lane-d-rmisc-allowed/1"`, the pinned RMISC `repo` and `revision`,
-  `status` `placeholder` (no folder) or `final` (≥ 1), `generated_by`, and
+  `status` `pending` (no folder) or `final` (≥ 1), `generated_by`, and
   `[[folder]]` tables with `name`, `reason`, `licence`, `domain`, `freq`,
   `data_check = "pass"`, names unique and sorted, never KnownOpen / KnownOil.
-  The repo copy is a placeholder until the owner's finalize run.
+  The repo copy is `pending` (no folder) until the owner's finalize run.
 
 ## Owner tools
 
@@ -39,7 +39,7 @@ written by pyarrow; nothing is downloaded). Nothing here imports torch.
 
 - `size --source S` prints `SIZE <source> <repo>@<rev> datasets=… files=…
   bytes=… (… GiB)` from the HF tree metadata (RMISC: the final allowed
-  folders only; a placeholder list is refused).
+  folders only; a pending list is refused).
 - `mirror` checks free disk ≥ size × 1.15 before downloading, downloads the
   pinned revision, checks every file size, builds the index and uploads data
   + index to Hippius and R2 under `lane_d_public/<source>/<revision>/`. Keys
@@ -61,6 +61,6 @@ Output formats are in the script's docstring.
 | index rows (GIFT, RMISC) | `test_gift_index_has_one_row_per_series`, `test_rmisc_index_groups_rows_by_original_filename` |
 | index / file-list hashes | `test_index_hashes_are_canonical_and_reproducible`, `test_a_tampered_index_or_file_list_is_refused` |
 | reader reads only the series | `test_read_series_returns_the_stored_series`, `test_read_series_reads_only_the_row_groups_of_that_series` |
-| allowed-list format | `test_the_repo_allowed_list_is_a_valid_placeholder`, `test_the_allowed_list_format_round_trips_and_refuses_defects` |
+| allowed-list format | `test_the_repo_allowed_list_is_a_valid_pending`, `test_the_allowed_list_format_round_trips_and_refuses_defects` |
 | size check, disk check, keys by env name, index command | `test_size_check_prints_the_bytes_from_the_metadata`, `test_rmisc_size_and_mirror_need_a_final_allowed_list`, `test_mirror_refuses_to_start_without_disk_headroom`, `test_mirror_reads_store_keys_from_the_environment_by_name`, `test_index_command_builds_the_index_from_a_local_copy` |
 | A5 candidates, data compare, finalize | `test_candidates_apply_the_a5_rules`, `test_candidates_refuse_unpinned_listings`, `test_datacompare_compares_data_not_names`, `test_finalize_writes_a_valid_final_list` |
