@@ -191,12 +191,17 @@ def test_grid_switch_at_the_activation_block():
 
 
 def test_gate_places_the_window_on_the_given_grid(tmp_path):
-    # block 9516105 at NOW: 45 blocks (9 min) before a 150-block boundary,
-    # 99 min before the next 900-block one.
+    # block 9516140 at NOW: 10 blocks (2 min) before a 150-block boundary,
+    # inside testnet's scaled 3.3 min blackout (#787); 92 min before the next
+    # 900-block one.
     testnet = g.load_grid(REPO / "chain.testnet.toml")
+    near = [_vline("02:59:00", "x block 9516135")]
     v = g.gate(service="validator", areas={}, diff_text="", now=NOW, trainer_lines=[],
-               validator_lines=CLOCK, work=tmp_path, on_main=True, acks=set(), grid=testnet)
+               validator_lines=near, work=tmp_path, on_main=True, acks=set(), grid=testnet)
     assert [r for r, _ in v.refuse] == ["settlement"]
+    v = g.gate(service="validator", areas={}, diff_text="", now=NOW, trainer_lines=[],
+               validator_lines=near, work=tmp_path, on_main=True, acks=set())
+    assert not v.refuse                                          # default 900 grid
     assert not _gate(tmp_path, service="validator", vlines=CLOCK).refuse   # default 900 grid
     mainnet = g.load_grid(REPO / "chain.toml")
     v = g.gate(service="validator", areas={}, diff_text="", now=NOW, trainer_lines=[],
