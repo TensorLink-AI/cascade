@@ -12,3 +12,6 @@ cascade/lane_d/publish.py
 # through cascade.lane_d.publish.sync_cards.
 scripts/laned_king_sync.py
 .github/workflows/laned-king-sync.yml
+# Lane D recurring jobs (ops tooling PR): the module of the w13 job these
+# tests pin (python -P -m cascade.lane_d.ops_jobs).
+cascade/lane_d/ops_jobs.py

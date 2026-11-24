@@ -1,0 +1,22 @@
+# TEMPLATE (not installed by any script): §11.1 "one digest, one identity".
+# Every crowned persisted lane D report must be in the signed
+# champions/lane_d/index.json with its crown block; with a local vault copy
+# and mirror copies (--vault-dir, --mirror hub=DIR r2=DIR hf=DIR in a drop-in)
+# the full check_one_digest also re-hashes the vault and the mirrors.
+# Read-only: it writes nothing. Exit 1 with lane_d_ops_king_unpublished
+# (critical) when a crowned king is missing or disagrees: publishing it is an
+# owner step (the king publication path is not wired into the validator).
+
+[Unit]
+Description=cascade lane D king publication check (read-only)
+
+[Service]
+Type=oneshot
+WorkingDirectory=/
+Environment=PYTHONPATH=/root/cascade
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/cascade-laned-jobs.env
+ExecStart=/root/cascade/.venv/bin/python -P -m cascade.lane_d.ops_jobs king-check --state ${LANED_STATE} --index ${LANED_INDEX} --signer-ss58 ${LANED_SIGNER_SS58} --log-file ${LANED_LOG}
+Nice=19
+MemoryMax=256M
+NoNewPrivileges=true

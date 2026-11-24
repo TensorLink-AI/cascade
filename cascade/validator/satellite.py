@@ -515,6 +515,11 @@ class SatelliteRunner(ActivationMixin):
     _prelaunch_tally: Any = field(default=None, repr=False)
     _image_decoupled: ActivationRecord = field(default_factory=ActivationRecord, repr=False)
     _image_decoupled_tally: Any = field(default=None, repr=False)
+    # DEC-CA-0068 shared ladder: its own record + tally, exactly as the full
+    # validator (loop.py) declares them (#790 — without them the mixin's
+    # startup raised AttributeError and the satellite never cast the vote).
+    _shared_ladder: ActivationRecord = field(default_factory=ActivationRecord, repr=False)
+    _shared_ladder_tally: Any = field(default=None, repr=False)
     _cfg_base: Any = field(default=None, repr=False)
     _settlement_block: int | None = field(default=None, repr=False)
     _netconfig_now: int | None = field(default=None, repr=False)
