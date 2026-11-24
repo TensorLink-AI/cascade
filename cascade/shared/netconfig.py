@@ -1393,17 +1393,31 @@ def lane_switches(cfg: ChainConfig, prev_cfg: ChainConfig, new: ChainConfig,
 
 def lane_a_share(cfg: ChainConfig, boundary: int) -> float | None:
     """Presentational: lane A's pool at settlement ``boundary`` (``1 - b - c -
-    d`` over the lanes active there, before lane B's unpaid refund)."""
-    from .lane_c import lane_pool_shares
-
-    b = cfg.lane_b if cfg.lane_b.active(boundary) else None
-    c = cfg.lane_c if cfg.lane_c.active(boundary) else None
-    d = cfg.lane_d if cfg.lane_d.active(boundary) else None
-    try:
-        s = lane_pool_shares(b, c, d)
-    except ValueError:
-        return None
-    return round(1.0 - s.b - s.c - s.d, 6)
+    d`` over the lanes active there, before lane B's unpaid refund). Mirrors
+    ``lane_c.lane_pool_shares`` without importing it: the satellite import
+    closure (INV-12) must not reach that producer module."""
+    b = float(cfg.lane_b.share) if cfg.lane_b.active(boundary) else 0.0
+    c = 0.0
+    if cfg.lane_c.active(boundary):
+        if cfg.lane_c.takes_from == "lane_a":
+            c = min(float(cfg.lane_c.share), max(0.0, 1.0 - b))
+        else:
+            c = min(float(cfg.lane_c.share), b)
+            b -= c
+    d = 0.0
+    if cfg.lane_d.active(boundary):
+        want, src = max(0.0, float(cfg.lane_d.share)), str(cfg.lane_d.takes_from)
+        if src == "lane_a":
+            d = min(want, max(0.0, 1.0 - b - c))
+        elif src == "lane_b":
+            d = min(want, max(0.0, b))
+            b -= d
+        elif src == "lane_c":
+            d = min(want, max(0.0, c))
+            c -= d
+        else:
+            return None
+    return round(1.0 - b - c - d, 6)
 
 
 def _lane_a_moves(prev_cfg: ChainConfig, new: ChainConfig, block: int) -> list[str]:
