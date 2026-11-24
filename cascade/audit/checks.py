@@ -2869,8 +2869,12 @@ def _lane_vector_want(receipt: RoundReceipt, cfg: ChainConfig, got_pol,
 # from the spec (LANE_D_PLAN D1/D48, §1.4), never through the producer's
 # lane D emission.
 
-# ``derive_weights(..., lane_d=...)`` refusal codes, in check order; the code
-# is ``why.split(":", 1)[0].strip()``.
+# ``derive_weights(..., lane_d=...)`` lane D codes, in check order; the code
+# is ``why.split(":", 1)[0].strip()``. rev6.18 B1: every one of them but
+# ``lane_d_carve_unsupported`` (lanes A/B/C cannot be rebuilt without the
+# carve) comes with a vector whose lane D share burns, lanes A/B/C
+# unchanged; ``lane_d_report_unverified``'s detail starts with the B3 code
+# (``cascade.audit.lane_d.REFUSAL_CODES``) of the burn check that failed.
 LANE_D_WEIGHT_ERRORS = ("lane_d_not_armed", "lane_d_record_missing", "lane_d_record_malformed",
                         "lane_d_boundary_mismatch", "lane_d_report_mismatch",
                         "lane_d_report_unverified", "lane_d_carve_unsupported")
@@ -2927,51 +2931,211 @@ def _lane_d_part(n_uids: int, *, share: float, court: list, king_decay: float,
     return out
 
 
-def _lane_d_court(receipt: RoundReceipt, cfg: ChainConfig, lane_d) -> tuple[list | None, str]:
-    """``(court uids, "")`` from the lane D record (the signed report and its
-    W7c receipt record) for the settlement ``receipt`` closes, or
-    ``(None, why)`` with a :data:`LANE_D_WEIGHT_ERRORS` code."""
+@dataclass(frozen=True)
+class LaneDPay:
+    """rev6.18 B1/B3: what lane D's share does at one settlement.
+
+    ``court``: the signed court's uids (king first) when the record binds a
+    readable report, else ``None``. ``code`` / ``detail``: the first
+    ``burn``-class finding (``""`` when lane D pays); ``alerts``: every
+    ``alert``-class finding as ``"<code>: <detail>"`` (logged and alerted,
+    pay unchanged); ``transient``: a verifier could not run (retry; neither
+    burn nor pay). Lane D pays its signed court iff ``paid``."""
+
+    court: list | None = None
+    code: str = ""
+    detail: str = ""
+    alerts: tuple[str, ...] = ()
+    transient: str = ""
+
+    @property
+    def paid(self) -> bool:
+        return not self.code and not self.transient and self.court is not None
+
+    @property
+    def why(self) -> str:
+        return f"{self.code}: {self.detail}" if self.code else ""
+
+
+def _signed_court(report: dict) -> list | None:
+    court = (report.get("pay") or {}).get("court") if isinstance(report, dict) else None
+    if not isinstance(court, list) or not all(isinstance(s, dict) and "uid" in s for s in court):
+        return None
+    return [s["uid"] for s in court]
+
+
+def lane_d_pay(receipt: RoundReceipt, cfg: ChainConfig, lane_d) -> LaneDPay:
+    """rev6.18 B1/B3: lane D's pay at the settlement ``receipt`` closes, from
+    the lane D record (the signed report and its W7c receipt record;
+    ``None`` = no record). Record-level failures and every ``burn``-class
+    :func:`cascade.audit.lane_d.lane_d_findings` code burn lane D's share
+    only; ``alert``-class codes keep the signed court paid. The codes are
+    :data:`cascade.audit.lane_d.REFUSAL_CODES`."""
     import hashlib
 
-    from .lane_d import _canon, check_lane_d
+    from .lane_d import (
+        ABSENT_STATUS,
+        TRANSIENT_CODE,
+        _canon,
+        check_lane_d_absent,
+        lane_d_findings,
+    )
 
     boundary = int(receipt.epoch_start_block)
+    if lane_d is None:
+        return LaneDPay(code="lane_d_record_missing",
+                        detail=f"lane D pays at the settlement {boundary} but no lane D record "
+                               f"was given")
+    rec = lane_d.get("receipt") if isinstance(lane_d, dict) else None
+    if isinstance(rec, dict) and rec.get("status") == ABSENT_STATUS:
+        # W14: an absent settlement burns lane D's share by design
+        res = check_lane_d_absent(rec, cfg.lane_d, boundary=boundary,
+                                  previous_posterior_sha256=str(
+                                      rec.get("prior_state_sha256", "")),
+                                  report=lane_d.get("report"))
+        return LaneDPay(code="lane_d_record_missing",
+                        detail=f"absent lane D record ({rec.get('reason')!r}): {res.detail}")
     if not isinstance(lane_d, dict) or not isinstance(lane_d.get("report"), dict) \
-            or not isinstance(lane_d.get("receipt"), dict):
-        return None, "lane_d_record_malformed: lane_d is not {report, receipt[, prior_reports]}"
-    report, rec = lane_d["report"], lane_d["receipt"]
+            or not isinstance(rec, dict):
+        return LaneDPay(code="lane_d_record_malformed",
+                        detail="lane_d is not {report, receipt[, prior_reports]}")
+    report = lane_d["report"]
     prior = lane_d.get("prior_reports")
     if prior is not None and not isinstance(prior, (list, tuple)):
-        return None, "lane_d_record_malformed: prior_reports is not a list"
+        return LaneDPay(code="lane_d_record_malformed", detail="prior_reports is not a list")
     for what, b in (("report", report.get("boundary")), ("receipt record", rec.get("boundary"))):
         if isinstance(b, bool) or not isinstance(b, int) or b != boundary:
-            return None, (f"lane_d_boundary_mismatch: the lane D {what}'s boundary {b!r} is not "
-                          f"the settlement's {boundary}")
+            return LaneDPay(code="lane_d_boundary_mismatch",
+                            detail=f"the lane D {what}'s boundary {b!r} is not the "
+                                   f"settlement's {boundary}")
     try:
         body = hashlib.sha256(_canon({k: v for k, v in report.items() if k != "signature"})
                               ).hexdigest()
     except (TypeError, ValueError) as e:
-        return None, f"lane_d_report_mismatch: the report body cannot be digested ({e})"
+        return LaneDPay(code="lane_d_report_mismatch",
+                        detail=f"the report body cannot be digested ({e})")
     if rec.get("report_sha256") != body:
-        return None, (f"lane_d_report_mismatch: the receipt record binds "
-                      f"{str(rec.get('report_sha256'))[:12]}, the report body is {body[:12]}")
-    res = check_lane_d(report, cfg.lane_d, signer_hotkey=cfg.manifest.validator_hotkey,
-                       prior_reports=None if prior is None else list(prior))
-    if res.status != "PASS":
-        return None, f"lane_d_report_unverified: check_lane_d {res.status}: {res.detail}"
-    court = (report.get("pay") or {}).get("court")
-    if not isinstance(court, list) or not all(isinstance(s, dict) and "uid" in s for s in court):
-        return None, "lane_d_report_unverified: pay.court is not a list of slots"
-    return [s["uid"] for s in court], ""
+        return LaneDPay(code="lane_d_report_mismatch",
+                        detail=f"the receipt record binds {str(rec.get('report_sha256'))[:12]}, "
+                               f"the report body is {body[:12]}")
+    court = _signed_court(report)
+    f = lane_d_findings(report, cfg.lane_d, signer_hotkey=cfg.manifest.validator_hotkey,
+                        prior_reports=None if prior is None else list(prior))
+    alerts = tuple(f"{c}: {d}" for c, d in f.alerts)
+    burn = f.burn
+    if burn is not None:
+        return LaneDPay(court=court, code="lane_d_report_unverified",
+                        detail=f"{burn[0]}: {burn[1]}", alerts=alerts)
+    if f.transient:
+        return LaneDPay(court=court, transient=f"{TRANSIENT_CODE}: {f.transient}", alerts=alerts)
+    if court is None:
+        return LaneDPay(code="lane_d_report_unverified",
+                        detail="ld_court: pay.court is not a list of slots", alerts=alerts)
+    return LaneDPay(court=court, alerts=alerts)
+
+
+def _lane_d_wants(receipt: RoundReceipt, cfg: ChainConfig, pol, n: int, pay: LaneDPay
+                  ) -> tuple[list[float] | None, list[float] | None, str | None]:
+    """``(paid, burned, None)``: the vector with lane D paying its signed
+    court (``None`` when the record names none) and with lane D's share
+    burned, lanes A/B/C identical in both (B1); or ``(None, None, why)``
+    when lanes A/B/C cannot be rebuilt."""
+    burned, _, why = _lane_vector_want(receipt, cfg, pol, n, d_court=[])
+    if why is not None:
+        return None, None, why
+    paid = None
+    if pay.court is not None:
+        paid, _, why = _lane_vector_want(receipt, cfg, pol, n, d_court=pay.court)
+        if why is not None:
+            return None, None, why
+    return paid, burned, None
+
+
+LANE_D_ROW = "lane_d"
+
+
+def check_lane_d_pay(receipt: RoundReceipt, cfg: ChainConfig, lane_d) -> CheckResult:
+    """The ``lane_d`` tier-0 row (rev6.18 B1/B3), only at a settlement lane D
+    pays. FAIL ``<code>: <detail>``: a ``burn``-class failure — lane D's
+    share burns, lanes A/B/C are unaffected (a satellite never burns the
+    whole vector on this row). WARN ``lane_d_check_alert: ...``: the
+    alert-class findings, the signed court stays paid. WARN
+    ``ld_verifier_unavailable: ...``: retry. PASS: lane D pays its court."""
+    from .lane_d import ALERT_TAG, TRANSIENT_CODE
+
+    if receipt.status == "rejected" or not receipt.weights:
+        return _skip(LANE_D_ROW, "no weight vector recorded")
+    vec, why = derive_weights(receipt, cfg, lane_d=lane_d)
+    if vec is None:
+        if why.startswith(TRANSIENT_CODE):
+            return _warn(LANE_D_ROW, why)
+        return _fail(LANE_D_ROW, why)
+    if why:
+        return _fail(LANE_D_ROW, f"{why} — lane D's share burns; lanes A/B/C unchanged")
+    if not _same_vector([float(w) for w in receipt.weights], vec):
+        # B3 "weights match the paid court": lanes A/B/C were compared by the
+        # weights row, so the difference is lane D's part
+        return _fail(LANE_D_ROW, "lane_d_report_unverified: ld_court: the recorded vector's "
+                                 "lane D part is not the signed court's — lane D's share "
+                                 "burns; lanes A/B/C unchanged")
+    pay = lane_d_pay(receipt, cfg, lane_d)
+    if pay.alerts:
+        return _warn(LANE_D_ROW, f"{ALERT_TAG}: " + "; ".join(pay.alerts)
+                     + " — the signed court stays paid")
+    return _ok(LANE_D_ROW, f"lane D pays its signed court {pay.court}")
+
+
+def _same_vector(a, b) -> bool:
+    return len(a) == len(b) and all(math.isclose(float(x), float(y), rel_tol=1e-9,
+                                                 abs_tol=1e-12) for x, y in zip(a, b, strict=True))
+
+
+def _lane_d_residual_problem(got: list[float], burned: list[float], *, share: float,
+                             prelaunch: float, burn_uid: int) -> str | None:
+    """Lanes A/B/C of ``got`` against ``burned`` (the rebuild with lane D's
+    share at ``burn_uid``) when lane D's part is not compared slot for slot:
+    the difference is lane D's part moved off the burn uid, so it is
+    non-negative off ``burn_uid``, at most lane D's (post pre-launch burn)
+    share anywhere, and sums to zero."""
+    tol = 1e-9
+    budget = (1.0 - min(1.0, max(0.0, float(prelaunch)))) * float(share)
+    diff = [float(g) - float(w) for g, w in zip(got, burned, strict=True)]
+    for u, d in enumerate(diff):
+        lo = -budget if u == burn_uid else 0.0
+        if d < lo - tol or d > budget + tol:
+            return (f"uid {u} holds {got[u]}, outside the lane A/B/C rebuild {burned[u]} plus "
+                    f"at most lane D's share {budget}")
+    if abs(sum(diff)) > tol:
+        return f"the vector sums {sum(diff):+.3g} off the lane A/B/C + lane D rebuild"
+    return None
 
 
 def _rebuild_lane_vector(name: str, receipt: RoundReceipt, cfg: ChainConfig, got_pol,
                          lad: dict | None) -> CheckResult:
     """Rebuild the vector from the lanes kept apart (lane A's court, lane B's
     ``lane_b_pay``, lane C's ``lane_c_pay`` — DEC-CA-0056, taken from lane
-    B's share) under ``got_pol`` and compare it uid for uid."""
+    B's share) under ``got_pol`` and compare it uid for uid.
+
+    rev6.18 B1: at a settlement lane D pays, lanes A/B/C are compared and
+    lane D's part only bounded (its share, moved off ``burn_uid``); the
+    ``lane_d`` row (:func:`check_lane_d_pay`) checks that part against the
+    signed court, and its failure burns lane D's share only."""
     got = [float(w) for w in receipt.weights]
     pay, c_pay = receipt.lane_b_pay, getattr(receipt, "lane_c_pay", None)
+    if cfg.lane_d.active(int(receipt.epoch_start_block)):
+        burned, _, why = _lane_vector_want(receipt, cfg, got_pol, len(got), d_court=[])
+        if why is not None:
+            return _fail(name, why)
+        share_d, _ = _lane_d_carve(cfg, cfg.lane_b if pay is not None else None,
+                                   cfg.lane_c if c_pay is not None else None)
+        why = _lane_d_residual_problem(got, burned, share=share_d,
+                                       prelaunch=float(got_pol.prelaunch_burn or 0.0),
+                                       burn_uid=int(cfg.scoring.burn_uid))
+        if why is not None:
+            return _fail(name, f"lanes A/B/C do not rebuild: {why} (policy "
+                               f"{got_pol.as_record()})")
+        return _ok(name, f"lanes A/B/C rebuild exactly; lane D's {share_d} share is checked by "
+                         f"the lane_d row (policy {got_pol.as_record()})")
     want, n_c_wins, why = _lane_vector_want(receipt, cfg, got_pol, len(got))
     if why is not None:
         return _fail(name, why)
@@ -3662,6 +3826,10 @@ def check_weights(
     shaped = _check_emission_weights(name, receipt, cfg)
     if shaped is not None:
         return shaped
+    if cfg.lane_d.active(int(receipt.epoch_start_block)):
+        from ..shared.emission import EmissionPolicy
+
+        return _rebuild_lane_vector(name, receipt, cfg, EmissionPolicy(), None)
     if cfg.lane_c.active(receipt.epoch_start_block):
         # DEC-CA-0056: every lane-C vector carries ``lane_c_pay`` (rebuilt
         # above); only a pure burn (force_burn) may omit it
@@ -3756,38 +3924,50 @@ def derive_weights(receipt: RoundReceipt, cfg: ChainConfig, *,
     rebuilt. ``cfg`` must be the config the receipt was judged under (its
     DEC-CA-0045 blocks and DEC-CA-0057 overlay applied). A satellite sets
     this vector only after :func:`check_weights` passed on the same receipt
-    and the two agree uid for uid.
+    and, when lane D pays its court, the two agree uid for uid.
 
     ``lane_d`` (W9): ``None``, or ``{"report", "receipt"[, "prior_reports"]}``
     — the settlement's signed ``lane-d-report/1``, its W7c receipt record
     and, for chain mode, the earlier signed reports. When lane D pays at the
-    boundary its part is re-derived from the report's ``pay.court`` once
-    :func:`cascade.audit.lane_d.check_lane_d` PASSes it; a refusal's code is
-    one of :data:`LANE_D_WEIGHT_ERRORS`. Lane D paying without a record is
-    refused, never a silent lane A-only vector (RV3 note 10). Unarmed with
-    no record, the result is exactly the lane A/B/C one (invariant 1)."""
+    boundary its part is re-derived from the report's ``pay.court``
+    (:func:`lane_d_pay`). rev6.18 B1: a failed lane D check burns ONLY lane
+    D's share — ``(vector, why)`` with a non-empty ``why`` (a
+    :data:`LANE_D_WEIGHT_ERRORS` code) is the vector to set, lanes A/B/C
+    exactly as without lane D's fault and lane D's share on ``burn_uid``.
+    That includes lane D paying without a record (never a silent lane
+    A-only vector, RV3 note 10), a record for an unarmed settlement (lane D
+    pays nothing: the lane A/B/C vector) and a recorded lane D part that is
+    not the signed court's ("weights match the paid court", B3). Alert-class
+    findings (:func:`lane_d_pay` ``alerts``) keep the court paid. A lane D
+    verifier that cannot run is ``(None, "ld_verifier_unavailable: ...")``
+    (retry). Unarmed with no record, the result is exactly the lane A/B/C
+    one (invariant 1)."""
     from ..shared.emission import EmissionPolicy, lane_parts
 
     boundary = int(receipt.epoch_start_block)
     pays_d = cfg.lane_d.active(boundary)
     if lane_d is not None and not pays_d:
-        return None, f"lane_d_not_armed: lane D does not pay at the settlement {boundary}"
-    if pays_d and lane_d is None:
-        return None, (f"lane_d_record_missing: lane D pays at the settlement {boundary} but no "
-                      f"lane D record was given")
+        vec, why = derive_weights(receipt, cfg)
+        if vec is None:
+            return None, why
+        return vec, f"lane_d_not_armed: lane D does not pay at the settlement {boundary}"
     if not receipt.weights:
         return None, "no weight vector recorded"
     n = len(receipt.weights)
     burn = cfg.scoring.burn_uid
     rec = getattr(receipt, "emission", None)
     if pays_d:
-        d_court, why = _lane_d_court(receipt, cfg, lane_d)
-        if d_court is None:
-            return None, why
         pol = (EmissionPolicy.from_record(rec.get("policy") or {}) if rec is not None
                else EmissionPolicy())
-        want, _, why = _lane_vector_want(receipt, cfg, pol, n, d_court=d_court)
-        return (want, "") if why is None else (None, why)
+        pay = lane_d_pay(receipt, cfg, lane_d)
+        if pay.transient:
+            return None, pay.transient
+        paid, burned, why = _lane_d_wants(receipt, cfg, pol, n, pay)
+        if why is not None:
+            return None, why
+        if not pay.paid:
+            return burned, pay.why
+        return paid, ""
     if rec is not None or getattr(receipt, "lane_c_pay", None) is not None:
         pol = (EmissionPolicy.from_record(rec.get("policy") or {}) if rec is not None
                else EmissionPolicy())
@@ -4335,11 +4515,14 @@ def run_tier0(
     *, funded_roster: dict | None = None, bench: dict | None = None,
     king_bench: dict | None = None, validator_bench: dict | None = None,
     marketcast_reports: dict | None = None, marketcast_inputs: dict | None = None,
+    lane_d: dict | None = None,
 ) -> list[CheckResult]:
     """All Tier-0 checks, in a stable order. CPU-only, seconds; ``client`` is an
     optional chain connection (None ⇒ the chain-dependent halves WARN).
     ``check_marketcast`` joins only at a settlement where MarketCast is active
-    (DEC-CA-0064), so every earlier receipt's output is unchanged."""
+    (DEC-CA-0064), so every earlier receipt's output is unchanged. The
+    ``lane_d`` row (:func:`check_lane_d_pay`, rev6.18 B1) joins only at a
+    settlement lane D pays; ``lane_d`` is its record (``None``: missing)."""
     results = [
         check_status(receipt),
         check_receipt_signature(receipt, cfg),
@@ -4377,5 +4560,7 @@ def run_tier0(
         # recorded draw), so every unarmed receipt's output is unchanged
         *([check_sentinel(receipt, cfg, client)] if _sentinel_in_play(receipt, cfg) else []),
         check_weights(receipt, cfg, client),
+        *([check_lane_d_pay(receipt, cfg, lane_d)]
+          if cfg.lane_d.active(int(receipt.epoch_start_block)) else []),
     ]
     return _confirm_rejection(receipt, results)
