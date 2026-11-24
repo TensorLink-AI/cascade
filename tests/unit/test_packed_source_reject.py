@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import base64
 import inspect
+import re
 import zlib
 from dataclasses import replace
 from pathlib import Path
@@ -152,9 +153,16 @@ def test_validate_mode():
 def test_default_is_scan_and_loader_round_trips(tmp_path):
     assert StaticGuardConfig(blocked=()).packed_sources == "scan"
     root = Path(__file__).resolve().parents[2]
-    text = (root / "chain.toml").read_text()
+    shipped = (root / "chain.toml").read_text()
+    # the shipped file types the live gate (S0a B9, owner 2026-11-23)
+    sg = load_chain_config(root / "chain.toml").static_guard
+    assert (sg.packed_sources, sg.packed_sources_from_block) == ("reject", 9169200)
+    assert sg.packed_sources_at(9169199) == "scan" and sg.packed_sources_at(9169200) == "reject"
+    text = re.sub(r"(?m)^packed_sources(_from_block)? *=.*\n", "", shipped)
     assert "packed_sources" not in text.split("[static_guard]")[1].split("[storage]")[0]
-    assert load_chain_config(root / "chain.toml").static_guard.packed_sources == "scan"
+    p0 = tmp_path / "unset.toml"
+    p0.write_text(text)
+    assert load_chain_config(p0).static_guard.packed_sources == "scan"
     armed = text.replace("[static_guard]\n", '[static_guard]\npacked_sources = "reject"\n', 1)
     p = tmp_path / "chain.toml"
     p.write_text(armed)

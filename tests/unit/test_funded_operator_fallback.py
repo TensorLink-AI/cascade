@@ -33,7 +33,8 @@ def test_knob_defaults_off_and_is_loader_parsed(cfg):
     from cascade.shared import config as cfg_mod
 
     assert RoundConfig().funded_operator_fallback is False
-    assert cfg.round.funded_operator_fallback is False               # shipped chain.toml: off
+    # shipped chain.toml: on since S0a (R6x typed the mainnet deployed value)
+    assert cfg.round.funded_operator_fallback is True
     assert 'funded_operator_fallback=bool(r.get("funded_operator_fallback", False))' in \
         inspect.getsource(cfg_mod.load_chain_config)
 
