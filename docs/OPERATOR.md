@@ -3441,7 +3441,10 @@ cascade-trainer --chain-toml chain.toml --work-root ./_train_work --preflight-v2
 
 This fetches the pinned tree, runs full bounded verification, and records a
 local proof tied to its ref, contract, generator policy and verifier source.
-It rents nothing. The first v2 king leg refuses rental without a matching
+It rents nothing. It exits 3 when the launch is still blocked after
+qualification (the printed blockers). `--preflight-v2-baseline-check REF` is
+the read-only version: it lists every blocker without fetching or writing
+(see [Lane D recurring jobs](#lane-d-recurring-jobs)). The first v2 king leg refuses rental without a matching
 proof and a pinned validator receipt anchor. A launch root survives a later
 v2 dethrone; changing the verifier or policy requires qualification again.
 The trainer and validator may share the configured signer; receipts then share
@@ -3559,3 +3562,160 @@ trainer (no legs in flight).
 `[lane_d] max_coldkey_unresolved_settlements` settlements. Alerts reach a
 webhook only when `/etc/cascade-ops.env` is filled; otherwise they reach only
 `alerts.jsonl`.
+
+### Elastic lane D hosts (`cascade-laned elastic`)
+
+Owner decision 2026-11-24 (plan R13, W6d): both lane D hosts are rented only
+while they have work. **GPU is always Lium; Shadeform is CPU only.** The
+controller runs on the box (HTTP and ssh only, nothing heavy) and is
+configured by `deploy/laned/elastic.toml` (operator-only, never consensus).
+
+| Role | Provider | Comes up | Goes down |
+|---|---|---|---|
+| `pool-d-builder` | Shadeform CPU VM (VM mode, user `shadeform`); any type with `num_gpus > 0` is refused | every 3 h (`cascade-laned-pool-d.timer`, 00/03/…/21:05 UTC) | right after `pool_d_publish` and `state-push`, unless `keep_warm = true`; always on failure |
+| `lane-d-eval-host` | Lium, through the existing adapter (digest-pinned worker image, host quarantine, lemon recording) | for a settlement with lane D work: `ceil(entries / per_host_entries)` hosts, at most `max_hosts` | when that settlement's scoring has decided (`down --cohort-done`) |
+
+**Costs.** Builder: the cheapest available type meeting the spec, at the
+2026-11-24 snapshot `massedcompute cpu_small` $0.22/h (40 GB / 800 GB) or
+`cpu_medium` $0.44/h (80 GB / 1600 GB), times the build hours (boot +
+`uv sync --frozen` + mirror delta + build). Eight builds a day at 1 h each and
+$0.44/h is about $106 a month; a build that runs the full 3 h makes it the
+same as keeping one VM warm (about $317 a month). Eval hosts: Lium price per
+host times the settlement's scoring hours, times the number of hosts (for
+example 2 H200 hosts at $3–4/h for 3 h is $18–24 a settlement). Caps:
+`max_price_per_hour` per role (never rented above), `monthly_cap_usd` per role
+over the controller's own spend ledger (`<state_dir>/spend.jsonl`); an eval
+cohort that the monthly cap cannot fund in full gets fewer hosts and an
+alert. Every rental carries a provider-side backstop (Shadeform
+`auto_delete` date + spend threshold, Lium `--ttl`).
+
+**Which GPU.** A candidate in `[[eval_host.candidates]]` is rented only when
+its `gpu_model` is listed by a `status = "qualified"` environment in F5's
+`deploy/laned/scoring_envs.toml`. Until that file is on main the
+`fallback_qualified_gpu_models` list applies (H200 on the pinned
+torch 2.4.1+cu124). The RTX PRO 6000 Blackwell (`Edition`) stays refused until
+F5's sm_120 environment is qualified. No qualified Lium GPU: the controller
+retries Lium for `retry_window_minutes`, writes the alert
+`lane_d_eval_no_lium_gpu` and exits `no_capacity` (the settlement retries).
+It never rents a GPU on Shadeform.
+
+**Same host per cohort (B6), many hosts.** A cohort keeps its hosts until it
+decides; a second `up` for the same cohort reuses them, `up` for another
+cohort and `down` without `--cohort-done` refuse (`cohort_open`).
+`run --role lane-d-eval-host` writes the shard plan: entries split
+deterministically from the boundary block hash and the entry ids, KING_D and
+the house on every host. The consensus half (each challenger paired with its
+own host's king inside the max-T LCB, and the signed report's per-model host
+and per-host king scores) extends F5 (#830) and needs a plan revision; until
+then the merge refuses `host_mismatch` when hosts disagree on the king.
+
+**Builder state.** The W6fs first-seen log and each snapshot's `metadata.json`
+(the next build's `--prior-dir`) live in the private `pool_d` bucket under
+`<pool_d_prefix>/_builder/`. Object storage, not a Shadeform volume: a volume
+is tied to one cloud and region, which would defeat the cheapest-available
+pick. `state-push` refuses (`state_conflict`) unless the bucket copy is a
+byte prefix of the local log and the bucket `HEAD.json` is the one
+`state-pull` saw. `mirror-sync` never touches `first_seen/`.
+
+**Keys the owner fills (names only).**
+
+- `/etc/cascade-laned-elastic.env` (mode 600, the systemd `EnvironmentFile`):
+  `SHADEFORM_API_KEY`, `SHADEFORM_SSH_KEY_ID`, and `LIUM_API_KEY` if the Lium
+  CLI is not already configured.
+- `/etc/cascade-laned-pool-d.env` (mode 600, copied to the builder at mode
+  600; create it with the `env-template` action, below): `HIPPIUS_S3_ACCESS_KEY`,
+  `HIPPIUS_S3_SECRET_KEY`, `TSFORGE_S3_ACCESS_KEY`, `TSFORGE_S3_SECRET_KEY`,
+  `TSFORGE_BUCKET`, `TSFORGE_S3_ENDPOINT`.
+- `deploy/laned/elastic.toml [eval_host] image`: the digest-pinned worker
+  image from the deployed provision.toml, and `per_host_entries` from the A9
+  timing.
+
+**How to run.** Always `quote` (or `--dry-run`) first; renting is
+Approve-tier. The console script `cascade-laned elastic` is the same tool;
+the snippets use the module form.
+
+```
+python -P -m cascade.laned.cli elastic env-template --path /etc/cascade-laned-pool-d.env
+python -P -m cascade.laned.cli elastic quote --role pool-d-builder
+python -P -m cascade.laned.cli elastic cycle --role pool-d-builder --dry-run
+python -P -m cascade.laned.cli elastic cycle --role pool-d-builder        # one build; the timer runs this
+python -P -m cascade.laned.cli elastic down  --role pool-d-builder
+
+python -P -m cascade.laned.cli elastic quote --role lane-d-eval-host --entries 5 --cohort B
+python -P -m cascade.laned.cli elastic up    --role lane-d-eval-host --entries 5 --cohort B
+python -P -m cascade.laned.cli elastic bootstrap --role lane-d-eval-host
+python -P -m cascade.laned.cli elastic run   --role lane-d-eval-host --block-hash H --king K \
+    --house HOUSE --entry-id E1 --entry-id E2 --out shards.json
+python -P -m cascade.laned.cli elastic down  --role lane-d-eval-host --cohort-done
+```
+
+Exit codes: 3 `no_capacity`, 4 `price_cap`, 5 `monthly_cap`, 6 `gpu_refused`,
+7 `cohort_open`, 8 `not_qualified`, 9 `state_conflict`, 10 `step_failed`,
+11 `teardown_unverified`, 12 `host_mismatch` (tests/accept/r13/README.md).
+
+### Lane D recurring jobs
+
+Each job is one idempotent command (a re-run with nothing new does nothing),
+takes `--dry-run` (prints the plan, writes nothing) and reads only local
+files: no chain read, rental, deploy or bucket write. The systemd units in
+`deploy/laned/systemd/` are **templates**: nothing installs or starts them.
+Installing one (copy to `/etc/systemd/system/`, fill
+`/etc/cascade-laned-jobs.env` from `cascade-laned-jobs.env.example`,
+`systemctl enable --now <name>.timer`) is an owner step, testnet first. Every
+mutating unit ships with `--dry-run`. Going live is a drop-in that repeats
+`ExecStart` without it, after the dry-run output has been reviewed.
+
+Exit codes for `python -P -m cascade.lane_d.ops_jobs <job>`: 0 means done,
+nothing to do, or dry-run planned. 1 means an input is invalid or a check
+found a problem, and nothing was written. 2 is a usage error. 3 means the job
+is blocked on an owner step.
+
+| Unit (`.service` + `.timer`) | Schedule | Command | Inputs (names only) | Owner steps |
+|---|---|---|---|---|
+| `cascade-laned-house-pointer` | 15 min | `ops_jobs house-pointer` | `LANED_KING_SOURCE` (the validator's JSON state, `king_pointer`, read only), `LANED_HOUSE_POINTER` (the inputs TOML `house_pointer`), `LANED_HOUSE_SOURCE`, `LANED_SIGNER_SS58`, `LANED_WALLET_NAME` / `LANED_WALLET_HOTKEY` (validator **hotkey**) | For each new lane A king, prepare `laned_house_source/1` = `{schema, king_pointer, digest, reveal_ts}`. `digest` is the lane D manifest digest of the king's BF16 cast (D47) and `reveal_ts` is D46's T. Nothing on main builds the cast yet, so until then the job exits 3. Then approve the live drop-in. |
+| `cascade-laned-published-weights` | hourly | `python -P -m cascade.lane_d.published_weights` | `LANED_INTAKE_STATE`, `LANED_INDEX`, `LANED_SIGNER_SS58`, `LANED_MIRROR_DIR` (local copy of one public mirror); lane A legs, kings and the house via extra `--checkpoint-dir` | Keep the mirror and checkpoint copies current (the fetchers are not built). Live drop-in. |
+| `cascade-laned-readiness-measure` | 3 h, **builder VM only** | `scripts/laned_w1_measure.py --forge-dir … --readiness-out …` | `LANED_FORGE_DIR` (synced forge mirror), `LANED_EVIDENCE_STAGE` | Move the staged `laned_readiness.json` to the validator host's stage. With the elastic builder ([above](#elastic-lane-d-hosts-cascade-laned-elastic)), the VM exists only during a build, so the owner runs this command inside that cycle rather than from a standing timer. The template suits a standing testnet builder. |
+| `cascade-laned-evidence` | 3 h | `ops_jobs evidence` | `LANED_CHAIN_TOML`, `LANED_EVIDENCE_STAGE`, `LANED_PINNED_READINESS` / `LANED_PINNED_T7` (the inputs TOML `readiness` / `t7`) | **T7 is an owner step.** Run the T7 measurement on the eval host pod (`cascade/eval/lane_d_t7.py`, `source = "pod"`), stage `t7.json`, then add `--t7`. A non-pod T7, an unparseable document, or one that disarms an armed context is refused (`--allow-disarm` overrides the last). |
+| `cascade-laned-vault-sweep` | daily 04:30 UTC | `ops_jobs vault-ledger`, then `python -P -m cascade.laned.vault_sweeper --dry-run` | `LANED_STATE`, `LANED_LEDGER`, `LANED_VAULT_DIR` / `LANED_ARCHIVE_DIR` (fs mode, testnet), `LANED_SWEEP_LOG_DIR` | A `--live` sweep needs the standing approval **D16** and a drop-in. S3 mode (`--s3 --archive-bucket`) takes its credentials from the owner's own mode-600 env file, never this one. |
+| `cascade-laned-king-check` | hourly | `ops_jobs king-check` | `LANED_STATE` (its persisted reports), `LANED_INDEX`, `LANED_SIGNER_SS58`; optional `--vault-dir` and `--mirror hub=… r2=… hf=…` local copies for the full re-hash | Publish a crowned king it flags. `publish_king` / `publish_index` exist (W13), but no production path calls them and no Hub/HF mirror client exists. Takedown (`publish.takedown`) is a one-shot owner action, not a job. |
+
+**Lane A item (testnet bring-up): qualify a compliant initial king.** Run
+`cascade-trainer --chain-toml chain.testnet.toml --work-root ./_train_work
+--preflight-v2-baseline-check NAMESPACE/GENERATOR@sha256:DIGEST` first. It is
+read-only: it fetches, writes and rents nothing. It prints every blocker at
+once (`worker_release: …`, `identity: …`, `no_validator_anchor`,
+`no_proof`, `proof_stale:<keys>`, `proof_not_full`) and exits 0 when ready, 3
+when blocked, 2 on error. Then run `--preflight-v2-baseline` with the same
+ref. That fetches the generator, runs the full sandbox verification and
+records the proof, then reports the same way. It exits 3, not 0, when another
+blocker remains. The trainer's `v2 launch blocked before rental` line names
+the king's real ref and work root.
+
+**Watcher tags** for cascade-ops (owner: add follower patterns; nothing here
+writes to cascade-ops). Lines are `<ts> LEVEL cascade.lane_d.ops: <tag> …` in
+`LANED_LOG` (`--log-file`):
+
+| Tag | Level | Meaning |
+|---|---|---|
+| `lane_d_ops_house_current` | info | pointer matches the lane A king |
+| `lane_d_ops_house_no_lane_a_king` | info | lane A has no king, so the previous house stays |
+| `lane_d_ops_house_resign_planned` | info | dry-run: the payload it would sign |
+| `lane_d_ops_house_resigned` | warning | new house pointer signed |
+| `lane_d_ops_house_resign_blocked` | error | lane A king changed and its house source is not prepared (exit 3) |
+| `lane_d_ops_house_failed` | error | unreadable or invalid input, or the wrong signer; nothing written |
+| `lane_d_ops_evidence_current` | info | pinned readiness / T7 already current |
+| `lane_d_ops_evidence_planned` | info | dry-run install plan |
+| `lane_d_ops_evidence_installed` | warning | new readiness / T7 installed (armed before → after) |
+| `lane_d_ops_evidence_refused` | error | invalid, non-pod or disarming document |
+| `lane_d_ops_ledger_current` | info | vault ledger unchanged |
+| `lane_d_ops_ledger_planned` | info | dry-run ledger |
+| `lane_d_ops_ledger_written` | info | ledger exported for the sweeper |
+| `lane_d_ops_ledger_failed` | error | state or closure unprovable; nothing written |
+| `lane_d_ops_king_ok` | info | every crowned report agrees with the index |
+| `lane_d_ops_king_unpublished` | critical | a crowned king is missing or disagrees (index, vault or mirror) |
+| `lane_d_ops_king_check_failed` | error | the index or the inputs are unreadable or unverified |
+
+The published-weights job prints `published_weights: wrote …`,
+`published_weights: current …`, `published_weights: dry-run …` and, on
+failure, `published_weights: … nothing written`. The sweeper writes its own
+JSON action log under `LANED_SWEEP_LOG_DIR`.

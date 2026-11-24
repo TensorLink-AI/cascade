@@ -144,7 +144,10 @@ def test_ready_never_downloads_the_weights(tmp_path):
 
     env.store.get = spy_get
     assert m.ready(files).status == 200
-    assert not any(not k.endswith("manifest.json") for k in reads), reads
+    # tests-correction (item 8, config hardening): ready also reads the small
+    # config.json to pin the whole file; it still never reads the weights or code.
+    assert not any(not k.endswith(("manifest.json", "config.json")) for k in reads), reads
+    assert not any(k.endswith("weights.safetensors") for k in reads), reads
 
 
 def test_ready_for_a_never_submitted_digest_is_unknown_entry(tmp_path):

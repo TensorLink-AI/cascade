@@ -1,0 +1,25 @@
+# TEMPLATE (not installed by any script): re-sign the lane D house pointer
+# when lane A's king changes (plan §10.4 "refresh house if KING_A digest
+# changed", §1.4, W5f). Read-only toward lane A: it reads the validator's JSON
+# state (king_pointer) and never edits it.
+#
+# Ships in --dry-run: it prints the payload it would sign and writes nothing.
+# Going live is an owner step: a drop-in that repeats ExecStart without
+# --dry-run (systemctl edit), after the dry-run output was reviewed.
+# Exit 3 = owner step: the house source (BF16 cast digest + D46 reveal_ts) for
+# the new lane A king is not prepared yet. Log tag lane_d_ops_house_*.
+
+[Unit]
+Description=cascade lane D house pointer re-sign (dry-run template)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/
+Environment=PYTHONPATH=/root/cascade
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/cascade-laned-jobs.env
+ExecStart=/root/cascade/.venv/bin/python -P -m cascade.lane_d.ops_jobs house-pointer --dry-run --king-source ${LANED_KING_SOURCE} --king-field ${LANED_KING_FIELD} --pointer ${LANED_HOUSE_POINTER} --signer-ss58 ${LANED_SIGNER_SS58} --house-source ${LANED_HOUSE_SOURCE} --wallet-name ${LANED_WALLET_NAME} --wallet-hotkey ${LANED_WALLET_HOTKEY} --log-file ${LANED_LOG}
+Nice=19
+MemoryMax=256M
+NoNewPrivileges=true

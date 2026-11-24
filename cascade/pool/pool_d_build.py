@@ -48,12 +48,14 @@ from pathlib import Path
 
 import numpy as np
 
+from ..shared.config.lane_d import LaneDConfig
 from .builder import _interp_channel, _sanitize_id
 
 POOL_D_SCHEMA = "pool_d/1"
 BUILDER_VERSION = "cascade-pool-d/1"
 HISTORY_LENGTH = 16_384
-DEFAULT_EMBARGO_HOURS = 48.0
+# The loader's [lane_d] embargo_hours default (W2e), never a second literal.
+DEFAULT_EMBARGO_HOURS = float(LaneDConfig.embargo_hours)
 EVIDENCE_SCHEMA = "laned-evidence/w6b/1"
 SNAPSHOT_FILES = ("metadata.json", "hist.npz", "tgt.npz")
 REPLAY_MISMATCH_EXIT = 3
@@ -532,16 +534,20 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--max-series-per-source", type=int, default=10_000)
     ap.add_argument("--mv-pack", action="store_true")
     ap.add_argument("--chain-toml", type=Path, default=None,
-                    help="read [lane_d] horizon / embargo_hours from this file")
+                    help="read [lane_d] horizon / embargo_hours from this file (default: "
+                         "the loader's default chain.toml)")
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--evidence-out", type=Path, default=None)
     args = ap.parse_args(argv)
 
-    cfg = PoolDBuildConfig()
-    if args.chain_toml is not None:
-        from ..shared.config import load_chain_config
+    from ..shared.config import load_chain_config
 
-        cfg = PoolDBuildConfig.from_lane_d(load_chain_config(args.chain_toml).lane_d)
+    # [lane_d] horizon / embargo_hours always come from a chain config: the
+    # named file, else the loader's default chain.toml (item 7: the builder
+    # never falls back to a hard-coded embargo).
+    cfg = PoolDBuildConfig.from_lane_d(load_chain_config(args.chain_toml).lane_d)
+    print(f"pool_d: [lane_d] embargo_hours={cfg.embargo_hours:g} horizon={cfg.horizon} from "
+          f"{args.chain_toml or 'the default chain.toml'}", file=sys.stderr)
     selection, mismatches = replay_lane_a(
         args.lane_a_pool, args.forge_dir, max_panel_series_per_feed=args.max_panel_series_per_feed,
         mv_pack=args.mv_pack, max_series_per_source=args.max_series_per_source)

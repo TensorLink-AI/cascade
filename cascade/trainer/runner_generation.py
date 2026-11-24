@@ -133,7 +133,9 @@ class _GenerationMixin:
             reason = "initial v2 king source has no matching full verification"
         self._v2_launch_preflight_status = {"state": "blocked", "ref": gen.ref, "reason": reason}
         log.error("v2 launch blocked before rental: qualify a compliant initial king with "
-                  "cascade-trainer --preflight-v2-baseline REF --work-root PATH")
+                  "cascade-trainer --chain-toml CHAIN_TOML --work-root %s "
+                  "--preflight-v2-baseline %s (check first: --preflight-v2-baseline-check)",
+                  self.work_root, gen.ref)
         return False
 
     def _generation_lead_seconds(self) -> float:
