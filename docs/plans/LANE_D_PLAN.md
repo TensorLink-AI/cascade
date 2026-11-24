@@ -1,10 +1,203 @@
 # Plan: lane D "open weights" (anything goes on our architecture), with lane E and lane A flexibility — v3
 
-Status: **PLAN v3, ~~rev6.12~~ ~~rev6.14~~ ~~rev6.15~~ ~~rev6.16~~ ~~rev6.17~~ ~~rev6.18~~ ~~rev6.20~~ rev6.23 (proposed 2026-11-22; ~~rev6.12~~ ~~rev6.14~~ ~~rev6.15~~ ~~rev6.16~~ ~~rev6.17~~ rev6.18 2026-11-23; rev6.20, rev6.23 2026-11-24)**: v2's design, made buildable by an
+Status: **PLAN v3, ~~rev6.12~~ ~~rev6.14~~ ~~rev6.15~~ ~~rev6.16~~ ~~rev6.17~~ ~~rev6.18~~ ~~rev6.20~~ rev6.21, rev6.23 (proposed 2026-11-22; ~~rev6.12~~ ~~rev6.14~~ ~~rev6.15~~ ~~rev6.16~~ ~~rev6.17~~ rev6.18 2026-11-23; rev6.20, rev6.21, rev6.23 2026-11-24)**: v2's design, made buildable by an
 autonomous loop. A work package is done **only when its Accept command exits
 0**; **(rev6)** its level is only what `scripts/laned/status` computes (§17),
 never a claim. Owner decisions are marked **[DECIDE]**. Nothing is armed. **No calendar
 dates**: stages are gated (§5).
+
+## rev6.21 (owner 2026-11-24; main @ b65f25d): four miner-chosen levers on lane B expert legs
+
+One owner decision (owner 2026-11-24, DECIDED: "open four new miner-chosen
+levers for lane B expert legs"). It builds on rev6.20 (lane B EMA, no
+cooldown; plan PR #840, feature PR #845) and on WB23 (miner-chosen
+`train_hours`, PR #816), and lands as **one feature PR** (rev6.17 rule),
+tests and code together, new WP **WB27** (`tests/accept/wb27/`). Plan text
+only here. Changed text elsewhere is marked **(rev6.21)**.
+
+**Where the levers live.** On the lane B funding request, next to WB23's
+`train_hours`: one header **`X-Lane-B-Levers`** carrying a JSON object (keys
+below; an absent key is its default; no header = every lever at its default
+= today's leg). The signature binds it: the lane B signed ref gains
+`|levers=<sha256 of the header value as sent>` after WB23's `|hours=` tag
+(no header ⇒ the signed field is today's, byte for byte). The intake parses
+and range-checks it before anything is queued or vaulted (nothing charged),
+the funded entry keeps the canonical value, and the trainer derives the leg
+contract from it.
+
+| Lever | Key | Range | Default (today) | Typed refusal |
+|---|---|---|---|---|
+| (1) LR scale | `lr_scale` | `[lane_b] lr_scale_min` … `lr_scale_max` (shipped 0.5 … 2.0; loader: `0 < min ≤ 1.0 ≤ max ≤ 4.0`), at most 3 decimals | 1.0 | `lr_scale_out_of_range` |
+| (2) Curriculum | `curriculum` | 1–3 ordered stages `[[name, fraction], …]`; names `[a-z][a-z0-9_-]{0,23}`, unique; fractions > 0 with at most 2 decimals, summing to exactly 1 | one stage (today) | `bad_curriculum` |
+| (3) Context length | `context_length` | 4096 … 32768, powers of two, ≤ the context ceiling, must fit the chosen GPU's measured memory | 4096 | `context_length_out_of_range`, `context_length_unfit`, **`context_length_unsupported` (see below)** |
+| (4) Scored EMA | `ema` | ~~{0.05, 0.10}~~ `[lane_b] ema_sigma_rels` (addition 6) | 0.10 | `ema_out_of_range`, `ema_unarmed` (a non-default width needs `[lane_b] ema_no_cooldown_from_block` typed) |
+
+Any other key, a non-object, or malformed JSON is `bad_levers`; any
+~~non-default lever while the activation key is unset is `levers_unarmed`.~~ (no activation key, addition 5)
+
+1. **`lr_scale`** multiplies the leg's base LR (every optimizer group,
+   NorMuon and AdamW, the router's own scale on top as today). Carried as a
+   new leg-contract term `lane_b_lr_scale` (dropped from `contract_digest`
+   at 1.0, `_DIGEST_DROP_WHEN_DEFAULT`), so the worker's receipt binds it;
+   `train_pyramid` refuses `lane_b_lr_scale ≠ 1.0` on a lane A leg.
+2. **Curriculum.** The miner declares up to 3 ordered stages (e.g.
+   `[["easy", 0.3], ["hard", 0.7]]`); fractions are step fractions of the
+   leg (= point-budget fractions: every step consumes the same batch).
+   Stage *i* has its own corpus, generated on the CPU tier exactly like
+   today's leg corpus, at the derived seed `curriculum_stage_seed(seed, i)`
+   (sha256, stdlib) and with the generator constructed with the opt-in
+   keyword **`curriculum_stage=<name>`** (passed only when the leg has > 1
+   stage and the constructor declares it, the DEC-CA-0028 `real_corpus_dir`
+   pattern; a multi-stage leg whose generator does not declare it is the
+   miner's fault, `generator_curriculum_unsupported`; `cascade lane-b
+   verify-repo` checks the signature statically). The trainer sends the pod
+   one merged index whose children are tagged with their stage; the pod
+   reads stage 0 to its budget (`budget × h_0 / 100`, `h` the hundredths),
+   then stage 1, …, the last stage to the remainder: deterministic, a pure
+   function of the contract. The leg-contract term `curriculum` (tuple of
+   `(name, hundredths)`, dropped from the digest at `()`) binds it; the pod
+   refuses an index whose stages disagree with the contract. A one-stage
+   curriculum is the default and changes nothing (the lane A corpus key is
+   reused exactly as today).
+3. **`context_length`.** **Not buildable on main without a contract change
+   — flagged for the owner, [DECIDE].** Two facts the brief did not have:
+   (a) there is no `[training] max_context_length`; the deployed `chain.toml`
+   has `max_context_length = 32768` only under `[lane_d]` (and
+   `[marketcast]`); (b) the locked architecture refuses any other context:
+   `CascadeMoEConfig.from_contract` (`cascade/trainer/pyramid_model.py`, folded
+   into `base_arch_digest`) raises unless `context_length == 4096`, and the
+   model's decode window `max_patches = 136` is sized for 4096 + 64. Opening
+   the lever means editing `pyramid_model.py`, which moves `base_arch_digest`
+   and therefore **lane A's `contract_digest`** — forbidden by this decision
+   ("no contract_digest change for lane A"). Also, every judge scores the
+   leg through the king's `config.json` (context 4096), so a longer training
+   context would not be what is judged. So the feature PR ships the wire
+   format and refusals only: `context_length` 4096 is accepted (a no-op);
+   anything else on the grid is refused **`context_length_unsupported`**
+   (off the grid: `context_length_out_of_range`). The memory-fit admission
+   check (`context_length_unfit`: projected peak = WB19
+   `peak_memory_bytes × context / 4096` must be ≤ 0.90 ×
+   `memory_total_bytes` of the chosen type) and the ceiling (a new `[lane_b]
+   max_context_length`, default 32768, never `[training]`) are specified for
+   when the owner opens it. Owner options: (i) keep it closed; (ii) an
+   arch-generation change (D15: a new board) that makes the context a
+   contract term of `pyramid_model.py` for every lane.
+4. **EMA choice.** From `[lane_b] ema_no_cooldown_from_block` (rev6.20) a
+   lane B leg scores a power EMA; the miner picks the width: 0.10 (default,
+   rev6.20's) or 0.05. Carried as the existing contract term
+   `power_ema_eval` (index into the image's `POWER_EMA_SIGMA_RELS = (0.05,
+   0.10)`: 0 for 0.05; −1 = the image default 0.10, dropped from the digest
+   as today). `train_pyramid` honours it only on a lane B EMA leg and refuses
+   it elsewhere. The checkpoint marker records `scored_sigma_rel`; the expert
+   entry's `scored_weights` gains `"ema005"`; the rebased (judged and merged)
+   checkpoint is built from that scored file, as rev6.20.
+
+~~**Activation: ONE typed key `[lane_b] miner_levers_from_block`** (integer ≥
+0; default **0 = never**, today's behaviour for every lever). When typed,
+an era boundary at or after `[v2] from_block` (loader-checked like
+`ema_no_cooldown_from_block`). A lane B leg whose dispatch block
+(`train_block`) is ≥ the key trains its funded levers; before it (or unset)
+it trains every lever at its default and records none.~~ **(rev6.21 owner
+addition 5) No activation block**: lanes B, C and D are not rolled out, so
+the levers are the default lane B behaviour. Keys `lr_scale_min` /
+`lr_scale_max` ship at 0.5 / 2.0, overlay-settable like every `[lane_b]`
+key; `levers_unarmed` is gone.
+
+**Owner additions (2026-11-24, same day; they supersede the text above
+where they differ):**
+
+1. **Legs up to 12 h.** `[lane_b] max_leg_hours = 12.0`, `max_leg_seconds =
+   54000` (12 h × 1.25) in the code defaults and both shipped files. Checked
+   for ≤ 6 h assumptions: pod TTLs derive from the leg contract's
+   `max_train_seconds` (`provider_ttl_seconds`) and scale; the key/queue TTL
+   `funded_entry_ttl_hours = 36` still covers a 15 h guard plus waiting;
+   `max_base_age_eras = 2` covers a leg that spans up to two 12 h eras;
+   the WB23 cross-era hold (`_leg_length_holds`) would hold a leg whose
+   guard + margin exceeds one era **forever**, so such a leg is no longer
+   held: it starts and settles at the boundary after its wall, rebased onto
+   that king. Validators never window-check a lane B `train_block`. The
+   `funded_sku_wall_seconds` table is lane A's (not used for lane B walls).
+2. **Token and/or hour limits, whichever comes first.** `X-Lane-B-Train-
+   Tokens` (signed `|tokens=`) and/or `X-Lane-B-Train-Hours`. Tokens only ⇒
+   the hour limit is `max_leg_hours`. Steps = `tokens // tokens_per_step`
+   (`batch_size × (context_length // patch_size) × patch_size` of the leg
+   contract, never a constant), capped at WB23's steps cap for the hour
+   limit; the training wall is the hour limit and hitting it is a normal
+   stop. Hours only on a measured GPU is WB23's leg unchanged. Codes
+   `bad_train_tokens`, `train_tokens_out_of_range`.
+3. **Any GPU type at the miner's own risk.** With a limit, a type with no
+   WB19 rate (or not listed) may be chosen on a Lium key; the record says
+   `gpu_measured: false`; it rents exactly that type. OOM / no boot / crash
+   fail the leg as the miner's (`own_risk_gpu_failed`, no requeue, no
+   refund). Image pinning and the sandbox are unchanged.
+4. **Recording.** A limits leg's contract carries `lane_b_stop_record`; the
+   checkpoint `config.json` records `lane_b_leg = {steps, tokens, stop}`
+   (`stop` ∈ steps / tokens / hours / corpus); the expert entry records the
+   requested limits, the derived steps and `train_tokens`, `gpu_measured`,
+   `trained_steps`, `trained_tokens`, `stop` (each dropped at its default),
+   and `check_leg_record` re-derives from what the leg trained.
+5. **No activation block** (above).
+6. **EMA choice is a set.** `[lane_b] ema_sigma_rels = [0.03, 0.05, 0.10,
+   0.15, 0.20]` (overlay-settable; code bounds 0.01–0.30, must contain
+   0.10), default 0.10. On a rev6.20 EMA leg the leg contract carries
+   `power_ema_sigma_rels = (σ,)`, `power_ema_eval = 0`: **only that EMA is
+   computed**, scored and merged; `scored_weights = "ema<σ×100:03d>"`
+   (e.g. `ema015`) and judges check it. Replaces the {0.05, 0.10} choice.
+
+**Signed record; judges re-derive.** The expert manifest entry gains
+**`levers`** (the canonical non-default levers; `{}` dropped from the
+canonical body, so an entry without levers keeps its bytes). `judge_entry`
+(validator, trainer self-judge and cascade-audit) refuses at a new stage
+**`levers`** (added to the audit's `LANE_B_STAGES`) an entry whose levers do
+not re-validate against `[lane_b]` or are non-default at a `train_block`
+before the key; the `scored_weights` stage re-derives `"ema005"` /
+`"ema010"` / `""` from `train_block`, `ema_no_cooldown_from_block` and the
+entry's `ema`. The trainer and the worker derive the leg contract with ONE
+shared helper (`lane_b_leg_contract`, stdlib); the trainer sends the pod the
+leg spec (WB23 length + levers) as `--recipe-json` on the expert role and
+checks the receipt's contract digest as today (`receipt_contract_ok`). This
+also closes a WB23 gap: on #816 the worker re-derived `for_hours(leg_hours)`
+while the trainer expected the `train_hours` contract.
+
+**Steps.** WB23's cap still applies unchanged (the steps of a lane A leg of
+the same hours); a lever never raises a leg's steps, guard or wall.
+
+**Anti-gaming (unchanged guards).** The levers change only how the selected
+expert rows are trained. Judging is untouched: every guard still runs once
+per leg against the same windows — the other suites' public metrics, every
+undeclared pool domain (with `_rest` pooling), every undeclared horizon
+target, guard 4 (whole-pool point gain ≥ 0) and the anchor-king guards
+(rev6.19, WB26). A lever that buys a target gain by hurting anything else
+fails exactly as today. Frozen rows stay the king's bytes (merge byte-check
+unchanged), the router stays frozen (D40 a), and no lever reaches lane A.
+
+**Lane A is byte-identical.** No `[training]` / `[v2.training]` key, no
+pinned dependency, no `base_arch_digest` and no lane A `contract_digest`
+moves: the two new contract terms are dropped at their defaults, and lane A
+legs never take them (`train_pyramid` refuses them without an expert
+selection). The existing byte-identity tests (WB25 `main_snapshot` oracle,
+W-EMA EMA-off comparisons, the multi-target manifest bytes test) prove it
+in CI. The generator keyword is passed only on a multi-stage lane B leg.
+
+**Miner CLI (WB24) and docs (WB20).** `cascade lane-b fund` gains
+`--lr-scale`, `--curriculum name:frac,…`, `--context-length`, `--ema`
+(builds, signs and pre-checks the header with the intake's codes);
+`cascade lane-b verify-repo` reports whether `Generator.__init__` declares
+`curriculum_stage`. `docs/MINER.md` lane B section documents the four
+levers, ranges, defaults, refusals and the activation key.
+
+**Activation (owner steps).** On-pod parts (`pyramid_trainer.py`,
+`stream.py`, the generator loader) ship in a shared-image repin (5 pins +
+wall gate, never mid seed epoch); the CPU-tier generation CLI ships with
+the release. Release-then-activate on netuid 91 (six external validators):
+release, ≥ 2/3 observed stake ~~, then type `miner_levers_from_block` at a
+future era boundary~~ (no key to type: lane B itself is not rolled out).
+Testnet (netuid 259) first.
+
+| Item | Change | Where |
+|---|---|---|
+| (a) | Four miner levers on lane B legs (no activation block); 12 h legs; token/hour limits; own-risk GPUs; EMA set; `context_length` refused (`context_length_unsupported`) pending an owner decision | rev6.21 (this section), §12b.6, WB27 row |
+| (b) | Feature PR WPs: WB27 (new), WB23 (intake, leg record), WB10 (keys), WB22 (manifest, driver), W-EMA (`pyramid_trainer.py`), W9 (`LANE_B_STAGES`), WB24 (CLI), WB20 (docs) | §3 |
 
 ## rev6.23 (owner 2026-11-24; main @ b65f25d): lane D court pays 80 / 15 / 5
 
@@ -3663,6 +3856,7 @@ Every new `[lane_b]` key below ships with:
 | W-EMA | **(rev5)** Score the raw cooled endpoint on every leg (lanes A and B **(rev6.20: lane B only until `[lane_b] ema_no_cooldown_from_block`; from it lane B legs train with no cooldown and score the σ 0.10 power EMA, recorded as the expert entry's `scored_weights`)**): `power_ema_active` → raw for warm-start legs; keep writing `weights_ema005`/`weights_ema010` unscored; main-validator EMA telemetry off the critical path (§8). Blocks every repin ≥ rc16 and D40(b) | worker image (`pyramid_trainer.py`) | — | ci + testnet | `scripts/laned/accept W-EMA` |
 | WB20 | Lane B docs (MINER, INTERFACE, AGENT_MINING, VALIDATOR) | — | WB13–WB18 | ci | `scripts/laned/accept WB20` |
 | WB21 | DEC-CA-0071 amendment (this PR drafts it; owner accepts) | — | — | ci + owner | `scripts/laned/accept WB21` |
+| WB27 | **(rev6.21, owner 2026-11-24)** Miner-chosen lane B leg levers on the funding request (`X-Lane-B-Levers`, signed `|levers=` tag): `lr_scale` (`[lane_b] lr_scale_min`…`lr_scale_max`, 0.5…2.0), curriculum (≤ 3 ordered stages, fractions sum to 1, stage corpora in order, generator keyword `curriculum_stage`), `context_length` (wire format + `context_length_unsupported` until the owner opens it: the locked `pyramid_model.py` pins 4096), EMA choice from `[lane_b] ema_sigma_rels` (only the chosen EMA computed; needs `ema_no_cooldown_from_block`); legs up to 12 h; token and/or hour limits (whichever first); any GPU at own risk (`gpu_measured`); no activation block; intake typed refusals; leg contract terms `lane_b_lr_scale` / `curriculum` / `lane_b_stop_record` / `power_ema_sigma_rels` + `power_ema_eval` (dropped at defaults); expert entry `levers`, `train_tokens`, `gpu_measured`, `trained_steps`, `trained_tokens`, `stop`; judge stage `levers`; `scored_weights` `ema<σ>`; WB23 steps cap unchanged; lane A byte-identical | headers `X-Lane-B-Levers`, `X-Lane-B-Train-Tokens`; keys `lr_scale_min`, `lr_scale_max`, `ema_sigma_rels`, `max_leg_hours` 12, `max_leg_seconds` 54000; entry fields above; stage `levers` | WB10, WB22, WB23, W-EMA (rev6.20) | ci + testnet | `scripts/laned/accept WB27` |
 | W-S1 | **(rev4: now in §3)** §16 sentinel draw + lane A gate rule behind `sentinel_from_block` + receipt field + `[v2]` overlay keys (**(rev5)** no shadow logging, D45). **(rev5) Changed consensus code:** the bench gate (`cascade/eval/bench_gate.py`) **and `king_check_gate` (`cascade/validator/king_check.py:93`)**, both of which must drop the sentinel suite from the rule; block-gated by `sentinel_from_block` | `[v2] sentinel_from_block`, `sentinel_suites`, `sentinel_ratchet`, `sentinel_tau` | W0c | ci | `scripts/laned/accept W-S1` (TS1–TS3, TS5) |
 | W-S2 | **(rev4: now in §3)** lane B guard/target exclusion for the sentinel. **(rev6.2, owner 2026-11-22) Follow-up:** a warm-start acceptance made at an era-init block is governed by the sentinel of the era that init block opens; applies to the acceptance callers (trainer `accept_candidates`, validator `verify_acceptance`) (§16) | — | W-S1 | ci | `scripts/laned/accept W-S2` (TS4) |
 | W-S3 | **(rev4: now in §3)** sentinel numbers on the status boards | — | W-S1 | ci | `scripts/laned/accept W-S3` |
@@ -4513,6 +4707,11 @@ The rules below are recorded in the DEC-CA-0071 amendment
 - **Legs:** `[lane_b] leg_hours = 3.0`, `leg_funding = "miner"` (deployed).
   **(rev5)** Replaced by miner-chosen `train_hours` (0.5–6 h) on a lane B GPU
   list (D42, §12b.6); `leg_hours` stays the default when a miner sets none.
+  **(rev6.21, owner 2026-11-24)** By default (no activation block) legs run
+  up to 12 h, stop at a token and/or hour limit, may use any GPU at the
+  miner's own risk, and the miner also chooses `lr_scale`, a ≤ 3-stage curriculum and the scored
+  EMA width (`ema_sigma_rels`) on the same request (`X-Lane-B-Levers`, WB27);
+  `context_length` is refused until the owner opens it (rev6.21 section).
 
 ### 12b.1 LB1: contamination check — a precondition for arming
 
