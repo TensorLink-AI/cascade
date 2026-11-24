@@ -668,11 +668,20 @@ class Provider(Protocol):
 
     name: str
 
-    def available(self, sku: str, count: int, *, gpus: int = 1) -> bool: ...
-    def launch(self, spec: LaunchSpec) -> list[str]: ...        # → pod handles
-    def wait_ready(self, pod_id: str, *, timeout: float) -> bool: ...
-    def get_ip(self, pod_id: str) -> PodAddress | None: ...
-    def terminate(self, pod_id: str) -> None: ...
+    def available(self, sku: str, count: int, *, gpus: int = 1) -> bool:
+        """Non-destructive capacity probe."""
+
+    def launch(self, spec: LaunchSpec) -> list[str]:
+        """Launch ``spec``; return the pod handles."""
+
+    def wait_ready(self, pod_id: str, *, timeout: float) -> bool:
+        """Block until the pod is ready or ``timeout`` passes."""
+
+    def get_ip(self, pod_id: str) -> PodAddress | None:
+        """The pod's SSH address, or None."""
+
+    def terminate(self, pod_id: str) -> None:
+        """Delete the pod (idempotent)."""
 
 
 # ── pure helpers (unit-tested) ───────────────────────────────────────────────
