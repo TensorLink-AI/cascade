@@ -295,7 +295,7 @@ PINNED = [
     (("round", "blocked_from_block"), ("overlay", "overlay_key")),
     (("scoring", "burn_uid"), ("main", "release_only_key")),
     (("lane_b", "remainder"), ("main", "release_only_key")),
-    (("marketcast", "from_block"), ("main", "release_only_key")),
+    (("marketcast", "from_block"), ("overlay", "overlay_key")),   # containment 2026-11-24
     (("round", "funded_pod_skus"), ("main", "release_only_key")),
     (("netconfig", "owner_hotkey"), ("main", "release_only_table")),
     (("storage", "hf_backup_repo"), ("main", "release_only_table")),
