@@ -233,7 +233,7 @@ class RoundConfig:
     # per-leg cost cap. Unknown SKU ⇒ max_train_seconds.
     funded_sku_wall_seconds: tuple[tuple[str, int], ...] = (
         ("4xB200", 10174), ("4xB300", 10299), ("4xH100", 13201), ("4xH200", 12483),
-        ("8xB200", 6866), ("8xB300", 6866), ("8xH100", 8801), ("8xH200", 8333),
+        ("8xB200", 6866), ("8xB300", 6866), ("8xH100", 13600), ("8xH200", 12270),
         ("H100", 6000), ("L40", 11400), ("L40S", 10200), ("RTX4090", 13500))
     # ── Miner-cost protections (2026-10-31 incident) ─────────────────────────
     # The worker image digest (``sha256:<64hex>`` or a full ``…@sha256:`` ref)
