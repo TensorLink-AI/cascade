@@ -95,7 +95,16 @@ eh_common_steps() {
     if [[ $pins == 1 ]]; then
         bench_flag=" --bench-venv"
     fi
-    eh_add venv_sync "$tool sync --release-dir $(eh_q "$EH_RELEASE") --host $userhost --port $port --known-hosts $(eh_q "$EH_KNOWN_HOSTS") --dest $(eh_q "$EH_DEST")$bench_flag"
+    # The profile's optional-dependencies groups (launch_eval: train, the
+    # pinned torch): `uv sync --frozen --extra NAME` on the host (#784).
+    local extras extra_flags="" e
+    local -a extra_list=()
+    extras=$(eh_profile "$EH_PROFILE" uv_extras)
+    read -r -a extra_list <<< "$extras"
+    for e in "${extra_list[@]}"; do
+        extra_flags+=" --extra $(eh_q "$e")"
+    done
+    eh_add venv_sync "$tool sync --release-dir $(eh_q "$EH_RELEASE") --host $userhost --port $port --known-hosts $(eh_q "$EH_KNOWN_HOSTS") --dest $(eh_q "$EH_DEST")$bench_flag$extra_flags"
 
     local in_dest
     in_dest="cd $(eh_q "$EH_DEST") &&"

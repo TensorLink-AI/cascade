@@ -1,0 +1,23 @@
+# TEMPLATE (validator host): validate the staged laned_readiness/1 and
+# laned_t7/1 and install them at the paths the --lane-d-inputs TOML names
+# (readiness, t7); the validator re-reads them every settlement, so no
+# restart. The T7 document comes only from the T7 pod run (an owner step on
+# the eval host, source "pod"); a non-pod T7, an unparseable document, or one
+# that would disarm a currently armed context is refused (exit 1).
+#
+# Ships in --dry-run; going live is a drop-in without --dry-run. Log tag
+# lane_d_ops_evidence_*.
+
+[Unit]
+Description=cascade lane D readiness/T7 evidence install (dry-run template)
+
+[Service]
+Type=oneshot
+WorkingDirectory=/
+Environment=PYTHONPATH=/root/cascade
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/cascade-laned-jobs.env
+ExecStart=/root/cascade/.venv/bin/python -P -m cascade.lane_d.ops_jobs evidence --dry-run --chain-toml ${LANED_CHAIN_TOML} --readiness ${LANED_EVIDENCE_STAGE}/laned_readiness.json --pinned-readiness ${LANED_PINNED_READINESS} --pinned-t7 ${LANED_PINNED_T7} --log-file ${LANED_LOG}
+Nice=19
+MemoryMax=512M
+NoNewPrivileges=true
