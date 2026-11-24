@@ -608,9 +608,12 @@ def test_driver_dispatches_mkt_legs_only_while_active_and_never_expires_them(tmp
     assert digest
     m = load_lane_c_manifest(published[-1][1])
     # review 2026-10-19: the trainer stamps the dispatch time (the forward-only
-    # clock) into the signed record, next to train_block
+    # clock) into the signed record, next to train_block; DEC-CA-0075: and
+    # the embargo in force at the dispatch
     assert [(e.target, e.marketcast) for e in m.entries] == [
-        ("mkt:returns", {**mkt, "train_time": 1_234_567.0})]
+        ("mkt:returns", {**mkt, "train_time": 1_234_567.0,
+                         "embargo_days": int(cfg.marketcast.embargo_days),
+                         "embargo_eval_days": int(cfg.marketcast.embargo_eval_days)})]
 
 
 def test_lane_c_entry_and_commit_grammar_for_mkt():

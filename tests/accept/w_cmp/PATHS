@@ -32,6 +32,8 @@ cascade/audit/main.py
 cascade/interface/contamination_scan.py
 cascade/funding/intake.py
 cascade/funding/main.py
-# Plan rev6.25 + DEC-CA-0075 (PR #878).
-docs/plans/LANE_D_PLAN.md
-decisions/DEC-CA-0075-declarative-competitions-standard-pool-rule-menu.md
+# Unit pins of the superseded release-only embargo and the eviction call
+# (owner 2026-11-24 decision; the plan and DEC-CA-0075 land in PR #878 first).
+tests/unit/test_marketcast_embargo.py
+tests/unit/test_marketcast_pay_duration.py
+tests/unit/test_marketcast_trainer.py
