@@ -35,8 +35,8 @@ def test_w_launch_blocks_are_era_starts_on_the_shipped_grids():
         at_18 = anchor + (1795629600 - t0) / 12.0       # 2026-11-25T18:00:00Z
         era = 3600 if launch == MAINNET_LAUNCH else 600
         assert launch == (math.floor(at_18) // era + 1) * era
-    assert MAINNET_LAUNCH >= int(main.v2.from_block)
-    assert TESTNET_LAUNCH >= int(test.v2.from_block)
+    assert int(main.v2.from_block) <= MAINNET_LAUNCH
+    assert int(test.v2.from_block) <= TESTNET_LAUNCH
     # every launch overlay arms lane D at exactly its network's launch block
     for _, _, full, launch in PAIRS.values():
         assert overrides(full)["lane_d"]["from_block"] == launch
