@@ -971,15 +971,18 @@ unstarted or ended competitions do not donate their allocation to active ones.
 
 **B/C reward progression.** B has no tiers and no decay (plan rev6.22,
 owner 2026-11-24): a B slot holder is paid 100% of its slot every settlement
-until it is replaced. MarketCast C records a tier from the confirmed gain.
-Current C full-pay tiers are:
+until it is replaced. MarketCast C records a full-pay duration from the
+confirmed gain (DEC-CA-0073): 5 days at the 0.01 gain margin, rising linearly
+to 20 days at a gain LCB of 0.05 or more, rounded up to whole eras. Current C
+full-pay periods are:
 
 <!-- cascade:rewards:slot-tiers:start -->
 | Lane | Target gain LCB | Full-pay eras |
 |---|---:|---:|
-| C: confirmed MarketCast gain | ≥ 0.05 | 10 |
-| C: confirmed MarketCast gain | ≥ 0.02 | 5 |
-| C: confirmed MarketCast gain | ≥ 0.01 | 2 |
+| C: confirmed MarketCast gain | 0.01 | 10 |
+| C: confirmed MarketCast gain | 0.02 | 18 |
+| C: confirmed MarketCast gain | 0.03 | 25 |
+| C: confirmed MarketCast gain | ≥ 0.05 | 40 |
 <!-- cascade:rewards:slot-tiers:end -->
 
 A threshold of 0.05 here is a 5% lower confidence bound on the target gain;
@@ -987,26 +990,13 @@ it is a different statistic from A's increment-unit crowning LCB. Full pay
 means **100% of that target's slot**, not 100% of the lane or subnet. The tier
 is fixed on the recorded win; a later tier retune does not restart that win.
 
-For C, after the full-pay period the configured one-era half-life gives
-multipliers 50% → 25% → 12.5% → a **10% slot floor**. A C win stops paying at
-**age 28 eras**, measured from C confirmation, including its full-pay eras.
-It does not get another 28 eras after decay starts. Replacement by a new
+A C win has no decay: its slot ends (burns) when its full-pay duration
+ends, unless a newer win has already replaced it. Replacement by a new
 holder stops the old holder earlier. At approximately 12 hours per mainnet
-era, 28 eras is approximately 14 days; blocks, not wall-clock estimates, govern.
+era, 10 eras is approximately 5 days; blocks, not wall-clock estimates, govern.
 
 <!-- cascade:rewards:slot-decay:start -->
-B: a held slot pays 100% of its slot (2.5% of total emissions) every settlement, with no decay and no expiry, until a newer leg's merge passes acceptance on that slot.
-
-C example (mkt:market): confirmed gain LCB 0.02, recorded full-pay period 5 eras.
-
-| Age since confirmation (eras) | Slot multiplier | Share of total emissions |
-|---|---:|---:|
-| 0–4 | 100% | 25% |
-| 5 | 50% | 12.5% |
-| 6 | 25% | 6.25% |
-| 7 | 12.5% | 3.125% |
-| 8–27 | 10% | 2.5% |
-| 28+ | 0% | 0% |
+B: a held slot pays 100% of its slot (2.5% of total emissions) every settlement, with no decay and no expiry, until a newer leg's merge passes acceptance on that slot. C has no decay: its slot pays 100% for its recorded full-pay duration, then ends.
 <!-- cascade:rewards:slot-decay:end -->
 
 **B slots pay until replaced.** A B slot holder is paid **100% of its slot
@@ -1035,7 +1025,7 @@ Every slot a leg clears is claimable, replacing that slot's holder, so one
 miner may hold every slot. The signed verdict rows list every tested slot
 with its family, bar, CRPS/MASE LCBs, point gains and whether it passed.
 
-C uses its own decay/expiry configuration. When a competition ends, `finish_full_pay` permits an existing
+C follows its own rule above (DEC-CA-0073). When a competition ends, `finish_full_pay` permits an existing
 holder only its remaining recorded full-pay period, capped at six wind-down
 eras; there is no decay tail after the end. Under `stop`, a settlement after
 `until_block` pays nothing. That ended competition's unpaid allocation burns.
@@ -1761,9 +1751,9 @@ market. The shipped suites are `ohlcv` (the next bars' high / low / close
 price and volume), `returns`, `vol` (Garman–Klass), `high` / `low` (the
 bar's up / down excursion from its open), `range` and `liquidity` (log
 volume); `funding` and `alpha` exist but are off. `mkt:market` is one lane-C
-slot, with lane C's decay and TTL; its full-pay period is tiered by
-`[marketcast] full_pay_tiers` (same placeholder table as lane C's, kept
-separate because the MarketCast gain is a different statistic).
+slot. A confirmed win pays it in full for 5 days (at `[marketcast]
+gain_margin`) up to 20 days (at `[lane_c] full_pay_max_gain` or more), then
+the slot ends (DEC-CA-0073).
 
 Licence: the pinned weights use a
 [Modified MIT licence](https://huggingface.co/mistralai/Timestral-28M/blob/180698bbf5a50dda3516aa6419798437fb03a430/LICENSE).
@@ -1925,11 +1915,16 @@ Every lane-C entry (DEC-CA-0056 review 2026-10-19):
 ### How it is judged
 
 - The **main validator** forecasts the untouched base and your fine-tune on
-  its GPU. It uses EVERY forward-only window of the signed snapshot of
-  realized bars (minute bars for sub-hourly series, an hourly bank for ≥ 1h
-  ones): each window starts at least `start_margin_seconds` after the time
-  the trainer dispatched your leg (`train_time`, signed by the trainer),
-  and is scored only once it has closed. It publishes the per-window losses
+  its GPU (DEC-CA-0073, owner 2026-11-24: a verdict within 13 hours). The
+  windows are DRAWN from the embargo — the `embargo_eval_days` (28) before
+  the time the trainer dispatched your leg (`train_time`, signed by the
+  trainer), days no leg ever reads (`data.end` ≤ your commit's UTC date −
+  30 days) — `backtest_windows_per_cell` (48) per asset, series and
+  timeframe, ranked by the hash of the settlement block that registers your
+  entry (it does not exist while you train). The `1mx60` and `5mx36` paths
+  also take their forward windows already closed in the snapshot (start ≥
+  `start_margin_seconds` after dispatch). Nothing waits for windows to close:
+  the verdict comes at the first settlement after your leg. It publishes the per-window losses
   and the forecasts themselves (float32 quantile sidecars), signed, at
   `marketcast/round-<id>.json`. Every validator derives the verdict from
   those rows, once a later trainer-signed lane-C manifest records the
@@ -1942,8 +1937,7 @@ Every lane-C entry (DEC-CA-0056 review 2026-10-19):
   class and requeued as an operator-side loss by the trainer: without
   operator recovery capacity it retrains on your key with a new pod, and
   pauses after three such losses.
-- Windows are spread over the whole period since your dispatch, only
-  liquid, live windows count (≥ 80 % live bars and ≥ $1M traded in the
+- Only liquid, live windows count (≥ 80 % live bars and ≥ $1M traded in the
   24 h before), and the gain weighs every horizon and every asset class
   equally, clustered by asset class × 6-hour block: you need wins across at
   least `min_time_blocks` (8) blocks, not one lucky regime. A NaN in any of
@@ -1953,14 +1947,17 @@ Every lane-C entry (DEC-CA-0056 review 2026-10-19):
   a window is chosen from what is known when it starts (liquidity, and a
   price context that is not flat).
 - **What is forecast.** Every window is a path of `<steps>` bars at its
-  horizon's bar (see `horizon_mix` above). `1mx60`, `5mx36`, `15mx96` and
-  `1hx48` windows are forward-only. `4hx42` and `1dx7` cannot close inside
-  the 6-day wait, so they are cut from the EMBARGO GAP instead (`[marketcast]
-  gap_horizons`): the days between the last day a recipe may train on
-  (`data.end` ≤ your submission's UTC date − 30 days) and your submission.
-  No leg ever reads those days. They are judge-phase evidence only; the
-  confirmation has no fresh gap. The rows record the submission instant
-  they were cut before (`gap_end`, the trainer's `train_time`).
+  horizon's bar (see `horizon_mix` above), every timeframe drawn from the
+  embargo as above. The initial test and the confirmation draw from the two
+  halves of a fixed public split of the windows, so a confirmation never
+  re-scores the initial test's windows. The rows record the whole draw
+  (`draw`: round block, its hash, span, counts) and the verdict reports the
+  backtest and forward windows' gains separately (`mkt.kinds`; the verdict
+  is the combined set's).
+- **Do not ship embargoed prices.** A generator tree is scanned (never run)
+  before your leg rents: a numeric sequence matching the embargoed bars
+  (closes or log returns of the ≥ 15-minute bars, exactly or rescaled)
+  refuses the leg as `embargo_series_embedded`.
 - **Score per window:** mean CRPS over the path's steps (2 × mean pinball
   over the 21 knots), divided by the seasonal-naive mean absolute error of
   the window's context (`crps_scale = "seasonal_naive"`, GIFT-Eval's MASE
@@ -2035,8 +2032,8 @@ Every lane-C entry (DEC-CA-0056 review 2026-10-19):
   Expired or deregistered holders no longer block a replacement. Each target
   has one final `confirmed` holder per settlement; an initial-test runner-up
   is labelled `not_selected` and earns no reward.
-- Too few windows or assets so far ⇒ your entry WAITS, and is re-judged
-  every settlement for up to `verdict_wait_blocks` (6 days). After that it
+- Too few windows or assets ⇒ your entry WAITS, and is re-judged every
+  settlement for up to `verdict_wait_blocks` (at most 13 h). After that it
   is dropped.
 
 ## 15. Open weights (lane D): the `cascade lane-d` CLI

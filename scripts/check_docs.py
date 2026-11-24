@@ -77,7 +77,7 @@ def reward_reference(root=ROOT):
     """Mainnet tables computed from configuration and the actual payout helpers."""
     from dataclasses import replace
 
-    from cascade.eval.expert_lane import LaneBWin, full_pay, reward_multiplier
+    from cascade.eval.expert_lane import LaneBWin
     from cascade.shared.config import load_chain_config
     from cascade.shared.emission import (
         EmissionPolicy,
@@ -86,8 +86,14 @@ def reward_reference(root=ROOT):
         ladder_step,
         lane_parts,
     )
+    from cascade.shared.era import era_length_blocks
     from cascade.shared.lane_b import lane_b_slots
-    from cascade.shared.lane_c import LaneCWin, lane_c_split, lane_pool_shares, win_expired
+    from cascade.shared.lane_c import (
+        LaneCWin,
+        lane_c_split,
+        lane_pool_shares,
+        target_full_pay_record,
+    )
 
     cfg = load_chain_config(root / "chain.toml")
 
@@ -103,36 +109,30 @@ def reward_reference(root=ROOT):
     starts = ["| Crowning LCB in increment units | Starting share of A |", "|---|---:|"]
     for threshold, _ in cfg.v2.ladder_start_tiers:
         starts.append(f"| ≥ {threshold:g} | {percent(crown_start(threshold, 'increment', cfg).start_bp / 10000)} |")
-    tiers = ["| Lane | Target gain LCB | Full-pay eras |", "|---|---:|---:|"]
     # LANE_D_PLAN rev6.22 (owner 2026-11-24): lane B is untiered — a held slot
-    # pays in full until replaced; only MarketCast C has full-pay tiers
-    for label, policy in (("C: confirmed MarketCast gain", cfg.marketcast),):
-        for threshold, _ in policy.full_pay_tiers:
-            tiers.append(f"| {label} | ≥ {threshold:g} | {full_pay(threshold, policy.full_pay_tiers).full_eras} |")
+    # pays in full until replaced. Lane C (DEC-CA-0073): a gain-scaled
+    # duration on the era grid in force at lane C's start, then the slot ends.
+    tiers = ["| Lane | Target gain LCB | Full-pay eras |", "|---|---:|---:|"]
+    c_eb = era_length_blocks(cfg.round, max(1, int(cfg.lane_c.from_block)))
+    c_margin, c_top = float(cfg.marketcast.gain_margin), float(cfg.lane_c.full_pay_max_gain)
+    c_target = cfg.lane_c.targets[0]
+
+    def c_eras(g):
+        return target_full_pay_record(c_target, g, cfg.lane_c, cfg.marketcast,
+                                      era_blocks=c_eb)["full_eras"]
+    c_points = [c_margin + (c_top - c_margin) * f for f in (0.0, 0.25, 0.5, 1.0)]
+    for g in c_points:
+        mark = "≥ " if g == c_points[-1] else ""
+        tiers.append(f"| C: confirmed MarketCast gain | {mark}{g:g} | {c_eras(g)} |")
     b_share, c_share, _ = lane_pool_shares(cfg.lane_b, cfg.lane_c)
     b_slot = b_share / len(lane_b_slots(cfg.lane_b))
+    decay = [f"B: a held slot pays 100% of its slot ({percent(b_slot)} of total emissions) "
+             "every settlement, with no decay and no expiry, until a newer leg's merge passes "
+             "acceptance on that slot. C has no decay: its slot pays 100% for its recorded "
+             "full-pay duration, then ends."]
     # Explicit hypothetical launched-lane state, with eligible holders, no I/O.
     _, slots = lane_c_split(cfg.lane_c, 1, 1, mc=replace(cfg.marketcast, from_block=1))
     target = cfg.lane_c.targets[0]
-    c_slot = c_share * slots[target]
-    full = full_pay(.02, cfg.marketcast.full_pay_tiers).full_eras
-    groups = []
-    for age in range(cfg.lane_c.win_ttl_eras + 1):
-        multiplier = (0.0 if win_expired(age, cfg.lane_c) else reward_multiplier(
-            age, full_eras=full, half_life_rounds=cfg.lane_c.half_life_rounds, floor=cfg.lane_c.floor))
-        if groups and multiplier == groups[-1][2]:
-            groups[-1][1] = age
-        else:
-            groups.append([age, age, multiplier])
-    decay = [f"B: a held slot pays 100% of its slot ({percent(b_slot)} of total emissions) "
-             "every settlement, with no decay and no expiry, until a newer leg's merge passes "
-             "acceptance on that slot.", "",
-             f"C example ({target}): confirmed gain LCB 0.02, recorded full-pay period {full} eras.",
-             "", "| Age since confirmation (eras) | Slot multiplier | Share of total emissions |",
-             "|---|---:|---:|"]
-    for start, end, multiplier in groups:
-        label = f"{start}+" if start == cfg.lane_c.win_ttl_eras else str(start) if start == end else f"{start}–{end}"
-        decay.append(f"| {label} | {percent(multiplier)} | {percent(c_slot * multiplier)} |")
     a, other = lane_parts([1, 2], 5, king_decay=cfg.scoring.king_decay, burn_uid=0,
         lane_b_cfg=cfg.lane_b, wins=[LaneBWin(3, lane_b_slots(cfg.lane_b)[0], 1.0)],
         lane_c_cfg=cfg.lane_c, c_wins=[LaneCWin(4, target, 1.0)], c_slot_frac=slots)
@@ -143,13 +143,9 @@ def reward_reference(root=ROOT):
     for label, uid in (("A king", 1), ("Eligible immediate former king", 2),
                        ("One full-pay B holder", 3), (f"One full-pay C holder ({target})", 4), ("Burn", 0)):
         example.append(f"| {label} | {percent(vector[uid])} |")
-    tier_descriptions = []
-    for label, policy in (("MarketCast C", cfg.marketcast),):
-        tier_descriptions.append(label + ": " + ", ".join(
-            f"LCB ≥ {threshold:g} → {full_pay(threshold, policy.full_pay_tiers).full_eras} eras"
-            for threshold, _ in policy.full_pay_tiers))
-    decay_steps = " → ".join(percent(reward_multiplier(full + offset, full_eras=full,
-        half_life_rounds=cfg.lane_c.half_life_rounds, floor=cfg.lane_c.floor)) for offset in range(3))
+    c_duration = (f"MarketCast C: {cfg.lane_c.full_pay_min_days:g} days ({c_eras(c_margin)} eras) "
+                  f"at LCB {c_margin:g}, rising linearly to {cfg.lane_c.full_pay_max_days:g} days "
+                  f"({c_eras(c_top)} eras) at LCB ≥ {c_top:g}")
     starts_text = "; ".join(f"LCB ≥ {threshold:g} → {percent(bp / 10000)}"
                             for threshold, bp in cfg.v2.ladder_start_tiers)
     summary = [
@@ -162,9 +158,9 @@ def reward_reference(root=ROOT):
         f"- **Former king:** only the immediate former king can receive {percent(cfg.v2.court_bp / 10000)} of A for {cfg.v2.court_blocks:,} blocks, while eligible. A qualifying compute-key lapse reduces the current king's payout to {percent(cfg.v2.key_slash_bp / 10000)} of A, without reducing separately earned B/C rewards.",
         f"- **B winner:** with merge acceptance enabled, qualification is unpaid. Acceptance into a scheduled shared starting checkpoint starts payment. The {len(lane_b_slots(cfg.lane_b))} slots each pay {percent(b_slot)} of total emissions to their holder every settlement, with no decay or expiry, until a newer leg's accepted merge takes the slot. Every leg is tested on every slot: up to {cfg.lane_b.max_domains_per_leg} declared targets clear at a {percent(cfg.lane_b.gain_margin)} gain LCB, any other slot at {percent(cfg.lane_b.undeclared_gain_margin)}; one miner may hold every slot.",
         f"- **C winner:** an initial test pass is unpaid. A later confirmation must win the target slot. C's pool is divided by competition weight, then target count. The current sole competition, MarketCast, has {len(cfg.lane_c.targets)} target{'' if len(cfg.lane_c.targets) == 1 else 's'}: each full-pay slot is {percent(c_share * slots[target])} of total emissions.",
-        "- **C full-pay duration:** " + "; ".join(tier_descriptions) + ". C uses confirmed gain; each win keeps its recorded tier. B has no tiers.",
-        f"- **C progression:** after full pay, C's per-era slot multipliers are {decay_steps}, then a {percent(cfg.lane_c.floor)} floor. Payment ends at age {cfg.lane_c.win_ttl_eras} eras, including the full-pay period. Age starts at C confirmation. A new holder stops the old holder's pay.",
-        "- **Burn:** unpaid A, empty B slots, empty/decayed/expired C slots in launched lanes and inactive competition allocations go to `burn_uid`; they are not shared among other miners. An unlaunched lane has no reserved pool.",
+        "- **C full-pay duration:** " + c_duration + ". C uses confirmed gain; each win keeps its recorded duration. B has no tiers.",
+        "- **C progression:** C has no decay: its slot ends when the full-pay duration ends. Age starts at C confirmation. A new holder stops the old holder's pay.",
+        "- **Burn:** unpaid A, empty B slots, empty/ended C slots and inactive competition allocations go to `burn_uid`; they are not shared among other miners. An unlaunched lane has no reserved pool.",
         "- **Check payment:** read signed reward records and on-chain weights. Queue completion, qualification and pending confirmation are not paid wins. Public status reports `reward_status=not_verified` because it does not verify payment.",
     ]
     return {"allocation": "\n".join(allocations), "king-start": "\n".join(starts),
