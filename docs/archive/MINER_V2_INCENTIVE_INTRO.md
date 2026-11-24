@@ -1,10 +1,12 @@
 # Cascade v2: what changes for miners
 
+> **Archived 2026-11-24.** Historical; not maintained. See [the archive index](README.md) for what replaces it.
+
 v2 has been live on mainnet (netuid 91) since **2026-10-30**: commits opened
 at 09:00 UTC and the first v2 era started at the first era boundary after
 12:00 UTC (block 9,399,600). This page lists only what differs from the
 pre-v2 Lane A.
-Everything not listed works as before ([MINER.md](MINER.md)). Signed receipts
+Everything not listed works as before ([MINER.md](../MINER.md)). Signed receipts
 and `cascade status --json` are authoritative over this page.
 
 ## At a glance
@@ -29,7 +31,7 @@ max_channels = 32`). A generator that emits any other width is refused
 before any compute is rented. The trainer never pads or merges channels, so
 32 is forced on you: if your process has fewer related channels, pack
 independent series into the 32 rows yourself. Optional `groups` labels mark
-which rows belong together ([INTERFACE.md](INTERFACE.md#pack-independent-groups-in-one-yield)).
+which rows belong together ([INTERFACE.md](../INTERFACE.md#pack-independent-groups-in-one-yield)).
 Length: 64–4096 in ordinary verification; the v2 CPU shard tier accepts
 longer series (check `cascade verify --live`), which training crops into
 random 4096-point windows (`[v2.training] long_series = "crop"`).
@@ -92,7 +94,7 @@ catalog, labelled with the 7 GIFT-Eval domains (`econ_fin`, `energy`,
 snapshots are revealed with a lag at
 [Tensor-Link/cascade-eval-pool](https://huggingface.co/datasets/Tensor-Link/cascade-eval-pool);
 use them as held-out data for `cascade score`/`iterate --pool-dir`, never as
-training data ([MINER.md](MINER.md#held-out-data-the-public-eval-pool)).
+training data ([MINER.md](../MINER.md#held-out-data-the-public-eval-pool)).
 
 - **Margin:** in increment units the bar is **0.10** against a fresh king,
   falling linearly to **0.01** over 18,000 blocks (≈ 2.5 days) of tenure.

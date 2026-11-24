@@ -131,7 +131,7 @@ export CASCADE_DIRECT_OWNER_HOTKEY=<owner ss58> CASCADE_DIRECT_CONFIG_BUCKET=<bu
    Budget `--max-spend` (and `--spend-cap`, both in the ledger's smallest
    money unit) from the highest hourly rate you would accept × (wall + 1 h),
    never from the catalog estimate. The Lane A price table is in
-   [MINER_V2_INCENTIVE_INTRO.md](MINER_V2_INCENTIVE_INTRO.md#gpus).
+   [MINER.md](MINER.md#measured-walls-and-prices).
 
    The catalog is `cascade/direct/profiles.py`. A job has one gang size, so
    4× and 8× layouts never mix in one job.

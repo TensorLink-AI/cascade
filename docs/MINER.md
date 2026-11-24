@@ -666,7 +666,7 @@ Picking a type never buys more compute.
 
 On mainnet v2 the list is **`8xH100` and `8xH200`** (deployed `[round]
 funded_pod_skus`); 4× layouts and Blackwell are not offered. Prices and
-measured walls are in [MINER_V2_INCENTIVE_INTRO.md](MINER_V2_INCENTIVE_INTRO.md#gpus).
+measured walls are in [measured walls and prices](#measured-walls-and-prices).
 
 ```bash
 cascade fund https://submissions.cascadesub.net --ref <repo@digest> \
@@ -706,6 +706,30 @@ cascade lane-c fund https://submissions.cascadesub.net --target mkt:market \
 - A layout type such as `8xH200` rents one pod with that many GPUs, and the
   leg trains data-parallel on all of them (same model as one GPU, sooner).
   Layouts rent on Lium only.
+
+#### Measured walls and prices
+
+| Layout | Measured wall (mainnet) | Lium $/h actually charged | Typical leg | **Plan for** |
+|---|---:|---:|---:|---:|
+| `8xH100` | ≈ 3.5 h | $14.40–23.20 | ~$60–95 | **up to ~$105** |
+| `8xH200` | ≈ 3.5 h | $24–46 (median ~$31) | ~$125 | **up to ~$210** |
+
+*Measured 2026-11-01/02 on mainnet:* a full v2 leg is 23,841 steps, and
+legs ran at about 112–115 steps per minute on **both** 8xH100 and 8xH200,
+so ≈ 3.5 h of GPU training either way. Prices are what Lium charged for
+8× pods on those days, not advertised rates; they move by the hour. The
+trainer's own planning walls are the deployed `funded_sku_wall_seconds`
+(read them with `cascade status --json`).
+
+- **Typical leg** = price × (wall + ~30 min boot, data and upload).
+- **Plan for** = the highest hourly rate you will accept × (wall + 1 h).
+  Use that number for `cascade preflight --max-spend` and for your Lium key
+  budget; `--max-spend` is a review input, not an enforced total.
+- A slow host can run to the 18,000 s (5 h) hard training wall, and a leg
+  that fails on a bad host and reruns also bills the pod time it already
+  used. Keep room for one rerun if your key's budget is tight.
+- **Blackwell (B200, B300) is not available.** The training image is built
+  for CUDA 12.4 (`torch==2.4.1+cu124`), which cannot run on Blackwell.
 
 ## 6. What happens to a funded entry
 
