@@ -55,6 +55,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -154,6 +155,13 @@ class EvalConfig:
     ssh_key_path: str = "~/.ssh/lium_cascade_ed25519"
     ssh_user: str = "root"
     scoring_envs: str = "deploy/laned/scoring_envs.toml"
+    # The public-mirror warm cache (owner 2026-11-24, #894): Lium persistent
+    # volume HUIDs, host i of a cohort gets volume i (`lium up --volume
+    # id:<HUID>`), mounted at public_cache_mount, where
+    # deploy/laned/public_mirror.toml's cache_dir lives. A host past the list
+    # scores from Hippius with its cache on the container disk (alerted).
+    public_cache_volumes: tuple[str, ...] = ()
+    public_cache_mount: str = "/workspace"
     # Used ONLY while scoring_envs is absent (F5, PR #830, not merged yet).
     fallback_qualified_gpu_models: tuple[str, ...] = ("NVIDIA H200",)
     candidates: tuple[EvalCandidate, ...] = (
@@ -241,6 +249,20 @@ def _builder_from(t: Mapping) -> BuilderConfig:
     return out
 
 
+_VOLUME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+
+
+def _volumes(v) -> tuple[str, ...]:
+    if not isinstance(v, (list, tuple)) or not all(isinstance(x, str) and _VOLUME_RE.match(x)
+                                                   for x in v):
+        raise ElasticError("usage", "[eval_host] public_cache_volumes must be a list of Lium "
+                                    f"volume HUIDs; got {v!r}")
+    if len(set(v)) != len(v):
+        raise ElasticError("usage", "[eval_host] public_cache_volumes repeats a volume "
+                                    "(one host per volume)")
+    return tuple(v)
+
+
 def _eval_from(t: Mapping) -> EvalConfig:
     d = EvalConfig()
     known = set(EvalConfig.__dataclass_fields__)
@@ -273,9 +295,13 @@ def _eval_from(t: Mapping) -> EvalConfig:
             str(x) for x in t.get("fallback_qualified_gpu_models",
                                   d.fallback_qualified_gpu_models)),
         candidates=cands_t,
+        public_cache_volumes=_volumes(t.get("public_cache_volumes", d.public_cache_volumes)),
         **{k: str(t.get(k, getattr(d, k))) for k in (
-            "image", "ssh_pubkey_path", "ssh_key_path", "ssh_user", "scoring_envs")},
+            "image", "ssh_pubkey_path", "ssh_key_path", "ssh_user", "scoring_envs",
+            "public_cache_mount")},
     )
+    if not out.public_cache_mount.startswith("/"):
+        raise ElasticError("usage", "[eval_host] public_cache_mount must be an absolute path")
     if out.max_price_per_hour <= 0 or out.monthly_cap_usd <= 0:
         raise ElasticError("usage", "[eval_host] max_price_per_hour and monthly_cap_usd "
                                     "must be > 0 (a spend cap is never off)")
@@ -825,8 +851,15 @@ def eval_up(cfg: ElasticConfig, lium, *, entries: int, cohort: str, dry_run: boo
     if n < want:
         alert(cfg, "lane_d_eval_hosts_capped", f"cohort {cohort}: {n} of {want} hosts "
                                                f"within the monthly cap", now=now)
+    vols = e.public_cache_volumes
+    if n > len(vols):
+        alert(cfg, "lane_d_eval_no_volume", f"cohort {cohort}: {n - len(vols)} of {n} host(s) "
+              f"without a public-cache Lium volume ([eval_host] public_cache_volumes); they "
+              f"fetch every drawn series from Hippius", now=now)
     plan = {"role": EVAL_HOST, "provider": EVAL_PROVIDER, "cohort": cohort, "entries": entries,
             "hosts_wanted": want, "hosts": n,
+            "volumes": [vols[i] if i < len(vols) else None for i in range(n)],
+            "public_cache_mount": e.public_cache_mount,
             "offers": [{"gpu_type": o.gpu_type, "price_per_hour": o.price_per_hour}
                        for o in offers[:n]], "refused_types": refused,
             "month_spent_usd": round(ledger.spent(EVAL_HOST, now), 4)}
@@ -848,7 +881,8 @@ def eval_up(cfg: ElasticConfig, lium, *, entries: int, cohort: str, dry_run: boo
             name = f"{NAME_PREFIX[EVAL_HOST]}-{cohort}-{i}"
             spec = LaunchSpec(sku=o.gpu_type, count=1, image=e.image, ssh_pubkey=pub,
                               name_prefix=name, sku_choices=(o.gpu_type,),
-                              exclude_ids=tuple(claimed), ttl_seconds=e.ttl_hours * 3600)
+                              exclude_ids=tuple(claimed), ttl_seconds=e.ttl_hours * 3600,
+                              volumes=(vols[i],) if i < len(vols) else ())
             pod = lium.launch(spec)[0]
             landed = lium.price_of(pod)
             ledger.open(role=EVAL_HOST, instance_id=pod, provider=EVAL_PROVIDER,
@@ -856,6 +890,7 @@ def eval_up(cfg: ElasticConfig, lium, *, entries: int, cohort: str, dry_run: boo
                         ts=clock.now())
             rented.append({"id": pod, "gpu_type": o.gpu_type, "gpu_model": o.candidate.gpu_model,
                            "profile": o.candidate.profile,
+                           "volume": vols[i] if i < len(vols) else None,
                            "price_per_hour": float(landed or o.price_per_hour)})
             claimed.append(o.executor_id)
             if landed is not None and landed > e.max_price_per_hour:

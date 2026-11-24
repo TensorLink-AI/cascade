@@ -65,3 +65,11 @@ before the cut (≤ 131072 points), the target the next `h` points.
 | drops | `test_unscorable_windows_are_dropped_for_every_model` |
 | per-source per-window scores via F2's API | `test_public_windows_score_through_the_f2_per_window_api` |
 | one draw for every model | `test_one_draw_serves_the_king_the_house_and_every_challenger` |
+
+## Hippius mirror reader (owner 2026-11-24, issue #894)
+
+`read_public_windows(draw, index_dir=, reader=, ...)`: with `reader(row) ->
+(C, L)` (the eval host's `PublicMirror.reader`, W6p) the series come from
+it instead of `data_root`; it is called only for the drawn rows and the
+windows / drops equal the local read's. Neither is a `ValueError`. The draw
+itself is unchanged. `test_w5k_reader.py`.

@@ -150,6 +150,11 @@ class LaunchSpec:
     # backstop that keeps a pod from billing after the trainer that rented it
     # died; adapters without the feature ignore it.
     ttl_seconds: float = 0.0
+    # Lium persistent volumes to attach (``lium up --volume id:<HUID>``), one
+    # per pod in launch order (pod i gets volumes[i]; none past the end). The
+    # lane D eval host's public-mirror blob cache (owner 2026-11-24, #894);
+    # adapters without volumes ignore it.
+    volumes: tuple[str, ...] = ()
 
 
 def lium_ttl_arg(ttl_seconds: float) -> str:
@@ -1580,6 +1585,9 @@ class LiumProvider:
             # injects the ACCOUNT's registered keys; a template NAME passed as
             # --image 400s ("image reference is not valid") — never do that.
             argv += ["--name", name, "--yes"]
+            vols = tuple(getattr(spec, "volumes", ()) or ())
+            if i < len(vols) and vols[i]:
+                argv += ["--volume", f"id:{vols[i]}"]
             ttl = lium_ttl_arg(getattr(spec, "ttl_seconds", 0.0))
             if ttl:
                 # Provider-side backstop: the pod terminates itself even if
