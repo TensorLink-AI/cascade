@@ -43,17 +43,27 @@ def register_kind():
     register_spec_kind(KIND)
 
 
+def try_register_kind() -> None:
+    """Fixture form: on a code base without W-CMP2 nothing registers (each
+    test body then fails on its own W-CMP2 import, never in the fixture)."""
+    import contextlib
+
+    with contextlib.suppress(ImportError):
+        register_kind()
+
+
 def unregister_kind():
     """Tests only: forget the instance kind so other tests see the shipped
-    registry (the kind registry is process-global)."""
+    registry (the kind registry is process-global). A no-op without W-CMP2."""
     from cascade.shared.config import lane_c as L
     from cascade.trainer import lane_c_competitions as TC
     from cascade.validator import lane_c_competitions as VC
 
-    L.SPEC_KINDS.discard(KIND)
-    L.COMPETITION_KINDS.pop(KIND, None)
-    VC._SPEC_INSTANCES.pop(KIND, None)
-    TC._SPEC_TRAINERS.pop(KIND, None)
+    getattr(L, "SPEC_KINDS", set()).discard(KIND)
+    if KIND in getattr(L, "SPEC_KINDS", ()) or hasattr(L, "SPEC_KINDS"):
+        L.COMPETITION_KINDS.pop(KIND, None)
+    getattr(VC, "_SPEC_INSTANCES", {}).pop(KIND, None)
+    getattr(TC, "_SPEC_TRAINERS", {}).pop(KIND, None)
 
 
 def mkt_mc():

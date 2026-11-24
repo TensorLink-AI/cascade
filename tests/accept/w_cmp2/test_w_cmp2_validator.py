@@ -26,7 +26,7 @@ from .helpers import (
     lane_c,
     mkt_mc,
     ptr,
-    register_kind,
+    try_register_kind,
     unregister_kind,
 )
 
@@ -38,7 +38,7 @@ KING = "5King"
 
 @pytest.fixture(autouse=True)
 def _kind():
-    register_kind()
+    try_register_kind()
     yield
     unregister_kind()
 
@@ -141,6 +141,7 @@ def _energy_rounds(tmp_path):
 
 
 def test_w_cmp2_a_new_competition_is_judged_end_to_end_by_its_own_id(tmp_path):
+    from cascade.shared.config.lane_c import register_spec_kind  # noqa: F401  (W-CMP2)
     from cascade.shared.lane_c import lane_c_split
 
     r, store, (s1, s2), (rows1, rows2, rows3) = _energy_rounds(tmp_path)
@@ -225,6 +226,7 @@ def _mkt_rounds(tmp_path, *, with_instance):
 def test_w_cmp2_mkt_is_byte_identical_with_an_instance_beside_it(tmp_path):
     import json
 
+    from cascade.shared.config.lane_c import register_spec_kind  # noqa: F401  (W-CMP2)
     from cascade.shared.lane_c import LaneCState
 
     r0, s0, rows0 = _mkt_rounds(tmp_path / "plain", with_instance=False)
