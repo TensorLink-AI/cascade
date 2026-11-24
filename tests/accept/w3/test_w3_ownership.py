@@ -62,10 +62,11 @@ def test_signature_binds_the_body(tmp_path):
     m.upload(files)
     from cascade.lane_d import service
 
-    signed = json.dumps({"licence": "Apache-2.0",
+    signed = json.dumps({"licence": "MIT",
                          "attestation": service.LICENCE_ATTESTATION}).encode()
-    sent = json.dumps({"licence": "OpenMDW-1.1",
-                       "attestation": service.LICENCE_ATTESTATION}).encode()
+    # the same fields in other bytes: the signature covers the body bytes
+    sent = json.dumps({"licence": "MIT",
+                       "attestation": service.LICENCE_ATTESTATION}, indent=1).encode()
     h = m.headers("ready", digest_of(manifest(files)), signed)
     r = call(env.app, "POST", READY, ip=m.ip, body=sent, headers=h)
     assert r.status == 400 and r.code == "bad_signature", r
@@ -91,7 +92,7 @@ def test_signature_binds_the_action(tmp_path):
     m.upload(files)
     from cascade.lane_d import service
 
-    body = json.dumps({"licence": "Apache-2.0",
+    body = json.dumps({"licence": "MIT",
                        "attestation": service.LICENCE_ATTESTATION}).encode()
     h = m.headers("submit", digest_of(manifest(files)), body)
     r = call(env.app, "POST", READY, ip=m.ip, body=body, headers=h)

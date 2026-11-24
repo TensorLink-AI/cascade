@@ -84,7 +84,7 @@ def _seed(fake, env, capsys, caplog):
     return digest_of(ckpt)
 
 
-def _ready(capsys, caplog, fake, digest, *extra, licence="Apache-2.0", attest=True):
+def _ready(capsys, caplog, fake, digest, *extra, licence="MIT", attest=True):
     args = ["lane-d", "ready", fake.base, "--digest", digest, "--context", str(CONTEXT),
             "--licence", licence, *wallet_args(), *extra]
     if attest:
@@ -141,11 +141,11 @@ def test_ready_sends_the_licence_and_the_exact_attestation(env, capsys, caplog):
     path = require_chosen_path()
     with intake(path, coldkey=COLD) as fake:
         dg = _seed(fake, env, capsys, caplog)
-        res = _ready(capsys, caplog, fake, dg, licence="OpenMDW-1.1")
+        res = _ready(capsys, caplog, fake, dg, licence="MIT")
         (req,) = fake.routes(READY)
     assert res.rc == 0, res
     body = json.loads(req["body"])
-    assert body == {"licence": "OpenMDW-1.1", "attestation": lane_d.LICENCE_ATTESTATION}
+    assert body == {"licence": "MIT", "attestation": lane_d.LICENCE_ATTESTATION}
 
 
 def test_ready_result_carries_the_ready_record_and_the_commit(env, capsys, caplog):
