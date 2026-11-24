@@ -32,6 +32,64 @@ log = logging.getLogger("cascade.chain")
 # Distinct bulk-decode failure causes already warned about (see poll_commitments).
 _bulk_decode_warned: set[str] = set()
 
+# ── history endpoint for reads at a PAST block ───────────────────────────────
+# The SDK's ``finney`` endpoint is a lite node that prunes state (and, with
+# blocks-pruning, bodies). A read AS OF an old block then fails; ChainClient
+# retries exactly that read ONCE on a history endpoint (default: the SDK's
+# ``archive`` network, wss://archive.chain.opentensor.ai:443). Only reads with
+# an explicit past ``block`` are ever routed there — never head reads, never
+# writes (set_weights / commitments). The answer is the same chain state, so
+# results are unchanged; only WHERE the read is served moves.
+DEFAULT_HISTORY_NETWORK = "archive"
+_HISTORY_DISABLED_VALUES = ("", "none", "off", "false", "0")
+# Lower-cased substrings of the errors a node raises for state it no longer
+# has. 11.3's transport turns the node's "State already discarded for <hash>"
+# into ``StateDiscardedError`` ("State discarded for 0x… make this request
+# using an archive node"); ``BlockNotFound`` ("no block at height N" / "no
+# header for 0x…" / 'Block not found for "0x…"') is a warp-synced or
+# blocks-pruned node without that block; ``block_info`` returning no header
+# is ChainClient's own "no block hash for block N". Anything else (timeouts,
+# decode errors, bad params) is NOT retried.
+_PRUNED_STATE_MARKERS = (
+    "state already discarded",
+    "state discarded for",
+    "unknownblock",
+    "unknown block",
+    "unable to retrieve",
+    "no block at height",
+    "no header for",
+    "block not found",
+    "header was not found",
+    "no block hash for block",
+)
+# (reason, endpoint) pairs already logged — the fallback logs once per reason.
+_history_fallback_logged: set[tuple[str, str]] = set()
+
+
+def pruned_state_reason(exc: BaseException | None) -> str | None:
+    """The pruned-state marker ``exc`` (or anything in its cause/context chain)
+    carries, or None when it is some other failure."""
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        text = f"{type(exc).__name__}: {exc}".lower()
+        if type(exc).__name__ == "StateDiscardedError":
+            return "state discarded for"
+        for marker in _PRUNED_STATE_MARKERS:
+            if marker in text:
+                return marker
+        exc = exc.__cause__ or exc.__context__
+    return None
+
+
+def _log_history_once(reason: str, endpoint: str, msg: str, *args: Any) -> None:
+    key = (reason, endpoint)
+    if key in _history_fallback_logged:
+        log.debug(msg, *args)
+        return
+    _history_fallback_logged.add(key)
+    log.warning(msg + " (logged once per reason)", *args)
+
 
 class ChainError(RuntimeError):
     """Wraps any bittensor exception so callers don't import bittensor."""
@@ -252,8 +310,15 @@ class ChainClient:
     wallet_name: str | None = None
     wallet_hotkey: str | None = None
     wallet_path: str | None = None
+    # Where a read AS OF a past block is retried when the primary node pruned
+    # it (see DEFAULT_HISTORY_NETWORK). None / "none" disables the fallback.
+    history_network: str | None = DEFAULT_HISTORY_NETWORK
     _subtensor: Any = None
     _wallet: Any = None
+    _history_subtensor: Any = None
+    # Set when the history endpoint proved to be another chain (genesis
+    # mismatch): the fallback is then off for this client's lifetime.
+    _history_refused: str | None = None
 
     @classmethod
     def from_config(
@@ -264,6 +329,7 @@ class ChainClient:
         wallet_name: str | None = None,
         wallet_hotkey: str | None = None,
         wallet_path: str | None = None,
+        history_network: str | None = DEFAULT_HISTORY_NETWORK,
     ) -> ChainClient:
         if cfg.netuid <= 0:
             raise ChainError(
@@ -276,7 +342,69 @@ class ChainClient:
             wallet_name=wallet_name,
             wallet_hotkey=wallet_hotkey,
             wallet_path=wallet_path,
+            history_network=history_network,
         )
+
+    # ── history fallback (reads at a past block only) ────────────────────────
+
+    def history_target(self) -> str | None:
+        """The history endpoint, or None when disabled / same as the primary."""
+        target = self.history_network
+        if target is None or str(target).strip().lower() in _HISTORY_DISABLED_VALUES:
+            return None
+        target = str(target).strip()
+        return None if target == self.network else target
+
+    @staticmethod
+    def _genesis_hash(sub: Any) -> str:
+        # System::BlockHash(0) is never pruned (frame_system skips block 0).
+        v = sub.query(("System", "BlockHash"), [0])
+        return str(getattr(v, "value", v)).lower()
+
+    def _history_sub(self) -> Any | None:
+        """The lazily-opened history Subtensor, or None when unavailable. On
+        first use it is checked to be the SAME chain as the primary (genesis
+        hash): a testnet / local primary never gets mainnet history."""
+        target = self.history_target()
+        if target is None or self._history_refused:
+            return None
+        if self._history_subtensor is None:
+            try:
+                bt = _import_bittensor()
+                hist = bt.Subtensor(target)
+                mine, theirs = self._genesis_hash(self.subtensor()), self._genesis_hash(hist)
+            except Exception as e:  # noqa: BLE001 — retried on the next fallback
+                _log_history_once("open_failed", target,
+                                  "chain history endpoint %s unavailable: %s", target, e)
+                return None
+            if not mine or mine != theirs:
+                self._history_refused = f"genesis {theirs} != primary {mine}"
+                _log_history_once("genesis_mismatch", target,
+                                  "chain history endpoint %s is another chain (%s); "
+                                  "history fallback disabled", target, self._history_refused)
+                return None
+            self._history_subtensor = hist
+        return self._history_subtensor
+
+    def _read_at(self, block: int | None, op):
+        """``op(subtensor)`` on the primary; when ``block`` is a past block and
+        the primary refused it as pruned, retried ONCE on the history endpoint.
+        Head reads (``block`` None) and non-prune errors are never retried."""
+        sub = self.subtensor()
+        try:
+            return op(sub)
+        except Exception as e:  # noqa: BLE001
+            reason = None if block is None else pruned_state_reason(e)
+            if reason is None:
+                raise
+            hist = self._history_sub()
+            if hist is None:
+                raise
+            _log_history_once(reason, str(self.history_target()),
+                              "chain read at block %s pruned on %s (%s); serving it from "
+                              "history endpoint %s", block, self.network, reason,
+                              self.history_target())
+            return op(hist)
 
     def subtensor(self):
         if self._subtensor is None:
@@ -332,19 +460,24 @@ class ChainClient:
 
     def block_timestamp(self, block: int | None = None) -> float:
         """UTC seconds from the chain's Timestamp pallet, independent of local time."""
-        value = self.subtensor().timestamp(block=block)
+        value = self._read_at(block, lambda sub: sub.timestamp(block=block))
         return float(value.timestamp())
 
     def block_hash(self, block: int | None = None) -> str:
         """The chain block hash at ``block`` (current block when None)."""
-        sub = self.subtensor()
-        try:
-            blk = int(self.current_block()) if block is None else int(block)
-            info = sub.block_info(blk)
-            h = getattr(info, "hash", None)
+        self.subtensor()
+
+        def _hash(sub: Any, blk: int) -> str:
+            h = getattr(sub.block_info(blk), "hash", None)
             if not h:
                 raise ValueError(f"no block hash for block {blk}")
             return str(h)
+
+        try:
+            if block is None:
+                return _hash(self.subtensor(), int(self.current_block()))
+            blk = int(block)
+            return self._read_at(blk, lambda sub: _hash(sub, blk))
         except Exception as e:  # noqa: BLE001
             raise ChainError(f"get_block_hash_failed: {e}") from e
 
@@ -365,10 +498,11 @@ class ChainClient:
         ``neurons[i].total_stake`` == 10.5's ``metagraph.S``; the
         ``neurons.all`` runtime call's ``total_stake`` is a different
         quantity and must never feed the activation tally)."""
-        sub = self.subtensor()
+        self.subtensor()  # connection errors surface unwrapped, as before
+        blk = None if block is None else int(block)
         try:
-            meta = sub.subnets.metagraph(
-                self.netuid, block=None if block is None else int(block), commitments=False)
+            meta = self._read_at(blk, lambda sub: sub.subnets.metagraph(
+                self.netuid, block=blk, commitments=False))
         except Exception as e:  # noqa: BLE001
             raise ChainError(f"metagraph_failed: {e}") from e
         if meta is None:
@@ -456,6 +590,11 @@ class ChainClient:
             if str(neuron.hotkey) == hotkey:
                 return uid
         return None
+
+    def hotkey_uids_at_block(self, block: int) -> dict[str, int]:
+        """``hotkey → uid`` of every hotkey registered AS OF ``block`` (one
+        metagraph read; the lane-C boundary registration snapshot)."""
+        return {str(nn.hotkey): uid for uid, nn in enumerate(self._metagraph(block).neurons)}
 
     def weights_for_hotkey(self, hotkey: str) -> list[float] | None:
         """The weight row a validator hotkey currently has on chain, or None.
@@ -717,10 +856,11 @@ class ChainClient:
         # miner fields are skipped silently. A failure is a ChainError the
         # caller retries next poll — never a per-uid walk (≈13 min on a full
         # metagraph), which would stall the poll loop this runs in.
-        sub = self.subtensor()
+        self.subtensor()
+        blk = None if block is None else int(block)
         try:
-            qm = sub.query_map(_COMMITMENT_OF, [self.netuid],
-                               block=None if block is None else int(block))
+            qm = self._read_at(blk, lambda sub: sub.query_map(
+                _COMMITMENT_OF, [self.netuid], block=blk))
         except Exception as e:  # noqa: BLE001
             raise ChainError(f"commitments_query_failed: {e}") from e
         out: dict[str, str] = {}

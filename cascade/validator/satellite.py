@@ -98,7 +98,8 @@ UNVERIFIABLE_WARN = frozenset({"receipt-signature", "manifest-signature", "netco
 # lane D are set as derived. Everything else (lane A's rows, the sentinel —
 # a lane A gate —, the netconfig row, signatures, continuity) still burns the
 # whole vector.
-LANE_ROWS = {"lane_b": "b", "lane_c": "c", "lane_c_chain": "c", "marketcast": "c"}
+LANE_ROWS = {"lane_b": "b", "lane_c": "c", "lane_c_chain": "c", "marketcast": "c",
+             "lane_c_registrations": "c"}
 
 
 def _lane_of_row(name: str) -> str | None:
@@ -933,6 +934,9 @@ def _build_parser() -> argparse.ArgumentParser:
                                 description="cascade satellite validator (DEC-CA-0058).")
     p.add_argument("--chain-toml", type=Path, default=None)
     p.add_argument("--network", default="finney")
+    p.add_argument("--history-network", default="archive",
+                   help="chain endpoint for reads at a PAST block the --network node pruned "
+                        "(retried there once; never writes / head reads). 'none' disables")
     p.add_argument("--wallet-name", default=None)
     p.add_argument("--wallet-hotkey", default=None)
     p.add_argument("--wallet-path", default=None)
@@ -962,7 +966,9 @@ def run_from_args(args: argparse.Namespace) -> int:
                  or Path(cfg.validator.state_db_path).parent)
     client = ChainClient.from_config(cfg, network=args.network, wallet_name=args.wallet_name,
                                      wallet_hotkey=args.wallet_hotkey,
-                                     wallet_path=args.wallet_path)
+                                     wallet_path=args.wallet_path,
+                                     history_network=getattr(args, "history_network",
+                                                             "archive"))
     hotkey = str(client.hotkey_ss58() or "")
     runner = build_satellite(cfg, state_dir=Path(state_dir), hotkey=hotkey)
     from ..shared.logging_util import restore_cascade_logging

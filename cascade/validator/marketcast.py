@@ -802,6 +802,11 @@ class MktPlan:
     # settlement ends with no holder), so the fold must too. Transient (a
     # plan is folded in the poll that computed it, never persisted).
     evict_after: list = field(default_factory=list)   # (target, hotkey, pointer), AFTER offers
+    # Owner 2026-11-24: every slot holder's registration consulted this
+    # settlement — ``{target, hotkey, uid}`` (uid None = deregistered) as of
+    # the boundary − 1; the receipt records them (``lane_c_registrations``)
+    # so satellites / the audit / late validators never need chain history.
+    registrations: list = field(default_factory=list)
 
 
 def _candidate(entry: LaneCEntry, phase: str, p: PendingEntry | None,
@@ -1103,8 +1108,9 @@ class MarketCastMixin:
             expired = win_expired(work.eras_since(holder, block,
                                                  era_length_blocks(self.cfg.round, block)),
                                   holder, self.cfg.lane_c)
-            unregistered = registration is not None and self._mkt_registration(
-                registration, holder.hotkey, max(0, block - 1), rid=rid) is None
+            unregistered = registration is not None and self._mkt_holder_uid(
+                registration, target, holder.hotkey, max(0, block - 1), rid=rid,
+                plan=plan) is None
             if expired or unregistered:
                 plan.evict.append((target, holder.hotkey, holder.trained_pointer))
                 del work.slots[target]
@@ -1226,6 +1232,96 @@ class MarketCastMixin:
                 if not holds:
                     j.holder = _holder_dict(holder)
         return plan, judgements + reg
+
+    def _mkt_holder_uid(self, registration: Callable, target: str, hotkey: str, block: int,
+                        *, rid: str, plan: MktPlan):
+        """A slot holder's uid AS OF ``block`` (the boundary − 1), recorded on
+        ``plan``. Sources, in order (owner 2026-11-24 — no chain history
+        needed): this node's boundary snapshot (read live at the boundary,
+        :meth:`_lane_c_registration_tick`); the MAIN validator's signed
+        receipt record for this round (a late node catching up); else the
+        chain read (whose client falls back to an archive endpoint for a
+        pruned block)."""
+        found, uid = self._mkt_known_registration(hotkey, block, rid=rid)
+        if not found:
+            uid = self._mkt_registration(registration, hotkey, block, rid=rid)
+        plan.registrations.append({"target": str(target), "hotkey": str(hotkey),
+                                   "uid": None if uid is None else int(uid)})
+        return uid
+
+    def _lane_c_reg_snapshots(self):
+        from ..shared.lane_c_registrations import RegistrationSnapshots
+
+        snaps = self.__dict__.get("_lane_c_reg_snaps")
+        if snaps is None:
+            snaps = RegistrationSnapshots(Path(
+                str(self.cfg.validator.state_db_path) + ".lane_c_registrations.json"))
+            self.__dict__["_lane_c_reg_snaps"] = snaps
+        return snaps
+
+    def _mkt_known_registration(self, hotkey: str, block: int, *, rid: str
+                                ) -> tuple[bool, int | None]:
+        """``(found, uid)`` from a recorded source (never the chain)."""
+        from ..shared.lane_c_registrations import recorded_uid
+
+        try:
+            snap = self._lane_c_reg_snapshots().get(int(block))
+        except Exception:  # noqa: BLE001 — a cache fault falls through
+            snap = None
+        if snap is not None:
+            uid = snap.get(str(hotkey))
+            return True, (None if uid is None else int(uid))
+        return recorded_uid(self._mkt_main_registrations(rid), hotkey, int(block))
+
+    def _mkt_main_registrations(self, rid: str) -> dict | None:
+        """The MAIN validator's signed ``lane_c_registrations`` record for
+        round ``rid`` (verified against ``[netconfig] owner_hotkey``), or
+        None — absent, unreadable or unsigned (cached per round)."""
+        cache = self.__dict__.setdefault("_mkt_main_reg_cache", {})
+        if rid in cache:
+            return cache[rid]
+        rec = None
+        main = self._mkt_main_hotkey()
+        if main:
+            from ..shared.hippius import receipt_round_key
+            from ..shared.receipt import load_receipt, verify_receipt_signature
+
+            try:
+                receipt = load_receipt(self._mkt_store().get_text(
+                    receipt_round_key(str(rid), main)))
+                if (str(receipt.round_id) == str(rid)
+                        and verify_receipt_signature(receipt, main)):
+                    rec = getattr(receipt, "lane_c_registrations", None)
+            except Exception:  # noqa: BLE001 — not published yet / unreadable
+                rec = None
+        if rec is not None:
+            cache[rid] = rec
+        return rec
+
+    def _lane_c_registration_tick(self, client: object) -> None:
+        """Snapshot ``hotkey → uid`` of the netuid AS OF the current
+        settlement boundary − 1 while that block is fresh on any node (lane C
+        active only; one metagraph read per boundary). Never raises."""
+        from ..shared.lane_c_registrations import SNAPSHOT_FRESH_BLOCKS
+
+        lc = getattr(self.cfg, "lane_c", None)
+        fn = getattr(client, "hotkey_uids_at_block", None)
+        if lc is None or not lc.from_block or fn is None:
+            return
+        try:
+            cur = int(client.current_block())  # type: ignore[attr-defined]
+            grid = int(self._lane_b_epoch_blocks(cur))
+            b = cur // grid * grid
+            if b <= 0 or not lc.active(b):
+                return
+            snaps = self._lane_c_reg_snapshots()
+            key = b - 1
+            if snaps.get(key) is not None or cur - key > SNAPSHOT_FRESH_BLOCKS:
+                return
+            snaps.put(key, dict(fn(key)))
+        except Exception as e:  # noqa: BLE001 — the settlement falls back
+            log.warning("lane C: boundary registration snapshot failed (%s); the settlement "
+                        "falls back to the main validator's record / the chain", e)
 
     @staticmethod
     def _mkt_registration(registration: Callable, hotkey: str, block: int, *, rid: str):
