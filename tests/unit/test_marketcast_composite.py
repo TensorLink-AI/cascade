@@ -49,8 +49,9 @@ def test_shipped_configs_are_the_composite_launch_set():
     for toml in ("chain.toml", "chain.testnet.toml"):
         cfg = load_chain_config(toml)
         mc = cfg.marketcast
-        # mainnet armed at 9586800 (owner 2026-11-24); testnet inert
-        fb = 9586800 if toml == "chain.toml" else 0
+        # mainnet armed at 9586800 (owner 2026-11-24); testnet at 8515200
+        # (TESTNET-FAST, owner 2026-11-24 option A)
+        fb = 9586800 if toml == "chain.toml" else 8515200
         assert mc.from_block == fb and mc.target_suites == (("market",) if fb else ())
         assert mc.composite and mc.suites == COMPOSITE_LAUNCH_SUITES
         assert "funding" not in mc.suites

@@ -483,7 +483,7 @@ deployment or qualification succeeded:
 | Template | V2 block | Loaded B gate | C / MarketCast blocks | Random-init eras | B pool | CPU generation |
 |---|---:|---:|---|---:|---|---|
 | `chain.toml` | 9399600 | 0 | 9586800 / 9586800 | 14 | 25% | enabled for shards; 90 min configured |
-| `chain.testnet.toml` | 8190000 | 8190001 | 0 / 0 | 0 | 50% | off; 90 min configured |
+| `chain.testnet.toml` | 8190000 | 8190001 | 8515200 / 8515200 | 0 | 50% | off; 90 min configured |
 <!-- cascade:config-reference:end -->
 
 Testnet retains its configured launch and older economics. A nonzero B launch
