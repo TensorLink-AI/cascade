@@ -16,7 +16,11 @@
   training). Both are refused before anything is loaded or torch imported.
 * **No padding.** Each history is truncated to the largest patch multiple it
   really has, capped at the declared ``context``; histories of equal length
-  are batched together (:func:`batch_plan`, one forward per length). The
+  are batched together (:func:`batch_plan`, one batch per length). A batch
+  runs as deterministic micro-batches of at most :func:`forward_batch_size`
+  windows (#785: ``windows x patches`` past ~65k overflows the CUDA grid in
+  the pyramid's attention, and memory goes first), a pure function of the
+  input length, horizon, patch size and :data:`MAX_FORWARD_TOKENS`. The
   pinned wrapper's edge-pad is never used, so a 4k model and a declared-128k
   copy of it score identically on windows with ≤ 4096 history (T7).
 * **Context is scorer-side.** The model is built from the checkpoint's own
@@ -57,6 +61,14 @@ SCORING_METHOD = "quantile_head"
 SCORER_CONTEXTS: tuple[int, ...] = (4096, 8192, 16384, 32768, 65536, 131072)
 # CPM masks contiguous spans of at most cpm_c_max = 16 patches of 32 points.
 MAX_HORIZON = 16 * 32
+# #785: patch tokens (windows x channels x patches, horizon patches included)
+# one model forward may carry. The pyramid reshapes to (B * P, C, -1) before
+# scaled_dot_product_attention; at ~65,536 rows the CUDA launch fails
+# ("invalid configuration argument") and larger batches OOM first. Measured
+# on the launch 4090 class: 62,400 / 33,000 tokens ran (<= 4.02 GiB peak),
+# 66,000 failed. Half the 65,535 grid limit; a release constant, never a
+# runtime memory probe, so every validator cuts the same micro-batches.
+MAX_FORWARD_TOKENS = 32768
 
 
 def _as_int(value, what: str) -> int:
@@ -281,6 +293,24 @@ def batch_plan(history_lengths, *, context: int, patch_size: int) -> dict[int, l
     return {length: plan[length] for length in sorted(plan)}
 
 
+def forward_batch_size(input_len: int, horizon: int, patch_size: int, *, channels: int = 1,
+                       max_tokens: int = MAX_FORWARD_TOKENS) -> int:
+    """Windows per model forward (#785): ``max_tokens // (channels *
+    patches)``, at least 1, where ``patches`` counts the history patches
+    plus the ``ceil(horizon / patch_size)`` masked horizon patches.
+    Deterministic in its arguments; ``ValueError`` on a non-positive input."""
+    length = _as_int(input_len, "input length")
+    h = _as_int(horizon, "horizon")
+    ps = _as_int(patch_size, "patch_size")
+    c = _as_int(channels, "channels")
+    cap = _as_int(max_tokens, "max_tokens")
+    if min(length, h, ps, c, cap) < 1:
+        raise ValueError(f"forward_batch_size: non-positive input "
+                         f"(len {length}, h {h}, patch {ps}, channels {c}, max_tokens {cap})")
+    patches = -(-length // ps) + -(-h // ps)
+    return max(1, cap // (c * patches))
+
+
 def _load_model(checkpoint_dir: Path, context: int, device: str):
     import torch
     from safetensors.torch import load_file
@@ -299,35 +329,104 @@ def _load_model(checkpoint_dir: Path, context: int, device: str):
 
 
 def _forward(pm, cfg, model, rows: np.ndarray, horizon: int, device: str) -> np.ndarray:
-    """``(B, L)`` float64 histories (L a patch multiple) → ``(B, horizon, Q21)``,
-    the pyramid head's quantiles in data units (the wrapper's arithmetic,
-    without its pad)."""
+    """``(B, L)`` univariate or ``(B, C, L)`` multichannel float64 histories
+    (L a patch multiple) → ``(B, horizon, Q21)`` resp. ``(B, C, horizon,
+    Q21)``, the pyramid head's quantiles in data units (the wrapper's
+    ``_parameters`` arithmetic, without its pad). The C channels of a window
+    are one joint forecast (the model's variate axis); each channel is
+    standardized on its own, as in training. ``(B, L)`` is exactly the
+    ``C = 1`` case, so a univariate batch runs the same arithmetic as before
+    F2 (rev6.18 A4: bit-identical)."""
     import torch
 
     ps = int(cfg.patch_size)
-    b, length = rows.shape
+    rows = np.asarray(rows)
+    uni = rows.ndim == 2
+    b, c, length = (rows.shape[0], 1, rows.shape[1]) if uni else rows.shape
     count = (int(horizon) + ps - 1) // ps
-    context = torch.as_tensor(rows, dtype=torch.float64, device=device)[:, None]
-    x = torch.cat([context, context.new_zeros(b, 1, count * ps)], -1)
+    context = torch.as_tensor(rows, dtype=torch.float64, device=device)
+    context = context[:, None] if uni else context
+    x = torch.cat([context, context.new_zeros(b, c, count * ps)], -1)
     mask = torch.zeros_like(x, dtype=torch.bool)
     mask[..., length:] = True
-    flat = x.reshape(b, -1)
+    flat = x.reshape(b * c, -1)
     z, loc, scale = pm.causal_standardize(flat, mask.reshape_as(flat))
-    z = z.masked_fill(mask.reshape_as(flat), 0).float().reshape(b, 1, -1, ps)
-    params = model(z, mask=mask.reshape(b, 1, -1, ps), with_parameters=True)
+    z = z.masked_fill(mask.reshape_as(flat), 0).float().reshape(b, c, -1, ps)
+    params = model(z, mask=mask.reshape(b, c, -1, ps), with_parameters=True)
     start = length // ps - 1
     params = params[:, :, start:start + count]
-    loc = loc.reshape(b, 1, -1, ps)[:, :, start:start + count, -1].float()
-    scale = scale.reshape(b, 1, -1, ps)[:, :, start:start + count, -1].float()
+    loc = loc.reshape(b, c, -1, ps)[:, :, start:start + count, -1].float()
+    scale = scale.reshape(b, c, -1, ps)[:, :, start:start + count, -1].float()
     q = pm.quantiles(params) * scale[..., None, None] + loc[..., None, None]
-    out = q[:, 0].reshape(b, -1, q.shape[-1])[:, :int(horizon)]
+    if uni:
+        out = q[:, 0].reshape(b, -1, q.shape[-1])[:, :int(horizon)]
+    else:
+        out = q.reshape(b, c, -1, q.shape[-1])[:, :, :int(horizon)]
     return out.cpu().numpy().astype(np.float64)
 
 
+def _forward_chunked(pm, cfg, model, rows: np.ndarray, horizon: int, device: str,
+                     max_tokens: int) -> np.ndarray:
+    """:func:`_forward` over ``rows`` (``(B, ..., L)``, one input length) in
+    contiguous micro-batches of :func:`forward_batch_size` windows, in order,
+    concatenated along the window axis. In exact arithmetic a window's
+    forward is independent of its batch (per-row standardization, per-series
+    attention, per-token routing with no capacity drop); in fp32 the GEMM
+    blocking depends on the batch rows, so the cut moves the last bits
+    (~1e-8 relative, measured on CPU). The cut is therefore part of the
+    deterministic recipe: fixed by :data:`MAX_FORWARD_TOKENS`, and each
+    micro-batch equals forecasting its windows on their own. An input that
+    fits under the cap is not cut (the pre-#785 forward, bit for bit)."""
+    rows = np.asarray(rows)
+    channels = int(np.prod(rows.shape[1:-1], dtype=np.int64)) if rows.ndim > 2 else 1
+    step = forward_batch_size(rows.shape[-1], horizon, int(cfg.patch_size), channels=channels,
+                              max_tokens=max_tokens)
+    if rows.shape[0] <= step:
+        return _forward(pm, cfg, model, rows, horizon, device)
+    return np.concatenate([_forward(pm, cfg, model, rows[i:i + step], horizon, device)
+                           for i in range(0, rows.shape[0], step)], axis=0)
+
+
+def _as_window(hist, i: int) -> np.ndarray:
+    """One history as a float64 array: 1-D ``(L,)`` (univariate; any 1-D
+    shape as before F2) or 2-D ``(C, L)`` (multichannel, C ≥ 2; a ``(1, L)``
+    history is the univariate ``(L,)``)."""
+    a = np.asarray(hist, dtype=np.float64)
+    if a.ndim == 2 and a.shape[0] > 1:
+        row = a
+    elif a.ndim <= 2:
+        row = a.reshape(-1)
+    else:
+        raise ValueError(f"window {i}: history shape {a.shape} is neither (L,) nor (C, L)")
+    if not np.isfinite(row).all():
+        raise ValueError(f"window {i}: non-finite history")
+    return row
+
+
+def forecast_rows(histories) -> list[int]:
+    """The forecast rows of each window in :func:`forecast_quantiles`'
+    output: 1 per univariate window, C per ``(C, L)`` window (C ≥ 2)."""
+    out = []
+    for h in histories:
+        shape = np.shape(h)
+        out.append(int(shape[0]) if len(shape) == 2 and int(shape[0]) > 1 else 1)
+    return out
+
+
 def forecast_quantiles(checkpoint_dir: str | os.PathLike, histories, *, context: int,
-                       horizon: int, contexts=None, device: str = "cpu") -> np.ndarray:
+                       horizon: int, contexts=None, device: str = "cpu",
+                       max_tokens: int = MAX_FORWARD_TOKENS) -> np.ndarray:
     """``(n, horizon, 9)`` quantile forecasts of ``histories`` at
     :data:`SCORING_LEVELS`.
+
+    rev6.18 A4 (F2): a history may be a ``(C, L)`` multichannel window
+    (C ≥ 2), forecast jointly by one model call. The output then has one row
+    per channel, window-major and channel-minor (:func:`forecast_rows`):
+    ``(Σ rows, horizon, 9)``. Windows batch by (channels, input length); the
+    univariate windows form exactly the pre-F2 per-length batches, so a
+    univariate forecast is bit-identical with or without multichannel windows
+    in the request. The channel pick (empty columns, the 32 cap) happens
+    box-side before the request (:mod:`cascade.eval.lane_d_channels`).
 
     ``context`` is the context to run at (an entry's
     :func:`effective_context`) and ``contexts`` the settlement's armed set:
@@ -336,34 +435,50 @@ def forecast_quantiles(checkpoint_dir: str | os.PathLike, histories, *, context:
     :data:`SCORER_CONTEXTS`. ``horizon`` must be in ``[1, MAX_HORIZON]``.
     Both checks run before anything is loaded or torch is imported. Each
     window's model input is its last :func:`batch_plan` length points plus
-    ``ceil(h/32)`` masked horizon patches, one forward per length. Raises
+    ``ceil(h/32)`` masked horizon patches, one batch per length, run in
+    micro-batches of :func:`forward_batch_size` windows (``max_tokens``
+    patch tokens per forward; #785). Raises
     ``ValueError`` on a history shorter than one patch, a non-finite history
     or a non-finite forecast."""
     ctx = declared_context(context, SCORER_CONTEXTS if contexts is None else contexts)
     h = _checked_horizon(horizon)
+    tokens = _as_int(max_tokens, "max_tokens")
+    if tokens < 1:
+        raise ValueError(f"max_tokens must be positive, got {tokens}")
     d = Path(checkpoint_dir)
-    rows = []
-    for i, hist in enumerate(histories):
-        row = np.asarray(hist, dtype=np.float64).reshape(-1)
-        if not np.isfinite(row).all():
-            raise ValueError(f"window {i}: non-finite history")
-        rows.append(row)
+    rows = [_as_window(hist, i) for i, hist in enumerate(histories)]
     if not rows:
         return np.empty((0, h, len(SCORING_LEVELS)), dtype=np.float64)
     # The patch size is read from the checkpoint's own config (json only), so
     # a too-short history is refused before torch or the weights load.
     meta = json.loads((d / "config.json").read_text(encoding="utf-8"))
-    plan = batch_plan([r.size for r in rows], context=ctx, patch_size=int(meta["moe"]["patch_size"]))
+    ps = int(meta["moe"]["patch_size"])
+    n_ch = [1 if r.ndim == 1 else int(r.shape[0]) for r in rows]
+    # One no-pad plan per channel count: C = 1 is the univariate plan, the
+    # same batches as before F2.
+    plans: dict[int, dict[int, list[int]]] = {}
+    for c in sorted(set(n_ch)):
+        members = [i for i, k in enumerate(n_ch) if k == c]
+        sub = batch_plan([rows[i].shape[-1] for i in members], context=ctx, patch_size=ps)
+        plans[c] = {length: [members[j] for j in idx] for length, idx in sub.items()}
+    offsets = np.concatenate([[0], np.cumsum(n_ch)]).astype(np.int64)
 
     import torch
 
     pm, cfg, model = _load_model(d, ctx, device)
     picks = np.asarray(level_indices(pm.QUANTILE_LEVELS), dtype=np.int64)
-    out = np.empty((len(rows), h, len(picks)), dtype=np.float64)
+    out = np.empty((int(offsets[-1]), h, len(picks)), dtype=np.float64)
     with torch.no_grad():
-        for length, idx in plan.items():
-            q = _forward(pm, cfg, model, np.stack([rows[i][-length:] for i in idx]), h, device)
-            out[idx] = q[:, :, picks]
+        for c, plan in plans.items():
+            for length, idx in plan.items():
+                q = _forward_chunked(pm, cfg, model,
+                                     np.stack([rows[i][..., -length:] for i in idx]), h, device,
+                                     tokens)
+                if c == 1:
+                    out[offsets[idx]] = q[:, :, picks]
+                    continue
+                for j, i in enumerate(idx):
+                    out[offsets[i]:offsets[i + 1]] = q[j][:, :, picks]
     if not np.isfinite(out).all():
         raise ValueError("non-finite lane D quantiles")
     return out
@@ -374,8 +489,19 @@ def score_window(q: np.ndarray, target: np.ndarray, history: np.ndarray,
     """``(crps, mase)`` of one ``(horizon, 9)`` forecast: ``crps`` is the
     window's weighted quantile loss over the grid (``2·mean_q pinball /
     Σ|y|``), ``mase`` scores the 0.5 quantile. ``ValueError`` when the
-    forecast is malformed or the target has no scale (``Σ|y| = 0``)."""
+    forecast is malformed or the target has no scale (``Σ|y| = 0``).
+
+    rev6.18 A4 (F2, DEC-CA-0041): a ``(C, horizon, 9)`` forecast of a
+    ``(C, horizon)`` target with a ``(C, L)`` history (C ≥ 2) is ONE
+    per-window score: each channel's ``crps`` and ``mase`` as above, then
+    the arithmetic mean over channels; ``crps`` averages only the channels
+    with ``Σ|y_c| > 0`` (zero-target channels are masked from the quantile
+    half, as lane A's ``wql_per_window`` does), ``mase`` averages every
+    channel. ``ValueError`` when no channel has scale. A 2-D call never
+    touches the univariate path, which is unchanged."""
     q = np.asarray(q, dtype=np.float64)
+    if q.ndim == 3:
+        return _score_multichannel(q, target, history, seasonal_period)
     y = np.asarray(target, dtype=np.float64).reshape(-1)
     if q.shape != (y.size, len(SCORING_LEVELS)) or not np.isfinite(q).all():
         raise ValueError(f"forecast shape {q.shape} / finiteness invalid for horizon {y.size}")
@@ -388,6 +514,30 @@ def score_window(q: np.ndarray, target: np.ndarray, history: np.ndarray,
     return crps, m
 
 
-__all__ = ["MAX_HORIZON", "MEDIAN_INDEX", "SCORER_CONTEXTS", "SCORING_LEVELS", "SCORING_METHOD",
-           "batch_plan", "declared_context", "forecast_quantiles", "level_indices",
+def _score_multichannel(q: np.ndarray, target, history, seasonal_period: int
+                        ) -> tuple[float, float]:
+    from .crps import wql_per_window
+
+    y = np.asarray(target, dtype=np.float64)
+    hist = np.asarray(history, dtype=np.float64)
+    c = q.shape[0]
+    if (c < 2 or y.ndim != 2 or y.shape[0] != c or hist.ndim != 2 or hist.shape[0] != c
+            or q.shape != (c, y.shape[1], len(SCORING_LEVELS)) or not np.isfinite(q).all()):
+        raise ValueError(f"multichannel forecast {q.shape} / target {y.shape} / history "
+                         f"{hist.shape} invalid")
+    # (num_q, C, H) quantiles against the (C, H) target: one row per channel.
+    qloss, abs_t = pinball_components(np.transpose(q, (2, 0, 1)), y, SCORING_LEVELS)
+    wql, valid = wql_per_window(qloss, abs_t)
+    if not bool(valid.any()):
+        raise ValueError("target has no scale")
+    crps = float(wql[valid].mean())
+    sp = max(1, int(seasonal_period))
+    m = float(np.mean([float(mase_one(q[k, :, MEDIAN_INDEX], y[k], hist[k], sp))
+                       for k in range(c)]))
+    return crps, m
+
+
+__all__ = ["MAX_FORWARD_TOKENS", "MAX_HORIZON", "MEDIAN_INDEX", "SCORER_CONTEXTS",
+           "SCORING_LEVELS", "SCORING_METHOD", "batch_plan", "declared_context",
+           "forecast_quantiles", "forecast_rows", "forward_batch_size", "level_indices",
            "score_window", "usable_length"]

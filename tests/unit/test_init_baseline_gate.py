@@ -1,10 +1,12 @@
-"""Init-baseline floor (DEC-CA-0034), the validator duel side.
+"""Init-baseline floor (DEC-CA-0034), the validator duel side — RETIRED
+(rev6.18 B12, owner 2026-11-23).
 
-KOTH compares entrants to each other and to the king, never to "do nothing".
-``[scoring] init_gate_mode`` is the authoritative floor — a challenger that
-beat the king but is worse than the init cannot be CROWNED. The gift-gate
-shape: off → shadow → enforce; can only block a dethrone, never grant one;
-king retention untouched. Consensus-relevant.
+It ran in SHADOW on mainnet from 2026-08-27 (floor computed and recorded on
+the receipt, verdict unchanged) and never enforced. Release-then-activate:
+``[scoring] init_gate_retired_from_block`` is the typed block; a round before
+it still runs the legacy shadow floor (so archived receipts replay), from it
+the floor is off. ``init_gate_mode`` / ``init_gate_tolerance`` are retired
+keys (ignored), "enforce" and the tolerance are gone.
 
 Off must be byte-identical to the pre-gate code, and the receipt tests pin
 signature stability. (The trainer's heat SHADOW row retired with the heat.)
@@ -26,12 +28,26 @@ SCORES = {"b": 0.25, "c": 0.35, "d": 0.40}
 INIT_SCORE = 0.30
 
 
-def test_default_config_ships_the_floor_in_shadow(cfg):
-    # Shadow = a visibility row only, verdicts untouched. Enforce remains a
-    # separate coordinated decision; this pins that the shipped file never
-    # silently escalates past shadow.
-    assert cfg.scoring.init_gate_mode == "shadow"
-    assert cfg.scoring.init_gate_tolerance == 0.0
+def test_default_config_keeps_the_legacy_shadow_until_the_retire_block(cfg):
+    # The shipped file types a placeholder block; until it every round runs
+    # the legacy shadow floor exactly as before (never enforce), from it off.
+    gate = cfg.scoring.init_gate_retired_from_block
+    assert gate > 0
+    assert cfg.koth_params(block=gate - 1).init_gate_mode == "shadow"
+    assert cfg.koth_params(block=None).init_gate_mode == "shadow"
+    assert cfg.koth_params(block=gate).init_gate_mode == "off"
+    assert not hasattr(cfg.scoring, "init_gate_mode")
+    assert not hasattr(cfg.scoring, "init_gate_tolerance")
+
+
+def test_retire_block_unset_is_off_at_every_block():
+    from cascade.shared.config import ScoringConfig, init_gate_mode_at
+
+    s = ScoringConfig(win_margin_start=0.02, win_margin_end=0.02,
+                      margin_warmup_rounds=0, min_windows=10, bootstrap_B=200,
+                      bootstrap_alpha=0.05, dethrone_cp=1)
+    assert s.init_gate_retired_from_block == 0
+    assert {init_gate_mode_at(s, b) for b in (None, 0, 1, 9_560_700)} == {"off"}
 
 
 def test_heat_json_round_trips_init_baseline():
@@ -94,48 +110,32 @@ def test_floor_shadow_records_but_never_gates():
     assert r.baseline_geomean is not None
 
 
-def test_floor_enforce_blocks_worse_than_init():
-    r = evaluate_round(KING, BAD_CHAL, _params(init_gate_mode="enforce"),
-                       seed=1, baseline_scores=_pw(0.82))
-    assert r.init_floor_passed is False
-    assert r.challenger_wins_round is False    # blocked: worse than doing nothing
-    # same challenger, gate off: it wins — the floor is what blocked it
-    assert evaluate_round(KING, BAD_CHAL, _params(), seed=1).challenger_wins_round
-
-
-def test_floor_enforce_passes_better_than_init():
-    r = evaluate_round(KING, GOOD_CHAL, _params(init_gate_mode="enforce"),
-                       seed=1, baseline_scores=_pw(0.90))
-    assert r.init_floor_passed is True
-    assert r.challenger_wins_round is True
-
-
-def test_floor_tolerance_widens_the_bar():
-    # BAD_CHAL (~0.85) vs init ~0.82: fails strict, passes at 10% slack.
-    strict = evaluate_round(KING, BAD_CHAL, _params(init_gate_mode="enforce"),
-                            seed=1, baseline_scores=_pw(0.82))
-    slack = evaluate_round(
-        KING, BAD_CHAL,
-        _params(init_gate_mode="enforce", init_gate_tolerance=0.10),
-        seed=1, baseline_scores=_pw(0.82))
-    assert strict.init_floor_passed is False
-    assert slack.init_floor_passed is True and slack.challenger_wins_round
-
-
-def test_floor_never_grants_a_win():
+def test_floor_shadow_never_grants_a_win():
     # A challenger that does NOT clear the margin stays a loser even when it
-    # beats the init soundly — the floor can only block, never grant.
+    # beats the init soundly — shadow only records.
     near_king = _pw(0.995)
-    r = evaluate_round(KING, near_king, _params(init_gate_mode="enforce"),
+    r = evaluate_round(KING, near_king, _params(init_gate_mode="shadow"),
                        seed=1, baseline_scores=_pw(1.5))
     assert r.init_floor_passed is True
     assert r.challenger_wins_round is False
 
 
 def test_floor_without_baseline_cannot_run():
-    r = evaluate_round(KING, GOOD_CHAL, _params(init_gate_mode="enforce"), seed=1)
+    r = evaluate_round(KING, GOOD_CHAL, _params(init_gate_mode="shadow"), seed=1)
     assert r.init_floor_passed is None
     assert r.challenger_wins_round is True     # judged as if the gate were off
+
+
+def test_enforce_and_tolerance_are_gone():
+    import dataclasses
+
+    names = {f.name for f in dataclasses.fields(KothParams)}
+    assert "init_gate_mode" in names           # archived params replay
+    assert "init_gate_tolerance" not in names
+    # a recorded "enforce" (never shipped) would not block a win either
+    r = evaluate_round(KING, BAD_CHAL, _params(init_gate_mode="enforce"),
+                       seed=1, baseline_scores=_pw(0.82))
+    assert r.init_floor_passed is False and r.challenger_wins_round is True
 
 
 # ── receipt signature stability ───────────────────────────────────────────────
@@ -167,48 +167,23 @@ def test_verdict_body_drops_absent_floor_fields():
 # ── loader round-trip (the DEC-CA-0035 sweep's regression class) ─────────────
 
 
-def test_loader_round_trips_init_gate_fields(tmp_path):
-    """Regression: like the DEC-CA-0033 [training] knobs, these fields landed
-    with dataclass defaults but no load_chain_config parsing — arming the
-    shadow gate in chain.toml silently no-oped."""
+def test_loader_round_trips_the_retire_block(tmp_path):
+    """Config knobs need loader parsing: the typed block must reach
+    koth_params, and the retired keys must load and change nothing."""
     from pathlib import Path
 
     from cascade.shared.config import load_chain_config
 
     repo_root = Path(__file__).resolve().parents[2]
     text = (repo_root / "chain.toml").read_text()
-    # The shipped file arms shadow, so the round trip is proven by REPLACING
-    # the shipped line with different values and reading them back.
-    assert 'init_gate_mode = "shadow"' in text          # [scoring]
+    line = next(x for x in text.splitlines()
+                if x.startswith("init_gate_retired_from_block"))
     patched = text.replace(
-        'init_gate_mode = "shadow"',
-        'init_gate_mode = "enforce"\ninit_gate_tolerance = 0.05', 1,
-    )
+        line, 'init_gate_retired_from_block = 9600300\n'
+              'init_gate_mode = "enforce"\ninit_gate_tolerance = 0.05', 1)
     p = tmp_path / "chain.toml"
     p.write_text(patched)
     c = load_chain_config(p)
-    assert c.scoring.init_gate_mode == "enforce"
-    assert c.scoring.init_gate_tolerance == 0.05
-    # and the koth params carry them through
-    kp = c.koth_params()
-    assert kp.init_gate_mode == "enforce"
-    assert kp.init_gate_tolerance == 0.05
-
-
-def test_loader_rejects_scoring_init_gate_typo(tmp_path):
-    """[scoring] is strict (gift-gate rule: a typo must not silently
-    un-enforce the floor)."""
-    from pathlib import Path
-
-    import pytest as _pytest
-
-    from cascade.shared.config import load_chain_config
-
-    repo_root = Path(__file__).resolve().parents[2]
-    text = (repo_root / "chain.toml").read_text()
-    patched = text.replace(
-        'init_gate_mode = "shadow"', 'init_gate_mode = "enforcee"', 1)
-    p = tmp_path / "chain.toml"
-    p.write_text(patched)
-    with _pytest.raises(ValueError, match=r"init_gate_mode='enforcee' invalid"):
-        load_chain_config(p)
+    assert c.scoring.init_gate_retired_from_block == 9600300
+    assert c.koth_params(block=9600299).init_gate_mode == "shadow"
+    assert c.koth_params(block=9600300).init_gate_mode == "off"

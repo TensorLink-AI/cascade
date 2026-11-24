@@ -40,6 +40,19 @@ production box. `verify` scans `/proc` read-only, as it does today.
   `cascade/validator/private_worker.py` (the code the eval host runs) adds a
   note containing `eval-host`: the eval host must be synced, eval host first.
 
+## 2b. The settlement blackout and the block clock (#787, `test_r8_settlement_scaling.py`)
+
+- The blackout scales with the settlement length in force at the
+  extrapolated block (`Grid.length_at`): mainnet's 3 h (900-block)
+  settlement keeps exactly 20 min before and 15 min after a boundary (pinned
+  to the block: 726 of 900 blocks open); a longer one (12 h) keeps the same
+  minutes (capped); a shorter one gets the same fractions (testnet's 150
+  blocks: 3.3 / 2.5 min), so a restart window always exists.
+- The block clock is the NEWEST sample of the validator log and
+  `trainer.log`; a sample older than 120 min is `REFUSE [clock]`.
+- `check --validator-log FILE` names the validator's log (default
+  `<root>/validator.log`; testnet's main validator writes `val0.log`).
+
 ## 3. AREAs
 
 - **(i) `lane_d_intake`**: a new key in `AREAS` that matches everything under

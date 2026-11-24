@@ -1,7 +1,8 @@
 """W2: every [lane_d] key is parsed by the loader, has its plan default, is
 carried by both shipped files, survives a TOML round-trip and is MUTATION-
 tested (changing the key changes the parsed value, so an unread key fails).
-Legacy / DEC-CA-0062 placeholder keys keep parsing."""
+The retired keys (rev6.18 B11: DEC-CA-0062 placeholders, confirm_on_king_change)
+load and change nothing."""
 
 from __future__ import annotations
 
@@ -10,13 +11,14 @@ import pytest
 from .helpers import (
     ARM,
     ARM_BLOCK_2,
-    LEGACY_KEYS,
-    LEGACY_VALUES,
     MUTATIONS,
+    RETIRED_LANE_D,
+    RETIRED_VALUES,
     SHIPPED,
     UNTIL_BLOCK_2,
     W2_DEFAULTS,
     W2_KEYS,
+    co_for,
     comparable,
     dump_lane_d,
     field,
@@ -90,9 +92,9 @@ def test_w2_shipped_table_carries_every_key_at_its_default(name):
 def test_w2_key_mutation_changes_the_parsed_value(name, key):
     """Two different values give two different parsed values (an unread key
     would give the same config twice)."""
-    a, b, co = MUTATIONS[key]
-    ld_a = load_ok(raw_with(name, {**co, key: a}), f" with {key}={a!r}").lane_d
-    ld_b = load_ok(raw_with(name, {**co, key: b}), f" with {key}={b!r}").lane_d
+    a, b, _co = MUTATIONS[key]
+    ld_a = load_ok(raw_with(name, {**co_for(key, a), key: a}), f" with {key}={a!r}").lane_d
+    ld_b = load_ok(raw_with(name, {**co_for(key, b), key: b}), f" with {key}={b!r}").lane_d
     va, vb = field(ld_a, key), field(ld_b, key)
     if key == "gate_weights":
         assert weights(va) == weights(a) and weights(vb) == weights(b), (va, vb)
@@ -102,8 +104,8 @@ def test_w2_key_mutation_changes_the_parsed_value(name, key):
     assert ld_a != ld_b, f"[lane_d] {key}: {a!r} and {b!r} parse to the same config"
 
 
-# Every W2 key at a non-default value together with every legacy key: one
-# table that must load, dump and load back equal.
+# Every W2 key at a non-default value: one table that must load, dump and
+# load back equal.
 ROUND_TRIP = {
     **{k: b for k, (_a, b, _co) in MUTATIONS.items()},
     **ARM,
@@ -115,10 +117,12 @@ ROUND_TRIP = {
     "dtypes": ["BF16"],
     "gate_suites": ["gift", "boom", "time"],
     "gate_weights": {"gift": 1.0, "boom": 2.0, "time": 1.0},
-    **LEGACY_VALUES,
     "notes": {"owner": "w2 round-trip"},
 }
-DUMP_KEYS = W2_KEYS + LEGACY_KEYS + ("notes",)
+# rev6.23: one court weight per slot of the mutated reward_prior_kings.
+ROUND_TRIP["court_weights"] = [0.9] + [0.1 / ROUND_TRIP["reward_prior_kings"]] * \
+    ROUND_TRIP["reward_prior_kings"]
+DUMP_KEYS = W2_KEYS + ("notes",)
 
 
 @pytest.mark.parametrize("name", SHIPPED)
@@ -144,23 +148,30 @@ def test_w2_round_trip_of_the_shipped_defaults(name, tmp_path):
 
 
 @pytest.mark.parametrize("name", SHIPPED)
-@pytest.mark.parametrize("key", LEGACY_KEYS)
-def test_w2_legacy_and_placeholder_keys_still_parse(name, key):
-    """The deployed file carries targets, teacher_*, gain_margin, ...: each
-    still parses and is carried as written, armed or not."""
-    co = {"teacher_models": ["chronos-2"]} if key == "teacher_mode" else {}
+@pytest.mark.parametrize("key", RETIRED_LANE_D)
+def test_w2_retired_keys_load_and_change_nothing(name, key):
+    """rev6.18 B11: the deployed file carries targets, teacher_*, gain_margin,
+    confirm_on_king_change, ...: each still loads (armed or not), is no
+    LaneDConfig field and leaves the parsed table equal to the one without it."""
+    import dataclasses
+
+    from cascade.shared.config import RETIRED_KEYS
+    from cascade.shared.config.lane_d import LaneDConfig
+
+    assert key in RETIRED_KEYS.get("lane_d", frozenset()), (
+        f"[lane_d] {key} is not a listed retired key")
+    assert key not in {f.name for f in dataclasses.fields(LaneDConfig)}, (
+        f"retired [lane_d] {key} is still a LaneDConfig field")
     for extra in ({}, ARM):
-        ld = load_ok(raw_with(name, {**extra, **co, key: LEGACY_VALUES[key]}),
-                     f" with legacy {key}").lane_d
-        assert norm(field(ld, key)) == norm(LEGACY_VALUES[key]), (
-            f"legacy [lane_d] {key} not carried: {field(ld, key)!r}")
+        with_key = load_ok(raw_with(name, {**extra, key: RETIRED_VALUES[key]}),
+                           f" with retired {key}").lane_d
+        without = load_ok(raw_with(name, dict(extra))).lane_d
+        assert with_key == without, f"retired [lane_d] {key} changed the parsed table"
 
 
 @pytest.mark.parametrize("name", SHIPPED)
-def test_w2_shipped_legacy_values_unchanged(name):
-    """The shipped legacy values parse to today's values."""
-    ld = load_ok(shipped_raw(name)).lane_d
-    assert field(ld, "pool_prefix") == "pool_d" and field(ld, "teacher_api") == "ephemeris"
-    assert field(ld, "teacher_mode") == "route" and field(ld, "gain_margin") == 0.01
-    assert norm(field(ld, "data_sources")) == ("real", "prior_corpus")
-    assert field(ld, "expert_choice") == "miner" and field(ld, "max_context_length") == 32768
+def test_w2_shipped_files_carry_no_retired_key(name):
+    """B11 deleted the retired lines from both shipped files."""
+    table = shipped_raw(name).get("lane_d", {})
+    left = sorted(k for k in RETIRED_LANE_D if k in table)
+    assert not left, f"{name} [lane_d] still carries retired keys {left}"

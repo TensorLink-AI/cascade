@@ -86,7 +86,7 @@ The parsers come from WB20 (`tests/accept/wb20/helpers.py`): sections, spans,
 - **Commands:** `cascade lane-d export|verify|submit|ready|status`, each in a
   span or code block.
 - **Hotkey:** "dedicated hotkey".
-- **Licence:** a paragraph naming `Apache-2.0`, `OpenMDW`, "training data"
+- **Licence:** a paragraph naming `MIT`, "training data"
   and "teacher" (the B13 attestation). "takedown".
 - **D43:** a paragraph with "reveal", "immediate(ly)" and "commit".
 - **Latency:** a paragraph with "forward-only", "latency" and
