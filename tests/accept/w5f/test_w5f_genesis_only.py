@@ -119,19 +119,8 @@ def test_a_house_retake_after_a_miner_crown_is_refused(tmp_path):
         {"digest": x["digest"], "hotkey": x["hotkey"], "uid": h.CHALLENGER_UID,
          "burn_reason": None}]
     f = lane_d_findings(_signed(forged), cfg.lane_d, signer_hotkey=h.signer().ss58_address)
-    assert f.burn is not None and f.burn[0] == "ld_crown", f.burn
-
-
-def test_court_renormalises_over_existing_kings_and_a_deregistered_slot_burns():
-    from cascade.audit.checks import _lane_d_part
-
-    w = (0.80, 0.15, 0.05)
-    two = _lane_d_part(8, share=0.5, court=[3, 2], court_weights=w, burn_uid=0)
-    assert two[3] == pytest.approx(0.5 * 0.80 / 0.95) and two[2] == pytest.approx(
-        0.5 * 0.15 / 0.95) and two[0] == 0.0
-    dereg = _lane_d_part(8, share=0.5, court=[3, None, 4], court_weights=w, burn_uid=0)
-    assert dereg[0] == pytest.approx(0.5 * 0.15), "a deregistered king's slot does not burn"
-    assert dereg[3] == pytest.approx(0.5 * 0.80) and dereg[4] == pytest.approx(0.5 * 0.05)
+    assert f.burn is not None and f.burn[0] == "ld_crown" and "DEC-CA-0076" in f.burn[1], \
+        f"the retake is not refused as a house KING_D after a miner crown: {f.burn}"
 
 
 def test_the_audit_derives_the_genesis_vector_from_the_signed_record(tmp_path):
@@ -152,3 +141,14 @@ def test_the_audit_derives_the_genesis_vector_from_the_signed_record(tmp_path):
     # the court-paying vector is not the genesis one
     burned = [float(x) for x in derive_weights(receipt, ccfg)[0]]
     assert burned != list(want), "fixture: lane D burned differs from lane D off"
+    # after genesis the court is 80/15/5 over the miner kings that exist; a
+    # deregistered king's slot burns (unchanged)
+    from cascade.audit.checks import _lane_d_part
+
+    w = (0.80, 0.15, 0.05)
+    two = _lane_d_part(8, share=0.5, court=[3, 2], court_weights=w, burn_uid=0)
+    assert two[3] == pytest.approx(0.5 * 0.80 / 0.95) and two[2] == pytest.approx(
+        0.5 * 0.15 / 0.95) and two[0] == 0.0
+    dereg = _lane_d_part(8, share=0.5, court=[3, None, 4], court_weights=w, burn_uid=0)
+    assert dereg[0] == pytest.approx(0.5 * 0.15), "a deregistered king's slot must burn"
+    assert dereg[3] == pytest.approx(0.5 * 0.80) and dereg[4] == pytest.approx(0.5 * 0.05)
