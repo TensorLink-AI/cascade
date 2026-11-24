@@ -40,23 +40,19 @@ def test_w_ov_envelope_refuses_loader_legal_dangerous_values(overrides, where):
     assert why is not None and "out of bounds" in why and where in why, why
 
 
-@pytest.mark.parametrize("value,inside", [
-    (0.0, True), (0.5, True), (0.99, True), (1.0, True),   # 1.0: the loader refuses it
-    (-0.01, False), (1.01, False), (2.0, False)])
-def test_w_ov_public_weight_is_bounded_to_the_unit_split(value, inside):
+@pytest.mark.parametrize("value", [-0.01, 1.01, 2.0])
+def test_w_ov_public_weight_is_bounded_to_the_unit_split(value):
     """rev6.18 A3 (F4): [lane_d] public_weight is overlay-tweakable inside
     [0, 1] (owner 2026-11-24: the 50/50 split moves by overlay, not by a
-    release); outside it the envelope refuses, whatever the loader says."""
+    release); outside it the envelope refuses, and every split inside it
+    (0, 0.5, 0.99, 1; the loader keeps < 1) passes the envelope, a 0.4
+    overlay being adopted end to end."""
     from cascade.shared import netconfig_bounds as nb
 
     got = nb.value_refusals({"lane_d": {"public_weight": value}})
-    assert (not got) == inside, got
-    if not inside:
-        assert "lane_d] public_weight" in got[0], got
-
-
-def test_w_ov_public_weight_overlay_inside_the_envelope_is_adopted():
-    """A 60/40 split by overlay is adopted (no other release needed)."""
+    assert got and "lane_d] public_weight" in got[0], (value, got)
+    for inside in (0.0, 0.5, 0.99, 1.0):
+        assert not nb.value_refusals({"lane_d": {"public_weight": inside}}), inside
     assert refusal(shipped_cfg(), {"lane_d": {"public_weight": 0.4}}) is None
 
 

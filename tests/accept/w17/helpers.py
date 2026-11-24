@@ -126,11 +126,16 @@ def _shipped() -> str:
     return (REPO / "chain.toml").read_text(encoding="utf-8")
 
 
+# rev6.18 A3 (F4): the W7c fixture scores the live half only. Stated here,
+# not read from w7c.helpers, so a BASE run (this WP's dir over a main without
+# F4) still collects and fails on the F4 assertions.
+LIVE_ONLY = {"public_weight": 0.0, "window_ratio_floor": 1e-9}
+
 ARMED_LANE_D = {"from_block": ARM_BLOCK, "share": 0.25, "takes_from": "lane_a",
                 "remainder": "burn", "contexts": [4096, 8192, 16384],
                 "horizon": w7c.HORIZON, "forward_margin_hours": w7c.MARGIN_H,
                 "max_mirror_lag_hours": 6.0, "min_windows": 24, "min_clusters": 4,
-                "bootstrap_B": 200, **w7c.LIVE_ONLY}
+                "bootstrap_B": 200, **LIVE_ONLY}
 
 
 def chain_cfg(*, armed: bool = True, sentinel: bool = False, **lane_over):
