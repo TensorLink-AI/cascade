@@ -83,7 +83,7 @@ def test_settle_judges_embargo_windows_of_every_cadence(tmp_path):
         fc[entry["digest"]][wid] = quantiles_around(y + rng.normal(0, 0.05 * sd, HORIZON),
                                                     0.3 * sd)
         fc[house["digest"]][wid] = quantiles_around(y + 3.0 * sd, 0.3 * sd)
-    s = settle_lane_d(cfg=cfg, boundary=BOUNDARY_1, pool_dir=pool_dir, entries=[dict(entry)],
+    s = settle_lane_d(**_rev614_ts(settle_lane_d, BOUNDARY_1), cfg=cfg, boundary=BOUNDARY_1, pool_dir=pool_dir, entries=[dict(entry)],
                       house=dict(house), forecasts=fc, uid_of={entry["hotkey"]: 6},
                       state_path=tmp_path / "state" / "lane_d_state.json",
                       signer=fixture_key("signer"), **gate_inputs(BOUNDARY_1, house["digest"]))
@@ -96,3 +96,14 @@ def test_settle_judges_embargo_windows_of_every_cadence(tmp_path):
         assert why is None, f"scored {wid} though the embargo-aware rule refuses it: {why}"
     emb = {window_id(r["series_id"], r["target_ts"]) for r in hourly_emb + fast_emb}
     assert member & emb, "no embargo window was judged at e = 48"
+
+
+def _rev614_ts(settle, boundary) -> dict:
+    """rev6.14 (a): the fixture's on-chain boundary timestamp (far after every
+    fixture T + eval_delay_hours, 12 s per block), passed only where
+    ``settle_lane_d`` takes it."""
+    import inspect
+
+    if "boundary_ts" not in inspect.signature(settle).parameters:
+        return {}
+    return {"boundary_ts": 2_000_000_000 + 12 * int(boundary)}
