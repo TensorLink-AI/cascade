@@ -414,16 +414,21 @@ def test_retired_keys_load_and_are_ignored(tmp_path):
         EvalConfig,
         LaneBConfig,
         RoundConfig,
+        ScoringConfig,
         TelemetryConfig,
         ValidatorConfig,
         load_chain_config,
     )
+    from cascade.shared.config.lane_d import LaneDConfig
 
     live = {"round": {f.name for f in dataclasses.fields(RoundConfig)},
             "telemetry": {f.name for f in dataclasses.fields(TelemetryConfig)},
             "eval": {f.name for f in dataclasses.fields(EvalConfig)},
             "validator": {f.name for f in dataclasses.fields(ValidatorConfig)},
+            "scoring": {f.name for f in dataclasses.fields(ScoringConfig)},
+            "lane_d": {f.name for f in dataclasses.fields(LaneDConfig)},
             "lane_b": {f.name for f in dataclasses.fields(LaneBConfig)}}
+    assert set(RETIRED_KEYS) <= set(live), "a retired section has no live-field check"
     for section, keys in RETIRED_KEYS.items():
         assert not keys & live[section], f"[{section}] retired key is a live field"
 
@@ -435,6 +440,11 @@ def test_retired_keys_load_and_are_ignored(tmp_path):
                                 if f"\n{k} " not in text and f"\n{k}=" not in text),
              "telemetry": "\n".join(f"{k} = 1" for k in sorted(RETIRED_KEYS["telemetry"])
                                     if f"\n{k} " not in text),
+             # rev6.18 B11/B12: a deployed file still carries these
+             "scoring": "\n".join(f"{k} = 1" for k in sorted(RETIRED_KEYS["scoring"])
+                                  if f"\n{k} " not in text),
+             "lane_d": "\n".join(f"{k} = 1" for k in sorted(RETIRED_KEYS["lane_d"])
+                                 if f"\n{k} " not in text),
              # rev6.22: an older file's lane B decay / TTL keys load, ignored
              "lane_b": "full_pay_tiers = [[0.05, 10], [0.02, 5], [0.01, 2]]\n"
                        "half_life_rounds = 1.0\nfloor = 0.1\nwin_ttl_eras = 28"}
@@ -443,6 +453,8 @@ def test_retired_keys_load_and_are_ignored(tmp_path):
             text = text.replace(f"\n[{section}]\n", f"\n[{section}]\n{lines}\n", 1)
     p = tmp_path / "chain.toml"
     p.write_text(text)
-    assert load_chain_config(p).round.epoch_blocks == load_chain_config(
-        DEFAULT_CHAIN_TOML).round.epoch_blocks
-    assert load_chain_config(p).lane_b == load_chain_config(DEFAULT_CHAIN_TOML).lane_b
+    got, shipped = load_chain_config(p), load_chain_config(DEFAULT_CHAIN_TOML)
+    assert got.round.epoch_blocks == shipped.round.epoch_blocks
+    assert got.scoring == shipped.scoring
+    assert got.lane_d == shipped.lane_d
+    assert got.lane_b == shipped.lane_b
