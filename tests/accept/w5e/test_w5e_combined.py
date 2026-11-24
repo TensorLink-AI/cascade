@@ -66,7 +66,7 @@ def _case(live_f, pub_f, *, n_live=60, n_pub=80):
     clusters = [f"src{i % 8}" for i in range(n_live)]
     pclusters = [("gift_eval_pretrain" if i % 2 else "rmisc") + f"|fam{i % 5}"
                  for i in range(n_pub)]
-    public = {"bar": pb, "members": [pub_m], "clusters": pclusters,
+    public = {"anchor": pb, "members": [pub_m], "clusters": pclusters,
               "sources": [c.split("|")[0] for c in pclusters]}
     return lb, [live_m], clusters, public
 
@@ -89,7 +89,7 @@ def test_one_part_without_clamp_is_the_cohort_max_t_lcb():
                            seed="s", clusters=clusters)
     x = [clamped_log_ratios(*king, *m, floor=1e-12) for m in members]
     new = parts_maxt_lcbs([(x, clusters, 1.0)], alpha=0.05, B=300, seed="s")
-    assert all(math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-12) for a, b in zip(old, new))
+    assert all(math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-12) for a, b in zip(old, new, strict=True))
 
 
 def test_the_per_window_ratio_is_clamped():

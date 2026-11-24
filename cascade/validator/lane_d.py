@@ -358,7 +358,7 @@ def judge_cohort(king: tuple, members: list[tuple], *, clusters: list, cfg, seed
 
     ``king`` / ``members`` are ``(crps, mase)`` per-window arrays on the
     cohort's live windows, ``clusters`` their sources. ``public`` (required
-    iff ``public_weight > 0``) is ``{"bar": (crps, mase), "members":
+    iff ``public_weight > 0``) is ``{"anchor": (crps, mase), "members":
     [(crps, mase)], "clusters": [...], "sources": [...]}`` on the settlement's
     public windows (clusters ``<source>|<family>``). ``lcb`` / ``gain`` are
     the combined statistic's on the gain scale ``1 − exp(−L)``; ``halves``
@@ -373,7 +373,7 @@ def judge_cohort(king: tuple, members: list[tuple], *, clusters: list, cfg, seed
     if w > 0.0:
         if public is None or not len(public["clusters"]):
             raise ValueError("public_weight > 0 needs the public half's scores")
-        xp = [clamped_log_ratios(*public["bar"], *pm, floor=floor) for pm in public["members"]]
+        xp = [clamped_log_ratios(*public["anchor"], *pm, floor=floor) for pm in public["members"]]
         parts.append((xp, list(public["clusters"]), w))
     lcbs = parts_maxt_lcbs(parts, alpha=float(cfg.alpha), B=int(cfg.bootstrap_B), seed=seed)
     live_labels = [f"{LIVE_SOURCE}|{c}" for c in clusters]
@@ -1443,7 +1443,7 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
         def pub_in(bar: str, pub_m=pub_m) -> dict | None:
             if pub is None:
                 return None
-            return {"bar": pub_of(bar), "members": pub_m,
+            return {"anchor": pub_of(bar), "members": pub_m,
                     "clusters": [f"{w['source']}|{w['family']}" for w in pub["windows"]],
                     "sources": [w["source"] for w in pub["windows"]]}
 
