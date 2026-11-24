@@ -76,6 +76,7 @@ def test_w_cmp2_a_spec_compiles_into_an_instance():
 ])
 def test_w_cmp2_a_bad_instance_is_refused_and_burns(bad, code):
     from cascade.shared.config import parse_chain_config
+    from cascade.shared.config.lane_c import register_spec_kind  # noqa: F401  (W-CMP2)
 
     cfg = parse_chain_config(_with(_raw(), {KIND: bad}))
     r = cfg.lane_c.spec_refusal(KIND)
@@ -93,6 +94,7 @@ def test_w_cmp2_reserved_ids_are_refused():
 def test_w_cmp2_overlay_adds_and_removes_a_competition_never_retroactively():
     from cascade.shared import netconfig as nc
     from cascade.shared.config import load_chain_config
+    from cascade.shared.config.lane_c import register_spec_kind  # noqa: F401  (W-CMP2)
 
     from .helpers import ROOT
 
