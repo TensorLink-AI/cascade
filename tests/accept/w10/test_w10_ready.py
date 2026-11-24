@@ -142,9 +142,10 @@ def test_ready_sends_the_licence_and_the_exact_attestation(env, capsys, caplog):
     with intake(path, coldkey=COLD) as fake:
         dg = _seed(fake, env, capsys, caplog)
         res = _ready(capsys, caplog, fake, dg, licence="MIT")
-        (req,) = fake.routes(READY)
+        reqs = fake.routes(READY)
     assert res.rc == 0, res
-    body = json.loads(req["body"])
+    assert len(reqs) == 1, reqs
+    body = json.loads(reqs[0]["body"])
     assert body == {"licence": "MIT", "attestation": lane_d.LICENCE_ATTESTATION}
 
 
