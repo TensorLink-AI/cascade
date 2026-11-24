@@ -117,6 +117,9 @@ class LaneDInputs:
     (``{hotkey: uid}``) and the ``house`` pointer record. ``armed`` (rev6.6)
     is the settlement's W5d armed record, passed to ``settle_lane_d(armed=)``
     (``None``: the legacy call, no armed fields in the report).
+    ``boundary_ts`` (rev6.14 (a)) is the boundary block's on-chain timestamp,
+    passed to ``settle_lane_d(boundary_ts=)`` (``None``: nothing is frozen or
+    judged, ``boundary_ts_missing``).
     ``channel_block_hash`` (rev6.18 A4, F2) is the block hash the source
     picked the channels of an over-cap multichannel window with (``None``
     when no window needed one); it must be the settlement's own."""
@@ -128,6 +131,7 @@ class LaneDInputs:
     house: Mapping
     prior_pool_dirs: tuple = ()
     armed: Mapping | None = None
+    boundary_ts: int | None = None
     channel_block_hash: str | None = None
 
 
@@ -298,6 +302,7 @@ class LaneDStep:
                               signer=self.signer, prior_pool_dirs=tuple(inp.prior_pool_dirs),
                               expect_prior_sha256=expect, boundary_block_hash=block_hash,
                               sentinel=sentinel, bench=bench, armed=_armed_of(inp),
+                              boundary_ts=getattr(inp, "boundary_ts", None),
                               max_channels=_max_channels(self.cfg))
         except Exception as e:  # noqa: BLE001 — LaneDStateError, schema, pool or crash
             raise LaneDWiringError("settle_refused",

@@ -322,3 +322,7 @@ crown nothing and that uid 6 is KING_D's court slot at B1, B2 and B3 (it
 checked B2 only). Nothing is weakened. On main the old code still runs the
 confirmation stage (X is crowned at B2), so the changed test fails on an
 assertion until the W5e implementation lands.
+
+## rev6.14 (a): judging start vs eligibility boundary (owner 2026-11-23)
+
+Option A (orchestrator 2026-11-23): the source reads the boundary block's on-chain timestamp with its chain reader and returns it as `LaneDInputs.boundary_ts` (W8b passes it to `settle_lane_d`); unreadable is `boundary_ts_unreadable`, never a guessed time. The fake reader answers a boundary block with W8b's fixture clock. `test_w8c_rev614.py`.
