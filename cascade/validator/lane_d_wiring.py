@@ -236,6 +236,7 @@ class LaneDStep:
         # built it (a websocket is never shared across threads).
         self._readers: dict[int, Any] = {}
         self._courts: dict[int, list[int | None]] = {}
+        self._genesis: dict[int, bool] = {}
         self._lock = threading.Lock()
 
     # ── the weight fold's read ──────────────────────────────────────────────
@@ -253,10 +254,25 @@ class LaneDStep:
             log.warning("lane D court_for(%r) failed: %s", boundary, e)
             return None
 
+    def genesis_for(self, boundary: int) -> bool:
+        """DEC-CA-0076: whether the settlement :meth:`court_for` answers from
+        has the house as KING_D (lane D's genesis: no miner has ever held
+        it). False before any publication. Memory only; never raises."""
+        try:
+            b = int(boundary)
+            with self._lock:
+                done = [k for k in self._courts if k <= b]
+                return bool(done) and self._genesis.get(max(done), False)
+        except Exception as e:  # noqa: BLE001 — the weight loop never sees a lane D error
+            log.warning("lane D genesis_for(%r) failed: %s", boundary, e)
+            return False
+
     def _set_court(self, boundary: int, report: Mapping) -> None:
         court = _court_uids(report)
+        genesis = bool((report.get("king_after") or {}).get("house"))
         with self._lock:
             self._courts[int(boundary)] = court
+            self._genesis[int(boundary)] = genesis
         log.info("lane D settlement %d published: court %s", boundary, court)
 
     # ── inputs ──────────────────────────────────────────────────────────────

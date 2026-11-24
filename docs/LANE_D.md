@@ -235,23 +235,32 @@ house included): `d_margin_start` (0.03) at tenure 0, falling linearly to
 4 days at 3 h each), flat after. A new crown restarts it. The signed report
 records the tenure and the bar applied (`crown_bar`) and your gain per half, per
 source (live, GiftEvalPretrain, RMISC) and per domain. Several entries freezing in one settlement
-form a cohort judged with max-T on their shared window set. When a miner
-holds KING_D, each member must also clear the current house on the same set.
-An entry is
+form a cohort judged with max-T on their shared window set. KING_D is the
+only bar (DEC-CA-0076). An entry is
 judged once; a loser is never re-judged on new windows.
 
 **Crowned at the first verdict.** There is no confirmation stage. An entry
-that clears the bar, the gate and (when a miner holds KING_D) the house is
-crowned at that settlement's verdict. A clear held only by a bench outage
+that clears the bar and the gate is crowned at that settlement's verdict. A clear held only by a bench outage
 is `bench_hold` and is decided when the sweep runs.
 
 ## The house, the gate, the sentinel
 
-**The house** is our own lane A king, always entered in lane D. It is
-refreshed whenever lane A's king digest changes, and its T is the block at
-which that digest was published. Lane D pays only for weights better than our
-own pipeline produces: if the house holds KING_D, the king slot goes unpaid
-(it burns, `house_king`). The house is never in the paid court.
+**The house** is our own lane A king, and it is lane D's **genesis bar
+only** (owner 2026-11-24, DEC-CA-0076). It is refreshed whenever lane A's
+king digest changes, and its T is the block at which that digest was
+published. The rules:
+
+- **Genesis.** No miner has held KING_D yet, so the house holds it and the
+  first crown must beat the house, which is the lane A king. Lane D pays
+  nobody and burns nothing: its share stays with its `takes_from` lane, and
+  the vector is exactly the lane-D-off one.
+- **After the first miner crown,** the house is gone from lane D. It is no
+  second bar, it enters no challenger, and it never retakes KING_D. A report
+  whose KING_D is the house after a miner crown (prior kings present, or the
+  house replacing a miner king) is refused (`ld_crown`, burn class).
+- **The house is never in the paid court.**
+- **Not changed:** the bench gate below still sweeps the house as a
+  reference.
 
 **The gate** is a rotating public-benchmark direction check, run once per
 crowning candidate. One suite is drawn from `gate_suites` (GIFT-Eval, BOOM,
@@ -278,8 +287,8 @@ up to `reward_prior_kings` (2) prior **miner** kings, paid by the explicit
 15% to the newest prior king, 5% to the next. A court with fewer slots splits
 over the slots it has (KING_D alone takes all of it; KING_D plus one prior
 king take 0.80/0.95 and 0.15/0.95). Prior kings keep being paid with no time
-limit. Unpaid share (a house king, an
-empty or deregistered slot) burns; the remainder destination is release-only
+limit. A deregistered king's slot burns (its uid no longer resolves to
+its hotkey). At genesis lane D carves nothing (see the house above); the remainder destination is release-only
 (`remainder = "burn"`). The shipped default is `share = 0.0` and
 `takes_from = "lane_b"`; the activation overlay sets the live split. Check
 signed reports and on-chain weights for payment: queue state or a held

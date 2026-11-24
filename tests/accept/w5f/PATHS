@@ -27,3 +27,9 @@ cascade/lane_d/ops_jobs.py
 # lane D entry, D46 reveal_ts from the lineage; pod side) whose documents the
 # w5f house-source job installs.
 cascade/lane_d/house_source.py
+# DEC-CA-0076 (owner 2026-11-24): the house is lane D's genesis bar only (no
+# second bar, no challenger, no retake after the first miner crown; genesis
+# pays lane D's takes_from lane). The decision record and the docs.
+decisions/DEC-CA-0076-lane-d-house-genesis-only.md
+docs/LANE_D.md
+docs/MINER_LANE_D.md

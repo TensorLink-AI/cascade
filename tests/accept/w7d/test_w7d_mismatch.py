@@ -72,11 +72,13 @@ def _has_gate(c, n) -> None:
     assert "gate" in c.pub.report(n), f"fixture: settlement {n} ran no gate"
 
 
-def _has_house_bar(c, n) -> None:
+def _has_no_house_bar(c, n) -> None:
+    """DEC-CA-0076: a miner holds KING_D at ``n``, and the house is no bar."""
     rep = c.pub.report(n)
-    assert rep["cohorts"] and "house_digest" in rep["cohorts"][0], \
+    assert rep["cohorts"] and "house_digest" not in rep["cohorts"][0], \
         f"fixture: settlement {n} judges against the house as a second bar"
-    assert rep["verdicts"] and "house" in rep["verdicts"][0]
+    assert rep["verdicts"] and "house" not in rep["verdicts"][0]
+    assert not rep["king_before"]["house"], f"fixture: a miner must hold KING_D at {n}"
 
 
 def _lie(c, n, mutate, paths, *, reseal=True, uid_of=False, key=None):
@@ -325,28 +327,17 @@ def test_prior_kings_off_the_chain_are_a_mismatch(chains):
 # ── the house bar ───────────────────────────────────────────────────────────
 
 
-def test_a_house_judgement_off_the_rows_is_a_mismatch(chains):
-    _has_house_bar(chains["house_bar"], 3)
-
-    def m(rep):
-        rep["verdicts"][0]["house"]["lcb"] = float(rep["verdicts"][0]["house"]["lcb"]) + 0.05
-
-    _lie(chains["house_bar"], 3, m, ["verdicts[0].house"])
-
-
-def test_a_dropped_house_bar_is_a_mismatch(chains):
-    """A miner holds KING_D, so the house is a second bar: a report that
-    judges without it (no `house_digest`, no house judgement, no house rows)
-    is a lie however consistent."""
+def test_a_house_bar_named_after_a_miner_crown_is_a_mismatch(chains):
+    """DEC-CA-0076 (owner 2026-11-24, laned:tests-correction; was: a house
+    judgement off the rows / a dropped house bar are lies): a miner holds
+    KING_D, so the house is no bar; a report naming it as one is a lie."""
     c = chains["house_bar"]
-    _has_house_bar(c, 3)
+    _has_no_house_bar(c, 3)
 
     def m(rep):
-        hd = rep["cohorts"][0].pop("house_digest")
-        rep["verdicts"][0].pop("house")
-        rep["rows"] = [r for r in rep["rows"] if r["digest"] != hd]
+        rep["cohorts"][0]["house_digest"] = rep["house"]["digest"]
 
-    _lie(c, 3, m, ["cohorts[0]", "verdicts[0]", "rows"])
+    _lie(c, 3, m, ["cohorts[0].house_digest"])
 
 
 # ── the first verdict against the refreshed house (rev6.11: no D20) ─────────

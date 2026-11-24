@@ -342,3 +342,39 @@ def test_913_a_lane_d_payee_registered_elsewhere_burns_only_lane_d_share(tmp_pat
             assert pushed[u] == recorded[u], f"uid {u}: lane A/B/C moved"
     assert sum(pushed) == pytest.approx(1.0)
     assert "lane_d_check_burn" in caplog.text and "reward-uid" in caplog.text
+
+
+def test_dec0076_genesis_settlement_pays_lane_a_on_the_satellite(tmp_path, offline):
+    """DEC-CA-0076: a signed lane D report whose KING_D is the house (no
+    miner has held it) — the main validator records the lane-D-off vector
+    (lane D's share stays with lane A) and the satellite, replaying the
+    full audit, sets exactly that vector; nothing burns."""
+    from cascade.audit.lane_d import _canon
+    from tests.unit.test_satellite_replay import (
+        BOUNDARIES,
+        MAIN_KP,
+        DictStore,
+        FakeClient,
+        _runner,
+        make_settlement,
+    )
+
+    store = DictStore()
+    cfg = _court_cfg(tmp_path / "cfg")
+    receipt, _ = make_settlement(cfg, store, 0)        # the lane-D-off vector
+    recorded = [float(w) for w in receipt.weights]
+    report = _paying_report(cfg, BOUNDARIES[0])
+    house = {"digest": report["house"]["digest"], "hotkey": None, "house": True,
+             "reveal_ts": report["house"]["reveal_ts"]}
+    report.update(king_before=house, king_after=dict(house), prior_kings=[],
+                  pay={"share": SHARE, "court": [{"digest": house["digest"], "hotkey": None,
+                                                  "uid": None, "burn_reason": "house_king"}]})
+    report.pop("signature")
+    report["signature"] = MAIN_KP.sign(_canon(report)).hex()
+    _publish_report(store, report)
+    runner = _runner(cfg, store, tmp_path / "sat")
+    client = FakeClient(BOUNDARIES[0] + 300)
+    doc = runner.poll(client)
+    assert doc["last_failing_check"] == "", doc
+    assert client.pushed[-1] == recorded, "genesis did not set the lane-D-off vector"
+    assert "lane_d" not in runner.state.attribution

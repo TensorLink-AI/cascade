@@ -455,6 +455,7 @@ class WeightsMixin:
             d_court = (self._lane_d_court(int(boundary))
                        if boundary is not None and lane_d is not None
                        and lane_d.active(int(boundary)) and not self.cfg.validator.force_burn
+                       and not self._lane_d_genesis(int(boundary))
                        else None)
             if lane_c_on or d_court is not None:
                 from ..shared.emission import EmissionPolicy
@@ -563,6 +564,21 @@ class WeightsMixin:
         with contextlib.suppress(Exception):
             self._last_weight_block = int(client.current_block())  # type: ignore[attr-defined]
         return vec
+
+    def _lane_d_genesis(self, boundary: int) -> bool:
+        """DEC-CA-0076 (owner 2026-11-24): the published settlement in force
+        at ``boundary`` has the house as KING_D (no miner ever held it):
+        lane D carves nothing, so the vector is exactly the lane-D-off one
+        (its share stays with its ``takes_from`` lane). Read only through the
+        injected ``lane_d_step.genesis_for``; anything else is not genesis."""
+        genesis_for = getattr(getattr(self, "lane_d_step", None), "genesis_for", None)
+        if not callable(genesis_for):
+            return False
+        try:
+            return genesis_for(int(boundary)) is True
+        except Exception as e:  # noqa: BLE001 — lane D never reaches the weight push
+            log.warning("lane D genesis unreadable at boundary %d (%s)", boundary, e)
+            return False
 
     def _lane_d_court(self, boundary: int) -> list[int | None]:
         """W8b: lane D's court for a vector at ``boundary``, read ONLY through

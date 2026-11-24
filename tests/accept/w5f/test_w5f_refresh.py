@@ -145,42 +145,35 @@ def _cohort_of(report, dg) -> dict:
     return found[0]
 
 
-def test_miner_held_refresh_new_house_is_the_second_bar_from_that_boundary(weak_swap):
+def test_miner_held_refresh_new_house_is_no_second_bar(weak_swap):
+    """DEC-CA-0076 (owner 2026-11-24, laned:tests-correction): after the
+    first miner crown the house is no bar — a refreshed house is recorded
+    but Y is judged against KING_D alone (was: the new house as the second
+    bar, W5c change 3)."""
     c, s3 = weak_swap
     r = c.reports[3]
     assert r["house"] == _house_record(H1W)
     assert s3["house"] == {"digest": H1W["digest"], "reveal_ts": T_H1}
-    # The refresh never moves the throne: X is KING_D at the boundary, and
-    # the throne moves only by Y's own crown (rev6.11 (b): at its first
-    # verdict), never to the house.
     assert r["king_before"]["digest"] == X["digest"] and not r["king_before"]["house"], \
         "a miner KING_D keeps its throne on a house refresh"
     assert r["crowned"] == Y["digest"]
-    assert s3["king"]["digest"] == Y["digest"] and not s3["king"]["house"], \
-        "the house refresh took KING_D, or Y did not crown at its first verdict"
+    assert s3["king"]["digest"] == Y["digest"] and not s3["king"]["house"]
     co = _cohort_of(r, Y["digest"])
     assert co["king_digest"] == X["digest"]
-    assert co.get("house_digest") == H1W["digest"], \
-        "Y must be judged against the NEW house as the second bar"
-    assert rows_of(r, H1W["digest"]) >= set(co["window_ids"])
-    assert not rows_of(r, H0["digest"]), "the old house must not be scored after the swap"
+    assert "house_digest" not in co, "the house is a second bar after a miner crown"
+    assert not rows_of(r, H1W["digest"]), "the house was scored after a miner crown"
+    assert not rows_of(r, H0["digest"])
     v = verdict_of(r, Y["digest"])
-    assert v is not None and v["house"]["digest"] == H1W["digest"]
-
-
-def test_miner_held_refresh_new_house_enters_as_a_challenger(weak_swap):
-    """§1.4 "It enters at that settlement" / §2 item 2: the house duels a
-    miner KING_D forward-only. A weaker house loses and never retakes."""
-    c, _ = weak_swap
-    v = verdict_of(c.reports[3], H1W["digest"])
-    assert v is not None, "the refreshed house was not judged against the miner KING_D"
-    assert v["king_digest"] == X["digest"]
-    assert v["cleared"] is False, "a weaker house must not clear the miner KING_D"
+    assert v is not None and "house" not in v
+def test_miner_held_refresh_new_house_enters_no_challenger(weak_swap):
+    """DEC-CA-0076 (laned:tests-correction; was §2 item 2, the house duels a
+    miner KING_D): a refreshed house is never judged after a miner crown."""
+    c, s3 = weak_swap
     for n in (3, 4):
-        st_king = c.reports[n]["king_after"]
-        assert not st_king["house"], f"boundary {n}: a weaker house took KING_D"
-
-
+        assert verdict_of(c.reports[n], H1W["digest"]) is None, \
+            f"boundary {n}: the refreshed house was judged against a miner KING_D"
+        assert not c.reports[n]["king_after"]["house"], f"boundary {n}: the house took KING_D"
+    assert "house_entry" not in s3
 def test_miner_held_refresh_weak_house_never_enters_the_court(weak_swap):
     c, _ = weak_swap
     # rev6.11 (b): Y is crowned at boundary(3), its first verdict.
@@ -224,75 +217,49 @@ def t10(tmp_path_factory):
     return {"chain": c, "s5": s5, "s6": s6, "restart": restart, "refs": refs}
 
 
-def test_t10_stronger_house_clears_and_retakes_at_its_first_verdict(t10):
+def test_t10_stronger_house_never_retakes(t10):
+    """DEC-CA-0076 (owner 2026-11-24, laned:tests-correction; was T10: a
+    stronger house retakes KING_D): the stronger H1 is recorded as the house
+    and never judged; Y keeps KING_D and the court stays the miner kings."""
     c, s5 = t10["chain"], t10["s5"]
     r = c.reports[5]
     assert r["house"] == _house_record(H1)
-    v = verdict_of(r, H1["digest"])
-    assert v is not None, "the swapped house was not judged against the miner KING_D"
-    assert v["king_digest"] == Y["digest"] and v["stage"] == "first"
-    assert v["cleared"] is True, v
-    co = r["cohorts"][v["cohort"]]
-    assert co["members"] == [H1["digest"]], "the house challenger is judged in its own cohort"
-    assert co["king_digest"] == Y["digest"]
-    assert "house_digest" not in co, "the house is never its own second bar"
-    assert "house" not in v
-    assert rows_of(r, H1["digest"]) == set(co["window_ids"])
-    # rev6.11 (b): no confirmation duel, for the house as for a miner: a
-    # passing first clear retakes KING_D at that settlement.
-    assert "confirmation" not in v
-    assert v["outcome"] == "crowned", v
+    assert verdict_of(r, H1["digest"]) is None, "the house challenged a miner KING_D"
     assert r["king_before"]["digest"] == Y["digest"]
-    assert r["king_after"] == _house_record(H1), "T10: the house retakes KING_D"
-    assert r["crowned"] is None, "a house retake names no miner crown"
-    k = s5["king"]
-    assert (k["digest"], k["house"], k["hotkey"]) == (H1["digest"], True, None)
-    assert c.pays[5]["court_uids"] == [None, UID_Y, UID_X]
-
-
-def test_t10_after_the_retake_the_house_holds_king_d_and_is_not_judged_again(t10):
-    """boundary(6), the same pointer: the house entry ended with the retake
-    at boundary(5); the house holds KING_D and is never judged again."""
-    c, s6 = t10["chain"], t10["s6"]
-    r = c.reports[6]
-    assert verdict_of(r, H1["digest"]) is None, "the house was judged again after its retake"
-    assert r["king_before"] == _house_record(H1)
-    assert r["king_after"] == _house_record(H1), "T10: the house keeps KING_D"
-    assert r["house"] == _house_record(H1)
+    assert r["king_after"] == r["king_before"], "the house retook KING_D"
     assert r["crowned"] is None
-    k = s6["king"]
-    assert (k["digest"], k["house"], k["hotkey"]) == (H1["digest"], True, None)
-
-
-def test_t10_slot_burns_and_prior_miner_tails_keep_paying(t10):
+    k = s5["king"]
+    assert (k["digest"], k["house"]) == (Y["digest"], False)
+    assert c.pays[5]["court_uids"] == [UID_Y, UID_X]
+def test_t10_the_house_never_holds_king_d_after_a_miner_crown(t10):
+    """DEC-CA-0076 (laned:tests-correction): boundaries 5-7, the house
+    refreshed twice (H1, then H2), never KING_D and never judged."""
+    c = t10["chain"]
+    for n in (5, 6, 7):
+        r = c.reports[n]
+        assert not r["king_after"]["house"], f"boundary {n}: the house holds KING_D"
+        assert verdict_of(r, r["house"]["digest"]) is None
+    assert "house_entry" not in t10["s5"] and "house_entry" not in t10["s6"]
+def test_t10_the_court_is_the_miner_kings_with_no_house_slot(t10):
+    """DEC-CA-0076 (laned:tests-correction; was T10's burning house slot):
+    the court is KING_D then the prior miner kings, every slot paid."""
     c, s6 = t10["chain"], t10["s6"]
-    assert [p["digest"] for p in s6["prior_kings"]] == [Y["digest"], X["digest"]], \
-        "the dethroned miner king must become the newest prior king"
-    assert c.pays[6]["court_uids"] == [None, UID_Y, UID_X], \
-        "T10: the king slot burns and both prior miner tails keep paying"
+    assert [p["digest"] for p in s6["prior_kings"]] == [X["digest"]]
+    assert c.pays[6]["court_uids"] == [UID_Y, UID_X]
     court = c.reports[6]["pay"]["court"]
-    assert court[0]["digest"] == H1["digest"] and court[0]["hotkey"] is None
-    assert court[0]["burn_reason"] == "house_king"
-    assert [(s["digest"], s["uid"], s["burn_reason"]) for s in court[1:]] == \
+    assert [(s["digest"], s["uid"], s["burn_reason"]) for s in court] == \
         [(Y["digest"], UID_Y, None), (X["digest"], UID_X, None)]
     assert c.reports[6]["pay"]["share"] == c.cfg.share
-
-
-def test_t10_house_held_refresh_after_the_retake_keeps_the_tails(t10):
-    """boundary(7): H2 replaces H1 in place; H1 is never a prior king."""
+def test_t10_a_later_house_refresh_keeps_the_miner_court(t10):
+    """boundary(7): H2 is recorded as the house; KING_D and the court are
+    untouched (DEC-CA-0076, laned:tests-correction)."""
     c = t10["chain"]
     st = c.state()
-    assert st["king"]["digest"] == H2["digest"] and st["king"]["house"]
+    assert st["king"]["digest"] == Y["digest"] and not st["king"]["house"]
     assert st["house"] == {"digest": H2["digest"], "reveal_ts": T_H2}
-    assert [p["digest"] for p in st["prior_kings"]] == [Y["digest"], X["digest"]], \
-        "a house-held refresh must not touch the miner tails"
-    assert all(p["digest"] not in (H0["digest"], H1["digest"]) for p in st["prior_kings"])
-    assert c.pays[7]["court_uids"] == [None, UID_Y, UID_X]
-    assert c.reports[7]["king_after"] == _house_record(H2)
-    assert verdict_of(c.reports[7], H2["digest"]) is None, \
-        "a house-held refresh replaces the house in place: no duel"
-
-
+    assert [p["digest"] for p in st["prior_kings"]] == [X["digest"]]
+    assert c.pays[7]["court_uids"] == [UID_Y, UID_X]
+    assert verdict_of(c.reports[7], H2["digest"]) is None
 def test_t10_reports_pass_the_audit(t10):
     c = t10["chain"]
     for n in (5, 6, 7):
@@ -318,18 +285,12 @@ def test_t10_retake_is_restart_safe(t10):
     assert read_state(restart) == t10["s6"]
 
 
-def test_t10_house_entry_is_registered_once(t10):
-    """The same pointer at boundary(5) and (6) is one house entry: judged
-    once, at boundary(5), where it retook KING_D; re-applying the pointer
-    never opens a second entry (rev6.11 (b): no confirmation stage)."""
+def test_t10_no_house_entry_is_ever_registered(t10):
+    """DEC-CA-0076 (laned:tests-correction; was: the house entry is judged
+    once): no settlement judges the house after a miner crown."""
     c = t10["chain"]
-    judged = [n for n in (5, 6) if verdict_of(c.reports[n], H1["digest"]) is not None]
-    assert judged == [5], f"the house entry was judged at {judged}"
-    v5 = verdict_of(c.reports[5], H1["digest"])
-    assert v5["stage"] == "first" and v5["king_digest"] == Y["digest"]
-    assert "confirmation" not in v5
-
-
+    assert [n for n in (5, 6, 7) if verdict_of(c.reports[n], H1["digest"]) is not None
+            or verdict_of(c.reports[n], H2["digest"]) is not None] == []
 def test_t10_exact_copy_of_the_house_is_still_refused_at_dedup(tmp_path):
     """T2 alongside T10: a miner entry whose digest is the swapped house's is
     refused (`duplicate_digest`), never judged."""

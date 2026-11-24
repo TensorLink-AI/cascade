@@ -93,8 +93,9 @@ def test_fixture_chain_shapes(chains):
 
     hb = _reports(chains["house_bar"])
     assert [r["crowned"] for r in hb] == [None, x, y], "house_bar: X at b2, Y at b3"
-    assert hb[2]["cohorts"] and "house_digest" in hb[2]["cohorts"][0]
-    assert hb[2]["verdicts"] and "house" in hb[2]["verdicts"][0]
+    # DEC-CA-0076 (laned:tests-correction): after X's crown the house is no bar
+    assert hb[2]["cohorts"] and "house_digest" not in hb[2]["cohorts"][0]
+    assert hb[2]["verdicts"] and "house" not in hb[2]["verdicts"][0]
     assert [p["digest"] for p in hb[2]["prior_kings"]] == [x]
     assert [s["uid"] for s in hb[2]["pay"]["court"]] == [12, 11]
 
