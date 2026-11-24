@@ -160,8 +160,7 @@ Errors:
 
 ## `ready <intake> --digest D --context C --licence L --attest`
 
-- `L` is one of `cascade.miner.lane_d.LICENCES == ("Apache-2.0",
-  "OpenMDW-1.1")`. Any other value is refused before any request.
+- `L` is one of `cascade.miner.lane_d.LICENCES == ("MIT",)`. Any other value is refused before any request.
 - Without `--attest`, nothing is sent and nothing committed
   (**`licence_attestation_missing`**). The statement is shown to the miner.
 - The body is `{"licence": L, "attestation":

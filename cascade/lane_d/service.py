@@ -68,12 +68,13 @@ _ROUTES = {SUBMIT_PATH: ("POST", "submit"), READY_PATH: ("POST", "ready"),
 
 # A signed timestamp must be within this many seconds of the intake's clock.
 FRESHNESS_SECONDS = 300
-# D13: the open licences a lane D checkpoint is published under.
-LICENCES = ("Apache-2.0", "OpenMDW-1.1")
+# D13 (owner 2026-11-24): the one open licence a lane D checkpoint is published under
+# (the exact SPDX id; a modified MIT is not MIT).
+LICENCES = ("MIT",)
 # B13 (plan §11.2): the one statement a miner attests at ready.
 LICENCE_ATTESTATION = (
     "I attest that this checkpoint's weights, code and config, and the training data "
-    "used to produce them, are licensed for publication under Apache-2.0 or OpenMDW-1.1, "
+    "used to produce them, are licensed for publication under the MIT licence, "
     "and that the training data contains no outputs of any teacher model released under "
     "a restricted licence.")
 
