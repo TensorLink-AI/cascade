@@ -3620,8 +3620,7 @@ byte prefix of the local log and the bucket `HEAD.json` is the one
   `SHADEFORM_API_KEY`, `SHADEFORM_SSH_KEY_ID`, and `LIUM_API_KEY` if the Lium
   CLI is not already configured.
 - `/etc/cascade-laned-pool-d.env` (mode 600, copied to the builder at mode
-  600; create it with `cascade-laned elastic env-template --path
-  /etc/cascade-laned-pool-d.env`): `HIPPIUS_S3_ACCESS_KEY`,
+  600; create it with the `env-template` action, below): `HIPPIUS_S3_ACCESS_KEY`,
   `HIPPIUS_S3_SECRET_KEY`, `TSFORGE_S3_ACCESS_KEY`, `TSFORGE_S3_SECRET_KEY`,
   `TSFORGE_BUCKET`, `TSFORGE_S3_ENDPOINT`.
 - `deploy/laned/elastic.toml [eval_host] image`: the digest-pinned worker
@@ -3629,20 +3628,22 @@ byte prefix of the local log and the bucket `HEAD.json` is the one
   timing.
 
 **How to run.** Always `quote` (or `--dry-run`) first; renting is
-Approve-tier.
+Approve-tier. The console script `cascade-laned elastic` is the same tool;
+the snippets use the module form.
 
 ```
-cascade-laned elastic quote --role pool-d-builder
-cascade-laned elastic cycle --role pool-d-builder --dry-run
-cascade-laned elastic cycle --role pool-d-builder        # one build; the timer runs this
-cascade-laned elastic down  --role pool-d-builder
+python -P -m cascade.laned.cli elastic env-template --path /etc/cascade-laned-pool-d.env
+python -P -m cascade.laned.cli elastic quote --role pool-d-builder
+python -P -m cascade.laned.cli elastic cycle --role pool-d-builder --dry-run
+python -P -m cascade.laned.cli elastic cycle --role pool-d-builder        # one build; the timer runs this
+python -P -m cascade.laned.cli elastic down  --role pool-d-builder
 
-cascade-laned elastic quote --role lane-d-eval-host --entries 5 --cohort B
-cascade-laned elastic up    --role lane-d-eval-host --entries 5 --cohort B
-cascade-laned elastic bootstrap --role lane-d-eval-host
-cascade-laned elastic run   --role lane-d-eval-host --block-hash H --king K \
+python -P -m cascade.laned.cli elastic quote --role lane-d-eval-host --entries 5 --cohort B
+python -P -m cascade.laned.cli elastic up    --role lane-d-eval-host --entries 5 --cohort B
+python -P -m cascade.laned.cli elastic bootstrap --role lane-d-eval-host
+python -P -m cascade.laned.cli elastic run   --role lane-d-eval-host --block-hash H --king K \
     --house HOUSE --entry-id E1 --entry-id E2 --out shards.json
-cascade-laned elastic down  --role lane-d-eval-host --cohort-done
+python -P -m cascade.laned.cli elastic down  --role lane-d-eval-host --cohort-done
 ```
 
 Exit codes: 3 `no_capacity`, 4 `price_cap`, 5 `monthly_cap`, 6 `gpu_refused`,
