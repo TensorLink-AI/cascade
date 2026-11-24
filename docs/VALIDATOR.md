@@ -197,8 +197,8 @@ python scripts/check_tls_trust.py   # same interpreter as the CLI
   --extra hippius --extra chain`.
 - **Don't skip the sync, even for a "small" release.** A release can move
   pinned dependencies. The 2026-11-25 launch release moves bittensor from
-  10.5 to 11.3.0, and the validator refuses to start on 10.5 (`bittensor
-  10.5.0 is installed but cascade needs the 11.x SDK`). `git pull` plus
+  10.5 to 11.3.0, and the validator refuses to start on 10.5 (error: "bittensor
+  10.5.0 is installed but … needs the 11.x SDK"). `git pull` plus
   restart without the sync is never a valid upgrade.
 
 - **Keep your state.** Restart from the same directory, so the validator
