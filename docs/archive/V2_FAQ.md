@@ -1,5 +1,7 @@
 # Cascade v2 FAQ
 
+> **Archived 2026-11-24.** Historical; not maintained. See [the archive index](README.md) for what replaces it.
+
 Answers to miners' questions about v2 (live on mainnet, netuid 91, since
 **2026-10-30**: commits opened 09:00 UTC, the first v2 era started at the
 first era boundary after 12:00 UTC, block 9,399,600). For what changes overall,
@@ -204,7 +206,7 @@ Every yield is `(32, L)`: deployed `[generator] min_channels =
 max_channels = 32`. The trainer never pads or merges channels, so a process
 with fewer channels must be packed into the 32 rows by your generator
 (optional `groups` labels say which rows belong together; see
-[INTERFACE.md](INTERFACE.md#pack-independent-groups-in-one-yield)). Each step
+[INTERFACE.md](../INTERFACE.md#pack-independent-groups-in-one-yield)). Each step
 trains 16 series × 32 channels at context 4096 (`[v2.training] batch_size =
 512` counted in sequences, 512 ÷ 32 = 16, in 8 micro-batches), for 23,841
 steps (≈ 50B points). Series longer than 4096 are cropped into random
@@ -223,7 +225,7 @@ folders (through 2026-08-03) are rebuilds, not byte mirrors. The latest
 revealed snapshot is `snapshots/2026-10-31-block-9388800` (3,841 series,
 sha256 `cb9b64d24f30fc41321058bb56583a60986a0a8e480bd5967962d21fe6896649`).
 Download and score instructions are in
-[MINER.md](MINER.md#3-verify-and-score-locally).
+[MINER.md](../MINER.md#3-verify-and-score-locally).
 
 It is an **evaluation** set: use it as held-out data for scoring, never as
 generator training data. The live private pool is newer and never revealed,
@@ -236,7 +238,7 @@ On mainnet the pool is built only from the
 (`tsbench_forge` source, via the bucket relay), labelled with the 7
 GIFT-Eval domains: `econ_fin`, `energy`, `healthcare`, `nature`, `sales`,
 `transport`, `web_cloudops`. Other sources the pool builder supports are not
-used on mainnet ([EVAL_POOL.md](EVAL_POOL.md#sources-shipped)).
+used on mainnet ([EVAL_POOL.md](../EVAL_POOL.md#sources-shipped)).
 
 ### What do `cascade score` and `cascade iterate` do, and not do?
 
@@ -252,7 +254,7 @@ used on mainnet ([EVAL_POOL.md](EVAL_POOL.md#sources-shipped)).
 - They score only on the pool you give them (`--pool-dir`, else `--pool`,
   else a small synthetic sample).
 - They do **not** run the public GIFT-Eval/BOOM/TIME/FEV benchmarks. Those
-  run in the separate `benchmarks/` sidecar ([benchmarks/README.md](../benchmarks/README.md)
+  run in the separate `benchmarks/` sidecar ([benchmarks/README.md](../../benchmarks/README.md)
   shows how to run it on a checkpoint). On mainnet the main validator runs
   them on its own GPU only for a private-pool winner, as a gate that can only
   block that win.
