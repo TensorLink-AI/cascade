@@ -53,6 +53,7 @@
       "description": "rev6.6: the variants armed at this settlement (ascending, a subset of params.contexts), present together with armed_evidence; absent on a settlement not handed the armed record."
     },
     "armed_evidence": {"$ref": "#/$defs/armed_evidence"},
+    "host": {"$ref": "#/$defs/host"},
     "extensions": {
       "type": "object",
       "description": "Open and never consensus: satellites must not read verdict, eligibility or weight inputs from it."
@@ -88,6 +89,20 @@
         "sources": {"type": "integer", "minimum": 0},
         "t7_fits": {"type": "boolean"},
         "armed": {"type": "boolean"}
+      }
+    },
+    "host": {
+      "type": "object",
+      "description": "rev6.18 B7: the eval host every forecast of this settlement was computed on (B6: one host per cohort): its scoring environment (deploy/laned/scoring_envs.toml name, qualified at this boundary), GPU model and driver (nvidia-smi), torch build ('<torch.__version__>/cuda-<torch.version.cuda>'), fingerprint (sha256 of the GPU UUID) and identity (the B6 host identity: sha256 over the five, cascade.shared.config.lane_d.host_identity). Absent on a settlement not handed the host record.",
+      "required": ["env", "gpu_model", "driver", "torch_build", "fingerprint", "identity"],
+      "additionalProperties": false,
+      "properties": {
+        "env": {"type": "string", "minLength": 1},
+        "gpu_model": {"type": "string", "minLength": 1},
+        "driver": {"type": "string", "minLength": 1},
+        "torch_build": {"type": "string", "minLength": 1},
+        "fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "identity": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
       }
     },
     "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},

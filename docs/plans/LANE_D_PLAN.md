@@ -1,6 +1,6 @@
 # Plan: lane D "open weights" (anything goes on our architecture), with lane E and lane A flexibility — v3
 
-Status: **PLAN v3, ~~rev6.12~~ ~~rev6.14~~ ~~rev6.15~~ ~~rev6.16~~ ~~rev6.17~~ ~~rev6.18~~ ~~rev6.20~~ rev6.21, rev6.22, rev6.23, rev6.24, rev6.25 (proposed 2026-11-22; ~~rev6.12~~ ~~rev6.14~~ ~~rev6.15~~ ~~rev6.16~~ ~~rev6.17~~ rev6.18 2026-11-23; rev6.20, rev6.21, rev6.22, rev6.23, rev6.24, rev6.25 2026-11-24)**: v2's design, made buildable by an
+Status: **PLAN v3, ~~rev6.12~~ ~~rev6.14~~ ~~rev6.15~~ ~~rev6.16~~ ~~rev6.17~~ ~~rev6.18~~ ~~rev6.20~~ rev6.19, rev6.21, rev6.22, rev6.23, rev6.24, rev6.25 (proposed 2026-11-22; ~~rev6.12~~ ~~rev6.14~~ ~~rev6.15~~ ~~rev6.16~~ ~~rev6.17~~ rev6.18 2026-11-23; rev6.19, rev6.20, rev6.21, rev6.22, rev6.23, rev6.24, rev6.25 2026-11-24)**: v2's design, made buildable by an
 autonomous loop. A work package is done **only when its Accept command exits
 0**; **(rev6)** its level is only what `scripts/laned/status` computes (§17),
 never a claim. Owner decisions are marked **[DECIDE]**. Nothing is armed. **No calendar
@@ -45,9 +45,10 @@ standard pool and the judge reads either form with byte-identical windows.
 Today no other lane C competition exists in code (the DEC-CA-0056
 `domain:`/`freq:`/`horizon:` kinds are retired as not forward-only; "energy"
 is a lane B domain). An energy lane C competition is a builder job emitting a
-standard pool + a spec — once the generic runner (W-CMP2) can host a second
-competition. Domain metrics (liquidity / range ...) stay registry blocks over
-the channels the spec's pool carries.
+standard pool + a spec, hosted by the multi-instance runner (f). Domain
+metrics (liquidity / range ...) stay registry blocks over the channels the
+spec's pool carries (`channels` maps a metric channel to the pool's, e.g.
+`{close = "load"}`).
 
 **(c) Embargo.** The trainer records `embargo_days` / `embargo_eval_days` at
 DISPATCH in the signed leg record; draw / scan / verdict / audit use the
@@ -66,14 +67,38 @@ non-default curve is recorded on the win; the audit re-derives it.
 sha256 against the pin before parsing, fail closed (`HashsetMismatch`, 503).
 Amends rev5's release-only pin (WB10 tests corrected).
 
+**(f) Multi-instance runner (W-CMP2; owner 2026-11-24: "build W-CMP2 for
+THIS release").** The `marketcast` runner hosts N specs at once. `mkt` is its
+legacy instance (`[marketcast]`, `mkt_reports`, `mkt_backlog`, report key
+`marketcast/round-<R>.json` — byte-identical, pinned with an instance
+configured beside it). Any other id is a spec INSTANCE with its own kind and
+targets `<id>:<name>`, legs, rows, report (`marketcast/<id>/round-<R>.json`,
+arbitrated by `reports[<id>]` in the lane-C manifest), verdicts, slots,
+payouts (its competition weight) and audit (`check_marketcast(kind=<id>)`).
+An instance spec must name its pool, metrics, universe, timeframes, horizons
+and `from_block` (an era boundary at or after `[lane_c] from_block`, never
+before the overlay's apply block); it inherits the deployed `[marketcast]`
+model pins, recipe bounds and verdict statistics. Its classes are its pool's
+`class` tags (any label; no market feed). The standard pool of ANY builder is
+projected generically (grid step → bank: 1 m bars, 5 m / 15 m native, 1 h
+coarse; `class` / `asset` tags; channels renamed by the spec). The trainer
+relays the instance's pool snapshot to the pod (one presigned link + its
+sha256); the pod clips it to the recipe's range before the dispatch. Lane-C
+pods must run a worker image built from this release to train an instance
+leg (the image changes only at a seed-epoch boundary, W-IMG); validators need
+nothing further. Not in this release: joint `maxt` for lanes B / C, the pool_d
+/ lane A projections (no lane C competition reads them).
+
 **Consensus.** One release to all validators, satellites and the trainer;
-nothing changes until an overlay selects something. After it, specs, menu
-choices, embargo and hash-set pins are overlay data. A new block is a release.
+nothing changes until an overlay selects something. After it, specs (new
+competitions included), menu choices, embargo and hash-set pins are overlay
+data. A new block (metric, family, curve, schema version, runner) is a
+release; a new data source is a builder job, never a release.
 
 | WP | What | Keys / fields | Depends | Runs in | Accept |
 |---|---|---|---|---|---|
 | W-CMP | **(rev6.25)** `std_pool` (schema, writer, reader, MarketCast projection + builder); `competition_spec` (registry, parse with typed refusals, bounds, compile onto MarketCast, `marketcast_spec`); `rules_menu` wired into lanes B / C / D and the audit; per-leg embargo record; hash set by content hash + key with fetch-verify and intake reload | (a)–(e) | W-OV | ci | `scripts/laned/accept W-CMP` |
-| W-CMP2 | **(rev6.25, plan only)** generic runner: a second concurrent lane C competition on a standard pool (per-instance judge / legs / reports / audit), `maxt` for lanes B and C, the pool_d / lane A pool projections | (a), (b), (d) | W-CMP | ci + testnet | `scripts/laned/accept W-CMP2` |
+| W-CMP2 | **(rev6.25, DECIDED owner 2026-11-24: this release)** multi-instance runner (f): spec instances with their own kind / targets / legs / rows / reports / verdicts / slots / payouts / audit; generic standard-pool projection with channel map; trainer pool relay + pod clip; `mkt` byte-identical. Out: joint `maxt` for B / C, pool_d / lane A projections | (a), (b), (f) | W-CMP | ci + testnet | `scripts/laned/accept W-CMP2` |
 
 ## rev6.24 (owner 2026-11-24; main @ ce27dfb): competition tweaks by signed overlay, with a code envelope
 
@@ -818,6 +843,108 @@ no key to type: lane B gets the rule when lane B rolls out.
 |---|---|---|
 | (a) | Lane B legs: no cooldown, scored = σ 0.10 power EMA, ~~behind `[lane_b] ema_no_cooldown_from_block`~~ **(rev6.20b) for every lane B leg** | §8 W-EMA (lane B struck), W-EMA row, §3.2 lane B bullet, §12b.0, D44 note |
 | (b) | Feature PR WPs: W-EMA (`pyramid_trainer.py`, `worker.py` ride-along), WB10 (key), WB22 (`expert_manifest.py`, `lane_b_driver.py`), WB23 (`validator/expert_lane.py`), W9 (`LANE_B_STAGES`) | §3 |
+
+## rev6.19 (owner 2026-11-24; main @ 052eabef): lane B suite-target gain test — improve EITHER CRPS OR MASE
+
+One owner decision for lane B (§12b, DEC-CA-0071 and its rev4 amendment).
+It is recorded here and in DEC-CA-0071 "Amendment rev6.19", not as a §17.4
+register row: W0 requires DEC-CA-0070 (lane D) to carry every register row,
+and this is a lane B rule. Plan text and the DEC-CA-0071 record only; the code
+lands as one feature PR (rev6.19 (F) below). Lane A, lane C and lane D are
+untouched. Superseded text is struck, not deleted.
+
+**Owner decision (2026-11-24, DECIDED).** The target-suite gain test becomes
+"improve EITHER CRPS OR MASE by ≥ 1% on the targeted public suite".
+
+### rev6.19 (G) The gain test, as built
+
+For a suite target `suite:<s>` (`s` ∈ gift, boom, time, fev), on the whole
+suite's paired per-item scores (`<s>_crps`, `<s>_mase`, each
+`paired_geomean_lcb` over items), against the current king:
+
+1. **Either metric clears the bar.** CRPS `LCB_{α'}(rel) ≥
+   gain_margin_public` OR MASE `LCB_{α'}(rel) ≥ gain_margin_public`
+   (`gain_margin_public` = 0.01, i.e. ≥ 1%), with `α' = α / (2k)` for a leg
+   declaring k targets.
+2. **Positive point gain** on at least one metric that cleared (1). A metric
+   whose LCB clears but whose point gain is ≤ 0 does not count as cleared.
+3. **The other metric is non-inferior** (the orchestrator's conservative
+   reading of the owner's rule, stated here so it is reviewable): the metric
+   that did not clear may not get worse beyond the existing non-inferiority
+   bound, `LCB_α(rel) ≥ −tau_public` (0.01), at the guard level α
+   (intersection-union, no correction — the same rule today's text applies
+   to MASE). When both metrics clear, (3) holds trivially (an `α'` LCB ≥ 0.01
+   implies the α LCB ≥ 0.01 > −tau on the same bootstrap draws).
+4. **Evidence floor unchanged:** at least `min_public_items` items, else
+   `inconclusive`, never a merge.
+
+**Multiple testing: Bonferroni α/2 per metric.** Two metrics are tested for
+superiority and either may win, so the gain family is split. Bonferroni is
+the choice consistent with the existing lane B code: `judge_expert_targets`
+already splits α across a leg's own targets by Bonferroni (`alpha / k`,
+`cascade/eval/expert_lane.py:284`), and lane B has no joint max-T across
+metrics (the only max-T, `cohort_maxt_lcbs`, `cascade/eval/bootstrap.py:393`,
+is lane D's cohort statistic). The two corrections compose: α/(2k). Each
+metric keeps its own bootstrap sub-seed (`<seed>|gain|<target>|crps`,
+`…|mase`), so the verdict stays deterministic and re-derivable.
+**(rev6.22, on merge)** Superseded for lane B once rev6.22's
+`judge_expert_slots` lands: every slot is tested in two studentised max-T
+families (declared, undeclared) across both metrics, and WB26's
+`gain_margin_public` maps to the declared bar for suite slots (rev6.22 "Suite
+slots and WB26"). Whichever of WB26 / rev6.22 lands second rebases onto the
+other.
+
+**Unchanged.** Every regression guard stays as DEC-CA-0071 §3 states it:
+every other public suite (CRPS and MASE each `LCB ≥ −tau_public`), every
+private-pool domain (`_rest` pooling), every horizon, the whole-pool point
+gain ≥ 0 (guard 4), and the fixed anchor king (guard 5). Domain and horizon
+targets keep today's single-statistic gain test.
+
+**Report fields (signed, re-derived).** Per suite target: `cleared_metric`
+(`crps` | `mase` | `both` | none), `crps_lcb` and `mase_lcb` (both at α'),
+`crps_gain` and `mase_gain` (point estimates), `noninf_metric` and
+`noninf_lcb` (the non-cleared metric's α LCB), and `gain_alpha` (= α').
+**Full-pay tier input:** ~~(orchestrator default, owner may override) the
+win's `gain_lcb` (the `full_pay` tier input) is the larger α' LCB among the
+metrics that cleared.~~ **(orchestrator 2026-11-24)** the win's `gain_lcb`
+(`target_lcb`, the `full_pay` tier input) is the SMALLER α′ LCB among the
+metrics that cleared (conservative).
+
+### rev6.19 (V) Verification against main @ 052eabef
+
+- `judge_expert_targets` (`cascade/eval/expert_lane.py:249`) has **no suite
+  branch yet**: `_target_mask` handles a pool domain or `horizon:<h>` only,
+  so a `suite:<s>` target finds zero windows and is `inconclusive`. There is
+  no `gain_margin_public` parameter in `ExpertLaneParams` or the lane B
+  loader, and no guard 4 / anchor guard. DEC-CA-0071 "Shipped: Nothing"
+  still holds for the judging side. The "today's rule" text (CRPS
+  superiority AND MASE non-inferior) is the plan/DEC design, not code.
+- No §3 WP row owns the suite-target judging branch (WB10–WB25 cover keys,
+  contamination, rows, opening rule, sentinel deferral, GPUs and leg
+  length; WB18 defers a sentinel suite target but does not judge one).
+- Nothing re-derives a lane B suite-target verdict yet (`check_lane_b`,
+  `cascade/audit/checks.py:3273`, checks weights and full-pay records).
+
+### rev6.19 (F) Feature build
+
+- ~~**One feature PR**, under the WP that builds the suite-target branch of
+  `judge_expert_targets` (with `gain_margin_public`, guard 4 and the anchor
+  guard): tests (`tests/accept/<wp>/`) and code together, the (G) report
+  fields, and `check_lane_b` re-deriving the either-metric verdict from the
+  signed per-item scores. **Owner input:** that WP has no row yet (see (V));
+  the orchestrator assigns one before the feature PR opens.~~ **(rev6.19,
+  orchestrator 2026-11-24)** assigned: **WB26 "lane B suite-target
+  judging"** (§3 lane B table; SB1 build set, §5 row 12c). One feature PR
+  labelled `laned:WB26`: `tests/accept/wb26/` (PATHS riding along) and the
+  code. `[lane_b] suite_targets` stays false until SB3/SB5 (§12b.1).
+- **Full-pay tier input (orchestrator 2026-11-24, supersedes the (G)
+  default):** the SMALLER α′ LCB among the cleared metrics (conservative).
+- **(rev6.22, orchestrator 2026-11-24)** WB26 builds on rev6.22's
+  `judge_expert_slots` (CRPS-or-MASE in two max-T families, `gain_margin`
+  declared bar): it adds only guard 4, the anchor guard, their report and
+  audit fields, the `tau_anchor_*` keys and the trainer's anchor rows (WB26
+  row). The (G) α/(2k) split, `gain_margin_public` and the full-pay input
+  above are superseded (rev6.22 retires the tiers).
 
 ## rev6.18 (owner 2026-11-23; main @ 78b1d45): eval v2 (live 50% + public 50%), multivariate, one checker, burn scoping, GPU environments
 
@@ -4326,6 +4453,7 @@ Every new `[lane_b]` key below ships with:
 | WB23 | **(rev5)** Miner-chosen leg length (D42, D42b): `train_hours` on the funding request (0.5–`max_leg_hours`, 0.5 h steps); steps fixed at admission and signed in the leg record; guard = `train_hours × guard_factor` + overhead, capped at `[lane_b] max_leg_seconds` (lane B contract derivation; `[training] max_train_seconds` untouched); expected landing boundary returned to the miner; validator check of recorded steps and guard | keys `max_leg_hours`, `max_leg_seconds`, `guard_factor`; `status/lane_b.json` shows steps, GPU and landing boundary | WB10, WB22 | ci | `scripts/laned/accept WB23` (TB25–TB27) |
 | WB24 | **(rev6.22)** `--target` is repeatable (any configured target; cap `max_domains_per_leg`). **(rev6.3, proposed)** Lane B miner CLI. Today `cascade lane-b fund` / `lane-b status` (`cascade/miner/lane_b.py`) do not send the declared-rows header, so the WB20 docs have miners hand-build that request. `cascade lane-b fund` gains `--declared-rows <file>` (builds and signs the WB14 `X-Lane-B-Declared-Rows` header and its signed `rows=` tag; refuses locally with the same `DECLARED_ROWS_CODES` the intake uses), `--target suite:<s>` (suite targets, WB18) and `--train-hours` (WB23, once built). `cascade lane-b status` shows the new deferral and refusal reasons (`rows_held`, `sentinel_target`, the `gate_closed_reason` values, the WB13 contamination codes incl. `contamination_budget_exceeded`) from `status/lane_b.json` and the intake replies. New `cascade lane-b verify-repo <dir>` runs the WB13 scan (`scan_repo`) locally against the pinned hash set (no upload; never executes the repo) so a miner can check before funding. Never prints keys; unarmed defaults unchanged | CLI flags `--declared-rows`, `--target suite:<s>`, `--train-hours`; subcommand `verify-repo` | WB13, WB14, WB15, WB17, WB18 (WB23 for `--train-hours`) | ci | `scripts/laned/accept WB24` |
 | WB25 | **(rev6.8, owner 2026-11-23)** Multi-GPU lane B expert legs. Today `train_pyramid` (`cascade/trainer/pyramid_trainer.py`) forces `world = 1` for an expert-slice leg (`gang_size(trainer.device) if slices is None else 1`), so a lane B leg trains on GPU0 of an 8× pod (WB19 on 8×H200: 0.055 steps/s, the same as an RTX 4090). WB25 trains lane B expert legs on every GPU of the rented layout through the existing `pyramid_dp` `Gang` (micro-batches dealt round-robin, sums all-reduced, rank 0 owns the corpus and the optimizer), extended for `ExpertSlices`: the helper ranks hold the same compact selected-row leaves; the optimizer sharding and the gradient all-reduce cover only the trainable (selected) expert rows; the router and the routing bias stay frozen (WB16, D40 option a). The leg is identical to the 1-GPU leg up to floating-point summation order, and frozen tensors and unselected rows are exactly the king's. The leg record keeps the GPU count (`gpu_n`; WB22's audit re-derivation is pinned to the recorded `gpu_n`); `CASCADE_TRAIN_GPUS` may lower it. Lane A legs (no slices) are byte-for-byte unchanged and keep the same Gang path. No dependency, `[training]` or contract-digest change | leg metric `gpu_n` | WB16, WB19 | ci + pod | `scripts/laned/accept WB25` |
+| WB26 | **(rev6.19, orchestrator-assigned 2026-11-24)** Lane B suite-target judging (DEC-CA-0071 §2-§3 + Amendment rev6.19). **(rev6.22, orchestrator 2026-11-24) Scope narrowed: WB26 builds ON rev6.22's `judge_expert_slots` (#854), which already judges suite slots CRPS-or-MASE in the declared (`gain_margin`) / undeclared (`undeclared_gain_margin`) max-T families; its bars and families are unchanged. WB26 adds only: guard 4 and the anchor guard, gating every CLEARED suite slot (the anchor guard reuses the `judge_expert_targets` guard engine with the anchor as baseline, at `tau_anchor_domain` / `tau_anchor_public`; the anchor is scored only when a suite slot clears); the `suite_guards` report record and its `check_lane_b` re-derivation; the two `tau_anchor_*` keys; and the trainer attaching `public_rows["anchor"]` to suite-target legs with the self-judge guarded against the same anchor. `gain_margin_public`, the α/(2k) split and the smaller-LCB full-pay input are dropped (rev6.22 pays until replaced, no tier). Items (1), (4)–(5) below are superseded where they conflict.** (1) **`suite:<s>` branch** in `judge_expert_targets` (`cascade/eval/expert_lane.py`): the rev6.19 (G) either-metric gain test on the whole suite's paired `<s>_crps` / `<s>_mase` items (CRPS OR MASE `LCB_{α/(2k)} ≥ gain_margin_public` with a positive point gain; the non-cleared metric `LCB_α ≥ −tau_public`; fewer than `min_public_items` items ⇒ `inconclusive: items`); the target suite's own keys are never also public guards. (2) **Guard 4** for a leg declaring any suite target: whole-pool point gain (`paired_point_rel` over every window) ≥ 0. (3) **Anchor guard** for the same legs: guards 1-3 (every undeclared pool domain with `_rest` pooling, every undeclared horizon target, every other suite's public metric) re-run against the anchor king at `tau_anchor_domain` / `tau_anchor_public` (default 0.0). The anchor is the era's promotion member, derived by the validator from the signed training manifest (`warm_start_base` when `warm_start_merges` is set, else `warm_start_ckpt`; never moved by a lane B merge); its private-pool scores are scored on the round's windows, its public rows are `ExpertEntry.public_rows["anchor"]`; no anchor or no anchor rows ⇒ the leg's guards fail (`anchor_missing`), fail-closed. Guards 4 and anchor run ONCE per leg with the other guards. (4) **Keys** `gain_margin_public` (0.01), `tau_anchor_public` (0.0), `tau_anchor_domain` (0.0): loader parse, range checks, `ExpertLaneParams` + `verdict_params`, overlay-settable (`ALLOWED["lane_b"] = None`), round-trip + mutation tests, shipped files at defaults. (5) **Report**: per suite-target row `suite_gain` {`cleared_metric`, `crps_lcb`, `mase_lcb`, `crps_gain`, `mase_gain`, `noninf_metric`, `noninf_lcb`, `gain_alpha`, `n_items`} and per leg `suite_guards` {`pool_gain`, `anchor_pointer`, `anchor_guard_lcbs`, `anchor_public_lcbs`}; `target_lcb` (the full-pay tier input) = the SMALLER α′ LCB among the cleared metrics (orchestrator 2026-11-24). (6) **`check_lane_b`** (`cascade/audit/checks.py`) re-derives every suite-target row from those fields (cleared metric, non-inferiority, guard 4, anchor bars, `gain_alpha = alpha/(2k)`, `target_lcb`, passed) and includes `suite_guards` in the guards-run-once signature. Unarmed (`suite_targets = false`): no suite slot exists, every receipt, verdict row and weight vector is byte-identical. Out of scope: the trainer attaching `public_rows["anchor"]` (a bench pass of the anchor, follow-up; until it lands a suite target cannot win) | config `gain_margin_public`, `tau_anchor_public`, `tau_anchor_domain`; receipt row `suite_gain`, `suite_guards` | WB10, WB18, W-S2 | ci | `scripts/laned/accept WB26` |
 | W-EMA | **(rev5)** Score the raw cooled endpoint on every leg (lanes A and B **(rev6.20b: lane A only; every lane B leg trains with no cooldown and scores the σ 0.10 power EMA, recorded as the expert entry's `scored_weights`, no activation key)**): `power_ema_active` → raw for warm-start legs; keep writing `weights_ema005`/`weights_ema010` unscored; main-validator EMA telemetry off the critical path (§8). Blocks every repin ≥ rc16 and D40(b) | worker image (`pyramid_trainer.py`) | — | ci + testnet | `scripts/laned/accept W-EMA` |
 | WB20 | **(rev6.22)** + MINER.md slot rule and the regenerated reward reference blocks. Lane B docs (MINER, INTERFACE, AGENT_MINING, VALIDATOR) | — | WB13–WB18 | ci | `scripts/laned/accept WB20` |
 | WB21 | DEC-CA-0071 amendment (this PR drafts it; owner accepts) | — | — | ci + owner | `scripts/laned/accept WB21` |
@@ -4660,7 +4788,7 @@ capability release → (rev5) one activation block, live everywhere.**
 | 11 | **(rev5) S6 Activate (no shadow, D45)** | **D19 (rev5):** the owner-run test entries run on **testnet** (S3), not in a mainnet shadow. Overlay seq N, **one overlay**: `[lane_d] from_block` at a far era boundary **with `share = 0.25` (rev5, D1) and `takes_from = "lane_a"`**, all lane A keys **byte-identical** to seq N-1 (no lane A tuning in a lane D overlay, ever). ~~share = 0 shadow~~ | **Observed** `cfg-` stake ≥ 2/3 (incl. the largest holder, 5E2LP6 at about 49%) at a boundary before `effective_block`. That's the only stake-weighted proof of upgrade, because only nodes on the capability release can verify a `[lane_d]` overlay. Else publish seq N+1 with a later block. Webhook test alert delivered. Keep-alive live. **(rev5)** All §4 T-rows green on testnet before the block is announced. From the block: lane D live and paid everywhere; first paid settlement's vectors match on ≥ 2 validators, satellite replay matches, `check_lane_d` passes |
 | 12 | ~~S6b Pay~~ **(rev5) merged into S6 (D45)** | — | — |
 | 12b | **(rev5) NOT PLANNED.** ~~(rev3) S6c Lane B~~ (rev4: superseded by the SB track below; it was for the parked §12 variant) | ~~Overlay: `[lane_b] from_block` at an era boundary (shadow first: `[lane_b] share = 0` for ≥ 2 eras, then the D1 split)~~ **(rev6)** struck: no shadow (D45); lane B arms at SB5 | ~~TB1–TB8 passed in S3; ≥ 2 eras of valid lane B reports at share 0 with satellite replay matching; then first paid settlement's vectors match on ≥ 2 validators~~ |
-| 12c | **(rev4) Lane B track SB0–SB5** (runs in parallel with lane D's S2–S3; depends on **S0a–S0c** de-drift, note budget and overlay bring-up, and on the shared S5 capability release) | **SB0** decide D35–D42, D42b · **SB1** build WB10–WB18, **(rev5)** WB22–WB23, W-S1–W-S2 · **SB2** WB19 measurement per GPU type (owner pod yes) · **SB3** testnet: TB10–TB27 (rev5), TS1–TS5, contamination check passing · **SB4** capability release (shared S5) · **SB5 (rev5, D45)** one overlay, once the D41 gate rule is satisfied and SB3 has passed (LB1): `[lane_b] from_block` with full share and `suite_targets` together, live everywhere at that block; no `share = 0` period. **(rev5)** If D40(b) is chosen: an image repin step (EMA constant fixed first; repin outside a seed epoch; moves lane A too) before SB3 | SB3 green including LB1's contamination check; **(rev5)** from the SB5 block, lane B live everywhere: first paid settlement's vectors match on ≥ 2 validators and satellite replay matches; gate-open evidence recorded |
+| 12c | **(rev4) Lane B track SB0–SB5** (runs in parallel with lane D's S2–S3; depends on **S0a–S0c** de-drift, note budget and overlay bring-up, and on the shared S5 capability release) | **SB0** decide D35–D42, D42b · **SB1** build WB10–WB18, **(rev5)** WB22–WB23, W-S1–W-S2, **(rev6.19)** WB26 · **SB2** WB19 measurement per GPU type (owner pod yes) · **SB3** testnet: TB10–TB27 (rev5), TS1–TS5, contamination check passing · **SB4** capability release (shared S5) · **SB5 (rev5, D45)** one overlay, once the D41 gate rule is satisfied and SB3 has passed (LB1): `[lane_b] from_block` with full share and `suite_targets` together, live everywhere at that block; no `share = 0` period. **(rev5)** If D40(b) is chosen: an image repin step (EMA constant fixed first; repin outside a seed epoch; moves lane A too) before SB3 | SB3 green including LB1's contamination check; **(rev5)** from the SB5 block, lane B live everywhere: first paid settlement's vectors match on ≥ 2 validators and satellite replay matches; gate-open evidence recorded |
 | 13 | **S7 Operate** | §10.4 runbook; §10.7 checks; revert overlay stays staged | No pending past its latency expectation without progress; first crowning (reported immediately, with seated and judged counts) or a house hold observed end-to-end |
 | 14 | **(rev3) S8 Long context** | W6-S8; rent valeval-laned (96 GB pinned torch) with owner yes; T7 at 32k/64k/128k; ~~then an overlay adds the passing variants to `contexts` (D10)~~ **(rev6.6:** no overlay: 32k–128k are in `contexts` from launch and each arms automatically when its gates pass, §1.1**)** | Each ~~added~~ **(rev6.6)** armed variant: T7 inside the settlement budget, W1 `min_long_series` met~~, overlay adopted ≥ 51%~~ |
 
@@ -5155,8 +5283,17 @@ The rules below are recorded in the DEC-CA-0071 amendment
 
 ### 12b.0 What carries over unchanged from DEC-CA-0071
 
-- **Gain test:** CRPS `LCB_α ≥ gain_margin_public` (0.01) on the whole suite;
-  MASE non-inferior; at least `min_public_items` items.
+- **Gain test:** ~~CRPS `LCB_α ≥ gain_margin_public` (0.01) on the whole suite;
+  MASE non-inferior; at least `min_public_items` items.~~ **(rev6.19, owner
+  2026-11-24)** improve EITHER CRPS OR MASE by ≥ 1% on the whole targeted
+  suite: CRPS `LCB_{α/2} ≥ gain_margin_public` (0.01) OR MASE
+  `LCB_{α/2} ≥ gain_margin_public` (Bonferroni α/2 per metric, on top of
+  the leg's α/k), a strictly positive point gain on a metric that cleared,
+  and the metric that did not clear non-inferior (`LCB_α ≥ −tau_public`);
+  at least `min_public_items` items. Full rule in rev6.19 (G). **(rev6.22,
+  on merge)** the multiplicity (α/(2k)) is replaced by rev6.22's declared /
+  undeclared max-T families once `judge_expert_slots` lands; WB26's
+  `gain_margin_public` is the declared bar for suite slots.
 - **Guards:** every other suite, every pool domain, every horizon; the
   whole-pool point gain must be ≥ 0 (guard 4); the fixed anchor king (guard
   5).
@@ -5907,7 +6044,6 @@ script parses this table on main; it changes only by an owner-merged plan PR.
 | D46 | decided | (a) house dated by its lineage | S | owner, 2026-11-21 |
 | D47 | decided | (a) score the house as a BF16 cast; dedup against BF16 casts | S | owner (default), 2026-11-21 |
 | D48 | decided | Fixed 25% shares of the total; lane D takes from lane A's 25% | S | owner, 2026-11-21 |
-
 **No decision is open, so no WP is blocked on a decision.** Proposed change 22
 asks the owner to confirm the five §15 rows recorded from "all other recs".
 

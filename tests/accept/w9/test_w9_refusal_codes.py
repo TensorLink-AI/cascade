@@ -35,6 +35,8 @@ PLAN_TABLE = {
     "ld_clock": "alert", "ld_embargo": "alert", "ld_draw": "alert",
     "ld_judged_set": "alert", "ld_chain": "alert", "ld_snapshot": "alert",
     "ld_public_index": "alert", "ld_bench": "alert",
+    # rev6.18 B5/B7 (F5): the signed scoring host (not a pay-stopping check).
+    "ld_host": "alert",
 }
 
 

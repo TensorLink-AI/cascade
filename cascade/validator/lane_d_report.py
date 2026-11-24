@@ -691,10 +691,24 @@ def _check_public(report: dict) -> None:
                                     "dropped windows not unique, sorted and drawn")
 
 
+def _check_host(report: dict) -> None:
+    """rev6.18 B7: a ``host`` record's ``identity`` hashes its other
+    fields (whether its env is qualified is the audit's check: it depends on
+    the boundary and the committed environment list)."""
+    if "host" not in report:
+        return
+    from ..shared.config.lane_d import host_record_problem
+
+    why = host_record_problem(report["host"])
+    if why:
+        raise ReportSchemaError("bad_value", "host", why)
+
+
 def _cross_field(report: dict) -> None:
     """The rules between fields, run after every structural check passes."""
     _check_public(report)
     _check_armed(report)
+    _check_host(report)
     _check_below_armed(report)
     _check_judging_start(report)
     _check_windows_embargo(report)

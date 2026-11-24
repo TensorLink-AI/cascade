@@ -113,7 +113,8 @@ class LaneBMixin:
             era_blocks=eb, cfg=self.cfg.lane_b, uid_of=uid_of))
         pay = {"block": int(block), "era_blocks": int(eb),
                "wins": lane_b_payouts(st, block=block, era_blocks=eb, cfg=self.cfg.lane_b,
-                                      n_uids=n_uids, uid_of=uid_of)}
+                                      n_uids=n_uids, uid_of=uid_of,
+                                      round_cfg=self.cfg.round)}
         lc = getattr(self.cfg, "lane_c", None)
         if lc is not None and lc.active(block):
             # Record B's actual allocation under C's configured funding
@@ -247,11 +248,24 @@ class LaneBMixin:
                 cfg=self.cfg.lane_b, seed=str(base_seed),
                 # DEC-CA-0050 merge guards: refuse a non-finite expert delta
                 strict=self.cfg.lane_b.merge_guard_at_settlement(block),
+                # WB23 (TB27): the contract a lane B leg derives from, for the
+                # consensus check of a recorded leg length
+                contract=self._lane_b_leg_base_contract(block),
                 **sentinel_kw,
             )
         except Exception as e:  # noqa: BLE001 — fetch/eval failure: retried, never a verdict
             raise LaneBTransient(f"judging {rid} failed: {type(e).__name__}: {e}") from e
         return _LaneBRound(rid, block, judgements_record(js), js)
+
+    def _lane_b_leg_base_contract(self, block: int):
+        """WB23: the throne contract at the settlement's contract block — what
+        the trainer derives a lane B leg from (``throne_contracts_at``)."""
+        from ..shared.era import settlement_contract_block
+
+        throne = getattr(self.cfg, "throne_contracts_at", None)
+        if throne is None:   # a config without a throne schedule (unit stubs)
+            return None
+        return throne(settlement_contract_block(self.cfg.round, int(block)))[0]
 
     def _lane_b_sentinel_kw(self, manifest: TrainingManifest) -> dict:
         """W-S2 (LANE_D_PLAN §16 rule 2, D35): ``{"sentinel": suite}`` for a
@@ -374,16 +388,13 @@ class LaneBMixin:
                     qualify_only = self.cfg.lane_b.acceptance_at_settlement(r.block)
                     wins = apply_judgements(st, r.judgements, round_id=r.round_id,
                                             settle_block=r.block,
-                                            tiers=self.cfg.lane_b.full_pay_tiers,
                                             qualify_only=qualify_only)
                 for merge, accepted, block in r.acceptances:
                     st.accept(merge, accepted, block)
                 for w in wins:
-                    log.info("lane B: %s %s for domain %s (round %s, LCB %.4f, tier %s "
-                             "=> %d full eras%s)", w.hotkey[:8],
-                             "qualified" if qualify_only else "merged", w.domain, r.round_id,
-                             w.target_lcb, w.tier, w.full_eras,
-                             ", BELOW the lowest tier" if w.below_floor else "")
+                    log.info("lane B: %s %s for domain %s (round %s, LCB %.4f)",
+                             w.hotkey[:8], "qualified" if qualify_only else "merged",
+                             w.domain, r.round_id, w.target_lcb)
             st.mark_applied(r.round_id, r.block)
         self._persist_lane_b()
         return list(rounds[-1].rows)
@@ -425,7 +436,6 @@ class LaneBMixin:
                 return
             r = self._lane_b_judge_round(m)
             apply_judgements(st, r.judgements, round_id=r.round_id, settle_block=r.block,
-                             tiers=self.cfg.lane_b.full_pay_tiers,
                              qualify_only=self.cfg.lane_b.acceptance_at_settlement(r.block))
             for merge, accepted, block in r.acceptances:
                 st.accept(merge, accepted, block)

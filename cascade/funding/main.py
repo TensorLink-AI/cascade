@@ -57,6 +57,19 @@ def ledger_pod_live(ledger_path: Path):
     return live
 
 
+def _lane_b_base_contract(cfg):
+    """WB23: the throne contract at ``[v2] from_block`` (what a lane B leg
+    derives from), or None without a config / throne schedule."""
+    if cfg is None or getattr(cfg, "throne_contracts_at", None) is None:
+        return None
+    try:
+        return cfg.throne_contracts_at(int(cfg.training.v2_from_block))[0]
+    except (AttributeError, IndexError, TypeError, ValueError) as e:
+        log.warning("lane B base contract unavailable (%s): train_hours steps uncapped "
+                    "at the intake (the trainer still clamps)", e)
+        return None
+
+
 def gpu_catalogs(cfg, *, env=None):
     """``(lane A GpuCatalog, lane B LaneBGpus)`` of the production intake.
 
@@ -744,6 +757,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         lane_c_closed=lane_c_closed,
         gpu_catalog=gpu_catalog,
         lane_b_gpus=lane_b_gpus,
+        # WB23: the reference steps of the lane B base contract cap the steps
+        # a train_hours fund fixes (the validator's consensus cap). The lane B
+        # queue itself is wired by ``lanes.apply`` (EffectiveLanes, #874).
+        lane_b_contract=_lane_b_base_contract(cfg),
         resolve_lane_b_reveal=lane_b_resolver,
         lane_b_cfg=lane_b_cfg,
         lane_b_hashset=lane_b_hashset,

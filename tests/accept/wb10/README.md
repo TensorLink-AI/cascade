@@ -161,3 +161,22 @@ No `tests/unit` file pins behaviour WB10 changes:
   release-only tuple doesn't break it.
 
 None is listed in `PATHS`.
+
+## rev6.22: the lane B slot rule (`test_wb10_lane_b_slots.py`)
+
+Owner 2026-11-24 (final): lane B is not rolled out, so there is no
+activation key. **Pay:** a held slot pays its full share every settlement,
+no decay, no TTL, until a newer merge takes it; empty slots burn. The four
+decay / TTL keys are in `RETIRED_KEYS["lane_b"]`: the shipped files drop
+them, and an older file carrying them loads to the same `LaneBConfig`.
+**Testing** (`judge_expert_slots`): every judged leg is tested on every
+slot; declared targets (`max_domains_per_leg` = 4) form one max-T family at
+`gain_margin`, every other slot a second max-T family at
+`undeclared_gain_margin` (0.02, validated `>= gain_margin`, overlay-settable).
+A slot clears on CRPS or MASE with the other metric non-inferior and every
+guard holding; each cleared slot is claimable, so one miner may hold every
+slot. The declared family's LCBs do not depend on the undeclared slots.
+Payouts, the take-all case, the replacement rule (only a newer accepted
+merge moves a slot) and inconclusive suites are pinned. PATHS gain the judge,
+validator rows, acceptance, the trainer call site, `v2_status.py` and the
+unit tests that pinned the retired rule.

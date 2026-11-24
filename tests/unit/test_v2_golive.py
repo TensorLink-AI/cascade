@@ -86,9 +86,11 @@ def test_mainnet_ships_inert_with_the_v2_contract_scheduled(tmp_path):
     assert cfg.training.at_block(10**9).base_arch == "cascade_pyramid"
     assert cfg.lane_b.domains == ("econ_fin", "energy", "healthcare", "nature", "sales",
                                   "transport", "web_cloudops")
-    assert (cfg.lane_b.full_pay_tiers, cfg.lane_b.half_life_rounds, cfg.lane_b.floor,
-            cfg.lane_b.win_ttl_eras) == (((0.05, 10), (0.02, 5), (0.01, 2)), 1.0, 0.1, 28)
-    assert cfg.lane_b.replay_settlements == 29 * cfg.round.era_settlements
+    # LANE_D_PLAN rev6.22: lane B pays a held slot in full until replaced —
+    # the decay / TTL keys are retired, so there is no TTL-sized replay cover
+    assert not any(hasattr(cfg.lane_b, k) for k in ("full_pay_tiers", "half_life_rounds",
+                                                    "floor", "win_ttl_eras"))
+    assert cfg.lane_b.replay_settlements == 64
 
 
 def test_testnet_is_armed_on_its_era_grid():

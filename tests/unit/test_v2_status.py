@@ -114,12 +114,11 @@ def test_lane_b_launch_does_not_stand_in_for_lane_a():
 
 
 def test_payout_terms_read_either_denomination():
-    t = payout_terms(LaneBConfig(domains=DOMAINS, half_life_rounds=1.0, floor=0.1,
-                                 win_ttl_eras=28))
-    # the gain-tiered full-pay period (owner 2026-10-20) replaces "full"
-    assert t == {"full_pay_tiers": [[0.05, 10], [0.02, 5], [0.01, 2]], "half_life": 1.0,
-                 "floor": 0.1, "ttl": 28.0, "unit": "eras", "share": 0.5, "slots": 2,
-                 "remainder": "burn"}
+    t = payout_terms(LaneBConfig(domains=DOMAINS))
+    # rev6.22 (owner 2026-11-24): a held slot pays in full until replaced
+    assert t == {"rule": "indefinite", "full_pay_tiers": None, "half_life": None,
+                 "floor": None, "ttl": None, "unit": "eras", "share": 0.5, "slots": 2,
+                 "remainder": "burn", "undeclared_gain_margin": 0.02}
 
     @dataclass(frozen=True)
     class SettleLB:                    # the original build: settlements, no TTL
