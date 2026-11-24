@@ -2029,8 +2029,8 @@ check `cascade status --json` before you submit.
 - `cascade lane-d submit https://<intake> ./entry --context 4096 --wallet-name W --wallet-hotkey H`
   signs the manifest with your hotkey and uploads the files straight to the
   vault. It commits nothing.
-- `cascade lane-d ready https://<intake> --digest <digest> --context 4096 --licence Apache-2.0 --attest --wallet-name W --wallet-hotkey H`
-  attests the open licence (`--licence` is `Apache-2.0` or `OpenMDW-1.1`;
+- `cascade lane-d ready https://<intake> --digest <digest> --context 4096 --licence MIT --attest --wallet-name W --wallet-hotkey H`
+  attests the open licence (`--licence` is `MIT`;
   without `--attest` it shows the statement and sends nothing), then commits
   the entry on chain with an immediate reveal.
 - `cascade lane-d status https://<intake> --hotkey <ss58>` shows the public

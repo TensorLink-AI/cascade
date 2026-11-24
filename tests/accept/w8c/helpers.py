@@ -316,7 +316,7 @@ def queue_row(entry: dict, *, state: str = "revealed", reveal_block=None) -> dic
             "coldkey_at_ready": entry["coldkey_at_ready"],
             "ready_block": int(entry["ready_block"]),
             "ready_expires_block": int(entry["ready_block"]) + 7200,
-            "weights_sha256": "c" * 64, "licence": "Apache-2.0",
+            "weights_sha256": "c" * 64, "licence": "MIT",
             "licence_attestation_sha256": "d" * 64,
             "commit_payload": commit_payload(int(entry["context"]), prefix)}
 

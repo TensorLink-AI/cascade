@@ -406,6 +406,26 @@ report PASSes.
 
 Run locally with `-m "not torch"`. Nothing here imports torch.
 
+## Multichannel windows (rev6.18 F2): `test_w9_multivariate.py`
+
+- `check_lane_d(..., max_channels=)`: `[generator] max_channels` at the
+  boundary (`derive_weights` passes it, `checks._lane_d_max_channels`).
+  Every judged window carrying the channel fields must carry all of them and
+  its `channels` must equal `channel_pick(draw.boundary_block_hash,
+  series_id, range(n_channels_raw) minus empty_channels, max_channels)` (the
+  rule re-stated in `cascade.audit.lane_d.channel_pick`, equal to the
+  producer's `cascade.eval.lane_d_channels.pick_channels` and the spec),
+  with `n_channels` and `channels_sha256` to match; an empty pick fails;
+  `max_channels=None` fails any multichannel window.
+- With `pool_dirs`: the scored snapshot's `hist.npz` series has
+  `n_channels_raw` channels and the window's `series_id`, every scored
+  channel holds a finite value, and a C >= 2 series is never recorded
+  univariate.
+
+On main these tests fail on the `settle_mv` / `max_channels` assertions or
+`cannot import name` (`channel_pick` from `cascade.audit.lane_d`,
+`_lane_d_max_channels` from `cascade.audit.checks`, both in PATHS).
+
 ## rev6.20 (owner 2026-11-24): lane B stage `scored_weights`
 
 `checks.LANE_B_STAGES` gains `scored_weights` (a refusal stage; a passed
