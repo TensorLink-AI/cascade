@@ -27,3 +27,6 @@ cascade/audit/checks.py
 # with lane_b_anchor_pointer.
 cascade/trainer/lane_b_driver.py
 cascade/trainer/rolling.py
+# Miner docs: the two tau_anchor_* keys in the MINER.md lane B key table
+# (WB20's every-key-documented check).
+docs/MINER.md
