@@ -143,3 +143,51 @@ def test_w_launch_suite_targets_stay_unarmed():
                            network=nc.network_identity(base))
     with pytest.raises(nc.NetConfigError, match="contamination_hashset"):
         nc.validate_overlay(base, body)
+
+
+@pytest.mark.parametrize("net", sorted(PAIRS))
+def test_w_launch_lane_d_launches_live_only(net):
+    """#894 (owner 2026-11-24): step 2 sets ``[lane_d] public_weight = 0.0``
+    (step 1 never carries a lane D key), the built config judges on the live
+    half alone, and with that weight the lane D judge and its inputs source
+    need NO public inputs: nothing is drawn, no index / eval host / block
+    hash is read (at the shipped 0.5 the same calls fail closed)."""
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from cascade.validator.lane_d import _public_half
+    from cascade.validator.lane_d_inputs import LaneDInputsError, LaneDInputsSource
+
+    base, b1, b2, launch = bodies(net)
+    assert overrides(PAIRS[net][2])["lane_d"]["public_weight"] == 0.0
+    assert "lane_d" not in b1["overrides"]
+    assert float(base.lane_d.public_weight) == 0.5          # the shipped default
+    out = nc_build(base, b2)
+    assert float(out.lane_d.public_weight) == 0.0
+
+    class _Boom:
+        def block_hash(self, _b):
+            raise AssertionError("public_weight = 0 must not read the block hash")
+
+    def inputs(cfg):
+        return SimpleNamespace(cfg=cfg, _public_indexes={}, _eval_host=None)
+
+    # the judge: no public half, no indexes / scores / block hash needed
+    assert _public_half(out.lane_d, None, None, None, 0, ["d" * 64]) is None
+    # the inputs source: (None, None) without touching the reader or the host
+    assert LaneDInputsSource._public(inputs(out), _Boom(), launch + 1, {}, frozenset(),
+                                     ()) == (None, None)
+    # control: at 0.5 the same missing inputs fail closed
+    half = replace(out, lane_d=replace(out.lane_d, public_weight=0.5))
+    with pytest.raises(LaneDInputsError, match="public"):
+        LaneDInputsSource._public(inputs(half), _Boom(), launch + 1, {}, frozenset(), ())
+    from cascade.validator.lane_d import LaneDPublicError
+
+    with pytest.raises(LaneDPublicError):
+        _public_half(half.lane_d, None, None, None, 0, ["d" * 64])
+
+
+def nc_build(base, body):
+    from cascade.shared import netconfig as nc
+
+    return nc.build_config(base, body)

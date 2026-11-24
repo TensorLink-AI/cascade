@@ -344,7 +344,7 @@ def apply_receipt_overlay(receipt: RoundReceipt, cfg, *, store=None):
     overlay the receipt stamps (fetched by seq, checked against the digest
     and the loaded ``[netconfig] owner_hotkey``), and the ``netconfig`` check
     row. ``(cfg, None)`` for a receipt without the stamp."""
-    from ..shared.netconfig import NetConfigError, apply_receipt_netconfig
+    from ..shared.netconfig import NetConfigError, apply_receipt_netconfig, out_of_bounds_report
 
     seq = int(getattr(receipt, "netconfig_seq", 0) or 0)
     if not seq:
@@ -361,8 +361,12 @@ def apply_receipt_overlay(receipt: RoundReceipt, cfg, *, store=None):
         return out, CheckResult("netconfig", WARN, f"overlay seq {seq} ({d[:12]}…) applied by "
                                 "digest; signature NOT verified ([netconfig] owner_hotkey is "
                                 "empty in the loaded config)")
+    # #891: keys of the stamped overlay this release's envelope refuses were
+    # replayed at the release value (the same rule every node applies)
+    oob = out_of_bounds_report().get(d)
+    tail = f"; out of current bounds, release value used: {' | '.join(oob)}" if oob else ""
     return out, CheckResult("netconfig", PASS, f"overlay seq {seq} ({d[:12]}…) verified "
-                            f"against {cfg.netconfig.owner_hotkey[:12]}… and applied")
+                            f"against {cfg.netconfig.owner_hotkey[:12]}… and applied{tail}")
 
 
 def fetch_bench_inputs(cfg, receipt: RoundReceipt, store) -> dict | None:

@@ -417,6 +417,11 @@ class ReceiptMixin:
                 economics=econ,
                 activation=activation,
             )
+            from ..shared.netconfig import out_of_bounds_report
+
+            oob = out_of_bounds_report()   # #891: in-force keys at the release value
+            if oob:
+                status["netconfig_out_of_bounds"] = oob
             publish_chain_status(store, status)
         except Exception as e:  # noqa: BLE001 — telemetry only
             log.debug("chain status publish skipped: %s", e)

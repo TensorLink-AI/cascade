@@ -28,6 +28,10 @@ share      = 0.15
 takes_from = "lane_a"
 
 [lane_d]
-from_block = 9586800
-share      = 0.5
-takes_from = "lane_a"
+from_block    = 9586800
+share         = 0.5
+takes_from    = "lane_a"
+# #894 (owner 2026-11-24): lane D launches LIVE-ONLY — the verdict is the
+# live half alone; no public index is drawn, scored or required. Raise it
+# later by overlay (W-OV bound [0, 1], the loader keeps it < 1).
+public_weight = 0.0
