@@ -1,5 +1,16 @@
-"""Independent satellite replay of a lane D receipt chain (LANE_D_PLAN §14.3,
-§1.5; W7d).
+"""The chain rules of ``check_lane_d`` (LANE_D_PLAN §14.3, §1.5; rev6.18 B2).
+
+rev6.18 B2: there is ONE lane D checker for outside validators,
+:func:`cascade.audit.lane_d.check_lane_d` (reached by the satellite through
+``audit_receipt``). This module was the W7d satellite replay
+(``cascade/satellite/lane_d_replay.py``); it now lives in the audit package
+and its rules that ``check_lane_d`` does not re-derive per report (the
+receipt links C1, ``king_before`` C2, ``prior_kings`` C3, held candidates C6,
+the used-window and house-challenger rules, entry progress, the state
+snapshot, the armed evidence, the window records, exact key sets) reach
+outside validators only through ``check_lane_d(..., chain=...)``, which maps
+every mismatch path to a rev6.18 B3 refusal code. Nothing outside the audit
+calls this module.
 
 :func:`replay_chain` takes what a satellite is given (the published signed
 ``lane-d-report/1`` files, the ``lane-d-receipt/1`` records in settlement
@@ -13,8 +24,8 @@ Invariant 12: this module re-implements the settlement rules from the plan
 and the signed formats. It imports only the shared pure primitives
 (``cascade.eval.bootstrap`` for the max-T statistic, ``cascade.shared.sr25519``
 for the signature check), the standard library and numpy; never the
-producer's eligibility, verdict, gate, state or weight code, and never the
-audit.
+producer's eligibility, verdict, gate, state or weight code, and no other
+audit module (``cascade.audit.lane_d`` imports it, never the reverse).
 
 Per settlement, in order (the first two can end the settlement early):
 

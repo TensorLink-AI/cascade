@@ -188,7 +188,7 @@ def test_two_validators_publish_the_same_settlements(tmp_path):
 
 
 def test_satellite_replay_matches_the_published_chain(tmp_path):
-    from cascade.satellite.lane_d_replay import MATCH, replay_chain
+    from cascade.audit.lane_d_chain import MATCH, replay_chain
 
     w = h.wiring()
     cfg = h.chain_cfg(tmp_path / "v")
