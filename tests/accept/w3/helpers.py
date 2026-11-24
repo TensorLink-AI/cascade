@@ -11,6 +11,7 @@ Checkpoint "files" are inert bytes; nothing uploaded is ever executed.
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import io
 import json
@@ -90,9 +91,11 @@ def message(action: str, hotkey: str, digest: str, context: int, timestamp: str,
 
 def checkpoint(tag: str, *, weights: bytes | None = None, extra: dict | None = None,
                drop: tuple[str, ...] = ()) -> dict[str, bytes]:
-    """Four inert files; ``weights`` fixes the weights bytes (dedup cases)."""
+    """Four inert files; ``weights`` fixes the weights bytes (dedup cases).
+    ``config.json`` is an allowed lane D config (the whole file is pinned at
+    ready: cascade.lane_d.entry_config) whose ``arch`` carries the tag."""
     files = {
-        "config.json": json.dumps({"tag": tag, "d_model": 64}).encode(),
+        "config.json": json.dumps(entry_config(arch=f"tag-{tag}"), sort_keys=True).encode(),
         "forecast_wrapper.py": f"# wrapper {tag}\n".encode(),
         "model.py": f"# model {tag}\n".encode(),
         "weights.safetensors": weights if weights is not None else f"W3W{tag}".encode() * 8,
@@ -101,6 +104,37 @@ def checkpoint(tag: str, *, weights: bytes | None = None, extra: dict | None = N
         files.pop(name)
     files.update(extra or {})
     return files
+
+
+PYRAMID_MODEL = REPO / "cascade" / "trainer" / "pyramid_model.py"
+PYRAMID_TRAINER = REPO / "cascade" / "trainer" / "pyramid_trainer.py"
+
+
+def pyramid_config_defaults() -> dict:
+    """``CascadeMoEConfig().to_dict()`` read from the source by AST (no torch):
+    every field's default, tuples as lists, the two module constants inlined."""
+    tree = ast.parse(PYRAMID_MODEL.read_text())
+    consts = {"NUM_QUANTILES": 21, "COPULA_RANK": 1}
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name == "CascadeMoEConfig":
+            out = {}
+            for s in node.body:
+                if isinstance(s, ast.AnnAssign) and isinstance(s.target, ast.Name):
+                    v = s.value
+                    val = consts[v.id] if isinstance(v, ast.Name) else ast.literal_eval(v)
+                    out[s.target.id] = list(val) if isinstance(val, tuple) else val
+            return out
+    raise AssertionError("no CascadeMoEConfig in pyramid_model.py")
+
+
+def entry_config(**top) -> dict:
+    """A lane D ``config.json`` as pyramid_trainer.save_checkpoint writes it."""
+    doc = {"moe": pyramid_config_defaults(),
+           "quantile_levels": [0.01, *(i / 20 for i in range(1, 20)), 0.99],
+           "base_arch": "cascade_pyramid", "arch": "cascade-moe-17m",
+           "input_transform": "none"}
+    doc.update(top)
+    return doc
 
 
 def manifest(files: dict[str, bytes]) -> dict:

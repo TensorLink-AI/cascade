@@ -45,6 +45,12 @@ from http import HTTPStatus
 from pathlib import Path
 
 from ..shared import sr25519
+from .entry_config import (
+    ENTRY_CONFIG_CODES,
+    ENTRY_CONFIG_FILE,
+    MAX_ENTRY_CONFIG_BYTES,
+    check_entry_config,
+)
 from .intake import ALLOWED_FILES, MANIFEST_OBJECT, IntakeError, canonical_manifest
 from .storage import LaneDStorage
 
@@ -114,6 +120,8 @@ REFUSAL_CODES = (
     "unknown_entry", "bad_body", "licence_not_open", "licence_attestation_missing",
     "context_mismatch", "missing_object", "size_mismatch", "stray_object",
     "upload_incomplete", "coldkey_cap_open", "queue_full", "ready_expired", "entry_closed",
+    # ready: the whole config.json pinned (cascade.lane_d.entry_config)
+    "config_unreadable", "config_key_not_allowed", "config_value_not_allowed",
     # fail closed
     "storage_unavailable", "chain_unavailable", "grants_unavailable", "dedup_unavailable",
     "state_unavailable", "internal_error",
@@ -500,6 +508,26 @@ class LaneDIntake:
             self._refreshed_block = block
         return block
 
+    def tick(self) -> int | None:
+        """One background refresh (#842): the same TTL / reveal evaluation a
+        request runs, under the request lock, persisted with the same atomic
+        write. Returns the head, or ``None`` when a chain read or the state
+        write failed (logged; the next tick retries; nothing changes)."""
+        with self._lock:
+            try:
+                return self._refresh()
+            except _Refusal as r:
+                log.warning("lane_d_intake_unavailable background refresh skipped (%s)", r.code)
+                return None
+
+    def refresh_timer(self, interval_s: float | None = None, *,
+                      wait: Callable[[float], bool] | None = None) -> RefreshTimer:
+        """A :class:`RefreshTimer` ticking every ``interval_s`` (default
+        ``[lane_d_ops] queue_poll_seconds``)."""
+        if interval_s is None:
+            interval_s = getattr(self.ops, "queue_poll_seconds", None)
+        return RefreshTimer(self, interval_s, wait=wait)
+
     # ── WSGI ─────────────────────────────────────────────────────────────────
 
     def __call__(self, environ, start_response):
@@ -756,8 +784,11 @@ class LaneDIntake:
                            "retry") from None
 
     def _check_objects(self, prefix: str, digest: str, files: dict[str, int]) -> str:
-        """The object list and sizes against the stored manifest; nothing but
-        ``manifest.json`` is read. Returns the weights sha256."""
+        """The object list and sizes against the stored manifest, then the
+        whole ``config.json`` against the pinned allowlist
+        (:func:`cascade.lane_d.entry_config.check_entry_config`); nothing but
+        ``manifest.json`` and that small JSON file is read, never the weights.
+        Returns the weights sha256."""
         try:
             try:
                 raw = self.storage.get(prefix + MANIFEST_OBJECT)
@@ -784,6 +815,22 @@ class LaneDIntake:
                     raise _Refusal(409, "missing_object", name) from None
                 if size != int(files[name]):
                     raise _Refusal(409, "size_mismatch", f"{name}: {size} != {files[name]}")
+            if int(files.get(ENTRY_CONFIG_FILE, 0)) > MAX_ENTRY_CONFIG_BYTES:
+                raise _Refusal(409, "config_unreadable",
+                               f"{ENTRY_CONFIG_FILE} is larger than {MAX_ENTRY_CONFIG_BYTES} bytes")
+            try:
+                raw_config = self.storage.get(prefix + ENTRY_CONFIG_FILE)
+            except KeyError:
+                raise _Refusal(409, "missing_object", ENTRY_CONFIG_FILE) from None
+            if hashlib.sha256(bytes(raw_config)).hexdigest() \
+                    != str(manifest["files"][ENTRY_CONFIG_FILE]["sha256"]):
+                raise _Refusal(409, "digest_mismatch",
+                               f"{ENTRY_CONFIG_FILE} does not hash to its manifest entry")
+            try:
+                check_entry_config(bytes(raw_config))
+            except IntakeError as e:
+                code = e.code if e.code in ENTRY_CONFIG_CODES else "config_unreadable"
+                raise _Refusal(409, code, e.detail[:300]) from None
         except _Refusal:
             raise
         except Exception as e:  # noqa: BLE001 — a transient error is never "absent"
@@ -811,9 +858,63 @@ class LaneDIntake:
             return self._row(rec)
 
 
+class RefreshTimer:
+    """Refresh the intake queue without traffic (#842).
+
+    The validator reads ``lane_d_intake_queue.json`` directly, so ``ready →
+    revealed`` and ``ready → ready_expired`` must land in the file in quiet
+    periods too. :meth:`run` ticks once at once (the startup refresh), then
+    every ``interval_s`` until :meth:`stop`. ``wait(timeout) -> bool`` is the
+    sleep (default: the stop event's ``wait``; ``True`` ends the loop), so a
+    test drives ticks without real sleeps. A tick never raises: an unexpected
+    error is logged and the loop keeps going."""
+
+    def __init__(self, app: LaneDIntake, interval_s, *,
+                 wait: Callable[[float], bool] | None = None):
+        if isinstance(interval_s, bool) or not isinstance(interval_s, int | float) \
+                or not math.isfinite(interval_s) or interval_s <= 0:
+            raise ValueError(f"refresh interval must be a positive number of seconds; "
+                             f"got {interval_s!r}")
+        self.app = app
+        self.interval_s = float(interval_s)
+        self._stop = threading.Event()
+        self._wait = wait or self._stop.wait
+        self._thread: threading.Thread | None = None
+        self.ticks = 0
+
+    def step(self) -> int | None:
+        """One tick; returns the head the refresh saw (``None`` = skipped)."""
+        self.ticks += 1
+        try:
+            return self.app.tick()
+        except Exception as e:  # noqa: BLE001 — the timer thread must never die
+            log.error("lane_d_intake_unavailable background refresh failed (%s)",
+                      type(e).__name__)
+            return None
+
+    def run(self) -> None:
+        while not self._stop.is_set():
+            self.step()
+            if self._wait(self.interval_s) or self._stop.is_set():
+                return
+
+    def start(self) -> RefreshTimer:
+        if self._thread is not None:
+            raise RuntimeError("refresh timer already started")
+        self._thread = threading.Thread(target=self.run, name="lane-d-intake-refresh",
+                                        daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self, timeout: float | None = 5.0) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout)
+
+
 __all__ = [
     "DEFAULT_PER_HOTKEY_RPM", "DEFAULT_PER_IP_RPM", "ENTRY_STATES", "FRESHNESS_SECONDS",
-    "GrantMinter", "LICENCES", "LICENCE_ATTESTATION", "LaneDIntake", "LaneDReads",
+    "GrantMinter", "LICENCES", "LICENCE_ATTESTATION", "LaneDIntake", "LaneDReads", "RefreshTimer",
     "MAX_BODY_BYTES", "OFFERED_UPLOAD_PATHS", "OPEN_STATES", "QUEUE_FILENAME", "QUEUE_PATH",
     "RATE_LIMIT_MAX_KEYS", "READY_PATH", "REFUSAL_CODES", "SUBMIT_PATH", "UPLOAD_PATH",
     "UPLOAD_PATH_IDS", "canonical_message", "client_ip", "commit_payload", "entry_prefix",

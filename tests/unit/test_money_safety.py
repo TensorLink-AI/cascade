@@ -53,7 +53,7 @@ def test_round_knob_defaults_match_the_dataclass_and_the_shipped_toml():
 
 def _edited(tmp_path, round_lines: str = "", validator_lines: str = "") -> Path:
     src = REPO_TOML.read_text(encoding="utf-8")
-    anchor = "funded_operator_fallback = false\n"
+    anchor = "funded_operator_fallback = true\n"
     assert src.count(anchor) == 1 and src.count("[validator]\n") == 1
     src = src.replace(anchor, anchor + round_lines, 1)
     src = src.replace("[validator]\n", "[validator]\n" + validator_lines, 1)

@@ -43,10 +43,12 @@ time map the forward-only rule uses), ``sources`` (class → source spec),
 the canonical body; the signature covers the same bytes.
 
 Windows (:func:`snapshot_windows`) are cut with the pure rule in
-:mod:`cascade.eval.marketcast` — forward-only: start strictly after the
-entry's train-block time + ``start_margin_seconds``, end at or before the
-snapshot's ``end``; the most recent ``windows_per_cell`` per (asset,
-horizon).
+:mod:`cascade.eval.marketcast`. The validator and the audit cut them by an
+entry's signed DRAW (DEC-CA-0074, :func:`embargo_draw`): per (asset, series,
+horizon) the ``backtest_windows_per_cell`` best-ranked windows by the round
+block's hash lying wholly in the ``embargo_eval_days`` before the leg's
+dispatch (the embargo no leg reads), in the phase's half of a fixed window
+partition, plus the closed forward windows of the ``forward_horizons``.
 """
 
 from __future__ import annotations
@@ -54,6 +56,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -544,20 +547,102 @@ def liquidity_filter(snap: MktSnapshot, mc: MarketCastConfig, cls: str, asset: s
 STALE_CONTEXT_SUITES = ("returns", "alpha", "ohlcv")
 
 
-def gap_span(mc: MarketCastConfig, gap_end: float) -> tuple[float, float]:
-    """``(after, end)`` of the embargo gap before a submission at
-    ``gap_end`` (owner 2026-11-18, ``gap_horizons``): windows start on or
-    after the first UTC day a recipe can never train on — a recipe's
-    ``data.end`` is at most ``embargo_days`` before the submission's UTC
-    date (:func:`cascade.shared.marketcast_recipe.parse_marketcast_recipe`)
-    and the leg reads that end day whole — and end by the submission."""
-    day = float(gap_end) // 86400 * 86400
+def embargo_span(mc: MarketCastConfig, end: float) -> tuple[float, float]:
+    """``(after, end)`` of the embargo before a dispatch at ``end``: windows
+    start on or after the first UTC day a recipe can never train on — a
+    recipe's ``data.end`` is at most ``embargo_days`` before its commit's UTC
+    date (:func:`cascade.shared.marketcast_recipe.parse_marketcast_recipe`;
+    the commit is at or before the dispatch) and the leg reads that end day
+    whole — and end by the dispatch."""
+    day = float(end) // 86400 * 86400
     first = day - (int(mc.embargo_days) - 1) * 86400
-    return first - 1.0, float(gap_end)
+    return first - 1.0, float(end)
+
+
+# ── DEC-CA-0074: the embargo draw ───────────────────────────────────────────
+
+HALF_TAG = "cascade-mkt-embargo-half/1|"
+PHASE_HALF = {"judge": 0, "confirm": 1}
+_HASH_RE = re.compile(r"^0x[0-9a-f]{64}$")
+
+
+def window_half(wid: str) -> int:
+    """The fixed PUBLIC partition of window ids into a judge half (0) and a
+    confirm half (1), so a confirm is always scored on windows its judge never
+    saw. Public on purpose: both halves lie in the embargo no leg reads."""
+    import hashlib
+
+    return hashlib.sha256((HALF_TAG + str(wid)).encode()).digest()[0] & 1
+
+
+def draw_rank(block_hash: str, wid: str) -> str:
+    """A window's place in the round's draw: sha256 of the rule, the round
+    block's hash (unknown while the leg trains) and the window id."""
+    import hashlib
+
+    from ..shared.config.marketcast import EMBARGO_RULE
+
+    return hashlib.sha256(f"{EMBARGO_RULE}|{block_hash}|{wid}".encode()).hexdigest()
+
+
+def embargo_draw(mc: MarketCastConfig, *, train_time: float, phase: str, block: int,
+                 block_hash: str, after: float) -> dict:
+    """The signed draw record of one entry (DEC-CA-0074): every number
+    the windows are cut from, re-derivable from the config, the trainer's
+    dispatch time ``train_time``, the round ``block`` and its hash. Backtest
+    windows lie wholly inside ``(lo, hi]`` = the ``embargo_eval_days`` before
+    the dispatch (inside the embargo: :func:`embargo_span`), in the phase's half;
+    forward windows (``forward_horizons`` only) start after ``after`` (the
+    entry's :func:`~cascade.validator.marketcast.entry_after`) and end by
+    ``forward_hi`` = dispatch + ``verdict_wait_blocks``. Raises ``ValueError`` for a
+    malformed hash or phase."""
+    from ..shared.config.marketcast import EMBARGO_RULE
+
+    h = str(block_hash).strip().lower()
+    if not _HASH_RE.match(h):
+        raise ValueError(f"block hash {block_hash!r} is not 0x + 64 hex digits")
+    if phase not in PHASE_HALF:
+        raise ValueError(f"unknown phase {phase!r}")
+    t = float(train_time)
+    lo = max(t - int(mc.embargo_eval_days) * DAY, embargo_span(mc, t)[0])
+    return {"rule": EMBARGO_RULE, "block": int(block), "block_hash": h, "phase": phase,
+            "half": PHASE_HALF[phase], "lo": float(lo), "hi": t,
+            "eval_days": int(mc.embargo_eval_days), "n": int(mc.backtest_windows_per_cell),
+            "forward_after": float(after),
+            "forward_hi": t + int(mc.wait_blocks) * BLOCK_SECONDS,
+            "forward_horizons": sorted(mc.forward_horizons),
+            "forward_n": int(mc.windows_per_cell)}
+
+
+def draw_problem(draw: dict, expected: dict) -> str:
+    """Why a signed draw is not the one the rule gives (``""`` = it is):
+    every field but the hash must equal ``expected`` (:func:`embargo_draw` with
+    the recorded hash), the hash well-formed. Judging validators read the
+    hash from the signed rows; the audit checks it against the chain."""
+    if not isinstance(draw, dict) or not draw:
+        return "no draw record"
+    for k in sorted(set(expected) | set(draw)):
+        a, b = draw.get(k), expected.get(k)
+        if isinstance(a, float) or isinstance(b, float):
+            try:
+                if abs(float(a) - float(b)) <= 1e-6:
+                    continue
+            except (TypeError, ValueError):
+                pass
+            return f"draw {k}={a!r}, the rule gives {b!r}"
+        if a != b:
+            return f"draw {k}={a!r}, the rule gives {b!r}"
+    return ""
+
+
+def window_kind(draw: dict, start: float) -> str:
+    """``"forward"`` (started after the dispatch) or ``"backtest"`` (drawn
+    from the embargo before it) for a window of a draw."""
+    return "forward" if float(start) > float(draw["hi"]) else "backtest"
 
 
 def snapshot_windows(snap: MktSnapshot, mc: MarketCastConfig, suite: str, *,
-                     after: float, gap_end: float = 0.0) -> list[MktWindow]:
+                     after: float, draw: dict | None = None) -> list[MktWindow]:
     """Every scorable window of ``suite`` for a submission whose windows
     must start after ``after`` (unix): per configured (class, asset) present
     in the snapshot and per suite horizon, ``windows_per_cell`` forward-only
@@ -567,23 +652,23 @@ def snapshot_windows(snap: MktSnapshot, mc: MarketCastConfig, suite: str, *,
     2026-10-20 — the old ``min_target_abs_bp`` floor conditioned the test set
     on the outcome: a lattice forecaster moving mass off zero gained 18.7 %);
     a zero-scale cell is masked in the verdict instead. Sorted by window id.
+    Without ``draw`` this is the plain forward-only cut (``cascade lane-c
+    test`` on a held-out snapshot).
 
-    A ``gap_horizons`` horizon (owner 2026-11-18) is cut from the embargo gap
-    before the submission instead (:func:`gap_span` of ``gap_end``, the
-    trainer's dispatch time) — and not at all when ``gap_end`` is 0 (a
-    confirm: the gap holds no fresh windows)."""
+    ``draw`` (DEC-CA-0074, :func:`embargo_draw`; every validator / audit
+    path): every horizon takes the ``n`` best-ranked (:func:`draw_rank`)
+    eligible windows of the phase's half (:func:`window_half`) lying wholly
+    in ``(lo, hi]``, plus — for a ``forward_horizons`` horizon — up to
+    ``forward_n`` forward windows in ``(forward_after, min(snapshot end,
+    forward_hi)]`` spread evenly; ``after`` is then unused."""
+    if draw:
+        return _drawn_windows(snap, mc, suite, draw)
     out: list[MktWindow] = []
     freqs = mc.frequencies_map[suite]
     labels = mc.series_labels(suite) if hasattr(mc, "series_labels") else (suite,)
-    gaps = tuple(getattr(mc, "gap_horizons", ()))
     for h in mc.horizons_map[suite]:
         f, steps = _geometry(freqs, h)
-        if h in gaps:
-            if not gap_end:
-                continue
-            lo, hi = gap_span(mc, gap_end)
-        else:
-            lo, hi = float(after), float(snap.end)
+        lo, hi = float(after), float(snap.end)
         for cls, asset in mc.suite_assets(suite):
             if asset not in snap.assets(cls):
                 continue
@@ -602,18 +687,51 @@ def snapshot_windows(snap: MktSnapshot, mc: MarketCastConfig, suite: str, *,
     return sorted(out, key=lambda w: w.wid)
 
 
+def _drawn_windows(snap: MktSnapshot, mc: MarketCastConfig, suite: str,
+                   draw: dict) -> list[MktWindow]:
+    out: list[MktWindow] = []
+    freqs = mc.frequencies_map[suite]
+    labels = mc.series_labels(suite) if hasattr(mc, "series_labels") else (suite,)
+    fwd = tuple(draw.get("forward_horizons", ()))
+    half, bh = int(draw["half"]), str(draw["block_hash"])
+    for h in mc.horizons_map[suite]:
+        f, steps = _geometry(freqs, h)
+        for cls, asset in mc.suite_assets(suite):
+            if asset not in snap.assets(cls):
+                continue
+            for lab in labels:
+                s = asset_series(snap, cls, asset, lab, f)
+                if s is None:
+                    continue
+                kw = dict(cls=cls, asset=asset, suite=lab, horizon=h, freq_minutes=f,
+                          steps=steps, t0=snap.bank(cls, asset, lab, f)[1],
+                          context_length=int(mc.eval_context_length),
+                          eligible=liquidity_filter(snap, mc, cls, asset, lab, f),
+                          stale_context=base_suite(lab) in STALE_CONTEXT_SUITES,
+                          crps_scale=str(getattr(mc, "crps_scale", "seasonal_naive")))
+                out.extend(cut_windows(
+                    s, after=float(draw["lo"]), now=min(float(draw["hi"]), float(snap.end)),
+                    limit=int(draw["n"]), keep=lambda w: window_half(w) == half,
+                    rank=lambda w: draw_rank(bh, w), **kw))
+                if h in fwd:
+                    out.extend(cut_windows(
+                        s, after=max(float(draw["forward_after"]), float(draw["hi"])),
+                        now=min(float(draw["forward_hi"]), float(snap.end)),
+                        limit=int(draw["forward_n"]), **kw))
+    return sorted(out, key=lambda w: w.wid)
+
+
 def target_windows(snap: MktSnapshot, mc: MarketCastConfig, name: str, *,
-                   after: float, gap_end: float = 0.0) -> list[MktWindow]:
+                   after: float, draw: dict | None = None) -> list[MktWindow]:
     """Every scorable window of the lane-C target ``mkt:<name>``: one
     suite's :func:`snapshot_windows`, or — the composite ``mkt:market``
     (owner 2026-11-10) — every enabled suite's, in window-id order (the row
-    order of the entry's report and quantile sidecar). ``gap_end``: see
+    order of the entry's report and quantile sidecar). ``draw``: see
     :func:`snapshot_windows`."""
     suites = mc.suites_of(name) if hasattr(mc, "suites_of") else (name,)
     if len(suites) == 1 and suites[0] == name:
-        return snapshot_windows(snap, mc, name, after=after, gap_end=gap_end)
-    out = [w for s in suites for w in snapshot_windows(snap, mc, s, after=after,
-                                                       gap_end=gap_end)]
+        return snapshot_windows(snap, mc, name, after=after, draw=draw)
+    out = [w for s in suites for w in snapshot_windows(snap, mc, s, after=after, draw=draw)]
     return sorted(out, key=lambda w: w.wid)
 
 
@@ -709,10 +827,11 @@ class MktSnapshotSource:
 
 
 __all__ = [
-    "CROSS_ASSET", "MKT_SNAPSHOT_VERSION", "gap_span", "STALE_CONTEXT_SUITES", "liquidity_filter", "MktSnapshot", "MktSnapshotSource", "SNAPSHOT_FILE",
+    "CROSS_ASSET", "MKT_SNAPSHOT_VERSION", "embargo_span", "STALE_CONTEXT_SUITES", "liquidity_filter", "MktSnapshot", "MktSnapshotSource", "SNAPSHOT_FILE",
     "SnapshotError", "asset_series", "build_snapshot", "canonical_body", "coarse_grid",
     "fetch_class_bars", "fetch_coarse_bars", "needs_coarse",
     "load_snapshot", "sign_snapshot_meta", "snapshot_digest", "snapshot_grid",
     "snapshot_windows", "verify_snapshot_signature", "window_covariates", "write_snapshot",
     "native_dir", "native_grid", "needed_banks", "target_windows",
+    "PHASE_HALF", "draw_problem", "draw_rank", "embargo_draw", "window_half", "window_kind",
 ]

@@ -1,6 +1,6 @@
 """Every suite on every timeframe, as multi-step paths (owner 2026-11-18):
-``<bar>x<steps>`` horizons, the week-long paths judged on the embargo gap
-before the submission (judge phase only), and the calibration slack counted
+``<bar>x<steps>`` horizons, every path drawn from the embargo before the
+dispatch (owner 2026-11-24, DEC-CA-0074), and the calibration slack counted
 in windows, not the correlated steps of one path."""
 
 from __future__ import annotations
@@ -11,9 +11,10 @@ from types import SimpleNamespace
 import pytest
 
 from cascade.eval.marketcast import window_geometry
-from cascade.pool.marketcast import gap_span
+from cascade.pool.marketcast import embargo_span
 from cascade.shared.config import load_chain_config
 from cascade.shared.config.marketcast import (
+    draw_problems,
     duration_minutes,
     horizon_path,
     parse_marketcast,
@@ -26,7 +27,6 @@ from cascade.shared.marketcast_report import (
     calibration_gate,
     load_mkt_report,
 )
-from cascade.validator.marketcast import entry_gap_end
 
 DAY = 86400
 
@@ -46,48 +46,55 @@ def test_shipped_grid_is_every_suite_on_every_timeframe():
     want = ["1mx60", "5mx36", "15mx96", "1hx48", "4hx42", "1dx7"]
     for toml in ("chain.toml", "chain.testnet.toml"):
         mc = load_chain_config(toml).marketcast
-        assert mc.gap_horizons == ("4hx42", "1dx7")
+        assert mc.forward_horizons == ("1mx60", "5mx36") and not hasattr(mc, "gap_horizons")
         for s in mc.suites:
             assert list(mc.horizons_map[s]) == want
             assert [window_geometry(mc.frequencies_map[s], h) for h in want] == [
                 (1, 60), (5, 36), (15, 96), (60, 48), (240, 42), (1440, 7)]
-        assert scorability_problems(mc) == []
+        assert scorability_problems(mc) == [] and draw_problems(mc) == []
 
 
-def test_gap_and_path_config_is_checked():
+def test_draw_and_path_config_is_checked():
     grid = {"suites": ["returns"], "frequencies": {"returns": ["1m", "1d"]},
             "horizons": {"returns": ["1mx60", "1dx7"]}}
-    mc = parse_marketcast({**grid, "gap_horizons": ["1dx7"]})
-    assert mc.gap_horizons == ("1dx7",) and scorability_problems(mc) == []
-    # forward-only, a week-long path cannot close inside the 6-day wait
-    assert any("forward wait" in p for p in scorability_problems(replace(mc, gap_horizons=())))
-    assert any("embargo gap" in p for p in scorability_problems(replace(mc, embargo_days=10)))
+    mc = parse_marketcast(grid)
+    assert mc.forward_horizons == ("1mx60",) and draw_problems(mc) == []
+    # the week-long path needs two aligned weeks of embargo span
+    assert any("embargo eval span" in p for p in draw_problems(replace(mc, embargo_eval_days=10)))
+    assert any(">= 2 days" in p for p in draw_problems(replace(mc, embargo_days=1)))
+    # a forward horizon must fit the <= 13 h forward span
+    assert any("forward horizon" in p
+               for p in draw_problems(replace(mc, forward_horizons=("1mx60", "1dx7"))))
     with pytest.raises(ValueError, match="no enabled suite"):
-        parse_marketcast({**grid, "gap_horizons": ["4hx42"]})
+        parse_marketcast({**grid, "forward_horizons": ["4hx42"]})
+    with pytest.raises(ValueError, match="embargo_eval_days"):
+        parse_marketcast({**grid, "embargo_eval_days": 30})
+    with pytest.raises(ValueError, match="backtest_windows_per_cell"):
+        parse_marketcast({**grid, "backtest_windows_per_cell": 257})
     with pytest.raises(ValueError, match="paths"):
         parse_marketcast({**grid, "frequencies": {"returns": ["1mx60"]}})
+    # owner 2026-11-24: a verdict within 13 h — a longer wait is capped in code
+    assert parse_marketcast({**grid, "verdict_wait_blocks": 43200}).wait_blocks == 3900
+    # the retired gap_horizons key of an older file loads and does nothing
+    assert parse_marketcast({**grid, "gap_horizons": ["1dx7"]}) == mc
 
 
-def test_the_gap_is_the_days_no_leg_reads():
+def test_the_embargo_is_the_days_no_leg_reads():
     mc = SimpleNamespace(embargo_days=30)
     sub = 1_790_000_000 + 5000
-    lo, hi = gap_span(mc, sub)
+    lo, hi = embargo_span(mc, sub)
     day = sub // DAY * DAY
-    # a recipe's data.end is <= the submission's UTC date - 30 d, read whole
+    # a recipe's data.end is <= the commit's UTC date - 30 d, read whole
     assert lo + 1 == day - 29 * DAY and hi == sub
 
 
-def test_gap_end_is_the_judge_dispatch_and_none_on_a_confirm():
-    mc = load_chain_config("chain.toml").marketcast
-    e = SimpleNamespace(marketcast={"train_time": 1_790_000_000.0})
-    assert entry_gap_end(e, mc, "judge") == 1_790_000_000.0
-    assert entry_gap_end(e, mc, "confirm") == 0.0
-    assert entry_gap_end(e, replace(mc, gap_horizons=()), "judge") == 0.0
-    ent = MktEntryRows("hk", "p", "mkt:market", "judge", 1.0, gap_end=1_790_000_000.0)
-    rep = MktReport("r", 1, {}, (ent, replace(ent, phase="confirm", gap_end=0.0)))
+def test_the_draw_record_round_trips_and_is_omitted_when_empty():
+    ent = MktEntryRows("hk", "p", "mkt:market", "judge", 1.0,
+                       draw={"rule": "embargo-v1", "block": 7, "lo": 1.0})
+    rep = MktReport("r", 1, {}, (ent, replace(ent, phase="confirm", draw={})))
     back = load_mkt_report(rep.to_json()).entries
-    assert [x.gap_end for x in back] == [1_790_000_000.0, 0.0]
-    assert b'"gap_end"' not in MktReport("r", 1, {}, (replace(ent, gap_end=0.0),)).canonical_body()
+    assert [x.draw for x in back] == [ent.draw, {}]
+    assert b'"draw"' not in MktReport("r", 1, {}, (replace(ent, draw={}),)).canonical_body()
 
 
 def test_calibration_slack_counts_windows_not_path_steps():

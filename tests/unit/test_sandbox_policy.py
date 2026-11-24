@@ -31,8 +31,12 @@ def test_load_check_refuses_an_armed_probe_on_a_weak_sandbox(tmp_path):
     check_generator_sandbox_config({"sandbox_mode": "container"}, {"dedup_probe_series": 8})
     # A weak deployment with the probe armed is refused by the loader too.
     assert load_chain_config(ROOT / "chain.toml").generator.sandbox_strict
-    text = (ROOT / "chain.toml").read_text().replace(
-        "dedup_probe_series = 0", "dedup_probe_series = 4", 1).replace(
+    # rev6.18 B13: the shipped file no longer carries the retired probe lines;
+    # a deployed file that still sets one is judged the same way.
+    shipped = (ROOT / "chain.toml").read_text()
+    assert "\ndedup_probe_series" not in shipped
+    text = shipped.replace(
+        "\n[round]\n", "\n[round]\ndedup_probe_series = 4\n", 1).replace(
         "sandbox_strict = true", "sandbox_strict = false", 1)
     p = tmp_path / "chain.toml"
     p.write_text(text)

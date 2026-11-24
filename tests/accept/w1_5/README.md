@@ -178,7 +178,7 @@ returns `PASS` on a genuine report, and `FAIL` when the signature,
 
 ### `cascade/shared/emission.py`
 
-- `lane_d_vector(n_uids, *, share, court_uids, king_decay, burn_uid) ->
+- `lane_d_vector(n_uids, *, share, court_uids, court_weights, burn_uid) ->
   list[float]` sums to `share`. A sole court member gets all of it, and a
   `None` (house) slot burns.
 - `lane_parts(…, lane_d_cfg=None, d_court_uids=())`:

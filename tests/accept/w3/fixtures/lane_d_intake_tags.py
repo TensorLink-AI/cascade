@@ -15,3 +15,37 @@ LANE_D_INTAKE_TAGS = (
     "lane_d_intake_unavailable",   # any typed 503 (storage / chain / grants / state)
     "lane_d_coldkey_unresolved",   # plan §1.2 D22 alert name
 )
+
+# The lane D recurring jobs (cascade/lane_d/ops_jobs.py, ops_jobs.LOG_TAGS; the
+# docs/OPERATOR.md "Lane D recurring jobs" watcher table lists the same set).
+LANE_D_OPS_TAGS = (
+    "lane_d_ops_house_current",
+    "lane_d_ops_house_no_lane_a_king",
+    "lane_d_ops_house_resign_planned",
+    "lane_d_ops_house_resigned",
+    "lane_d_ops_house_resign_blocked",
+    "lane_d_ops_house_failed",
+    "lane_d_ops_evidence_current",
+    "lane_d_ops_evidence_planned",
+    "lane_d_ops_evidence_installed",
+    "lane_d_ops_evidence_refused",
+    "lane_d_ops_ledger_current",
+    "lane_d_ops_ledger_planned",
+    "lane_d_ops_ledger_written",
+    "lane_d_ops_ledger_failed",
+    "lane_d_ops_king_ok",
+    "lane_d_ops_king_unpublished",
+    "lane_d_ops_king_check_failed",
+    "lane_d_ops_house_source_current",
+    "lane_d_ops_house_source_planned",
+    "lane_d_ops_house_source_installed",
+    "lane_d_ops_house_source_refused",
+    "lane_d_ops_king_publish_current",
+    "lane_d_ops_king_publish_planned",
+    "lane_d_ops_king_published",
+    "lane_d_ops_king_publish_blocked",
+    "lane_d_ops_king_publish_failed",
+    "lane_d_ops_takedown_planned",
+    "lane_d_ops_takedown_done",
+    "lane_d_ops_takedown_failed",
+)

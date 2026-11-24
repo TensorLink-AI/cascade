@@ -86,11 +86,13 @@ def _add_build_args(p: argparse.ArgumentParser) -> None:
                         "Raise --max-channels alongside, and arm [scoring] mv_score_from_block.")
     p.add_argument("--max-channels", type=int, default=32,
                    help="Max variates a kept series may carry (raise with --mv-pack).")
-    p.add_argument("--max-series-per-domain", type=int, default=800)
+    # Reviewed lane-A caps (2026-11-23: 800/400 -> 1500/750, ~10k-series
+    # snapshot); publish-pool.yml must pass the same values (pinned by test).
+    p.add_argument("--max-series-per-domain", type=int, default=1500)
     p.add_argument(
         "--max-series-per-domain-freq",
         type=int,
-        default=400,
+        default=750,
         help="Cap per (domain, granularity) cell — an hourly flood inside a domain "
         "can't crowd out that domain's daily series.",
     )

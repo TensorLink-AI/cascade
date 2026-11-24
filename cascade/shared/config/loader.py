@@ -11,7 +11,7 @@ from pathlib import Path
 from .chain_config import ChainConfig
 from .generation import parse_generation
 from .lane_c import parse_lane_c
-from .lane_d import parse_lane_d
+from .lane_d import RETIRED_LANE_D_KEYS, parse_lane_d
 from .marketcast import check_marketcast_arming, parse_marketcast
 from .money import parse_money_safety, parse_validator_cache
 from .reliability import parse_reliability
@@ -22,7 +22,6 @@ from .scoring import (
     _bench_gate_tolerance,
     _bench_gate_win_rate,
     _gift_gate_mode,
-    _init_gate_mode,
     _margin_mode,
     check_margin_v2,
     check_shared_ladder,
@@ -98,9 +97,20 @@ RETIRED_KEYS: dict[str, frozenset[str]] = {
         "dedup_max_tokens", "duel_from_block", "funded_activation_block",
     }),
     "telemetry": frozenset({"scratch_shadow_every_rounds"}),
+    # rev6.18 B12: the DEC-CA-0034 init gate's mode / tolerance. Its legacy
+    # shadow window is [scoring] init_gate_retired_from_block.
+    "scoring": frozenset({"init_gate_mode", "init_gate_tolerance"}),
+    # rev6.18 B11: confirm_on_king_change and the DEC-CA-0062 keys.
+    "lane_d": RETIRED_LANE_D_KEYS,
     # Parsed by older releases (hf_cache_seconds was REQUIRED there), read by none.
     "eval": frozenset({"eval_source"}),
     "validator": frozenset({"hf_cache_seconds"}),
+    # DEC-CA-0073 (owner 2026-11-24): lane C / MarketCast pay is the
+    # gain-scaled full-pay duration ([lane_c] full_pay_min_days /
+    # full_pay_max_days / full_pay_max_gain); the gain-tiered period, its
+    # decay and the TTL are gone. Overlays naming these are refused.
+    "lane_c": frozenset({"full_pay_tiers", "half_life_rounds", "floor", "win_ttl_eras"}),
+    "marketcast": frozenset({"full_pay_tiers"}),
 }
 
 
@@ -398,13 +408,12 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
         kind_from_blocks={"mkt": int(marketcast.from_block)},
         era_blocks_at=lambda b: max(1, _ebp if (_eab and _ebp and 0 < b < _eab) else _eb)
         * max(1, _era_settlements))
-    # An mkt: win pays through a lane-C slot (lane C's TTL): its tiered
-    # full-pay period must not outlive it (checked armed or not, like lane C).
-    _lc_ttl = int(lane_c.win_ttl_eras)
-    if _lc_ttl and any(n > _lc_ttl for _, n in marketcast.full_pay_tiers):
-        raise ValueError(f"[marketcast] full_pay_tiers {list(marketcast.full_pay_tiers)}: "
-                         f"full_eras exceeds [lane_c] win_ttl_eras={_lc_ttl} (an mkt: win "
-                         "pays through a lane-C slot)")
+    # DEC-CA-0073: an mkt: win's pay-duration ramp starts at
+    # [marketcast] gain_margin, so it must lie below [lane_c] full_pay_max_gain
+    if not float(marketcast.gain_margin) < float(lane_c.full_pay_max_gain):
+        raise ValueError(f"[marketcast] gain_margin={marketcast.gain_margin} must be < "
+                         f"[lane_c] full_pay_max_gain={lane_c.full_pay_max_gain} (the mkt: "
+                         "pay-duration ramp runs from the margin to the max gain)")
 
     cfg = ChainConfig(
         schema_version=schema,
@@ -641,10 +650,10 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
             # DEC-CA-0061 rule v2 thresholds
             bench_gate_tolerance=_bench_gate_tolerance(s.get("bench_gate_tolerance", 0.01)),
             bench_gate_min_win_rate=_bench_gate_win_rate(s.get("bench_gate_min_win_rate", 0.5)),
-            # DEC-CA-0034 (parsing added with DEC-CA-0035's loader sweep —
-            # same landed-without-parsing defect as the [training] knobs)
-            init_gate_mode=_init_gate_mode(s.get("init_gate_mode", "off")),
-            init_gate_tolerance=float(s.get("init_gate_tolerance", 0.0)),
+            # rev6.18 B12: the DEC-CA-0034 init gate is retired; its legacy
+            # shadow floor runs only on rounds before this block.
+            init_gate_retired_from_block=max(
+                0, int(s.get("init_gate_retired_from_block", 0) or 0)),
             margin_mode=_margin_mode(s.get("margin_mode", "level")),
             margin_increment_floor=float(s.get("margin_increment_floor", 0.01)),
             cascade_enabled=bool(s.get("cascade_enabled", False)),
