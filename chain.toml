@@ -396,7 +396,7 @@ funded_capacity_reserve = 1     # retired (ignored)
 # more and rent only when a miner names them (--gpu, own --max-price).
 # Blackwell (4xB200, 8xB200, 4xB300, 8xB300) waits on a torch cu12.8 image:
 # the pinned image is torch 2.4.1 cu124, which cannot run on B200/B300.
-funded_pod_skus = ["8xH200", "8xH100", "4xH200", "4xH100"]
+funded_pod_skus = ["8xH100", "8xH200"]
 # Never rent executors whose CPU model contains any of these (case-insensitive
 # substring of Lium's specs.cpu.model). 2026-09-13/14: four legs stalled —
 # zero series inside the 1800 s stall window — and all four sat on Xeon
@@ -473,7 +473,7 @@ dispatch_reattach_grace_seconds = 900
 # capacity takes an OPERATOR final lane from hosts.toml the moment one is on
 # file — operator-billed for that leg only; legs already running on their
 # payer's pod are untouched. false ⇒ funded legs never run on operator lanes.
-funded_operator_fallback = false
+funded_operator_fallback = true
 # Direct submissions + champion-only publication (DEC-CA-0036, second half;
 # SHIPPED INERT): code POSTs straight to cascade-intake (same request as the
 # Lium key), lives in the operator-private store below, and rides the chain as
@@ -990,7 +990,7 @@ pool_s3_region   = ""
 # HuggingFace-Hub dataset used as a manifest/receipt fallback ONLY during a
 # Hippius S3 outage (cascade.shared.hippius.HFFallbackStore). Make it a public
 # dataset; auth via HF_TOKEN. Empty = no fallback.
-hf_backup_repo   = ""                               # e.g. "yourorg/cascade-manifests-mirror"
+hf_backup_repo   = "tensorlink-dev/cascade-backup"   # live since 2026-09-14 (S0a, typed from the deployed file)
 # S3-compatible BACKUP of the manifest/receipt bucket: dual-writes every object
 # and serves reads when Hippius S3 is down. Credentials via
 # BACKUP_S3_ACCESS_KEY / BACKUP_S3_SECRET_KEY.

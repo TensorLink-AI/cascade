@@ -53,6 +53,9 @@ Main now carries the deployed values (main <- deployed):
 | `[round] funded_sku_wall_measured_image` | `sha256:5d41d94b…a67641` (rc15) |
 | `[training] budget_denomination_after` / `_block` | `"points+mv20"` / 9165600 (owner decision) |
 | `[static_guard] packed_sources` / `_from_block` | `"reject"` / 9169200 (owner decision) |
+| `[round] funded_pod_skus` | `["8xH100", "8xH200"]` (folded from #532, owner 2026-11-24) |
+| `[round] funded_operator_fallback` | `true` (folded from #532) |
+| `[storage] hf_backup_repo` | `"tensorlink-dev/cascade-backup"` (folded from #532) |
 
 ## Operator-only keys (19): no edit, no marker
 
