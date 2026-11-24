@@ -59,8 +59,24 @@ def _chain(base):
     return s1, s2
 
 
-def test_refused_latest_is_skipped_and_the_successor_chains_from_it():
+def _nc():
+    """``cascade.shared.netconfig`` with the #911 owner-tool API; its absence
+    (a base without this change) is an assertion failure, not a crash."""
+    import inspect
+
     from cascade.shared import netconfig as nc
+
+    assert hasattr(nc, "newest_valid"), "netconfig.newest_valid missing (#911)"
+    params = inspect.signature(nc.plan_overlay).parameters
+    assert "in_force" in params and "allow_lane_off" in params, (
+        "plan_overlay takes no in_force / allow_lane_off (#911)")
+    names = {f.name for f in __import__("dataclasses").fields(nc.OverlayPlan)}
+    assert {"in_force", "changes", "lanes"} <= names, "OverlayPlan lacks #911 fields"
+    return nc
+
+
+def test_refused_latest_is_skipped_and_the_successor_chains_from_it():
+    nc = _nc()
 
     base = shipped_cfg()
     s1, s2 = _chain(base)
@@ -87,7 +103,7 @@ def test_refused_latest_is_skipped_and_the_successor_chains_from_it():
 
 
 def test_dropped_restatement_shows_and_an_implicit_lane_off_is_refused():
-    from cascade.shared import netconfig as nc
+    nc = _nc()
 
     base = shipped_cfg()
     s1, s2 = _chain(base)
@@ -104,10 +120,14 @@ def test_dropped_restatement_shows_and_an_implicit_lane_off_is_refused():
     allowed = nc.plan_overlay(base, _kill_omit(), EFF, s2, in_force=s1, allow_lane_off=True)
     assert allowed.ok, allowed.render()
     assert any("LANE D" in w and "allowed" in w for w in allowed.warnings)
+    # the guard is the owner's: the omitting overlay still VALIDATES on a node
+    # (DEC-CA-0057 snapshots), so the tool is the only place it is caught
+    body = nc.next_overlay(_kill_omit(), EFF, s2, network=nc.network_identity(base))
+    assert int(nc.validate_overlay(base, body).lane_d.from_block) == 0
 
 
 def test_an_explicit_lane_d_kill_is_allowed_and_reported():
-    from cascade.shared import netconfig as nc
+    nc = _nc()
 
     base = shipped_cfg()
     s1, _ = _chain(base)
@@ -119,7 +139,7 @@ def test_an_explicit_lane_d_kill_is_allowed_and_reported():
 
 
 def test_share_moves_and_unchanged_restatements():
-    from cascade.shared import netconfig as nc
+    nc = _nc()
 
     base = shipped_cfg()
     s1, _ = _chain(base)
@@ -133,18 +153,6 @@ def test_share_moves_and_unchanged_restatements():
     assert "LANE B SHARE: 0.35 -> 0.3" in moved.lanes
     assert "LANE D SHARE: 0.5 -> 0.45" in moved.lanes
     assert "[lane_d] share: 0.5 -> 0.45" in moved.changes
-
-
-def test_validate_overlay_and_build_are_unchanged_by_the_guard():
-    """The guard is the owner's: the omitting overlay still VALIDATES on a node
-    (DEC-CA-0057 snapshots), so the tool is the only place it can be caught."""
-    from cascade.shared import netconfig as nc
-
-    base = shipped_cfg()
-    s1, s2 = _chain(base)
-    body = nc.next_overlay(_kill_omit(), EFF, s2, network=nc.network_identity(base))
-    built = nc.validate_overlay(base, body)
-    assert int(built.lane_d.from_block) == 0
 
 
 # ── the wrapper (cascade-laned overlay publish) ──────────────────────────────
@@ -177,6 +185,7 @@ def _vals(out: str, tag: str) -> list[str]:
 
 
 def test_wrapper_after_a_refused_overlay(tmp_path, capsys):
+    _nc()
     base = shipped_cfg()
     s1, s2 = _chain(base)
     prev, held = _write(tmp_path, "s2.json", s2), _write(tmp_path, "s1.json", s1)
@@ -200,6 +209,7 @@ def test_wrapper_after_a_refused_overlay(tmp_path, capsys):
 
 
 def test_wrapper_refuses_an_implicit_lane_off_unless_allowed(tmp_path, capsys):
+    _nc()
     base = shipped_cfg()
     s1, s2 = _chain(base)
     prev, held = _write(tmp_path, "s2.json", s2), _write(tmp_path, "s1.json", s1)
@@ -221,8 +231,8 @@ def test_wrapper_refuses_an_implicit_lane_off_unless_allowed(tmp_path, capsys):
 
 def test_validator_dry_run_judges_against_the_newest_valid_body(tmp_path, monkeypatch,
                                                                  capsys):
+    nc = _nc()
     from cascade.shared import hippius
-    from cascade.shared import netconfig as nc
     from cascade.validator import main as vm
 
     base = shipped_cfg()
