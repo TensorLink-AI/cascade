@@ -29,6 +29,7 @@ internally-reproducible digest schemes — ``corpus_mode`` is in
 
 from __future__ import annotations
 
+import abc
 import contextlib
 import hashlib
 import itertools
@@ -133,8 +134,12 @@ def _inprocess_stream(
         yield validator.process(item, i)
 
 
-class RoundStream:
-    """Context manager: ``series()`` plus digest / counts read after consumption."""
+class RoundStream(abc.ABC):
+    """Context manager: ``series()`` plus digest / counts read after consumption.
+
+    An abstract base: every concrete stream (``_CacheReuseStream``,
+    ``_FreshSeriesStream``, ``_ShardStream``, ``_SeedMixStream``) implements
+    the four abstract members."""
 
     def __enter__(self) -> RoundStream:
         return self
@@ -142,23 +147,27 @@ class RoundStream:
     def __exit__(self, *exc: object) -> None:
         self.close()
 
-    def close(self) -> None:
-        pass
+    def close(self) -> None:  # noqa: B027 — optional hook, deliberately not abstract
+        """Release the stream's resources; the base stream holds none."""
 
+    @abc.abstractmethod
     def series(self) -> Iterator[np.ndarray]:  # pragma: no cover - abstract
-        raise NotImplementedError
+        """The corpus series in training order, up to the token budget."""
 
     @property
+    @abc.abstractmethod
     def digest(self) -> str:  # pragma: no cover - abstract
-        raise NotImplementedError
+        """The rolling digest of the consumed series."""
 
     @property
+    @abc.abstractmethod
     def n_series(self) -> int:  # pragma: no cover - abstract
-        raise NotImplementedError
+        """How many series were consumed."""
 
     @property
+    @abc.abstractmethod
     def total_points(self) -> int:  # pragma: no cover - abstract
-        raise NotImplementedError
+        """How many points (in the budget denomination) were consumed."""
 
 
 class _CacheReuseStream(RoundStream):
