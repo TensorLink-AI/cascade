@@ -178,5 +178,5 @@ def test_fixture_forbidden_names_cover_the_producer_modules():
               "cascade.shared.emission", "cascade.shared.chain", "cascade.audit.lane_d",
               "cascade.eval.lane_d_scorer", "torch"):
         assert forbidden(m), m
-    for m in ALLOWED_PRIMITIVES + ("cascade.satellite.lane_d_replay", "numpy", "hashlib"):
+    for m in ALLOWED_PRIMITIVES + ("cascade.audit.lane_d_chain", "numpy", "hashlib"):
         assert not forbidden(m), m

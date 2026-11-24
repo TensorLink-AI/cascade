@@ -17,3 +17,12 @@ cascade/validator/main.py
 # lane D's part always in emission_vector's second argument (RV3 note 10).
 # No lane_d* import here (invariant 12).
 cascade/validator/weights.py
+# rev6.18 B1 (owner 2026-11-23): the satellite path. At a settlement lane D
+# pays, the satellite reads the lane D record and the audit's one lane D
+# checker decides it (the lane_d row); a burn-class failure burns lane D's
+# share ONLY (lanes A/B/C set as derived), an alert-class one is logged
+# (lane_d_check_alert) and the signed court stays paid.
+cascade/validator/satellite.py
+# rev6.18 B2: the published-chain replay test reads the chain rules at their
+# new home (the former cascade/satellite/lane_d_replay.py).
+cascade/audit/lane_d_chain.py

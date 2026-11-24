@@ -19,4 +19,4 @@ cascade/validator/lane_d_status.py
 # cascade/satellite/lane_d_replay.py), so an honest first-verdict crown is
 # audited and replayed as such and no report carries confirm_on_king_change.
 cascade/audit/lane_d.py
-cascade/satellite/lane_d_replay.py
+cascade/audit/lane_d_chain.py
