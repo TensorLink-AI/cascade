@@ -344,7 +344,7 @@ and the lane-C manifests the rows name. It checks:
   than an hour off the anchor is noted;
 - with the published snapshot (`--mkt-snapshots DIR` on `cascade-audit
   marketcast`): the report's window set EQUALS the set the entry's signed
-  DEC-CA-0073 draw re-cuts (`snapshot_windows`) — nothing omitted, nothing
+  DEC-CA-0074 draw re-cuts (`snapshot_windows`) — nothing omitted, nothing
   added. Always: the draw is the rule's (re-derived from `train_time`, the
   row's `round_block`, the phase and `fresh_after`), its block hash the
   chain's (`--network`; `--no-chain` WARNs), every backtest window lies

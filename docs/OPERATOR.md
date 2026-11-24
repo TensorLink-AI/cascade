@@ -2290,7 +2290,7 @@ tests).
 **No recording lead time** (owner 2026-11-10). A series at frequency `f` is
 cut from the COARSEST bank whose interval divides `f`: the 1-minute bars
 (`snapshot_days`, 30 — a 32768-step 1m context is 22.8 days; the
-DEC-CA-0073 draw reads the 28 days before a dispatch), a native 5m / 15m bank (`native_history_days`: 121 / 348) or
+DEC-CA-0074 draw reads the 28 days before a dispatch), a native 5m / 15m bank (`native_history_days`: 121 / 348) or
 the hourly bank (`coarse_history_days`, 1372). Each bank is sized for the
 full `eval_context_length` (32768, owner 2026-11-21); bars neither the API
 nor the recording holds stay NaN, so a window's context is as long as the
@@ -2309,7 +2309,7 @@ time anchor. It goes to `pool_mkt/snapshots/block-<N>.tar` plus
 `pool_mkt/index.json` in the pool bucket. Publish often: an entry's windows exist only once a snapshot
 covering them is active (its embargo draw up to the dispatch, its forward
 windows after it). An inconclusive entry waits up to `verdict_wait_blocks`
-(capped at 3900 = 13 h, DEC-CA-0073). The trainer also reads the snapshot
+(capped at 3900 = 13 h, DEC-CA-0074). The trainer also reads the snapshot
 active at a dispatch to scan a generator tree for embargoed bars
 (`embargo_series_embedded`) before it rents.
 
@@ -2364,7 +2364,7 @@ per asset.
 The loader refuses a configuration with an unscorable (suite, horizon): the
 history of the bank its frequency is cut from (`coarse_history_days`,
 `native_history_days` or `snapshot_days`) must hold the 32-step context + the
-horizon. Arming (DEC-CA-0073, `draw_problems`) also needs the
+horizon. Arming (DEC-CA-0074, `draw_problems`) also needs the
 `embargo_eval_days` span to hold ONE aligned window of every horizon (≥ 2 ×
 the horizon) and `min_time_blocks` blocks, a forward horizon to fit
 `verdict_wait_blocks` × 12 s − `start_margin_seconds`, and `embargo_days` ≥ 2.
@@ -2372,7 +2372,7 @@ the horizon) and `min_time_blocks` blocks, a forward horizon to fit
 **The horizon grid** (owner 2026-11-18). A horizon is `<bar>x<steps>`: a
 path of `steps` bars of `<bar>`; every shipped suite is scored on every
 timeframe (`[marketcast.frequencies]` / `[marketcast.horizons]` in both
-tomls). Owner 2026-11-24 (DEC-CA-0073): every timeframe is DRAWN from the
+tomls). Owner 2026-11-24 (DEC-CA-0074): every timeframe is DRAWN from the
 embargo (`pool.marketcast.embargo_draw`): per (asset, series, horizon) the
 `backtest_windows_per_cell` (48) best-ranked windows by
 sha256(rule | round block hash | window id), lying wholly in the

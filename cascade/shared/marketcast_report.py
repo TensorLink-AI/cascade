@@ -159,7 +159,7 @@ class MktEntryRows:
     # "pointer", "quantiles_key", "quantiles_sha256"} ({} = none measured);
     # the per-window losses are the rows' ``hold``
     holder: dict = field(default_factory=dict)
-    # DEC-CA-0073: the window draw (cascade.pool.marketcast.embargo_draw: rule,
+    # DEC-CA-0074: the window draw (cascade.pool.marketcast.embargo_draw: rule,
     # round block + hash, spans, counts; {} = none, the plain forward cut) —
     # the windows are re-derived from it and the snapshot
     draw: dict = field(default_factory=dict)
@@ -559,7 +559,7 @@ def composite_from_rows(rows: MktEntryRows, mc, *, k: int, seed: str, levels,
 
 
 def kind_scores(rows: MktEntryRows, mc, *, suite: str, k: int, seed: str) -> dict:
-    """DEC-CA-0073 (c): the verdict's numbers on the FORWARD and the BACKTEST
+    """DEC-CA-0074 (c): the verdict's numbers on the FORWARD and the BACKTEST
     windows of a draw separately — reported, never gating (the verdict
     is the combined set's). ``{}`` without a draw."""
     from ..pool.marketcast import window_kind

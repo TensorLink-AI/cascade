@@ -63,7 +63,7 @@ EB = 7200
 BLOCK = 20 * EB
 T0 = int(datetime(2026, 9, 1, tzinfo=UTC).timestamp())
 # BLOCK ↔ T0 + ~3333 minutes: 55 h of embargo history before the legs' dispatch
-# (DEC-CA-0073: the windows are drawn from it) and 27 h after
+# (DEC-CA-0074: the windows are drawn from it) and 27 h after
 ANCHOR_T = T0 + 200_000
 ASSETS = ("BTC", "ETH", "SOL", "XRP", "HYPE", "BNB")
 UIDS = {"alice": 7, "carol": 9, "dave": 10, "erin": 11}
@@ -172,7 +172,7 @@ def _entry(hk, *, train_block=BLOCK - 100, base_sha=None, ckpt=None, target="mkt
                                   "checkpoint_sha256": ckpt or hashlib.sha256(
                                       hk.encode()).hexdigest(),
                                   "train_time": _tt(train_block),
-                                  # DEC-CA-0073: the trainer's pre-rent embargo scan
+                                  # DEC-CA-0074: the trainer's pre-rent embargo scan
                                   "embargo_scan": {"rule": "embargo-v1",
                                                    "result": "no_generator"}})
 
@@ -318,7 +318,7 @@ def test_register_record_judge_confirm_and_slot(cfg, tmp_path):
     assert not c["passed"] and c["outcome"] == "dropped"
     a3 = {(x["hotkey"], x["phase"]): x for x in rows3 if "error" not in x}[("alice", "confirm")]
     assert a3["outcome"] == "confirmed" and a3["mkt"]["fresh_after"] == float(f.s1.end)
-    # DEC-CA-0073: the judge drew from the embargo before the dispatch, by the
+    # DEC-CA-0074: the judge drew from the embargo before the dispatch, by the
     # registering round's hash; the confirm from the OTHER half (never a window
     # its judge scored) plus forwards after the judge snapshot
     d1, d2 = rep1.entries[0].draw, rep2.entries[0].draw
@@ -347,7 +347,7 @@ def test_register_record_judge_confirm_and_slot(cfg, tmp_path):
                                    if k.startswith("lane_c/")},
               "quantiles": {k: v for k, v in f.store.objs.items() if k.endswith(".npy")},
               "snapshots": {f.s1.digest: f.s1, f.s2.digest: f.s2},
-              # DEC-CA-0073: the chain's hash of every draw's round block
+              # DEC-CA-0074: the chain's hash of every draw's round block
               "block_hashes": {b: _bhash(b) for b in (BLOCK, BLOCK + EB, BLOCK + 2 * EB)}}
     bad = {**inputs, "block_hashes": {**inputs["block_hashes"], BLOCK: _bhash(1)}}
     res = check_marketcast(rcs[1], f.r.cfg, reps, **bad)
@@ -622,7 +622,7 @@ def test_inconclusive_entries_wait_then_drop(cfg, tmp_path):
                 history=_history([late], {"dave": late.train_block - 100}))
     _rows(r, _settle(store, "1001", [late]))
     out = []
-    # DEC-CA-0073: an inconclusive entry waits at most verdict_wait_blocks,
+    # DEC-CA-0074: an inconclusive entry waits at most verdict_wait_blocks,
     # capped at 3900 (13 h) whatever the table says
     assert MC.verdict_wait_blocks == 2 * EB and MC.wait_blocks == 3900
     # each settlement judges the round the previous one registered (3 h grid)

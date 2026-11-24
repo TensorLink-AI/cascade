@@ -20,7 +20,7 @@ lane C (review fixes 2026-10-19):
 2. **Rows** (the DEC-CA-0063 pattern). The MAIN validator (``[netconfig]
    owner_hotkey``) computes each round's rows once, on its GPU: the signed
    snapshot active at the round's block, the entry's DRAWN windows
-   (DEC-CA-0073, :func:`entry_draw`: per (asset, series, horizon) the
+   (DEC-CA-0074, :func:`entry_draw`: per (asset, series, horizon) the
    ``backtest_windows_per_cell`` best-ranked by the round block's hash, lying
    wholly in the ``embargo_eval_days`` before the TRAINER-stamped dispatch —
    bars no leg reads — in the judge or confirm half of a fixed public
@@ -155,14 +155,14 @@ def mkt_train_time(entry: LaneCEntry) -> float | None:
     return t if math.isfinite(t) and t > 0 else None
 
 
-# DEC-CA-0073: the trainer's embargo contamination receipt results an entry
+# DEC-CA-0074: the trainer's embargo contamination receipt results an entry
 # may carry (anything else, or none, and it is not judged on the embargo)
 EMBARGO_SCAN_OK = ("clean", "no_generator")
 EMBARGO_EMBEDDED = "embargo_series_embedded"
 
 
 def embargo_scan_problem(entry: LaneCEntry) -> tuple[str, str] | None:
-    """DEC-CA-0073 guard (b) on the validator: an entry is judged on
+    """DEC-CA-0074 guard (b) on the validator: an entry is judged on
     embargo windows only if its trainer-signed ``marketcast`` record carries
     the trainer's pre-rent embargo scan (``embargo_scan``) with a passing
     result. ``embedded`` is the miner's ``fault``; a missing / unknown
@@ -180,7 +180,7 @@ def embargo_scan_problem(entry: LaneCEntry) -> tuple[str, str] | None:
 
 def mkt_prechecks(entry: LaneCEntry, *, lc, mc, commitments) -> tuple[str, str] | None:
     """``(stage, reason)`` of the first failed pre-check, or None (the last
-    is the DEC-CA-0073 embargo-scan receipt, :func:`embargo_scan_problem`)."""
+    is the DEC-CA-0074 embargo-scan receipt, :func:`embargo_scan_problem`)."""
     if entry.target not in lc.targets or suite_of(entry.target) not in mc.target_suites:
         return "target", f"{entry.target!r} is not an enabled MarketCast target"
     m = dict(entry.marketcast or {})
@@ -214,7 +214,7 @@ def entry_after(entry: LaneCEntry, mc, *, fresh_after: float = 0.0) -> float:
 
 def entry_draw(entry: LaneCEntry, mc, *, phase: str, block: int, block_hash: str,
                fresh_after: float = 0.0) -> dict:
-    """DEC-CA-0073: the entry's signed draw record at round ``block``
+    """DEC-CA-0074: the entry's signed draw record at round ``block``
     (:func:`cascade.pool.marketcast.embargo_draw`): backtests from the
     embargo before its trainer-stamped dispatch, forwards after
     :func:`entry_after`."""
@@ -229,7 +229,7 @@ def entry_draw(entry: LaneCEntry, mc, *, phase: str, block: int, block_hash: str
 
 def _draw_mismatch(entry: LaneCEntry, rows: MktEntryRows, mc, *, phase: str, block: int,
                    fresh_after: float) -> str:
-    """Why the rows' signed draw is not the DEC-CA-0073 rule's for ``entry``
+    """Why the rows' signed draw is not the DEC-CA-0074 rule's for ``entry``
     at round ``block`` (``""`` = it is). Pure; the block hash is taken from
     the rows (the main validator read it; ``cascade-audit`` checks it on
     chain)."""
@@ -378,7 +378,7 @@ def judge_marketcast_entry(entry: LaneCEntry, rows: MktEntryRows | None, *, mc, 
     if vs is not None:
         rec["vs_holder"] = vs        # owner 2026-11-18: the paired slot test
     if getattr(rows, "draw", None):
-        # DEC-CA-0073 (c): which rule drew the windows, and the forward /
+        # DEC-CA-0074 (c): which rule drew the windows, and the forward /
         # backtest sub-scores (reported; the verdict is the combined set's)
         rec["draw"] = {k_: rows.draw.get(k_) for k_ in ("rule", "block", "block_hash", "phase",
                                                          "lo", "hi", "n")}
@@ -474,7 +474,7 @@ def compute_entry_rows(entry: LaneCEntry, *, phase: str, after: float, snap, mc,
     digest, window id)`` (the F4 near-duplicate test reuses them). Losses
     come from the float32 quantiles the sidecar publishes
     (:func:`~cascade.shared.marketcast_report.score_windows`). ``draw``
-    (DEC-CA-0073, :func:`entry_draw`) is the windows' signed draw; it rides
+    (DEC-CA-0074, :func:`entry_draw`) is the windows' signed draw; it rides
     the rows (None = the plain forward-only cut after ``after``: tests)."""
     from ..eval.marketcast import COVERAGE_GATE_SUITES
     from ..eval.timestral_adapter import batched_forecasts
@@ -758,7 +758,7 @@ class MarketCastMixin:
 
     mkt_forecaster_fn: Callable | None = None
     mkt_snapshot_fn: Callable | None = None
-    # DEC-CA-0073: ``block -> 0x hash`` of a round block (tests; None = chain)
+    # DEC-CA-0074: ``block -> 0x hash`` of a round block (tests; None = chain)
     mkt_block_hash_fn: Callable | None = None
     # GPU offload (cascade.validator.mkt_offload): the hosts file the
     # provisioner's [provisioner.mkt] stage publishes (None = forecast on
@@ -803,7 +803,7 @@ class MarketCastMixin:
         return src.snapshot_for(block)
 
     def _mkt_block_hash(self, block: int) -> str:
-        """The hash of ``block`` (DEC-CA-0073 draw seed): ``mkt_block_hash_fn``
+        """The hash of ``block`` (DEC-CA-0074 draw seed): ``mkt_block_hash_fn``
         (tests) or the loop's chain client."""
         fn = self.mkt_block_hash_fn
         if fn is not None:
@@ -1230,7 +1230,7 @@ class MarketCastMixin:
                                              f"trainer's dispatch time gives "
                                              f"{entry_after(e, mc, fresh_after=fresh)}")
                     elif not rows.deferred:
-                        # DEC-CA-0073: the signed draw must be the rule's for
+                        # DEC-CA-0074: the signed draw must be the rule's for
                         # this round, entry and phase (the hash is the audit's)
                         why_d = _draw_mismatch(e, rows, mc, phase=phase, block=B,
                                                fresh_after=fresh)
@@ -1417,7 +1417,7 @@ class MarketCastMixin:
             return False
         snap, skey, ssha = got
         try:
-            # DEC-CA-0073: the round block's hash ranks the embargo draw (it
+            # DEC-CA-0074: the round block's hash ranks the embargo draw (it
             # did not exist while the legs trained)
             bhash = self._mkt_block_hash(int(item["block"]))
         except Exception as e:  # noqa: BLE001 — a chain read: retried next settlement
