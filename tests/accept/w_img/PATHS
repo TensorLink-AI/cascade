@@ -33,6 +33,14 @@ cascade/trainer/lane_c_driver.py
 cascade/validator/lane_d.py
 cascade/validator/lane_d_inputs.py
 cascade/validator/lane_d_wiring.py
+# The unmeasured-image wall cap (owner 2026-11-24, "YES to the 5 h cap"):
+# [round] unmeasured_image_wall_cap_seconds, the rent sites, the leg wall
+# estimate, the watchdog and the completed-leg record.
+cascade/shared/config/rounds.py
+cascade/trainer/cost_guards.py
+cascade/trainer/runner_capacity.py
+cascade/trainer/runner_funded_pods.py
+cascade/trainer/runner_operator_pods.py
 # The decision record and the operator runbook.
 decisions/DEC-CA-0067-image-decoupled-training-contract.md
 docs/OPERATOR.md

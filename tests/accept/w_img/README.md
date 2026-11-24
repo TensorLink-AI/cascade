@@ -22,8 +22,16 @@ reproducibility-contract decision, signed off by the owner.**
   - that image is the same for the whole seed epoch;
   - it changes only at a seed-epoch boundary.
   There is no fixed validator pin. The trainer binds the `[v2] *_after`
-  release at the next seed-epoch start. The measured-wall gate and the
-  qualification record stay per image.
+  release at the next seed-epoch start. The qualification record stays per
+  image.
+- **Unmeasured walls** (owner 2026-11-24, "YES to the 5 h cap"). A funded or
+  king rent on an image with no measured pod walls is rented instead of
+  refused:
+  - the leg wall is capped at `[round] unmeasured_image_wall_cap_seconds`
+    (18000);
+  - the leg's record carries `walls_measured: false` and the cap;
+  - 0 restores the old refusal.
+  Measured images are unchanged.
 - **Lanes B, C, D.** The image is recorded, never enforced:
   - `ExpertEntry.train_image_digest`;
   - `LaneCEntry.train_image_digest`;
@@ -47,6 +55,9 @@ reproducibility-contract decision, signed off by the owner.**
   - byte-identity before activation.
 - `test_w_img_lanes_bcd.py`: lanes B, C and D record the image, dropped when it
   is the default.
+- `test_w_img_wall_cap.py`: a measured image is unchanged, an unmeasured one
+  rents under the cap (the leg wall, the watchdog and the record), and cap 0
+  refuses as before.
 - `test_w_img_config.py`: the loader, the shipped files are off, and the keys
   are release-only.
 

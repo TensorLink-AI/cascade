@@ -509,6 +509,10 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
                 else RoundConfig.funded_sku_wall_seconds),
             funded_sku_wall_measured_image=validate_measured_image(
                 r.get("funded_sku_wall_measured_image", "")),
+            unmeasured_image_wall_cap_seconds=validate_nonneg_seconds(
+                "unmeasured_image_wall_cap_seconds",
+                r.get("unmeasured_image_wall_cap_seconds",
+                      RoundConfig.unmeasured_image_wall_cap_seconds)),
             progress_watchdog_grace_seconds=validate_nonneg_seconds(
                 "progress_watchdog_grace_seconds",
                 r.get("progress_watchdog_grace_seconds",

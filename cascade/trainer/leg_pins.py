@@ -98,6 +98,19 @@ def leg_round(runner):
     return round_pins_at(cfg, image_after_from(cfg))
 
 
+def leg_round_view(runner):
+    """:func:`leg_round` for PLANNING only (the leg wall estimate): the same
+    pins, without the qualification refusal (no log, never raises for it —
+    the rent itself still goes through :func:`leg_round`)."""
+    cfg = runner.cfg
+    mc = getattr(cfg, "marketcast", None)
+    if getattr(_local(runner), "mkt_leg", False) and getattr(mc, "pod_image", ""):
+        return leg_round(runner)
+    if not contract_runs_after(cfg, leg_contract(runner)):
+        return cfg.round
+    return round_pins_at(cfg, image_after_from(cfg))
+
+
 def proven_runtime_terms(cfg, contract, digest: str) -> tuple[str, str] | None:
     """DEC-CA-0067: the PROVEN ``(train_image_digest, continuation_protocol)``
     of a leg that recorded the full ``digest`` against ``contract``, else

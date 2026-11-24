@@ -566,8 +566,12 @@ update for major upgrades, not if we tweak training image or comp rules";
   `image_epoch_state.json` and applied as `[v2] image_after_epoch_block`
   (`era.image_after_from` generalises the switch block for `round_pins_at`,
   `bind_image_after`, `leg_pins`, the rendered worker chain.toml and the
-  MarketCast leg kwarg). The measured-wall gate and the qualification record
-  still apply per after image.
+  MarketCast leg kwarg). The qualification record still applies per after
+  image. **Unmeasured walls (owner 2026-11-24, "YES to the 5 h cap"):** a
+  funded or king rent on an image with no measured pod walls rents with
+  every leg wall capped at `[round] unmeasured_image_wall_cap_seconds`
+  (18000), records `walls_measured: false` and the cap in the leg record, and
+  is no longer refused (0 = the old refusal). Measured images are unchanged.
 - **Lanes B, C, D.** From the same block the signed records log the image:
   `ExpertEntry.train_image_digest`, `LaneCEntry.train_image_digest`, and the
   lane D report's `extensions.eval_image` (eval host code identity). No

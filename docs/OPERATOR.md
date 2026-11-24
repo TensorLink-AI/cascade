@@ -247,6 +247,23 @@ Validators reject a settlement whose entries ran mixed images
 (`era_image_mixed`) or whose image changed inside a seed epoch
 (`era_image_changed`).
 
+**An image without measured pod walls (owner 2026-11-24).** If
+`[round] funded_sku_wall_measured_image` names another image than the one a
+funded leg or king pod would rent, the rent is no longer refused. Instead:
+
+- every SKU's leg wall is planned at `[round]
+  unmeasured_image_wall_cap_seconds` (default 18000 = 5 h, never above the
+  contract's `max_train_seconds`), instead of the measured table;
+- the progress watchdog holds the leg to that cap;
+- the completed-leg record carries `walls_measured: false` and
+  `wall_cap_seconds`;
+- the trainer logs `image … has NO measured pod walls — renting with the
+  leg wall capped at 18000 s`.
+
+Measure the walls on the new image and set `funded_sku_wall_measured_image`
+to return to the table. `unmeasured_image_wall_cap_seconds = 0` restores the
+old refusal. A measured image behaves exactly as before.
+
 ### Re-pinning the image inside a v2 seed epoch (DEC-CA-0067)
 
 `train_image_digest` is part of `contract_digest`. Before DEC-CA-0067 is in

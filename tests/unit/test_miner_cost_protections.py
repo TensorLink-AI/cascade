@@ -360,13 +360,22 @@ def test_measured_wall_gate_is_off_by_default_and_passes_a_match():
     assert measured_wall_refusal(RoundConfig(funded_pod_image=img)) == ""
     assert measured_wall_refusal(RoundConfig(funded_pod_image=img,
                                              funded_sku_wall_measured_image=DIGEST_C)) == ""
+    # W-IMG (owner 2026-11-24, "YES to the 5 h cap"): an unmeasured image
+    # rents under [round] unmeasured_image_wall_cap_seconds (default 18000);
+    # the old refusal is the cap set to 0
+    assert measured_wall_refusal(RoundConfig(funded_pod_image=img,
+                                             funded_sku_wall_measured_image=DIGEST_A)) == ""
     why = measured_wall_refusal(RoundConfig(funded_pod_image=img,
-                                            funded_sku_wall_measured_image=DIGEST_A))
+                                            funded_sku_wall_measured_image=DIGEST_A,
+                                            unmeasured_image_wall_cap_seconds=0))
     assert "no measured wall for the pinned image" in why
 
 
 def test_unmeasured_image_refuses_the_rent_unburned(tmp_path, monkeypatch, caplog):
-    runner = _runner(tmp_path, funded_sku_wall_measured_image=DIGEST_A)
+    # the cap off (0): today's refusal (W-IMG: the default rents under the cap,
+    # tests/accept/w_img/test_w_img_wall_cap.py)
+    runner = _runner(tmp_path, funded_sku_wall_measured_image=DIGEST_A,
+                     unmeasured_image_wall_cap_seconds=0)
     _vault(tmp_path, "hkA")
     rents = []
     monkeypatch.setattr(funded_mod, "rent_funded_pod", lambda **kw: rents.append(kw))
