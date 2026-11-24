@@ -425,3 +425,14 @@ Run locally with `-m "not torch"`. Nothing here imports torch.
 On main these tests fail on the `settle_mv` / `max_channels` assertions or
 `cannot import name` (`channel_pick` from `cascade.audit.lane_d`,
 `_lane_d_max_channels` from `cascade.audit.checks`, both in PATHS).
+
+## rev6.22: lane B weights under both pay rules (`test_w9_lane_b_indefinite_pay.py`)
+
+The audit (`_check_lane_b_weights`, via `_lane_b_paid_wins`) picks the rule by
+the settlement block: before `[lane_b] indefinite_pay_from_block` (and AT it)
+the decay + TTL rebuild is unchanged and the record must carry no `pay_rule` /
+`since_era`; after it every paid win has multiplier 1 (no TTL), the record has
+`pay_rule = "indefinite"` and each win the re-derived `since_era`. Tampered
+multipliers, a missing or spurious `pay_rule`, a wrong `since_era`, and a
+post-gate vector built under the old rule all FAIL. Receipts are built by the
+validator's own `_lane_b_vector` on the shipped chain.toml.

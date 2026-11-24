@@ -1008,6 +1008,21 @@ B example: accepted marginal gain LCB 0.02, recorded full-pay period 5 eras.
 | 28+ | 0% | 0% |
 <!-- cascade:rewards:slot-decay:end -->
 
+**Indefinite B pay (built, off; plan rev6.22, owner 2026-11-24).** From the
+era starting at `[lane_b] indefinite_pay_from_block` (shipped `0` = never;
+announced by the owner, testnet first) a B slot holder is paid **100% of its
+slot every settlement, with no decay and no 28-era expiry**, for as long as it
+holds the slot. The tier above is still recorded but no longer shortens
+pay. A holder loses the slot only when a newer leg on the same target passes
+merge acceptance, which is judged against the init that already contains
+the holder's experts, so the newer leg must improve on top of the holder. A
+tie or an inconclusive result leaves the holder in place. A deregistered
+holder's slot burns, and empty slots still burn. One leg that wins several
+targets holds each of those slots. Settlements before the activation block
+keep the decay and expiry above; each receipt's `lane_b_pay` record says
+which rule paid it (`pay_rule = "indefinite"`, plus `since_era` per holder).
+Read `cascade status --json` for the live value.
+
 C uses its own decay/expiry configuration, currently the same half-life,
 floor and TTL. When a competition ends, `finish_full_pay` permits an existing
 holder only its remaining recorded full-pay period, capped at six wind-down
@@ -1364,7 +1379,13 @@ Declare 1–3 targets under the checked-in mainnet limit
 
 The trainer measures which experts the king routes each target to and chooses
 eligible rows. Multiple targets train the union of their selections in one
-leg, with the same budget as a single-target leg. Miners do not supply expert
+leg, with the same budget as a single-target leg. Each target is judged on
+its own (at `alpha / k` for k targets), and every target that passes claims
+its own slot, so one leg can hold several slots. A guard failure blocks every
+target of the leg. Fund such a leg with `cascade lane-b fund ... --targets
+energy,h720`, or repeat `--target` once per target (for example `--target
+energy --target suite:gift` while suite targets are on). The intake and the
+local check both refuse more than `max_domains_per_leg` targets. Miners do not supply expert
 IDs. Domain selection uses context patches; horizon selection uses masked
 forecast patches and context, never the future target values.
 

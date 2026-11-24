@@ -161,3 +161,17 @@ No `tests/unit` file pins behaviour WB10 changes:
   release-only tuple doesn't break it.
 
 None is listed in `PATHS`.
+
+## rev6.22: indefinite lane B pay (`test_wb10_indefinite_pay.py`)
+
+Owner 2026-11-24: "make the pay indefinite". `[lane_b] indefinite_pay_from_block`
+(integer, default 0 = never) ships at 0 in both files. A typed value must be an
+era boundary at or after `[v2] from_block`, and `acceptance_from_block` must be
+typed at or before it (a newer leg takes a held slot only through merge
+acceptance, judged on top of the base that carries the holder). From the era
+starting at it, `lane_b_payouts` pays every held slot multiplier 1 with no TTL
+and stamps `since_era`; before it the rows are byte-identical to the decay +
+TTL rule. One hotkey may hold several slots; empty slots burn; a qualified but
+not yet accepted newer leg never moves the slot; an older accepted merge never
+displaces a newer holder. PATHS gain `cascade/shared/lane_b.py` and
+`cascade/validator/lane_b.py`.

@@ -6,6 +6,10 @@ cascade/shared/config/lane_b.py
 cascade/shared/config/__init__.py
 cascade/shared/config/loader.py
 cascade/shared/netconfig.py
+# rev6.22 indefinite lane B pay (behind [lane_b] indefinite_pay_from_block):
+# the payout rows and the validator's signed pay record.
+cascade/shared/lane_b.py
+cascade/validator/lane_b.py
 # [lane_b] defaults only; nothing armed (from_block and share unchanged).
 chain.toml
 chain.testnet.toml

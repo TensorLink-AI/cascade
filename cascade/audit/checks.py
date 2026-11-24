@@ -2453,6 +2453,16 @@ def _lane_b_paid_wins(receipt: RoundReceipt, cfg: ChainConfig,
                             abs_tol=1e-12) or int(pay.get("slots", -1)) != len(slots):
             return [], (f"lane-B pay record share/slots {pay.get('share')}/{pay.get('slots')} "
                         f"!= {want_share}/{len(slots)} with lane C")
+    # rev6.22: the rule in force at THIS settlement's block decides the
+    # re-derivation — indefinite (multiplier 1, no TTL, ``since_era``) or the
+    # decay + TTL rule (no ``pay_rule`` / ``since_era`` in the record)
+    from ..shared.lane_b import indefinite_pay_at, since_era
+
+    indefinite = indefinite_pay_at(lb, block)
+    if (pay.get("pay_rule") == "indefinite") != indefinite or (
+            "pay_rule" in pay and not indefinite):
+        return [], (f"lane-B pay_rule {pay.get('pay_rule')!r} but the rule in force at "
+                    f"block {block} is {'indefinite' if indefinite else 'decay + TTL'}")
     wins, seen = [], set()
     for w in pay.get("wins", ()):
         d, uid = str(w.get("domain")), int(w.get("uid", -1))
@@ -2465,6 +2475,24 @@ def _lane_b_paid_wins(receipt: RoundReceipt, cfg: ChainConfig,
         if int(w.get("age", -1)) != age:
             return [], (f"domain {d}: recorded age {w.get('age')} != {age} "
                         f"eras since block {w.get('merge_block')}")
+        if indefinite:
+            want_era = since_era(int(w.get("merge_block", 0)), era_blocks=eb,
+                                 round_cfg=cfg.round)
+            if w.get("since_era") != want_era or isinstance(w.get("since_era"), bool):
+                return [], (f"domain {d}: since_era {w.get('since_era')!r} != {want_era} "
+                            f"(the era of merge block {w.get('merge_block')})")
+            why = _paid_full_pay_why(
+                w, lb.full_pay_tiers, at_win=int(w.get("merge_block", -1)) == block,
+                ttl=0, state_entry=None if post is None else (post.get("lane_b") or {}).get(d))
+            if why:
+                return [], f"domain {d}: {why}"
+            if float(w.get("multiplier", -1.0)) != 1.0:
+                return [], (f"domain {d}: multiplier {w.get('multiplier')} != 1.0 under "
+                            "indefinite pay")
+            wins.append(LaneBWin(uid=uid, domain=d, multiplier=1.0))
+            continue
+        if "since_era" in w:
+            return [], f"domain {d}: since_era recorded before indefinite pay is in force"
         if win_expired(age, lb):
             return [], (f"domain {d}: win paid at age {age} eras, past "
                         f"win_ttl_eras={lb.win_ttl_eras}")
@@ -3172,7 +3200,12 @@ def _check_lane_b_weights(name: str, receipt: RoundReceipt, cfg: ChainConfig,
     re-derive from ``[lane_b]``, no win at or past ``win_ttl_eras`` is paid,
     each domain slot pays ``share / n_domains × multiplier``
     (never more), and the unpaid lane-B share goes to ``burn_uid`` (or back to
-    lane A under ``remainder = "lane_a"``). Without the record (a validator
+    lane A under ``remainder = "lane_a"``). From ``[lane_b]
+    indefinite_pay_from_block`` (rev6.22) the same rebuild runs under the
+    indefinite rule instead: every held slot pays multiplier 1 with no TTL,
+    the record names ``pay_rule = "indefinite"`` and each win its
+    ``since_era``; the rule is chosen by the settlement's block, so receipts
+    on either side of the boundary each re-derive. Without the record (a validator
     whose push fell back to the legacy vector, e.g. ``force_burn``) only the
     decomposition is checked: every lane-A recipient holds at least
     ``(1 − share) ×`` its court share and no non-burn uid draws more lane-B

@@ -9,6 +9,12 @@ win pays in full for its RECORDED ``full_eras`` eras, then decays, and stops
 paying at ``win_ttl_eras`` (its slot burns; the merged weights stay in the
 king).
 
+Indefinite pay (LANE_D_PLAN rev6.22, owner 2026-11-24): from ``[lane_b]
+indefinite_pay_from_block`` a held slot pays its full slot share every
+settlement (multiplier 1, no decay, no TTL) until a newer accepted merge takes
+the slot; an empty slot still burns. The decay + TTL rule still pays every
+settlement before that block.
+
 Gain-tiered full-pay period (owner 2026-10-20): ``full_eras`` is chosen AT
 THE WIN from the win's target gain LCB (``target_lcb``) by ``[lane_b]
 full_pay_tiers`` (:func:`cascade.eval.expert_lane.full_pay`) and recorded on
@@ -249,15 +255,40 @@ def lane_b_slots(cfg) -> tuple[str, ...]:
     return tuple(getattr(cfg, "targets", None) or cfg.domains)
 
 
+def indefinite_pay_at(cfg, block: int | None) -> bool:
+    """The rev6.22 indefinite-pay rule is in force for the settlement at
+    ``block`` (``[lane_b] indefinite_pay_from_block``; False for a config
+    without the key)."""
+    at = getattr(cfg, "indefinite_pay_at_settlement", None)
+    return bool(at(block)) if at is not None else False
+
+
+def since_era(merge_block: int, *, era_blocks: int, round_cfg=None) -> int:
+    """The era index a slot holder has held its slot since: the era of its
+    merging settlement on the grid in force there (``round_cfg``), else
+    ``merge_block // era_blocks``."""
+    if round_cfg is not None:
+        from .era import era_index_of
+
+        return int(era_index_of(round_cfg, int(merge_block)))
+    return int(merge_block) // max(1, int(era_blocks))
+
+
 def lane_b_payouts(state: LaneBState, *, block: int, era_blocks: int, cfg, n_uids: int,
-                   uid_of: dict[str, int] | None = None) -> list[dict]:
+                   uid_of: dict[str, int] | None = None, round_cfg=None) -> list[dict]:
     """The PAID live wins at ``block`` — what :func:`combined_weights` pays and
     the receipt's ``lane_b_pay`` records: ``{domain, hotkey, uid,
     merge_block, age, multiplier, gain_lcb, tier, full_eras, below_floor}``
     per configured domain (``age`` in eras; the full-pay fields as RECORDED
     on the win),
     deregistered or out-of-range winners and EXPIRED wins (``age >=
-    win_ttl_eras``) dropped — an unpaid slot burns."""
+    win_ttl_eras``) dropped — an unpaid slot burns.
+
+    Under the rev6.22 indefinite-pay rule (:func:`indefinite_pay_at`) a held
+    slot never expires and pays multiplier 1.0, and each row also carries
+    ``since_era`` (:func:`since_era`); before it the rows are byte-identical
+    to the decay + TTL rule's."""
+    indefinite = indefinite_pay_at(cfg, block)
     out = []
     for d in lane_b_slots(cfg):
         w = state.wins.get(d)
@@ -269,13 +300,20 @@ def lane_b_payouts(state: LaneBState, *, block: int, era_blocks: int, cfg, n_uid
         if uid is None or not 0 <= int(uid) < n_uids:
             continue
         age = state.eras_since(w, block, era_blocks)
-        if win_expired(age, cfg):
-            continue
-        m = reward_multiplier(age, full_eras=win_full_eras(w),
-                              half_life_rounds=cfg.half_life_rounds, floor=cfg.floor)
-        out.append({"domain": d, "hotkey": w.hotkey, "uid": int(uid),
-                    "merge_block": int(w.merge_block), "age": int(age), "multiplier": m,
-                    **w.full_pay_record()})
+        if indefinite:
+            m = 1.0
+        else:
+            if win_expired(age, cfg):
+                continue
+            m = reward_multiplier(age, full_eras=win_full_eras(w),
+                                  half_life_rounds=cfg.half_life_rounds, floor=cfg.floor)
+        row = {"domain": d, "hotkey": w.hotkey, "uid": int(uid),
+               "merge_block": int(w.merge_block), "age": int(age), "multiplier": m,
+               **w.full_pay_record()}
+        if indefinite:
+            row["since_era"] = since_era(w.merge_block, era_blocks=era_blocks,
+                                         round_cfg=round_cfg)
+        out.append(row)
     return out
 
 

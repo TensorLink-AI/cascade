@@ -1418,6 +1418,17 @@ floor            = 0.1             # owner-tunable
 win_ttl_eras     = 28              # owner-tunable: 14 days of 12 h eras
 # replay_settlements: unset ⇒ (win_ttl_eras + 1) × era_settlements, so a
 # rebuilt validator's lane-B state holds every still-paying win.
+# Indefinite pay (LANE_D_PLAN rev6.22, owner 2026-11-24, CONSENSUS): from the
+# era starting at this typed era boundary (>= [v2] from_block, and
+# acceptance_from_block must be at or before it) a held slot pays its FULL
+# slot share every settlement — no decay, no TTL — until a newer accepted
+# merge takes the slot (it must pass the marginal acceptance judge on top of
+# the base that already carries the holder; ties/inconclusive keep the
+# holder). Empty slots still burn. From it the four payout keys above
+# (full_pay_tiers, half_life_rounds, floor, win_ttl_eras) govern only earlier
+# settlements. 0 = never (today's decay + TTL rule). Typed by
+# release-then-activate (netuid 91 has external validators), testnet first.
+indefinite_pay_from_block = 0
 # Verdict (gain = superiority, guards = non-inferiority, all at alpha)
 alpha              = 0.05
 bootstrap_B        = 10000

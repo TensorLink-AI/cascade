@@ -701,6 +701,16 @@ class LaneBConfig:
     # CONSENSUS: qualifications are unpaid until an incremental merge passes
     # acceptance at a scheduled warm start. 0 preserves historical payouts.
     acceptance_from_block: int = 0
+    # CONSENSUS (LANE_D_PLAN rev6.22, owner 2026-11-24): from the era starting
+    # at this typed block a held slot pays its FULL slot share every
+    # settlement — multiplier 1, no decay, no TTL — until a newer accepted
+    # merge takes the slot. ``full_pay_tiers`` / ``half_life_rounds`` /
+    # ``floor`` / ``win_ttl_eras`` then govern only settlements before it
+    # (re-derived by the audit under the rule in force at each block). 0 =
+    # never (today's decay + TTL rule). Needs ``acceptance_from_block`` at
+    # or before it: a newer leg takes a slot only by passing the marginal
+    # acceptance judge on top of the base that already carries the holder.
+    indefinite_pay_from_block: int = 0
     # Who pays for a lane-B leg (TRAINER POLICY): "miner" (the default,
     # DEC-CA-0059 item 8) rents on the miner's deposited key through
     # ``/v1/lane-b/fund`` with no operator fallback; "operator" keeps the
@@ -755,6 +765,14 @@ class LaneBConfig:
         n = int(self.acceptance_from_block)
         # The boundary settlement supplies candidates to the new era's init.
         return n > 0 and block is not None and int(block) >= n
+
+    def indefinite_pay_at_settlement(self, block: int | None) -> bool:
+        """The rev6.22 indefinite-pay rule pays the settlement at boundary
+        ``block``: it belongs to the era containing ``block − 1``, so ``block
+        > N`` ⇔ that era starts at or after the typed boundary ``N``. The
+        settlement AT ``N`` keeps the decay + TTL rule."""
+        n = int(self.indefinite_pay_from_block)
+        return n > 0 and block is not None and int(block) > n
 
     def merge_guard_at_settlement(self, block: int | None) -> bool:
         """Merge guards apply to the settlement at boundary ``block`` (it
@@ -820,6 +838,16 @@ def _merge_guard_block(raw, v2_from_block: int, key="merge_guard_from_block") ->
     if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
         raise ValueError(f'[lane_b] {key} must be an integer >= 0 or "v2"; '
                          f"got {raw!r}")
+    return int(raw)
+
+
+def _indefinite_pay_block(raw: object) -> int:
+    """``[lane_b] indefinite_pay_from_block`` (rev6.22): an integer ``>= 0``
+    (0 = never; the loader checks a typed value is an era boundary at or
+    after ``[v2] from_block``)."""
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        raise ValueError(f"[lane_b] indefinite_pay_from_block must be an integer >= 0 "
+                         f"(0 = never); got {raw!r}")
     return int(raw)
 
 
@@ -906,8 +934,15 @@ def parse_lane_b(lb: dict, *, from_block: int | None = None,
             int(v2_from_block) if v2_from_block is not None else max(0, fb - 1),
             "acceptance_from_block"),
         leg_funding=str(lb.get("leg_funding", "miner")),
+        indefinite_pay_from_block=_indefinite_pay_block(lb.get("indefinite_pay_from_block", 0)),
         **track,
     )
+    ip, ab = cfg.indefinite_pay_from_block, cfg.acceptance_from_block
+    if ip and not 0 < ab <= ip:
+        raise ValueError(
+            f"[lane_b] indefinite_pay_from_block={ip} needs acceptance_from_block at or "
+            f"before it (got {ab}): a newer leg may take a held slot only by passing the "
+            "marginal acceptance judge on top of the base that carries the holder")
     if cfg.leg_funding not in LANE_B_LEG_FUNDING:
         raise ValueError(f"[lane_b] leg_funding must be one of {LANE_B_LEG_FUNDING}; "
                          f"got {cfg.leg_funding!r}")

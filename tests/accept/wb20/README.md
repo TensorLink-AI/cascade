@@ -124,3 +124,11 @@ only, so no import can fail for the right reason. A scratch control
 satisfied every test: minimal conforming sections appended to the four docs
 passed all 60. Injected stale keys, codes, headers, IPs, a wrong default and
 a refused example each failed.
+
+## rev6.22 (`test_wb20_indefinite_pay_docs.py`)
+
+`docs/MINER.md` names `indefinite_pay_from_block` (default read from
+`LaneBConfig`), the no-decay / no-expiry rule, holder-keeps-on-tie, burned
+empty slots, the signed `pay_rule` / `since_era` fields (checked against the
+validator source) and multi-target funding with a repeated `--target`
+(checked against the parser).

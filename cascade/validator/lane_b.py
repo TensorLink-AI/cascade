@@ -113,7 +113,14 @@ class LaneBMixin:
             era_blocks=eb, cfg=self.cfg.lane_b, uid_of=uid_of))
         pay = {"block": int(block), "era_blocks": int(eb),
                "wins": lane_b_payouts(st, block=block, era_blocks=eb, cfg=self.cfg.lane_b,
-                                      n_uids=n_uids, uid_of=uid_of)}
+                                      n_uids=n_uids, uid_of=uid_of,
+                                      round_cfg=self.cfg.round)}
+        from ..shared.lane_b import indefinite_pay_at
+
+        if indefinite_pay_at(self.cfg.lane_b, block):
+            # rev6.22: the signed record names the rule (absent before it, so
+            # pre-gate receipts keep their bytes)
+            pay["pay_rule"] = "indefinite"
         lc = getattr(self.cfg, "lane_c", None)
         if lc is not None and lc.active(block):
             # Record B's actual allocation under C's configured funding

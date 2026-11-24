@@ -765,6 +765,9 @@ full_pay_tiers   = [[0.05, 10], [0.02, 5], [0.01, 2]]
 half_life_rounds = 1.0
 floor            = 0.1
 win_ttl_eras     = 28
+# rev6.22 indefinite pay (see chain.toml): 0 = never. Testnet needs
+# acceptance_from_block typed at or before it first.
+indefinite_pay_from_block = 0
 alpha              = 0.05
 bootstrap_B        = 10000
 gain_margin        = 0.01          # > 0 (load-checked): an unchanged expert must not merge
