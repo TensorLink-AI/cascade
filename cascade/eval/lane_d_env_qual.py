@@ -283,10 +283,18 @@ def rel_diff(ref, cand) -> float:
 def replay_crowns(scores: Mapping[str, dict], models: Sequence[str], contexts, clusters,
                   lane_d: Mapping, seed: str) -> dict:
     """Per context and bar: the cohort verdict (model 0 = KING_D)."""
+    from ..shared.config.lane_d import LaneDConfig
     from ..validator.lane_d import judge_cohort
 
-    cfg = argparse.Namespace(alpha=float(lane_d["alpha"]), bootstrap_B=int(lane_d["bootstrap_B"]),
-                             d_margin=float(lane_d["d_margin"]))
+    # rev6.18 A3 (F4): the judge reads the per-window ratio clamp and the
+    # public weight. The golden set is live windows only, so the replay judges
+    # the live half alone (public_weight 0); the clamp is the deployed
+    # config's when given, else the release default (LaneDConfig).
+    cfg = argparse.Namespace(
+        alpha=float(lane_d["alpha"]), bootstrap_B=int(lane_d["bootstrap_B"]),
+        d_margin=float(lane_d["d_margin"]), public_weight=0.0,
+        window_ratio_floor=float(lane_d.get("window_ratio_floor",
+                                            LaneDConfig.window_ratio_floor)))
     out = {}
     for c in contexts:
         def sc(m, c=c):
@@ -537,7 +545,7 @@ def main(argv: list[str] | None = None) -> int:
 
             ld = load_chain_config(a.chain_config).lane_d
             lane_d = {k: getattr(ld, k) for k in ("alpha", "bootstrap_B", "d_margin",
-                                                  "d_margin_start")}
+                                                  "d_margin_start", "window_ratio_floor")}
             doc = compare(a.golden, a.reference, a.candidate, lane_d=lane_d, seed=a.seed,
                           w0b_junit=a.w0b_junit, a9_t7_path=a.a9)
             a.out.parent.mkdir(parents=True, exist_ok=True)
