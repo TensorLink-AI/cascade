@@ -352,9 +352,9 @@ def test_dec0076_genesis_settlement_pays_lane_a_on_the_satellite(tmp_path, offli
     from cascade.audit.lane_d import _canon
     from tests.unit.test_satellite_replay import (
         BOUNDARIES,
+        MAIN_KP,
         DictStore,
         FakeClient,
-        MAIN_KP,
         _runner,
         make_settlement,
     )
