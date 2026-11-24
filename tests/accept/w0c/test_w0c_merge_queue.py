@@ -18,6 +18,8 @@ import yaml
 from .helpers import REPO, commit, git, init_repo, output, run_tool, write
 
 WORKFLOW = REPO / ".github" / "workflows" / "laned-accept.yml"
+# fixture modules change within one second at equal size: no stale .pyc
+NO_PYC = {"PYTHONDONTWRITEBYTECODE": "1"}
 
 W3_TEST = ("import pkg_lib\nimport pkg_w3\n\n\n"
            "def test_w3():\n    assert pkg_w3.W3 == pkg_lib.LIB\n")
@@ -52,7 +54,7 @@ def _labels(tmp_path: Path, labels: dict[int, list[str]]) -> Path:
 def test_freshness_warn_only_reports_a_stale_base_without_failing(tmp_path):
     repo, base0 = _seed(tmp_path)
     # main moved: pkg_lib changed, which W3's tests import (the #593 shape)
-    main1 = _on(repo, base0, [({"pkg_lib.py": "LIB = 2\n"}, "lib (#1)")])
+    main1 = _on(repo, base0, [({"pkg_lib.py": "LIB = 22\n"}, "lib (#1)")])
     pr = _on(repo, base0, [({"pkg_w3.py": "W3 = 1\n"}, "w3 impl")])
     warned = run_tool("accept", "--freshness", "--base", base0, "--head", pr, "--main", main1,
                       "--warn-only", "--root", repo)
@@ -74,15 +76,15 @@ def test_merge_group_runs_each_queued_prs_own_wp_on_the_combined_ref(tmp_path):
     impl = ({"pkg_w3.py": "W3 = 1\n"}, "w3 impl (#7)")
     alone = _on(repo, base0, [impl])
     ok = run_tool("accept", "--merge-group", "--base", base0, "--head", alone,
-                  "--group-labels", _labels(tmp_path, {7: ["laned:W3"]}), "--root", repo)
+                  "--group-labels", _labels(tmp_path, {7: ["laned:W3"]}), "--root", repo, env=NO_PYC)
     assert ok.returncode == 0, output(ok)
     assert "GROUP-OWN W3" in ok.stdout, output(ok)
     assert "GROUP W3 accept PASS (#7)" in ok.stdout, output(ok)
     # a PR queued ahead (or merged to main since W3's PR base) breaks W3:
     # the CROSS excludes W3, so only its own run on the combined ref sees it
-    broken = _on(repo, base0, [({"pkg_lib.py": "LIB = 2\n"}, "lib bump (#6)"), impl])
+    broken = _on(repo, base0, [({"pkg_lib.py": "LIB = 22\n"}, "lib bump (#6)"), impl])
     bad = run_tool("accept", "--merge-group", "--base", base0, "--head", broken,
-                   "--group-labels", _labels(tmp_path, {6: [], 7: ["laned:W3"]}), "--root", repo)
+                   "--group-labels", _labels(tmp_path, {6: [], 7: ["laned:W3"]}), "--root", repo, env=NO_PYC)
     assert bad.returncode != 0, output(bad)
     assert "GROUP W3 accept FAIL (#7)" in bad.stdout, output(bad)
     assert "GROUP FAIL" in bad.stdout, output(bad)
@@ -92,12 +94,12 @@ def test_merge_group_fails_closed_without_labels_or_pr_number(tmp_path):
     repo, base0 = _seed(tmp_path)
     alone = _on(repo, base0, [({"pkg_w3.py": "W3 = 1\n"}, "w3 impl (#7)")])
     unknown = run_tool("accept", "--merge-group", "--base", base0, "--head", alone,
-                       "--group-labels", _labels(tmp_path, {}), "--root", repo)
+                       "--group-labels", _labels(tmp_path, {}), "--root", repo, env=NO_PYC)
     assert unknown.returncode != 0, output(unknown)
     assert "no labels for #7" in unknown.stdout, output(unknown)
     direct = _on(repo, base0, [({"pkg_w3.py": "W3 = 1\n"}, "direct push")])
     nopr = run_tool("accept", "--merge-group", "--base", base0, "--head", direct,
-                    "--group-labels", _labels(tmp_path, {}), "--root", repo)
+                    "--group-labels", _labels(tmp_path, {}), "--root", repo, env=NO_PYC)
     assert nopr.returncode != 0, output(nopr)
     assert "names no PR" in nopr.stdout, output(nopr)
 

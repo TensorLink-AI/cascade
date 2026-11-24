@@ -2570,11 +2570,11 @@ def selftest_merge_group(ident: tuple[str, ...]) -> list[str]:
                  ("GROUP-OWN W3", "GROUP W3 accept PASS (#7)", "PASS W3"))
             # #6 queued ahead changes pkg_lib (W3 was green on base0 only): the
             # CROSS over the group excludes W3, so only its own run catches it
-            broken = queue(base0, [({"pkg_lib.py": "LIB = 2\n"}, "lib bump (#6)"), impl])
+            broken = queue(base0, [({"pkg_lib.py": "LIB = 22\n"}, "lib bump (#6)"), impl])
             case("own-wp-broken-by-group", broken, {6: [], 7: ["laned:W3"]}, False,
                  ("GROUP #6: no laned:<WP> label", "GROUP W3 accept FAIL (#7)"))
             # a stale-base PR the queue rebased onto a main that broke it
-            main1 = queue(base0, [({"pkg_lib.py": "LIB = 3\n"}, "lib on main (#5)")])
+            main1 = queue(base0, [({"pkg_lib.py": "LIB = 333\n"}, "lib on main (#5)")])
             stale = queue(main1, [impl])
             lanedlib.git(root, "checkout", "-q", "--detach", stale)
             with contextlib.redirect_stdout(io.StringIO()) as buf:
@@ -3280,6 +3280,10 @@ def cmd_selftest() -> int:
     tests-only / tests-correction MODE rules."""
     failures: list[str] = []
     ident = ("-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false")
+    # fixture modules are rewritten within one second at the same size; a
+    # cached .pyc (mtime + size check) would then hide the change from the
+    # pytest subprocesses (seen on CI 2026-11-24): never write bytecode
+    os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
     # the fixture repos' `(#N)` subjects must never meet the real repo's PR
     # labels or ledger (the PR job exports both)
     for k in ("LANED_PR_LABELS", "LANED_LEDGER"):
