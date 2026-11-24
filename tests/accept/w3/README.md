@@ -192,7 +192,7 @@ The body is `{"licence": <id>, "attestation": <text>}`; unparseable is
 `400 bad_body`. The steps, in order:
 
 1. **B13 licence attestation.** The licence must be one of
-   `service.LICENCES == ("Apache-2.0", "OpenMDW-1.1")` (D13), else
+   `service.LICENCES == ("MIT",)` (D13), else
    `400 licence_not_open`. The attestation must be exactly
    `service.LICENCE_ATTESTATION`, else `400 licence_attestation_missing`.
    That's one statement of at least 80 characters naming both licences,
