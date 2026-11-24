@@ -16,6 +16,9 @@ needs torch or a GPU.
 funded_pod_skus = ["8xH200", "8xH100", "4xH200", "4xH100", "8xRTX4090"]
 ```
 
+- **(F6, owner 2026-11-24)** Lane A's own `[round] funded_pod_skus` on main is
+  now the live mainnet list `["8xH100", "8xH200"]` (`helpers.MAIN_ROUND_SKUS`,
+  #532 folded into #835); the lane B list below is unchanged.
 - Rationale: these are the data-centre multi-GPU layouts that lane A's funded
   ladder already rents (`[round] funded_pod_skus`), plus `8xRTX4090`, which
   the owner asked for on lane B only. No layout has a single GPU. WB19

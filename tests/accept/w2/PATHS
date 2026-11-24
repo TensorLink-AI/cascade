@@ -7,5 +7,6 @@ chain.toml
 chain.testnet.toml
 # Existing unit test pinning the placeholder behaviour (arming refused).
 tests/unit/test_lane_d_placeholder.py
-# rev6.23: the RETIRED_KEYS test ([lane_d] king_decay retired).
+# F6 (plan rev6.18 B11): the retired [lane_d] keys' loader property;
+# rev6.23: [lane_d] king_decay joins them.
 tests/unit/test_config.py

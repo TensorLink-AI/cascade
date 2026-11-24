@@ -16,6 +16,7 @@ from .scoring import (
     ScoringConfig,
     effective_margin_mode,
     effective_win_margin_start,
+    init_gate_mode_at,
     margin_v2_active,
     mv_score_active,
 )
@@ -206,8 +207,9 @@ class ChainConfig:
             bench_gate_min_win_rate=self.scoring.bench_gate_min_win_rate,
             margin_mode=effective_margin_mode(self.scoring, block),
             margin_increment_floor=self.scoring.margin_increment_floor,
-            init_gate_mode=self.scoring.init_gate_mode,
-            init_gate_tolerance=self.scoring.init_gate_tolerance,
+            # rev6.18 B12: the legacy shadow floor before
+            # [scoring] init_gate_retired_from_block, off from it.
+            init_gate_mode=init_gate_mode_at(self.scoring, block),
             mv_score=mv_score_active(self.scoring, block),
         )
 
