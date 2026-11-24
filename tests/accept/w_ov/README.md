@@ -17,3 +17,15 @@ Every test imports `cascade.shared.netconfig_bounds` in its body, so on a
 base without the WP it fails as a missing module inside `PATHS`.
 Local run: `-m 'not torch'`, `--noconftest` (the satellite fixture is
 rebuilt in `helpers.fixture_raw`).
+
+## F4 keys (rev6.18 A3, owner 2026-11-24)
+
+The 50/50 live/public split is overlay-tweakable after the release, so both
+F4 keys are bounded: `[lane_d] public_weight` in [0, 1] (the loader keeps it
+< 1) and `[lane_d] window_ratio_floor` in [0.1, 0.9] (the per-window clamp
+[floor, 1 / floor]; there is no separate ceiling key). `DANGEROUS` gains a
+floor of 0.05 (one window swings the score 20x) and 0.95 (nothing clears);
+`test_w_ov_public_weight_is_bounded_to_the_unit_split` pins the split's range
+and `test_w_ov_public_weight_overlay_inside_the_envelope_is_adopted` a 0.4
+overlay. The retired backtest bounds are gone (D24), and the `d_margin` row
+no longer carries `backtest_weight_cap`.
