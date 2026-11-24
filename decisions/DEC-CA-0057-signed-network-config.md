@@ -19,6 +19,24 @@ by an overlay. A persisted node refuses sequence rollback; a fresh node still
 needs an authenticated deployment checkpoint/history to detect a stale latest
 pointer. A deployment label identifies the network; it is not a genesis proof.
 
+Envelope amendment (owner 2026-11-24, LANE_D_PLAN rev6.24, W-OV): "satellite
+validators do not need to update — we need the flexibility." On top of the
+loader, `cascade/shared/netconfig_bounds.py` refuses (1) an override outside
+its per-key envelope (`BOUNDS`: alphas <= 0.10, margins >= 0.002, bootstrap
+B <= 50000, window counts <= 20000, lane shares, ...), (2) release-only keys
+inside allowed tables (`RELEASE_ONLY_KEYS`: contract digest, fork-guard
+feature names, operator-local paths, external endpoints), (3) a data
+reference that is not `<repo>@<revision>` (`PINNED_REF_KEYS`) and (4) a lane
+share the carve would clamp. The envelope is code; no overlay changes it,
+the signature/trust rules or `[netconfig] owner_hotkey`. Lane C's eval DATA
+— `[marketcast] assets`, `frequencies`, `horizons`, `composite_suite_weights`,
+`windows_per_cell` — joins `ALLOWED["marketcast"]` (superseding "window
+construction remains release-only" below for those keys); the model pins,
+`from_block`, `suites`, `data_sources`, `pool_prefix`, the context lengths
+and `embargo_days` stay release-only. An older node lacks the envelope and
+accepts a superset; `plan_overlay` runs it, so a published overlay is one
+every node accepts.
+
 Owner (2026-10-19): every consensus constant a validator reads from its local
 `chain.toml` that is not code, a locked training term or a security root is
 changed by an owner-signed overlay instead of a fleet release, and goes live

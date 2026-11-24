@@ -191,7 +191,8 @@ is a lagged reveal of **retired** validator snapshots, byte-identical to what
 was scored. Use `snapshots/<as_of>-block-<N>/` folders (legacy date-only
 folders through 2026-08-03 are rebuilds); the latest is
 `snapshots/2026-10-31-block-9388800` (3,841 series). Each holds the scored
-`block-<N>.tar`, `POOL_SHA256`, unpacked `<series_id>.npy`, `metadata.json`
+`block-<N>.tar`, `POOL_SHA256`, unpacked `<series_id>.npy` (folders revealed
+from 2026-11-24 omit them: `tar -xf block-<N>.tar` first), `metadata.json`
 (`freq`, `seasonal_period`, `domain`, `source`; older snapshots can include
 sources no longer used) and `provenance.json`. Point `--pool-dir` at one
 snapshot folder; it reads the `.npy` files and `metadata.json` and ignores

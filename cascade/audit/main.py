@@ -595,7 +595,7 @@ def fetch_marketcast_inputs(receipt: RoundReceipt, reports: dict, store, *,
     that carried each entry (``train_time``), the quantile sidecars the
     reports bind, and the verified snapshots found under ``snapshot_dir``
     (one snapshot directory per child) and — with a chain ``client`` — the
-    hash of every block a signed window draw names (DEC-CA-0073). Anything
+    hash of every block a signed window draw names (DEC-CA-0074). Anything
     unreadable is left out (the check WARNs on it)."""
     from ..shared.lane_c_manifest import lane_c_manifest_key
     from ..shared.marketcast_report import load_mkt_report

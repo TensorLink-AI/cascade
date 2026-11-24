@@ -406,6 +406,16 @@ report PASSes.
 
 Run locally with `-m "not torch"`. Nothing here imports torch.
 
+## Scoring host (rev6.18)
+
+Tests: `test_w9_host.py`. `check_lane_d(..., scoring_envs=None)`: a report
+with `host` FAILs (`scoring host: ...`) unless `host_problem` holds at the
+report's boundary against `scoring_envs` (default: the committed
+`deploy/laned/scoring_envs.toml`). A report without
+`host` is unchanged. Refusal code `ld_host`, class **alert** (not one of
+the four B3 pay-stopping checks): logged and alerted, the signed court keeps
+being paid; an unreadable list is an `ld_host` finding too.
+
 ## Multichannel windows (rev6.18 F2): `test_w9_multivariate.py`
 
 - `check_lane_d(..., max_channels=)`: `[generator] max_channels` at the
@@ -436,3 +446,7 @@ per slot; `check_lane_b` re-derives each row for its family (`declared` at
 critical value per family. A wrong bar, family, declared flag, verdict, a
 second critical value in one family, or a missing slot FAILs. Rows come from
 the validator's `judgements_record` over a real `judge_expert_slots` verdict.
+
+## rev6.14 (a): judging start vs eligibility boundary (owner 2026-11-23)
+
+The audit re-derives the judging start (`frozen_before_eval_delay` FAILs, a judged cohort without `boundary_ts` FAILs) and judges eligibility at `b = T + forward_margin_hours` (default 0). `test_w9_rev614.py`.

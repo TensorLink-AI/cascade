@@ -52,6 +52,7 @@ def test_publish_lane_a_is_unchanged(lc_cfg, tmp_path, monkeypatch):
     store = MemStore()
     monkeypatch.setattr(cli, "load_chain_config", lambda p=None: lc_cfg)
     monkeypatch.setattr(hippius, "pool_s3_store", lambda storage, **kw: store)
+    monkeypatch.setattr(cli, "estimate_chain_head", lambda cfg: None)  # no network
     assert cli.main(["publish", "--sources", "synthetic", "--effective-block", "1800",
                      "--out", str(tmp_path / "stage")]) == 0
     assert set(store.objs) == {"pool/snapshots/block-1800.tar", "pool/index.json"}

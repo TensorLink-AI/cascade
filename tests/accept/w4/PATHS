@@ -9,3 +9,10 @@ cascade/eval/checkpoint_guard.py
 cascade/eval/lane_d_handshake.py
 # fetch_presigned / FetchError: credential-free presigned GET with size cap.
 cascade/lane_d/storage.py
+# rev6.18 B5/B7 (F5): the qualified scoring environment list, its loader
+# (ScoringEnv, load_scoring_envs, host_identity, host_problem) and the
+# eval host CLI hello that probes the environment; operator text.
+deploy/laned/scoring_envs.toml
+cascade/shared/config/lane_d.py
+cascade/eval/lane_d_forecasts.py
+docs/OPERATOR.md

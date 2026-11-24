@@ -101,6 +101,8 @@ class _FakeApi:
     def __init__(self, token=None, existing: set[str] | None = None):
         self.existing = existing if existing is not None else set()
         self.uploaded_dirs: list[str] = []
+        self.uploaded_files: dict[str, list[str]] = {}
+        self.fail_next = 0
         self.card_updates = 0
 
     def create_repo(self, **kw):
@@ -110,7 +112,14 @@ class _FakeApi:
         return path in self.existing
 
     def upload_folder(self, *, folder_path, path_in_repo, **kw):
+        if self.fail_next:
+            self.fail_next -= 1
+            raise RuntimeError("AccessDenied: Request has expired")
+        from pathlib import Path
+
         self.uploaded_dirs.append(path_in_repo)
+        self.uploaded_files[path_in_repo] = sorted(
+            p.name for p in Path(folder_path).iterdir() if p.is_file())
 
     def upload_file(self, *, path_in_repo, **kw):
         assert path_in_repo == "README.md"
@@ -147,7 +156,11 @@ def test_reveal_uploads_retired_verified_tars(tmp_path, fake_hub):
     stage = tmp_path / "block-100"
     assert (stage / "block-100.tar").read_bytes() == tar
     assert (stage / SHA_MARKER).read_text().strip() == tar_cid_digest(tar)
-    assert (stage / "a.npy").is_file()  # unpacked alongside the tar
+    # ONE commit of the exact tar + marker + small sidecars, never the per-series
+    # .npy (thousands of LFS uploads outlived HF's 900 s presigned URLs).
+    assert fake_hub.uploaded_files[reveal_dir_name(metas[0])] == [
+        SHA_MARKER, "block-100.tar", "metadata.json"]
+    assert not (stage / "a.npy").exists()
 
 
 def test_reveal_digest_mismatch_is_fatal(tmp_path, fake_hub):
@@ -175,3 +188,80 @@ def test_reveal_skips_already_revealed_and_pruned(tmp_path, fake_hub):
     assert n == 0
     assert fake_hub.uploaded_dirs == []
     assert fake_hub.card_updates == 1  # card still refreshed to newest-done
+
+
+# ── one reveal per day (owner 2026-11-24, option b) ──────────────────────────
+
+
+def _index_of(blocks, tars):
+    metas = [_meta(b, sha=tar_cid_digest(tars[b]) if b in tars else "") for b in blocks]
+    store = _FakeStore(_index_doc(metas),
+                       {f"pool/snapshots/block-{b}.tar": t for b, t in tars.items()})
+    return metas, store
+
+
+def test_newest_only_reveals_the_newest_retired_and_never_the_newest_three(tmp_path, fake_hub):
+    tars = {b: _tar_bytes({f"s{b}.npy": b"x", "metadata.json": b"{}"})
+            for b in (100, 200, 300, 400, 500, 600)}
+    metas, store = _index_of([100, 200, 300, 400, 500, 600], tars)
+
+    n = reveal_snapshots(store, "org/repo", hf_token="t", work_dir=tmp_path,
+                         keep_newest=3, max_reveal=1, newest_only=True)
+    # 400/500/600 = active + two pending: withheld. 300 is the newest retiree;
+    # 100 and 200 stay in the bucket only.
+    assert n == 1
+    assert fake_hub.uploaded_dirs == [reveal_dir_name(metas[2])]
+
+
+def test_newest_only_never_backfills_older_retirees(tmp_path, fake_hub):
+    tars = {b: _tar_bytes({"a.npy": b"x"}) for b in (100, 200, 300, 400, 500)}
+    metas, store = _index_of([100, 200, 300, 400, 500], tars)
+    fake_hub.existing.add(f"{reveal_dir_name(metas[1])}/{SHA_MARKER}")  # 200 already on HF
+
+    n = reveal_snapshots(store, "org/repo", hf_token="t", work_dir=tmp_path,
+                         keep_newest=3, max_reveal=1, newest_only=True)
+    assert n == 0
+    assert fake_hub.uploaded_dirs == []  # block 100 is NOT backfilled
+
+
+def test_upload_retries_then_marker_rides_the_same_commit(tmp_path, fake_hub, monkeypatch):
+    import time
+
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    tar = _tar_bytes({"a.npy": b"aa", "provenance.json": b"{}"})
+    metas = [_meta(100, sha=tar_cid_digest(tar)), _meta(200), _meta(300)]
+    store = _FakeStore(_index_doc(metas), {"pool/snapshots/block-100.tar": tar})
+    fake_hub.fail_next = 1  # HF presigned URL expired on the first attempt
+
+    assert reveal_snapshots(store, "org/repo", hf_token="t", work_dir=tmp_path) == 1
+    files = fake_hub.uploaded_files[reveal_dir_name(metas[0])]
+    assert files == [SHA_MARKER, "block-100.tar", "provenance.json"]
+
+
+def test_upload_failure_after_retries_is_loud_and_leaves_no_marker(tmp_path, fake_hub,
+                                                                   monkeypatch):
+    import time
+
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    tar = _tar_bytes({"a.npy": b"aa"})
+    metas = [_meta(100, sha=tar_cid_digest(tar)), _meta(200), _meta(300)]
+    store = _FakeStore(_index_doc(metas), {"pool/snapshots/block-100.tar": tar})
+    fake_hub.fail_next = 99
+
+    with pytest.raises(RuntimeError, match="expired"):
+        reveal_snapshots(store, "org/repo", hf_token="t", work_dir=tmp_path)
+    assert fake_hub.uploaded_dirs == []  # no marker on HF => next run retries it
+
+
+def test_revealed_tar_is_what_the_miner_verifier_accepts(tmp_path, fake_hub):
+    """The public reader (cascade.miner.hf_pool) checks block-<N>.tar against
+    POOL_SHA256 and extracts the tar — exactly the two files staged here."""
+    import hashlib
+
+    tar = _tar_bytes({"a.npy": b"aa", "metadata.json": b"{}"})
+    metas = [_meta(100, sha=tar_cid_digest(tar)), _meta(200), _meta(300)]
+    store = _FakeStore(_index_doc(metas), {"pool/snapshots/block-100.tar": tar})
+    reveal_snapshots(store, "org/repo", hf_token="t", work_dir=tmp_path)
+    stage = tmp_path / "block-100"
+    want = (stage / SHA_MARKER).read_text().split()[0]
+    assert hashlib.sha256((stage / "block-100.tar").read_bytes()).hexdigest() == want

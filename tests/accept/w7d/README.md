@@ -464,3 +464,7 @@ expect that one convention (and the fixture test also checks the reason
 `bench_hold`); the C6 row and the `held` row above say the same. Nothing
 else changed. Both tests stay red on main (old confirmation stage) and pass
 with the W5e implementation (#802).
+
+## rev6.14 (a): judging start vs eligibility boundary (owner 2026-11-23)
+
+The replay re-derives the judging start from the signed `boundary_ts` and the T values: a cohort frozen before `t_max + 3600 * eval_delay_hours` is a MISMATCH at `cohorts[i].frozen_before_eval_delay`, a judged cohort without `boundary_ts` a MISMATCH at `boundary_ts`, and the params echo carries `eval_delay_hours`. Every fixture settlement passes the fixture clock. `test_w7d_rev614.py`.

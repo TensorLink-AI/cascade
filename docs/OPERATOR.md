@@ -2289,7 +2289,7 @@ tests).
 **No recording lead time** (owner 2026-11-10). A series at frequency `f` is
 cut from the COARSEST bank whose interval divides `f`: the 1-minute bars
 (`snapshot_days`, 30 — a 32768-step 1m context is 22.8 days; the
-DEC-CA-0073 draw reads the 28 days before a dispatch), a native 5m / 15m bank (`native_history_days`: 121 / 348) or
+DEC-CA-0074 draw reads the 28 days before a dispatch), a native 5m / 15m bank (`native_history_days`: 121 / 348) or
 the hourly bank (`coarse_history_days`, 1372). Each bank is sized for the
 full `eval_context_length` (32768, owner 2026-11-21); bars neither the API
 nor the recording holds stay NaN, so a window's context is as long as the
@@ -2308,7 +2308,7 @@ time anchor. It goes to `pool_mkt/snapshots/block-<N>.tar` plus
 `pool_mkt/index.json` in the pool bucket. Publish often: an entry's windows exist only once a snapshot
 covering them is active (its embargo draw up to the dispatch, its forward
 windows after it). An inconclusive entry waits up to `verdict_wait_blocks`
-(capped at 3900 = 13 h, DEC-CA-0073). The trainer also reads the snapshot
+(capped at 3900 = 13 h, DEC-CA-0074). The trainer also reads the snapshot
 active at a dispatch to scan a generator tree for embargoed bars
 (`embargo_series_embedded`) before it rents.
 
@@ -2363,7 +2363,7 @@ per asset.
 The loader refuses a configuration with an unscorable (suite, horizon): the
 history of the bank its frequency is cut from (`coarse_history_days`,
 `native_history_days` or `snapshot_days`) must hold the 32-step context + the
-horizon. Arming (DEC-CA-0073, `draw_problems`) also needs the
+horizon. Arming (DEC-CA-0074, `draw_problems`) also needs the
 `embargo_eval_days` span to hold ONE aligned window of every horizon (≥ 2 ×
 the horizon) and `min_time_blocks` blocks, a forward horizon to fit
 `verdict_wait_blocks` × 12 s − `start_margin_seconds`, and `embargo_days` ≥ 2.
@@ -2371,7 +2371,7 @@ the horizon) and `min_time_blocks` blocks, a forward horizon to fit
 **The horizon grid** (owner 2026-11-18). A horizon is `<bar>x<steps>`: a
 path of `steps` bars of `<bar>`; every shipped suite is scored on every
 timeframe (`[marketcast.frequencies]` / `[marketcast.horizons]` in both
-tomls). Owner 2026-11-24 (DEC-CA-0073): every timeframe is DRAWN from the
+tomls). Owner 2026-11-24 (DEC-CA-0074): every timeframe is DRAWN from the
 embargo (`pool.marketcast.embargo_draw`): per (asset, series, horizon) the
 `backtest_windows_per_cell` (48) best-ranked windows by
 sha256(rule | round block hash | window id), lying wholly in the
@@ -3523,16 +3523,31 @@ publishes is Approve-tier.
 | `pool_d` builder | a dedicated small CPU VM | builds the private `pool_d` snapshots; never the box or a rented GPU pod |
 | Main validator | the box | scores forecasts against the `pool_d` targets, runs the bootstrap, signs the `lane-d-report/1` report and writes `lane_d_state.json` |
 
-**The launch eval host runs the pinned torch.** It is valpriv-4090 or another
-pod with the release's `uv sync --frozen` venv (torch 2.4.1+cu124), at least
-24 GB of GPU memory and the worker handshake. It is not valeval-blackwell4:
-Blackwell sm_120 cannot run the pinned torch (only the benchmarks sidecar
-venv), so its numerics would differ and the handshake fails. Bring it up at
-S4 with an on-rent check (`nvidia-smi -L`, VRAM, driver, disk), pinned
-known_hosts and a dry run. It gets presigned GETs only, never a credential.
+**The eval host runs a qualified scoring environment (plan rev6.18 B5).**
+Any GPU may score lane D when its environment is a `qualified` entry of
+`deploy/laned/scoring_envs.toml` at the settlement boundary: the GPU model is
+listed, the driver is in range and the torch build matches. Launch list:
+`cu124-torch241` (the release's `uv sync --frozen` venv, torch 2.4.1+cu124;
+e.g. valpriv-4090, at least 24 GB) and `sm120-torch212` (RTX PRO 6000
+Blackwell, e.g. valeval-blackwell4; **candidate** until its qualification
+evidence is committed, so it is refused until then). Lane A's pinned training
+contract is not affected. The eval host names its environment with
+`python -m cascade.eval.lane_d_forecasts hello --env NAME` (or
+`CASCADE_LANE_D_SCORING_ENV`); the validator's handshake refuses an
+unqualified one (`lane_d_handshake_env_refused`, settlement
+`env_unqualified`, nothing scored) and the signed report records `host`
+(env, GPU model, driver, torch build, GPU fingerprint, host identity). Every
+model of a settlement is forecast on that one host; the optional
+`score_cache_dir` (`--lane-d-inputs`) reuses forecasts only for the same host
+identity and code, so moving to another host re-scores the whole cohort.
+Qualifying a new environment: the procedure in the file's header (candidate
+PR, W0b + golden-set agreement vs `cu124-torch241`, A9 timing, evidence file,
+owner merge with an activation `from_block`). Bring the host up at S4 with an
+on-rent check (`nvidia-smi -L`, VRAM, driver, disk), pinned known_hosts and a
+dry run. It gets presigned GETs only, never a credential.
 
-**S8: long context.** `valeval-laned` (80–96 GB, a pinned-venv GPU such as an
-H100 or A100 80 GB, never Blackwell, at least 300 GB disk for the prefetch
+**S8: long context.** `valeval-laned` (80–96 GB, any GPU in a qualified
+scoring environment, at least 300 GB disk for the prefetch
 cache and `pool_d_hist`) is rented only at S8, for the 32k–128k contexts.
 No overlay arms a context: every variant is in `contexts` from launch and
 the validator arms it at each settlement once its readiness count
