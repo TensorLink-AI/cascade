@@ -15,3 +15,9 @@ CHANGES.md
 # the website surfaces (§11.2 "llms.txt (repo + website)", "website")
 cascade/website/llms.txt
 cascade/website/index.html
+# One miner guide per competition (owner 2026-11-24): intent, scoring, pay,
+# strategies, costs, refusals, FAQ; linked from MINER.md and llms.txt.
+docs/MINER_LANE_A.md
+docs/MINER_LANE_B.md
+docs/MINER_LANE_C_MARKETCAST.md
+docs/MINER_LANE_D.md

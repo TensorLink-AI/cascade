@@ -11,6 +11,7 @@
 - [Repository and miner instructions](AGENTS.md): read before taking action; local work is the default and publication/spending need human authorization.
 - [Mine with an agent](docs/AGENT_MINING.md): installation, A/B/C local tests, preflight and exact-entry tracking.
 - [Miner CLI guide](docs/MINER.md): submission, compute keys, queues, judging, rewards and recovery.
+- One competition brief per lane (intent, scoring, pay, strategies, costs, refusals, FAQ): [lane A](docs/MINER_LANE_A.md), [lane B](docs/MINER_LANE_B.md), [lane C MarketCast](docs/MINER_LANE_C_MARKETCAST.md), [lane D](docs/MINER_LANE_D.md). `cascade rules <lane>` prints the live rule values from `chain.toml`.
 - [Generator interface](docs/INTERFACE.md): source, determinism, output shapes, dependencies and resource limits; read before editing a generator.
 - [Validator guide](docs/VALIDATOR.md): choose satellite, full evaluator or designated main-validator responsibilities.
 - [Operator runbook](docs/OPERATOR.md): services, capacity, release configuration, recovery and publishing.

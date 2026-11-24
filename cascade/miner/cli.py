@@ -36,6 +36,10 @@ Fine-tuning lane (DEC-CA-0056; MarketCast-only: ``mkt:<suite>`` targets):
 Open-weights lane (DEC-CA-0062, DEC-CA-0070): ``cascade lane-d
 export|verify|submit|ready|status``, see ``cascade/miner/lane_d.py``.
 
+Rules of every lane: ``cascade rules a|b|c|d [--all | --key K]`` prints the
+values the lane is judged and paid under, read from ``chain.toml`` (see
+``cascade/miner/rules.py``; one guide per lane, docs/MINER_LANE_*.md).
+
 Every command takes ``--json`` (or ``CASCADE_JSON=1``): one JSON document on
 stdout, human lines on stderr (``cascade/miner/output.py``). Paid actions
 (``fund``, ``submit`` with a key, ``direct fund``) refuse without ``--yes``.
@@ -1649,10 +1653,13 @@ def build_parser() -> argparse.ArgumentParser:
     from .lane_d import add_lane_d
     from .live_status import add_status
     from .preflight import add_preflight
+    from .rules import add_rules
     from .starter import add_init
 
     parser = argparse.ArgumentParser(
-        prog="cascade", description="cascade subnet miner CLI (generator and direct-MoE lanes).",
+        prog="cascade", description="cascade subnet miner CLI: lane A generators, lane B experts, "
+                                    "lane C MarketCast, lane D open weights (`cascade rules <lane>` "
+                                    "prints each lane's rules).",
         epilog="--json on any command prints one machine-readable result. Exit codes: 0 ok, "
                "1 rejected, 2 usage, 3 network, 4 registry, 5 needs --yes. See AGENTS.md.")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -1677,6 +1684,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_lane_b(sub)
     add_lane_c(sub)
     add_lane_d(sub)
+    add_rules(sub)
     _add_json_flag(parser)
     return parser
 

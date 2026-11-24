@@ -11,6 +11,12 @@ on your compute account. Local training experiments need suitable compute too.
 | C | An eligible MarketCast fine-tuning recipe, optionally with a generator | Beat the pinned application base on future data, then confirm and take a slot | [Lane C](#what-you-submit) |
 | D | A trained cascade_pyramid checkpoint (BF16 weights you trained anywhere) | Beat the lane D king on forward-only private windows, then confirm (built, unarmed) | [Lane D](LANE_D.md) |
 
+**One competition brief per lane** (intent, scoring and pay numbers with a
+worked example, strategies, costs, refusals, FAQ):
+[lane A](MINER_LANE_A.md) · [lane B](MINER_LANE_B.md) ·
+[lane C, MarketCast](MINER_LANE_C_MARKETCAST.md) · [lane D](MINER_LANE_D.md).
+`cascade rules a|b|c|d` prints each lane's live values from `chain.toml`.
+
 The submission contract (what the code must be) is [INTERFACE.md](INTERFACE.md).
 This guide is the end-to-end walkthrough.
 Coding agents can follow [AGENT_MINING.md](AGENT_MINING.md) for lane starters,
