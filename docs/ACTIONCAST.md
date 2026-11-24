@@ -42,11 +42,12 @@ gets a `<Vertical>Cast` fine-tune and an `act:` scenario on the shared kit.
 9. [Rewarding creative use of forecasts](#9-rewarding-creative-use-of-forecasts)
 10. [Explaining actions to the customer](#10-explaining-actions-to-the-customer)
 11. [Incentives: king of the hill, privacy, duplicates](#11-incentives-king-of-the-hill-privacy-duplicates)
-12. [Submission](#12-submission)
-13. [Rules](#13-rules)
-14. [Implementation map](#14-implementation-map)
-15. [Config sketch](#15-config-sketch)
-16. [Rollout](#16-rollout)
+12. [Diverse strategies and a reasoning corpus for RL](#12-diverse-strategies-and-a-reasoning-corpus-for-rl)
+13. [Submission](#13-submission)
+14. [Rules](#14-rules)
+15. [Implementation map](#15-implementation-map)
+16. [Config sketch](#16-config-sketch)
+17. [Rollout](#17-rollout)
 
 ## 1. Why
 
@@ -143,8 +144,9 @@ the same episodes, by `increment_margin` at the LCB. Each `act:<scenario>` has t
 
 | slot | who | share |
 |---|---|---|
-| main | best confirmed qualifier | 1 − `novel_share` |
+| main | best confirmed qualifier | 1 − `novel_share` − `archive_share` |
 | novel-use | best confirmed qualifier whose per-episode gains correlate ≤ `novel_max_corr` with the main holder's, and whose forecast value ≥ the reference's | `novel_share` (e.g. 0.3) |
+| archive | one elite per behaviour niche: beats the reference (LCB > 0), passes the gates, confirmed (§12) | `archive_share` (e.g. 0.2), split across occupied niches |
 
 Payout is the competition's weight in `[lane_c.competitions.act]`, split
 equally across its targets, then split per slot, on the gain-tiered lane-C
@@ -931,7 +933,127 @@ Winner-take-all can deter entrants. The counterweights:
 - **Holders whose explanation scores fall** while their decision gains rise
   (trading explanations away).
 
-## 12. Submission
+## 12. Diverse strategies and a reasoning corpus for RL
+
+King of the hill finds the best harness, but it concentrates on one
+strategy. We also want the opposite: **many good, different strategies**,
+because each one produces trajectories we can train on. A trajectory is a
+state, the forecasts asked for, the reasoning (Engy calls, decision-model
+probabilities, explanation claims), the action, and the outcome with its
+reward. Every ActionCast run already records all of that in its transcript.
+This section pays for *coverage*, so the corpus is broad, not 10,000 copies
+of the leader.
+
+### What the corpus is good for
+
+Every episode is already run under several harnesses (the miner, the
+reference, the holder, the published set, the naive-forecast run), on the
+same states. So the corpus holds:
+
+| data | RL use |
+|---|---|
+| per-step (state, reasoning, action) with a scored outcome | outcome-reward RL; offline RL on logged trajectories |
+| the same state, two harnesses, known which did better | preference pairs (DPO-style), with no human labels |
+| claimed counterfactuals that the validator tested and found true or false | training a model to say true things about its own policy |
+| explanations that passed or failed the factual checks | training grounded, factual explanation |
+| the same harness with the real fine-tune and with a naive forecaster | learning how much a forecast is worth to a decision |
+
+The obvious targets are our own policy and explainer models per vertical,
+for example an Engy LLM fine-tuned to reason over Cast forecasts. Those
+would join the gateway like any other pinned model (§6).
+
+### Mechanism: a quality-diversity archive per scenario
+
+This is MAP-Elites, used as a payout rule.
+
+1. **Behaviour descriptors, measured not declared.** The validator computes
+   a few per-scenario numbers from each entry's actions and transcript, for
+   example for `act:perp`:
+   * turnover;
+   * hedge use;
+   * average utilisation;
+   * how much of the forecast budget it spends, and on what horizons;
+   * how often it calls an LLM;
+   * which drivers its explanations cite.
+
+   `act:bess` and `act:inventory` get their own descriptors (cycling depth,
+   reserve held for spikes, order lumpiness, safety-stock level, and so on).
+   The miner never labels its own strategy.
+2. **A grid of niches.** Each descriptor is binned (for example 3–5 bins on
+   2–3 axes, so 9–60 niches). Every niche keeps one **elite**: the best
+   entry whose behaviour lands in that niche.
+3. **A quality floor, not a crown.** To enter or take a niche, an entry must:
+   * beat the **reference** (not the holder): gain LCB > 0;
+   * pass the factual explanation gate (§10);
+   * pass model lift;
+   * be confirmed on fresh episodes.
+
+   To take an occupied niche, it must beat that niche's elite paired by
+   `increment_margin`, the same rule as the main slot (§11), within the
+   niche.
+4. **Pay per occupied niche.** An archive share (`archive_share`, for example
+   20 % of the scenario's payout) is split equally across occupied niches,
+   each on the decaying reign schedule. Unoccupied niches burn their share.
+   That makes filling an empty, unusual niche the cheapest money in the
+   competition, which is exactly what drives coverage.
+5. **Niches are dropped and added by the owner** (config). A niche that
+   proves useless for training can be retired at a release.
+
+The resulting payout per scenario:
+
+| slot | share | pays for |
+|---|---|---|
+| main | e.g. 0.5 | the best |
+| novel-use | e.g. 0.3 | the best that wins *differently* from the main holder |
+| archive | e.g. 0.2, split across niches | good-enough strategies covering the behaviour space |
+
+### Reasoning logs specifically
+
+- **A trace channel.** Besides the customer-facing explanation, a harness may
+  return a free-form `trace` per step: its working, its LLM chain of
+  thought, its alternatives considered. The trace is logged, length-capped
+  and not scored for wording. Only the explanation is held to the factual
+  gate.
+- **Trace diversity as a descriptor (optional).** One archive axis can be a
+  pinned embedding of the traces, clustered. This rewards reasoning in a
+  different way, not only acting differently. Its risk is that junk text
+  can move an embedding. The mitigation is that the entry must still clear
+  the quality floor and the factual gate, so a junk trace attached to a weak
+  policy earns nothing. Start without it and add it once it has been
+  red-teamed.
+- **Free volume.** Archive elites and published harnesses can be re-run by
+  the owner on extra "exploration" episodes at no miner cost (forecasts are
+  cached per window). Miners supply the strategies; the owner supplies the
+  data volume.
+
+### Gaming checks
+
+| attack | defence |
+|---|---|
+| one owner fills many niches with cheap variants | at most `max_niches_per_coldkey` (for example 2) per scenario; each entry pays a leg; each niche elite is confirmed; owner-weighted Bonferroni |
+| steering the descriptors (for example adding pointless turnover to land in an empty niche) | descriptors are measured on validator episodes, and the entry still needs gain LCB > 0 over the reference, net of the costs that pointless turnover adds; a niche bought by burning money usually fails the floor |
+| copying a published elite into a neighbouring niche | the five dedup layers (§11) still apply across niches |
+| junk traces for the trace axis | the trace axis is off at launch; when it is on, the floor and gate still apply |
+
+### Data rights (needs a terms decision)
+
+Training on the corpus needs explicit submission terms. Every submitter
+licenses the transcripts, traces and actions of their runs to the subnet
+for model training, including runs of entries that never win. This is
+separate from publication: training use is internal, and public release
+still follows §11. Q13 covers it.
+
+### What to monitor
+
+- How many niches are occupied, and how often they turn over.
+- How many distinct owners hold niches. One owner holding many is a red
+  flag.
+- How much each niche's data helps a model trained on the corpus,
+  measured offline. This is the real test of whether coverage is buying
+  useful diversity.
+- Descriptor values clustering at bin edges (steering).
+
+## 13. Submission
 
 The miner uploads the tree to the private vault and commits
 `metro-v1:ft:act:<scenario>:hippius:vault/direct@sha256:<digest>` (the
@@ -962,7 +1084,7 @@ they draw on a per-episode budget of forecast series × horizon steps, with a
 context-length cap. `fc.budget_left()` reports what remains. Over budget
 means the call is refused, not that the episode fails.
 
-## 13. Rules
+## 14. Rules
 
 - **Sandbox.** The same static guard and network-isolated sandbox as
   generators (`cascade/interface/static_guard.py`): no network, no clock, no
@@ -990,7 +1112,7 @@ means the call is refused, not that the episode fails.
   decays to the floor (§11).
 - **Model lift.** See §4.
 
-## 14. Implementation map
+## 15. Implementation map
 
 | piece | where | what |
 |---|---|---|
@@ -1007,7 +1129,7 @@ means the call is refused, not that the episode fails.
 | audit | `cascade/audit/harness_reproduce.py` + a branch in `checks.py` | replays transcripts on CPU and re-derives scores and LCBs |
 | docs | `docs/ACTIONCAST_MINER.md` | the miner guide, in the MARKETCAST.md shape |
 
-## 15. Config sketch
+## 16. Config sketch
 
 ```toml
 [lane_c]
@@ -1030,6 +1152,13 @@ hard_tier_fraction   = 0.3
 increment_margin     = 0.01     # paired gain over holder and published set
 publish              = "dethrone"  # dethrone | floor | crown | delay:<eras>
 max_open_per_coldkey = 1
+archive_share        = 0.2
+max_niches_per_coldkey = 2
+trace_max_tokens     = 4000
+
+[actioncast.archive.perp]          # descriptors and bins, per scenario
+descriptors = ["turnover", "hedge_use", "llm_rate"]
+bins        = [3, 3, 3]
 ast_dedup            = true
 near_dup_action_corr = 0.98
 step_cpu_ms          = 200
@@ -1062,7 +1191,7 @@ regions    = ["NSW1", "QLD1", "VIC1", "SA1", "TAS1"]
 episode_h  = 24
 ```
 
-## 16. Rollout
+## 17. Rollout
 
 0. Build the kit first (layers 1–4, golden vectors), and write the three
    first scenarios as specs on it. If a scenario needs a one-off module, the

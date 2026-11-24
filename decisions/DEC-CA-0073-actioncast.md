@@ -113,6 +113,23 @@ Owner rulings (2026-11-24) are marked **(owner)**. The rest is proposed.
       confirmation).
     * Design: ACTIONCAST.md §11.
 
+
+13. **Diverse strategies feed a reasoning corpus for RL (proposed).**
+    * A quality-diversity (MAP-Elites) archive per scenario pays one elite
+      per behaviour niche. Behaviour is measured by the validator, never
+      declared. To hold a niche, an entry must beat the reference, pass the
+      gates and be confirmed.
+    * The archive takes `archive_share` (e.g. 0.2) of the scenario's
+      payout, beside the main and novel-use slots, split across occupied
+      niches.
+    * Harnesses may return a free-form reasoning trace per step: logged,
+      not scored.
+    * Every run's transcript (state, forecasts, reasoning, action, outcome,
+      paired comparisons) forms a training corpus for outcome RL,
+      preference pairs and factual explanation.
+    * Training use needs explicit submission terms (Q13).
+    * Design: ACTIONCAST.md §12.
+
 ## Consequences
 
 - **New code:**
@@ -184,10 +201,15 @@ Owner rulings (2026-11-24) are marked **(owner)**. The rest is proposed.
   Should a launch bounty seed each new scenario? Is non-winners' code
   private forever, or published after N eras? Should a public leaderboard
   show verdict scores for every entry?
+- **Q13. Diversity and data.** What are the payout shares: main, novel-use
+  and archive (0.5 / 0.3 / 0.2 proposed)? Which descriptors and bins per
+  scenario? Should the trace-embedding axis be added, and when? What are
+  the submission terms that license all runs (including non-winners) for
+  internal training, and which models do we train first?
 
 ## Rollout
 
-See [docs/ACTIONCAST.md §16](../docs/ACTIONCAST.md#16-rollout). In short:
+See [docs/ACTIONCAST.md §17](../docs/ACTIONCAST.md#17-rollout). In short:
 
 1. Build the kit and the gateway.
 2. Run `act:perp` end to end on `mkt:market`, which already exists.
