@@ -484,6 +484,82 @@ def check_numerics_contract(receipt: RoundReceipt, cfg: ChainConfig,
                      + notes)
 
 
+def _receipt_epoch_image(receipt: RoundReceipt, cfg: ChainConfig):
+    """``(in_force, seed_epoch_start_block, image, entries)`` of a receipt
+    under the W-IMG rule (:func:`cascade.shared.era.image_epoch_rule_at`),
+    read from the embedded signed manifest alone."""
+    from ..shared.config import image_digest
+    from ..shared.era import EraSpec, image_epoch_rule_at, seed_epoch_start_block
+    from ..shared.manifest import contract_payload
+
+    man = receipt.manifest or {}
+    try:
+        era = EraSpec.from_json(man.get("era")) if man.get("era") is not None else None
+    except ValueError:
+        era = None
+    boundary = int(receipt.epoch_start_block)
+    if era is None or not image_epoch_rule_at(cfg, boundary, era):
+        return False, 0, "", []
+    body = man.get("contract_body")
+    source = body if isinstance(body, dict) else receipt_training(receipt, cfg)
+    image = image_digest(str(contract_payload(source).get("train_image_digest", "") or ""))
+    entries = [e for e in (man.get("entries") or []) if isinstance(e, dict)]
+    return True, seed_epoch_start_block(cfg.round, era), image, entries
+
+
+def check_image_epoch(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
+    """W-IMG (plan rev6.24 (e), owner 2026-11-24), replayed per receipt: from
+    the seed epoch ``[v2] image_epoch_from_block`` admits, every entry of the
+    settlement ran the ONE image its declared contract names (no fixed pin;
+    the image stays inside each leg's ``training_contract_digest``, which
+    ``numerics-contract`` re-derives). Joined to the Tier-0 run only when
+    the rule is configured, so every other receipt's output is unchanged.
+    Cross-settlement continuity is :func:`check_image_epoch_chain`."""
+    from ..shared.config import image_digest
+
+    name = "image-epoch"
+    in_force, epoch, image, entries = _receipt_epoch_image(receipt, cfg)
+    if not in_force:
+        return _ok(name, "one-image-per-seed-epoch rule not in force for this settlement")
+    if receipt.status == "rejected" and not receipt.manifest:
+        return _ok(name, "rejected round without a manifest body")
+    if not image:
+        return _fail(name, "the settlement's contract names no train_image_digest")
+    for e in entries:
+        got = image_digest(str(e.get("train_image_digest", "") or ""))
+        if got != image:
+            return _fail(name, f"{e.get('role')} uid{e.get('miner_uid')} ran image "
+                               f"{(got or '<none>')[:19]}…, the seed epoch's is {image[:19]}…")
+    return _ok(name, f"every entry of seed epoch @{epoch} ran image {image[:19]}… "
+                     f"({len(entries)} entr{'y' if len(entries) == 1 else 'ies'})")
+
+
+def check_image_epoch_chain(receipts, cfg: ChainConfig) -> CheckResult:
+    """W-IMG across settlements (``receipts`` in chain order): the image of a
+    seed epoch never changes inside it — every accepted receipt of one seed
+    epoch (keyed statelessly by its era stamp's seed block) declares the same
+    image; a new image appears only with a new seed epoch."""
+    name = "image-epoch-chain"
+    seen: dict[int, tuple[str, str]] = {}
+    n = 0
+    for rc in receipts:
+        if getattr(rc, "status", "") == "rejected":
+            continue
+        in_force, epoch, image, _ = _receipt_epoch_image(rc, cfg)
+        if not in_force or not image:
+            continue
+        n += 1
+        prev = seen.get(epoch)
+        if prev is not None and prev[0] != image:
+            return _fail(name, f"seed epoch @{epoch} ran image {prev[0][:19]}… at round "
+                               f"{prev[1]} but {image[:19]}… at round "
+                               f"{getattr(rc, 'round_id', '?')} (image changed mid-epoch)")
+        seen.setdefault(epoch, (image, str(getattr(rc, "round_id", "?"))))
+    if not n:
+        return _ok(name, "no settlement under the one-image-per-seed-epoch rule")
+    return _ok(name, f"{n} settlement(s) over {len(seen)} seed epoch(s), one image each")
+
+
 def check_era(receipt: RoundReceipt, cfg: ChainConfig, client: object | None = None) -> CheckResult:
     """DEC-CA-0043 era envelope, replayed under the receipt's own block.
 
@@ -3306,6 +3382,15 @@ def _lane_b_slot_row_verdict(r: dict, lb, slots: tuple[str, ...]) -> str | None:
     if bool(r.get("guard_reason")) == guards_ok:
         return f"{d}: guard_reason {r.get('guard_reason')!r} contradicts the guard LCBs"
     want = bool(cleared) and guards_ok
+    sgd = r.get("suite_guards")
+    if suite and want:
+        # WB26 (DEC-CA-0071 §3 guards 4-5): a suite slot that clears is
+        # claimable only if guard 4 and the anchor guard hold
+        if not isinstance(sgd, dict) or "pool_gain" not in sgd:
+            return f"{d}: a cleared suite slot carries no suite_guards (guard 4 / anchor guard)"
+        want = _lane_b_suite_guards_ok(sgd, lb, guards, pubs)
+    elif sgd:
+        return f"{d}: suite_guards on a row that is not a cleared, guarded suite slot"
     if bool(r.get("passed")) != want:
         return (f"{d}: passed={r.get('passed')} but the re-derived slot verdict is {want} "
                 f"(LCBs {lcbs} vs bar {want_bar}, guards ok {guards_ok})")
@@ -3313,6 +3398,22 @@ def _lane_b_slot_row_verdict(r: dict, lb, slots: tuple[str, ...]) -> str | None:
                  or float(r.get("target_lcb")) != float(lcbs[r.get("gain_metric")])):
         return f"{d}: gain_metric {r.get('gain_metric')!r} / target_lcb do not match {cleared}"
     return None
+
+
+def _lane_b_suite_guards_ok(sgd: dict, lb, guards: dict, pubs: dict) -> bool:
+    """WB26 (DEC-CA-0071 §3 guards 4-5) from a suite slot's ``suite_guards``:
+    the whole-pool point gain ``>= 0``, and the anchor record covers every
+    guard of the leg with each ``>= -tau_anchor_*``. An anchor record that
+    does not cover the guards (``anchor_missing``) is not ok."""
+    def _f(x) -> float:
+        return float("nan") if x is None else float(x)
+
+    a_dom = sgd.get("anchor_guard_lcbs") or {}
+    a_pub = sgd.get("anchor_public_lcbs") or {}
+    return (_f(sgd.get("pool_gain")) >= 0.0 and bool(sgd.get("anchor_pointer"))
+            and set(a_dom) == set(guards) and set(a_pub) == set(pubs)
+            and all(_f(x) >= -lb.tau_anchor_domain for x in a_dom.values())
+            and all(_f(x) >= -lb.tau_anchor_public for x in a_pub.values()))
 
 
 def _lane_b_row_verdict(r: dict, lb, slots: tuple[str, ...]) -> str | None:
@@ -3442,6 +3543,11 @@ def check_lane_b(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
                                "(guards must run once per leg)")
         if any(r.get("guard_reason") for r in conc) and any(r.get("passed") for r in rs):
             return _fail(name, f"{hk}: a guard failed but a target of the leg passed")
+        # WB26: guard 4 + the anchor guard also run once per leg
+        if len({json.dumps(r["suite_guards"], sort_keys=True) for r in conc
+                if r.get("suite_guards")}) > 1:
+            return _fail(name, f"{hk}: the leg's suite guards differ between its suite slots "
+                               "(guard 4 / the anchor guard run once per leg)")
     best: dict[str, float] = {}
     for r in rows:
         if r.get("passed"):
@@ -4691,6 +4797,12 @@ def check_marketcast(receipt: RoundReceipt, cfg: ChainConfig,
     return _ok(name, detail)
 
 
+def _image_epoch_configured(cfg: ChainConfig) -> bool:
+    from ..shared.era import image_epoch_from
+
+    return bool(image_epoch_from(cfg))
+
+
 def run_tier0(
     receipt: RoundReceipt, cfg: ChainConfig, client: object | None = None,
     *, funded_roster: dict | None = None, bench: dict | None = None,
@@ -4721,6 +4833,7 @@ def run_tier0(
         *([check_numerics_contract(receipt, cfg, client)]
           if (int(getattr(cfg.v2, "image_decoupled_from_block", 0) or 0)
               or int(getattr(receipt, "image_decoupled_block", 0) or 0)) else []),
+        *([check_image_epoch(receipt, cfg)] if _image_epoch_configured(cfg) else []),
         check_contract_declaration(receipt, cfg),
         check_base_arch_digest(receipt, cfg),
         check_commit_cutoff(receipt, client),

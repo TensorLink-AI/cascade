@@ -244,6 +244,14 @@ class RoundConfig:
     # requeued unburned as an operator fault. "" = gate off (the walls are
     # trusted as-is — the pre-gate behaviour).
     funded_sku_wall_measured_image: str = ""
+    # W-IMG (owner 2026-11-24, "YES to the 5 h cap"): a funded leg or king
+    # rent whose pinned image has NO measured walls (the gate above is set and
+    # names another image) is RENTED anyway, with every SKU's leg wall taken
+    # as this cap (never above the contract's ``max_train_seconds``) instead
+    # of the measured table; the leg's record carries ``walls_measured:
+    # false`` and the cap. 0 = refuse the rent (the pre-W-IMG gate). A
+    # measured image behaves exactly as before.
+    unmeasured_image_wall_cap_seconds: int = 18000
     # Progress watchdog per funded leg: once a detached leg has trained for
     # this many seconds (from its first observed step), its steps/s is
     # projected to completion; a leg projected past ``tolerance`` × the

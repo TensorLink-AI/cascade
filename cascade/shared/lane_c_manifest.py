@@ -86,6 +86,10 @@ class LaneCEntry:
     # EXACT identity lane-C dedup orders by (DEC-CA-0008 spirit); "" = legacy
     tree_digest: str = ""
     competition: dict = field(default_factory=dict)   # any other kind's entry data
+    # W-IMG (plan rev6.24 (e)): the worker image digest the leg ran — logged,
+    # never enforced; "" (every entry before ``[v2] image_epoch_from_block``)
+    # is dropped from the canonical body
+    train_image_digest: str = ""
 
     def __post_init__(self) -> None:
         from .config.lane_c import check_target, is_mkt_target
@@ -155,6 +159,8 @@ class LaneCManifest:
                 e.pop("tree_digest", None)
             if not e.get("competition"):
                 e.pop("competition", None)
+            if not e.get("train_image_digest"):
+                e.pop("train_image_digest", None)
         return json.dumps(d, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
     def digest(self) -> str:
@@ -188,7 +194,8 @@ def load_lane_c_manifest(text: str) -> LaneCManifest:
                    public_rows=dict(e.get("public_rows") or {}),
                    marketcast=dict(e.get("marketcast") or {}),
                    tree_digest=str(e.get("tree_digest", "") or ""),
-                   competition=dict(e.get("competition") or {}))
+                   competition=dict(e.get("competition") or {}),
+                   train_image_digest=str(e.get("train_image_digest", "") or ""))
         for e in o["entries"])
     return LaneCManifest(round_id=str(o["round_id"]), era_index=int(o["era_index"]),
                          created_block=int(o["created_block"]),

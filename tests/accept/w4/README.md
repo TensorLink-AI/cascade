@@ -240,3 +240,33 @@ including RTX PRO 6000 Blackwell). Tests: `test_w4_envs.py`.
   a candidate entry; W0b + golden set vs `cu124-torch241`, rel. diff <= 1e-3,
   identical crowns; A9 timing; `evidence/lane_d_env_<name>.json`; owner merge
   with `from_block` after the release ships).
+
+## Qualifying a scoring environment (B5)
+
+Owner 2026-11-24: lane D's eval host is a 1x RTX PRO 6000 Blackwell
+(`sm120-torch212`). Tests: `test_w4_env_qual.py` (no torch).
+
+- **`sm120-torch212` lock**: `deploy/laned/envs/sm120-torch212/{pyproject.toml,uv.lock}`
+  (torch 2.12.1 = the PyPI cu130 wheel of `benchmarks/uv.lock`; numpy and
+  safetensors at the release `uv.lock` versions; `qualify` group = pytest).
+  The entry pins `lock` + `lock_sha256` and `torch_build =
+  "2.12.1+cu130/cuda-13.0"` (the wheel's `torch.__version__` carries the
+  `+cu130` tag; F5's `"2.12.1/cuda-13.0"` could never match a hello). Status
+  stays `candidate`.
+- **`cascade.eval.lane_d_env_qual`**: `golden` (deterministic pick of
+  `HALF_MIN` = 500 live + 500 public windows from `pool_d/1` directories,
+  hashed), `forecast` (pod: every checkpoint at every `CONTEXTS` value, the
+  host record probed and checked against the entry), `compare` (both runs
+  scored with `score_window`; cohort replayed with `judge_cohort`, model 0 =
+  KING_D, clusters = source, at `d_margin` and `d_margin_start`; W0b junit;
+  A9 `laned_t7/1` pod doc at `A9_WINDOWS` x `A9_MODELS`), `check`.
+- **`evidence_problem(doc, env, envs=)`** recomputes every verdict from the
+  per-window scores in the file: lock and torch build of the entry, host in
+  the entry's GPU/driver range, reference = qualified `cu124-torch241` with
+  the release lock, both halves, >= 3 distinct checkpoints, all launch
+  contexts, per-window rel. diff <= `REL_TOL` (1e-3), identical crowns, the
+  required W0b torch tests passed (none skipped), A9 rows re-derived and
+  passing on that GPU. No flag in the file is trusted.
+- **Committed gate**: every `qualified` entry whose evidence is not
+  `reference` must have a committed evidence file that `evidence_problem`
+  accepts.

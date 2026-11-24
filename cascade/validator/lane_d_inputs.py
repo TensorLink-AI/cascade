@@ -506,6 +506,9 @@ class LaneDInputsSource:
                    state: dict, house: dict, armed: Sequence[int], boundary: int
                    ) -> tuple[dict, dict | None]:
         ident, host = self._hello(boundary)
+        # W-IMG: the identity the forecasts ran on (recorded in the report)
+        self._eval_identity = {"git_head": str(getattr(ident, "git_head", "") or ""),
+                               "package_hash": str(getattr(ident, "package_hash", "") or "")}
         cache, ns = self._score_cache, None
         if cache is not None and host is not None:
             from .lane_d_score_cache import namespace
@@ -618,7 +621,7 @@ class LaneDInputsSource:
                            uid_of=uid_of, house=house, prior_pool_dirs=tuple(dirs[:-1]),
                            armed=armed, boundary_ts=boundary_ts,
                            channel_block_hash=self.channel_block_hash,
-                           host=host)
+                           host=host, eval_identity=getattr(self, "_eval_identity", None))
 
 
 def build_lane_d_inputs(cfg: Any, *, state_dir, intake_state_dir,

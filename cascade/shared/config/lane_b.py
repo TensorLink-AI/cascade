@@ -45,6 +45,11 @@ LANE_B_TRACK_DEFAULTS: dict[str, object] = {
     "max_leg_hours": 6.0,
     "max_leg_seconds": 27_000,         # 6 h x 1.25
     "guard_factor": 1.25,
+    # WB26 (DEC-CA-0071 §3 guards 4-5): the anchor-king guard tolerances (no
+    # worse than the anchor at alpha). CONSENSUS verdict terms, read only when
+    # a suite slot clears.
+    "tau_anchor_public": 0.0,
+    "tau_anchor_domain": 0.0,
 }
 
 _HASHSET_RE = re.compile(r"sha256:[0-9a-f]{64}")
@@ -164,6 +169,10 @@ def parse_lane_b_track(lb: dict, *,
         "max_leg_seconds": _int("max_leg_seconds",
                                 lb.get("max_leg_seconds", d["max_leg_seconds"]), lo=1),
         "guard_factor": _float("guard_factor", lb.get("guard_factor", d["guard_factor"])),
+        "tau_anchor_public": _float("tau_anchor_public",
+                                    lb.get("tau_anchor_public", d["tau_anchor_public"])),
+        "tau_anchor_domain": _float("tau_anchor_domain",
+                                    lb.get("tau_anchor_domain", d["tau_anchor_domain"])),
         "contamination_hashset_key": _hashset_key(lb.get("contamination_hashset_key", "")),
     }
     from ..rules_menu import parse_lane_menu
@@ -193,4 +202,7 @@ def parse_lane_b_track(lb: dict, *,
     if out["guard_factor"] < 1.0:
         raise ValueError(f"[lane_b] guard_factor must be >= 1.0 (a factor below 1 truncates "
                          f"every leg); got {out['guard_factor']}")
+    for key in ("tau_anchor_public", "tau_anchor_domain"):
+        if not 0.0 <= out[key] < 1.0:
+            raise ValueError(f"[lane_b] {key} must be in [0, 1); got {out[key]}")
     return out

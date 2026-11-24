@@ -635,6 +635,10 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
                 else RoundConfig.funded_sku_wall_seconds),
             funded_sku_wall_measured_image=validate_measured_image(
                 r.get("funded_sku_wall_measured_image", "")),
+            unmeasured_image_wall_cap_seconds=validate_nonneg_seconds(
+                "unmeasured_image_wall_cap_seconds",
+                r.get("unmeasured_image_wall_cap_seconds",
+                      RoundConfig.unmeasured_image_wall_cap_seconds)),
             progress_watchdog_grace_seconds=validate_nonneg_seconds(
                 "progress_watchdog_grace_seconds",
                 r.get("progress_watchdog_grace_seconds",
@@ -943,6 +947,36 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
         if cfg.v2.from_block and _idb < int(cfg.v2.from_block):
             raise ValueError(f"[v2] image_decoupled_from_block={_idb} precedes [v2] "
                              f"from_block={cfg.v2.from_block}")
+    # W-IMG (plan rev6.24 (e)): the image-per-seed-epoch rule and the
+    # trainer's bound epoch block are era starts; the rule builds on the
+    # DEC-CA-0067 decoupled check (entries publish their image from it).
+    for _key in ("image_epoch_from_block", "image_after_epoch_block"):
+        _blk = int(getattr(cfg.v2, _key, 0) or 0)
+        if not _blk:
+            continue
+        _grid = _ebp if (_eab and _ebp and _blk < _eab) else _eb
+        if not _eab and _act_grid_after and cfg.activation.feature:
+            _grid = _act_grid_after
+        if _blk % (max(1, _grid) * max(1, _era_settlements)):
+            raise ValueError(f"[v2] {_key}={_blk} is not an era start "
+                             f"(era = {max(1, _grid) * max(1, _era_settlements)} blocks)")
+        if cfg.v2.from_block and _blk < int(cfg.v2.from_block):
+            raise ValueError(f"[v2] {_key}={_blk} precedes [v2] from_block={cfg.v2.from_block}")
+    _ieb = int(cfg.v2.image_epoch_from_block)
+    if _ieb:
+        if not (cfg.v2.image_decoupled_from_block or cfg.v2.image_decoupled_feature):
+            raise ValueError("[v2] image_epoch_from_block needs the DEC-CA-0067 image-decoupled "
+                             "check ([v2] image_decoupled_from_block or its v2b vote)")
+        if _idb and _ieb < _idb:
+            raise ValueError(f"[v2] image_epoch_from_block={_ieb} precedes [v2] "
+                             f"image_decoupled_from_block={_idb}")
+    _iab = int(cfg.v2.image_after_epoch_block)
+    if _iab:
+        if not _ieb or _iab < _ieb:
+            raise ValueError(f"[v2] image_after_epoch_block={_iab} needs [v2] "
+                             "image_epoch_from_block at or before it")
+        if not cfg.v2.train_image_digest_after:
+            raise ValueError("[v2] image_after_epoch_block needs the [v2] *_after release")
     # LANE_D_PLAN §16: the sentinel arms at an era boundary on the grid in
     # force at it, once the four-suite rule v2 is in force (0 = off).
     _sfb = int(cfg.v2.sentinel_from_block)

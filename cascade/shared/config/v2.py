@@ -158,6 +158,27 @@ class V2Config:
     # tick and raises an operator alert while it is true. Default false: an
     # unqualified after release is refused (no post-switch rent/dispatch).
     image_after_unqualified_override: bool = False
+    # W-IMG (plan rev6.24 (e), owner 2026-11-24; CONSENSUS, release-then-
+    # activate): the image-per-seed-epoch rule. From the first v2 SEED EPOCH
+    # starting at or after this block (an era start; a block inside a seed
+    # epoch defers the rule to the next seed-epoch start, never splits one),
+    # every leg of a seed epoch (king and challengers) shares ONE worker image
+    # digest — the settlement's ``contract_body`` image — and it changes only
+    # at a seed-epoch boundary. The image is chosen by the trainer per seed
+    # epoch (the ``*_after`` release binds at the next seed-epoch start,
+    # ``image_after_epoch_block``), never a validator config pin; it stays
+    # inside each leg's ``contract_digest``. Needs
+    # ``image_decoupled_from_block`` (the entries publish their image from
+    # it) at or before it. Lanes B-D record the image per leg / eval from the
+    # same block (drop-when-default before it). 0 = off: today's rule,
+    # byte-identical.
+    image_epoch_from_block: int = 0
+    # W-IMG TRAINER-ONLY: the seed-epoch start block the ``*_after`` release
+    # binds at (the generalised DEC-CA-0067 switch). Written by the trainer
+    # when it binds (persisted beside its state, ``image_epoch_state.json``);
+    # a typed value is the owner override. Must be an era start at or after
+    # ``image_epoch_from_block``. Validators never read it. 0 = unbound.
+    image_after_epoch_block: int = 0
     # Emission burns (CONSENSUS on the weight vector, see
     # cascade.shared.emission). ``prelaunch_burn``: the fraction of every
     # pre-v2 vector sent to ``burn_uid`` by a validator on this release.
@@ -386,7 +407,7 @@ def parse_v2_economics(v2raw: dict) -> dict:
     if readiness and (not readiness.isascii() or not readiness.isalnum() or len(readiness) > 12):
         raise ValueError("v2 prelaunch_burn_readiness must be up to 12 ASCII letters/digits")
     out.update(launch_at_utc=launch, commit_open_at_utc=opening, prelaunch_burn_readiness=readiness)
-    for k in ("random_init_eras", "reign_warm_start_blocks", "prelaunch_burn_from_block", "commit_from_block", "eval_n_windows", "init_epoch_bind_from_block", "image_decoupled_from_block", "eval_n_windows_after"):
+    for k in ("random_init_eras", "reign_warm_start_blocks", "prelaunch_burn_from_block", "commit_from_block", "eval_n_windows", "init_epoch_bind_from_block", "image_decoupled_from_block", "eval_n_windows_after", "image_epoch_from_block", "image_after_epoch_block"):
         raw = v2raw.get(k, 0)
         if isinstance(raw, bool) or not isinstance(raw, int):
             raise ValueError(f"[v2] {k} must be an integer; got {raw!r}")
@@ -738,6 +759,10 @@ class LaneBConfig:
     max_leg_hours: float = 6.0
     max_leg_seconds: int = 27_000
     guard_factor: float = 1.25
+    # WB26 (DEC-CA-0071 §3 guards 4-5; CONSENSUS, read only when a suite slot
+    # clears): the anchor-king guard tolerances
+    tau_anchor_public: float = 0.0
+    tau_anchor_domain: float = 0.0
 
     def active(self, block: int | None) -> bool:
         return self.from_block > 0 and block is not None and int(block) >= self.from_block
@@ -798,6 +823,8 @@ class LaneBConfig:
             min_guard_windows=self.min_guard_windows,
             min_public_items=self.min_public_items,
             undeclared_gain_margin=self.undeclared_gain_margin,
+            tau_anchor_public=self.tau_anchor_public,
+            tau_anchor_domain=self.tau_anchor_domain,
         )
 
 

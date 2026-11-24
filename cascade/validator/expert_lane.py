@@ -45,7 +45,12 @@ from pathlib import Path
 
 import numpy as np
 
-from ..eval.expert_lane import ExpertVerdict, TargetsVerdict, judge_expert_slots
+from ..eval.expert_lane import (
+    ExpertVerdict,
+    TargetsVerdict,
+    is_suite_target,
+    judge_expert_slots,
+)
 from ..shared.expert_manifest import ExpertEntry, ExpertManifest
 from ..shared.lane_b import DomainWin, LaneBState
 
@@ -161,7 +166,8 @@ def judge_entry(entry: ExpertEntry, *, manifest: ExpertManifest, king_pointer: s
                 king_scores, evaluate: Callable[[str], list], fetch_dir: Callable[[str], Path],
                 cfg, seed: str, recompute_selection: Callable | None = None,
                 strict: bool = False, sentinel: str | None = None,
-                contract=None) -> ExpertJudgement:
+                contract=None, anchor_pointer: str | None = None,
+                anchor_scores: Callable[[], list] | None = None) -> ExpertJudgement:
     """``sentinel`` is the settlement era's LANE_D_PLAN §16 suite (W-S2, D35):
     its ``<suite>_crps`` / ``<suite>_mase`` public guards are not built and
     ``require_public`` minus it is what must pair; every other guard is judged
@@ -171,7 +177,16 @@ def judge_entry(entry: ExpertEntry, *, manifest: ExpertManifest, king_pointer: s
     entry whose recorded leg length (``train_hours`` / ``leg_steps`` /
     ``leg_guard_seconds``) breaks the ``[lane_b]`` consensus caps is refused
     at stage ``leg_length`` before any fetch. An entry without one is judged
-    as before; ``contract`` None skips the check."""
+    as before; ``contract`` None skips the check.
+
+    WB26 (DEC-CA-0071 §3 guards 4-5): a suite slot that clears is also
+    guarded against the anchor king ``anchor_pointer`` (the era's promotion
+    member, derived by the caller from the signed training manifest), scored
+    on the same windows through ``anchor_scores()`` (memoised by
+    :func:`judge_manifest`) and paired on ``public_rows["anchor"]`` — all
+    resolved lazily, only when a suite slot would be claimed. A missing
+    anchor, anchor score or anchor row refuses the suite slots
+    (``anchor_missing``); domain and horizon slots are unaffected."""
     if manifest.king_pointer != king_pointer:
         return ExpertJudgement(entry, False, "stale",
                                f"rebased onto {manifest.king_pointer}, king is {king_pointer}")
@@ -251,6 +266,9 @@ def judge_entry(entry: ExpertEntry, *, manifest: ExpertManifest, king_pointer: s
         seed=f"{seed}|{entry.miner_hotkey}|{entry.domain}",
         horizons=[window_horizon(sid) for sid, _ in k["ids"]] if hts else None,
         horizon_targets=hts,
+        **({"anchor": lambda: _anchor_input(rows, k, anchor_pointer, anchor_scores, cfg,
+                                            sentinel)}
+           if any(is_suite_target(t) for t in _targets(cfg)) else {}),
     )
     v = tv.verdicts[declared[0]]
     won = tv.won
@@ -262,6 +280,28 @@ def judge_entry(entry: ExpertEntry, *, manifest: ExpertManifest, king_pointer: s
         reason = f"won {won}" if won else (tv.guard_reason or "no target won")
     return ExpertJudgement(entry, bool(won), "verdict", reason, v, king_pointer=king_pointer,
                            targets=tv)
+
+
+def _anchor_input(rows: dict, king: dict, pointer: str | None,
+                  scores: Callable[[], list] | None, cfg, sentinel: str | None) -> dict | None:
+    """The anchor-guard input of :func:`judge_expert_slots` (WB26), or None
+    (``anchor_missing``) when the anchor, its scores or its rows are absent."""
+    if not pointer or scores is None or not rows.get("anchor"):
+        return None
+    from ..eval.public_guards import MissingPublicGuard, pair_public_rows, sentinel_pairing_kw
+
+    a = _arrays(scores())
+    if a["ids"] != king["ids"]:
+        return None
+    try:
+        pub = pair_public_rows(rows.get("anchor"), rows.get("candidate"),
+                               min_items=cfg.min_public_items,
+                               **sentinel_pairing_kw(rows.get("anchor"), rows.get("candidate"),
+                                                     cfg.require_public, sentinel)).public
+    except MissingPublicGuard:
+        return None
+    return {"pointer": str(pointer), "qloss": a["qloss"], "abs": a["abs"],
+            "mase": a["mase"], "public": pub}
 
 
 def _targets(cfg) -> tuple[str, ...]:
@@ -276,7 +316,19 @@ def judge_manifest(manifest: ExpertManifest, **kw) -> list[ExpertJudgement]:
     the non-finite refusal of stage ``merge`` — callers pass
     ``cfg.merge_guard_at_settlement(settlement block)``; ``sentinel``
     (keyword, default None) is the settlement era's §16 suite, left out of
-    the public guards (W-S2, D35)."""
+    the public guards (W-S2, D35); ``anchor_pointer`` (keyword, default
+    None) is the WB26 anchor king, scored at most once per manifest through
+    ``evaluate`` and only when a suite slot would be claimed."""
+    if kw.get("anchor_pointer"):
+        memo: list = []
+        ap, ev = str(kw["anchor_pointer"]), kw["evaluate"]
+
+        def _anchor_scores() -> list:
+            if not memo:
+                memo.append(ev(ap))
+            return memo[0]
+
+        kw = {**kw, "anchor_scores": _anchor_scores}
     return [judge_entry(e, manifest=manifest, **kw) for e in manifest.entries
             if e.domain in _targets(kw["cfg"])]
 
@@ -357,6 +409,13 @@ def _num(x):
     return None if x is None or (isinstance(x, float) and x != x) else float(x)
 
 
+def _suite_guards_record(sg: dict) -> dict:
+    return {"pool_gain": _num(sg.get("pool_gain")),
+            "anchor_pointer": str(sg.get("anchor_pointer") or ""),
+            "anchor_guard_lcbs": _nums(sg.get("anchor_guard_lcbs") or {}),
+            "anchor_public_lcbs": _nums(sg.get("anchor_public_lcbs") or {})}
+
+
 def _nums(d: dict) -> dict:
     return {str(k): _num(v) for k, v in sorted(d.items())}
 
@@ -381,5 +440,7 @@ def _slot_rows(j: ExpertJudgement, declared: tuple[str, ...]) -> list[dict]:
             "target_gain": _num(v.target_gain),
             "target_n": int(v.target_n), "target_clusters": int(v.target_clusters),
             "inconclusive": v.inconclusive, "guard_reason": tv.guard_reason,
+            # WB26: guard 4 + the anchor guard of a suite slot (drop-when-empty)
+            **({"suite_guards": _suite_guards_record(v.suite_guards)} if v.suite_guards else {}),
         })
     return rows

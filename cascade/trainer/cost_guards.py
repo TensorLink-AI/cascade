@@ -199,11 +199,17 @@ def leg_watchdog(runner, *, gen, pod, contract, key_check=None,
         return None
     local = runner.__dict__.get("_leg_local_obj")
     end = getattr(local, "end_wall", None)
+    wall = float(getattr(contract, "max_train_seconds", 0) or 0)
+    capped = float((getattr(local, "wall_record", None) or {}).get("wall_cap_seconds", 0) or 0)
+    if capped > 0:
+        # W-IMG: an unmeasured image's leg is held to the cap (never above
+        # the contract's own wall)
+        wall = min(wall, capped) if wall > 0 else capped
     return ProgressWatchdog(
         label=f"funded leg {gen.hotkey[:12]}", hotkey=gen.hotkey,
         pod_name=str(getattr(pod, "instance_id", "?")),
         training_steps=int(getattr(contract, "training_steps", 0) or 0),
-        max_train_seconds=float(getattr(contract, "max_train_seconds", 0) or 0),
+        max_train_seconds=wall,
         end_wall=None if end is None else float(end), grace_seconds=grace,
         tolerance=float(getattr(rnd, "progress_watchdog_tolerance", 1.5) or 1.5),
         key_check=key_check, key_check_seconds=key_every, early_seconds=early,
@@ -213,21 +219,70 @@ def leg_watchdog(runner, *, gen, pod, contract, key_check=None,
 # ── 2. measured-wall gate ────────────────────────────────────────────────────
 
 
+def walls_measured(round_cfg) -> bool:
+    """Whether the SKU wall table applies to ``round_cfg``'s pinned pod image:
+    the gate is off (``funded_sku_wall_measured_image`` empty: the walls are
+    trusted as-is) or it names that image."""
+    from ..shared.config import image_digest
+
+    measured = str(getattr(round_cfg, "funded_sku_wall_measured_image", "") or "")
+    if not measured:
+        return True
+    pinned = image_digest(str(getattr(round_cfg, "funded_pod_image", "") or ""))
+    return pinned == measured
+
+
+def unmeasured_wall_cap(round_cfg) -> float:
+    """W-IMG (owner 2026-11-24): the leg wall a rent on an image WITHOUT
+    measured walls is planned and capped at — ``[round]
+    unmeasured_image_wall_cap_seconds`` — or 0.0 (the walls are measured, or
+    the cap is off and such a rent is refused)."""
+    if walls_measured(round_cfg):
+        return 0.0
+    return float(max(0, int(getattr(round_cfg, "unmeasured_image_wall_cap_seconds", 0) or 0)))
+
+
+def wall_record(round_cfg) -> dict:
+    """The leg record's wall provenance: ``{"walls_measured": False,
+    "wall_cap_seconds": cap}`` for a leg rented under the unmeasured-image
+    cap, else ``{}`` (a measured image: the record is unchanged)."""
+    cap = unmeasured_wall_cap(round_cfg)
+    return {"walls_measured": False, "wall_cap_seconds": int(cap)} if cap > 0 else {}
+
+
+def note_unmeasured_wall(runner, round_cfg, what: str) -> dict:
+    """Mark the leg on this thread as rented under the unmeasured-image cap
+    (read back by the completed-leg record) and log it loudly. Returns the
+    :func:`wall_record` (``{}`` = a measured image, nothing marked)."""
+    rec = wall_record(round_cfg)
+    if rec:
+        log.warning("%s: image %s… has NO measured pod walls — renting with the leg wall "
+                    "capped at %d s ([round] unmeasured_image_wall_cap_seconds; "
+                    "walls_measured=false recorded)", what,
+                    str(getattr(round_cfg, "funded_pod_image", "") or "unpinned")[-19:],
+                    rec["wall_cap_seconds"])
+    loc = runner.__dict__.get("_leg_local_obj")
+    if loc is not None:
+        loc.wall_record = dict(rec)      # {} for a measured image: nothing carried over
+    return rec
+
+
 def measured_wall_refusal(round_cfg) -> str:
     """Why no funded leg / king pod may rent now, or ``""``.
 
     ``[round] funded_sku_wall_measured_image`` names the image the SKU wall
     table was measured on; every latest-safe-start and per-leg cost cap is
     built on those walls, so renting on another image is renting on a guess
-    (2026-10-31: 20x off). Empty knob = gate off."""
+    (2026-10-31: 20x off). Empty knob = gate off. W-IMG (owner 2026-11-24):
+    with ``[round] unmeasured_image_wall_cap_seconds`` > 0 an unmeasured
+    image is NOT refused — the leg wall is capped there instead
+    (:func:`unmeasured_wall_cap`)."""
     from ..shared.config import image_digest
 
+    if walls_measured(round_cfg) or unmeasured_wall_cap(round_cfg) > 0:
+        return ""
     measured = str(getattr(round_cfg, "funded_sku_wall_measured_image", "") or "")
-    if not measured:
-        return ""
     pinned = image_digest(str(getattr(round_cfg, "funded_pod_image", "") or ""))
-    if pinned == measured:
-        return ""
     return (f"funded_sku_wall_seconds were measured on image {measured[:19]}… but "
             f"funded_pod_image is {(pinned or 'unpinned')[:19]}… — no measured wall for "
             "the pinned image; rent refused (operator: measure the walls on this image "

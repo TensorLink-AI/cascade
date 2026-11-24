@@ -65,6 +65,7 @@ from typing import Protocol
 
 from ..funding.queue import COMPETITION_ENDED_CLASS, OPERATOR_FAULT_CLASS, split_lane_c_ref
 from ..shared.atomic import read_text_with_backup, write_text_atomic
+from ..shared.era import image_record_at
 from .finetune import LegRecipe, RecipeError
 from .lane_c_competitions import trainer_competition
 
@@ -117,23 +118,23 @@ class LaneCOps(Protocol):
         """The LaneCQueue, or None."""
 
     def lane_a_busy(self, hotkey: str) -> bool:
-        """Whether a lane-A leg of the hotkey is in flight."""
+        """A lane-A leg of the hotkey is in flight."""
 
     def fetch_recipe(self, ref: str, target: str, *, submission_time: float,
                      train_time: float) -> LegRecipe:
-        """The validated recipe (RecipeError = the miner's fault)."""
+        """The leg's recipe (RecipeError = the miner's fault)."""
 
     def train_leg(self, leg: dict, recipe: LegRecipe) -> dict:
-        """The trained leg's result (LegFailure on failure)."""
+        """Train one leg (LegFailure on failure)."""
 
     def sign(self, manifest):
-        """The manifest, signed by the trainer hotkey."""
+        """Sign the lane-C manifest."""
 
     def publish(self, key: str, text: str) -> None:
-        """Write ``text`` at ``key`` in the manifest bucket."""
+        """Publish ``text`` at ``key``."""
 
     def spawn(self, fn, name: str) -> None:
-        """Run ``fn`` on a named worker thread."""
+        """Run ``fn`` in the background."""
 
 
 @dataclass
@@ -443,6 +444,8 @@ class LaneCDriver:
                     "train_block": int(result.get("train_block", leg["started_block"])),
                     "gpu_name": str(result.get("gpu_name", "") or ""),
                     "recipe": asdict(recipe) if recipe is not None else {},
+                    **({"train_image_digest": str(result["train_image_digest"])}
+                       if result.get("train_image_digest") else {}),
                     **({"tree_digest": str(leg["tree_digest"])} if leg.get("tree_digest")
                        else {}),
                     **({"marketcast": {**dict(result["marketcast"]),
@@ -533,7 +536,10 @@ class LaneCDriver:
                     funded_by="miner",
                     marketcast=dict(f.get("marketcast") or {}),
                     competition=dict(f.get("competition") or {}),
-                    tree_digest=str(f.get("tree_digest", "") or ""))
+                    tree_digest=str(f.get("tree_digest", "") or ""),
+                    # W-IMG: logged, never enforced; absent before the activation
+                    train_image_digest=(str(f.get("train_image_digest", "") or "")
+                                        if image_record_at(self.cfg, int(block)) else ""))
                     for f in todo)
                 manifest = LaneCManifest(
                     round_id=rid, era_index=int(era_index),

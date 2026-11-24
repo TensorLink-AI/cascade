@@ -1,0 +1,32 @@
+# WB26: guards 4 and 5 on lane B suite slots (plan §3 WB26 row, rev6.19,
+# narrowed onto rev6.22's judge_expert_slots; DEC-CA-0071 §3).
+#
+# The judge: judge_expert_slots takes `anchor` (lazily resolved) and gates
+# every cleared suite slot on guard 4 (whole-pool point gain >= 0) and the
+# anchor guard; ExpertLaneParams gains tau_anchor_public / tau_anchor_domain.
+cascade/eval/expert_lane.py
+# The validator: judge_entry / judge_manifest take anchor_pointer (scored once
+# per manifest, only when a suite slot would be claimed) and pair
+# public_rows["anchor"]; judgements_record writes suite_guards.
+cascade/validator/expert_lane.py
+# The validator wiring: lane_b_anchor_pointer derives the anchor from the
+# signed training manifest; _lane_b_judge_experts always passes it (no
+# activation block, owner 2026-11-24).
+cascade/validator/lane_b.py
+# The keys: loader parse + range checks, LaneBConfig fields, verdict_params.
+cascade/shared/config/lane_b.py
+cascade/shared/config/v2.py
+# Shipped files at the defaults.
+chain.toml
+chain.testnet.toml
+# The audit: check_lane_b re-derives suite_guards on every suite slot row.
+cascade/audit/checks.py
+# The trainer side: every settling leg carries the era anchor's bench rows
+# (public_rows["anchor"], benched once per anchor) and the self-judge
+# (RunnerLaneBOps.judge) gets the same anchor; the rolling trainer derives it
+# with lane_b_anchor_pointer.
+cascade/trainer/lane_b_driver.py
+cascade/trainer/rolling.py
+# Miner docs: the two tau_anchor_* keys in the MINER.md lane B key table
+# (WB20's every-key-documented check).
+docs/MINER.md
