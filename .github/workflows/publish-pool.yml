@@ -1,4 +1,4 @@
-# Daily publish of the cascade held-out eval pool from the tsbench-forge mirror.
+# Hourly publish of the cascade held-out eval pool from the tsbench-forge mirror.
 #
 # The two-bucket relay (docs/EVAL_POOL.md): the forge scrape host mirrors raw
 # data to a PRIVATE forge bucket; this job syncs that down and builds + publishes
@@ -42,7 +42,16 @@ name: Publish eval pool
 
 on:
   schedule:
-    - cron: "0 3 * * *"          # 03:00 UTC daily — active from the next round
+    # Hourly (owner 2026-11-24). Validators select one snapshot per 3 h epoch
+    # and a re-publish for the same effective_block REPLACES that index entry
+    # (publish_pool_snapshot is idempotent per block; validators cache by
+    # block + sha256), so the hourly runs keep refreshing the pending snapshot
+    # and the last one built before its epoch is the one scored. --round-buffer
+    # 2 (publish step) keeps that pending block at least one full epoch past
+    # any build, so a ~55 min build can never land on an epoch that started
+    # while it ran, i.e. on a boundary the trainer may already have pinned.
+    # The HF reveal still runs once a day (03:xx UTC runs only; see that step).
+    - cron: "0 * * * *"
   workflow_dispatch:
     inputs:
       network:
@@ -252,7 +261,12 @@ jobs:
             --max-series-per-domain-freq 750 \
             --max-series-per-domain 1500 \
             --selection balanced \
+            --round-buffer 2 \
+            --max-keep 480 \
             --effective-block "$EFFECTIVE_BLOCK"
+          # --round-buffer 2: see the schedule comment (hourly publishes).
+          # --max-keep 480: one index entry per epoch now (8/day, not 1/day),
+          #   so 480 keeps the same ~60 days of history the default 60 kept.
 
       # MarketCast uses the separate bar/alpha recorder pipeline and
       # `cascade-pool publish --lane mkt`; the retired forge --lane c path
@@ -265,7 +279,8 @@ jobs:
       # whenever mirror partitions landed after the publish (observed live:
       # block-8740800 = 3,356 series vs its rebuild = 3,442). The newest two
       # snapshots are withheld (pending + possibly-active), so a revealed pool
-      # can never be selected by a current or future round; effective lag ~48h.
+      # can never be selected by a current or future round. With hourly publishes
+      # and --round-buffer 2 the newest THREE are withheld (see --keep-newest).
       # Idempotent per snapshot — backlog backfills across runs (max 6/run).
       # Skipped cleanly if HF_TOKEN isn't set.
       - name: Reveal retired snapshots to public HF  (exact bytes)
@@ -281,9 +296,21 @@ jobs:
           BACKUP_S3_ACCESS_KEY: ${{ secrets.BACKUP_S3_ACCESS_KEY }}
           BACKUP_S3_SECRET_KEY: ${{ secrets.BACKUP_S3_SECRET_KEY }}
         run: |
+          # Once a day: a scheduled run reveals only at 03:xx UTC. A run queued
+          # past the hour is caught up next day (the reveal mirrors every
+          # retired snapshot not yet on HF). Dispatches always reveal.
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "$(date -u +%H)" != "03" ]; then
+            echo "Hourly run: the HF reveal runs once a day at 03:xx UTC; skipping."
+            exit 0
+          fi
           TOML=chain.toml
           [ "$NETWORK" = "testnet" ] && TOML=chain.testnet.toml
-          cascade-pool reveal --chain-toml "$TOML" --hf-repo "$HF_EVAL_REPO"
+          # --keep-newest 3: with --round-buffer 2 the index holds TWO pending
+          #   entries (next epoch, the one after) above the active one, so the
+          #   default 2 would reveal the snapshot being scored right now.
+          # --max-reveal 12: 8 snapshots retire per day now (one per epoch).
+          cascade-pool reveal --chain-toml "$TOML" --hf-repo "$HF_EVAL_REPO" \
+            --keep-newest 3 --max-reveal 12
           # DEC-CA-0056: the lane-C pool's retired snapshots, under pool_c/ in
           # the same dataset (inert until [lane_c] from_block is typed)
           if python -c "import sys; from cascade.shared.config import load_chain_config as l; sys.exit(0 if l('$TOML').lane_c.from_block else 1)"; then
