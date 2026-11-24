@@ -1,0 +1,7 @@
+# Lane D RMISC allowed list (LANE_D_PLAN rev6.18 A5). Written by
+# scripts/laned_rmisc_allowlist.py finalize; do not hand-edit.
+schema = "lane-d-rmisc-allowed/1"
+repo = "nju-zhangsq/RMISC"
+revision = "d0cdd935300ca9b3b2d6f23e6085db24cb7560c2"
+status = "placeholder"
+generated_by = "placeholder: the owner run of scripts/laned_rmisc_allowlist.py finalize replaces this file (A5)"

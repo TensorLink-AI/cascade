@@ -1313,6 +1313,225 @@ def _snapshot_problem(report: dict, cfg, pool_dirs, windows: dict) -> str | None
     return None
 
 
+# ── rev6.18 A1/A2/A6 (F3): the public-source draw, re-derived ───────────────
+#
+# Re-stated from the spec (tests/accept/w5k/README.md, w6p/README.md), never
+# imported from the producer (invariant 12): the pinned sources, the draw
+# constants, the index format and the draw itself. A mismatch is alert class:
+# ``ld_public_index`` for the pinned revision and the index / file-list
+# hashes, ``ld_draw`` for the drawn windows.
+PUBLIC_SCHEMA = "lane-d-public/1"
+PUBLIC_INDEX_SCHEMA = "lane-d-public-index/1"
+PUBLIC_SEED_TAG = "lane_d_public"
+PUBLIC_PINS = {
+    "gift_eval_pretrain": ("Salesforce/GiftEvalPretrain",
+                           "6830b624de7ed2b3d3e5b85bb6959d81dcc5d874", False),
+    "rmisc": ("nju-zhangsq/RMISC", "d0cdd935300ca9b3b2d6f23e6085db24cb7560c2", True),
+}
+PUBLIC_N_WINDOWS = 5000
+PUBLIC_MIN_HISTORY = 128
+
+
+def _pub_canon(obj) -> bytes:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                      allow_nan=False).encode("utf-8")
+
+
+def _pub_quota(caps: dict[str, int], total: int) -> dict[str, int]:
+    """The even split: smallest capacity first (ties by key), scarce cells
+    whole, the surplus re-split."""
+    quota = {k: 0 for k in caps}
+    remaining = dict(sorted(caps.items()))
+    want = int(total)
+    while remaining and want > 0:
+        share = max(1, want // len(remaining))
+        key = min(remaining, key=lambda k: (remaining[k], k))
+        cap = remaining.pop(key)
+        take = min(cap, share if remaining else want)
+        quota[key] = take
+        want -= take
+    return quota
+
+
+def _pub_hint(seed: str, kind: str, o: int, r: int) -> int:
+    return int(hashlib.sha256(f"{seed}:{kind}:{o}:{r}".encode()).hexdigest(), 16)
+
+
+def _pub_cut(seed: str, o: int, r: int, length: int, h: int, m: int, multi: bool,
+             used: list[int]) -> int:
+    """One window per series: ``c = m + H(cut, o, 1) mod (L - h - m + 1)``.
+    Several: slots ``m + off + j*h`` (``j < k``), ``off = H(offset, o, 0) mod
+    (L - m - k*h + 1)``; round ``r`` takes the unused slot at ``H(slot, o, r)
+    mod #unused`` (ascending)."""
+    if not multi:
+        return m + _pub_hint(seed, "cut", o, 1) % (length - h - m + 1)
+    k = max(0, (length - m) // h)
+    off = _pub_hint(seed, "offset", o, 0) % (length - m - k * h + 1)
+    free = [m + off + j * h for j in range(k) if m + off + j * h not in used]
+    return free[_pub_hint(seed, "slot", o, r) % len(free)]
+
+
+def _pub_rows(index_dir) -> tuple[dict, list[dict]]:
+    """The manifest and rows of a public index, every hash checked (a
+    ``ValueError`` names the first defect)."""
+    import gzip
+
+    d = Path(index_dir)
+    m = json.loads((d / "manifest.json").read_text(encoding="utf-8"))
+    if m.get("schema") != PUBLIC_INDEX_SCHEMA:
+        raise ValueError(f"manifest schema {m.get('schema')!r}")
+    files = sorted(({"path": str(f["path"]), "size": int(f["size"]), "sha256": str(f["sha256"])}
+                    for f in m["files"]), key=lambda f: f["path"])
+    if hashlib.sha256(_pub_canon(files)).hexdigest() != m.get("files_sha256"):
+        raise ValueError("files_sha256 is not the manifest's file list")
+    h, rows = hashlib.sha256(), []
+    with gzip.open(d / "index.jsonl.gz", "rb") as gz:
+        for line in gz:
+            h.update(line)
+            row = json.loads(line)
+            if row.get("ordinal") != len(rows) or _pub_canon(row) + b"\n" != line:
+                raise ValueError(f"index line {len(rows)} is not canonical / in ordinal order")
+            rows.append(row)
+    if h.hexdigest() != m.get("index_sha256") or len(rows) != m.get("n_series"):
+        raise ValueError("the index bytes do not hash to index_sha256")
+    return m, rows
+
+
+def public_redraw(rows: list[dict], *, source: str, block_hash: str, horizon: int,
+                  n_windows: int = PUBLIC_N_WINDOWS, min_history: int = PUBLIC_MIN_HISTORY,
+                  multi_window: bool | None = None) -> dict:
+    """The public draw re-derived from index rows: ``{capacity, quota,
+    windows}`` (windows ``{window_id, ordinal, family, freq, cut, h,
+    length}`` sorted by id)."""
+    multi = PUBLIC_PINS[source][2] if multi_window is None else bool(multi_window)
+    h, m = int(horizon), int(min_history)
+    seed = f"{block_hash}:{PUBLIC_SEED_TAG}:{source}"
+
+    def slots(n: int) -> int:
+        return max(0, (int(n) - m) // h)
+
+    cells: dict[str, list[dict]] = {}
+    for r in rows:
+        if slots(r["length"]) >= 1:
+            cells.setdefault(f"{r['family']}|{r['freq']}", []).append(r)
+    caps = {k: (sum(slots(r["length"]) for r in v) if multi else len(v)) for k, v in cells.items()}
+    quota = _pub_quota(caps, n_windows)
+    taken: dict[int, list[int]] = {}
+    for k in sorted(cells):
+        left, rnd = quota.get(k, 0), 1
+        members = sorted(cells[k], key=lambda r: r["ordinal"])
+        while left > 0:
+            pool = [r for r in members if len(taken.get(r["ordinal"], ())) == rnd - 1
+                    and slots(r["length"]) >= rnd]
+            if not pool:
+                break
+            pool.sort(key=lambda r: (_pub_hint(seed, "pick", r["ordinal"], rnd), r["ordinal"]))
+            for r in pool[:left]:
+                o = r["ordinal"]
+                c = _pub_cut(seed, o, rnd, int(r["length"]), h, m, multi, taken.get(o, []))
+                taken.setdefault(o, []).append(c)
+                left -= 1
+            if not multi:
+                break
+            rnd += 1
+    by_o = {r["ordinal"]: r for r in rows}
+    windows = sorted(({"window_id": f"{source}:{by_o[o]['series_id']}:{c}:h{h}", "ordinal": o,
+                       "family": by_o[o]["family"], "freq": by_o[o]["freq"], "cut": c, "h": h,
+                       "length": int(by_o[o]["length"])}
+                      for o, cuts in taken.items() for c in cuts),
+                     key=lambda w: w["window_id"])
+    return {"capacity": dict(sorted(caps.items())), "quota": dict(sorted(quota.items())),
+            "windows": windows}
+
+
+def _public_block_hash(report: dict):
+    for k, f in (("draw", "boundary_block_hash"), ("gate", "block_hash")):
+        v = report.get(k)
+        if isinstance(v, dict) and isinstance(v.get(f), str):
+            return v[f]
+    return None
+
+
+def _public_index_problems(report: dict, public_indexes) -> list[str]:
+    """``ld_public_index``: each source is a pinned one at its pinned repo and
+    revision; with ``public_indexes`` ({source: index dir}) the auditor's
+    index verifies and its revision, ``index_sha256`` and ``files_sha256``
+    are the report's."""
+    if "public" not in report:
+        return []
+    pub = report["public"]
+    if not isinstance(pub, dict) or pub.get("schema") != PUBLIC_SCHEMA:
+        return [f"public schema {pub.get('schema') if isinstance(pub, dict) else pub!r}"]
+    out = []
+    for s in pub["sources"]:
+        src = s["source"]
+        pin = PUBLIC_PINS.get(src)
+        if pin is None:
+            out.append(f"public source {src!r} is not a pinned source")
+            continue
+        if (s["repo"], s["revision"]) != pin[:2]:
+            out.append(f"public {src}: {s['repo']}@{s['revision']} is not the pinned "
+                       f"{pin[0]}@{pin[1]}")
+        if public_indexes is None or src not in public_indexes:
+            continue
+        try:
+            m, _rows = _pub_rows(public_indexes[src])
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            out.append(f"public {src}: the auditor's index does not verify: {e}")
+            continue
+        for k in ("index_sha256", "files_sha256", "revision", "repo"):
+            if m.get(k) != s[k]:
+                out.append(f"public {src}: {k} {s[k]!r} is not the index's {m.get(k)!r}")
+        if m.get("source") != src:
+            out.append(f"public {src}: the auditor's index is of {m.get('source')!r}")
+    return out
+
+
+def _public_draw_problems(report: dict, cfg, public_indexes) -> list[str]:
+    """``ld_draw`` for the public half: the seed is the settlement's block
+    hash, the draw constants are the spec's (``n_windows`` 5000,
+    ``min_history`` 128, ``horizon`` = ``[lane_d] horizon``, ``multi_window``
+    per source); with ``public_indexes`` the capacity, quota and every drawn
+    window are re-derived from the index and must match."""
+    if "public" not in report:
+        return []
+    bh = _public_block_hash(report)
+    out = []
+    for s in report["public"]["sources"]:
+        src = s["source"]
+        if src not in PUBLIC_PINS:
+            continue
+        if bh is None or s["seed"] != f"{bh}:{PUBLIC_SEED_TAG}:{src}":
+            out.append(f"public {src}: seed {s['seed']!r} is not "
+                       f"<boundary_block_hash>:{PUBLIC_SEED_TAG}:{src}")
+            continue
+        want = {"n_windows": PUBLIC_N_WINDOWS, "min_history": PUBLIC_MIN_HISTORY,
+                "horizon": int(cfg.horizon), "multi_window": PUBLIC_PINS[src][2]}
+        bad = sorted(k for k, v in want.items() if s[k] != v)
+        if bad:
+            out.append(f"public {src}: draw constants {bad} are not the spec's")
+            continue
+        if public_indexes is None or src not in public_indexes:
+            continue
+        try:
+            m, rows = _pub_rows(public_indexes[src])
+        except (OSError, ValueError, KeyError, TypeError):
+            continue          # ld_public_index names it
+        if m.get("index_sha256") != s["index_sha256"]:
+            continue          # ld_public_index names it
+        got = public_redraw(rows, source=src, block_hash=bh, horizon=int(cfg.horizon))
+        for k in ("capacity", "quota"):
+            if got[k] != s[k]:
+                out.append(f"public {src}: {k} is not the re-derived draw's")
+        if got["windows"] != s["windows"]:
+            mine = {w["window_id"] for w in got["windows"]}
+            theirs = {w["window_id"] for w in s["windows"]}
+            diff = sorted(mine ^ theirs)[:3] or ["(same ids, other fields)"]
+            out.append(f"public {src}: the drawn windows are not the re-derived draw "
+                       f"(first differences {diff})")
+    return out
+
+
 _UNSET = object()
 
 # ── rev6.18 B3: per-check refusal codes (LANE_D_PLAN rev6.18 B3 table) ──────
@@ -1401,7 +1620,7 @@ class LaneDFindings:
 
 def lane_d_findings(report: dict, cfg, *, signer_hotkey: str, prior_reports=None,
                     era_sentinel=_UNSET, pool_dirs=None, bench_rows=None, uid_of=None,
-                    chain=None, max_channels=None) -> LaneDFindings:
+                    chain=None, max_channels=None, public_indexes=None) -> LaneDFindings:
     """Run every check of :func:`check_lane_d` and return its findings
     (rev6.18 B3). Same arguments as :func:`check_lane_d`.
 
@@ -1515,6 +1734,11 @@ def lane_d_findings(report: dict, cfg, *, signer_hotkey: str, prior_reports=None
         # rev6.18 A4 (F2): each multichannel window's channel pick is part of
         # the seeded draw (the boundary block hash): re-derived, alert class.
         alert("ld_draw", lambda: _channel_problems(report, windows, max_channels))
+        # rev6.18 A1/A2/A6 (F3): the public draw, re-derived from the auditor's
+        # index (``public_indexes``) and the block hash; the pinned revision
+        # and the index / file-list hashes. Both alert class.
+        alert("ld_public_index", lambda: _public_index_problems(report, public_indexes))
+        alert("ld_draw", lambda: _public_draw_problems(report, cfg, public_indexes))
         # The §1.3b gate decides every crowning candidate; the crowning and
         # the paid court follow from it.
         crown, problems = _crown_problems(report, cfg, boundary, confirms, entries)
@@ -1697,7 +1921,7 @@ def _chain_findings(report: dict, cfg, signer_hotkey: str, prior_reports, chain)
 
 def check_lane_d(report: dict, cfg, *, signer_hotkey: str, prior_reports=None,
                  era_sentinel=_UNSET, pool_dirs=None, bench_rows=None, uid_of=None,
-                 chain=None, max_channels=None) -> CheckResult:
+                 chain=None, max_channels=None, public_indexes=None) -> CheckResult:
     """PASS on a genuine report; FAIL when the signature, ``rows_sha256``,
     a stated parameter or the verdict re-derived from the rows disagrees,
     or the crown's provenance does not hold (RV7 B2). rev6.18 B3: the FAIL
@@ -1719,10 +1943,17 @@ def check_lane_d(report: dict, cfg, *, signer_hotkey: str, prior_reports=None,
     (rev6.18 A4, F2): ``[generator] max_channels`` at the boundary; every
     judged multichannel window's channel pick is re-derived with it
     (``ld_draw``; with ``pool_dirs`` also checked against the stored series,
-    ``ld_snapshot``); ``None`` fails any multichannel window."""
+    ``ld_snapshot``); ``None`` fails any multichannel window.
+    ``public_indexes`` (rev6.18 A6, F3): ``{source: index dir}``, the auditor's
+    copies of the public indexes; each named source's index is verified
+    against the report's revision / ``index_sha256`` / ``files_sha256``
+    (``ld_public_index``) and its draw re-derived from the index and the
+    block hash (``ld_draw``); ``None`` checks the report's public block
+    alone (pins, seed, constants)."""
     f = lane_d_findings(report, cfg, signer_hotkey=signer_hotkey, prior_reports=prior_reports,
                         era_sentinel=era_sentinel, pool_dirs=pool_dirs, bench_rows=bench_rows,
-                        uid_of=uid_of, chain=chain, max_channels=max_channels)
+                        uid_of=uid_of, chain=chain, max_channels=max_channels,
+                        public_indexes=public_indexes)
     if f.findings:
         code, detail = f.findings[0]
         return _fail(NAME, f"{code}: {detail}")

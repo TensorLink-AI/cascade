@@ -987,8 +987,17 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
                   prior_pool_dirs=(), expect_prior_sha256: str | None = None,
                   boundary_block_hash: str | None = None, sentinel: str | None = None,
                   bench=None, armed: dict | None = None,
-                  max_channels: int | None = None) -> LaneDSettlement:
+                  max_channels: int | None = None,
+                  public_indexes: dict | None = None) -> LaneDSettlement:
     """Settle lane D at ``boundary`` (see the module docstring).
+
+    ``public_indexes`` (rev6.18 A1/A2/A6, F3) is ``{source: index dir}`` of the
+    public sources (W6p indexes). With ``boundary_block_hash`` each source is
+    drawn (:func:`~cascade.validator.lane_d_public.draw_public`, 5000
+    windows, the same for KING_D, the house and every challenger) and the
+    report carries the ``public`` block (revision, index and file-list
+    hashes, window ids). The box reads only the indexes; scoring the public
+    windows and the combined rule are F4's. ``None`` records nothing.
 
     ``max_channels`` (rev6.18 A4, F2) is ``[generator] max_channels``: the
     channel cap of a multichannel ``(C, L)`` pool window, whose pick
@@ -1446,6 +1455,14 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     if gate is not None:
         # Present iff the gate ran (absent, never null, otherwise).
         report["gate"] = gate
+    if public_indexes and boundary_block_hash is not None:
+        # rev6.18 F3 (W5k): one public draw per source, from the indexes.
+        from .lane_d_public import draw_public, public_record
+
+        report["public"] = public_record([
+            draw_public(public_indexes[src], source=src,
+                        boundary_block_hash=str(boundary_block_hash), horizon=h)
+            for src in sorted(public_indexes)])
     if armed_fields is not None:
         # rev6.6: the settlement's armed set and the evidence it was armed
         # on, signed, so satellites verify it (never re-derive it from

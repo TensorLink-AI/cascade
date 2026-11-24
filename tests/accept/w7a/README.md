@@ -664,3 +664,31 @@ channel pick re-stated from the plan, and `settle_mv` (asserts
   window's `if {required: [n_channels]} then {required: all six}` and the
   cross-field check enforce all-or-none. A univariate window carries none
   of them, so a univariate report is unchanged.
+
+## Public sources (rev6.18 F3): `test_w7a_public.py`, `pub.py`
+
+`pub.py` settles F2's chain with `settle_lane_d(..., public_indexes=)`
+(the tiny GiftEvalPretrain and RMISC mirrors of
+`tests/accept/w6p/fixtures.py`; asserts the keyword first). It is shared
+with W9.
+
+- Top-level optional `public` (absent, never null, when no index is
+  given): `{schema: "lane-d-public/1", sources: [...]}`, one entry per
+  source, sorted by `source` (`gift_eval_pretrain`, `rmisc`).
+- `$defs.public_source` (closed): `source`, `repo`, `revision` (40
+  hex, the ONE pinned HF revision), `index_sha256`, `files_sha256`,
+  `seed` (`<boundary block hash>:lane_d_public:<source>`), `n_windows`
+  (5000), `horizon` (`[lane_d] horizon`), `min_history` (128),
+  `multi_window`, `capacity` / `quota` (`{"<family>|<freq>": n}`),
+  `windows` (`$defs.public_window`: `window_id`, `ordinal`, `family`,
+  `freq`, `cut`, `h`, `length`) and `dropped` (`{window_id, reason}`,
+  the read-time drops of W5k).
+- Cross-field (`_check_public`): sources unique and sorted; the seed on the
+  report's block hash (the draw's / gate's); quotas sum to at most
+  `n_windows`, each at most its capacity, each cell's drawn windows at most
+  its quota; window ids unique, sorted, `<source>:<series_id>:<cut>:h<h>`,
+  `h = horizon`, `min_history <= cut <= length - h`, no two targets of a
+  series overlapping; dropped windows drawn, unique, sorted.
+
+On main these tests fail on the `public_indexes` assertion or the schema's
+top-level property set (`TOP_LEVEL_OPTIONAL` now lists `public`).
