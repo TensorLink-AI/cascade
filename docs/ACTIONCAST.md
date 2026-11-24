@@ -1,18 +1,29 @@
-# Decision AI — design
+# ActionCast — design
 
-**Decision AI** is a lane-C competition. Miners write *decision software*, a
+**ActionCast** is a lane-C competition. Miners write *decision software*, a
 **harness**, that turns our fine-tuned models' forecasts into actions. It
 trades a risk mandate, dispatches a battery, orders stock, or covers any
 vertical we fine-tune for. Harnesses are judged forward-only on real data,
 in simulated episodes, against a reference harness on the same model.
 
-- **Decision record:** [DEC-CA-0073](../decisions/DEC-CA-0073-decision-ai.md)
+- **Decision record:** [DEC-CA-0073](../decisions/DEC-CA-0073-actioncast.md)
   holds what is decided, the owner rulings and the open questions (`Q1`…`Q10`
   below refer to it).
 - **Status: design, not built, not armed.** Every number is a proposed
   default.
 - **Plugin interface:** [LANE_C_COMPETITIONS.md](LANE_C_COMPETITIONS.md).
-  Decision AI is the `dai` competition kind; targets are `dai:<scenario>`.
+  ActionCast is the `act` competition kind; targets are `act:<scenario>`.
+
+**The Cast set.** Lane C competitions are named in one family. Each
+vertical has a fine-tune (the model) and an ActionCast scenario (the
+software that uses it):
+
+| vertical | fine-tune | kind | ActionCast scenario |
+|---|---|---|---|
+| markets | **MarketCast** (live) | `mkt:` | `act:perp` |
+| energy | **EnergyCast** (to build) | `nrg:` | `act:bess` |
+| inventory | **InventoryCast** (to build) | `inv:` | `act:inventory` |
+| next vertical | **<Vertical>Cast** | `<abc>:` | `act:<scenario>` |
 
 ## Contents
 
@@ -39,7 +50,7 @@ to charge, how much to order. That step is where a forecast earns its value,
 and most of it is not forecasting. It covers sizing on uncertainty, costs,
 constraints, risk, and what to do when the forecast is wrong.
 
-Decision AI pays miners for that software. It also gives each fine-tune a
+ActionCast pays miners for that software. It also gives each fine-tune a
 decision-based test on top of CRPS. And it grows a shared, open kit of
 building blocks that every new vertical reuses.
 
@@ -49,7 +60,7 @@ building blocks that every new vertical reuses.
  MINER                          TRAINER (miner's key)            MAIN VALIDATOR                       EVERYONE
  ─────                          ─────────────────────            ──────────────                       ────────
  harness tree ──commit──▶ chain ──▶ CPU qualifier leg            forward recorders (prices, demand,
- (policy.py,  dai:<scen>          · static guard + smoke run      text feeds) ─────────┐
+ (policy.py,  act:<scen>          · static guard + smoke run      text feeds) ─────────┐
   harness.json)                   · historical backtest vs ref                         ▼
                                   · freeze pointer ──manifest──▶  episode runner (sandbox, no network)
                                                                     │  miner harness
@@ -73,7 +84,7 @@ building blocks that every new vertical reuses.
 1. **Build.** The miner writes a harness on the kit (`cascade.harness`) and
    backtests it locally on recorded history (`cascade harness backtest`).
 2. **Commit and fund.** The miner commits
-   `metro-v1:ft:dai:<scenario>:hippius:<repo>@sha256:<digest>` and funds a
+   `metro-v1:ft:act:<scenario>:hippius:<repo>@sha256:<digest>` and funds a
    short CPU leg.
 3. **Qualify.** The trainer runs the static guard and a smoke run. It then
    backtests the harness against the reference on public history. Failing
@@ -111,14 +122,14 @@ A judge-phase entry passes when **all** of these hold, at `alpha / k`
 
 Then the DEC-CA-0056 machinery applies unchanged: the best passer becomes
 pending, is confirmed at uncorrected `alpha` at the next settlement, and
-takes the slot by the slot rule. Each `dai:<scenario>` has two slots:
+takes the slot by the slot rule. Each `act:<scenario>` has two slots:
 
 | slot | who | share |
 |---|---|---|
 | main | best confirmed qualifier | 1 − `novel_share` |
 | novel-use | best confirmed qualifier whose per-episode gains correlate ≤ `novel_max_corr` with the main holder's, and whose forecast value ≥ the reference's | `novel_share` (e.g. 0.3) |
 
-Payout is the competition's weight in `[lane_c.competitions.dai]`, split
+Payout is the competition's weight in `[lane_c.competitions.act]`, split
 equally across its targets, then split per slot, on the gain-tiered lane-C
 schedule with its TTL. Unpaid slots burn.
 
@@ -128,9 +139,9 @@ Each vertical has two lane-C competitions that feed each other:
 
 | vertical | fine-tune target (the model) | harness target (the app) |
 |---|---|---|
-| markets / trading | `mkt:market` (MarketCast, live) | `dai:perp` |
-| energy | an energy-price fine-tune, e.g. `nrg:<market>` (to build) | `dai:bess` |
-| inventory / demand | a demand fine-tune, e.g. `dmd:<suite>` (to build) | `dai:inventory` |
+| markets / trading | **MarketCast**, `mkt:market` (live) | `act:perp` |
+| energy | **EnergyCast**, an energy-price fine-tune, `nrg:<market>` (to build) | `act:bess` |
+| inventory / demand | **InventoryCast**, a demand fine-tune, `inv:<suite>` (to build) | `act:inventory` |
 
 Rules:
 
@@ -147,7 +158,7 @@ Rules:
   confirm would run on a different model than its judge phase is dropped as
   `stale` and requeued uncharged, like `base_moved` in DEC-CA-0056. A harness
   that only worked with the old weights loses its slot at that confirm.
-- **An app arms only after its vertical's fine-tune.** `dai:<scenario>`
+- **An app arms only after its vertical's fine-tune.** `act:<scenario>`
   needs its paired fine-tune target configured (load-checked). Running on the
   pinned base until the first holder is allowed.
 - **Feedback to the fine-tune (later, not consensus at first).** Each verdict
@@ -218,7 +229,7 @@ gateway on the main validator makes the outside call. The gateway:
   LLMs. Each transcript entry stores the proof, and the auditor checks it
   without regenerating. Spot-check regeneration (the earlier plan) becomes a
   fallback for calls without a proof.
-- **Registry.** `[dai.providers.engy]` lists the allowed models by
+- **Registry.** `[actioncast.providers.engy]` lists the allowed models by
   Engy's model id and weights hash. Only models whose training cutoff is
   before the competition's `from_block` are allowed.
 - **No tools beyond the gateway.** Requests go out with no provider-side
@@ -234,8 +245,8 @@ gateway on the main validator makes the outside call. The gateway:
   (`cascade.harness.agent`). An Engy LLM can run an agent loop inside a
   step, for example forecast, check the tail, then size, and every tool call
   is a gateway call against the same budgets.
-- **Cadence.** For example, one LLM step per hour for `dai:perp`, per 2 h
-  for `dai:bess` and per day for `dai:inventory`, plus a token budget per
+- **Cadence.** For example, one LLM step per hour for `act:perp`, per 2 h
+  for `act:bess` and per day for `act:inventory`, plus a token budget per
   episode. The LLM plans, and fast numeric code acts every step.
 
 ### Decision models from decisionmodels.io
@@ -256,7 +267,7 @@ gateway on the main validator makes the outside call. The gateway:
   `{question: {answer: p}}`. `state` is built with kit helpers from the
   observation and forecasts. Forecast quantiles are a natural input, which
   keeps the fine-tune in the loop.
-- **Registry.** `[dai.providers.decisionmodels]` pins the model names
+- **Registry.** `[actioncast.providers.decisionmodels]` pins the model names
   and versions. The listing names `s1-fast`, `s1-pro`, `s1-vision` and
   `Quyet-1.0-Large`, said to be Apache-2.0: to confirm.
 - **Determinism and audit.** Replies (probabilities) go in the transcript,
@@ -353,7 +364,7 @@ kernels. Miners see exactly what they have to beat.
 ```toml
 # cascade/harness/scenarios/hydro.toml   (example: a hydro reservoir)
 scenario  = "hydro"
-model     = "dmd:inflow"            # the paired fine-tune target
+model     = "inv:inflow"            # the paired fine-tune target
 template  = "Store"
 data      = "adapters.river_flow"   # forward recorder + adapter (code, reviewed)
 step      = "1d"
@@ -380,7 +391,7 @@ select = "inflow_pct < 10"
 - **What is spec.** Everything else. Load-checked: the model target exists,
   every series is forward-recorded, the terms and reference resolve, and the
   variant ranges are bounded.
-- **What it unlocks.** The same competition kind (`dai`) serves every
+- **What it unlocks.** The same competition kind (`act`) serves every
   vertical. Arming a vertical's app is a release with its spec, then a
   `from_block`, as for any lane-C competition. Candidate next verticals on
   the existing templates:
@@ -397,7 +408,7 @@ Because harnesses see templates, not verticals, a harness written for
 `"scenarios": ["bess", "inventory", "hydro"]` and enter each one. Each entry
 is still judged and paid per scenario, by the rules above.
 
-Optional (Q9): a **generalist slot** `dai:store` (and `dai:position`),
+Optional (Q9): a **generalist slot** `act:store` (and `act:position`),
 scored on the geometric mean of the gains across every armed scenario of
 that template. It would include one scenario added after the harness was
 committed, so the harness cannot have been tuned to it. This pays for
@@ -420,7 +431,7 @@ episode length, a reference harness and (where one exists) a
 perfect-foresight oracle. Where there is an oracle, the score is
 oracle-normalised and so scale-free across assets, markets and days.
 
-### `dai:bess` — battery arbitrage on real-time power prices (recommended first)
+### `act:bess` — battery arbitrage on real-time power prices (recommended first)
 
 - **Data.** Public 5-min regional prices that need no key: AEMO NEM
   (5 regions) first. ERCOT / CAISO are candidates once their terms are
@@ -447,7 +458,7 @@ This is the cleanest scenario. It has a bounded oracle, so the score is
 scale-free and the noise is low. Quantile forecasts help in a way you can
 measure: reserving SoC for spikes depends on the upper tail.
 
-### `dai:inventory` — periodic-review replenishment
+### `act:inventory` — periodic-review replenishment
 
 - **Data.** Real daily count series recorded forward. Candidates that are
   public and keyless: Wikipedia pageviews per article (as SKU demand, scaled
@@ -464,10 +475,10 @@ measure: reserving SoC for spikes depends on the upper tail.
   or the cost ratio. This is Q3.
 - **Reference harness.** A base-stock policy at the critical fractile
   `p / (p + h)`, using the forecaster's quantile of lead-time demand.
-- **Forecaster.** The demand fine-tune's slot holder (`dmd:<suite>`), trained
+- **Forecaster.** The demand fine-tune's slot holder (`inv:<suite>`), trained
   on the same forward count series.
 
-### `dai:perp` — risk-managed perp mandate (owner, 2026-11-24: not scored on trading success)
+### `act:perp` — risk-managed perp mandate (owner, 2026-11-24: not scored on trading success)
 
 Profit is too noisy to judge, and most of it comes from the direction call,
 which this app does not test. Instead, **the harness is forced to hold a
@@ -535,8 +546,8 @@ and they are far less noisy than returns.
 
 It is a risk-management score, not a profit claim, and the docs must say so.
 
-Later candidates: `dai:hedge` (fuel / power hedging ratio), `dai:capacity`
-(cloud autoscaling on `domain:web_cloudops` series), `dai:staffing`.
+Later candidates: `act:hedge` (fuel / power hedging ratio), `act:capacity`
+(cloud autoscaling on `domain:web_cloudops` series), `act:staffing`.
 
 ## 9. Rewarding creative use of forecasts
 
@@ -567,7 +578,7 @@ fixed number of calls per step. Spending it well is part of the game.
 - **Event-driven spending.** A harness can save budget in quiet hours and
   spend it in stress hours, or re-forecast only when its own trigger fires.
 - **Cross-vertical models.** `harness.json` may list other verticals'
-  fine-tunes it also calls, for example `dai:bess` asking `mkt:market` for
+  fine-tunes it also calls, for example `act:bess` asking `mkt:market` for
   gas or power-adjacent markets. The main model must still be used (the
   model-lift gate). Other models are extra inputs and count against the same
   budget.
@@ -579,7 +590,7 @@ unchanged.
 
 ### 2. A novel-use slot per scenario
 
-Each `dai:<scenario>` has two slots:
+Each `act:<scenario>` has two slots:
 
 | slot | who takes it | share of the scenario's payout |
 |---|---|---|
@@ -647,7 +658,7 @@ or a different way of winning.
 
 ## 10. Submission
 
-The miner commits `metro-v1:ft:dai:<scenario>:hippius:<repo>@sha256:<digest>`
+The miner commits `metro-v1:ft:act:<scenario>:hippius:<repo>@sha256:<digest>`
 (the existing lane-C form, parsed generically). The tree:
 
 ```
@@ -703,30 +714,30 @@ means the call is refused, not that the episode fails.
 
 | piece | where | what |
 |---|---|---|
-| kind | `cascade/shared/config/lane_c.py` | `register_competition_kind("dai", eval="paired episode decision score", forward_only=True, parse_value=check_scenario)` |
+| kind | `cascade/shared/config/lane_c.py` | `register_competition_kind("act", eval="paired episode decision score", forward_only=True, parse_value=check_scenario)` |
 | kit | `cascade/harness/` (new: `data`, `forecast`, `decide`, `env`) | the primitive set, with golden-vector tests per primitive; published as a standalone package for miners |
 | scenarios | `cascade/harness/scenarios/<name>.toml` + `adapters/` | one spec per scenario, plus its data adapter and forward recorder |
 | model gateway | `cascade/validator/harness_gateway.py` (new) | Engy and decisionmodels.io clients: registry pinning, budgets, request-hash cache, transcript (with Engy proofs), transient handling, per-entry metering |
 | agent tools | `cascade/harness/agent.py` | kit primitives as tool schemas for LLM tool use |
 | sandbox runner | `cascade/eval/harness/runner.py` | runs `Harness` in the sandbox, proxies `fc.forecast`, writes the transcript |
 | trainer half | `cascade/trainer/lane_c_competitions.py` | `HarnessTrainer`: `read_recipe` checks the tree. `train_leg` is a short CPU leg (DEC-CA-0053 CPU tier, on the miner's key): static guard, a smoke run, and a **historical qualifier** (it must beat the reference on public backtest episodes, so junk is filtered before it costs validator GPU). It then freezes the pointer. `leg_hours` ≈ 0.25 |
-| validator half | `cascade/validator/lane_c_competitions.py` | `HarnessValidator.judge`: on the main validator, for entries whose forward window has closed, it runs N episodes × {miner, reference, naive-model miner} through `MktSession.forecaster(...)` (reusing the pod via `MktLease(owner="dai")`), scores them and emits `LaneCJudgement` rows. Uses `generic_fold = True` unless the forecaster-change rule needs state |
+| validator half | `cascade/validator/lane_c_competitions.py` | `HarnessValidator.judge`: on the main validator, for entries whose forward window has closed, it runs N episodes × {miner, reference, naive-model miner} through `MktSession.forecaster(...)` (reusing the pod via `MktLease(owner="act")`), scores them and emits `LaneCJudgement` rows. Uses `generic_fold = True` unless the forecaster-change rule needs state |
 | reports | same | main-validator per-round report (`report_key`), as MarketCast does, so satellites need no GPU |
 | audit | `cascade/audit/harness_reproduce.py` + a branch in `checks.py` | replays transcripts on CPU and re-derives scores and LCBs |
-| docs | `docs/DECISION_AI_MINER.md` | the miner guide, in the MARKETCAST.md shape |
+| docs | `docs/ACTIONCAST_MINER.md` | the miner guide, in the MARKETCAST.md shape |
 
 ## 13. Config sketch
 
 ```toml
 [lane_c]
-targets = ["mkt:market", "dai:bess", "dai:inventory"]
+targets = ["mkt:market", "act:bess", "act:inventory"]
 
-[lane_c.competitions.dai]
+[lane_c.competitions.act]
 weight      = 0.5
 from_block  = 0
 until_block = 0
 
-[dai]                           # sibling table, like [marketcast] (overlay allow-list)
+[actioncast]                    # sibling table, like [marketcast] (overlay allow-list)
 episodes_per_verdict = 400
 verdict_wait_blocks  = 21600    # ~3 days of forward data
 gain_margin          = 0.01
@@ -738,20 +749,20 @@ hard_tier_fraction   = 0.3
 step_cpu_ms          = 200
 tree_max_bytes       = 2_000_000
 
-[dai.providers.engy]         # LLMs; cutoff must precede from_block
+[actioncast.providers.engy]         # LLMs; cutoff must precede from_block
 models             = ["<engy-model-id>@<weights-hash>"]   # to choose (Q10)
 decoding           = "greedy"
 tools              = "gateway-only"   # no provider-side web or browse tools
 tokens_per_episode = 20000
 require_proof      = true
 
-[dai.providers.decisionmodels]
+[actioncast.providers.decisionmodels]
 models               = ["<model>@<version>"]   # e.g. s1-fast, to confirm
 calls_per_episode    = 500
 spot_check_fraction  = 0.02
 prob_tolerance       = 1e-6
 
-[dai.bess]
+[actioncast.bess]
 model      = "nrg:aemo"   # paired fine-tune target; its holder (or pinned base) is the forecaster
 regions    = ["NSW1", "QLD1", "VIC1", "SA1", "TAS1"]
 episode_h  = 24
@@ -765,15 +776,15 @@ episode_h  = 24
    Build the model gateway and the transcript format in the same step: the
    forecast path first, then the Engy and decisionmodels.io clients once
    their API facts are confirmed (Q10).
-1. Build `dai:perp` plumbing on `mkt:market` first: it is the only vertical
+1. Build `act:perp` plumbing on `mkt:market` first: it is the only vertical
    whose fine-tune exists, so the forecaster pairing can be tested end to
-   end. In parallel, build the `nrg:` fine-tune and `dai:bess` together, since
+   end. In parallel, build the `nrg:` fine-tune and `act:bess` together, since
    they share the AEMO recorder. Run the Q5 noise study offline for each
    scenario.
 2. Testnet with the reference harness and two or three variants written by
    us (good, bad, model-blind), to check that the verdicts rank them
    correctly.
-3. Ship the release, then arm each `dai:` scenario at an era boundary, after
-   its fine-tune target and its own noise study. With risk scoring, `dai:perp`
+3. Ship the release, then arm each `act:` scenario at an era boundary, after
+   its fine-tune target and its own noise study. With risk scoring, `act:perp`
    can arm first, because `mkt:market` already exists.
 

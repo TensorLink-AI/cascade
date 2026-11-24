@@ -1,15 +1,19 @@
 ---
 id: DEC-CA-0073
 type: decision
-title: "Decision AI (`dai:<scenario>`): a lane-C competition for decision software that calls our per-vertical fine-tunes (plus Engy LLMs and decisionmodels.io decision models), judged forward-only against a reference harness on the same model"
+title: "ActionCast (`act:<scenario>`): a lane-C competition for decision software that calls our per-vertical fine-tunes (plus Engy LLMs and decisionmodels.io decision models), judged forward-only against a reference harness on the same model"
 status: proposed
 date: 2026-11-24
-tags: [lane-c, competitions, decision-ai, harness, applications, v2]
+tags: [lane-c, competitions, actioncast, harness, applications, v2]
 revisit_when: "the owner settles Q1–Q10; or a scenario cannot supply enough forward episodes per settlement; or slots stay unpaid for weeks because decision-score noise swamps the margin; or Engy / decisionmodels.io cannot pin versions or return reproducible replies"
 relations: {depends_on: [DEC-CA-0056, DEC-CA-0064, DEC-CA-0063], relates_to: [DEC-CA-0015, DEC-CA-0053, DEC-CA-0069]}
 ---
 
-**Design:** [docs/DECISION_AI.md](../docs/DECISION_AI.md) has the system
+**Naming (owner):** the Cast set. Fine-tunes are named per vertical
+(MarketCast, EnergyCast, InventoryCast, …). ActionCast is the competition
+for the software that uses them.
+
+**Design:** [docs/ACTIONCAST.md](../docs/ACTIONCAST.md) has the system
 diagram, the lifecycle, the kit, the scenarios, the scoring, the
 implementation map, the config and the rollout. This record holds what is
 decided and what is still open. Nothing is built or armed.
@@ -25,18 +29,18 @@ get open, competitive decision software built on that model.
 
 Owner rulings (2026-11-24) are marked **(owner)**. The rest is proposed.
 
-1. **Decision AI is a lane-C competition kind, `dai`.** A target is
-   `dai:<scenario>`. It uses the lane-C plugin interface
+1. **ActionCast is a lane-C competition kind, `act`.** A target is
+   `act:<scenario>`. It uses the lane-C plugin interface
    (`docs/LANE_C_COMPETITIONS.md`) and has its own weight in
-   `[lane_c.competitions.dai]`.
+   `[lane_c.competitions.act]`.
 2. **Miners submit a harness.** That is deterministic Python decision code
    on the shared kit, plus `harness.json`. It is not trained. It runs
    sandboxed with no network.
 3. **It uses our fine-tune for the vertical (owner).** Each scenario is
    paired with its vertical's fine-tune target and always calls that
    target's current slot holder, or its pinned base before the first
-   holder: `dai:perp` ↔ `mkt:market`, `dai:bess` ↔ `nrg:`,
-   `dai:inventory` ↔ `dmd:`. A `dai:` scenario arms only after its fine-tune
+   holder: `act:perp` ↔ MarketCast (`mkt:market`), `act:bess` ↔ EnergyCast
+   (`nrg:`), `act:inventory` ↔ InventoryCast (`inv:`). An `act:` scenario arms only after its fine-tune
    target is configured.
 4. **LLMs come from Engy, decision models from decisionmodels.io (owner).**
    A harness reaches both, and the fine-tune, only through one model
@@ -49,7 +53,7 @@ Owner rulings (2026-11-24) are marked **(owner)**. The rest is proposed.
    the same model. It passes on a composite gain LCB ≥ 0.01, with no term
    confidently worse and a positive model lift. After that, the DEC-CA-0056
    Bonferroni → pending → confirm → slot rules apply unchanged.
-6. **Trading is scored on risk management, not profit (owner).** `dai:perp`
+6. **Trading is scored on risk management, not profit (owner).** `act:perp`
    forces a mandate: basket, directions and weights. It scores vol
    tracking, tail control, an FZ0 risk-forecast loss and costs. PnL is a
    diagnostic only.
@@ -82,7 +86,7 @@ Owner rulings (2026-11-24) are marked **(owner)**. The rest is proposed.
   * forward recorders for each vertical's data;
   * the trainer and validator halves of the plugin;
   * an audit replay;
-  * the `nrg:` and `dmd:` fine-tune competitions that the energy and
+  * the EnergyCast (`nrg:`) and InventoryCast (`inv:`) fine-tune competitions that the energy and
     inventory apps depend on.
 - **Main-validator load** grows: episode runs, plus metered external calls.
   The proposal is that miners pay for external calls (Q10).
@@ -93,23 +97,23 @@ Owner rulings (2026-11-24) are marked **(owner)**. The rest is proposed.
 
 ## Open (owner to answer)
 
-- **Q1. Forecaster change.** Proposed in DECISION_AI.md §5: the holder
+- **Q1. Forecaster change.** Proposed in ACTIONCAST.md §5: the holder
   keeps its slot, and its next confirm runs on the new model. Confirm this,
   or choose to re-score every harness holder at each fine-tune change.
 - **Q2. Model-lift gate.** Should a harness be *required* to beat its own
   naive-forecast run? Requiring it keeps the competition about the model.
   Dropping it widens the field to any good policy.
 - **Q3. Score per scenario.** Use the oracle-normalised capture or regret
-  ratio, or the raw cost ratio? For `dai:perp`: the term weights, σ* range,
+  ratio, or the raw cost ratio? For `act:perp`: the term weights, σ* range,
   `min_util`, and whether execution / client-flow steps are in v1 or later.
 - **Q4. The energy and demand fine-tunes.** Resolved in principle: each
   vertical uses its own fine-tune (owner, 2026-11-24). Still open: the pinned
-  base and suites for `nrg:` and `dmd:` (Timestral-28M again?), and whether
+  base and suites for `nrg:` and `inv:` (Timestral-28M again?), and whether
   each app scenario arms with its fine-tune or one era after it.
 - **Q5. Noise budget.** Before any `from_block`, run the reference harness
   against small perturbations of itself on recorded data. Measure how many
   episodes a 1 % gain needs to pass at α/k. This decides
-  `episodes_per_verdict`. For `dai:perp`, measure each score term's noise
+  `episodes_per_verdict`. For `act:perp`, measure each score term's noise
   separately; a term too noisy to move the composite is dropped or
   down-weighted.
 - **Q6. Who pays for eval.** Should the main validator pay for forward
@@ -125,7 +129,7 @@ Owner rulings (2026-11-24) are marked **(owner)**. The rest is proposed.
   small blocks new ideas; too large makes the main validator's GPU cost
   unpredictable.
 
-- **Q9. Generalist slots.** Should there be `dai:store` / `dai:position`
+- **Q9. Generalist slots.** Should there be `act:store` / `act:position`
   slots scored across every scenario of a template, including one added after
   commit? And what weight should they get against the per-scenario slots?
 
@@ -137,9 +141,9 @@ Owner rulings (2026-11-24) are marked **(owner)**. The rest is proposed.
 
 ## Rollout
 
-See [docs/DECISION_AI.md §14](../docs/DECISION_AI.md#14-rollout). In short:
+See [docs/ACTIONCAST.md §14](../docs/ACTIONCAST.md#14-rollout). In short:
 
 1. Build the kit and the gateway.
-2. Run `dai:perp` end to end on `mkt:market`, which already exists.
-3. Build `nrg:` and `dai:bess` together.
+2. Run `act:perp` end to end on `mkt:market`, which already exists.
+3. Build EnergyCast and `act:bess` together.
 4. Run a noise study per scenario before each scenario's `from_block`.
