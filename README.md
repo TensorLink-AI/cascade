@@ -53,6 +53,7 @@ training leg. Funding makes an entry eligible; it never guarantees a reward.
 | A validator | [Validator guide](docs/VALIDATOR.md) |
 | The operator | [Operator runbook](docs/OPERATOR.md) |
 | Reviewing the design | [Architecture](docs/ARCHITECTURE.md), [model and recipe](docs/MODEL.md) and [decisions](decisions/) |
+| Looking for any other doc | [The docs map](docs/README.md) |
 
 The live model is **Cascade MoE Base - 1.23B** (a pyramid mixture of experts,
 112M active parameters per token). Smaller presets (17.58M, 69.02M, 273.84M)
