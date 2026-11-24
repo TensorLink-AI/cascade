@@ -7,3 +7,5 @@ chain.toml
 chain.testnet.toml
 # Existing unit test pinning the placeholder behaviour (arming refused).
 tests/unit/test_lane_d_placeholder.py
+# F6 (plan rev6.18 B11): the retired [lane_d] keys' loader property.
+tests/unit/test_config.py

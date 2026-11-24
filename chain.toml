@@ -168,6 +168,13 @@ batch_denomination          = "series"
 # worker image built from this release: an older worker parses no such key
 # and would bill C×L, stopping a wide leg C× early. Bit-identical at C=1.
 budget_denomination         = "series_points"
+# DEC-CA-0047 scheduled switch of the v1 contract (TrainingContractConfig.at_block;
+# never in contract_digest). Live on mainnet since 9165600; v2 (from 9399600)
+# carries its own contract, so this only shapes eras [9165600, 9399600) and
+# lets audit/replay re-derive the contract those v1 rounds trained under.
+# Typed from the deployed file (S0a B9, owner 2026-11-23).
+budget_denomination_after       = "points+mv20"
+budget_denomination_after_block = 9165600
 # optimiser (u-muP transfer: tune once on a small proxy width, pin the result)
 optimizer          = "normuon_adamw"
 base_lr            = 4e-3        # u-muP width-independent learning rate
@@ -389,7 +396,7 @@ funded_capacity_reserve = 1     # retired (ignored)
 # more and rent only when a miner names them (--gpu, own --max-price).
 # Blackwell (4xB200, 8xB200, 4xB300, 8xB300) waits on a torch cu12.8 image:
 # the pinned image is torch 2.4.1 cu124, which cannot run on B200/B300.
-funded_pod_skus = ["8xH200", "8xH100", "4xH200", "4xH100"]
+funded_pod_skus = ["8xH100", "8xH200"]
 # Never rent executors whose CPU model contains any of these (case-insensitive
 # substring of Lium's specs.cpu.model). 2026-09-13/14: four legs stalled —
 # zero series inside the 1800 s stall window — and all four sat on Xeon
@@ -443,7 +450,11 @@ funded_max_leg_cost_usd = 75.0
 # variates (the same 512 rows per step as v2's 16 × 32) scaled to v2's 23,841
 # steps (× 0.867). 8xH200, 8xH100, 4xH100 measured; 4xH200 and Blackwell
 # estimated. Re-measure on the pinned image.
-funded_sku_wall_seconds = { RTX4090 = 13500, L40S = 10200, L40 = 11400, H100 = 6000, "8xH200" = 8333, "8xH100" = 8801, "4xH200" = 12483, "4xH100" = 13201, "4xB200" = 10174, "8xB200" = 6866, "4xB300" = 10299, "8xB300" = 6866 }
+funded_sku_wall_seconds = { RTX4090 = 13500, L40S = 10200, L40 = 11400, H100 = 6000, "8xH200" = 12270, "8xH100" = 13600, "4xH200" = 12483, "4xH100" = 13201, "4xB200" = 10174, "8xB200" = 6866, "4xB300" = 10299, "8xB300" = 6866 }
+# 2026-10-31: 8xH200 / 8xH100 above MEASURED on rc15 (2.04 / 1.84 steps/s x 23,841 steps, x1.05).
+# Typed from the deployed file (S0a B9, owner 2026-11-23).
+# Measured-wall gate (#393): no funded/king rent unless the walls were measured on this image.
+funded_sku_wall_measured_image = "sha256:5d41d94bc0c0d3ae3dfd042b0cc7e4d900c7d1f48173808436c12bf764a67641"
 # King pod rents JIT at the round's SKU (operator-billed); retire the
 # provisioner's final stage — the trainer ledgers and sweeps these pods.
 funded_king_rent = true
@@ -462,7 +473,7 @@ dispatch_reattach_grace_seconds = 900
 # capacity takes an OPERATOR final lane from hosts.toml the moment one is on
 # file — operator-billed for that leg only; legs already running on their
 # payer's pod are untouched. false ⇒ funded legs never run on operator lanes.
-funded_operator_fallback = false
+funded_operator_fallback = true
 # Direct submissions + champion-only publication (DEC-CA-0036, second half;
 # SHIPPED INERT): code POSTs straight to cascade-intake (same request as the
 # Lium key), lives in the operator-private store below, and rides the chain as
@@ -495,9 +506,6 @@ dedup_max_tokens   = 50000       # retired (ignored)
 dedup_config_only_enforce = true
 dedup_config_only_from_block = 8992800
 dedup_phase_seconds = 900
-dedup_probe_mode   = "shadow"
-dedup_probe_series = 0
-dedup_probe_budget_seconds = 600
 
 # Retired (ignored): the boundary-round trainer's genesis baseline king.
 genesis_generator_ref = "cascade/genesis-baseline@sha256:56c68bdac31718db7c59708c9678b19347fe7ef2f8a696bdd5f3ad4548e17a65"
@@ -902,13 +910,15 @@ contract_from_block    = 9046800
 # ARMED 2026-08-27 (owner): live for rounds from r47's epoch, same boundary as
 # the recipe cut — one validator update before block 8942400 covers both.
 declared_contract_from_block = 8942400
-# Init-baseline duel gate (DEC-CA-0034) in SHADOW (armed 2026-08-27, owner):
-# the validator scores the warm-start init on the verdict windows and records
-# init_baseline_geomean / init_floor_passed in the receipt (drop-when-None —
-# archived signatures survive) but the verdict is UNCHANGED. Log-only, so
-# validators may enable it at their own pace; enforce is a later, separate
-# coordinated decision once the shadow verdicts calibrate init_gate_tolerance.
-init_gate_mode = "shadow"
+# Init-baseline duel gate (DEC-CA-0034) RETIRED (rev6.18 B12, owner
+# 2026-11-23). It ran in SHADOW from 2026-08-27 (init_baseline_geomean /
+# init_floor_passed on the receipt, verdict unchanged). A round whose epoch
+# boundary is before this block still runs that legacy shadow floor (and
+# archived receipts replay so); from it the floor is off. PLACEHOLDER: far
+# future until the owner types the real era boundary at the F6 release cut
+# (same value in the deployed file). 0 would mean "off at every block" and
+# break the koth-params replay of archived shadow-era receipts.
+init_gate_retired_from_block = 4294967295
 
 [dependencies]
 # Allowlist for a generator's requirements.txt. Generators are purely
@@ -952,6 +962,12 @@ blocked = [
     "cascade.validator",
     "cascade.shared.chain",
 ]
+# Python packed into string constants is refused at ADMISSION from 9169200
+# (live on mainnet; the per-leg sandbox preflight keeps "scan"). Typed from the
+# deployed file (S0a B9, owner 2026-11-23): main's default "scan" would relax
+# the static guard on the next deploy.
+packed_sources            = "reject"
+packed_sources_from_block = 9169200
 
 [storage]
 # Hippius storage layer: Hub OCI registry for models/checkpoints/generators
@@ -974,7 +990,7 @@ pool_s3_region   = ""
 # HuggingFace-Hub dataset used as a manifest/receipt fallback ONLY during a
 # Hippius S3 outage (cascade.shared.hippius.HFFallbackStore). Make it a public
 # dataset; auth via HF_TOKEN. Empty = no fallback.
-hf_backup_repo   = ""                               # e.g. "yourorg/cascade-manifests-mirror"
+hf_backup_repo   = "tensorlink-dev/cascade-backup"   # live since 2026-09-14 (S0a, typed from the deployed file)
 # S3-compatible BACKUP of the manifest/receipt bucket: dual-writes every object
 # and serves reads when Hippius S3 is down. Credentials via
 # BACKUP_S3_ACCESS_KEY / BACKUP_S3_SECRET_KEY.
@@ -1671,7 +1687,6 @@ tau_public      = 0.01
 lowfreq_freqs   = ["D", "W", "M", "ME", "MS", "Q", "QE", "QS", "A", "Y", "YE"]  # A10: daily and slower
 reward_prior_kings = 2           # D7
 king_decay      = 0.5            # D7
-confirm_on_king_change = "restart"  # D20 (a)
 max_entries_per_settlement = 8   # D3
 max_open_per_coldkey = 2         # D3
 max_judged_per_coldkey_per_settlement = 2  # A8
@@ -1681,18 +1696,9 @@ max_bench_holds = 4
 loser_ttl_eras  = 4              # D8
 max_mirror_lag_hours = 6.0       # A1
 ready_ttl_blocks = 7200          # B10: ~24 h at 12 s blocks
-# DEC-CA-0062 keys, still parsed and carried as written.
-targets         = []             # TBD
-teacher_ref     = ""             # TBD: the teacher to distil from
-teacher_api     = "ephemeris"    # owner: Ephemeris TS foundation-model API (validators never call it)
-teacher_mode    = "route"        # route | ensemble | explicit (explicit needs teacher_models)
-real_corpus_ref = ""             # TBD: owner-pinned real corpus (DEC-CA-0028 pattern)
-data_sources    = ["real", "prior_corpus"]  # miners SELECT data (no generator): real and/or prior training corpora
-augmentations   = []             # TBD: the allowed augmentation list
-expert_choice   = "miner"        # miner | affinity | all
-max_context_length = 32768       # longer-context legs, up to 32k
-pool_prefix     = "pool_d"
-gain_margin     = 0.01
+# Retired (rev6.18 B11): confirm_on_king_change and the DEC-CA-0062 keys
+# (targets ... win_ttl_eras). The loader ignores them (RETIRED_KEYS["lane_d"]),
+# so a deployed file that still carries them loads unchanged.
 
 # ── MarketCast: lane-C fine-tune eval on Timestral-28M (DEC-CA-0064) — BUILT, SHIPPED OFF ──
 # Fine-tunes of a PINNED third-party base (mistralai/Timestral-28M, Modified
