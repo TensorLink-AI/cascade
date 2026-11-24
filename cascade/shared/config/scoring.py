@@ -295,21 +295,17 @@ class ScoringConfig:
     # regression; the suite-equal task win rate must be >= bench_gate_min_win_rate.
     bench_gate_tolerance: float = 0.01
     bench_gate_min_win_rate: float = 0.5
-    # Init-baseline floor (see cascade.eval.koth.KothParams.init_gate_mode):
-    # the shared warm-start init scored on the SAME duel windows as an absolute
-    # floor under the crown — a challenger that beat the king but is worse than
-    # "do nothing" cannot be crowned. Same progression as the gift gate:
-    # "off" (default) | "shadow" (floor computed + recorded on the receipt,
-    # verdict unchanged) | "enforce" (AND-ed into the win; can only BLOCK a
-    # dethrone, never grant one — king retention untouched, worst case = king
-    # holds). The measured motivation (2026-08-26): the raw init outscored
-    # every trained entrant post-mix-change, invisibly, because KOTH has no
-    # null baseline. Rounds with no warm_start_ckpt have no baseline — the
-    # floor simply cannot run (recorded None). [scoring] is fleet-consensus:
-    # identical across all validators or verdicts fork — release-then-activate,
-    # shadow first, never straight to enforce.
-    init_gate_mode: str = "off"
-    init_gate_tolerance: float = 0.0
+    # Init-baseline floor (DEC-CA-0034), RETIRED (rev6.18 B12, owner
+    # 2026-11-23): the v2 king check already compares the king against the
+    # init. It ran in SHADOW on mainnet from 2026-08-27 (floor computed and
+    # recorded on the receipt, verdict unchanged); it never enforced. Release-
+    # then-activate (DEC-CA-0045 typed block): a round whose epoch boundary is
+    # BEFORE this block still runs the legacy shadow floor exactly as before
+    # (and replays so — archived receipts record ``init_gate_mode = "shadow"``);
+    # from it the floor is off. 0 = no legacy window (off at every block).
+    # The old ``init_gate_mode`` / ``init_gate_tolerance`` keys are retired
+    # (loader RETIRED_KEYS["scoring"]). CONSENSUS: keep identical fleet-wide.
+    init_gate_retired_from_block: int = 0
     # Margin denomination (DEC-CA-0027; see cascade.eval.koth.MARGIN_MODES).
     # "level" (default) = LCB of (king − chal)/king — exact current behaviour.
     # "increment" = the warm-start-era rule: the shared init is scored as a
@@ -654,20 +650,17 @@ def _gift_gate_mode(value: object) -> str:
     return mode
 
 
-_INIT_GATE_MODES = ("off", "shadow", "enforce")
-
-
-def _init_gate_mode(value: object) -> str:
-    """Validate ``[scoring] init_gate_mode`` at load time (gift-gate rule: a
-    typo must fail fast, not silently un-enforce the floor). The heat-side
-    ``[round] init_gate_mode`` is deliberately NOT run through this — its
-    unknown-value semantics are warn-and-off at the use site (DEC-CA-0034)."""
-    mode = str(value)
-    if mode not in _INIT_GATE_MODES:
-        raise ValueError(
-            f"[scoring] init_gate_mode={mode!r} invalid; one of {_INIT_GATE_MODES}"
-        )
-    return mode
+def init_gate_mode_at(scoring: ScoringConfig, block: int | None) -> str:
+    """The init-baseline floor mode for the round at epoch boundary ``block``
+    (rev6.18 B12): ``"shadow"`` (the legacy, log-only DEC-CA-0034 floor) on a
+    round before ``init_gate_retired_from_block``, else ``"off"``. An unknown
+    block (``None``) reads as before the block. ``0`` ⇒ ``"off"`` everywhere.
+    Block-gated like :func:`mv_score_active`, so validator and audit resolve
+    the same mode per round."""
+    gate = int(scoring.init_gate_retired_from_block or 0)
+    if gate > 0 and (block is None or int(block) < gate):
+        return "shadow"
+    return "off"
 
 
 def parse_bench_workers(value) -> str:
