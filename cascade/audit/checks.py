@@ -2381,7 +2381,7 @@ def check_king_check(receipt: RoundReceipt, cfg: ChainConfig,
 
 
 def _paid_full_pay_why(w: dict, tiers, *, at_win: bool, ttl: int,
-                       state_entry: list | None) -> str | None:
+                       state_entry: list | None, mismatch=None) -> str | None:
     """Why a payout record's win carries a forged / inconsistent gain-tiered
     full-pay period (owner 2026-10-20), else None. Every paid win carries
     ``gain_lcb`` / ``tier`` / ``full_eras`` / ``below_floor``; ``full_eras``
@@ -2404,7 +2404,9 @@ def _paid_full_pay_why(w: dict, tiers, *, at_win: bool, ttl: int,
     if lcb is None or not math.isfinite(float(lcb)):
         return f"gain_lcb {lcb!r} is not finite"
     if at_win:
-        why = full_pay_mismatch(w, tiers)
+        # ``mismatch`` (DEC-CA-0073, lane C): the gain-scaled duration's
+        # re-derivation, in place of the gain-tiered one
+        why = mismatch(w) if mismatch is not None else full_pay_mismatch(w, tiers)
         if why:
             return f"full-pay tier forged: {why}"
     elif bool(w.get("below_floor")) != (float(lcb) < float(w.get("tier") or 0.0)):
@@ -2421,14 +2423,17 @@ def _paid_full_pay_why(w: dict, tiers, *, at_win: bool, ttl: int,
 def _lane_b_paid_wins(receipt: RoundReceipt, cfg: ChainConfig,
                       n_uids: int) -> tuple[list, str | None]:
     """The receipt's ``lane_b_pay`` wins re-derived from ``[lane_b]``:
-    ``(wins, None)``, or ``([], why)`` on the first inconsistency (decay clock,
-    era length, unknown/duplicate domain, out-of-range uid, age, expiry,
-    multiplier)."""
+    ``(wins, None)``, or ``([], why)`` on the first inconsistency (payout
+    clock, era length, unknown/duplicate slot, out-of-range uid, age,
+    ``since_era``, multiplier, the holder against ``state_post``).
+
+    One rule (LANE_D_PLAN rev6.22, owner 2026-11-24): a held slot pays its
+    full slot share — multiplier 1.0, no decay, no TTL — until replaced."""
     import math
 
-    from ..eval.expert_lane import LaneBWin, reward_multiplier
+    from ..eval.expert_lane import LaneBWin
     from ..shared.era import era_length_blocks
-    from ..shared.lane_b import lane_b_slots, win_expired
+    from ..shared.lane_b import lane_b_slots, since_era
 
     lb = cfg.lane_b
     # DEC-CA-0059: one slot per lane-B target (domains + horizon targets)
@@ -2438,7 +2443,7 @@ def _lane_b_paid_wins(receipt: RoundReceipt, cfg: ChainConfig,
     post = post if isinstance(post, dict) and "lane_b" in post else None
     block = int(pay.get("block", -1))
     if block != int(receipt.epoch_start_block):
-        return [], (f"lane-B decay clock at block {block}, but the settlement "
+        return [], (f"lane-B payout clock at block {block}, but the settlement "
                     f"is {receipt.epoch_start_block}")
     eb = int(era_length_blocks(cfg.round, block))
     if int(pay.get("era_blocks", -1)) != eb:
@@ -2461,25 +2466,30 @@ def _lane_b_paid_wins(receipt: RoundReceipt, cfg: ChainConfig,
         seen.add(d)
         if not 0 <= uid < n_uids:
             return [], f"lane-B payout to out-of-range uid {uid}"
-        age = max(0, (block - int(w.get("merge_block", 0))) // eb)
+        mb = int(w.get("merge_block", -1))
+        if not 0 <= mb <= block:
+            return [], f"domain {d}: merge block {mb} is not at or before the settlement"
+        age = max(0, (block - mb) // eb)
         if int(w.get("age", -1)) != age:
             return [], (f"domain {d}: recorded age {w.get('age')} != {age} "
-                        f"eras since block {w.get('merge_block')}")
-        if win_expired(age, lb):
-            return [], (f"domain {d}: win paid at age {age} eras, past "
-                        f"win_ttl_eras={lb.win_ttl_eras}")
-        why = _paid_full_pay_why(
-            w, lb.full_pay_tiers, at_win=int(w.get("merge_block", -1)) == block,
-            ttl=int(lb.win_ttl_eras),
-            state_entry=None if post is None else (post.get("lane_b") or {}).get(d))
-        if why:
-            return [], f"domain {d}: {why}"
-        mult = reward_multiplier(age, full_eras=int(w["full_eras"]),
-                                 half_life_rounds=lb.half_life_rounds, floor=lb.floor)
-        if not math.isclose(float(w.get("multiplier", -1.0)), mult, rel_tol=1e-12,
-                            abs_tol=1e-15):
-            return [], f"domain {d}: multiplier {w.get('multiplier')} != {mult} at age {age}"
-        wins.append(LaneBWin(uid=uid, domain=d, multiplier=mult))
+                        f"eras since block {mb}")
+        want_era = since_era(mb, era_blocks=eb, round_cfg=cfg.round)
+        got_era = w.get("since_era")
+        if isinstance(got_era, bool) or got_era != want_era:
+            return [], (f"domain {d}: since_era {got_era!r} != {want_era} (the era of "
+                        f"merge block {mb})")
+        if isinstance(w.get("multiplier"), bool) or w.get("multiplier") != 1.0:
+            return [], (f"domain {d}: multiplier {w.get('multiplier')!r} != 1.0 (a held "
+                        "slot pays in full, rev6.22)")
+        lcb = w.get("gain_lcb")
+        if isinstance(lcb, bool) or not isinstance(lcb, (int, float)) or not math.isfinite(lcb):
+            return [], f"domain {d}: gain_lcb {lcb!r} is not finite"
+        entry = None if post is None else (post.get("lane_b") or {}).get(d)
+        if post is not None and (not entry or [entry[0], int(entry[2])]
+                                 != [w.get("hotkey"), mb]):
+            return [], (f"domain {d}: paid holder {w.get('hotkey')!r}@{mb} is not the "
+                        f"settlement state's {entry[:3] if entry else None}")
+        wins.append(LaneBWin(uid=uid, domain=d, multiplier=1.0))
     return wins, None
 
 
@@ -2490,7 +2500,7 @@ def _lane_c_paid_wins(receipt: RoundReceipt, cfg: ChainConfig,
     inconsistency (lane C not active, payout clock, era length, share / slot
     count, unknown / duplicate target, uid range, age, expiry, multiplier)."""
     from ..shared.era import era_length_blocks
-    from ..shared.lane_c import LaneCWin, full_pay_tiers_for, target_multiplier, win_expired
+    from ..shared.lane_c import LaneCWin, full_pay_record_mismatch
 
     lc = cfg.lane_c
     pay = receipt.lane_c_pay or {}
@@ -2540,14 +2550,19 @@ def _lane_c_paid_wins(receipt: RoundReceipt, cfg: ChainConfig,
         if int(w.get("age", -1)) != age:
             return [], (f"target {t}: recorded age {w.get('age')} != {age} eras since block "
                         f"{w.get('win_block')}")
-        if win_expired(age, lc):
-            return [], f"target {t}: win paid at age {age} eras, past win_ttl_eras={lc.win_ttl_eras}"
+        # DEC-CA-0073: full pay for the win's recorded gain-scaled duration
+        # (re-derived at the win), then the slot ends — no decay, no TTL
+        mc_ = getattr(cfg, "marketcast", None)
         why = _paid_full_pay_why(
-            w, full_pay_tiers_for(t, lc, getattr(cfg, "marketcast", None)),
-            at_win=int(w.get("win_block", -1)) == block, ttl=int(lc.win_ttl_eras),
-            state_entry=None if post is None else (post or {}).get(t))
+            w, None, at_win=int(w.get("win_block", -1)) == block, ttl=0,
+            state_entry=None if post is None else (post or {}).get(t),
+            mismatch=lambda r, t=t, mc_=mc_: full_pay_record_mismatch(r, t, lc, mc_,
+                                                                       era_blocks=eb))
         if why:
             return [], f"target {t}: {why}"
+        if age >= int(w["full_eras"]):
+            return [], (f"target {t}: win paid at age {age} eras, past its full-pay duration "
+                        f"({w['full_eras']} eras) — the slot has ended")
         if bool(w.get("wind_down", False)) != (t in winding):
             return [], (f"target {t}: wind_down flag {w.get('wind_down')} but its competition "
                         f"is {'' if t in winding else 'not '}winding down at {block}")
@@ -2561,7 +2576,7 @@ def _lane_c_paid_wins(receipt: RoundReceipt, cfg: ChainConfig,
                             f"period ({w.get('full_eras')} eras) or the wind-down window")
             mult = 1.0
         else:
-            mult = target_multiplier(age, lc, int(w["full_eras"]))
+            mult = 1.0
         if not math.isclose(float(w.get("multiplier", -1.0)), mult, rel_tol=1e-12,
                             abs_tol=1e-15):
             return [], f"target {t}: multiplier {w.get('multiplier')} != {mult} at age {age}"
@@ -3172,12 +3187,12 @@ def _check_lane_b_weights(name: str, receipt: RoundReceipt, cfg: ChainConfig,
     """DEC-CA-0050 weight check, selected by ``cfg.lane_b.active(block)``.
 
     With the receipt's ``lane_b_pay`` record (every vector a lane-B validator
-    sets) the vector is REBUILT exactly: the decay clock is this settlement's
-    block, each paid win's age (in ERAS of the grid in force) and multiplier
-    re-derive from ``[lane_b]``, no win at or past ``win_ttl_eras`` is paid,
-    each domain slot pays ``share / n_domains × multiplier``
-    (never more), and the unpaid lane-B share goes to ``burn_uid`` (or back to
-    lane A under ``remainder = "lane_a"``). Without the record (a validator
+    sets) the vector is REBUILT exactly: the payout clock is this
+    settlement's block, each paid win's age and ``since_era`` (in ERAS of the
+    grid in force) re-derive, each held slot pays ``share / n_slots`` in full
+    (rev6.22: no decay, no TTL), and the unpaid lane-B share (empty slots)
+    goes to ``burn_uid`` (or back to lane A under ``remainder = "lane_a"``).
+    Without the record (a validator
     whose push fell back to the legacy vector, e.g. ``force_burn``) only the
     decomposition is checked: every lane-A recipient holds at least
     ``(1 − share) ×`` its court share and no non-burn uid draws more lane-B
@@ -3231,19 +3246,95 @@ def _check_lane_b_weights(name: str, receipt: RoundReceipt, cfg: ChainConfig,
 
 
 LANE_B_STAGES = ("stale", "selection", "merge", "verdict", "targets")
-# DEC-CA-0071 §1 (WB26): a suite target's name prefix (= config.v2's
-# ``SUITE_TARGET_PREFIX``; a literal so the audit stays import-light)
-SUITE_TARGET_PREFIX = "suite:"
+
+
+def _lane_b_slot_row_verdict(r: dict, lb, slots: tuple[str, ...]) -> str | None:
+    """Why one rev6.22 every-slot row (it carries ``gain_bar``) contradicts
+    ``[lane_b]``, else None: the bar is ``gain_margin`` for a declared slot
+    and ``undeclared_gain_margin`` otherwise; the family level is ``alpha``;
+    an inconclusive row (floors, or a suite without items) never passes; a
+    conclusive row passes iff some metric's family LCB clears the bar with a
+    positive point gain, the other metric's marginal LCB is non-inferior and
+    every guard holds."""
+    import math
+
+    d = str(r.get("domain"))
+    declared = list(r.get("targets") or [])
+    if bool(r.get("declared")) != (d in declared):
+        return f"{d}: declared={r.get('declared')!r} but the leg declares {declared}"
+    if r.get("family") != ("declared" if d in declared else "undeclared"):
+        return f"{d}: test family {r.get('family')!r} does not match its declaration"
+    want_bar = lb.gain_margin if d in declared else lb.undeclared_gain_margin
+    if not math.isclose(float(r.get("gain_bar") or -1.0), want_bar, rel_tol=1e-12):
+        return f"{d}: bar {r.get('gain_bar')} != {want_bar} ({'declared' if d in declared else 'undeclared'})"
+    if not math.isclose(float(r.get("alpha") or -1.0), lb.alpha, rel_tol=1e-12):
+        return f"{d}: family level {r.get('alpha')} != alpha {lb.alpha} (each max-T family)"
+    inc = str(r.get("inconclusive") or "")
+    guards = r.get("guard_lcbs") or {}
+    pubs = r.get("public_lcbs") or {}
+    if inc:
+        if r.get("passed") or r.get("gain_metric"):
+            return f"{d}: inconclusive ({inc}) row passed"
+        return None
+    suite = d.startswith("suite:")
+    if not suite:
+        n, cl = int(r.get("target_n") or 0), int(r.get("target_clusters") or 0)
+        if n < lb.min_target_windows or cl < lb.min_target_clusters:
+            return f"{d}: {n} windows / {cl} clusters is inconclusive, row says conclusive"
+    elif int(r.get("target_n") or 0) < lb.min_public_items:
+        return f"{d}: {r.get('target_n')} items is inconclusive, row says conclusive"
+    lcbs, gains, nis = (r.get(k) or {} for k in ("metric_lcbs", "metric_gains", "metric_ni_lcbs"))
+    metrics = ("crps", "mase")
+    if any(m not in lcbs or lcbs[m] is None or gains.get(m) is None or nis.get(m) is None
+           for m in metrics):
+        return f"{d}: a conclusive row lacks its CRPS/MASE LCBs, gains or non-inferiority LCBs"
+    tau = lb.tau_public if suite else lb.tau_domain
+    cleared = [m for m in metrics if float(lcbs[m]) >= want_bar and float(gains[m]) > 0.0
+               and all(float(nis[o]) >= -tau for o in metrics if o != m)]
+    guards_ok = (all(float(v) >= -lb.tau_domain for v in guards.values())
+                 and all(float(v) >= -lb.tau_public for v in pubs.values()))
+    if bool(r.get("guard_reason")) == guards_ok:
+        return f"{d}: guard_reason {r.get('guard_reason')!r} contradicts the guard LCBs"
+    want = bool(cleared) and guards_ok
+    sgd = r.get("suite_guards")
+    if suite and want:
+        # WB26 (DEC-CA-0071 §3 guards 4-5): a suite slot that clears is
+        # claimable only if guard 4 and the anchor guard hold
+        if not isinstance(sgd, dict) or "pool_gain" not in sgd:
+            return f"{d}: a cleared suite slot carries no suite_guards (guard 4 / anchor guard)"
+        want = _lane_b_suite_guards_ok(sgd, lb, guards, pubs)
+    elif sgd:
+        return f"{d}: suite_guards on a row that is not a cleared, guarded suite slot"
+    if bool(r.get("passed")) != want:
+        return (f"{d}: passed={r.get('passed')} but the re-derived slot verdict is {want} "
+                f"(LCBs {lcbs} vs bar {want_bar}, guards ok {guards_ok})")
+    if want and (r.get("gain_metric") not in cleared
+                 or float(r.get("target_lcb")) != float(lcbs[r.get("gain_metric")])):
+        return f"{d}: gain_metric {r.get('gain_metric')!r} / target_lcb do not match {cleared}"
+    return None
+
+
+def _lane_b_suite_guards_ok(sgd: dict, lb, guards: dict, pubs: dict) -> bool:
+    """WB26 (DEC-CA-0071 §3 guards 4-5) from a suite slot's ``suite_guards``:
+    the whole-pool point gain ``>= 0``, and the anchor record covers every
+    guard of the leg with each ``>= -tau_anchor_*``. An anchor record that
+    does not cover the guards (``anchor_missing``) is not ok."""
+    def _f(x) -> float:
+        return float("nan") if x is None else float(x)
+
+    a_dom = sgd.get("anchor_guard_lcbs") or {}
+    a_pub = sgd.get("anchor_public_lcbs") or {}
+    return (_f(sgd.get("pool_gain")) >= 0.0 and bool(sgd.get("anchor_pointer"))
+            and set(a_dom) == set(guards) and set(a_pub) == set(pubs)
+            and all(_f(x) >= -lb.tau_anchor_domain for x in a_dom.values())
+            and all(_f(x) >= -lb.tau_anchor_public for x in a_pub.values()))
 
 
 def _lane_b_row_verdict(r: dict, lb, slots: tuple[str, ...]) -> str | None:
     """Why ``r`` (one lane-B verdict row) contradicts ``[lane_b]``, else None.
     A multi-target row (DEC-CA-0059, it names ``targets``) is re-derived in
     full; a single-target row carries no point gain, so only ``passed ⇒``
-    every bar is checked (its bytes are the pre-0059 row). A row of a leg
-    declaring a suite target (WB26) also re-derives guard 4 and the anchor
-    guard from ``suite_guards``; a suite-target row is re-derived in full from
-    ``suite_gain`` (:func:`_lane_b_suite_gain_verdict`)."""
+    every bar is checked (its bytes are the pre-0059 row)."""
     import math
 
     d = str(r.get("domain"))
@@ -3254,6 +3345,8 @@ def _lane_b_row_verdict(r: dict, lb, slots: tuple[str, ...]) -> str | None:
         return f"{d}: unknown stage {r.get('stage')!r}"
     if r.get("stage") != "verdict":
         return f"{d}: a {r.get('stage')}-stage row passed" if r.get("passed") else None
+    if "gain_bar" in r:
+        return _lane_b_slot_row_verdict(r, lb, slots)
     lcb = r.get("target_lcb")
     lcb_ok = lcb is not None and not math.isnan(float(lcb)) and float(lcb) >= lb.gain_margin
     guards = r.get("guard_lcbs") or {}
@@ -3263,20 +3356,6 @@ def _lane_b_row_verdict(r: dict, lb, slots: tuple[str, ...]) -> str | None:
     declared = list(r.get("targets") or [d])
     if any(t in guards for t in declared):
         return f"{d}: a declared target {sorted(set(declared) & set(guards))} is also a guard"
-    suite_leg = any(str(t).startswith(SUITE_TARGET_PREFIX) for t in declared)
-    inc = str(r.get("inconclusive") or "")
-    if suite_leg:
-        own = {f"{str(t)[len(SUITE_TARGET_PREFIX):]}_{m}" for t in declared
-               if str(t).startswith(SUITE_TARGET_PREFIX) for m in ("crps", "mase")}
-        if own & set(pubs):
-            return f"{d}: a declared suite's own metric {sorted(own & set(pubs))} is also a guard"
-        if not inc:
-            ok, why = _lane_b_suite_guards_ok(r, lb, guards, pubs)
-            if why:
-                return f"{d}: {why}"
-            guards_ok = guards_ok and ok
-    if d.startswith(SUITE_TARGET_PREFIX):
-        return _lane_b_suite_gain_verdict(r, lb, d, len(declared), inc, guards_ok)
     if not multi:
         if r.get("passed") and not (lcb_ok and guards_ok):
             return f"{d}: passed with LCB {lcb} / guards {guards} {pubs} below the bars"
@@ -3284,6 +3363,7 @@ def _lane_b_row_verdict(r: dict, lb, slots: tuple[str, ...]) -> str | None:
     k = len(declared)
     if not math.isclose(float(r.get("alpha") or -1.0), lb.alpha / k, rel_tol=1e-12):
         return f"{d}: gain level {r.get('alpha')} != alpha/k = {lb.alpha}/{k}"
+    inc = str(r.get("inconclusive") or "")
     gain = r.get("target_gain")
     if inc:
         want = False
@@ -3299,79 +3379,6 @@ def _lane_b_row_verdict(r: dict, lb, slots: tuple[str, ...]) -> str | None:
     if bool(r.get("passed")) != want:
         return (f"{d}: passed={r.get('passed')} but the re-derived per-target verdict is "
                 f"{want} (LCB {lcb} vs {lb.gain_margin}, gain {gain}, guards ok {guards_ok})")
-    return None
-
-
-def _lane_b_f(x) -> float:
-    return float("nan") if x is None else float(x)
-
-
-def _lane_b_suite_guards_ok(r: dict, lb, guards: dict, pubs: dict) -> tuple[bool, str]:
-    """WB26 (DEC-CA-0071 §3 guards 4-5): ``(ok, malformed reason)`` of a
-    conclusive row of a suite-target leg — the whole-pool point gain ≥ 0 and
-    every domain / horizon / public guard also met against the anchor king
-    (``tau_anchor_domain`` / ``tau_anchor_public``). An anchor record that
-    does not cover the leg's guards is ``anchor_missing``: not ok."""
-    sgd = r.get("suite_guards")
-    if not isinstance(sgd, dict) or "pool_gain" not in sgd:
-        return False, "a suite-target leg row carries no suite_guards (guard 4 / anchor)"
-    a_dom = sgd.get("anchor_guard_lcbs") or {}
-    a_pub = sgd.get("anchor_public_lcbs") or {}
-    anchor_ok = (bool(sgd.get("anchor_pointer")) and set(a_dom) == set(guards)
-                 and set(a_pub) == set(pubs)
-                 and all(_lane_b_f(x) >= -lb.tau_anchor_domain for x in a_dom.values())
-                 and all(_lane_b_f(x) >= -lb.tau_anchor_public for x in a_pub.values()))
-    return _lane_b_f(sgd.get("pool_gain")) >= 0.0 and anchor_ok, ""
-
-
-def _lane_b_suite_gain_verdict(r: dict, lb, d: str, k: int, inc: str,
-                               guards_ok: bool) -> str | None:
-    """WB26 (DEC-CA-0071 Amendment rev6.19): re-derive a suite-target row from
-    ``suite_gain`` — CRPS OR MASE LCB at ``alpha / (2k)`` ≥
-    ``gain_margin_public`` with a positive point gain, the non-cleared metric
-    ``≥ −tau_public``, ``target_lcb`` = the SMALLER cleared LCB, and
-    ``passed`` = cleared ∧ non-inferior ∧ every guard."""
-    import math
-
-    if inc:
-        if inc != "items" or r.get("passed") or r.get("suite_gain"):
-            return f"{d}: inconclusive ({inc}) suite row passed or carries a gain record"
-        return None
-    g = r.get("suite_gain") or {}
-    if not g:
-        return f"{d}: a conclusive suite-target row carries no suite_gain"
-    if int(g.get("n_items") or 0) < lb.min_public_items:
-        return f"{d}: {g.get('n_items')} suite items is inconclusive, row says conclusive"
-    ga = lb.alpha / (2 * k)
-    if not math.isclose(_lane_b_f(g.get("gain_alpha")), ga, rel_tol=1e-12):
-        return f"{d}: suite gain level {g.get('gain_alpha')} != alpha/(2k) = {lb.alpha}/{2 * k}"
-    lcb = {m: _lane_b_f(g.get(f"{m}_lcb")) for m in ("crps", "mase")}
-    gain = {m: _lane_b_f(g.get(f"{m}_gain")) for m in ("crps", "mase")}
-    cleared = [m for m in ("crps", "mase")
-               if lcb[m] >= lb.gain_margin_public and gain[m] > 0.0]
-    want_cm = "both" if len(cleared) == 2 else (cleared[0] if cleared else "")
-    if str(g.get("cleared_metric") or "") != want_cm:
-        return f"{d}: cleared_metric {g.get('cleared_metric')!r} != re-derived {want_cm!r}"
-    noninf_ok = True
-    if len(cleared) == 1:
-        other = "mase" if cleared[0] == "crps" else "crps"
-        if g.get("noninf_metric") != other:
-            return f"{d}: noninf_metric {g.get('noninf_metric')!r} != {other!r}"
-        noninf_ok = _lane_b_f(g.get("noninf_lcb")) >= -lb.tau_public
-    elif g.get("noninf_metric"):
-        return f"{d}: noninf_metric {g.get('noninf_metric')!r} with {len(cleared)} cleared metrics"
-    if cleared:
-        want_lcb = min(lcb[m] for m in cleared)
-        if not math.isclose(_lane_b_f(r.get("target_lcb")), want_lcb,
-                            rel_tol=1e-12, abs_tol=1e-15):
-            return (f"{d}: target_lcb {r.get('target_lcb')} != the smaller cleared LCB "
-                    f"{want_lcb}")
-    if "targets" in r and bool(r.get("guard_reason")) == guards_ok:
-        return f"{d}: guard_reason {r.get('guard_reason')!r} contradicts the guard LCBs"
-    want = bool(cleared) and noninf_ok and guards_ok
-    if bool(r.get("passed")) != want:
-        return (f"{d}: passed={r.get('passed')} but the re-derived suite verdict is {want} "
-                f"(cleared {cleared}, non-inferior {noninf_ok}, guards ok {guards_ok})")
     return None
 
 
@@ -3422,21 +3429,39 @@ def check_lane_b(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
                 or any(t not in slots for t in declared) or len(set(declared)) != len(declared)):
             return _fail(name, f"{hk}: declared targets {declared} are not 1.."
                                f"{lb.max_domains_per_leg} configured slots")
-        if sorted(str(r.get("domain")) for r in rs) != sorted(declared) or any(
+        if any("gain_bar" in r for r in rs):
+            # rev6.22: a judged leg is tested on EVERY slot, one row each
+            if (sorted(str(r.get("domain")) for r in rs) != sorted(slots)
+                    or not all("gain_bar" in r for r in rs)
+                    or any(list(r.get("targets") or []) != declared for r in rs)):
+                return _fail(name, f"{hk}: rows {[r.get('domain') for r in rs]} do not cover "
+                                   f"every slot {list(slots)} once each")
+            # two families (owner 2026-11-24): declared slots among themselves,
+            # undeclared slots among themselves — one critical value each
+            for fam in ("declared", "undeclared"):
+                crit = {json.dumps(r.get("maxt_crit")) for r in rs
+                        if r.get("family") == fam and not r.get("inconclusive")}
+                if len(crit) > 1:
+                    return _fail(name, f"{hk}: the {fam} rows carry different max-T "
+                                       "critical values (one per family)")
+        elif sorted(str(r.get("domain")) for r in rs) != sorted(declared) or any(
                 list(r.get("targets") or []) != declared for r in rs):
             return _fail(name, f"{hk}: rows {[r.get('domain') for r in rs]} do not cover the "
                                f"declared targets {declared} once each")
         conc = [r for r in rs if r.get("stage") == "verdict" and not r.get("inconclusive")]
         sig = {(json.dumps(r.get("guard_lcbs") or {}, sort_keys=True),
                 json.dumps(r.get("public_lcbs") or {}, sort_keys=True),
-                str(r.get("guard_reason") or ""),
-                # WB26: guard 4 + the anchor guard also run once per leg
-                json.dumps(r.get("suite_guards") or {}, sort_keys=True)) for r in conc}
+                str(r.get("guard_reason") or "")) for r in conc}
         if len(sig) > 1:
             return _fail(name, f"{hk}: the leg's guards differ between its targets "
                                "(guards must run once per leg)")
         if any(r.get("guard_reason") for r in conc) and any(r.get("passed") for r in rs):
             return _fail(name, f"{hk}: a guard failed but a target of the leg passed")
+        # WB26: guard 4 + the anchor guard also run once per leg
+        if len({json.dumps(r["suite_guards"], sort_keys=True) for r in conc
+                if r.get("suite_guards")}) > 1:
+            return _fail(name, f"{hk}: the leg's suite guards differ between its suite slots "
+                               "(guard 4 / the anchor guard run once per leg)")
     best: dict[str, float] = {}
     for r in rows:
         if r.get("passed"):
@@ -3459,17 +3484,11 @@ def check_lane_b(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
             if max(float(r.get("target_lcb")) for r in mine) < best[d]:
                 return _fail(name, f"slot {d} went to {w.get('hotkey')!r}, not the best "
                                    f"passing target LCB {best[d]}")
-            # gain-tiered full-pay (owner 2026-10-20): the tier is derived from
-            # THIS row's target LCB (per target of a multi-target leg) — the
-            # pay record's gain_lcb must be it, and its tier re-derives from it
+            # the pay record's gain_lcb is THIS row's target LCB (per target
+            # of a multi-target leg); rev6.22: no tier to re-derive from it
             if w.get("gain_lcb") is None or float(w.get("gain_lcb")) != best[d]:
                 return _fail(name, f"slot {d}: pay record gain_lcb {w.get('gain_lcb')!r} != "
                                    f"the winning row's target LCB {best[d]}")
-            from ..eval.expert_lane import full_pay_mismatch
-
-            why = full_pay_mismatch(w, lb.full_pay_tiers)
-            if why:
-                return _fail(name, f"slot {d}: full-pay tier forged: {why}")
         elif d in best:
             return _fail(name, f"slot {d} has a passing row at this settlement but is still "
                                f"paid to the win from block {w.get('merge_block')}")
@@ -3555,10 +3574,8 @@ def _lane_b_acceptance_pay(receipt, cfg):
             source = approved.get(win["domain"])
             if source is None or source["hotkey"] != win["hotkey"]:
                 return "paid qualification has no accepted merge"
-            if any(win.get(k) != source.get(sk) for k, sk in (
-                    ("gain_lcb", "target_lcb"), ("tier", "tier"),
-                    ("full_eras", "full_eras"), ("below_floor", "below_floor"))):
-                return "payout differs from the accepted marginal gain/tier"
+            if win.get("gain_lcb") != source.get("target_lcb"):
+                return "payout differs from the accepted marginal gain"
     return None
 
 
@@ -3738,14 +3755,17 @@ def check_lane_c(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
             return _fail(name, f"{who} passed without the public guard "
                                f"{missing} configured for {t}")
         if phase == "confirm":
-            # gain-tiered full-pay (owner 2026-10-20): the tier a confirmed
-            # win records, re-derived from this row's gain LCB
-            from ..eval.expert_lane import full_pay_mismatch
-            from ..shared.lane_c import full_pay_tiers_for
+            # the gain-scaled full-pay duration a confirmed win records
+            # (DEC-CA-0073), re-derived from this row's gain LCB on the era
+            # grid in force at this settlement
+            from ..shared.era import era_length_blocks
+            from ..shared.lane_c import full_pay_record_mismatch
 
             fp = dict(r.get("full_pay") or {})
             fp["gain_lcb"] = lcb
-            why = full_pay_mismatch(fp, full_pay_tiers_for(t, lc, cfg.marketcast))
+            why = full_pay_record_mismatch(
+                fp, t, lc, cfg.marketcast,
+                era_blocks=int(era_length_blocks(cfg.round, boundary)))
             if why:
                 return _fail(name, f"{who}: full-pay tier forged: {why}")
         if phase == "judge":
@@ -4255,10 +4275,18 @@ def _mkt_init_lineage(init: str, train_time: float, cfg: ChainConfig, manifests:
                                   f"manifest the auditor holds")
 
 
+class _AuditEntry:
+    """The one field :func:`~cascade.validator.marketcast.entry_draw` reads
+    (the trainer-signed ``train_time``), for the audit's draw re-derivation."""
+
+    def __init__(self, train_time: float | None) -> None:
+        self.marketcast = {} if train_time is None else {"train_time": float(train_time)}
+
+
 def check_marketcast(receipt: RoundReceipt, cfg: ChainConfig,
                      reports: dict | None = None, *, lane_c_manifests: dict | None = None,
-                     quantiles: dict | None = None, snapshots: dict | None = None
-                     ) -> CheckResult:
+                     quantiles: dict | None = None, snapshots: dict | None = None,
+                     block_hashes: dict | None = None) -> CheckResult:
     """DEC-CA-0064 MarketCast replay (joins :func:`run_tier0` ONLY at a
     settlement where ``[marketcast]`` is active, so earlier audit output is
     byte-identical). Nothing here trusts the main validator's arithmetic.
@@ -4272,11 +4300,17 @@ def check_marketcast(receipt: RoundReceipt, cfg: ChainConfig,
       (``train_time`` from the trainer-signed lane-C manifest that carried
       the entry, ``lane_c_manifests``: ``{round: text}``; and on a confirm,
       ≥ the recorded ``fresh_after``) — never the snapshot anchor;
+    * DEC-CA-0073: the entry's signed draw is the rule's (re-derived from
+      ``train_time``, the round block, the phase and ``fresh_after``), its
+      block hash the chain's (``block_hashes``: ``{block: hash}``; WARN
+      without); every backtest window lies wholly in the draw's embargo
+      span and the phase's half, every forward window after the dispatch
+      + margin on a ``forward_horizons`` horizon; no cell holds more than
+      ``n`` backtests / ``windows_per_cell`` forwards;
     * with the published snapshot (``snapshots``: ``{digest: MktSnapshot}``)
-      the report's window set must EQUAL the forward-only set
-      :func:`~cascade.pool.marketcast.snapshot_windows` re-cuts (nothing
-      omitted, nothing added); without it, every window must be forward-only
-      and no (asset, horizon) cell hold more than ``windows_per_cell``;
+      the report's window set must EQUAL the set the draw re-cuts
+      (:func:`~cascade.pool.marketcast.snapshot_windows`: nothing omitted,
+      nothing added);
     * with the quantile sidecar (``quantiles``: ``{key: bytes}``, sha256
       bound in the signed report) AND the snapshot, every per-window loss
       and coverage tally is recomputed on CPU from the snapshot targets and
@@ -4311,7 +4345,7 @@ def check_marketcast(receipt: RoundReceipt, cfg: ChainConfig,
     if not mkt:
         return _ok(name, "no MarketCast rows at this settlement")
     from ..eval.marketcast import COVERAGE_GATE_SUITES
-    from ..pool.marketcast import gap_span, target_windows
+    from ..pool.marketcast import target_windows, window_half, window_kind
     from ..shared.config.marketcast import base_suite
     from ..shared.marketcast_report import (
         GUARD_FIELDS,
@@ -4421,11 +4455,21 @@ def check_marketcast(receipt: RoundReceipt, cfg: ChainConfig,
         if want_after is None or not usable:
             return _fail(name, f"{who}: windows start after {ent.after}, the trainer's dispatch "
                                f"time gives {want_after}")
-        want_gap = (float(tt) if str(r.get("phase", ent.phase)) == "judge"
-                    and tuple(getattr(mc, "gap_horizons", ())) else 0.0)
-        if float(ent.gap_end) != want_gap:
-            return _fail(name, f"{who}: gap windows end by {ent.gap_end}, the trainer's dispatch "
-                               f"time gives {want_gap}")
+        from ..validator.marketcast import _draw_mismatch
+
+        draw = dict(ent.draw or {})
+        if m.get("round_block") is None:
+            return _fail(name, f"{who}: the row records no round_block to re-derive its draw")
+        rb = int(m["round_block"])
+        why_d = _draw_mismatch(_AuditEntry(tt), ent, mc, phase=str(r.get("phase", ent.phase)),
+                               block=rb, fresh_after=float(m.get("fresh_after", 0.0) or 0.0))
+        if why_d:
+            return _fail(name, f"{who}: the report's window draw: {why_d}")
+        if block_hashes is None or rb not in block_hashes:
+            _miss("block hash (chain)")
+        elif str(block_hashes[rb]).lower() != str(draw.get("block_hash", "")).lower():
+            return _fail(name, f"{who}: the draw's block hash {draw.get('block_hash')} is not "
+                               f"block {rb}'s on chain ({block_hashes[rb]})")
         # red-team F4: the near-duplicate record and the stage it implies
         from ..validator.marketcast import near_duplicate_of
 
@@ -4449,37 +4493,40 @@ def check_marketcast(receipt: RoundReceipt, cfg: ChainConfig,
             return _fail(name, f"{who}: fine-tune loss non-finite on {nonfinite[:2]} — that "
                                f"entry is a fault, not a verdict")
         cells: dict[tuple, int] = {}
-        gaps = tuple(getattr(mc, "gap_horizons", ()))
         for w in ent.windows:
-            if w.horizon in gaps:
-                # owner 2026-11-18: a gap window sits inside the embargo gap
-                lo, hi = gap_span(mc, float(ent.gap_end)) if ent.gap_end else (0.0, -1.0)
-                if not (w.start > lo and w.end <= hi):
-                    return _fail(name, f"{who}: gap window {w.wid} is outside the embargo "
-                                       f"gap before {ent.gap_end}")
-            elif not (w.start > float(ent.after) and w.end <= int(snap_rec.get("end", 0))):
-                return _fail(name, f"{who}: window {w.wid} is not forward-only "
-                                   f"(after {ent.after}, snapshot end {snap_rec.get('end')})")
-            c = (w.suite_label, w.cluster, w.horizon)
+            kind = window_kind(draw, w.start)
+            if kind == "backtest":
+                # DEC-CA-0073: wholly inside the embargo span, in the phase's half
+                if not (w.start > float(draw["lo"]) and w.end <= float(draw["hi"])
+                        and window_half(w.wid) == int(draw["half"])):
+                    return _fail(name, f"{who}: backtest window {w.wid} is outside the draw's "
+                                       f"embargo span / half")
+            elif not (w.horizon in tuple(draw.get("forward_horizons", ()))
+                      and w.start > float(draw["forward_after"])
+                      and w.end <= min(float(draw["forward_hi"]), int(snap_rec.get("end", 0)))):
+                return _fail(name, f"{who}: window {w.wid} is not a forward window of the draw "
+                                   f"(after {draw['forward_after']}, snapshot end "
+                                   f"{snap_rec.get('end')})")
+            c = (kind, w.suite_label, w.cluster, w.horizon)
             cells[c] = cells.get(c, 0) + 1
-        over = [c for c, n in cells.items() if n > int(mc.windows_per_cell)]
+        over = [c for c, n in cells.items()
+                if n > int(draw["n"] if c[0] == "backtest" else draw["forward_n"])]
         if over:
-            return _fail(name, f"{who}: {over[:2]} hold more than windows_per_cell="
-                               f"{mc.windows_per_cell} windows")
+            return _fail(name, f"{who}: {over[:2]} hold more windows than the draw allows "
+                               f"(n={draw['n']}, forward_n={draw['forward_n']})")
         suite = str(r["target"]).split(":", 1)[1]
         snap = (snapshots or {}).get(str(snap_rec.get("digest", "")))
         if snap is None:
             _miss("snapshot")
         else:
-            want = target_windows(snap, mc, suite, after=float(ent.after),
-                                  gap_end=float(ent.gap_end))
+            want = target_windows(snap, mc, suite, after=float(ent.after), draw=draw)
             got_ids = [w.wid for w in ent.windows]
             want_ids = [w.wid for w in want]
             if got_ids != want_ids:
                 gone = sorted(set(want_ids) - set(got_ids))
                 extra = sorted(set(got_ids) - set(want_ids))
                 return _fail(name, f"{who}: the report's windows are not the snapshot's "
-                                   f"forward-only set (omitted {gone[:2]}{'…' if len(gone) > 2 else ''}"
+                                   f"drawn set (omitted {gone[:2]}{'…' if len(gone) > 2 else ''}"
                                    f" {len(gone)}, added {extra[:2]} {len(extra)})")
             data = (quantiles or {}).get(ent.quantiles_key) if ent.quantiles_key else None
             if data is None:

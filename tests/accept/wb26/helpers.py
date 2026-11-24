@@ -1,27 +1,30 @@
-"""Shared spec and helpers for the WB26 acceptance tests: lane B suite-target
-judging (DEC-CA-0071 §2-§3, Amendment rev6.19; plan §3 WB26 row, rev6.19 (G)).
+"""Shared spec and helpers for the WB26 acceptance tests: guards 4 and 5 of
+lane B suite slots (DEC-CA-0071 §3; plan §3 WB26 row, narrowed onto rev6.22).
 
-The rule under test (rev6.19 (G), owner 2026-11-24; full-pay input,
-orchestrator 2026-11-24):
+WB26 builds ON rev6.22's ``judge_expert_slots`` (#854): every leg is tested
+on every slot, CRPS or MASE, in the declared (``gain_margin``) / undeclared
+(``undeclared_gain_margin``) max-T families — none of that is WB26's and
+none of it is re-tested here beyond what the guards need. WB26 adds:
 
-- a suite target ``suite:<s>`` wins when CRPS OR MASE clears
-  ``LCB_{alpha/(2k)} >= gain_margin_public`` (0.01) on the whole suite's
-  paired items with a strictly positive point gain;
-- the metric that did not clear must be non-inferior, ``LCB_alpha >=
-  -tau_public``;
-- fewer than ``min_public_items`` paired items is ``inconclusive: items``;
-- the win's ``target_lcb`` (the ``full_pay`` tier input) is the SMALLER
-  cleared LCB;
-- every existing guard holds, plus guard 4 (whole-pool point gain >= 0) and
-  the anchor guard (domain / horizon / public guards against the anchor king
-  at ``tau_anchor_domain`` / ``tau_anchor_public``, default 0.0); no anchor
-  is ``anchor_missing`` (fail-closed).
+- **guard 4:** a suite slot that clears is claimable only if the whole-pool
+  paired point gain is ``>= 0`` (the contamination tripwire);
+- **guard 5, the anchor guard:** and only if every guard of the leg (each
+  pool domain, horizon and public metric) also holds against the anchor king
+  at ``tau_anchor_domain`` / ``tau_anchor_public`` (default 0.0). No anchor,
+  or an anchor lacking a guarded public metric, is ``anchor_missing``;
+- both are computed once per leg, lazily (the anchor is scored only when a
+  suite slot would be claimed), recorded as ``suite_guards`` and re-derived
+  by ``check_lane_b``; domain and horizon slots are never affected;
+- the anchor is the era's promotion member from the signed training
+  manifest; the trainer attaches its bench rows as ``public_rows["anchor"]``
+  to every settling leg and self-judges against it.
 
-Everything runs the REAL code: ``judge_expert_targets`` (eval), the
+Everything runs the REAL code: ``judge_expert_slots`` (eval), the
 validator's ``judge_manifest`` / ``judgements_record`` and
-``LaneBMixin._lane_b_judge_experts``, the real ``[lane_b]`` parser and the
-audit's lane B row check. Stand-ins are W-S2's GPU boundary (the torch
-weight I/O and byte-check merge) and the window scores / bench rows.
+``LaneBMixin._lane_b_judge_experts``, the real ``[lane_b]`` parser, the
+audit's lane B row check and WB18's real trainer driver. Stand-ins are W-S2's
+GPU boundary (the torch weight I/O and byte-check merge) and the window
+scores / bench rows.
 
 No module in WB26's PATHS is imported at module level.
 """
@@ -39,13 +42,13 @@ from tests.accept.w_s2 import helpers as ws2
 
 REPO = Path(__file__).resolve().parents[3]
 SUITES = ("gift", "boom", "time", "fev")
+SUITE_SLOTS = tuple(f"suite:{s}" for s in SUITES)
 METRICS = ("crps", "mase")
 DOMAINS = ws2.DOMAINS
 N_ITEMS = 40
 B = 400
 ALPHA = 0.05
 SEED = "wb26"
-GAIN_MARGIN_PUBLIC = 0.01
 TAU_PUBLIC = 0.01
 
 ANCHOR_PTR_NAME = "wb26-anchor"
@@ -53,6 +56,9 @@ pointer = ws2.pointer
 KING_PTR = ws2.pointer(ws2.KING_PTR_NAME)
 CAND_PTR = ws2.pointer(ws2.CAND_PTR_NAME)
 ANCHOR_PTR = ws2.pointer(ANCHOR_PTR_NAME)
+
+# a clear GIFT gain: 10% better on GIFT CRPS clears the 1% declared bar
+GIFT_GAIN = {("gift", "crps"): 0.90}
 
 
 def has_param(fn, name: str) -> bool:
@@ -63,11 +69,11 @@ def has_param(fn, name: str) -> bool:
 
 
 def need_anchor_param():
-    from cascade.eval.expert_lane import judge_expert_targets
+    from cascade.eval.expert_lane import judge_expert_slots
 
-    assert has_param(judge_expert_targets, "anchor"), (
-        "judge_expert_targets takes the anchor king's scores as keyword `anchor` "
-        "(WB26, DEC-CA-0071 §3 guard 5)")
+    assert has_param(judge_expert_slots, "anchor"), (
+        "judge_expert_slots takes the anchor king's scores as keyword `anchor` "
+        "(WB26, DEC-CA-0071 §3 guards 4-5)")
 
 
 # ── synthetic inputs (eval level) ────────────────────────────────────────────
@@ -108,10 +114,10 @@ def pool(effect: dict | None = None):
 
 def anchor_input(pub: dict, *, pool_effect: dict | None = None,
                  public_factors: dict | None = None, drop: tuple[str, ...] = ()) -> dict:
-    """The anchor king: by default identical to the king (so the anchor
-    guard re-states the king guards at tau 0). ``pool_effect[d]`` scales the
-    anchor's losses on domain d (< 1 = the anchor is better); public
-    ``public_factors[(s, m)]`` scales the anchor's items."""
+    """The anchor king: by default identical to the king. ``pool_effect[d]``
+    scales the anchor's losses on domain d (< 1 = the anchor is better);
+    ``public_factors[(s, m)]`` scales the anchor's items; ``drop`` removes
+    public metrics from the anchor."""
     _, _, (kq, ka, km), _ = pool()
     eff = pool_effect or {}
     f = np.asarray([float(eff.get(s.domain, 1.0)) for s in ws2.window_scores({})])
@@ -134,31 +140,29 @@ def params(**over):
     return ExpertLaneParams(**{**base, **over})
 
 
-def judge(targets, *, factors=None, pool_effect=None, n=None, anchor="same",
-          anchor_kw=None, horizons=None, horizon_targets=(), **over):
-    """Run the real ``judge_expert_targets``; ``anchor="same"`` builds the
-    default anchor (= the king), ``None`` passes no anchor."""
-    from cascade.eval.expert_lane import judge_expert_targets
+def judge(declared=("suite:gift",), *, factors=None, pool_effect=None, anchor="same",
+          anchor_kw=None, calls: list | None = None, **over):
+    """Run the real ``judge_expert_slots`` over every slot (the two domains
+    and the four suites). ``anchor="same"`` builds the default anchor (= the
+    king) and passes it LAZILY (a callable that logs into ``calls``);
+    ``None`` passes no anchor."""
+    from cascade.eval.expert_lane import judge_expert_slots
 
     need_anchor_param()
     doms, clusters, (kq, ka, km), (cq, ca, cm) = pool(pool_effect)
-    pub = public(factors, n=n)
+    pub = public(factors)
+    log = calls if calls is not None else []
     if anchor == "same":
-        anchor = anchor_input(pub, **(anchor_kw or {}))
-    return judge_expert_targets(
-        targets=list(targets), domains=doms,
+        a = anchor_input(pub, **(anchor_kw or {}))
+
+        def anchor():
+            log.append("anchor")
+            return a
+    return judge_expert_slots(
+        slots=list(DOMAINS) + list(SUITE_SLOTS), declared=list(declared), domains=doms,
         king_qloss=kq, king_abs_target=ka, king_mase=km,
         chal_qloss=cq, chal_abs_target=ca, chal_mase=cm,
-        clusters=clusters, public=pub, params=params(**over), seed=SEED,
-        horizons=horizons, horizon_targets=horizon_targets, anchor=anchor)
-
-
-def suite_rec(v) -> dict:
-    rec = getattr(v, "suite", None)
-    assert isinstance(rec, dict) and rec, (
-        f"a conclusive suite-target verdict records its gain test in `suite` "
-        f"(cleared_metric, crps_lcb, mase_lcb, ...); got {rec!r} (reason {v.reason!r})")
-    return rec
+        clusters=clusters, public=pub, params=params(**over), seed=SEED, anchor=anchor)
 
 
 # ── validator level ──────────────────────────────────────────────────────────

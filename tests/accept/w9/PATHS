@@ -15,3 +15,6 @@ cascade/audit/checks.py
 # lane D's burn scoped to its share (derive_weights, lane_d_pay, the lane_d
 # tier-0 row) and the audit's fetch of the lane D record (audit_receipt).
 cascade/audit/main.py
+# rev6.22: the slot-row tests drive the every-slot judge and its verdict rows.
+cascade/eval/expert_lane.py
+cascade/validator/expert_lane.py

@@ -425,3 +425,14 @@ Run locally with `-m "not torch"`. Nothing here imports torch.
 On main these tests fail on the `settle_mv` / `max_channels` assertions or
 `cannot import name` (`channel_pick` from `cascade.audit.lane_d`,
 `_lane_d_max_channels` from `cascade.audit.checks`, both in PATHS).
+
+## rev6.22: lane B weights and slot rows (`test_w9_lane_b_slots.py`)
+
+One pay rule: every paid holder has multiplier 1.0 at any age (no TTL), the
+re-derived `age` and `since_era`, a finite `gain_lcb`, and equals its holder
+in `state_post`; tampering with any of them FAILs. A judged leg has one row
+per slot; `check_lane_b` re-derives each row for its family (`declared` at
+`gain_margin`, `undeclared` at `undeclared_gain_margin`) and binds one
+critical value per family. A wrong bar, family, declared flag, verdict, a
+second critical value in one family, or a missing slot FAILs. Rows come from
+the validator's `judgements_record` over a real `judge_expert_slots` verdict.

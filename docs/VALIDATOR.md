@@ -539,11 +539,11 @@ Percentages are shares of the competition reward vector. A lane's pool is its bu
 - **A winner:** a random-init or other level-unit win starts at 50% of A. Increment-unit wins use the duel's lower confidence bound (LCB): LCB ≥ 0.5 → 80%; LCB ≥ 0.25 → 65%; LCB ≥ 0.1 → 50%; LCB ≥ 0.01 → 25%. These are the duel's increment units, not percentages of absolute forecast-error reduction.
 - **A progression:** each passed scheduled king check adds 10 percentage points of A, up to 95%. Failure sets 10%; a deferred check holds the share. Time alone does not increase it.
 - **Former king:** only the immediate former king can receive 5% of A for 36,000 blocks, while eligible. A qualifying compute-key lapse reduces the current king's payout to 1% of A, without reducing separately earned B/C rewards.
-- **B winner:** with merge acceptance enabled, qualification is unpaid. Acceptance into a scheduled shared starting checkpoint starts payment. The 10 targets each reserve 2.5% of total emissions at full pay.
+- **B winner:** with merge acceptance enabled, qualification is unpaid. Acceptance into a scheduled shared starting checkpoint starts payment. The 10 slots each pay 2.5% of total emissions to their holder every settlement, with no decay or expiry, until a newer leg's accepted merge takes the slot. Every leg is tested on every slot: up to 4 declared targets clear at a 1% gain LCB, any other slot at 2%; one miner may hold every slot.
 - **C winner:** an initial test pass is unpaid. A later confirmation must win the target slot. C's pool is divided by competition weight, then target count. The current sole competition, MarketCast, has 1 target: each full-pay slot is 25% of total emissions.
-- **Full-pay duration:** B: LCB ≥ 0.05 → 10 eras, LCB ≥ 0.02 → 5 eras, LCB ≥ 0.01 → 2 eras; MarketCast C: LCB ≥ 0.05 → 10 eras, LCB ≥ 0.02 → 5 eras, LCB ≥ 0.01 → 2 eras. B uses accepted marginal gain; C uses confirmed gain. Each win keeps its recorded tier.
-- **B/C progression:** after full pay, B's per-era slot multipliers are 50% → 25% → 12.5%, then a 10% floor. Payment ends at age 28 eras, including the full-pay period. C has its own policy (currently a 10% floor and age 28 expiry). Age starts at B acceptance or C confirmation. A new holder stops the old holder's pay.
-- **Burn:** unpaid A, empty/decayed/expired slots in launched lanes and inactive competition allocations go to `burn_uid`; they are not shared among other miners. An unlaunched lane has no reserved pool.
+- **C full-pay duration:** MarketCast C: 5 days (10 eras) at LCB 0.01, rising linearly to 20 days (40 eras) at LCB ≥ 0.05. C uses confirmed gain; each win keeps its recorded duration. B has no tiers.
+- **C progression:** C has no decay: its slot ends when the full-pay duration ends. Age starts at C confirmation. A new holder stops the old holder's pay.
+- **Burn:** unpaid A, empty B slots, empty/ended C slots and inactive competition allocations go to `burn_uid`; they are not shared among other miners. An unlaunched lane has no reserved pool.
 - **Check payment:** read signed reward records and on-chain weights. Queue completion, qualification and pending confirmation are not paid wins. Public status reports `reward_status=not_verified` because it does not verify payment.
 <!-- cascade:rewards:summary:end -->
 
@@ -594,11 +594,12 @@ validator can judge the same settlement under different rules.
     B reserves 25% when launched: A/B split 75/25 while C is off, and
     A/B/C split 50/25/25 while C is on. B's share has one slot per
     `[lane_b]` domain plus one per `[eval]
-    scored_horizons` rung (mainnet 7 + 3 = 10; testnet 7), each win paid
-    100 % for the `full_eras` of the highest `[lane_b] full_pay_tiers`
-    threshold its gain LCB meets (fixed at the win), then halving per era to
-    a 10 % floor, and nothing after 28 eras; the unpaid remainder burns.
-    `replay_settlements` defaults to cover that window. With `[lane_c]`
+    scored_horizons` rung (mainnet 7 + 3 = 10; testnet 7), each holder
+    paid 100 % of its slot every settlement until a newer accepted merge
+    takes it (LANE_D_PLAN rev6.22: no decay, no TTL); empty slots burn.
+    Every judged leg is tested on every slot (declared targets at
+    `gain_margin`, the rest at `undeclared_gain_margin`, two max-T
+    families). Under merge acceptance recovery walks the complete ledger. With `[lane_c]`
     armed, mainnet C takes its share from A (A 50 / B 25 / C 25). The
     explicit `takes_from = "lane_b"` retains the existing testnet split.
     Lane-C recovery replays back to its saved boundary, or activation for

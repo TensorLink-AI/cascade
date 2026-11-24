@@ -66,7 +66,9 @@ def test_payout_schedule_and_ttl():
         pay = lane_c_payouts(st, block=age * ERA, era_blocks=ERA, cfg=LC, n_uids=16)
         mult.append(pay[0]["multiplier"] if pay else None)
         assert all(p["target"] == "mkt:returns" for p in pay)
-    assert mult == [1.0, 1.0, 0.5, 0.25, 0.1, 0.1, None]       # floor, then TTL burns it
+    # DEC-CA-0073: full pay for the recorded full_eras (5), then the slot
+    # ends (burns) — no decay tail, no TTL
+    assert mult == [1.0, 1.0, None, None, None, None, None]
     # deregistered / out-of-range holders are unpaid
     assert lane_c_payouts(st, block=0, era_blocks=ERA, cfg=LC, n_uids=16, uid_of={}) == []
     assert lane_c_payouts(st, block=0, era_blocks=ERA, cfg=LC, n_uids=5) == []

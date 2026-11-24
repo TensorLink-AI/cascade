@@ -1,8 +1,7 @@
-"""WB26: ``check_lane_b`` re-derives every suite-target verdict row from its
-recorded fields (plan WB26 row item 6): the either-metric gain test at
-``alpha/(2k)``, the non-inferiority of the other metric, ``target_lcb`` = the
-smaller cleared LCB, guard 4 and the anchor guard. Honest rows come from the
-real validator (``judgements_record``); each tampered copy must be caught."""
+"""WB26: ``check_lane_b`` re-derives guard 4 and the anchor guard of every
+suite slot row from its ``suite_guards`` record (plan WB26 row). Honest rows
+come from the real validator (``judgements_record``); each tampered copy
+must be caught by the audit's lane B row check."""
 
 from __future__ import annotations
 
@@ -31,28 +30,9 @@ def _why(row, cfg):
     return _lane_b_row_verdict(row, cfg, lane_b_slots(cfg))
 
 
-def _honest(tmp_path):
-    cases = {
-        "crps": {("gift", "crps"): 0.95},
-        "mase": {("gift", "mase"): 0.95},
-        "both": {("gift", "crps"): 0.95, ("gift", "mase"): 0.90},
-        "noninf_fail": {("gift", "crps"): 0.95, ("gift", "mase"): 1.03},
-        "none": {},
-    }
-    out = {}
-    for name, f in cases.items():
-        cfg, (row,) = _rows(tmp_path, f)
-        assert "suite_gain" in row, f"{name}: the suite row records suite_gain: {sorted(row)}"
-        out[name] = row
-    return cfg, out
-
-
-def test_honest_suite_rows_rederive(tmp_path):
-    cfg, rows = _honest(tmp_path)
-    for name, row in rows.items():
-        assert _why(row, cfg) is None, (name, _why(row, cfg))
-    assert rows["crps"]["passed"] and rows["mase"]["passed"] and rows["both"]["passed"]
-    assert not rows["noninf_fail"]["passed"] and not rows["none"]["passed"]
+def _gift(rows):
+    (r,) = [r for r in rows if r["domain"] == GIFT]
+    return r
 
 
 def _tamper(row, path, value):
@@ -64,38 +44,50 @@ def _tamper(row, path, value):
     return r
 
 
-@pytest.mark.parametrize("case,path,value", [
-    ("crps", ("passed",), False),
-    ("noninf_fail", ("passed",), True),
-    ("none", ("passed",), True),
-    ("crps", ("suite_gain", "cleared_metric"), "both"),
-    ("mase", ("suite_gain", "noninf_metric"), "mase"),
-    ("crps", ("suite_gain", "gain_alpha"), 0.05),
-    ("crps", ("suite_gain", "n_items"), 3),
-    ("noninf_fail", ("suite_gain", "noninf_lcb"), 0.0),
-    ("crps", ("suite_guards", "pool_gain"), -0.01),
-    ("crps", ("suite_guards", "anchor_pointer"), ""),
-    ("crps", ("suite_guards", "anchor_guard_lcbs", "web"), -0.001),
-    ("crps", ("suite_guards", "anchor_public_lcbs", "boom_crps"), -0.001),
-    ("crps", ("public_lcbs", "gift_crps"), 0.0),
+def test_honest_rows_rederive_and_suite_guards_are_recorded(tmp_path):
+    cfg, rows = _rows(tmp_path, h.GIFT_GAIN)
+    for r in rows:
+        assert _why(r, cfg) is None, (r["domain"], _why(r, cfg))
+    g = _gift(rows)
+    assert g["passed"] and "suite_guards" in g, sorted(g)
+
+
+def test_honest_anchor_missing_row_rederives(tmp_path):
+    cfg, rows = _rows(tmp_path, h.GIFT_GAIN, anchor_pointer="")
+    g = _gift(rows)
+    assert not g["passed"] and "suite_guards" in g, g["reason"]
+    assert _why(g, cfg) is None, _why(g, cfg)
+
+
+@pytest.mark.parametrize("path,value", [
+    (("suite_guards", "pool_gain"), -0.01),
+    (("suite_guards", "anchor_pointer"), ""),
+    (("suite_guards", "anchor_guard_lcbs", "web"), -0.001),
+    (("suite_guards", "anchor_public_lcbs", "boom_crps"), -0.001),
 ])
-def test_tampered_suite_rows_are_caught(tmp_path, case, path, value):
-    cfg, rows = _honest(tmp_path)
-    bad = _tamper(rows[case], path, value)
-    assert _why(bad, cfg) is not None, f"audit accepted a tampered {case} row: {path} = {value!r}"
+def test_tampered_suite_guards_on_a_passing_row_are_caught(tmp_path, path, value):
+    cfg, rows = _rows(tmp_path, h.GIFT_GAIN)
+    bad = _tamper(_gift(rows), path, value)
+    assert _why(bad, cfg) is not None, f"audit accepted a passing row with {path} = {value!r}"
 
 
-def test_full_pay_lcb_must_be_the_smaller_cleared_lcb(tmp_path):
-    cfg, rows = _honest(tmp_path)
-    row = rows["both"]
-    g = row["suite_gain"]
-    assert row["target_lcb"] == min(g["crps_lcb"], g["mase_lcb"])
-    bad = _tamper(row, ("target_lcb",), max(g["crps_lcb"], g["mase_lcb"]))
-    assert _why(bad, cfg) is not None, "audit accepted target_lcb = the LARGER cleared LCB"
-
-
-def test_suite_row_without_suite_guards_is_refused(tmp_path):
-    cfg, rows = _honest(tmp_path)
-    bad = copy.deepcopy(rows["crps"])
+def test_passing_suite_row_without_suite_guards_is_refused(tmp_path):
+    cfg, rows = _rows(tmp_path, h.GIFT_GAIN)
+    bad = copy.deepcopy(_gift(rows))
     bad.pop("suite_guards")
-    assert _why(bad, cfg) is not None
+    assert _why(bad, cfg) is not None, "audit accepted a claimed suite slot with no suite_guards"
+
+
+def test_refused_row_flipped_to_passed_is_caught(tmp_path):
+    cfg, rows = _rows(tmp_path, h.GIFT_GAIN, anchor_pointer="")
+    bad = _tamper(_gift(rows), ("passed",), True)
+    bad["gain_metric"] = "crps"
+    assert _why(bad, cfg) is not None, "audit accepted an anchor_missing suite row as passed"
+
+
+def test_suite_guards_on_a_domain_row_are_refused(tmp_path):
+    cfg, rows = _rows(tmp_path, h.GIFT_GAIN)
+    (dom,) = [r for r in rows if r["domain"] == "energy"]
+    bad = copy.deepcopy(dom)
+    bad["suite_guards"] = copy.deepcopy(_gift(rows)["suite_guards"])
+    assert _why(bad, cfg) is not None, "audit accepted suite_guards on a domain slot row"

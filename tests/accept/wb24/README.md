@@ -161,3 +161,12 @@ reason is in `data` or in the output. A refusal's contamination receipt is
 not carried, and an echoed key is printed. The golden, suite-target
 (through abbreviation), contamination-code, unarmed-status and sanity tests
 pass on main.
+
+## rev6.22: repeatable `--target` (`test_wb24_multi_target.py`)
+
+`lane-b fund --target T` may be repeated (one target per flag, any configured
+target, suites mixed with domains/horizons); it sends the same slot-ordered
+`X-Lane-B-Targets` as `--targets T1,T2`. More than `max_domains_per_leg` (4),
+a repeat, a comma inside one flag, or an unknown target is refused locally as
+`bad_targets` with nothing sent (one test with the four-target case, so it
+fails on BASE, whose cap is 3 and whose `--target` takes one suite).

@@ -250,6 +250,26 @@ check-pr failure or any failing run fails the group (closed). The CROSS rule
 then runs over BASE..HEAD excluding the `GROUP-OWN` WPs (their own Accept just
 ran). Nothing is ledger-recorded (the push job records after the merge).
 
+RETIRED rule (owner decision D24, plan rev6.18, 2026-11-24: W5i retired, not
+built): a WP listed in scripts/laned/retired_wps at BASE (`<WP> <owner
+decision reference>` per line; a bare id fails closed) was dropped by an owner
+decision. Read at BASE / the board ref only, never from the PR (only a W0c PR
+edits scripts/laned/), so a PR cannot retire its own WP.
+    scope: its PATHS never count. A PR needs no label of it for a file in
+        its PATHS; a file only a retired WP's PATHS match is out of scope.
+        Its label is inert: the other labels' check-pr runs judge the diff
+        without it and without its tests dir.
+    its tests dir: a PR may only delete files there (else `FAIL rule1:
+        retired-tests`), under its label (else `batch-unlabelled-tests`) and
+        with laned:tests-correction (else `FAIL weakened`).
+    check-pr for it prints `RETIRED <WP> <reference>` and `MODE retired`
+        (the PR job and the merge group run nothing for it: `GROUP <WP>
+        retired SKIP`); a PR whose only labels are retired may change nothing
+        but their tests dirs (`FAIL paths: retired-only`).
+    never a CROSS WP (built_wps_at skips it), never a freshness dependency;
+        the status board keeps it at L0 with side state `retired` and shows
+        RETIRED.
+
 The pytest command is `uv run --frozen pytest` unless LANED_PYTEST_CMD is set
 (shlex-split). It always runs with cwd = --root. Exit 0 means pass.
 """
@@ -914,6 +934,56 @@ def cmd_check_pr_feature(root: Path, wp: str, pr_wps: list[str], base: str, head
     return 0
 
 
+def check_pr_retired(root: Path, wp: str, base: str, head: str, diff: list[str], labels: list[str],
+                     retired: dict[str, str], correction: bool
+                     ) -> tuple[int | None, list[str], list[str]]:
+    """RETIRED rule (module docstring) for check-pr. Returns ``(rc, diff,
+    labels)``: ``rc`` is the check-pr exit code when the rule decides it
+    (``wp`` is retired, or the PR breaks the rule), else None and the diff /
+    labels the other rules judge: without the retired WPs' tests dirs (each
+    is judged by its own label's run) and without retired labels (inert:
+    their PATHS never count for scope)."""
+    rdirs = {lanedlib.wp_dir(w): w for w in retired}
+
+    def retired_dir(p: str) -> str | None:
+        parts = p.split("/")
+        return parts[2] if len(parts) >= 4 and p.startswith("tests/accept/") and parts[2] in rdirs else None
+
+    deleted = set(lanedlib.git(root, "diff", "--no-renames", "--name-only", "--diff-filter=D",
+                                   f"{base}...{head}").stdout.split())
+    changed = sorted(p for p in diff if retired_dir(p) and p not in deleted)
+    if changed:
+        return fail("rule1", "retired-tests: a retired WP's tests/accept/<wp>/ may only be deleted; "
+                    "the PR adds or changes " + " ".join(changed)), diff, labels
+    label_dirs = {lanedlib.wp_dir(w) for w in labels}
+    unlabelled = sorted({d for p in diff if (d := retired_dir(p)) and d not in label_dirs})
+    if unlabelled:
+        return fail("rule1", "batch-unlabelled-tests: tests dir(s) without their laned:<WP> label: "
+                    + " ".join(f"tests/accept/{d}/" for d in unlabelled)), diff, labels
+    live = [w for w in labels if lanedlib.wp_dir(w) not in rdirs]
+    own_dir = lanedlib.wp_dir(wp)
+    if own_dir in rdirs:
+        why = retired[rdirs[own_dir]]
+        own = [p for p in diff if retired_dir(p) == own_dir]
+        rest = [p for p in diff if retired_dir(p) != own_dir]
+        print(f"RETIRED {wp} {why}")
+        if rest and not live:
+            return fail("paths", f"retired-only: laned:{wp} is a retired WP's label and covers only deleting "
+                        f"tests/accept/{own_dir}/; the PR also changes " + " ".join(sorted(rest))
+                        + " with no live laned:<WP> label"), diff, labels
+        weak = weakened_tests(root, wp, base, head) if own else []
+        if weak and not correction:
+            for x in weak:
+                print(f"weakened {wp}: {x}")
+            return fail("weakened", f"deleting a retired WP's tests needs laned:{lanedlib.CORRECTION_LABEL} "
+                        f"(cite the owner decision: {why})"), diff, labels
+        for x in weak:
+            print(f"weakened {wp}: {x} (allowed: laned:{lanedlib.CORRECTION_LABEL})")
+        print("MODE retired")
+        return 0, diff, labels
+    return None, [p for p in diff if not retired_dir(p)], live
+
+
 def cmd_check_pr(root: Path, wp: str, base: str, head: str,
                  pr_wps: list[str] | None = None, correction: bool = False) -> int:
     m = REVIEW_WP.match(wp)
@@ -922,13 +992,25 @@ def cmd_check_pr(root: Path, wp: str, base: str, head: str,
     diff = lanedlib.git(root, "diff", "--name-only", f"{base}...{head}").stdout.split()
     if not diff:
         return fail("paths", "the PR changes nothing")
+    # the tests-correction flag label is never a WP
+    labels = [w for w in dict.fromkeys([*(pr_wps or []), wp]) if w != lanedlib.CORRECTION_LABEL]
+    # RETIRED rule (module docstring): read at BASE, never from the PR
+    try:
+        retired = lanedlib.retired_wps_at(root, base)
+    except ValueError as e:
+        return fail("retired", str(e))
+    if retired:
+        rc, diff, labels = check_pr_retired(root, wp, base, head, diff, labels, retired, correction)
+        if rc is not None:
+            return rc
+        if not diff:
+            return fail("rule1", f"batch-label-without-changes: laned:{wp}: the PR changes only "
+                        "retired WPs' tests dirs")
     rc = cmd_check_pr_evidence(root, wp, base, head, diff)
     if rc is not None:
         return rc
     tests = [p for p in diff if p.startswith("tests/accept/")]
     others = [p for p in diff if not p.startswith("tests/accept/")]
-    # the tests-correction flag label is never a WP
-    labels = [w for w in dict.fromkeys([*(pr_wps or []), wp]) if w != lanedlib.CORRECTION_LABEL]
     if tests and others:
         # rev6.17 rule 1: tests + code together (FEATURE rule)
         return cmd_check_pr_feature(root, wp, labels, base, head, diff, correction)
@@ -1334,8 +1416,11 @@ def built_wps_at(root: Path, ref: str) -> list[tuple[str, list[str]]]:
     coupled = lanedlib.coupled_batches_at(root, ref)
     subjects = lanedlib.first_parent_subjects(root, ref)
     labels = pr_labels(root)
+    retired = lanedlib.retired_dirs(lanedlib.retired_wps_at(root, ref))
     built: list[tuple[str, list[str]]] = []
     for d in sorted(out):
+        if d in retired:
+            continue  # RETIRED rule: never built, never a CROSS WP
         proc = lanedlib.git(root, "show", f"{ref}:tests/accept/{d}/PATHS", check=False)
         if proc.returncode != 0:
             continue
@@ -1629,12 +1714,14 @@ def _py_closure_hits(root: Path, start: list[str], targets: list[str]) -> list[s
     return sorted(t for t in targets if t in mods and t not in py)
 
 
-def stale_reasons(root: Path, pr_diff: list[str], main_diff: list[str]) -> list[str]:
+def stale_reasons(root: Path, pr_diff: list[str], main_diff: list[str],
+                  skip_dirs: set[str] | frozenset[str] = frozenset()) -> list[str]:
     """Why the PR's changes and main's changes since the tested base interact
     in the tree at ``root`` (empty: they don't). The cross dependency analysis:
     a path both touched; a changed module of one side importing (statically,
     transitively) a changed path of the other; or a WP whose tests depend
-    (cross_reasons) on both diffs."""
+    (cross_reasons) on both diffs. ``skip_dirs``: retired WPs' tests dirs
+    (RETIRED rule: never run, so never stale)."""
     why: list[str] = []
     both = sorted(set(pr_diff) & set(main_diff))
     if both:
@@ -1648,6 +1735,8 @@ def stale_reasons(root: Path, pr_diff: list[str], main_diff: list[str]) -> list[
     dirs = sorted(p.name for p in (root / "tests" / "accept").iterdir()
                   if (p / "PATHS").is_file()) if (root / "tests" / "accept").is_dir() else []
     for d in dirs:
+        if d in skip_dirs:
+            continue
         paths = lanedlib.parse_paths((root / "tests" / "accept" / d / "PATHS").read_text())
         on_pr = cross_reasons(root, d, paths, pr_diff)
         if not on_pr:
@@ -1697,14 +1786,18 @@ def cmd_freshness(root: Path, base: str, head: str, main_ref: str, warn_only: bo
     n = lanedlib.git(root, "rev-list", "--count", f"{mb}..{m}").stdout.strip()
     print(f"freshness: tested base {b[:12]}, {main_ref} {m[:12]} is {n} commit(s) past the merge-base "
           f"{mb[:12]}; main touched {len(main_diff)} path(s), the PR {len(pr_diff)}")
-    why = stale_reasons(root, pr_diff, main_diff)
+    try:
+        skip = lanedlib.retired_dirs(lanedlib.retired_wps_at(root, b))
+    except ValueError as e:
+        return stale(str(e))
+    why = stale_reasons(root, pr_diff, main_diff, skip)
     with tempfile.TemporaryDirectory(prefix="laned-fresh-") as tmp:
         wt = Path(tmp) / "main"
         proc = lanedlib.git(root, "worktree", "add", "--detach", "-q", str(wt), m, check=False)
         if proc.returncode != 0:
             return stale(f"no worktree of {main_ref}: {proc.stderr.strip()[:200]}")
         try:
-            why += [f"at {main_ref}: {w}" for w in stale_reasons(wt, pr_diff, main_diff)]
+            why += [f"at {main_ref}: {w}" for w in stale_reasons(wt, pr_diff, main_diff, skip)]
         finally:
             lanedlib.git(root, "worktree", "remove", "--force", str(wt), check=False)
             lanedlib.git(root, "worktree", "prune", check=False)
@@ -1814,6 +1907,10 @@ def cmd_merge_group(root: Path, base: str, head: str, labels: dict[int, list[str
             mode = next((ln[5:].strip() for ln in out.splitlines() if ln.startswith("MODE ")), "")
             if mode == "review":
                 print(f"GROUP {wp} review PASS (#{n})")
+                continue
+            if mode == "retired":
+                # RETIRED rule: the label is inert, the WP has nothing to run
+                print(f"GROUP {wp} retired SKIP (#{n})")
                 continue
             if mode == "evidence":
                 runs = [("evidence " + ln[9:].strip(), ln[9:].strip())
@@ -2206,6 +2303,34 @@ def selftest_evidence(ident: tuple[str, ...]) -> list[str]:
             os.environ.pop("LANED_PYTEST_CMD", None)
         else:
             os.environ["LANED_PYTEST_CMD"] = saved
+    return failures
+
+
+def selftest_retired() -> list[str]:
+    """RETIRED rule: the retired_wps parser (reference required, comments
+    ignored) and this repo's own file (W5i, plan rev6.18 D24)."""
+    failures: list[str] = []
+    got = lanedlib.parse_retired_wps("# c\n\nW5i  plan rev6.18 (D24)  # note\nX1 decision D9\n")
+    if got != {"W5i": "plan rev6.18 (D24)", "X1": "decision D9"}:
+        failures.append(f"retired parse: {got}")
+    for bare in ("W5i\n", "W5i   # only a comment\n"):
+        try:
+            lanedlib.parse_retired_wps(bare)
+            failures.append(f"retired parse: {bare!r} without a reference was accepted")
+        except ValueError:
+            pass
+    if lanedlib.parse_retired_wps(None) != {}:
+        failures.append("retired parse: no file is not empty")
+    own = Path(__file__).resolve().parent / "retired_wps"
+    try:
+        mine = lanedlib.parse_retired_wps(own.read_text()) if own.is_file() else {}
+    except ValueError as e:
+        mine = {}
+        failures.append(f"retired: {own.name}: {e}")
+    if "D24" not in mine.get("W5i", ""):
+        failures.append(f"retired: {own.name} does not retire W5i citing D24: {mine}")
+    if lanedlib.retired_dirs(mine) != {lanedlib.wp_dir(w) for w in mine}:
+        failures.append("retired: retired_dirs")
     return failures
 
 
@@ -3331,6 +3456,7 @@ def cmd_selftest() -> int:
     failures += selftest_verification(ident)
     failures += selftest_evidence(ident)
     failures += selftest_w3a_nolock_evidence()
+    failures += selftest_retired()
     failures += selftest_wb19_partial_evidence()
     failures += selftest_cross(ident)
     failures += selftest_freshness(ident)

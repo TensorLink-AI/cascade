@@ -119,8 +119,8 @@ class LaneBOps(Protocol):
               anchor_pointer: str | None = None) -> list:
         """The manifest's ExpertJudgement list; ``sentinel`` (W-S2) is the
         settlement era's §16 suite, passed only while armed; ``anchor_pointer``
-        (WB26) the era's anchor king, passed only when a suite-target leg
-        settles."""
+        (WB26) the era's anchor king, passed only when the settling legs
+        carry anchor rows (suite slots configured)."""
 
     def merge_scores(self, pointer: str, block: int) -> list:
         """The held-out acceptance scores of ``pointer``."""
@@ -1132,10 +1132,11 @@ class LaneBDriver:
 
         ``anchor_pointer`` (WB26, DEC-CA-0071 §3 guard 5): the era's anchor
         king — the promotion member the validator derives from the signed
-        training manifest. A leg declaring a suite target carries the
-        anchor's public rows as ``public_rows["anchor"]`` (benched once per
-        anchor), and the self-judge is guarded against the same anchor."""
-        from ..eval.expert_lane import is_suite_target
+        training manifest; the caller passes it only while suite slots are
+        configured. Every leg is tested on every suite slot (rev6.22), so
+        every settling leg carries the anchor's public rows as
+        ``public_rows["anchor"]`` (benched once per anchor), and the
+        self-judge is guarded against the same anchor."""
         from ..shared.expert_manifest import ExpertEntry, ExpertManifest, leg_label
         from .moe_model import MergeError
 
@@ -1216,7 +1217,7 @@ class LaneBDriver:
                                      min_items=lb.min_public_items)
                 except MissingPublicGuard as e:
                     raise OSError(f"lane-B candidate public benchmarks unavailable: {e}") from e
-                if anchor_pointer and any(is_suite_target(t) for t in declared):
+                if anchor_pointer:
                     rows["anchor"] = self._anchor_bench_rows(anchor_pointer, require)
             entries.append(ExpertEntry(
                 miner_hotkey=sub["hotkey"], miner_uid=int(sub["uid"]), gen_ref=sub["gen_ref"],
@@ -1252,8 +1253,7 @@ class LaneBDriver:
             from ..validator.expert_lane import apply_judgements
 
             for w in apply_judgements(LaneBState(), judgements, round_id=rid,
-                                      settle_block=block, tiers=lb.full_pay_tiers,
-                                      qualify_only=True):
+                                      settle_block=block, qualify_only=True):
                 qualified.setdefault(w.rebased_pointer, []).append(asdict(w))
         with self._lock:
             if rid in self._abandoned:

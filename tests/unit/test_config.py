@@ -412,20 +412,27 @@ def test_retired_keys_load_and_are_ignored(tmp_path):
         DEFAULT_CHAIN_TOML,
         RETIRED_KEYS,
         EvalConfig,
+        LaneBConfig,
         RoundConfig,
         ScoringConfig,
         TelemetryConfig,
         ValidatorConfig,
         load_chain_config,
     )
+    from cascade.shared.config.lane_c import LaneCConfig
     from cascade.shared.config.lane_d import LaneDConfig
+    from cascade.shared.config.marketcast import MarketCastConfig
 
     live = {"round": {f.name for f in dataclasses.fields(RoundConfig)},
             "telemetry": {f.name for f in dataclasses.fields(TelemetryConfig)},
             "eval": {f.name for f in dataclasses.fields(EvalConfig)},
             "validator": {f.name for f in dataclasses.fields(ValidatorConfig)},
             "scoring": {f.name for f in dataclasses.fields(ScoringConfig)},
-            "lane_d": {f.name for f in dataclasses.fields(LaneDConfig)}}
+            "lane_d": {f.name for f in dataclasses.fields(LaneDConfig)},
+            # DEC-CA-0073: lane C's gain-tiered pay keys
+            "lane_c": {f.name for f in dataclasses.fields(LaneCConfig)},
+            "marketcast": {f.name for f in dataclasses.fields(MarketCastConfig)},
+            "lane_b": {f.name for f in dataclasses.fields(LaneBConfig)}}
     assert set(RETIRED_KEYS) <= set(live), "a retired section has no live-field check"
     for section, keys in RETIRED_KEYS.items():
         assert not keys & live[section], f"[{section}] retired key is a live field"
@@ -442,7 +449,13 @@ def test_retired_keys_load_and_are_ignored(tmp_path):
              "scoring": "\n".join(f"{k} = 1" for k in sorted(RETIRED_KEYS["scoring"])
                                   if f"\n{k} " not in text),
              "lane_d": "\n".join(f"{k} = 1" for k in sorted(RETIRED_KEYS["lane_d"])
-                                 if f"\n{k} " not in text)}
+                                 if f"\n{k} " not in text),
+             # DEC-CA-0073: a deployed file may still carry lane C's old pay keys
+             "lane_c": "\n".join(f"{k} = 1" for k in sorted(RETIRED_KEYS["lane_c"])),
+             "marketcast": "\n".join(f"{k} = 1" for k in sorted(RETIRED_KEYS["marketcast"])),
+             # rev6.22: an older file's lane B decay / TTL keys load, ignored
+             "lane_b": "full_pay_tiers = [[0.05, 10], [0.02, 5], [0.01, 2]]\n"
+                       "half_life_rounds = 1.0\nfloor = 0.1\nwin_ttl_eras = 28"}
     for section, lines in extra.items():
         if lines:
             text = text.replace(f"\n[{section}]\n", f"\n[{section}]\n{lines}\n", 1)
@@ -452,3 +465,5 @@ def test_retired_keys_load_and_are_ignored(tmp_path):
     assert got.round.epoch_blocks == shipped.round.epoch_blocks
     assert got.scoring == shipped.scoring
     assert got.lane_d == shipped.lane_d
+    assert got.lane_c == shipped.lane_c and got.marketcast == shipped.marketcast
+    assert got.lane_b == shipped.lane_b

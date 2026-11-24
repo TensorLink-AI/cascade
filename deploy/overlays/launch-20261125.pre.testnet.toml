@@ -1,0 +1,30 @@
+# Wed 2026-11-25 launch rehearsal, STEP 1 of 2 (seq N), TESTNET (netuid 259)
+# — publish and observe this BEFORE the mainnet pair. Effective at testnet
+# era start 8524200 (= 14207 x 600; testnet era = epoch_blocks 150 x
+# era_settlements 4): the first testnet era boundary after Wed 18:00 UTC,
+# ~18:52 UTC from head 8511976 @ 2026-11-24 02:06:48 UTC at the measured
+# 12.0 s/block — about 3.6 h before the mainnet launch (9586800).
+# Re-check against the testnet head before publishing; if 8524200 is less than
+# one era ahead by then, use the next multiple of 600.
+#
+# Testnet [lane_b] from_block is already 8190000 in chain.testnet.toml, so it
+# is not restated. Why two steps: the R3 overlay lint (`non-lane-d`) refuses a
+# [lane_d] overlay whose other keys are not a byte-identical restatement of
+# seq N-1; step 2 (launch-20261125.testnet.toml) restates this and adds
+# [lane_d].
+#
+# PREREQUISITE: chain.testnet.toml ships [netconfig] owner_hotkey = "" — no
+# testnet node can verify ANY overlay until a release types it.
+#
+#   cascade-validator --chain-toml chain.testnet.toml \
+#     --netconfig-overlay deploy/overlays/launch-20261125.pre.testnet.toml \
+#     --netconfig-effective-block 8524200
+#
+# Folds in #859's split-a0-b35-c15-d50.testnet.toml. Overlays are SNAPSHOTS.
+
+[lane_b]
+share = 0.35
+
+[lane_c]
+share      = 0.15
+takes_from = "lane_a"

@@ -45,11 +45,9 @@ LANE_B_TRACK_DEFAULTS: dict[str, object] = {
     "max_leg_hours": 6.0,
     "max_leg_seconds": 27_000,         # 6 h x 1.25
     "guard_factor": 1.25,
-    # WB26 (DEC-CA-0071 §2-§3, Amendment rev6.19): the suite-target gain bar
-    # (CRPS OR MASE LCB_{alpha/(2k)} >= gain_margin_public) and the anchor-king
-    # guard tolerances (no worse than the anchor at alpha). CONSENSUS verdict
-    # terms, read only for a leg declaring a suite target.
-    "gain_margin_public": 0.01,
+    # WB26 (DEC-CA-0071 §3 guards 4-5): the anchor-king guard tolerances (no
+    # worse than the anchor at alpha). CONSENSUS verdict terms, read only when
+    # a suite slot clears.
     "tau_anchor_public": 0.0,
     "tau_anchor_domain": 0.0,
 }
@@ -158,8 +156,6 @@ def parse_lane_b_track(lb: dict, *,
         "max_leg_seconds": _int("max_leg_seconds",
                                 lb.get("max_leg_seconds", d["max_leg_seconds"]), lo=1),
         "guard_factor": _float("guard_factor", lb.get("guard_factor", d["guard_factor"])),
-        "gain_margin_public": _float("gain_margin_public",
-                                     lb.get("gain_margin_public", d["gain_margin_public"])),
         "tau_anchor_public": _float("tau_anchor_public",
                                     lb.get("tau_anchor_public", d["tau_anchor_public"])),
         "tau_anchor_domain": _float("tau_anchor_domain",
@@ -189,9 +185,6 @@ def parse_lane_b_track(lb: dict, *,
     if out["guard_factor"] < 1.0:
         raise ValueError(f"[lane_b] guard_factor must be >= 1.0 (a factor below 1 truncates "
                          f"every leg); got {out['guard_factor']}")
-    if not 0.0 < out["gain_margin_public"] < 1.0:
-        raise ValueError("[lane_b] gain_margin_public must be in (0, 1) — a zero bar lets an "
-                         f"unchanged expert win a suite; got {out['gain_margin_public']}")
     for key in ("tau_anchor_public", "tau_anchor_domain"):
         if not 0.0 <= out[key] < 1.0:
             raise ValueError(f"[lane_b] {key} must be in [0, 1); got {out[key]}")

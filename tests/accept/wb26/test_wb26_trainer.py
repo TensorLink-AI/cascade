@@ -1,5 +1,5 @@
-"""WB26 trainer side: a settling suite-target leg carries the era anchor
-king's public bench rows (``ExpertEntry.public_rows["anchor"]``), benched
+"""WB26 trainer side: every settling leg (rev6.22 tests every leg on every
+suite slot) carries the era anchor king's public bench rows (``ExpertEntry.public_rows["anchor"]``), benched
 once per anchor, and the self-judge is guarded against the same anchor — so
 a suite target can actually win. The rolling trainer derives the anchor with
 the validator's own rule (``lane_b_anchor_pointer``)."""
@@ -30,9 +30,26 @@ def test_suite_leg_carries_anchor_rows_and_self_judge_gets_the_anchor(tmp_path):
     assert call["kw"].get("anchor_pointer") == h.ANCHOR_PTR, call["kw"]
 
 
-def test_domain_leg_never_benches_the_anchor(tmp_path):
+def test_domain_leg_also_carries_anchor_rows(tmp_path):
+    """rev6.22 tests every leg on every suite slot, so a domain leg can clear
+    an undeclared suite slot too: it carries the anchor rows as well."""
     sc = h.trainer_scenario(tmp_path, target="energy")
     h.trainer_settle(sc, tmp_path, anchor_pointer=h.ANCHOR_PTR)
+    e = _entry(sc)
+    assert (e.public_rows or {}).get("anchor") == h.bench_rows({}), sorted(e.public_rows)
+    (call,) = sc.ops.judge_calls
+    assert call["kw"].get("anchor_pointer") == h.ANCHOR_PTR, call["kw"]
+
+
+def test_no_anchor_pointer_no_anchor_rows(tmp_path):
+    """Without an anchor (suite slots off, or a random-init era) nothing is
+    benched for it and the self-judge call is the pre-WB26 call."""
+    from cascade.trainer.lane_b_driver import LaneBDriver
+
+    assert h.has_param(LaneBDriver.settle, "anchor_pointer"), (
+        "LaneBDriver.settle takes the era's anchor king as keyword `anchor_pointer` (WB26)")
+    sc = h.trainer_scenario(tmp_path)
+    h.trainer_settle(sc, tmp_path)
     e = _entry(sc)
     assert "anchor" not in (e.public_rows or {}), sorted(e.public_rows)
     assert h.ANCHOR_PTR not in sc.ops.fetched, sc.ops.fetched
