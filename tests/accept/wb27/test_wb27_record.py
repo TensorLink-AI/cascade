@@ -31,7 +31,7 @@ def _manifest(*entries):
                           lineage_tokens=1, entries=tuple(entries))
 
 
-def test_default_entry_keeps_todays_bytes_unchanged_when_unarmed():
+def test_default_entry_keeps_todays_bytes():
     body = json.loads(_manifest(_entry()).canonical_body())
     e = body["entries"][0]
     for k in ("levers", "train_tokens", "gpu_measured", "trained_steps", "trained_tokens",

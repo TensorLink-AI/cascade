@@ -32,6 +32,7 @@ cascade/validator/expert_lane.py
 cascade/audit/checks.py
 # Miner CLI and docs; shipped files carry max_leg_hours = 12.
 cascade/miner/lane_b.py
+cascade/miner/cli.py
 docs/MINER.md
 chain.toml
 chain.testnet.toml

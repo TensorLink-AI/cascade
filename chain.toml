@@ -1496,8 +1496,9 @@ sentinel_max_defer_eras  = 4           # §12b.5
 # measured its step rate on the pinned image (evidence/wb19.json); until
 # then a lane B fund choosing it is refused gpu_rate_unmeasured.
 funded_pod_skus          = ["8xH200", "8xH100", "4xH200", "4xH100", "8xRTX4090"]
-# owner 2026-11-24 (rev6.21): up to 12 h legs; the 6 h / 27000 s caps still
-# bind before [lane_b] miner_levers_from_block (unset here = 6 h).
+# owner 2026-11-24 (rev6.21): up to 12 h legs (no activation block: lane B
+# is not rolled out). An unmeasured / unlisted type may be chosen at the
+# miner's own risk with a token or hour limit (WB27).
 max_leg_hours            = 12.0
 max_leg_seconds          = 54000       # 12 h x 1.25
 guard_factor             = 1.25

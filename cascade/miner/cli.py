@@ -1420,11 +1420,22 @@ def _cmd_credentials(args: argparse.Namespace) -> int:
     return OK
 
 
-def add_gpu_args(p: argparse.ArgumentParser, *, budget: bool = False) -> None:
+LANE_B_GPU_HELP = (
+    "GPU type your key rents for the lane B leg: one of chain.toml [lane_b] funded_pod_skus "
+    "(shipped: 8xH200, 8xH100, 4xH200, 4xH100, 8xRTX4090; a type rents once WB19 has "
+    "measured it), or ANY other layout (e.g. 4xL40S) with --train-tokens / --train-hours, "
+    "AT YOUR OWN RISK: no refund if the leg OOMs, cannot boot or crashes (Lium key only). "
+    "With --train-hours on a measured type the steps come from its measured rate.")
+
+
+def add_gpu_args(p: argparse.ArgumentParser, *, budget: bool = False,
+                 lane_b: bool = False) -> None:
     """DEC-CA-0060 ``--gpu`` / ``--allow-fallback`` / ``--max-price`` on a fund
-    command (lane A ``fund``, ``lane-b fund`` and ``lane-c fund``)."""
+    command (lane A ``fund``, ``lane-b fund`` and ``lane-c fund``). ``lane_b``:
+    the lane B help (its own GPU list and own-risk types, WB22 / WB27)."""
     p.add_argument("--gpu", default="",
-                   help="GPU type your key rents (one of chain.toml [round] funded_pod_skus; "
+                   help=LANE_B_GPU_HELP if lane_b else
+                   "GPU type your key rents (one of chain.toml [round] funded_pod_skus; "
                         "mainnet: 8xH100 or 8xH200). Same token budget and wall as every leg — a faster "
                         "type costs more per hour, never buys more compute. Default: the "
                         "cheapest fitting type under the operator's price caps. The "

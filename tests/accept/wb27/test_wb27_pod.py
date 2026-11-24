@@ -167,3 +167,12 @@ def test_cli_levers_and_limits(tmp_path):
     (tmp_path / "generator.py").write_text(
         "class Generator:\n    def __init__(self, d, *, seed):\n        pass\n")
     assert not generator_declares_curriculum_stage(tmp_path)
+
+
+def test_lane_b_gpu_help_lists_every_lane_b_type_and_the_own_risk_rule():
+    from cascade.miner.cli import LANE_B_GPU_HELP
+
+    lb = h.chain_cfg().lane_b
+    for sku in lb.funded_pod_skus:
+        assert sku in LANE_B_GPU_HELP, sku
+    assert "AT YOUR OWN RISK" in LANE_B_GPU_HELP and "no refund" in LANE_B_GPU_HELP

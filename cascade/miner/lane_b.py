@@ -99,7 +99,7 @@ def add_lane_b(sub: argparse._SubParsersAction) -> None:
     f.add_argument("--chain-toml", type=Path, default=None, help="Override chain.toml path.")
     from .cli import add_gpu_args
 
-    add_gpu_args(f)
+    add_gpu_args(f, lane_b=True)
     f.add_argument("--wallet-name", required=True, help="Bittensor wallet (coldkey) name.")
     f.add_argument("--wallet-hotkey", required=True, help="Bittensor wallet hotkey name.")
     f.add_argument("--wallet-path", default=None, help="Optional non-default wallet root.")
