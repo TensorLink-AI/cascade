@@ -62,7 +62,12 @@ def _probe(env, gpu, driver, torch_build):
 
 
 def _t7(gpu=PRO6000, n_windows=15000, wall_s=600.0):
-    from cascade.eval.lane_d_t7 import LAUNCH_VARIANTS, build_evidence, settlement_budget, variant_row
+    from cascade.eval.lane_d_t7 import (
+        LAUNCH_VARIANTS,
+        build_evidence,
+        settlement_budget,
+        variant_row,
+    )
 
     rows = [variant_row(host="laned-eval-sm120", gpu=gpu, variant=v, input_len=v, history_min=v,
                         history_max=v, wall_s=wall_s, peak_mem_gb=20.0,
