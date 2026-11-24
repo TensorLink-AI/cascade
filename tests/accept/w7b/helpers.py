@@ -228,7 +228,7 @@ def signed_report(tmp: Path) -> dict:
         state = tmp / "state" / "lane_d_state.json"
         state.parent.mkdir(parents=True, exist_ok=True)
         cfg = lane_d_cfg()
-        s = settle_lane_d(cfg=cfg, boundary=BOUNDARY_1, pool_dir=pool, entries=[e],
+        s = settle_lane_d(**_rev614_ts(settle_lane_d, BOUNDARY_1), cfg=cfg, boundary=BOUNDARY_1, pool_dir=pool, entries=[e],
                           house={"digest": house, "reveal_ts": HOUSE_T}, forecasts=fc,
                           uid_of={hotkey: CHALLENGER_UID}, state_path=state, signer=signer)
         _CACHE[key] = {"report": s.report, "signer": signer, "other": other, "cfg": cfg}
@@ -303,3 +303,14 @@ def chain_raw(validator_hotkey: str) -> dict:
     if validator_hotkey.strip():
         raw.setdefault("netconfig", {})["owner_hotkey"] = validator_hotkey
     return raw
+
+
+def _rev614_ts(settle, boundary) -> dict:
+    """rev6.14 (a): the fixture's on-chain boundary timestamp (far after every
+    fixture T + eval_delay_hours, 12 s per block), passed only where
+    ``settle_lane_d`` takes it."""
+    import inspect
+
+    if "boundary_ts" not in inspect.signature(settle).parameters:
+        return {}
+    return {"boundary_ts": 2_000_000_000 + 12 * int(boundary)}

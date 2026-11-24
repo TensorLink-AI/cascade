@@ -248,7 +248,7 @@ def settle(cfg, b, pool_dir, entries, house_rec, fc, uid_of, state_path, prior=(
     from cascade.validator.lane_d import settle_lane_d
 
     kw = {"prior_pool_dirs": [Path(p) for p in prior]} if prior else {}
-    return settle_lane_d(cfg=cfg, boundary=b, pool_dir=pool_dir,
+    return settle_lane_d(**_rev614_ts(settle_lane_d, b), cfg=cfg, boundary=b, pool_dir=pool_dir,
                          entries=[dict(e) for e in entries], house=dict(house_rec),
                          forecasts=fc, uid_of=dict(uid_of), state_path=state_path,
                          signer=fixture_key("signer"), **kw)
@@ -269,7 +269,7 @@ def settle_gated(cfg, b, pool_dir, entries, house_rec, fc, uid_of, state_path, *
     assert not missing, (f"settle_lane_d takes no {missing}: the W3b gate is not wired into "
                          "the settlement (W5e)")
     kw = {"prior_pool_dirs": [Path(p) for p in prior]} if prior else {}
-    return settle_lane_d(cfg=cfg, boundary=b, pool_dir=pool_dir,
+    return settle_lane_d(**_rev614_ts(settle_lane_d, b), cfg=cfg, boundary=b, pool_dir=pool_dir,
                          entries=[dict(e) for e in entries], house=dict(house_rec),
                          forecasts=fc, uid_of=dict(uid_of), state_path=state_path,
                          signer=fixture_key("signer"), boundary_block_hash=hash_,
@@ -375,3 +375,14 @@ def expected_gate_record(cfg, b: int, hash_: str, sentinel=None) -> dict:
     from cascade.validator.lane_d_gate import gate_record
 
     return gate_record(cfg, int(b), hash_, sentinel=sentinel)
+
+
+def _rev614_ts(settle, boundary) -> dict:
+    """rev6.14 (a): the fixture's on-chain boundary timestamp (far after every
+    fixture T + eval_delay_hours, 12 s per block), passed only where
+    ``settle_lane_d`` takes it."""
+    import inspect
+
+    if "boundary_ts" not in inspect.signature(settle).parameters:
+        return {}
+    return {"boundary_ts": 2_000_000_000 + 12 * int(boundary)}

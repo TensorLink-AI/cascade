@@ -309,7 +309,7 @@ def settle(cfg, b, pool_dir, entries, house_rec, fc, state_path, *, prior=(),
     if tag is not None:
         kw.update(boundary_block_hash=block_hash(tag),
                   bench=passing_bench(candidates, references, f"sess-{tag}"))
-    return settle_lane_d(cfg=cfg, boundary=b, pool_dir=pool_dir,
+    return settle_lane_d(**_rev614_ts(settle_lane_d, b), cfg=cfg, boundary=b, pool_dir=pool_dir,
                          entries=[dict(e) for e in entries], house=copy.deepcopy(house_rec),
                          forecasts=fc, uid_of=dict(UIDS if uid_of is None else uid_of),
                          state_path=state_path, signer=fixture_key("signer"), **kw)
@@ -398,3 +398,14 @@ def miner_court(chain: Chain) -> None:
     """boundary(1)..(4): two real miner crowns, KING_D = Y, prior = [X]."""
     crown_x(chain)
     crown_y(chain)
+
+
+def _rev614_ts(settle, boundary) -> dict:
+    """rev6.14 (a): the fixture's on-chain boundary timestamp (far after every
+    fixture T + eval_delay_hours, 12 s per block), passed only where
+    ``settle_lane_d`` takes it."""
+    import inspect
+
+    if "boundary_ts" not in inspect.signature(settle).parameters:
+        return {}
+    return {"boundary_ts": 2_000_000_000 + 12 * int(boundary)}

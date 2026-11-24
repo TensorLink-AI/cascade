@@ -447,3 +447,7 @@ On main these tests fail on the `settle_mv` / `max_channels` assertions or
 On main these tests fail on the lazy fixture (`f3_fixture.py`: no
 `tests/accept/w7a/pub.py`), the `public_indexes` assertion or
 `cannot import name 'public_redraw'`.
+
+## rev6.14 (a): judging start vs eligibility boundary (owner 2026-11-23)
+
+The audit re-derives the judging start (`frozen_before_eval_delay` FAILs, a judged cohort without `boundary_ts` FAILs) and judges eligibility at `b = T + forward_margin_hours` (default 0). `test_w9_rev614.py`.
