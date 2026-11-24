@@ -341,7 +341,7 @@ def test_native_banks_snapshot_and_composite_windows(tmp_path):
     # every suite on every timeframe, each horizon a multi-step path (owner 2026-11-18)
     assert {(w.horizon, w.freq_minutes, w.steps) for w in ws if w.suite == "returns"} >= {
         ("1mx60", 1, 60), ("5mx36", 5, 36), ("15mx96", 15, 96), ("1hx48", 60, 48)}
-    # DEC-CA-0073: the drawn windows — every timeframe from the embargo before
+    # DEC-CA-0074: the drawn windows — every timeframe from the embargo before
     # the dispatch, in the phase's half, plus the short paths' closed forwards
     tt = float(end - 10 * 3600)
     h = "0x" + "ab" * 32

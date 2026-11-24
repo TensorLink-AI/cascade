@@ -407,7 +407,9 @@ def expected_params(cfg) -> dict:
             # settlement budget and the minimum fresh share.
             "embargo_hours": float(cfg.embargo_hours),
             "max_windows_per_settlement": int(cfg.max_windows_per_settlement),
-            "min_fresh_window_share": float(cfg.min_fresh_window_share)}
+            "min_fresh_window_share": float(cfg.min_fresh_window_share),
+            # rev6.14 (a): the judging start j = T + eval_delay_hours.
+            "eval_delay_hours": float(cfg.eval_delay_hours)}
 
 
 def crown_bar_at(cfg, tenure: int) -> float:
@@ -810,6 +812,7 @@ class _Settlement:
         self._guarded("rows", self.index_rows)
         self._guarded("cohorts", self.check_cohorts)
         self._guarded("draw", self.check_draw)
+        self._guarded("skipped", self.check_judging_start_skips)
         self._guarded("gate", self.check_gate)
         self._guarded("verdicts", self.check_outcomes)
         self._guarded("king_after", self.check_crown)
@@ -1152,6 +1155,29 @@ class _Settlement:
         if set(self.windows) != window_union:
             self.d.add("windows")
 
+    def check_judging_start_skips(self) -> None:
+        """rev6.14 (a): a ``before_eval_delay`` skip names an entry whose
+        judging start max(T_E, T_K) + eval_delay_hours is after the signed
+        ``boundary_ts``; ``boundary_ts_missing`` appears only without it."""
+        r, d = self.r, self.d
+        bts = r.get("boundary_ts")
+        if "boundary_ts" in r and not _is_int(bts):
+            d.add("boundary_ts")
+            return
+        delay = 3600.0 * float(self.cfg.eval_delay_hours)
+        kt = int(self.king_before["reveal_ts"]) if self.king_before is not None else None
+        for i, sk in enumerate(r.get("skipped") or []):
+            if not isinstance(sk, dict):
+                continue
+            why = sk.get("reason")
+            if why == "boundary_ts_missing" and bts is not None:
+                d.add(f"skipped[{i}].reason")
+            elif why == "before_eval_delay":
+                e = self.entries.get(sk.get("digest"))
+                t = int(e[1]["reveal_ts"]) if e is not None else None
+                if bts is None or t is None or kt is None or bts >= max(t, kt) + delay:
+                    d.add(f"skipped[{i}].reason")
+
     def check_draw(self) -> None:
         """W5j: the draw record (present iff a cohort was drawn: a cohort and a
         boundary block hash) is bound to its block hash, the budget and the
@@ -1262,6 +1288,13 @@ class _Settlement:
         t_max = max([king_ts, *reveal.values()])
         if not _same(c.get("t_max"), t_max):
             d.add(f"{at}.t_max")
+        # rev6.14 (a): never frozen before the judging start j = t_max +
+        # eval_delay_hours, against the signed boundary timestamp.
+        bts = self.r.get("boundary_ts")
+        if not _is_int(bts):
+            d.add("boundary_ts")
+        elif bts < t_max + 3600.0 * float(cfg.eval_delay_hours):
+            d.add(f"{at}.frozen_before_eval_delay")
         wids = c["window_ids"]
         if not isinstance(wids, list) or not all(isinstance(w, str) for w in wids):
             d.add(f"{at}.window_ids")

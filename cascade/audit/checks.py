@@ -4270,7 +4270,7 @@ def check_marketcast(receipt: RoundReceipt, cfg: ChainConfig,
       (``train_time`` from the trainer-signed lane-C manifest that carried
       the entry, ``lane_c_manifests``: ``{round: text}``; and on a confirm,
       ≥ the recorded ``fresh_after``) — never the snapshot anchor;
-    * DEC-CA-0073: the entry's signed draw is the rule's (re-derived from
+    * DEC-CA-0074: the entry's signed draw is the rule's (re-derived from
       ``train_time``, the round block, the phase and ``fresh_after``), its
       block hash the chain's (``block_hashes``: ``{block: hash}``; WARN
       without); every backtest window lies wholly in the draw's embargo
@@ -4466,7 +4466,7 @@ def check_marketcast(receipt: RoundReceipt, cfg: ChainConfig,
         for w in ent.windows:
             kind = window_kind(draw, w.start)
             if kind == "backtest":
-                # DEC-CA-0073: wholly inside the embargo span, in the phase's half
+                # DEC-CA-0074: wholly inside the embargo span, in the phase's half
                 if not (w.start > float(draw["lo"]) and w.end <= float(draw["hi"])
                         and window_half(w.wid) == int(draw["half"])):
                     return _fail(name, f"{who}: backtest window {w.wid} is outside the draw's "

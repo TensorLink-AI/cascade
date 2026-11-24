@@ -1,6 +1,6 @@
 """Every suite on every timeframe, as multi-step paths (owner 2026-11-18):
 ``<bar>x<steps>`` horizons, every path drawn from the embargo before the
-dispatch (owner 2026-11-24, DEC-CA-0073), and the calibration slack counted
+dispatch (owner 2026-11-24, DEC-CA-0074), and the calibration slack counted
 in windows, not the correlated steps of one path."""
 
 from __future__ import annotations

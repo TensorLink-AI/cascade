@@ -317,7 +317,7 @@ byte-identical to what validators scored. Each
 |---|---|
 | `block-<N>.tar` | the exact tar validators scored |
 | `POOL_SHA256` | its sha256 (matches receipts and the publisher index) |
-| `<series_id>.npy` | the same series, unpacked |
+| `<series_id>.npy` | the same series, unpacked (folders revealed before 2026-11-24 only; for newer folders run `tar -xf block-<N>.tar` in the folder, or use `--pool-hf`) |
 | `metadata.json` | `{series_id: {freq, seasonal_period, domain, source, …}}` |
 | `provenance.json` | the build configuration recorded at publish time |
 
@@ -1915,7 +1915,7 @@ Every lane-C entry (DEC-CA-0056 review 2026-10-19):
 ### How it is judged
 
 - The **main validator** forecasts the untouched base and your fine-tune on
-  its GPU (DEC-CA-0073, owner 2026-11-24: a verdict within 13 hours). The
+  its GPU (DEC-CA-0074, owner 2026-11-24: a verdict within 13 hours). The
   windows are DRAWN from the embargo — the `embargo_eval_days` (28) before
   the time the trainer dispatched your leg (`train_time`, signed by the
   trainer), days no leg ever reads (`data.end` ≤ your commit's UTC date −

@@ -436,3 +436,7 @@ per slot; `check_lane_b` re-derives each row for its family (`declared` at
 critical value per family. A wrong bar, family, declared flag, verdict, a
 second critical value in one family, or a missing slot FAILs. Rows come from
 the validator's `judgements_record` over a real `judge_expert_slots` verdict.
+
+## rev6.14 (a): judging start vs eligibility boundary (owner 2026-11-23)
+
+The audit re-derives the judging start (`frozen_before_eval_delay` FAILs, a judged cohort without `boundary_ts` FAILs) and judges eligibility at `b = T + forward_margin_hours` (default 0). `test_w9_rev614.py`.

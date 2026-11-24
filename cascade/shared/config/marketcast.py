@@ -136,7 +136,7 @@ TIMESTRAL_MAX_CONTEXT = 32768
 # [marketcast] max_leg_hours; the verdict never waits on the leg's length)
 MAX_LEG_HOURS_CEILING = 168.0
 CRPS_SCALES = ("level", "seasonal_naive")
-# Owner 2026-11-24 (DEC-CA-0073): a verdict within 13 hours of submission,
+# Owner 2026-11-24 (DEC-CA-0074): a verdict within 13 hours of submission,
 # judged on windows drawn from the embargo. Code bounds of its overlay knobs.
 VERDICT_MAX_HOURS = 13
 VERDICT_WAIT_MAX_BLOCKS = 3900            # 13 h of 12 s blocks
@@ -459,7 +459,7 @@ class MarketCastConfig:
     # the 1-minute + hourly banks only (the pre-2026-11-10 layout).
     native_intervals: tuple[str, ...] = ()
     native_history_days: tuple[tuple[str, int], ...] = (("15m", 50), ("5m", 21))
-    # Owner 2026-11-24 (DEC-CA-0073): every horizon is judged on windows
+    # Owner 2026-11-24 (DEC-CA-0074): every horizon is judged on windows
     # DRAWN from the embargo — the ``embargo_eval_days`` before the leg's
     # dispatch, which no training leg reads (a recipe's data ends >=
     # ``embargo_days`` before its commit) — ``backtest_windows_per_cell`` per
@@ -637,7 +637,7 @@ def scorability_problems(mc: MarketCastConfig) -> list[str]:
       (:meth:`MarketCastConfig.bank_days`) holds at least ``MIN_CONTEXT +
       steps`` blocks.
 
-    Whether the DEC-CA-0073 embargo draw can hold the windows is an arming
+    Whether the DEC-CA-0074 embargo draw can hold the windows is an arming
     check (:func:`draw_problems`)."""
     from ...eval.marketcast import window_geometry
 
@@ -659,7 +659,7 @@ def scorability_problems(mc: MarketCastConfig) -> list[str]:
 
 
 def draw_problems(mc: MarketCastConfig) -> list[str]:
-    """DEC-CA-0073: why the embargo draw could never judge (empty = it can;
+    """DEC-CA-0074: why the embargo draw could never judge (empty = it can;
     an ARMING check, :func:`arming_problems`): an embargo of >= 2 days (the
     draw reads only days no leg reads); per enabled (suite, horizon) the
     ``embargo_eval_days`` span holds an aligned window (window origins sit
@@ -874,10 +874,10 @@ def parse_marketcast(raw: object) -> MarketCastConfig:
         raise ValueError("[marketcast] need windows_per_cell >= 1, start_margin_seconds >= 0, "
                          "verdict_wait_blocks >= 0 and snapshot_days >= 1")
     if wait > VERDICT_WAIT_MAX_BLOCKS:
-        # owner 2026-11-24 (DEC-CA-0073): a verdict within 13 h — a larger
+        # owner 2026-11-24 (DEC-CA-0074): a verdict within 13 h — a larger
         # value (an older deployed file, an overlay) is capped in code
         _log.warning("[marketcast] verdict_wait_blocks=%d is capped at %d (a verdict within "
-                     "%d h, DEC-CA-0073)", wait, VERDICT_WAIT_MAX_BLOCKS, VERDICT_MAX_HOURS)
+                     "%d h, DEC-CA-0074)", wait, VERDICT_WAIT_MAX_BLOCKS, VERDICT_MAX_HOURS)
     cdays = _num(mc.get("coarse_history_days", 180), "coarse_history_days", integer=True)
     rto = _num(mc.get("report_timeout_settlements", 8), "report_timeout_settlements",
                integer=True)
@@ -975,9 +975,9 @@ def parse_marketcast(raw: object) -> MarketCastConfig:
         raise ValueError(f"[marketcast] guards must be unique members of {GUARD_METRICS}; "
                          f"got {list(gd)}")
     if mc.get("gap_horizons"):
-        # retired (owner 2026-11-24, DEC-CA-0073): every horizon is drawn from
+        # retired (owner 2026-11-24, DEC-CA-0074): every horizon is drawn from
         # the embargo; an older file still naming it loads, the key does nothing
-        _log.warning("[marketcast] gap_horizons is retired (DEC-CA-0073): every horizon is "
+        _log.warning("[marketcast] gap_horizons is retired (DEC-CA-0074): every horizon is "
                      "drawn from the embargo; the key is ignored")
     fed = _num(mc.get("embargo_eval_days", min(28, max(1, emb - 1))), "embargo_eval_days",
                integer=True)
