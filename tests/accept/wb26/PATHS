@@ -11,8 +11,8 @@ cascade/eval/expert_lane.py
 # suite_gain / suite_guards.
 cascade/validator/expert_lane.py
 # The validator wiring: lane_b_anchor_pointer derives the anchor from the
-# signed training manifest; _lane_b_judge_experts passes it while
-# suite_targets is armed.
+# signed training manifest; _lane_b_judge_experts always passes it (no
+# activation block, owner 2026-11-24); it is scored only for a suite target.
 cascade/validator/lane_b.py
 # The keys: loader parse + range checks, LaneBConfig fields, verdict_params.
 cascade/shared/config/lane_b.py

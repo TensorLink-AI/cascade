@@ -105,8 +105,9 @@ def test_validator_scores_the_manifest_anchor(tmp_path):
 
 
 def test_inv1_validator_does_not_score_an_anchor_with_suite_targets_off(tmp_path):
-    """``suite_targets = false``: no suite slot, the judge call carries no
-    anchor and nothing but the king and the candidate is scored."""
+    """``suite_targets = false``: no suite slot, so although the judge is
+    handed the anchor (WB26 is not block-gated, owner 2026-11-24) nothing
+    but the king and the candidate is scored, and the row keeps its bytes."""
     from cascade.validator.lane_b import lane_b_anchor_pointer  # noqa: F401  (WB26 helper)
 
     cfg = h.lane_b_cfg(suite_targets=False)
@@ -115,3 +116,13 @@ def test_inv1_validator_does_not_score_an_anchor_with_suite_targets_off(tmp_path
     assert h.ANCHOR_PTR not in seen and set(seen) <= {h.KING_PTR, h.CAND_PTR}, seen
     (row,) = rnd.rows
     assert "suite_gain" not in row and "suite_guards" not in row
+
+
+def test_rule_is_not_behind_an_activation_block():
+    """Owner 2026-11-24: lane B is not rolled out, so the WB26 rule is the
+    default rule — no ``[lane_b]`` activation-block key gates it."""
+    from cascade.shared.config.lane_b import LANE_B_TRACK_DEFAULTS
+
+    new = {"gain_margin_public", "tau_anchor_public", "tau_anchor_domain"}
+    assert new <= set(LANE_B_TRACK_DEFAULTS), sorted(LANE_B_TRACK_DEFAULTS)
+    assert not [k for k in LANE_B_TRACK_DEFAULTS if "suite" in k and k.endswith("_from_block")]

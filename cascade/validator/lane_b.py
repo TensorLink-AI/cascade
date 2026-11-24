@@ -260,10 +260,10 @@ class LaneBMixin:
                 # DEC-CA-0050 merge guards: refuse a non-finite expert delta
                 strict=self.cfg.lane_b.merge_guard_at_settlement(block),
                 **sentinel_kw,
-                # WB26 (DEC-CA-0071 §3 guard 5): suite targets armed ⇒ the
-                # anchor king (scored only if an entry declares a suite)
-                **({"anchor_pointer": lane_b_anchor_pointer(manifest)}
-                   if self.cfg.lane_b.suite_targets else {}),
+                # WB26 (DEC-CA-0071 §3 guard 5): the anchor king, scored only
+                # if an entry declares a suite target. Not block-gated (owner
+                # 2026-11-24: lane B is not rolled out; this is the rule).
+                anchor_pointer=lane_b_anchor_pointer(manifest),
             )
         except Exception as e:  # noqa: BLE001 — fetch/eval failure: retried, never a verdict
             raise LaneBTransient(f"judging {rid} failed: {type(e).__name__}: {e}") from e
