@@ -110,15 +110,30 @@ class LegFailure(Exception):
 
 
 class LaneCOps(Protocol):
-    def commitments(self) -> list: ...                 # chain Commitment rows (latest per hotkey)
-    def queue(self): ...                               # LaneCQueue | None
-    def lane_a_busy(self, hotkey: str) -> bool: ...    # a lane-A leg of the hotkey in flight
+    def commitments(self) -> list:
+        """Chain Commitment rows (latest per hotkey)."""
+
+    def queue(self):
+        """The LaneCQueue, or None."""
+
+    def lane_a_busy(self, hotkey: str) -> bool:
+        """Whether a lane-A leg of the hotkey is in flight."""
+
     def fetch_recipe(self, ref: str, target: str, *, submission_time: float,
-                     train_time: float) -> LegRecipe: ...             # RecipeError = miner
-    def train_leg(self, leg: dict, recipe: LegRecipe) -> dict: ...    # LegFailure on failure
-    def sign(self, manifest): ...
-    def publish(self, key: str, text: str) -> None: ...
-    def spawn(self, fn, name: str) -> None: ...
+                     train_time: float) -> LegRecipe:
+        """The validated recipe (RecipeError = the miner's fault)."""
+
+    def train_leg(self, leg: dict, recipe: LegRecipe) -> dict:
+        """The trained leg's result (LegFailure on failure)."""
+
+    def sign(self, manifest):
+        """The manifest, signed by the trainer hotkey."""
+
+    def publish(self, key: str, text: str) -> None:
+        """Write ``text`` at ``key`` in the manifest bucket."""
+
+    def spawn(self, fn, name: str) -> None:
+        """Run ``fn`` on a named worker thread."""
 
 
 @dataclass
