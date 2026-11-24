@@ -189,6 +189,18 @@ python scripts/check_tls_trust.py   # same interpreter as the CLI
 # restart cascade-validator the way you normally run it
 ```
 
+- **Always repeat the `--extra` flags.** `uv sync --frozen` makes the venv
+  match the lock exactly. Without the extras, it **uninstalls** them,
+  bittensor included. Running processes keep working until their next
+  restart or lazy import, then fail with `No module named 'bittensor'`.
+  Satellites: `pip install -e '.[satellite]'` again, or `uv sync --frozen
+  --extra hippius --extra chain`.
+- **Don't skip the sync, even for a "small" release.** A release can move
+  pinned dependencies. The 2026-11-25 launch release moves bittensor from
+  10.5 to 11.3.0, and the validator refuses to start on 10.5 (error: "bittensor
+  10.5.0 is installed but … needs the 11.x SDK"). `git pull` plus
+  restart without the sync is never a valid upgrade.
+
 - **Keep your state.** Restart from the same directory, so the validator
   finds its state files (`validator_state.db`, `cascade_state.json`,
   `warm_start_init.json`, `activation_*.json`). They carry your activation
@@ -304,7 +316,9 @@ boundary. Supported numeric/rule settings can use
 installed release supports them; adoption checks and durable history govern
 the effective block. Manually diverging `[scoring]`, `[eval]` or the cascade
 envelope can still produce different verdicts and weights. For a release,
-pull, `uv sync --frozen`, and restart before the announced activation block.
+follow [Upgrade an existing validator](#upgrade-an-existing-validator) (pull,
+`uv sync --frozen --extra train --extra hippius --extra chain` with the
+extras, restart) before the announced activation block.
 For a supported overlay, follow its adoption/effective-block evidence without
 manually changing constants. Confirm the applied config identity and next
 settlement's vector agree with the expected network state.
