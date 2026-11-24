@@ -104,11 +104,10 @@ def test_parse_chain_config_is_the_loader_and_does_not_mutate_its_input():
 def test_netconfig_table_defaults_inert_and_refuses_typos():
     for path in ("chain.toml", "chain.testnet.toml"):
         c = load_chain_config(REPO / path)
-        if path == "chain.toml":
-            assert c.netconfig.owner_hotkey == c.manifest.validator_hotkey
-            assert c.netconfig.enabled
-        else:
-            assert c.netconfig.owner_hotkey == "" and not c.netconfig.enabled
+        # both releases name their main validator (testnet: owner 2026-11-24, R7t)
+        assert c.netconfig.owner_hotkey == c.manifest.validator_hotkey
+        assert c.netconfig.owner_hotkey != ""
+        assert c.netconfig.enabled
     # the shipped release (v2 launch typed, validator bench source armed)
     # needs its [netconfig] owner: dropping the table is refused
     raw = copy.deepcopy(SHIPPED_RAW)

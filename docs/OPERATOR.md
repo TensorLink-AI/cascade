@@ -120,8 +120,9 @@ edited `chain.toml` before shipping it.
    qualifying the production VM image. A dependency import failure must stop
    provisioning before any miner generator runs.
 6. **Main validator identity.** Mainnet pins `[netconfig] owner_hotkey` to
-   its configured main validator. Testnet keeps a separate unset identity;
-   set it when enabling validator-sourced benches there. The
+   its configured main validator. Testnet pins its own main validator
+   (validator0, = testnet `[manifest] validator_hotkey`; owner 2026-11-24),
+   which also arms testnet overlays (S0c drill R7t). The
    loader refuses `[v2] bench_source = "validator"` with a resolved block >
    0 unless `owner_hotkey` is set, `[v2] king_ladder = true`, the block is an
    era boundary at/after `[v2] from_block`, and `owner_hotkey` equals
@@ -2288,8 +2289,8 @@ tests).
 
 **No recording lead time** (owner 2026-11-10). A series at frequency `f` is
 cut from the COARSEST bank whose interval divides `f`: the 1-minute bars
-(`snapshot_days`, 30 — a 32768-step 1m context is 22.8 days, plus the 6-day
-verdict wait), a native 5m / 15m bank (`native_history_days`: 121 / 348) or
+(`snapshot_days`, 30 — a 32768-step 1m context is 22.8 days; the
+DEC-CA-0073 draw reads the 28 days before a dispatch), a native 5m / 15m bank (`native_history_days`: 121 / 348) or
 the hourly bank (`coarse_history_days`, 1372). Each bank is sized for the
 full `eval_context_length` (32768, owner 2026-11-21); bars neither the API
 nor the recording holds stay NaN, so a window's context is as long as the
@@ -2306,8 +2307,11 @@ A snapshot carries the 1-minute bars on one UTC-minute grid, the native
 banks (`n5m/`, `n15m/`, body `native`), the coarse HOURLY bank and a block →
 time anchor. It goes to `pool_mkt/snapshots/block-<N>.tar` plus
 `pool_mkt/index.json` in the pool bucket. Publish often: an entry's windows exist only once a snapshot
-covering them is active. The verdict waits up to `verdict_wait_blocks` for
-them.
+covering them is active (its embargo draw up to the dispatch, its forward
+windows after it). An inconclusive entry waits up to `verdict_wait_blocks`
+(capped at 3900 = 13 h, DEC-CA-0073). The trainer also reads the snapshot
+active at a dispatch to scan a generator tree for embargoed bars
+(`embargo_series_embedded`) before it rents.
 
 Hyperliquid history depth (measured 2026-10-19 with read-only `info`
 calls, BTC and `xyz:GOLD`): `candleSnapshot` serves only the most recent
@@ -2317,8 +2321,8 @@ from listing. So:
 
 - the hourly bank fits (180 < 208 days), and is what makes the 1d horizons
   scorable (21 daily bars could never hold the 32-step minimum context);
-- the API alone keeps only ~3.6 days of 1m candles, less than the 6-day
-  verdict wait — hence the recorder above (each window's realized candles
+- the API alone keeps only ~3.6 days of 1m candles, less than the 28-day
+  embargo draw — hence the recorder above (each window's realized candles
   must be captured before the API drops them);
 - a recipe's embargoed training range (≥ 30 days old) has no minute or
   5-minute bars on Hyperliquid. Set `[marketcast] bar_relay =
@@ -2360,21 +2364,28 @@ per asset.
 The loader refuses a configuration with an unscorable (suite, horizon): the
 history of the bank its frequency is cut from (`coarse_history_days`,
 `native_history_days` or `snapshot_days`) must hold the 32-step context + the
-horizon, and the span its windows are cut from must hold ONE aligned window
-(≥ 2 × the horizon; 2026-11-18, was two): the forward wait
-(`verdict_wait_blocks` × 12 s − `start_margin_seconds`), or for a
-`gap_horizons` horizon the `embargo_days` gap.
+horizon. Arming (DEC-CA-0073, `draw_problems`) also needs the
+`embargo_eval_days` span to hold ONE aligned window of every horizon (≥ 2 ×
+the horizon) and `min_time_blocks` blocks, a forward horizon to fit
+`verdict_wait_blocks` × 12 s − `start_margin_seconds`, and `embargo_days` ≥ 2.
 
 **The horizon grid** (owner 2026-11-18). A horizon is `<bar>x<steps>`: a
 path of `steps` bars of `<bar>`; every shipped suite is scored on every
 timeframe (`[marketcast.frequencies]` / `[marketcast.horizons]` in both
-tomls): `1mx60`, `5mx36`, `15mx96`, `1hx48` forward-only, and `4hx42`,
-`1dx7` in `gap_horizons` — a week cannot close inside the 6-day wait, so
-those windows are cut from the embargo gap before the submission
-(`pool.marketcast.gap_span`: from the first UTC day no recipe can train on
-up to `train_time`). Gap windows exist in the JUDGE phase only (a confirm
-has none); each entry's rows carry the `gap_end` they were cut before,
-which validators and the audit bind to the trainer's `train_time`. On the
+tomls). Owner 2026-11-24 (DEC-CA-0073): every timeframe is DRAWN from the
+embargo (`pool.marketcast.embargo_draw`): per (asset, series, horizon) the
+`backtest_windows_per_cell` (48) best-ranked windows by
+sha256(rule | round block hash | window id), lying wholly in the
+`embargo_eval_days` (28) before the trainer's `train_time` (never before the
+first UTC day no recipe can train on), in the judge or confirm half of a
+fixed public window partition; `1mx60` / `5mx36` (`forward_horizons`) also
+take up to `windows_per_cell` closed forward windows (after `train_time` +
+`start_margin_seconds`, by `train_time` + the wait). The main validator reads
+the round block's hash (the loop's chain client); each entry's rows carry the
+whole `draw`, which validators re-derive (a mismatch is an infra deferral)
+and the audit also checks against the chain (`cascade-audit marketcast
+--network`, `--no-chain` WARNs). `gap_horizons` is retired (an older file
+naming it loads; the key does nothing). On the
 real 9-asset test subset (4 forward days) the grid cut 4320 / 2710 / 260 /
 80 / 270 / 270 windows (1mx60 … 1dx7): the 2-day and week paths are thin
 (1–4 windows per asset per round), but each carries 7–96 steps. The

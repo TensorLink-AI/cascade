@@ -343,10 +343,15 @@ and the lane-C manifests the rows name. It checks:
   The main validator's snapshot anchor never sets it; a train block more
   than an hour off the anchor is noted;
 - with the published snapshot (`--mkt-snapshots DIR` on `cascade-audit
-  marketcast`): the report's window set EQUALS the forward-only set
-  `snapshot_windows` re-cuts — nothing omitted, nothing added. Without it,
-  every window must start after `after`, end by the snapshot's end, and no
-  (asset, horizon) cell hold more than `windows_per_cell`;
+  marketcast`): the report's window set EQUALS the set the entry's signed
+  DEC-CA-0073 draw re-cuts (`snapshot_windows`) — nothing omitted, nothing
+  added. Always: the draw is the rule's (re-derived from `train_time`, the
+  row's `round_block`, the phase and `fresh_after`), its block hash the
+  chain's (`--network`; `--no-chain` WARNs), every backtest window lies
+  wholly in the draw's embargo span and the phase's half, every forward
+  window is a `forward_horizons` window after `after` and by the forward
+  end, and no cell holds more than the draw's `n` backtests /
+  `forward_n` forwards;
 - with the snapshot and the sidecar (sha256 bound in the signed report):
   every per-window loss and coverage tally is recomputed on CPU from the
   snapshot's targets and the published float32 quantiles

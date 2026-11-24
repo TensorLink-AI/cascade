@@ -133,8 +133,10 @@ credentials, so a Hippius-only operator needs nothing extra.
 
 ## V2 pool size, channel width and evidence
 
-New `build`/`publish` commands default to **800 series per domain**, **400 per
-(domain, frequency) cell**, a **32-channel upper limit**, and
+New `build`/`publish` commands default to **1500 series per domain**, **750 per
+(domain, frequency) cell** (raised 2026-11-23 from 800 / 400 for a ~10k-series
+snapshot; small domains are fully taken and the even-by-domain draw flows their
+surplus to the larger domains), a **32-channel upper limit**, and
 `--cluster-by source_family`. A real series keeps its native channel count;
 1–31 channels remain valid. These eval rules differ from synthetic generators,
 which now require exactly 32 channels. No channel is repeated to reach 32.
@@ -365,8 +367,8 @@ Operator steps:
    ```bash
    TSFORGE_DIR=./tsforge cascade-pool publish \
      --chain-toml "$TOML" --sources tsbench_forge \
-     --max-panel-series-per-feed 5 --max-series-per-domain-freq 400 \
-     --max-series-per-domain 800 --selection balanced \
+     --max-panel-series-per-feed 20 --max-series-per-domain-freq 750 \
+     --max-series-per-domain 1500 --selection balanced \
      --require-domain --require-source --min-series-per-domain 300 \
      --effective-block "$EFFECTIVE_BLOCK"
    ```
