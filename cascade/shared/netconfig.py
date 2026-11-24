@@ -119,6 +119,9 @@ ALLOWED: dict[str, frozenset[str] | None] = {
         "min_time_blocks", "coverage_tolerance", "coverage_tolerance_over",
         "tail_tolerance", "calibration_z", "zero_scale_frac", "cell_ratio_cap",
         "near_dup_tol", "report_timeout_settlements", "max_infra_deferrals",
+        # DEC-CA-0073: the embargo eval-draw length, backtest windows per cell
+        # and the <= 13 h inconclusive wait (code-bounded by the loader)
+        "embargo_eval_days", "backtest_windows_per_cell", "verdict_wait_blocks",
     }),
 }
 # Recovery controls are trainer-only policy; satellites can ignore their values.

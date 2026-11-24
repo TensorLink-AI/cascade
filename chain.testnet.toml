@@ -1020,7 +1020,7 @@ gain_margin     = 0.01
 # Fine-tunes of a PINNED third-party base (mistralai/Timestral-28M, Modified
 # MIT licence with a USD 20M/month revenue restriction that extends to
 # derivatives — owner/legal open item) are judged paired vs the untouched base
-# on forward-only market windows, one lane-C slot per suite (target
+# on market windows drawn from the embargo no leg reads (DEC-CA-0073), one lane-C slot per suite (target
 # "mkt:<suite>", listed in [lane_c] targets). Arming (from_block > 0) is
 # load-checked: an era boundary >= [v2] from_block and >= [lane_c] from_block,
 # [v2] bench_source = "validator" in force (the main validator's GPU scores
@@ -1053,10 +1053,15 @@ embargo_days       = 30                         # recipe training data ends this
 max_synthetic_fraction = 1.0                    # miner generator share of the training mix (1.0 = pure synthetic allowed)
 max_leg_hours      = 12.0                       # cap on a recipe's own leg_hours (miner-paid wall); no leg_hours = [lane_c] leg_hours
 eval_context_length = 32768                     # owner 2026-11-21: UP TO 32k context steps the base and the fine-tune both see (shorter while the bank's history is shorter)
-windows_per_cell   = 48                         # per (asset, horizon), spread evenly: 2 per 6 h block over 6 days
-start_margin_seconds = 3600                     # windows start >= 1 h after the train block
-verdict_wait_blocks = 43200                     # an entry waits up to 6 days for its windows to close
-snapshot_days      = 30                         # 1m bank: 32768-step 1m context (22.8 d) + the 6-day verdict wait (recorder fills it forward)
+# Owner 2026-11-24 (DEC-CA-0073): a verdict within 13 h of submission; every
+# horizon drawn from the embargo by the round block's hash (as chain.toml).
+embargo_eval_days  = 28                         # overlay-settable, 1 .. embargo_days - 1
+backtest_windows_per_cell = 48                  # overlay-settable, 1 .. 256: drawn per (asset, series, horizon)
+forward_horizons   = ["1mx60", "5mx36"]         # also scored on closed forward windows (never waited for)
+windows_per_cell   = 48                         # forward windows per (asset, horizon), spread evenly
+start_margin_seconds = 3600                     # forward windows start >= 1 h after dispatch
+verdict_wait_blocks = 3900                      # overlay-settable, <= 3900: an inconclusive entry waits <= 13 h
+snapshot_days      = 30                         # 1m bank: 32768-step 1m context (22.8 d) + the 28-day embargo draw (recorder fills it forward)
 coarse_history_days = 1372                      # hourly bank: 32768 h (1365 d) + the wait; HL serves ~208 d of 1h, the recorder the rest as it accrues
 report_timeout_settlements = 8                  # trainer records a missing report "absent" after this
 max_infra_deferrals = 8                         # main-validator compute failures before an uncharged drop
@@ -1093,10 +1098,8 @@ guards             = ["mase", "qlike", "tail"]  # no-regression vs base: median 
 guard_floor        = 0.0                        # a guard CONFIDENTLY worse than the base (UCB < -this) fails the entry
 # Owner 2026-11-18: every suite on every timeframe, each a multi-step PATH
 # (<bar>x<steps>): 1m x 60 (1 h), 5m x 36 (3 h), 15m x 96 (1 d), 1h x 48 (2 d),
-# 4h x 42 and 1d x 7 (7 d). The 7-day paths cannot close inside the 6-day wait,
-# so they are judged on the embargo gap (the days before the submission no
-# training leg reads); the shorter paths stay forward-only.
-gap_horizons       = ["4hx42", "1dx7"]
+# 4h x 42 and 1d x 7 (7 d). Owner 2026-11-24 (DEC-CA-0073): every path is
+# drawn from the embargo (embargo_eval_days above); gap_horizons is gone.
 baseline_gate      = true                       # must beat random walk + EWMA/FHS and seasonal AR(1): composite LCB >= 0, no suite confidently worse
 # Owner 2026-11-19: the official calendars (federalreserve.gov FOMC calendar — statement 14:00 ET
 # on the meeting's last day, 2027 tentative; bls.gov CPI + Employment Situation, 08:30 ET),
