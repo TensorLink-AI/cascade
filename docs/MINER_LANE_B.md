@@ -225,4 +225,11 @@ token or hour limit. An unmeasured type that fails is not requeued or
 refunded.
 
 **What does `cascade lane-b test` prove?** That your entry trains and how it
-scores on a local pool. A local gain is not a live verdict.
+scores on a local pool. A local gain is not a live verdict. The verdict comes from
+the validators' own judge (`judge_expert_slots`), so every slot is tested, not
+only the ones you declared. It prints one line per slot: the family (declared or
+undeclared), the bar, the CRPS and MASE gain with their LCBs, and whether the
+slot cleared and why. Add `--public-project` to pair the public benchmarks (suite
+slots need them). Add `--anchor <the era's anchor king>` to run the suite-slot
+anchor guard. Without it, the output says that suite slots were previewed
+without that guard.

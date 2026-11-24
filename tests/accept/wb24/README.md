@@ -170,3 +170,24 @@ target, suites mixed with domains/horizons); it sends the same slot-ordered
 a repeat, a comma inside one flag, or an unknown target is refused locally as
 `bad_targets` with nothing sent (one test with the four-target case, so it
 fails on BASE, whose cap is 3 and whose `--target` takes one suite).
+
+## Owner 2026-11-24: `lane-b test` runs the validators' judge (`test_wb24_slot_preview.py`)
+
+`cascade lane-b test` previews a leg with the validators' own
+`judge_expert_slots` (#854: every slot; declared / undeclared max-T families at
+`gain_margin` / `undeclared_gain_margin`; CRPS or MASE with the other
+non-inferior) and WB26's suite-slot guards (#882). `--anchor` scores the
+era's anchor king locally for the anchor guard; without it the output says
+suite slots were previewed without that guard. Torch is blocked; scores are
+W-S2 / WB26 stand-ins.
+
+| test | asserts |
+|---|---|
+| `test_preview_is_byte_identical_to_the_validator_judge` | `judge_slots_preview` returns a verdict whose `asdict` JSON equals a direct `judge_expert_slots` call built from the validator's helpers (`_arrays`, `pair_public_rows` + `sentinel_pairing_kw`, `window_horizon`, `_anchor_input`); every `[lane_b] targets` slot is tested, the declared one at `gain_margin`, the rest at `undeclared_gain_margin` |
+| `test_plain_english_lines_name_slot_family_bar_gains_and_outcome` | each slot line names the slot, its family and bar, CRPS and MASE gain with LCB, and CLEARED / not cleared |
+| `test_suite_slots_without_anchor_are_flagged_not_silently_passed` | without an anchor a clearing suite slot is `anchor_missing` and the output says it was previewed without the anchor guard; with one, guard 5 runs and records the anchor |
+| `test_lane_b_test_runs_the_validator_judge_and_prints_slots` | `test_lane_b` (fakes for training/scoring) calls `judge_expert_slots` once for qualification with every slot and the declared targets, never the old per-target judge, and returns `slot_report` / `won_slots` |
+| `test_lane_b_test_help_offers_anchor` | `lane-b test --help` documents `--anchor` and the anchor guard |
+
+On main, `judge_slots_preview` / `describe_slots` do not exist and
+`lane-b test` calls `judge_expert_targets` (the old per-target judge).
