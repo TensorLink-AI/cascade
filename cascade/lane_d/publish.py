@@ -474,6 +474,90 @@ def check_one_digest(*, index, report, vault, mirrors: Mapping) -> list[str]:
     return problems
 
 
+# ── production: the index entry of a crowned report, the publish request ────
+
+# The record the validator's settlement step leaves for the king-publish job
+# when a lane D crowning settles (cascade.validator.lane_d_wiring).
+PUBLISH_REQUEST_SCHEMA = "laned_king_publish_request/1"
+PUBLISH_REQUESTS_DIR = "lane_d_publish_requests"
+# The sentinel entry of a king crowned in an era whose sentinel is not armed.
+SENTINEL_NOT_ARMED = {"suite": "none", "status": "not_armed"}
+
+
+def publish_request_path(state_path, boundary: int) -> Path:
+    """``<state dir>/lane_d_publish_requests/<boundary>.json``."""
+    return Path(state_path).parent / PUBLISH_REQUESTS_DIR / f"{int(boundary)}.json"
+
+
+def publish_request(report: Mapping, sentinel_record: Mapping | None) -> dict:
+    """The publish request of one crowned settlement: the boundary, the
+    crowned digest and the era's sentinel record for the king (``None``
+    when the era's sentinel is not armed or the sweep published nothing)."""
+    crowned = report.get("crowned")
+    if not isinstance(crowned, str) or not _DIGEST_RE.fullmatch(crowned):
+        raise PublishError("index_field_invalid", f"report crowned {crowned!r}")
+    return {"schema": PUBLISH_REQUEST_SCHEMA, "boundary": int(report["boundary"]),
+            "digest": crowned,
+            "sentinel": None if sentinel_record is None else copy.deepcopy(dict(sentinel_record))}
+
+
+def sentinel_entry(report: Mapping, record: Mapping | None) -> dict:
+    """The index ``sentinel`` of a crowned report: :data:`SENTINEL_NOT_ARMED`
+    when the settlement's gate names no sentinel, else the era's sentinel
+    record for this king (suite, status, the king's numbers). A record for
+    another king, boundary or suite is refused."""
+    gate = report.get("gate") if isinstance(report.get("gate"), Mapping) else {}
+    suite = gate.get("sentinel")
+    if suite is None:
+        return dict(SENTINEL_NOT_ARMED)
+    if not isinstance(record, Mapping):
+        raise PublishError("index_field_missing",
+                           f"settlement {report.get('boundary')}: the era's sentinel {suite!r} "
+                           "is armed but no sentinel record was given")
+    for field, want in (("king_digest", report.get("crowned")), ("suite", suite),
+                        ("boundary", report.get("boundary"))):
+        if record.get(field) != want:
+            raise PublishError("index_field_invalid",
+                               f"sentinel record {field} {record.get(field)!r} is not {want!r}")
+    king = (record.get("models") or {}).get("king")
+    return {"suite": str(suite), "status": str(record.get("status")),
+            "king": copy.deepcopy(king) if isinstance(king, Mapping) else None}
+
+
+def king_entry(report: Mapping, *, licence: str, sentinel: Mapping) -> dict:
+    """The §11.1 index entry of a crowned lane D report, every field taken
+    from the signed report (``licence`` from the intake's ready record,
+    ``sentinel`` from :func:`sentinel_entry`). Deterministic in its inputs."""
+    crowned = report.get("crowned")
+    if not isinstance(crowned, str) or not _DIGEST_RE.fullmatch(crowned):
+        raise PublishError("index_field_invalid", f"report crowned {crowned!r}")
+    entry = next((e for e in report.get("entries") or () if isinstance(e, Mapping)
+                  and e.get("digest") == crowned), None)
+    if entry is None:
+        raise PublishError("index_field_missing", f"the report lists no entry {crowned}")
+    gate = report.get("gate")
+    result = next((r for r in (gate or {}).get("results") or () if isinstance(r, Mapping)
+                   and r.get("digest") == crowned and r.get("outcome") == "pass"), None)
+    if not isinstance(gate, Mapping) or result is None:
+        raise PublishError("index_field_missing", f"the report has no gate pass for {crowned}")
+    verdict = next((v for v in report.get("verdicts") or () if isinstance(v, Mapping)
+                    and v.get("digest") == crowned and v.get("outcome") == "crowned"), None)
+    if verdict is not None:
+        lcb = verdict.get("lcb")
+    elif isinstance(result.get("held_from"), Mapping):        # a held clear crowned later
+        lcb = result["held_from"].get("lcb")
+    else:
+        raise PublishError("index_field_missing", f"no crowning LCB for {crowned}")
+    king = {"hotkey": entry.get("hotkey"), "context": entry.get("context"), "digest": crowned,
+            "crown_block": report.get("boundary"),
+            "lcb": float(lcb) if isinstance(lcb, int | float) and not isinstance(lcb, bool)
+            else lcb,
+            "gate": {"suite": gate.get("suite"), "block": gate.get("block"),
+                     "sentinel": gate.get("sentinel"), **copy.deepcopy(dict(result))},
+            "sentinel": copy.deepcopy(dict(sentinel)), "license": licence}
+    return _check_king(king)
+
+
 # ── takedown (rev5, B13) ─────────────────────────────────────────────────────
 
 
@@ -515,7 +599,9 @@ def takedown(index, *, digest: str, reason: str, block: int, mirrors: Mapping, s
 
 
 __all__ = ["HF_MIRROR_REPO", "INDEX_KEY", "INDEX_SCHEMA", "KINGS_PREFIX", "KING_FIELDS",
-           "MIRRORS", "PUBLISH_CODES", "PublishError", "TAKEDOWN_MIRRORS", "TAKEDOWN_REASONS",
+           "MIRRORS", "PUBLISH_CODES", "PUBLISH_REQUESTS_DIR", "PUBLISH_REQUEST_SCHEMA",
+           "PublishError", "SENTINEL_NOT_ARMED", "TAKEDOWN_MIRRORS", "TAKEDOWN_REASONS",
            "build_index", "check_one_digest", "hub_repo", "index_body", "index_bytes",
-           "mirror_prefix", "model_card", "provenance", "publish_index", "publish_king",
+           "king_entry", "mirror_prefix", "model_card", "provenance", "publish_index",
+           "publish_king", "publish_request", "publish_request_path", "sentinel_entry",
            "sync_cards", "takedown", "verify_index", "verify_mirrors"]
