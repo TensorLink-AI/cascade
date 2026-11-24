@@ -8,8 +8,6 @@ intake (helpers.py); no network, no keyfile."""
 
 from __future__ import annotations
 
-import pytest
-
 from . import helpers as h
 from .helpers import cli_env, intake, net  # noqa: F401 — pytest fixtures
 
@@ -68,23 +66,24 @@ def test_repeated_target_matches_targets_list(tmp_path, cli_env, intake, capsys)
     assert [p.header(h.HEADER_TARGETS) for p in posts] == ["energy,web_cloudops"] * 2
 
 
-@pytest.mark.parametrize("flags", [
-    ("--target", "energy", "--target", "web_cloudops", "--target", "sales",
-     "--target", "nature", "--target", "transport"),  # 5 > max_domains_per_leg = 4
-    ("--target", "energy", "--target", "energy"),   # repeated
-    ("--target", "energy,web_cloudops"),            # one target per flag
-    ("--target", "nope"),                           # not configured
-])
-@_spec
-def test_repeated_target_refused_locally(flags, tmp_path, cli_env, intake, capsys):  # noqa: F811
-    toml = h.write_toml(tmp_path / "chain.toml")
-    run = h.run_cli(capsys, h.fund_argv(intake.base, toml, *flags, targets=None))
-    assert run.rc == h.USAGE and run.code() == "bad_targets", (flags, run.rc, run.code())
-    assert intake.requests == []
+FOUR = ("energy", "web_cloudops", "sales", "nature")
 
 
 @_spec
-def test_target_and_targets_stay_exclusive(tmp_path, cli_env, intake, capsys):  # noqa: F811
+def test_repeated_target_cap_is_max_domains_per_leg(tmp_path, cli_env, intake, capsys):  # noqa: F811
+    """Four repeated targets (the rev6.22 cap) are sent in slot order; a fifth,
+    a repeat, a comma inside one flag or an unknown target is refused locally
+    with nothing sent."""
     toml = h.write_toml(tmp_path / "chain.toml")
-    run = h.run_cli(capsys, h.fund_argv(intake.base, toml, "--target", "web_cloudops"))
-    assert run.rc != h.OK and intake.requests == []
+    flags = [x for t in FOUR for x in ("--target", t)]
+    h.run_cli(capsys, h.fund_argv(intake.base, toml, *flags, targets=None))
+    posts = intake.posts()
+    assert len(posts) == 1, "four repeated --target flags must be sent as one fund"
+    assert posts[0].header(h.HEADER_TARGETS).split(",") == [
+        t for t in h.load_cfg(toml).lane_b.targets if t in FOUR]
+    for bad in ((*flags, "--target", "transport"), ("--target", "energy", "--target", "energy"),
+                ("--target", "energy,web_cloudops"), ("--target", "nope")):
+        before = len(intake.requests)
+        run = h.run_cli(capsys, h.fund_argv(intake.base, toml, *bad, targets=None))
+        assert run.rc == h.USAGE and run.code() == "bad_targets", (bad, run.rc, run.code())
+        assert len(intake.requests) == before

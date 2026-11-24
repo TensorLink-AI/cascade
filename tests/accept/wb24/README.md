@@ -168,4 +168,5 @@ pass on main.
 target, suites mixed with domains/horizons); it sends the same slot-ordered
 `X-Lane-B-Targets` as `--targets T1,T2`. More than `max_domains_per_leg` (4),
 a repeat, a comma inside one flag, or an unknown target is refused locally as
-`bad_targets` with nothing sent. `--target` and `--targets` stay exclusive.
+`bad_targets` with nothing sent (one test with the four-target case, so it
+fails on BASE, whose cap is 3 and whose `--target` takes one suite).
