@@ -109,17 +109,15 @@ class KothParams:
     bench_gate_rule: str = "dec-ca-0054"
     bench_gate_tolerance: float = 0.01
     bench_gate_min_win_rate: float = 0.5
-    # Init-baseline floor ([scoring] init_gate_mode): the shared warm-start
-    # init, scored on the SAME duel windows, as an absolute floor under the
-    # crown — "nobody takes the throne who's worse than doing nothing".
-    # Same rollout shape as the gift gate: "off" → "shadow" (floor computed
-    # and recorded, never gates) → "enforce" (a challenger whose observed
-    # geomean is worse than ``baseline × (1 + init_gate_tolerance)`` cannot
-    # win the round). It can only BLOCK a dethrone, never grant one; king
-    # retention is untouched. Consensus-relevant: every validator must run
-    # the same mode or verdicts fork (release-then-activate, shadow first).
+    # Init-baseline floor (DEC-CA-0034), RETIRED (rev6.18 B12): "off", or
+    # "shadow" on a round before [scoring] init_gate_retired_from_block — the
+    # shared warm-start init's observed geomean on the SAME duel windows is
+    # compared with the challenger's and recorded on the receipt
+    # (``init_floor_passed``); the verdict never depends on it. Kept as a
+    # field so archived receipts (params ``init_gate_mode = "shadow"``) still
+    # form a KothParams and replay. The "enforce" mode and the tolerance never
+    # ran live and are gone.
     init_gate_mode: str = "off"
-    init_gate_tolerance: float = 0.0
     # Margin denomination (see MARGIN_MODES). "level" is bit-identical to the
     # pre-field behaviour; receipts record these via the params dict, so an
     # increment round replays under the rule that decided it.
@@ -227,9 +225,8 @@ class RoundResult:
     # weights.safetensors), the same artifact form challengers are scored on.
     margin_mode: str = "level"
     baseline_geomean: float | None = None
-    # Init-baseline floor verdict (``KothParams.init_gate_mode``): None = gate
-    # off or no baseline this round; under "enforce" a False has already been
-    # folded into ``challenger_wins_round``; under "shadow" it is logged only.
+    # Legacy shadow init-floor result (``KothParams.init_gate_mode``): None =
+    # floor off or no baseline this round; never part of the win.
     init_floor_passed: bool | None = None
     # DEC-CA-0054 three-suite bench gate outcome, when it ran (None = not run).
     bench_gate_passed: bool | None = None
@@ -444,15 +441,13 @@ def cohort_maxt_lcb_map(
 def with_cohort_lcb(result: RoundResult, lcb: float, params: KothParams) -> RoundResult:
     """A cohort challenger's :class:`RoundResult` re-decided under its
     family-wise max-T ``lcb`` (DEC-CA-0038): swap the lcb and recompute the win
-    under the SAME rule :func:`evaluate_round` used — ``lcb >= margin``, AND-ed
-    with the enforce-mode init-baseline floor. Geomeans, the floor result, and
+    under the SAME rule :func:`evaluate_round` used — ``lcb >= margin``.
+    Geomeans, the (shadow) floor result, and
     the diagnostics are untouched (they never depended on the correction). The
     one place the win is re-derived, shared by the validator and the audit."""
     # NaN compares False, but only by accident of IEEE — make the rule explicit:
     # an uncomputable bound never clears a margin.
     wins = bool(math.isfinite(lcb) and lcb >= result.margin)
-    if params.init_gate_mode == "enforce" and result.init_floor_passed is False:
-        wins = False
     return replace(result, lcb=lcb, challenger_wins_round=wins)
 
 
@@ -586,23 +581,18 @@ def evaluate_round(
             pass
     win_rate, wilcoxon_p, per_domain = _shadow_diagnostics(king_scores, chal_scores)
     chal_geo = global_geomean(chal_scores, wql_mode=wql_mode)
-    # Init-baseline floor (KothParams.init_gate_mode): the challenger's
-    # observed geomean against the shared init's, on these very windows.
-    # Enforce AND-s it into the win — the gift-gate shape: it can only BLOCK
-    # a dethrone, never grant one. No baseline this round ⇒ the floor cannot
-    # run (None), whatever the mode.
+    # Legacy shadow init floor (KothParams.init_gate_mode, rev6.18 B12): the
+    # challenger's observed geomean against the shared init's, on these very
+    # windows — recorded, never part of the win. No baseline this round ⇒ the
+    # floor cannot run (None).
     init_floor_passed: bool | None = None
     if init_gate and base_geo is not None:
-        init_floor_passed = bool(
-            chal_geo <= base_geo * (1.0 + max(0.0, params.init_gate_tolerance))
-        )
+        init_floor_passed = bool(chal_geo <= base_geo)
     # An uncomputable bound (empty bootstrap sample ⇒ NaN) is an INCONCLUSIVE
     # round — king holds, streak untouched — never a compare that happens to
     # be False today and True on some other path.
     computable = bool(math.isfinite(lcb))
     wins = bool(computable and lcb >= margin)
-    if params.init_gate_mode == "enforce" and init_floor_passed is False:
-        wins = False
     return RoundResult(
         challenger_wins_round=wins,
         lcb=lcb,

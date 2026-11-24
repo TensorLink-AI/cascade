@@ -1,0 +1,985 @@
+{
+  "base_seed": 9550553995117568107,
+  "emission": {
+    "boundary": 9560700,
+    "king_since_block": 9531900,
+    "ladder": {
+      "bp": 1000,
+      "court_hotkey": "5CMfsDbJuEftMMQeM7npYmkgzCC4Eodev5h5c6KBYncvUCKQ",
+      "court_until_block": 9566100,
+      "event": "none",
+      "funded_by": "king",
+      "key_lapses": 0,
+      "lapse_open": false,
+      "prev_bp": 1000,
+      "prev_key_lapses": 0,
+      "prev_lapse_open": false,
+      "prev_slash_until_block": 0,
+      "reign_start_block": 9547200,
+      "slash_reason": "",
+      "slash_until": null,
+      "slash_until_block": 0,
+      "slashed": false
+    },
+    "policy": {
+      "former_share": 0.05,
+      "king_share": 0.1,
+      "king_slash": null,
+      "lane_a_cap": null,
+      "prelaunch_burn": 0.0
+    }
+  },
+  "entry_scores": [],
+  "epoch_block_hash": "0x339bd8e44a4bdfe2950111a8e231d8197fcae4cf3d111eb95ca9e328674ade1e",
+  "epoch_start_block": 9560700,
+  "era_base_seed": 824229856147703689,
+  "era_start_block": 9558000,
+  "eval_context": {
+    "n_windows": 12000,
+    "num_samples": 100,
+    "pool_digest": "141a86bfbc258918226256946f9b005c9429f5b34f946c8c1d5bd1989a0fdb4d",
+    "pool_ref": "pool/snapshots/block-9559800.tar",
+    "window_ids": [
+      "h64-s3",
+      "h64-s4",
+      "h64-s5",
+      "h64-s6",
+      "h64-s8",
+      "h64-s9",
+      "h64-s10",
+      "h64-s11"
+    ]
+  },
+  "generation_seed": 2516496980201912973,
+  "image_decoupled_block": 9493200,
+  "manifest": {
+    "base_arch_digest": "b19f700765825b3a30b26f83b9677b7fcacd65ab300e43e1eef2a6e255135228",
+    "contract_body": {
+      "accepted_fields": [
+        "groups"
+      ],
+      "adamw_beta1": 0.91,
+      "adamw_beta2": 0.972,
+      "adamw_lr_scale": 0.2,
+      "arch_preset": "cascade-moe-v2-120m",
+      "base_arch": "cascade_pyramid",
+      "base_arch_digest": "b19f700765825b3a30b26f83b9677b7fcacd65ab300e43e1eef2a6e255135228",
+      "base_lr": 0.002125,
+      "batch_denomination": "sequences",
+      "batch_size": 512,
+      "context_length": 4096,
+      "continuation_protocol": "cascade-continuation/1",
+      "copula_loss_cap": 0.1,
+      "copula_patches": 127,
+      "copula_samples": 4,
+      "corpus_mode": "shards",
+      "cpm_c_max": 16,
+      "cpm_p_max": 0.4,
+      "d_ff": 2346,
+      "d_model": 1088,
+      "expected_gpu": "",
+      "extra_sizes": [],
+      "grad_clip": 7.0,
+      "head_dim": 64,
+      "horizon": 64,
+      "input_transform": "arcsinh_causal",
+      "long_series": "crop",
+      "lr_schedule": "wsd",
+      "masking": "contiguous_patch",
+      "max_train_seconds": 18000,
+      "micro_batches": 8,
+      "mlp_expansion": 2,
+      "muon_momentum": 0.96,
+      "muon_row_beta2": 0.999,
+      "mup_lr_exponent": 1.42,
+      "num_heads": 17,
+      "num_layers": 10,
+      "num_quantiles": 21,
+      "optimizer": "normuon_adamw",
+      "patch_size": 32,
+      "power_ema_scope": "leg",
+      "ref_throughput_tokens_per_s": 0,
+      "route_bias_rate_scale": 0.25,
+      "router_lr_scale": 0.1,
+      "target_train_hours": 3.0,
+      "train_image_digest": "sha256:5d41d94bc0c0d3ae3dfd042b0cc7e4d900c7d1f48173808436c12bf764a67641",
+      "train_seed_salt": 1337,
+      "training_steps": 23841,
+      "umup_base_d_model": 512,
+      "warmup_fraction": 0.002909090909090909,
+      "weight_decay": 2e-08
+    },
+    "contract_digest": "99f952333c89539c7ef26cd12e3edb39edff67699fc08d0d2c5f20e7c88fd929",
+    "created_block": 9560701,
+    "entries": [
+      {
+        "continuation_protocol": "cascade-continuation/1",
+        "corpus_digest": "8073d3f449a5b0d14c9a69a08489601824ab6a88d003ca92449930aec3d8f9f9",
+        "funded_by": "king",
+        "gen_ref": "vault/direct@sha256:52af214e50b4a8da9535ec2fba73937658a4ec33a368caa604edbb90d3eefa30",
+        "gpu_name": "NVIDIA H100 80GB HBM3",
+        "init_pointer": "metro-v1:trained:hippius:cascade/ckpt-r17472041992776185935-challenger-cascade-moe-v2-120m-kingkey@sha256:4fffe119eafdec971eec214ad5c65fda3dab4f3aad4c16818608a07675f42827",
+        "miner_hotkey": "5G6jNi6YAWfDYy5eq6jR8VaHWq5nS4iGxjETdDXC9kjDNfRm",
+        "miner_uid": 164,
+        "numerics_contract_digest": "7bd4d1ce233928b6f47b00a141c7f424ce7b141002d31a3f68a03d791af64424",
+        "role": "king",
+        "size": "cascade-moe-v2-120m",
+        "train_block": 9527094,
+        "train_image_digest": "sha256:5d41d94bc0c0d3ae3dfd042b0cc7e4d900c7d1f48173808436c12bf764a67641",
+        "trained_pointer": "metro-v1:trained:hippius:cascade/ckpt-r824229856147703689-challenger-cascade-moe-v2-120m-u164@sha256:0d7e107f50e5ba38aef64f24454a0eff422b9e4409967a134654083d19aff1be",
+        "training_contract_digest": "99f952333c89539c7ef26cd12e3edb39edff67699fc08d0d2c5f20e7c88fd929"
+      },
+      {
+        "continuation_protocol": "cascade-continuation/1",
+        "corpus_digest": "8052d1be48d34c321c5875c3a80f48be9bdb957681309bcecdc7c1504c3eb8de",
+        "gen_ref": "vault/direct@sha256:705a1c1219a15511e172d94274db1910f98fcb5075fec7eefc9cbc6c21d24995",
+        "gpu_name": "NVIDIA H100 80GB HBM3",
+        "init_pointer": "metro-v1:trained:hippius:cascade/ckpt-r17472041992776185935-challenger-cascade-moe-v2-120m-kingkey@sha256:4fffe119eafdec971eec214ad5c65fda3dab4f3aad4c16818608a07675f42827",
+        "miner_hotkey": "5GMzsPiUhy6gtqU5GxeUgzJ4yyQnJ5iyx8EUdSgZD2riSDgn",
+        "miner_uid": 171,
+        "numerics_contract_digest": "7bd4d1ce233928b6f47b00a141c7f424ce7b141002d31a3f68a03d791af64424",
+        "role": "challenger",
+        "size": "cascade-moe-v2-120m",
+        "train_block": 9556776,
+        "train_image_digest": "sha256:5d41d94bc0c0d3ae3dfd042b0cc7e4d900c7d1f48173808436c12bf764a67641",
+        "trained_pointer": "metro-v1:trained:hippius:cascade/ckpt-r824229856147703689-challenger-cascade-moe-v2-120m-u171@sha256:e0abcf355b76c0ce8995c1a7ac8a618d5401e653685f38979fd4e64967976c1d",
+        "training_contract_digest": "99f952333c89539c7ef26cd12e3edb39edff67699fc08d0d2c5f20e7c88fd929"
+      }
+    ],
+    "era": {
+      "generation": 17,
+      "index": 2655,
+      "member_index": 0,
+      "seed_block": 9507600,
+      "start_block": 9558000
+    },
+    "eval_dataset": "cascade-private-v1",
+    "eval_pool_key": "pool/snapshots/block-9559800.tar",
+    "eval_pool_sha256": "141a86bfbc258918226256946f9b005c9429f5b34f946c8c1d5bd1989a0fdb4d",
+    "manifest_version": 2,
+    "numerics_contract_digest": "7bd4d1ce233928b6f47b00a141c7f424ce7b141002d31a3f68a03d791af64424",
+    "prev_manifest_sha256": "15b954b94dc6b4abd0e3795b914b0b167b67a5b02b0bf1b109b5e90fd8d7a285",
+    "prev_round_id": "5814254951587009336",
+    "round_id": "9550553995117568107",
+    "signature": "12bc3c976ca0c07739529fd7fd420ee6a36b80da7506108b3c66beb1d75b655a34a24f9faef60b2bfc3bb360b1131170b1d356d871e29bf1d5a4d689995cb68e",
+    "validator_bench_reports": {
+      "5814254951587009336": "ae6024ecafac1b60c9c9c9d4a41856cf122d8a8247f42324fc2ba86fdb9dc19e"
+    },
+    "warm_start_ckpt": "metro-v1:trained:hippius:cascade/ckpt-r17472041992776185935-challenger-cascade-moe-v2-120m-kingkey@sha256:4fffe119eafdec971eec214ad5c65fda3dab4f3aad4c16818608a07675f42827",
+    "warm_start_size": "cascade-moe-v2-120m"
+  },
+  "manifest_sha256": "8474290ea5205ac7f18c5d7385fdd306ba8fe84c9a926e00291a6bcd62348700",
+  "participants": [
+    {
+      "commit_block": 9395726,
+      "gen_ref": "vault/direct@sha256:0701f1dac35549fbd70d65b7b4534e2e4ee0faf55fd6a3687e7991c676ef6965",
+      "hotkey": "5Gsazg71o4zEE857qpKKUHzwcddEjggNpWvWnTQ9QF5yVyd8",
+      "uid": 3
+    },
+    {
+      "commit_block": 9395710,
+      "gen_ref": "vault/direct@sha256:503a2b7b62e794ac1323d290dfbbb66a784420780e5e656503075ea2b6ff621e",
+      "hotkey": "5GTftcbYykBfDNt1GNWJ2f8q9qUbWgy8LP4Gsc6xwHCzrNCQ",
+      "uid": 6
+    },
+    {
+      "commit_block": 9396566,
+      "gen_ref": "vault/direct@sha256:060f57d2802072219f1a835eb04b63dbd1d49246e8c8dcc2c0269f78147f85d3",
+      "hotkey": "5G9uGuAqdJVcd7nxwkT4DVei38kYQDDKKLDkB2Q3GfX3qCkT",
+      "uid": 18
+    },
+    {
+      "commit_block": 9527993,
+      "gen_ref": "vault/direct@sha256:53ebbed58a2cc4b004057a7830657c0bd72e758bc455fe878d74ff0a3bd57512",
+      "hotkey": "5Fe2epjByjiPPwc7TXVxvj2A9sj1RYod2yHR8EymMMr1xc8a",
+      "uid": 69
+    },
+    {
+      "commit_block": 9399578,
+      "gen_ref": "vault/direct@sha256:3e31fcee8c17a3457bbe8be91e263e7ed23aa84f147b1ea275e239e0612aed90",
+      "hotkey": "5FNahazP5Zs8HA2TwQgmNMJVp9JiySqzhCyh7LFoPo1hdAbB",
+      "uid": 70
+    },
+    {
+      "commit_block": 9396598,
+      "gen_ref": "vault/direct@sha256:3fdfc202f099ac8ed13fc18f50c8303776608a08672b7d4ecd4ec04a2243e04b",
+      "hotkey": "5CyVQSE65pkEZktuwfjYeqSiDkc76Acie6M4CuzbMbqZPjG1",
+      "uid": 73
+    },
+    {
+      "commit_block": 9425200,
+      "gen_ref": "vault/direct@sha256:e512764f73d3842af3451d7529293658c81e569c98f17c86ff30def0b38f97f6",
+      "hotkey": "5Grq7ZmW8ZQtkw8o5iy6T2LoyEegPFoV1Ky9mvCvYpfhjRnN",
+      "uid": 78
+    },
+    {
+      "commit_block": 9407634,
+      "gen_ref": "vault/direct@sha256:15f1d83bede34fea4a7e79f78e274a18258b8177196ccb9d7dea99a8f6fb3339",
+      "hotkey": "5Fjqa9Py3ahBQis17K2Zhvd9ygrCgVHvkLvcLUarqdG5KinJ",
+      "uid": 90
+    },
+    {
+      "commit_block": 9525861,
+      "gen_ref": "vault/direct@sha256:8d54d03c5c2f04be1cac96710f79e9e03198782f5b0d7b4e6ccbe59b52dfe64c",
+      "hotkey": "5CwPnFoT2LbTzNbg2yQHhVzEpMr7XqaShHxBRZQ9yZgrosfy",
+      "uid": 92
+    },
+    {
+      "commit_block": 9395710,
+      "gen_ref": "vault/direct@sha256:0a5656fc88a4fe4fe97b1fdba121b80251dc1da6d2af9fd8e263ddaf706d0dc9",
+      "hotkey": "5Gb7bJAuctXjcqNCAkFRZUo6MPWkPTBLGRC2X3HeT5yoP9JV",
+      "uid": 101
+    },
+    {
+      "commit_block": 9515601,
+      "gen_ref": "vault/direct@sha256:e0d3dec52f5e01fde9a46a97600976b9dbcb7970d418ec8afa84283748070f6e",
+      "hotkey": "5FUNxThGfsthFxkMsKaTMHZpgrh6FBsrH3YPYuF8JWr9err8",
+      "uid": 105
+    },
+    {
+      "commit_block": 9457529,
+      "gen_ref": "vault/direct@sha256:8e64a6c1d79f7094593ac94cce440fe9d081d18c688fe129d5de2d6600dafae2",
+      "hotkey": "5GT8YprmStTSo7wn6Hw9xwDmBUk4YUMmci2xsaFjszW896UK",
+      "uid": 107
+    },
+    {
+      "commit_block": 9480121,
+      "gen_ref": "vault/direct@sha256:57246fa00a66882e3b8f81dd62011937dbb812fd5c00f5b843188690a4e32976",
+      "hotkey": "5ELRsGeL4oer2fuxoWUiva1hpjJuh29BQMXx1vKRvztyZgP6",
+      "uid": 121
+    },
+    {
+      "commit_block": 9493181,
+      "gen_ref": "vault/direct@sha256:cea0f66e083b5c42c6dfd5bd3c8e715f62b494c40a401dfc15ba6c55b46e89a7",
+      "hotkey": "5FsZCqidTNosMbkyTjsk8ZtP3ZfTcfTPG2H69dbQwVx36Xxn",
+      "uid": 123
+    },
+    {
+      "commit_block": 9398858,
+      "gen_ref": "vault/direct@sha256:ea458ea32c53005b604a98c9b718594e0e67ff0b4347f7e92d4ea38284aed242",
+      "hotkey": "5Gxy52cJZkKQct8FpgEQmHwSxNKyHk3hVWzZRALqU6JjNGNy",
+      "uid": 124
+    },
+    {
+      "commit_block": 9395734,
+      "gen_ref": "vault/direct@sha256:6964d36458c139e42a8564344bf6586b18ac58ac2b8a4f874a2463aa0eb3a0b5",
+      "hotkey": "5DwRbu2MazEJ2V8RDdWwwEqGHujStPCQdYmBCb5boKC7DFp8",
+      "uid": 126
+    },
+    {
+      "commit_block": 9395978,
+      "gen_ref": "vault/direct@sha256:ea08ac9f61ac3b92d14a0cb28283bd6c7f1102eb626892c8257ef050f133b50b",
+      "hotkey": "5FpUQ5vrkc1ZeGMAsN3X87YgnqGy3JauPiY5ojsTsJ9m1nKZ",
+      "uid": 136
+    },
+    {
+      "commit_block": 9395978,
+      "gen_ref": "vault/direct@sha256:82e3eef04a47f8442dbe8fba0b786b8d1edc1c9a22b39a810306c54f955042ad",
+      "hotkey": "5DUHhhFE6APfsRkmpsi3keuQbtg4yu9v8KnTLiY3X8BRyCRU",
+      "uid": 137
+    },
+    {
+      "commit_block": 9428879,
+      "gen_ref": "vault/direct@sha256:ed7f5bfa9e5bb8ad0ed9c7ed5727eba396e631880f9f7389ca746e1208daf165",
+      "hotkey": "5GhPUmHVMqaXWKAP1EC38vLhPwSquZev7D2CaKEQ9vPPG6Qc",
+      "uid": 141
+    },
+    {
+      "commit_block": 9395846,
+      "gen_ref": "vault/direct@sha256:e927233a6d6a6301ab274ddddc8996b4ea29869b8529ec766603b8ebed7c5f66",
+      "hotkey": "5FNdDSA68zpsyDdSHk2rgMGha9JZogdsgntAiESf8qYGgVJv",
+      "uid": 142
+    },
+    {
+      "commit_block": 9395978,
+      "gen_ref": "vault/direct@sha256:b5e761b3dc5062a880f91ff9dc9e9030b50f424b3db31253e456c7c19a339350",
+      "hotkey": "5Esu9b2m37g5Q33L1a7XpMD6ZtMwVp4h8WdN6CDJLhzS8C94",
+      "uid": 143
+    },
+    {
+      "commit_block": 9395606,
+      "gen_ref": "vault/direct@sha256:b0cd4fca88c7d0a9e1e9c19d9c7d5a29f0b34ef049a758c4636ecb2741b164f3",
+      "hotkey": "5D81RYTPJRyzMXDZgzdqcRorjC74N2QAUPKpiTzWW5mzfoLk",
+      "uid": 144
+    },
+    {
+      "commit_block": 9417936,
+      "gen_ref": "vault/direct@sha256:89da4c38ba57d28b1d122da7c4a5fe3697b2c7376b31924e052c8413840033ca",
+      "hotkey": "5Et6YQoCwjbiSrGGPXnNyK9mBF3zmPWupvB5R6vtXZ8wEehA",
+      "uid": 145
+    },
+    {
+      "commit_block": 9411886,
+      "gen_ref": "vault/direct@sha256:9760573c8e134d96088937ca6691ebe5b30c971ef13cb773a05dc4819b44bccf",
+      "hotkey": "5DpyoY8pxp5xCXvErnuUDDygBT6rXQcTEBYJHBYo4rpPpGRT",
+      "uid": 146
+    },
+    {
+      "commit_block": 9395610,
+      "gen_ref": "vault/direct@sha256:0598706ca7f1030fa6938b5e19ee09fbc6bdb412638eb234a52a6cf726a1a0b1",
+      "hotkey": "5HTttnSPMmN9w8tcM8hDrvp1jSibZ8zFeJjaFDKj9R7soaB1",
+      "uid": 147
+    },
+    {
+      "commit_block": 9395606,
+      "gen_ref": "vault/direct@sha256:e2a6da52e856184cb2575935163410a83fb3e39593f390a040bbd3ac868ce75a",
+      "hotkey": "5Fy4WoLB7w88p1F1Wf2qoXzV4QmVT625hhNnJ6id1fFpwfe8",
+      "uid": 148
+    },
+    {
+      "commit_block": 9415027,
+      "gen_ref": "vault/direct@sha256:4e16c72cbf241f4a30046e96ce5f7e36ea80e7d92b8c102d1feef35e829c91eb",
+      "hotkey": "5CCaDSjusArdwf6Ds7exfz2hj38afam2RWyDd4m1cyVz3ZQY",
+      "uid": 149
+    },
+    {
+      "commit_block": 9415131,
+      "gen_ref": "vault/direct@sha256:074c614662b2cb3ae5e2166d4872e7e3a1fc2a5b81939e58bae7406f81d3a29d",
+      "hotkey": "5Ey5cCasUiMSW3UzGweCs6cY6yiq4PtsTpPes21FJhpE5zQC",
+      "uid": 150
+    },
+    {
+      "commit_block": 9395978,
+      "gen_ref": "vault/direct@sha256:d776a46363ba2729af1fc89d14b824bf64713f30634e43a9d524817eb45fa534",
+      "hotkey": "5FRvXrNr7ZqLb7DW5xwworjLbFYjbab1pGfhCgjQjY497qeZ",
+      "uid": 151
+    },
+    {
+      "commit_block": 9452261,
+      "gen_ref": "vault/direct@sha256:e19670236a3fae5107cf96f5a6008b96505de9377a095e40257d2f1c9f4390d5",
+      "hotkey": "5FWibGAeMJP2jsuf4dy46XEKLFtPoDABCEQUc4tjaz631Zit",
+      "uid": 152
+    },
+    {
+      "commit_block": 9395978,
+      "gen_ref": "vault/direct@sha256:d94ae2dfe44aae4efa5a900d2c22289bde6a1f31b5643a95404f5bbd24d6d98d",
+      "hotkey": "5F9nUEZhFUDFQZ9DwrNBHH5bSJ7iccqmiecgnjRKarFfvkX9",
+      "uid": 153
+    },
+    {
+      "commit_block": 9395978,
+      "gen_ref": "vault/direct@sha256:367246f6e92776064169994c5d95b8d92726f40fd111b2c90f2838d3fcaad48f",
+      "hotkey": "5D9rSvoT4fpMTSQ9DKg3DAHVgeEUpwUxcmNkpfwuC1xfrbPi",
+      "uid": 154
+    },
+    {
+      "commit_block": 9398482,
+      "gen_ref": "vault/direct@sha256:a248f17aebd574de874203730025ea584dfab08437c72167a54c2a96a33fd970",
+      "hotkey": "5D2KVsjeQj27K3AQQKChtYnmUT1A2u7syWnrd7Rpd5dmosPH",
+      "uid": 156
+    },
+    {
+      "commit_block": 9398264,
+      "gen_ref": "vault/direct@sha256:16e76f02a57497d1e77815d192d37391f83ddc9b3a3b7ad4d06acc45bc7165b2",
+      "hotkey": "5C4hrfpMJV8wgkuswdL9u49qjoXwCKvqnbv6pMFCknD8ARCm",
+      "uid": 159
+    },
+    {
+      "commit_block": 9452945,
+      "gen_ref": "vault/direct@sha256:02b1f09b3f49aceef94069fc02fc38b8e06391512adf6d92beb6ac1d2bd9c6bb",
+      "hotkey": "5GLSfDutTZE3oew7baaYdPcwEhHVGHCEZW9FZX2ynWrCCQfQ",
+      "uid": 160
+    },
+    {
+      "commit_block": 9403178,
+      "gen_ref": "vault/direct@sha256:9ae7b4ff54ec77dbc235e86534f28501adb18be88e174fafb8e092080e52588c",
+      "hotkey": "5G9ZupVHbJz2W567G7ggKVyGBUfdrc4TSYVtdot7WjWE5Si4",
+      "uid": 161
+    },
+    {
+      "commit_block": 9410378,
+      "gen_ref": "vault/direct@sha256:c0187942f5572edd79011e900e0315d6b29987fbb25b08a6837657de6752bdee",
+      "hotkey": "5Cf1WjbzfAxbZuCEMkifAv1vpQbvn3zqeBKcx4iauWi134JY",
+      "uid": 162
+    },
+    {
+      "commit_block": 9428379,
+      "gen_ref": "vault/direct@sha256:507800c2257eb4242b3db7eb0426a284467da19963a77cb7ff24677cec81d359",
+      "hotkey": "5DCcxVwFjmunymsnua6c7Dgsg4X2HwMQtfCgobtzm1AnCwx7",
+      "uid": 163
+    },
+    {
+      "commit_block": 9525889,
+      "gen_ref": "vault/direct@sha256:52af214e50b4a8da9535ec2fba73937658a4ec33a368caa604edbb90d3eefa30",
+      "hotkey": "5G6jNi6YAWfDYy5eq6jR8VaHWq5nS4iGxjETdDXC9kjDNfRm",
+      "uid": 164
+    },
+    {
+      "commit_block": 9451249,
+      "gen_ref": "vault/direct@sha256:135fca70bac1a23d5d078219bdce670fd4e6ff1e1c5888023575ad4efb1cba45",
+      "hotkey": "5E5JKj3U3XFck7HnduH4dyMduRqSRLs3LWYeuTsQikiYPLGo",
+      "uid": 165
+    },
+    {
+      "commit_block": 9453225,
+      "gen_ref": "vault/direct@sha256:71068572503ec12dd6ce4bedbd616b7514f23224b8a2517ee8f643134b5b77cd",
+      "hotkey": "5CAh4WoWRvaVfvYKrCmB698BvaaE5Vi234mdDoWXQ5o2bE9z",
+      "uid": 167
+    },
+    {
+      "commit_block": 9529637,
+      "gen_ref": "vault/direct@sha256:5c7cb33416d502eeb5862046e22693c37b0b8fd6e3b32d1075bc9a8af52c76e6",
+      "hotkey": "5ESGRyVDQ7C6ZSX5Grqk3gxvn5D9VNFtbiTDcMyGfgZQcPP5",
+      "uid": 168
+    },
+    {
+      "commit_block": 9551590,
+      "gen_ref": "vault/direct@sha256:705a1c1219a15511e172d94274db1910f98fcb5075fec7eefc9cbc6c21d24995",
+      "hotkey": "5GMzsPiUhy6gtqU5GxeUgzJ4yyQnJ5iyx8EUdSgZD2riSDgn",
+      "uid": 171
+    },
+    {
+      "commit_block": 9395718,
+      "gen_ref": "vault/direct@sha256:835047364a52d3a8e3c13cbb00e9d896c8f97e4dd4f3ee03fbba9831f32e8543",
+      "hotkey": "5GQVWv4CDnQTvU9kAp1MdoWpibciwueWJF5Eygy2KqixFdHK",
+      "uid": 194
+    },
+    {
+      "commit_block": 9404514,
+      "gen_ref": "vault/direct@sha256:486342aeed017ee541f71116ce167b937c86ac120b378edb8987bcce9a11913c",
+      "hotkey": "5FbUnQh5WK1NYN6fkpA7rfLKE7S9zyTW89d3yko5Fasgy49T",
+      "uid": 196
+    },
+    {
+      "commit_block": 9408664,
+      "gen_ref": "vault/direct@sha256:824e11651ebb67bc8d3249d788b555a3c6042c485ef8c51c8a55a1a1b57947d0",
+      "hotkey": "5FHPFZ1xeYLT1SFCXf4UkkCjHmFSxQLfgxGyKfubYigM5Ucq",
+      "uid": 198
+    },
+    {
+      "commit_block": 9530189,
+      "gen_ref": "vault/direct@sha256:638afbb77f9eb948a7a156f639cd0c2ed849188ad06902c2e02a25898e787403",
+      "hotkey": "5Ctyc5w8gwifykMUSdUT5iNmjPr5E2X7sdPXwYeTLzrmmWh9",
+      "uid": 203
+    },
+    {
+      "commit_block": 9412882,
+      "gen_ref": "vault/direct@sha256:9b9e40c186617bf46b1346c71265f72ad62d77b9899bf1726f7d03e1defa5ea5",
+      "hotkey": "5DUaX6Nwid3jxk8TWXASNokXPCEWFSCSwVmz2sUUs1Szr4XV",
+      "uid": 211
+    },
+    {
+      "commit_block": 9424900,
+      "gen_ref": "vault/direct@sha256:716765dcf2f61c2e3fb91ffc4e620026fc88dd3d4c2e9799908b1592d9852142",
+      "hotkey": "5CMfsDbJuEftMMQeM7npYmkgzCC4Eodev5h5c6KBYncvUCKQ",
+      "uid": 220
+    },
+    {
+      "commit_block": 9417956,
+      "gen_ref": "vault/direct@sha256:fc3db1abfb7c4d94373f52438ba59e9690963a0e96f7216712914276f41c9d27",
+      "hotkey": "5CmGrxLHEqWSNCfhZnNaFq4wBwB4cuhReaaqVuHfkMusBiyb",
+      "uid": 231
+    },
+    {
+      "commit_block": 9421128,
+      "gen_ref": "vault/direct@sha256:c364f12800a6c31d1c091525108b6f7fd90814142c99d93bc2dd8457aeba010a",
+      "hotkey": "5EvqPCMNRDLYErwVC3QQ6HAYxJyvWKWjuvG9emjUjSoK9xgr",
+      "uid": 232
+    },
+    {
+      "commit_block": 9412114,
+      "gen_ref": "vault/direct@sha256:42a66b8edd3eb0ba6f6b67bec376d47547f48399cddacbf93903201f60d435c9",
+      "hotkey": "5GRPKCJJuBk2eW1AVNWXtvXTzdaATtRZPX5mHgRkDuXs6sbs",
+      "uid": 254
+    }
+  ],
+  "prelaunch_burn_block": 9486900,
+  "receipt_version": 3,
+  "reject_reason": null,
+  "reward_uids": [
+    164,
+    220
+  ],
+  "round_id": "9550553995117568107",
+  "signature": "54f06441299793cd6415545fdf7668047a5ecec6b2ee4de7b9517c982b8407014b425ed9b00d6e5e63fed6c2fdf5f279379a3f88f84bc86ba8ef6ce276566d84",
+  "state_post": {
+    "former_kings": [
+      "5CMfsDbJuEftMMQeM7npYmkgzCC4Eodev5h5c6KBYncvUCKQ",
+      "5Gsa19SFpRY9fSXHMN7PQDdfHHqn2anrcxPvNmg49XrAsm5E",
+      "5FCh4hvwUcweBTtBQYY2HniWzyWkjiybsdfQJuAyR7f1FjMV",
+      "5HCFGiKHeaVDgdgR6A8iqfrNmiHwQhq421w9jnR6F9vWdnYS"
+    ],
+    "king": "5G6jNi6YAWfDYy5eq6jR8VaHWq5nS4iGxjETdDXC9kjDNfRm",
+    "king_since_block": 9531900,
+    "ladder": {
+      "bp": 1000,
+      "court_hotkey": "5CMfsDbJuEftMMQeM7npYmkgzCC4Eodev5h5c6KBYncvUCKQ",
+      "court_until_block": 9566100,
+      "key_lapses": 0,
+      "lapse_open": false,
+      "slash_until_block": 0,
+      "slashed": false
+    },
+    "tenure_rounds": 3
+  },
+  "state_prior_sha256": "192f3412b8b55dbeaf28cbf1ec455c4a1bcea37bc852950dcaf7e8ac27ddf2f0",
+  "status": "scored",
+  "training_seed": 1755181696937488125,
+  "v2_block": 9399600,
+  "validator_hotkey": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+  "verdict": {
+    "boot_p50": 0.029905290769634905,
+    "boot_p95": 0.46433926899835953,
+    "bootstrap_seed": "9550553995117568107",
+    "chal_geomean": 0.3803128734397752,
+    "challenger_wins_round": false,
+    "cohort_geomeans": {
+      "5GMzsPiUhy6gtqU5GxeUgzJ4yyQnJ5iyx8EUdSgZD2riSDgn": 0.3803128734397752
+    },
+    "cohort_per_domain": {
+      "5GMzsPiUhy6gtqU5GxeUgzJ4yyQnJ5iyx8EUdSgZD2riSDgn": {
+        "econ_fin": {
+          "chal": 0.42023543956358644,
+          "king": 0.42213016568153333,
+          "n": 1743,
+          "win_rate": 0.5892139988525531
+        },
+        "energy": {
+          "chal": 0.48347055912794484,
+          "king": 0.4876194310979017,
+          "n": 1797,
+          "win_rate": 0.5297718419588202
+        },
+        "healthcare": {
+          "chal": 0.5918588207278384,
+          "king": 0.5952227840338059,
+          "n": 1797,
+          "win_rate": 0.5197551474680022
+        },
+        "nature": {
+          "chal": 0.12424815509148361,
+          "king": 0.12501731950237205,
+          "n": 1797,
+          "win_rate": 0.5069560378408459
+        },
+        "sales": {
+          "chal": 0.7027132054538421,
+          "king": 0.6999778391327699,
+          "n": 1272,
+          "win_rate": 0.5031446540880503
+        },
+        "transport": {
+          "chal": 0.3496069548807217,
+          "king": 0.3464206040722885,
+          "n": 1797,
+          "win_rate": 0.5364496382860323
+        },
+        "web_cloudops": {
+          "chal": 0.37059557272313964,
+          "king": 0.3663391798575341,
+          "n": 1797,
+          "win_rate": 0.5136338341680579
+        }
+      }
+    },
+    "cohort_per_horizon": {
+      "5GMzsPiUhy6gtqU5GxeUgzJ4yyQnJ5iyx8EUdSgZD2riSDgn": {
+        "256": {
+          "chal": 0.3864149154766331,
+          "king": 0.3858076116054272,
+          "n": 4000,
+          "win_rate": 0.52375
+        },
+        "64": {
+          "chal": 0.24391134849558696,
+          "king": 0.24658802815131342,
+          "n": 4000,
+          "win_rate": 0.52475
+        },
+        "720": {
+          "chal": 0.5818225403882066,
+          "king": 0.5768979447329075,
+          "n": 4000,
+          "win_rate": 0.53925
+        }
+      }
+    },
+    "dethroned": false,
+    "gift_gate_passed": null,
+    "gift_lcb": null,
+    "inconclusive": false,
+    "init_baseline_geomean": 0.3810468318492244,
+    "init_floor_passed": true,
+    "king_geomean": 0.3804048178873435,
+    "king_hotkey": "5G6jNi6YAWfDYy5eq6jR8VaHWq5nS4iGxjETdDXC9kjDNfRm",
+    "king_tenure_rounds": 32,
+    "king_uid": 164,
+    "lcb": -0.512031638109814,
+    "margin": 0.009999999999999995,
+    "n_clusters": 765,
+    "n_windows": 12000,
+    "note": "loss",
+    "params": {
+      "bench_gate_mode": "enforce",
+      "bench_gate_rule": "avg_noninf_winrate",
+      "bootstrap_B": 10000,
+      "bootstrap_alpha": 0.05,
+      "dethrone_cp": 1,
+      "gift_gate_min_configs": 15,
+      "gift_gate_mode": "off",
+      "gift_gate_tolerance": 0.03,
+      "init_gate_mode": "shadow",
+      "margin_mode": "increment",
+      "margin_warmup_rounds": 20,
+      "min_clusters": 0,
+      "min_windows": 200,
+      "mv_score": true,
+      "win_margin_end": 0.01,
+      "win_margin_start": 0.1
+    },
+    "per_domain": {
+      "econ_fin": {
+        "chal": 0.42023543956358644,
+        "king": 0.42213016568153333,
+        "n": 1743,
+        "win_rate": 0.5892139988525531
+      },
+      "energy": {
+        "chal": 0.48347055912794484,
+        "king": 0.4876194310979017,
+        "n": 1797,
+        "win_rate": 0.5297718419588202
+      },
+      "healthcare": {
+        "chal": 0.5918588207278384,
+        "king": 0.5952227840338059,
+        "n": 1797,
+        "win_rate": 0.5197551474680022
+      },
+      "nature": {
+        "chal": 0.12424815509148361,
+        "king": 0.12501731950237205,
+        "n": 1797,
+        "win_rate": 0.5069560378408459
+      },
+      "sales": {
+        "chal": 0.7027132054538421,
+        "king": 0.6999778391327699,
+        "n": 1272,
+        "win_rate": 0.5031446540880503
+      },
+      "transport": {
+        "chal": 0.3496069548807217,
+        "king": 0.3464206040722885,
+        "n": 1797,
+        "win_rate": 0.5364496382860323
+      },
+      "web_cloudops": {
+        "chal": 0.37059557272313964,
+        "king": 0.3663391798575341,
+        "n": 1797,
+        "win_rate": 0.5136338341680579
+      }
+    },
+    "per_domain_win_rate": {
+      "econ_fin": [
+        0.5892139988525531,
+        1743
+      ],
+      "energy": [
+        0.5297718419588202,
+        1797
+      ],
+      "healthcare": [
+        0.5197551474680022,
+        1797
+      ],
+      "nature": [
+        0.5069560378408459,
+        1797
+      ],
+      "sales": [
+        0.5031446540880503,
+        1272
+      ],
+      "transport": [
+        0.5364496382860323,
+        1797
+      ],
+      "web_cloudops": [
+        0.5136338341680579,
+        1797
+      ]
+    },
+    "per_horizon": {
+      "256": {
+        "chal": 0.3864149154766331,
+        "king": 0.3858076116054272,
+        "n": 4000,
+        "win_rate": 0.52375
+      },
+      "64": {
+        "chal": 0.24391134849558696,
+        "king": 0.24658802815131342,
+        "n": 4000,
+        "win_rate": 0.52475
+      },
+      "720": {
+        "chal": 0.5818225403882066,
+        "king": 0.5768979447329075,
+        "n": 4000,
+        "win_rate": 0.53925
+      }
+    },
+    "wilcoxon_p": 2.0452518539978377e-11,
+    "win_rate": 0.52925
+  },
+  "weights": [
+    0.85,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.1,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.05,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ]
+}
