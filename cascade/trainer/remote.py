@@ -356,6 +356,11 @@ def worker_argv(
         argv += ["--domain", domain, "--selection-json",
                  _json.dumps({str(k): sorted(v) for k, v in sorted(expert_selection.items())},
                              separators=(",", ":"))]
+        if finetune_recipe:
+            # WB27 (plan rev6.21): the lane B leg spec (WB23 length + levers)
+            # the worker derives its leg contract from; emitted only when set,
+            # so every other expert leg's argv is byte-identical
+            argv += ["--recipe-json", finetune_recipe]
     if role == "finetune":
         # DEC-CA-0056 lane-C leg: the recipe (validated JSON; the worker
         # re-validates it) — the base king rides --warm-start-ref

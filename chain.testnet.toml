@@ -807,8 +807,8 @@ open_rule                = "cogate"
 sentinel_target_rule     = "defer"
 sentinel_max_defer_eras  = 4
 funded_pod_skus          = ["RTX4090", "RTX3090", "L40S", "L40", "A6000"]   # = [round] funded_pod_skus
-max_leg_hours            = 1.0     # TESTNET-FAST (2026-11-24): 6.0 (on the 0.5 h grid)
-max_leg_seconds          = 4500    # TESTNET-FAST (2026-11-24): 27000 (1 h x 1.25, as mainnet's 6 h x 1.25)
+max_leg_hours            = 1.0     # TESTNET-FAST (2026-11-24): 12.0 (rev6.21; on the 0.5 h grid)
+max_leg_seconds          = 4500    # TESTNET-FAST (2026-11-24): 54000 (1 h x 1.25, as mainnet's 12 h x 1.25)
 guard_factor             = 1.25
 tau_anchor_public        = 0.0
 tau_anchor_domain        = 0.0

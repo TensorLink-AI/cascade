@@ -162,6 +162,14 @@ No `tests/unit` file pins behaviour WB10 changes:
 
 None is listed in `PATHS`.
 
+## rev6.20 (owner 2026-11-24): the lane B leg contract
+
+No activation key (owner 2026-11-24: lanes B, C and D are not rolled out, so
+EMA / no cooldown is simply lane B). `lane_b_leg_contract(contract)` returns
+the leg contract with `lr_schedule = "warmup_constant_ema"` (cascade_pyramid
+only); `LANE_B_SCORED_EMA = "ema010"`. No `[lane_b]` key arms it, and the
+lane A contract digest is unchanged. `test_wb10_lane_b_leg_contract.py`.
+
 ## rev6.22: the lane B slot rule (`test_wb10_lane_b_slots.py`)
 
 Owner 2026-11-24 (final): lane B is not rolled out, so there is no

@@ -12,7 +12,7 @@ import json
 
 import pytest
 
-from .helpers import base_contract, lane_b_cfg, want_reference_steps
+from .helpers import base_contract, caps_in_force, lane_b_cfg, want_reference_steps
 
 GEN = "alice/metro-gen@sha256:" + "a" * 64
 PTR = "metro-v1:trained:hippius:org/ckpt@sha256:" + "b" * 64
@@ -118,7 +118,7 @@ def test_judge_leg_length_armed_nonempty_lane_d_effect():
     """A recorded leg inside the caps also goes on to the fetch."""
     _fields_present()
     e = _entry(train_hours=6.0, leg_steps=100,
-               leg_guard_seconds=int(lane_b_cfg().max_leg_seconds))
+               leg_guard_seconds=caps_in_force(lane_b_cfg())[1])   # rev6.21: the cap
     with pytest.raises(_Fetched):
         _judge(e, _fetch_marks)
 

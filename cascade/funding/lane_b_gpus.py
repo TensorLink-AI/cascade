@@ -149,12 +149,14 @@ _UNSET = object()
 
 
 @contextmanager
-def rent_scope(runner, gpus: LaneBGpus):
+def rent_scope(runner, gpus: LaneBGpus, *, only: tuple[str, ...] = ()):
     """While the block runs on this thread, the runner's rent path
-    (``runner_capacity``) rents from lane B's measured list only."""
+    (``runner_capacity``) rents from lane B's measured list only — or, with
+    ``only`` (owner 2026-11-24: an own-risk GPU type the miner chose, no WB19
+    rate), exactly those types."""
     loc = runner.__dict__.setdefault("_leg_local_obj", threading.local())
     prev = getattr(loc, "lane_b_rent_skus", _UNSET)
-    loc.lane_b_rent_skus = tuple(gpus.rent_skus())
+    loc.lane_b_rent_skus = tuple(only) if only else tuple(gpus.rent_skus())
     try:
         yield loc
     finally:
