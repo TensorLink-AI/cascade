@@ -81,6 +81,19 @@ Owner rulings (2026-11-24) are marked **(owner)**. The rest is proposed.
 10. **Separate product.** Winning harnesses and their transcripts are
     published. Copies are not paid: exact or behavioural duplicates lose to
     the earlier commitment.
+11. **Actions are explained to the customer, factually (owner).** Every
+    material action has an explanation: claims tied to transcript evidence,
+    plus plain text where every sentence cites a claim. Explanations are
+    checked without an LLM judge:
+    * claims against the transcript;
+    * numbers against the cited claims;
+    * counterfactuals by replaying the harness;
+    * drivers against measured sensitivity.
+
+    A pinned Engy model acts only as a *reader* that must predict the
+    harness's actions from the explanations. False or unsupported
+    statements fail the entry. Explanation quality may not fall below the
+    reference's. Design: ACTIONCAST.md §10.
 
 ## Consequences
 
@@ -143,10 +156,15 @@ Owner rulings (2026-11-24) are marked **(owner)**. The rest is proposed.
   Engy reply carry a proof? Who pays: metered to the miner, as proposed, or
   absorbed by us? Is there a commercial or partner agreement (rate limits,
   data terms)? Should miner-shipped decision weights stay as a second path?
+- **Q11. Explanations.** Agree the factual-gate rates and the driver
+  coverage. Should the explanation score only guard (not worse than the
+  reference, as proposed), or also add to the composite gain? Which
+  locales come after English? Is "material action" the right trigger, or
+  should every step be explained?
 
 ## Rollout
 
-See [docs/ACTIONCAST.md §14](../docs/ACTIONCAST.md#14-rollout). In short:
+See [docs/ACTIONCAST.md §15](../docs/ACTIONCAST.md#15-rollout). In short:
 
 1. Build the kit and the gateway.
 2. Run `act:perp` end to end on `mkt:market`, which already exists.

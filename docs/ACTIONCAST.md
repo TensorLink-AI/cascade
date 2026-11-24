@@ -40,11 +40,12 @@ gets a `<Vertical>Cast` fine-tune and an `act:` scenario on the shared kit.
 7. [Primitive kit](#7-primitive-kit)
 8. [Scenarios](#8-scenarios)
 9. [Rewarding creative use of forecasts](#9-rewarding-creative-use-of-forecasts)
-10. [Submission](#10-submission)
-11. [Rules](#11-rules)
-12. [Implementation map](#12-implementation-map)
-13. [Config sketch](#13-config-sketch)
-14. [Rollout](#14-rollout)
+10. [Explaining actions to the customer](#10-explaining-actions-to-the-customer)
+11. [Submission](#11-submission)
+12. [Rules](#12-rules)
+13. [Implementation map](#13-implementation-map)
+14. [Config sketch](#14-config-sketch)
+15. [Rollout](#15-rollout)
 
 ## 1. Why
 
@@ -102,6 +103,8 @@ building blocks that every new vertical reuses.
    episodes: the miner, the reference, and the miner on naive forecasts.
    Every model call goes through the gateway into a transcript.
 6. **Verdict.** Score terms → paired cluster bootstrap → the gates in §4.
+   Explanations are checked in the same pass (§10): grounding, truth,
+   counterfactual replays and the simulatability reader.
    The best passer per target becomes pending.
 7. **Confirm.** At the next settlement the pending entry is re-judged on
    fresh episodes, on the current fine-tune holder. Pass → it takes the main
@@ -123,6 +126,8 @@ A judge-phase entry passes when **all** of these hold, at `alpha / k`
 | no term worse | every score term's LCB ≥ −`tau`: a gain on one term cannot buy a confident loss on another |
 | model lift | the harness's score with the real fine-tune beats its own naive-forecast run (`LCB ≥ model_lift_margin`) |
 | clusters | at least `min_target_clusters` distinct clusters (start days / regions / SKUs) |
+| factual | every explanation claim checks out against the transcript; an entry with any false claim at the gate rate fails (§10) |
+| explanation | explanation score LCB over the reference's ≥ −`tau`, so explanations can't be traded away for decision gain (§10) |
 
 Then the DEC-CA-0056 machinery applies unchanged: the best passer becomes
 pending, is confirmed at uncorrected `alpha` at the next settlement, and
@@ -660,14 +665,133 @@ correlation rule all go to the earlier commitment. Building on a published
 idea is fine. Winning still needs a confident gain over the current holder,
 or a different way of winning.
 
-## 10. Submission
+## 10. Explaining actions to the customer
+
+**Owner (2026-11-24):** explaining decisions to the customer, factually, is
+part of what the software does. It is not optional and it is not a separate
+slot. Every ActionCast entry must explain its actions, and the explanations
+are scored.
+
+"Factual" has a precise meaning here: **every statement is tied to evidence
+in the transcript and can be checked by machine.** An LLM may write the
+words, but it never grades them. The harness is deterministic and can be
+replayed, so an explanation can be tested against what the harness actually
+does.
+
+### What the harness returns
+
+`step` returns an action and, for every **material action**, an
+`Explanation`. A material action is an action that changes by more than the
+scenario's threshold, a limit that binds, or a mandate change.
+`episode_report` returns a customer summary at the end of each episode.
+
+```python
+return Decision(
+    action=self.plan(q, obs.soc),
+    explanation=Explanation(
+        claims=[
+            ex.forecast("c1", q, series="price.NSW1", level=0.9, horizon="16:00-18:00"),
+            ex.observation("c2", obs, "soc", value=0.42),
+            ex.constraint("c3", "soc_max", binding=False),
+            ex.counterfactual("c4", input="forecast.price.NSW1.p90", change=-0.3,
+                              expect="discharge_mw <= 0.2"),
+        ],
+        text="Holding charge for the evening peak: there is a 10% chance the price "
+             "tops $300/MWh between 16:00 and 18:00 [c1], and the battery is at 42% [c2]. "
+             "If that risk were 30% lower, it would sell now instead [c4].",
+    ),
+)
+```
+
+| claim type | what it states | how it is checked |
+|---|---|---|
+| `observation` | an input's value at the decision time | equals the observation |
+| `forecast` | a model's quantile or interval, with model, level and horizon | equals the recorded reply for that call |
+| `constraint` | a limit, and whether it binds | equals the simulator's state |
+| `cost` | a fee, slippage or penalty incurred or avoided | equals the simulator's cost ledger |
+| `counterfactual` | "if input X changed by d, the action would satisfy Y" | the validator re-runs the harness with X changed (below) |
+| `driver` | "this action depends mostly on these inputs" | matches measured sensitivity (below) |
+| `outcome` | what then happened (episode reports only) | equals the realised data |
+
+### Checks
+
+1. **Grounding (no LLM).** Every sentence of `text` must cite at least one
+   claim, `[c1]`. Every number in a sentence must match a number in a cited
+   claim, after unit and rounding rules. Uncited sentences and unmatched
+   numbers count as **unsupported**.
+2. **Truth (no LLM).** Every claim is checked against the transcript,
+   simulator state or realised data, by the table above. A wrong claim is
+   **false**.
+3. **Counterfactual faithfulness (no LLM).** The validator replays the
+   harness with the claimed change, and also with changes it samples
+   itself, which the miner cannot choose. Claimed counterfactuals must hold.
+   Sampled ones measure how sensitive the action really is to each input.
+4. **Driver coverage (no LLM).** The listed drivers must account for at least
+   `driver_coverage` (for example 70 %) of the measured sensitivity.
+   "I used the forecast" earns nothing. The real reasons must be named.
+5. **Simulatability (Engy LLM as reader, not judge).** A pinned Engy model
+   reads the explanations only, never the code, and then predicts the
+   harness's actions on held-out states from the same episodes. The score is
+   prediction accuracy against the harness's real actions. Padding doesn't
+   help. Text is length-capped and stripped of instructions before the
+   reader sees it, and the reader only outputs a prediction.
+6. **Plain language (diagnostic only).** A readability measure and an
+   optional pinned-LLM pairwise preference against the reference
+   explanation are published but not paid. A tone or style rule can be
+   promoted to a gate later, once there is evidence it cannot be gamed.
+
+**Forecasts must be stated as forecasts.** A sentence about the future must
+cite a `forecast` claim, and its wording must carry the probability ("a 10%
+chance…", "likely between…"). The grounding checker refuses future-tense
+certainty ("the price will…") with no probability attached.
+
+### Scoring
+
+- **Factual gate.** False claims and unsupported sentences must be under
+  `max_false_rate` (for example 0.5 % of claims) and `max_unsupported_rate`
+  (for example 1 % of sentences), at their upper confidence bounds. Failing
+  either fails the entry, whatever its decision gain.
+- **Explanation score.** A composite of counterfactual accuracy, driver
+  coverage and simulatability, compared with the reference harness's
+  template explanations on the same episodes. It enters the verdict through
+  the "no term worse" guard (§4): an entry cannot pass by explaining worse
+  than the reference. Q11 asks whether it should also add to the composite
+  gain.
+- **Cost.** Explanations count against the Engy token budget when an LLM
+  writes them. Template explanations, built from kit builders, cost nothing.
+
+### What the customer gets
+
+- A plain-language reason for every material action, each sentence
+  footnoted to its evidence (the forecast, the reading, the limit).
+- A "what would change my mind" line (the counterfactual) that has been
+  tested against the software itself.
+- An episode report: what was done, why, and how it turned out against the
+  forecast, with the same footnotes.
+- The evidence trail (transcript references), so an auditor or the
+  customer's own team can check any statement.
+
+### Kit support (`cascade.harness.explain`, layer 5)
+
+- **Claim builders.** `ex.forecast`, `ex.observation`, `ex.constraint`,
+  `ex.cost`, `ex.counterfactual`, `ex.driver`. Each one captures its
+  evidence reference from the transcript automatically, so a harness can't
+  cite a value it never saw.
+- **Renderers.** Deterministic templates per claim type and locale (English
+  in v1). An optional Engy-written `text` must still pass grounding.
+- **The checker itself,** so miners run exactly the validator's checks
+  locally (`cascade harness explain-check`).
+- **Reference explanations.** The reference harness ships template
+  explanations. They are the bar every entry must not fall below.
+
+## 11. Submission
 
 The miner commits `metro-v1:ft:act:<scenario>:hippius:<repo>@sha256:<digest>`
 (the existing lane-C form, parsed generically). The tree:
 
 ```
 harness.json      # {"scenario": "bess", "api": 1, "models": ["nrg:aemo", "mkt:market"], ...}
-policy.py         # class Harness(HarnessBase): reset(spec) / step(obs, fc) -> action
+policy.py         # class Harness(HarnessBase): reset(spec) / step(obs, fc) -> Decision(action, explanation) / episode_report()
 lib/…             # optional pure-Python helpers, size-capped
 ```
 
@@ -690,7 +814,7 @@ they draw on a per-episode budget of forecast series × horizon steps, with a
 context-length cap. `fc.budget_left()` reports what remains. Over budget
 means the call is refused, not that the episode fails.
 
-## 11. Rules
+## 12. Rules
 
 - **Sandbox.** The same static guard and network-isolated sandbox as
   generators (`cascade/interface/static_guard.py`): no network, no clock, no
@@ -700,8 +824,8 @@ means the call is refused, not that the episode fails.
   way out of the sandbox is the model gateway (forecasts, Engy,
   decisionmodels.io).
 - **Determinism.** Same observations and model replies (forecasts, Engy
-  replies, decision-model probabilities) give the same actions, byte for
-  byte. The validator records every forecast request and
+  replies, decision-model probabilities) give the same actions and the same
+  explanations, byte for byte. The validator records every forecast request and
   reply in a per-episode transcript (hashed into the receipt row). The
   auditor replays the harness on CPU from the transcript, without a GPU.
   This is the DEC-CA-0064 B3 pattern: you can check a verdict without
@@ -714,7 +838,7 @@ means the call is refused, not that the episode fails.
   commitment block.
 - **Model lift.** See §4.
 
-## 12. Implementation map
+## 13. Implementation map
 
 | piece | where | what |
 |---|---|---|
@@ -727,10 +851,11 @@ means the call is refused, not that the episode fails.
 | trainer half | `cascade/trainer/lane_c_competitions.py` | `HarnessTrainer`: `read_recipe` checks the tree. `train_leg` is a short CPU leg (DEC-CA-0053 CPU tier, on the miner's key): static guard, a smoke run, and a **historical qualifier** (it must beat the reference on public backtest episodes, so junk is filtered before it costs validator GPU). It then freezes the pointer. `leg_hours` ≈ 0.25 |
 | validator half | `cascade/validator/lane_c_competitions.py` | `HarnessValidator.judge`: on the main validator, for entries whose forward window has closed, it runs N episodes × {miner, reference, naive-model miner} through `MktSession.forecaster(...)` (reusing the pod via `MktLease(owner="act")`), scores them and emits `LaneCJudgement` rows. Uses `generic_fold = True` unless the forecaster-change rule needs state |
 | reports | same | main-validator per-round report (`report_key`), as MarketCast does, so satellites need no GPU |
+| explanations | `cascade/harness/explain.py` + `cascade/eval/harness/explain_check.py` | claim builders, renderers, grounding / truth / counterfactual / driver checks, the simulatability reader |
 | audit | `cascade/audit/harness_reproduce.py` + a branch in `checks.py` | replays transcripts on CPU and re-derives scores and LCBs |
 | docs | `docs/ACTIONCAST_MINER.md` | the miner guide, in the MARKETCAST.md shape |
 
-## 13. Config sketch
+## 14. Config sketch
 
 ```toml
 [lane_c]
@@ -753,6 +878,14 @@ hard_tier_fraction   = 0.3
 step_cpu_ms          = 200
 tree_max_bytes       = 2_000_000
 
+[actioncast.explain]
+max_false_rate       = 0.005    # claims, at the upper bound
+max_unsupported_rate = 0.01     # sentences, at the upper bound
+driver_coverage      = 0.7
+counterfactual_samples = 4      # validator-sampled per material action
+text_max_words       = 80
+reader_model         = "<engy-model-id>@<weights-hash>"
+
 [actioncast.providers.engy]         # LLMs; cutoff must precede from_block
 models             = ["<engy-model-id>@<weights-hash>"]   # to choose (Q10)
 decoding           = "greedy"
@@ -772,7 +905,7 @@ regions    = ["NSW1", "QLD1", "VIC1", "SA1", "TAS1"]
 episode_h  = 24
 ```
 
-## 14. Rollout
+## 15. Rollout
 
 0. Build the kit first (layers 1–4, golden vectors), and write the three
    first scenarios as specs on it. If a scenario needs a one-off module, the
