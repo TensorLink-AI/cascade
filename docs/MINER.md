@@ -317,7 +317,7 @@ byte-identical to what validators scored. Each
 |---|---|
 | `block-<N>.tar` | the exact tar validators scored |
 | `POOL_SHA256` | its sha256 (matches receipts and the publisher index) |
-| `<series_id>.npy` | the same series, unpacked |
+| `<series_id>.npy` | the same series, unpacked (folders revealed before 2026-11-24 only; for newer folders run `tar -xf block-<N>.tar` in the folder, or use `--pool-hf`) |
 | `metadata.json` | `{series_id: {freq, seasonal_period, domain, source, …}}` |
 | `provenance.json` | the build configuration recorded at publish time |
 

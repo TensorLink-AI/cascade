@@ -65,3 +65,19 @@ def test_reveal_runs_once_a_day_and_never_reveals_the_active_snapshot():
     primary = re.search(r'cascade-pool reveal --chain-toml.*?(?=\n\s*#|\n\s*if |\Z)', run, re.S)[0]
     # buffer pending entries sit above the active one: withhold all of them + it
     assert int(_flag(primary, '--keep-newest')) >= buffer + 1
+    # owner 2026-11-24 option (b): ONE snapshot per day — the newest retiree;
+    # the rest stay in the pool bucket (no backfill)
+    assert '--newest-only' in primary.split()
+    assert int(_flag(primary, '--max-reveal')) == 1
+
+
+def test_reveal_cli_parses_the_scheduled_flags():
+    from cascade.pool.cli import _add_reveal
+
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers()
+    _add_reveal(sub)
+    args = parser.parse_args(['reveal', '--hf-repo', 'o/r', '--keep-newest', '3',
+                              '--newest-only', '--max-reveal', '1'])
+    assert (args.keep_newest, args.newest_only, args.max_reveal) == (3, True, 1)
+    assert parser.parse_args(['reveal', '--hf-repo', 'o/r']).newest_only is False

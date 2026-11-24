@@ -50,6 +50,12 @@ on:
     # 2 (publish step) keeps that pending block at least one full epoch past
     # any build, so a ~55 min build can never land on an epoch that started
     # while it ran, i.e. on a boundary the trainer may already have pinned.
+    # FREEZE (consensus): publish_pool_snapshot refuses to change an entry
+    # that activates within one epoch of the chain head (estimated from the
+    # validator's status/chain.json; head unknown => no replacement at all),
+    # so the bytes the trainer signs into the manifest (eval_pool_sha256) and
+    # every validator re-resolves are final an epoch before activation. A
+    # refused replace is a logged warning, exit 0.
     # The HF reveal still runs once a day (03:xx UTC runs only; see that step).
     - cron: "0 * * * *"
   workflow_dispatch:
@@ -281,7 +287,10 @@ jobs:
       # snapshots are withheld (pending + possibly-active), so a revealed pool
       # can never be selected by a current or future round. With hourly publishes
       # and --round-buffer 2 the newest THREE are withheld (see --keep-newest).
-      # Idempotent per snapshot — backlog backfills across runs (max 6/run).
+      # One snapshot per day (--newest-only), uploaded as ONE commit of the
+      # exact tar + POOL_SHA256 + small sidecars — not thousands of per-series
+      # .npy, whose presigned LFS URLs expired mid-commit (900 s) and failed
+      # every reveal from 2026-11-20 (run 45317813555). Idempotent per snapshot.
       # Skipped cleanly if HF_TOKEN isn't set.
       - name: Reveal retired snapshots to public HF  (exact bytes)
         if: env.HF_TOKEN != ''
@@ -308,9 +317,12 @@ jobs:
           # --keep-newest 3: with --round-buffer 2 the index holds TWO pending
           #   entries (next epoch, the one after) above the active one, so the
           #   default 2 would reveal the snapshot being scored right now.
-          # --max-reveal 12: 8 snapshots retire per day now (one per epoch).
+          # --newest-only --max-reveal 1 (owner 2026-11-24, option b): reveal
+          #   ONE snapshot per day — the newest retired one — so HF grows at
+          #   the old daily rate. The other ~7 retirees of the day stay in the
+          #   pool bucket only and are never backfilled.
           cascade-pool reveal --chain-toml "$TOML" --hf-repo "$HF_EVAL_REPO" \
-            --keep-newest 3 --max-reveal 12
+            --keep-newest 3 --newest-only --max-reveal 1
           # DEC-CA-0056: the lane-C pool's retired snapshots, under pool_c/ in
           # the same dataset (inert until [lane_c] from_block is typed)
           if python -c "import sys; from cascade.shared.config import load_chain_config as l; sys.exit(0 if l('$TOML').lane_c.from_block else 1)"; then
