@@ -59,8 +59,19 @@ class ExpertEntry:
     # changes the reduction order). 0 = not recorded — dropped from the
     # canonical body, so an entry without it keeps its bytes.
     gpu_n: int = 0
+    # plan rev6.20 (owner 2026-11-24): which weights the leg scored (and the
+    # rebased / merged checkpoint carries): "ema010" = the sigma_rel 0.10
+    # power EMA of a no-cooldown leg, from [lane_b] ema_no_cooldown_from_block;
+    # "" = the raw cooled endpoint — dropped from the canonical body, so an
+    # entry without it keeps its bytes. Judges re-derive it from train_block.
+    scored_weights: str = ""
 
     def __post_init__(self) -> None:
+        from .config.lane_b import LANE_B_SCORED_WEIGHTS
+
+        if self.scored_weights not in LANE_B_SCORED_WEIGHTS:
+            raise ValueError(f"expert entry scored_weights must be one of "
+                             f"{LANE_B_SCORED_WEIGHTS}; got {self.scored_weights!r}")
         if isinstance(self.gpu_n, bool) or not isinstance(self.gpu_n, int) or self.gpu_n < 0:
             raise ValueError(f"expert entry gpu_n must be an int >= 0; got {self.gpu_n!r}")
         for name in ("selection", "exclude"):
@@ -105,6 +116,8 @@ class ExpertManifest:
                 e["targets"] = list(e["targets"])
             if not e.get("gpu_n"):
                 e.pop("gpu_n", None)          # not recorded: today's bytes
+            if not e.get("scored_weights"):
+                e.pop("scored_weights", None)  # raw cooled endpoint: today's bytes
         return json.dumps(d, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
     def digest(self) -> str:

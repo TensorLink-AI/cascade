@@ -405,3 +405,8 @@ main). That shows the contract can be built and that every honest fixture
 report PASSes.
 
 Run locally with `-m "not torch"`. Nothing here imports torch.
+
+## rev6.20 (owner 2026-11-24): lane B stage `scored_weights`
+
+`checks.LANE_B_STAGES` gains `scored_weights` (a refusal stage; a passed
+row at it is flagged). `test_w9_lane_b_scored_weights.py`.

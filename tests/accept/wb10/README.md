@@ -161,3 +161,11 @@ No `tests/unit` file pins behaviour WB10 changes:
   release-only tuple doesn't break it.
 
 None is listed in `PATHS`.
+
+## rev6.20 (owner 2026-11-24): `ema_no_cooldown_from_block`
+
+`[lane_b] ema_no_cooldown_from_block` (integer >= 0, default 0 = never;
+loader: an era boundary at or after `[v2] from_block`). From it a lane B
+leg's contract is `lane_b_leg_schedule(...)` (`lr_schedule =
+"warmup_constant_ema"`) and its `scored_weights_at(block)` is `"ema010"`.
+Not shipped in `chain.toml` (default). `test_wb10_ema_no_cooldown.py`.

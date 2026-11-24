@@ -738,6 +738,17 @@ class LaneBConfig:
     max_leg_hours: float = 6.0
     max_leg_seconds: int = 27_000
     guard_factor: float = 1.25
+    # CONSENSUS (plan rev6.20, owner 2026-11-24): typed era-start block (0 =
+    # never) from which a lane B leg trains with no LR cooldown and is scored
+    # (and merged) on its sigma_rel 0.10 power EMA; the expert entry records
+    # ``scored_weights`` and judges re-derive it from its ``train_block``.
+    ema_no_cooldown_from_block: int = 0
+
+    def scored_weights_at(self, block: int | None) -> str:
+        """``scored_weights`` a lane B leg dispatched at ``block`` carries."""
+        from .lane_b import lane_b_scored_weights
+
+        return lane_b_scored_weights(self, block)
 
     def active(self, block: int | None) -> bool:
         return self.from_block > 0 and block is not None and int(block) >= self.from_block

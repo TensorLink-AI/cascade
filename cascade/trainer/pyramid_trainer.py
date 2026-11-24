@@ -170,6 +170,33 @@ def power_ema_active(warm_start_dir, expert_selection):
     return False
 
 
+def lane_b_ema_leg(lr_schedule, expert_selection):
+    """Is this a lane B EMA / no-cooldown leg (plan rev6.20, owner
+    2026-11-24)? ``True`` iff the leg contract's ``lr_schedule`` is
+    ``"warmup_constant_ema"`` (set only by ``lane_b_leg_schedule`` from
+    ``[lane_b] ema_no_cooldown_from_block``) on an expert leg; ``False`` for
+    ``"wsd"`` (every lane A leg and every lane B leg before the key). Any
+    other schedule, or the EMA schedule on a lane A leg, is refused. Pure."""
+    if lr_schedule == "wsd":
+        return False
+    if lr_schedule == "warmup_constant_ema":
+        if expert_selection is None:
+            raise ValueError("pyramid recipe: lr_schedule='warmup_constant_ema' is lane B only "
+                             "(needs an expert selection)")
+        return True
+    raise ValueError(f"pyramid recipe requires lr_schedule='wsd' (or the lane B "
+                     f"'warmup_constant_ema'); got {lr_schedule!r}")
+
+
+def lane_b_schedule_factor(step, total_steps):
+    """The lane B EMA leg's LR factor: WSD's warmup (the same step count as
+    ``pyramid_optimizer.schedule_factor`` at ``total_steps``), then 1.0 to
+    the last step: no cooldown / decay tail. Pure."""
+    cooldown = max(1, round(total_steps / 11))
+    warmup = min(80, max(1, total_steps - cooldown))
+    return step / warmup if step < warmup else 1.0
+
+
 def power_ema_state(emas):
     """Every EMA's shadows and step counter as one flat tensor dict."""
     flat = {}
@@ -210,7 +237,7 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
     # Recipe values are explicit contract terms; refuse silently ignored alternatives.
     expected = dict(optimizer="normuon_adamw", base_lr=0.002125, weight_decay=2e-8,
         grad_clip=7.0, batch_denomination="sequences", budget_denomination="points",
-        masking="contiguous_patch", input_transform="arcsinh_causal", lr_schedule="wsd",
+        masking="contiguous_patch", input_transform="arcsinh_causal",
         anneal_fraction=0.0, ema_decay=0.0, power_ema_sigma_rels=(),
         copula_samples=4, copula_loss_cap=0.1, muon_momentum=0.96,
         muon_row_beta2=0.999, adamw_beta1=0.91, adamw_beta2=0.972,
@@ -219,9 +246,15 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
     for name, value in expected.items():
         if getattr(contract, name) != value:
             raise ValueError(f"pyramid recipe requires {name}={value!r}")
+    no_cooldown = lane_b_ema_leg(contract.lr_schedule, expert_selection)
     ema_sigmas, ema_eval = power_ema_settings()
-    # computed on every leg (shadow); SCORED only where the init says so
-    ema_scored = bool(ema_sigmas) and power_ema_active(warm_start_dir, expert_selection)
+    if no_cooldown and not ema_sigmas:
+        raise ValueError("the lane B EMA schedule needs the image's power EMA "
+                         "(POWER_EMA_SIGMA_RELS is empty)")
+    # computed on every leg (shadow); SCORED only where the init says so, or
+    # on a lane B leg under the EMA / no-cooldown schedule (plan rev6.20)
+    ema_scored = bool(ema_sigmas) and (
+        no_cooldown or power_ema_active(warm_start_dir, expert_selection))
     if tuple(contract.accepted_fields) not in ((), ("groups",)):
         raise ValueError("pyramid recipe accepts only optional groups")
     if str(trainer.dtype) != "torch.float32":
@@ -387,7 +420,8 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
                 if gang is not None:
                     gang.gather_muon()
                 stable = trainer._stable_snapshot(model, optimizer)
-            factor = schedule_factor(step, steps)
+            factor = (lane_b_schedule_factor(step, steps) if no_cooldown
+                      else schedule_factor(step, steps))
             for group in optimizer.param_groups:
                 group["lr"] = group["base_lr"] * factor
             optimizer.zero_grad(set_to_none=True)
@@ -481,7 +515,9 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
     scored = average(emas[ema_eval]) if ema_scored else live
     out = Path(out_dir)
     save_checkpoint(out, scored, cfg, contract, power_ema=(
-        {"sigma_rels": list(ema_sigmas), "scored_sigma_rel": ema_sigmas[ema_eval]}
+        {"sigma_rels": list(ema_sigmas), "scored_sigma_rel": ema_sigmas[ema_eval],
+         # plan rev6.20: the leg's schedule, the record settlement checks
+         **({"schedule": contract.lr_schedule} if no_cooldown else {})}
         if ema_scored else None))
     from .ckpt_digest import save_tensors_hashed
 
@@ -508,7 +544,7 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
         "active_params": counts["active"], "train_seconds": duration,
         "deadline_hit": step < steps and duration >= contract.max_train_seconds,
         "data_wait_s": timed.wait_s,
-        "tokens_frac": tokens / max(1, token_budget), "lr_schedule": "wsd",
+        "tokens_frac": tokens / max(1, token_budget), "lr_schedule": contract.lr_schedule,
         "optim_state_resumed": resumed_optimizer,
         "training_complete": step == steps,
         "corpus_exhausted": step < steps and tokens < token_budget and duration < contract.max_train_seconds}
