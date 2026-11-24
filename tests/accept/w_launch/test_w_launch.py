@@ -37,6 +37,9 @@ def test_w_launch_blocks_are_era_starts_on_the_shipped_grids():
         assert launch == (math.floor(at_18) // era + 1) * era
     assert MAINNET_LAUNCH >= int(main.v2.from_block)
     assert TESTNET_LAUNCH >= int(test.v2.from_block)
+    # every launch overlay arms lane D at exactly its network's launch block
+    for _, _, full, launch in PAIRS.values():
+        assert overrides(full)["lane_d"]["from_block"] == launch
 
 
 def test_w_launch_chain_toml_types_lane_c_and_marketcast():
