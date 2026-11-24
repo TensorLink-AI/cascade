@@ -413,15 +413,20 @@ def test_retired_keys_load_and_are_ignored(tmp_path):
         RETIRED_KEYS,
         EvalConfig,
         RoundConfig,
+        ScoringConfig,
         TelemetryConfig,
         ValidatorConfig,
         load_chain_config,
     )
+    from cascade.shared.config.lane_d import LaneDConfig
 
     live = {"round": {f.name for f in dataclasses.fields(RoundConfig)},
             "telemetry": {f.name for f in dataclasses.fields(TelemetryConfig)},
             "eval": {f.name for f in dataclasses.fields(EvalConfig)},
-            "validator": {f.name for f in dataclasses.fields(ValidatorConfig)}}
+            "validator": {f.name for f in dataclasses.fields(ValidatorConfig)},
+            "scoring": {f.name for f in dataclasses.fields(ScoringConfig)},
+            "lane_d": {f.name for f in dataclasses.fields(LaneDConfig)}}
+    assert set(RETIRED_KEYS) <= set(live), "a retired section has no live-field check"
     for section, keys in RETIRED_KEYS.items():
         assert not keys & live[section], f"[{section}] retired key is a live field"
 
@@ -432,11 +437,18 @@ def test_retired_keys_load_and_are_ignored(tmp_path):
     extra = {"round": "\n".join(f"{k} = 1" for k in sorted(RETIRED_KEYS["round"])
                                 if f"\n{k} " not in text and f"\n{k}=" not in text),
              "telemetry": "\n".join(f"{k} = 1" for k in sorted(RETIRED_KEYS["telemetry"])
-                                    if f"\n{k} " not in text)}
+                                    if f"\n{k} " not in text),
+             # rev6.18 B11/B12: a deployed file still carries these
+             "scoring": "\n".join(f"{k} = 1" for k in sorted(RETIRED_KEYS["scoring"])
+                                  if f"\n{k} " not in text),
+             "lane_d": "\n".join(f"{k} = 1" for k in sorted(RETIRED_KEYS["lane_d"])
+                                 if f"\n{k} " not in text)}
     for section, lines in extra.items():
         if lines:
             text = text.replace(f"\n[{section}]\n", f"\n[{section}]\n{lines}\n", 1)
     p = tmp_path / "chain.toml"
     p.write_text(text)
-    assert load_chain_config(p).round.epoch_blocks == load_chain_config(
-        DEFAULT_CHAIN_TOML).round.epoch_blocks
+    got, shipped = load_chain_config(p), load_chain_config(DEFAULT_CHAIN_TOML)
+    assert got.round.epoch_blocks == shipped.round.epoch_blocks
+    assert got.scoring == shipped.scoring
+    assert got.lane_d == shipped.lane_d

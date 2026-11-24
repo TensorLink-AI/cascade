@@ -996,7 +996,6 @@ tau_public      = 0.01
 lowfreq_freqs   = ["D", "W", "M", "ME", "MS", "Q", "QE", "QS", "A", "Y", "YE"]  # A10: daily and slower
 reward_prior_kings = 2           # D7
 king_decay      = 0.5            # D7
-confirm_on_king_change = "restart"  # D20 (a)
 max_entries_per_settlement = 8   # D3
 max_open_per_coldkey = 2         # D3
 max_judged_per_coldkey_per_settlement = 2  # A8
@@ -1006,18 +1005,9 @@ max_bench_holds = 4
 loser_ttl_eras  = 4              # D8
 max_mirror_lag_hours = 6.0       # A1
 ready_ttl_blocks = 7200          # B10: ~24 h at 12 s blocks
-# DEC-CA-0062 keys, still parsed and carried as written.
-targets         = []             # TBD
-teacher_ref     = ""             # TBD: the teacher to distil from
-teacher_api     = "ephemeris"    # owner: Ephemeris TS foundation-model API (validators never call it)
-teacher_mode    = "route"        # route | ensemble | explicit (explicit needs teacher_models)
-real_corpus_ref = ""             # TBD: owner-pinned real corpus (DEC-CA-0028 pattern)
-data_sources    = ["real", "prior_corpus"]  # miners SELECT data (no generator): real and/or prior training corpora
-augmentations   = []             # TBD: the allowed augmentation list
-expert_choice   = "miner"        # miner | affinity | all
-max_context_length = 32768       # longer-context legs, up to 32k
-pool_prefix     = "pool_d"
-gain_margin     = 0.01
+# Retired (rev6.18 B11): confirm_on_king_change and the DEC-CA-0062 keys
+# (targets ... win_ttl_eras). The loader ignores them (RETIRED_KEYS["lane_d"]),
+# so a deployed file that still carries them loads unchanged.
 
 # ── MarketCast: lane-C fine-tune eval on Timestral-28M (DEC-CA-0064) — BUILT, SHIPPED OFF ──
 # Fine-tunes of a PINNED third-party base (mistralai/Timestral-28M, Modified
