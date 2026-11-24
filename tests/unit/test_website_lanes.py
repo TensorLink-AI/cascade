@@ -105,7 +105,7 @@ def test_lane_b_horizon_slots_and_multi_target_wins(tmp_path, monkeypatch):
     from tests.unit import test_website_render as R
 
     def _cfg(from_block):
-        lb = LaneBConfig(from_block=from_block, domains=R.DOMAINS, win_ttl_eras=28,
+        lb = LaneBConfig(from_block=from_block, domains=R.DOMAINS,
                          horizons=(64,), max_domains_per_leg=2)
         return SimpleNamespace(lane_b=lb, subnet=SimpleNamespace(netuid=91),
                                training=SimpleNamespace(v2_from_block=from_block))

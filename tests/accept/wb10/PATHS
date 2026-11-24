@@ -31,3 +31,4 @@ tests/unit/test_v2_status.py
 tests/unit/test_config.py
 tests/unit/test_lane_b_multi_target.py
 tests/unit/test_v2_golive.py
+tests/unit/test_satellite_replay.py
