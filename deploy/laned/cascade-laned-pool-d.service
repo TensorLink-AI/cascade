@@ -1,0 +1,18 @@
+# One elastic lane D pool_d build (plan R13 / W6d): rent the cheapest Shadeform
+# CPU VM under the caps, bootstrap, first_seen record+commit, pool_d_build,
+# pool_d_publish, state-push, delete (unless keep_warm). Started by
+# cascade-laned-pool-d.timer every 3 h. Credentials: SHADEFORM_API_KEY and
+# SHADEFORM_SSH_KEY_ID from the EnvironmentFile (mode 600, owner fills);
+# the builder's own keys ride in /etc/cascade-laned-pool-d.env (mode 600).
+[Unit]
+Description=cascade lane D elastic pool_d build (Shadeform CPU)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/cascade
+EnvironmentFile=/etc/cascade-laned-elastic.env
+ExecStart=/root/cascade/.venv/bin/cascade-laned elastic cycle --role pool-d-builder --config /root/cascade/deploy/laned/elastic.toml
+TimeoutStartSec=3h
+Nice=10
