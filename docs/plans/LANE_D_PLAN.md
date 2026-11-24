@@ -1,10 +1,94 @@
 # Plan: lane D "open weights" (anything goes on our architecture), with lane E and lane A flexibility — v3
 
-Status: **PLAN v3, ~~rev6.12~~ ~~rev6.14~~ ~~rev6.15~~ ~~rev6.16~~ ~~rev6.17~~ rev6.18 (proposed 2026-11-22; ~~rev6.12~~ ~~rev6.14~~ ~~rev6.15~~ ~~rev6.16~~ ~~rev6.17~~ rev6.18 2026-11-23)**: v2's design, made buildable by an
+Status: **PLAN v3, ~~rev6.12~~ ~~rev6.14~~ ~~rev6.15~~ ~~rev6.16~~ ~~rev6.17~~ ~~rev6.18~~ rev6.19 (proposed 2026-11-22; ~~rev6.12~~ ~~rev6.14~~ ~~rev6.15~~ ~~rev6.16~~ ~~rev6.17~~ ~~rev6.18 2026-11-23~~ rev6.19 2026-11-24)**: v2's design, made buildable by an
 autonomous loop. A work package is done **only when its Accept command exits
 0**; **(rev6)** its level is only what `scripts/laned/status` computes (§17),
 never a claim. Owner decisions are marked **[DECIDE]**. Nothing is armed. **No calendar
 dates**: stages are gated (§5).
+
+## rev6.19 (owner 2026-11-24; main @ 052eabef): lane B suite-target gain test — improve EITHER CRPS OR MASE
+
+One owner decision for lane B (§12b, DEC-CA-0071 and its rev4 amendment).
+It is recorded here and in DEC-CA-0071 "Amendment rev6.19", not as a §17.4
+register row: W0 requires DEC-CA-0070 (lane D) to carry every register row,
+and this is a lane B rule. Plan text and the DEC-CA-0071 record only; the code
+lands as one feature PR (rev6.19 (F) below). Lane A, lane C and lane D are
+untouched. Superseded text is struck, not deleted.
+
+**Owner decision (2026-11-24, DECIDED).** The target-suite gain test becomes
+"improve EITHER CRPS OR MASE by ≥ 1% on the targeted public suite".
+
+### rev6.19 (G) The gain test, as built
+
+For a suite target `suite:<s>` (`s` ∈ gift, boom, time, fev), on the whole
+suite's paired per-item scores (`<s>_crps`, `<s>_mase`, each
+`paired_geomean_lcb` over items), against the current king:
+
+1. **Either metric clears the bar.** CRPS `LCB_{α'}(rel) ≥
+   gain_margin_public` OR MASE `LCB_{α'}(rel) ≥ gain_margin_public`
+   (`gain_margin_public` = 0.01, i.e. ≥ 1%), with `α' = α / (2k)` for a leg
+   declaring k targets.
+2. **Positive point gain** on at least one metric that cleared (1). A metric
+   whose LCB clears but whose point gain is ≤ 0 does not count as cleared.
+3. **The other metric is non-inferior** (the orchestrator's conservative
+   reading of the owner's rule, stated here so it is reviewable): the metric
+   that did not clear may not get worse beyond the existing non-inferiority
+   bound, `LCB_α(rel) ≥ −tau_public` (0.01), at the guard level α
+   (intersection-union, no correction — the same rule today's text applies
+   to MASE). When both metrics clear, (3) holds trivially (an `α'` LCB ≥ 0.01
+   implies the α LCB ≥ 0.01 > −tau on the same bootstrap draws).
+4. **Evidence floor unchanged:** at least `min_public_items` items, else
+   `inconclusive`, never a merge.
+
+**Multiple testing: Bonferroni α/2 per metric.** Two metrics are tested for
+superiority and either may win, so the gain family is split. Bonferroni is
+the choice consistent with the existing lane B code: `judge_expert_targets`
+already splits α across a leg's own targets by Bonferroni (`alpha / k`,
+`cascade/eval/expert_lane.py:284`), and lane B has no joint max-T across
+metrics (the only max-T, `cohort_maxt_lcbs`, `cascade/eval/bootstrap.py:393`,
+is lane D's cohort statistic). The two corrections compose: α/(2k). Each
+metric keeps its own bootstrap sub-seed (`<seed>|gain|<target>|crps`,
+`…|mase`), so the verdict stays deterministic and re-derivable.
+
+**Unchanged.** Every regression guard stays as DEC-CA-0071 §3 states it:
+every other public suite (CRPS and MASE each `LCB ≥ −tau_public`), every
+private-pool domain (`_rest` pooling), every horizon, the whole-pool point
+gain ≥ 0 (guard 4), and the fixed anchor king (guard 5). Domain and horizon
+targets keep today's single-statistic gain test.
+
+**Report fields (signed, re-derived).** Per suite target: `cleared_metric`
+(`crps` | `mase` | `both` | none), `crps_lcb` and `mase_lcb` (both at α'),
+`crps_gain` and `mase_gain` (point estimates), `noninf_metric` and
+`noninf_lcb` (the non-cleared metric's α LCB), and `gain_alpha` (= α').
+**Full-pay tier input (orchestrator default, owner may override):** the
+win's `gain_lcb` (the `full_pay` tier input) is the larger α' LCB among the
+metrics that cleared.
+
+### rev6.19 (V) Verification against main @ 052eabef
+
+- `judge_expert_targets` (`cascade/eval/expert_lane.py:249`) has **no suite
+  branch yet**: `_target_mask` handles a pool domain or `horizon:<h>` only,
+  so a `suite:<s>` target finds zero windows and is `inconclusive`. There is
+  no `gain_margin_public` parameter in `ExpertLaneParams` or the lane B
+  loader, and no guard 4 / anchor guard. DEC-CA-0071 "Shipped: Nothing"
+  still holds for the judging side. The "today's rule" text (CRPS
+  superiority AND MASE non-inferior) is the plan/DEC design, not code.
+- No §3 WP row owns the suite-target judging branch (WB10–WB25 cover keys,
+  contamination, rows, opening rule, sentinel deferral, GPUs and leg
+  length; WB18 defers a sentinel suite target but does not judge one).
+- Nothing re-derives a lane B suite-target verdict yet (`check_lane_b`,
+  `cascade/audit/checks.py:3273`, checks weights and full-pay records).
+
+### rev6.19 (F) Feature build
+
+- **One feature PR**, under the WP that builds the suite-target branch of
+  `judge_expert_targets` (with `gain_margin_public`, guard 4 and the anchor
+  guard): tests (`tests/accept/<wp>/`) and code together, the (G) report
+  fields, and `check_lane_b` re-deriving the either-metric verdict from the
+  signed per-item scores. **Owner input:** that WP has no row yet (see (V));
+  the orchestrator assigns one before the feature PR opens. Until then the
+  rule is design text only and `[lane_b] suite_targets` stays false (its
+  arming is gated on SB3 anyway, §12b.1).
 
 ## rev6.18 (owner 2026-11-23; main @ 78b1d45): eval v2 (live 50% + public 50%), multivariate, one checker, burn scoping, GPU environments
 
@@ -4329,8 +4413,14 @@ The rules below are recorded in the DEC-CA-0071 amendment
 
 ### 12b.0 What carries over unchanged from DEC-CA-0071
 
-- **Gain test:** CRPS `LCB_α ≥ gain_margin_public` (0.01) on the whole suite;
-  MASE non-inferior; at least `min_public_items` items.
+- **Gain test:** ~~CRPS `LCB_α ≥ gain_margin_public` (0.01) on the whole suite;
+  MASE non-inferior; at least `min_public_items` items.~~ **(rev6.19, owner
+  2026-11-24)** improve EITHER CRPS OR MASE by ≥ 1% on the whole targeted
+  suite: CRPS `LCB_{α/2} ≥ gain_margin_public` (0.01) OR MASE
+  `LCB_{α/2} ≥ gain_margin_public` (Bonferroni α/2 per metric, on top of
+  the leg's α/k), a strictly positive point gain on a metric that cleared,
+  and the metric that did not clear non-inferior (`LCB_α ≥ −tau_public`);
+  at least `min_public_items` items. Full rule in rev6.19 below.
 - **Guards:** every other suite, every pool domain, every horizon; the
   whole-pool point gain must be ≥ 0 (guard 4); the fixed anchor king (guard
   5).
@@ -5060,7 +5150,6 @@ script parses this table on main; it changes only by an owner-merged plan PR.
 | D46 | decided | (a) house dated by its lineage | S | owner, 2026-11-21 |
 | D47 | decided | (a) score the house as a BF16 cast; dedup against BF16 casts | S | owner (default), 2026-11-21 |
 | D48 | decided | Fixed 25% shares of the total; lane D takes from lane A's 25% | S | owner, 2026-11-21 |
-
 **No decision is open, so no WP is blocked on a decision.** Proposed change 22
 asks the owner to confirm the five §15 rows recorded from "all other recs".
 
