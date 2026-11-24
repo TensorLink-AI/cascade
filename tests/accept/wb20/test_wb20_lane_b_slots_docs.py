@@ -8,6 +8,23 @@ from __future__ import annotations
 
 from pathlib import Path
 
+
+def _spec(fn):
+    """A missing behaviour fails as an AssertionError (never an import,
+    attribute, key or value error), so BASE fails for the right reason."""
+    import functools
+
+    @functools.wraps(fn)
+    def run(*a, **kw):
+        try:
+            return fn(*a, **kw)
+        except AssertionError:
+            raise
+        except Exception as e:  # noqa: BLE001 - every other failure is the spec failing
+            raise AssertionError(f"{type(e).__name__}: {e}") from e
+
+    return run
+
 REPO = Path(__file__).resolve().parents[3]
 MINER = REPO / "docs" / "MINER.md"
 
@@ -16,6 +33,7 @@ def _text() -> str:
     return " ".join(MINER.read_text(encoding="utf-8").split())
 
 
+@_spec
 def test_miner_md_states_full_pay_until_replaced():
     from cascade.shared.config import LaneBConfig
 
@@ -27,6 +45,7 @@ def test_miner_md_states_full_pay_until_replaced():
     assert "since_era" in t
 
 
+@_spec
 def test_miner_md_states_every_slot_two_families_and_bars():
     from cascade.shared.config import LaneBConfig
 
@@ -40,6 +59,7 @@ def test_miner_md_states_every_slot_two_families_and_bars():
     assert "CRPS **or** MASE" in t
 
 
+@_spec
 def test_miner_md_documents_multi_target_funding():
     import argparse
 

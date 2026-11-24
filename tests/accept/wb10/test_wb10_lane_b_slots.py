@@ -24,6 +24,23 @@ import pytest
 
 from .helpers import SHIPPED, load_ok, overrides_refusal, raw_with, refused
 
+
+def _spec(fn):
+    """A missing behaviour fails as an AssertionError (never an import,
+    attribute, key or value error), so BASE fails for the right reason."""
+    import functools
+
+    @functools.wraps(fn)
+    def run(*a, **kw):
+        try:
+            return fn(*a, **kw)
+        except AssertionError:
+            raise
+        except Exception as e:  # noqa: BLE001 - every other failure is the spec failing
+            raise AssertionError(f"{type(e).__name__}: {e}") from e
+
+    return run
+
 RETIRED = ("full_pay_tiers", "half_life_rounds", "floor", "win_ttl_eras")
 ERA = 100
 
@@ -32,6 +49,7 @@ ERA = 100
 
 
 @pytest.mark.parametrize("name", SHIPPED)
+@_spec
 def test_wb10_shipped_files_carry_no_retired_payout_key(name):
     import tomllib
     from pathlib import Path
@@ -45,6 +63,7 @@ def test_wb10_shipped_files_carry_no_retired_payout_key(name):
 
 
 @pytest.mark.parametrize("name", SHIPPED)
+@_spec
 def test_wb10_retired_payout_keys_load_and_are_ignored(name):
     from cascade.shared.config import RETIRED_KEYS
 
@@ -55,10 +74,12 @@ def test_wb10_retired_payout_keys_load_and_are_ignored(name):
 
 
 @pytest.mark.parametrize("value", [0.005, 1.0, float("nan"), -0.1])
+@_spec
 def test_wb10_undeclared_gain_margin_refuses_bad_values(value):
     assert refused(raw_with("chain.toml", {"undeclared_gain_margin": value}))
 
 
+@_spec
 def test_wb10_undeclared_gain_margin_parses_and_is_overlay_settable():
     lb = load_ok(raw_with("chain.toml", {"undeclared_gain_margin": 0.03})).lane_b
     assert lb.undeclared_gain_margin == 0.03
@@ -92,6 +113,7 @@ def _state(*wins):
     return st
 
 
+@_spec
 def test_wb10_held_slot_pays_full_forever():
     from cascade.shared.lane_b import lane_b_payouts
 
@@ -105,6 +127,7 @@ def test_wb10_held_slot_pays_full_forever():
                                "multiplier", "gain_lcb"}
 
 
+@_spec
 def test_wb10_one_miner_holds_every_slot_and_empty_slots_burn():
     from cascade.shared.lane_b import combined_weights
 
@@ -121,6 +144,7 @@ def test_wb10_one_miner_holds_every_slot_and_empty_slots_burn():
     assert vec[9] == pytest.approx(0.5) and vec[0] == pytest.approx(0.0)
 
 
+@_spec
 def test_wb10_holder_keeps_slot_until_a_newer_accepted_merge():
     from cascade.shared.lane_b import LaneBState, lane_b_payouts
 
@@ -180,6 +204,7 @@ def _judge(declared, effects, **kw):
                               **_scores(effects, **kw))
 
 
+@_spec
 def test_wb10_every_slot_is_tested_and_each_cleared_slot_is_claimable():
     tv = _judge(["energy"], {"energy": 0.90, "web": 0.95, "sales": 0.985})
     assert tv.targets == DOMS and tv.declared == ("energy",)
@@ -193,11 +218,13 @@ def test_wb10_every_slot_is_tested_and_each_cleared_slot_is_claimable():
     assert set(tv.maxt_crits) == {"declared", "undeclared"}
 
 
+@_spec
 def test_wb10_declared_target_clears_at_the_lower_bar():
     tv = _judge(["sales"], {"sales": 0.985})
     assert tv.verdicts["sales"].passed and tv.verdicts["sales"].bar == 0.01
 
 
+@_spec
 def test_wb10_declared_family_is_independent_of_the_undeclared_slots():
     """Testing every other slot never makes a declared target harder: the
     declared family's critical value and LCBs are the same whatever the
@@ -208,6 +235,7 @@ def test_wb10_declared_family_is_independent_of_the_undeclared_slots():
     assert a.verdicts["energy"].metric_lcbs == b.verdicts["energy"].metric_lcbs
 
 
+@_spec
 def test_wb10_crps_or_mase_with_the_other_non_inferior():
     # CRPS improves 5%, MASE flat: clears on CRPS
     tv = _judge(["energy"], {"energy": 0.95}, mase_effects={"energy": 1.0})
@@ -217,11 +245,13 @@ def test_wb10_crps_or_mase_with_the_other_non_inferior():
     assert not tv.verdicts["energy"].passed
 
 
+@_spec
 def test_wb10_a_guard_failure_blocks_every_slot():
     tv = _judge(["energy"], {"energy": 0.90, "web": 0.90, "nature": 1.10})
     assert tv.guard_reason and tv.won == []
 
 
+@_spec
 def test_wb10_inconclusive_slot_is_never_claimed():
     from cascade.eval.expert_lane import ExpertLaneParams, judge_expert_slots
 

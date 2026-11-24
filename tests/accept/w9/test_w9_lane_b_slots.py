@@ -26,6 +26,23 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+
+def _spec(fn):
+    """A missing behaviour fails as an AssertionError (never an import,
+    attribute, key or value error), so BASE fails for the right reason."""
+    import functools
+
+    @functools.wraps(fn)
+    def run(*a, **kw):
+        try:
+            return fn(*a, **kw)
+        except AssertionError:
+            raise
+        except Exception as e:  # noqa: BLE001 - every other failure is the spec failing
+            raise AssertionError(f"{type(e).__name__}: {e}") from e
+
+    return run
+
 REPO = Path(__file__).resolve().parents[3]
 ERA = 3600
 V2 = 9_399_600
@@ -74,6 +91,7 @@ def _audit(cfg, rc):
 
 
 @pytest.mark.parametrize("eras", [0, 10, 28, 500])
+@_spec
 def test_w9_holder_paid_in_full_at_any_age(tmp_path, eras):
     block = MERGE + eras * ERA
     cfg, rc = _receipt(tmp_path, block)
@@ -85,6 +103,7 @@ def test_w9_holder_paid_in_full_at_any_age(tmp_path, eras):
 
 
 @pytest.mark.parametrize("tamper", ["decayed", "since_era", "bool_since_era", "age", "no_lcb"])
+@_spec
 def test_w9_tampered_payout_row_fails(tmp_path, tamper):
     cfg, rc = _receipt(tmp_path, MERGE + 40 * ERA)
     pay = copy.deepcopy(rc.lane_b_pay)
@@ -103,6 +122,7 @@ def test_w9_tampered_payout_row_fails(tmp_path, tamper):
     assert _audit(cfg, bad).status == "FAIL", tamper
 
 
+@_spec
 def test_w9_payout_binds_to_the_settlement_state(tmp_path):
     cfg, rc = _receipt(tmp_path, MERGE + 5 * ERA)
     ok = {"lane_b": {"energy": ["alice", HOLDER_UID, MERGE, "r1", 0.03, None, None]}}
@@ -165,6 +185,7 @@ def _check_rows(cfg, rows):
     return check_lane_b(rc, replace(cfg, lane_b=replace(cfg.lane_b, acceptance_from_block=0)))
 
 
+@_spec
 def test_w9_judged_leg_has_one_row_per_slot_in_two_families(tmp_path):
     cfg = _cfg(tmp_path)
     tv, rows = _rows(cfg, ["energy"], {"energy": 0.9, "sales": 0.94})
@@ -179,6 +200,7 @@ def test_w9_judged_leg_has_one_row_per_slot_in_two_families(tmp_path):
 
 @pytest.mark.parametrize("tamper", ["gain_bar", "family", "passed", "crit", "missing_slot",
                                     "declared_flag"])
+@_spec
 def test_w9_tampered_slot_rows_fail(tmp_path, tamper):
     cfg = _cfg(tmp_path)
     _tv, rows = _rows(cfg, ["energy", "web_cloudops"], {"energy": 0.9, "sales": 0.94})
