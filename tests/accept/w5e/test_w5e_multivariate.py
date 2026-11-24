@@ -19,7 +19,8 @@ import numpy as np
 import pytest
 
 from tests.accept.w7a import helpers as w7a
-from tests.accept.w7a import mv
+
+from .f2_fixture import mv
 
 WIDE = 40
 WIDE_EMPTY = (5, 17, 22, 30, 33, 38, 39)     # 33 non-empty channels left: one over the cap

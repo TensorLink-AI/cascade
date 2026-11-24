@@ -17,9 +17,8 @@ from pathlib import Path
 
 import numpy as np
 
-from tests.accept.w7a import mv
-
 from . import helpers as h
+from .f2_fixture import mv
 
 WIDE_EMPTY = (5, 17, 22, 30, 33, 38, 39)
 
