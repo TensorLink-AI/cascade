@@ -3542,7 +3542,18 @@ model of a settlement is forecast on that one host; the optional
 identity and code, so moving to another host re-scores the whole cohort.
 Qualifying a new environment: the procedure in the file's header (candidate
 PR, W0b + golden-set agreement vs `cu124-torch241`, A9 timing, evidence file,
-owner merge with an activation `from_block`). Bring the host up at S4 with an
+owner merge with an activation `from_block`). The kit is
+`python -P -m cascade.eval.lane_d_env_qual {golden,forecast,compare,check}`:
+`golden` picks 500 live + 500 public windows from `pool_d/1` directories,
+`forecast` runs on the pod in the environment under test (and, for the
+reference, in the release venv on a `cu124-torch241` GPU), `compare` scores
+both, replays the cohort and attaches the W0b junit XML and the A9
+`laned_t7/1` pod document (`cascade.eval.lane_d_t7_pod --window-counts 15000
+--n-models 10`), and `check --env NAME` re-derives the committed evidence
+file (the W4 acceptance test does the same for every qualified entry). The
+`sm120-torch212` venv is `uv sync --project deploy/laned/envs/sm120-torch212
+--frozen --group qualify` with the repo on `PYTHONPATH`; its hello reports
+`torch_build = 2.12.1+cu130/cuda-13.0`. Bring the host up at S4 with an
 on-rent check (`nvidia-smi -L`, VRAM, driver, disk), pinned known_hosts and a
 dry run. It gets presigned GETs only, never a credential.
 
