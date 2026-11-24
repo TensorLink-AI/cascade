@@ -65,7 +65,36 @@ the paid court" burn check). The validator's builder
 **Text struck elsewhere:** §1.4 (court decay), the W2 key list, D7 (§6 and
 §17.4), D25's 57 / 29 / 14.
 
+## rev6.20b (owner 2026-11-24): no activation block for lane B EMA
+
+Owner 2026-11-24: "lanes B, C and D are NOT rolled out yet, so **no
+activation blocks**." This amends rev6.20 below. Plan text only.
+
+- **EMA, no cooldown is simply lane B.** Every lane B leg contract carries
+  `lr_schedule = "warmup_constant_ema"` (`lane_b_leg_contract`, the one
+  helper the trainer and the worker share). Every lane B leg scores and
+  merges its σ_rel 0.10 power EMA. No key, flag or block arms it.
+- **~~`[lane_b] ema_no_cooldown_from_block`~~ is not built** (struck in
+  rev6.20 below). It never reached main, so there is nothing to retire.
+- **Kept:** the signed record and the judge check. Every expert manifest
+  entry carries `scored_weights = "ema010"`, always in the signed body. A
+  manifest without the field loads as `""`, and `judge_entry` refuses any
+  entry whose value is not `"ema010"` at stage `scored_weights` (in the
+  audit's `LANE_B_STAGES`).
+- **Dropped:** the trainer's per-leg marker check (`scored_weights_mismatch`).
+  The receipt check (`receipt_contract_ok`) already binds the pod to the
+  EMA leg contract.
+- **Unchanged:** lane A (W-EMA, cooldown, `contract_digest`, `[training]`,
+  pinned deps). The on-pod part still ships in a shared-image repin, never
+  mid seed epoch. Lane B goes live only with its own rollout
+  (`[lane_b] from_block`).
+- **WPs (#845):** W-EMA, WB10 (`lane_b_leg_contract`, no key), WB22, W-S2,
+  W9, WB20 (MINER.md).
+
 ## rev6.20 (owner 2026-11-24; main @ 052eabe): lane B legs train with EMA, no cooldown
+
+**(rev6.20b) The activation key below is superseded: no key; the rule is
+lane B itself (rev6.20b above).**
 
 One owner decision, for **lane B only** (owner 2026-11-24, DECIDED: "let's
 just do EMA, no cooldown"). Plan text only; the code lands as one feature
@@ -105,15 +134,15 @@ for every input. Lane A training, the lane A `contract_digest`, every
 byte-identical; the existing byte-identity tests (WB25 `main_snapshot`
 oracle, W-EMA EMA-off comparisons) prove it in CI.
 
-**Consensus surface (validators judge lane B legs).** One typed activation
-key, the repo's `*_from_block` pattern:
+**Consensus surface (validators judge lane B legs).** ~~One typed activation
+key, the repo's `*_from_block` pattern:~~ **(rev6.20b) no key.**
 
-- **`[lane_b] ema_no_cooldown_from_block`** (integer ≥ 0; default **0 =
+- ~~**`[lane_b] ema_no_cooldown_from_block`** (integer ≥ 0; default **0 =
   never**, today's behaviour). When typed, an era boundary at or after
   `[v2] from_block` (loader-checked, like `acceptance_from_block`).
   Overlay-settable like every `[lane_b]` key except the release-only hash
   set. A lane B leg whose dispatch block (`--block`, recorded as the expert
-  manifest entry's `train_block`) is ≥ the key trains under the new rule.
+  manifest entry's `train_block`) is ≥ the key trains under the new rule.~~
 - **Lane B leg contract.** From that block the trainer and the worker derive
   the leg contract as today (`for_hours`) and then set `lr_schedule =
   "warmup_constant_ema"`, one shared helper on both sides. The worker's
@@ -145,12 +174,13 @@ key, the repo's `*_from_block` pattern:
 repin + wall gate, never mid seed epoch (memory: "Image repin: 5 pins + wall
 gate"), release-then-activate on netuid 91 (six external validators): ship
 the validator release, wait for ≥ 2/3 observed stake, then type
-`ema_no_cooldown_from_block` at a future era boundary. Testnet (netuid 259)
-first. Until the key is typed nothing changes, on any image.
+~~`ema_no_cooldown_from_block` at a future era boundary. Testnet (netuid 259)
+first. Until the key is typed nothing changes, on any image.~~ **(rev6.20b)**
+no key to type: lane B gets the rule when lane B rolls out.
 
 | Item | Change | Where |
 |---|---|---|
-| (a) | Lane B legs: no cooldown, scored = σ 0.10 power EMA, behind `[lane_b] ema_no_cooldown_from_block` | §8 W-EMA (lane B struck), W-EMA row, §3.2 lane B bullet, §12b.0, D44 note |
+| (a) | Lane B legs: no cooldown, scored = σ 0.10 power EMA, ~~behind `[lane_b] ema_no_cooldown_from_block`~~ **(rev6.20b) for every lane B leg** | §8 W-EMA (lane B struck), W-EMA row, §3.2 lane B bullet, §12b.0, D44 note |
 | (b) | Feature PR WPs: W-EMA (`pyramid_trainer.py`, `worker.py` ride-along), WB10 (key), WB22 (`expert_manifest.py`, `lane_b_driver.py`), WB23 (`validator/expert_lane.py`), W9 (`LANE_B_STAGES`) | §3 |
 
 ## rev6.18 (owner 2026-11-23; main @ 78b1d45): eval v2 (live 50% + public 50%), multivariate, one checker, burn scoping, GPU environments
@@ -3660,7 +3690,7 @@ Every new `[lane_b]` key below ships with:
 | WB23 | **(rev5)** Miner-chosen leg length (D42, D42b): `train_hours` on the funding request (0.5–`max_leg_hours`, 0.5 h steps); steps fixed at admission and signed in the leg record; guard = `train_hours × guard_factor` + overhead, capped at `[lane_b] max_leg_seconds` (lane B contract derivation; `[training] max_train_seconds` untouched); expected landing boundary returned to the miner; validator check of recorded steps and guard | keys `max_leg_hours`, `max_leg_seconds`, `guard_factor`; `status/lane_b.json` shows steps, GPU and landing boundary | WB10, WB22 | ci | `scripts/laned/accept WB23` (TB25–TB27) |
 | WB24 | **(rev6.3, proposed)** Lane B miner CLI. Today `cascade lane-b fund` / `lane-b status` (`cascade/miner/lane_b.py`) do not send the declared-rows header, so the WB20 docs have miners hand-build that request. `cascade lane-b fund` gains `--declared-rows <file>` (builds and signs the WB14 `X-Lane-B-Declared-Rows` header and its signed `rows=` tag; refuses locally with the same `DECLARED_ROWS_CODES` the intake uses), `--target suite:<s>` (suite targets, WB18) and `--train-hours` (WB23, once built). `cascade lane-b status` shows the new deferral and refusal reasons (`rows_held`, `sentinel_target`, the `gate_closed_reason` values, the WB13 contamination codes incl. `contamination_budget_exceeded`) from `status/lane_b.json` and the intake replies. New `cascade lane-b verify-repo <dir>` runs the WB13 scan (`scan_repo`) locally against the pinned hash set (no upload; never executes the repo) so a miner can check before funding. Never prints keys; unarmed defaults unchanged | CLI flags `--declared-rows`, `--target suite:<s>`, `--train-hours`; subcommand `verify-repo` | WB13, WB14, WB15, WB17, WB18 (WB23 for `--train-hours`) | ci | `scripts/laned/accept WB24` |
 | WB25 | **(rev6.8, owner 2026-11-23)** Multi-GPU lane B expert legs. Today `train_pyramid` (`cascade/trainer/pyramid_trainer.py`) forces `world = 1` for an expert-slice leg (`gang_size(trainer.device) if slices is None else 1`), so a lane B leg trains on GPU0 of an 8× pod (WB19 on 8×H200: 0.055 steps/s, the same as an RTX 4090). WB25 trains lane B expert legs on every GPU of the rented layout through the existing `pyramid_dp` `Gang` (micro-batches dealt round-robin, sums all-reduced, rank 0 owns the corpus and the optimizer), extended for `ExpertSlices`: the helper ranks hold the same compact selected-row leaves; the optimizer sharding and the gradient all-reduce cover only the trainable (selected) expert rows; the router and the routing bias stay frozen (WB16, D40 option a). The leg is identical to the 1-GPU leg up to floating-point summation order, and frozen tensors and unselected rows are exactly the king's. The leg record keeps the GPU count (`gpu_n`; WB22's audit re-derivation is pinned to the recorded `gpu_n`); `CASCADE_TRAIN_GPUS` may lower it. Lane A legs (no slices) are byte-for-byte unchanged and keep the same Gang path. No dependency, `[training]` or contract-digest change | leg metric `gpu_n` | WB16, WB19 | ci + pod | `scripts/laned/accept WB25` |
-| W-EMA | **(rev5)** Score the raw cooled endpoint on every leg (lanes A and B **(rev6.20: lane B only until `[lane_b] ema_no_cooldown_from_block`; from it lane B legs train with no cooldown and score the σ 0.10 power EMA, recorded as the expert entry's `scored_weights`)**): `power_ema_active` → raw for warm-start legs; keep writing `weights_ema005`/`weights_ema010` unscored; main-validator EMA telemetry off the critical path (§8). Blocks every repin ≥ rc16 and D40(b) | worker image (`pyramid_trainer.py`) | — | ci + testnet | `scripts/laned/accept W-EMA` |
+| W-EMA | **(rev5)** Score the raw cooled endpoint on every leg (lanes A and B **(rev6.20b: lane A only; every lane B leg trains with no cooldown and scores the σ 0.10 power EMA, recorded as the expert entry's `scored_weights`, no activation key)**): `power_ema_active` → raw for warm-start legs; keep writing `weights_ema005`/`weights_ema010` unscored; main-validator EMA telemetry off the critical path (§8). Blocks every repin ≥ rc16 and D40(b) | worker image (`pyramid_trainer.py`) | — | ci + testnet | `scripts/laned/accept W-EMA` |
 | WB20 | Lane B docs (MINER, INTERFACE, AGENT_MINING, VALIDATOR) | — | WB13–WB18 | ci | `scripts/laned/accept WB20` |
 | WB21 | DEC-CA-0071 amendment (this PR drafts it; owner accepts) | — | — | ci + owner | `scripts/laned/accept WB21` |
 | W-S1 | **(rev4: now in §3)** §16 sentinel draw + lane A gate rule behind `sentinel_from_block` + receipt field + `[v2]` overlay keys (**(rev5)** no shadow logging, D45). **(rev5) Changed consensus code:** the bench gate (`cascade/eval/bench_gate.py`) **and `king_check_gate` (`cascade/validator/king_check.py:93`)**, both of which must drop the sentinel suite from the rule; block-gated by `sentinel_from_block` | `[v2] sentinel_from_block`, `sentinel_suites`, `sentinel_ratchet`, `sentinel_tau` | W0c | ci | `scripts/laned/accept W-S1` (TS1–TS3, TS5) |
@@ -3825,7 +3855,8 @@ These are pinned by tests in the WPs named.
     raw cooled endpoint on every leg.
   - **(rev6.20)** Lane B EMA / no cooldown is on-pod code too
     (`pyramid_trainer.py`, `worker.py`), so it ships in a shared-image repin;
-    it changes nothing until `[lane_b] ema_no_cooldown_from_block` is typed
+    **(rev6.20b: no key; it applies to every lane B leg once lane B rolls
+    out)** ~~it changes nothing until `[lane_b] ema_no_cooldown_from_block` is typed~~
     (release-then-activate, after the repin).
 
 ---
@@ -4091,7 +4122,7 @@ is **accepted** unless a row says otherwise. The explicit answers:
 | D42 | **(rev5) DECIDED (owner 2026-11-21):** expert-leg cost (LB6) | **Cheaper GPUs allowed** via a lane B-only `[lane_b] funded_pod_skus` (each type image-qualified and measured first), and **miner-chosen leg length** `train_hours` 0.5–6.0 h (`[lane_b] max_leg_hours = 6.0`), guard capped by a new `[lane_b] max_leg_seconds`, never by editing `[training] max_train_seconds`. Operator funding not adopted. §12b.6 |
 | D42b | **(rev5)** What `train_hours` means (§12b.6) | (a) wall hours on the chosen GPU, steps fixed at admission from the measured per-GPU rate (**recommended**); (b) reference hours, steps = 23,841 × h / 3 on any GPU **(rev5) DECIDED: (a) real hours on the chosen GPU** (owner). |
 | D43 | **(rev5) DECIDED (owner 2026-11-21):** lane D reveal timing | **Immediate reveal** (`min_blocks`), not lane A's boundary − 25 blocks; T = the observed reveal block. Starts the forward clock up to ≈ 3 h earlier. §1.2 step 4, W10. (The commit-inclusion-block alternative is not adopted) |
-| D44 | **(rev5) WITHDRAWN (owner 2026-11-21)** | Power EMA instead of cooldown was drafted and then dropped by the owner. ~~Lanes A and B keep today's cooldown.~~ Lane A keeps today's cooldown. Not planned **for lane A**. **(rev6.20, owner 2026-11-24)** Lane B only: EMA, no cooldown, decided separately (rev6.20 section, behind `[lane_b] ema_no_cooldown_from_block`); D44 itself stays withdrawn |
+| D44 | **(rev5) WITHDRAWN (owner 2026-11-21)** | Power EMA instead of cooldown was drafted and then dropped by the owner. ~~Lanes A and B keep today's cooldown.~~ Lane A keeps today's cooldown. Not planned **for lane A**. **(rev6.20, owner 2026-11-24)** Lane B only: EMA, no cooldown, decided separately (rev6.20 / rev6.20b: every lane B leg, no activation key); D44 itself stays withdrawn |
 | D45 | **(rev5) DECIDED (owner 2026-11-21):** go-live rule | No shadow modes: every feature goes live at one activation block on every node at full effect. Testnet + S1 replace shadow evidence; release-then-activate (observed stake ≥ 2/3 **before** the block) and the kill switch stay. §5 |
 | D46 | **(rev5, C1)** House T, which fixes starvation (§1.3, §1.4; interacts with D20) | Today the house's T resets on every KING_A change (a dethrone or a promotion; the king leg trains once per seed epoch, `shared/era.py:440-457`), so pending entries restart. If lane A changes king faster than lane D's commit-to-crown latency (~~about 2–8 days with confirmation~~ **(rev6.11)** ≈ T+6–9 h (10 s data) to ≈ 1 day (15-min, hourly) with 3-hourly pool_d, no confirmation duel), no challenger can crown. (a) **T_house = the latest commit (reveal) block of any generator in its lineage (recommended)**; (b) an entry keeps the T_K it froze against; (c) unchanged. B2 measures house refresh frequency **(rev5) DECIDED: (a)** (owner). |
 | D47 | **(rev5, C2)** House precision under BF16-only | (a) **score the house as a BF16 cast of KING_A, and dedup entries against BF16 casts of every published checkpoint (recommended)**, so the house plays by the entry rules and a cast copy can't dodge dedup; (b) the house stays F32 |
@@ -4125,11 +4156,10 @@ is **accepted** unless a row says otherwise. The explicit answers:
 - **(rev5) WP W-EMA (blocks every repin to an image ≥ rc16, including any
   image #477's NCCL pin ships in if it's built from main):**
   - The next image **scores the raw cooled endpoint on every leg**, in lanes
-    A ~~and B~~. **(rev6.20, owner 2026-11-24) Lane B is superseded:** from
-    `[lane_b] ema_no_cooldown_from_block` a lane B leg trains with no
-    cooldown and scores its σ_rel 0.10 power EMA (rev6.20 above); before it
-    (and with the key unset) lane B keeps this rule. Lane A keeps it
-    unconditionally. `power_ema_active` is changed so warm-start legs behave like
+    A ~~and B~~. **(rev6.20/rev6.20b, owner 2026-11-24) Lane B is
+    superseded:** every lane B leg trains with no cooldown and scores its
+    σ_rel 0.10 power EMA (rev6.20 above), with no activation key. Lane A
+    keeps this rule unconditionally. `power_ema_active` is changed so warm-start legs behave like
     random-init legs do today: `weights.safetensors` is the raw endpoint, and
     `weights_ema005` / `weights_ema010` are written alongside, **unscored**.
   - The main validator scores the EMA files **off the critical path** and
@@ -4140,9 +4170,9 @@ is **accepted** unless a row says otherwise. The explicit answers:
     switch the scored file, as one activation for every leg (D45).
   - Tests: a warm-start leg's scored file is byte-identical to the raw
     endpoint; both EMA files are present; a lane B leg from an EMA-marked king
-    still scores raw **(rev6.20: under the default `wsd` leg contract, i.e.
-    before `ema_no_cooldown_from_block`; after it the lane B leg scores its
-    own σ 0.10 EMA whatever its king)**.
+    still scores raw **(rev6.20b: only when trained directly on the `wsd`
+    era contract; the dispatched lane B leg contract is the EMA schedule, so
+    a dispatched lane B leg scores its own σ 0.10 EMA whatever its king)**.
 - **Reproducibility:** options are folded into each leg's effective contract
   and replayed by the trainer, validators and audit.
 - **Cost:** it's a lane A contract change (image, repin and seed-epoch rules;
@@ -4504,12 +4534,11 @@ The rules below are recorded in the DEC-CA-0071 amendment
   reused as-is (`:49-51`).
 - **(rev6.20, owner 2026-11-24) Schedule and scored weights.** ~~A lane B
   leg uses lane A's WSD schedule (cooldown over the last 1/11 of its steps)
-  and scores the raw cooled endpoint (W-EMA).~~ From `[lane_b]
-  ema_no_cooldown_from_block` a lane B leg has **no cooldown** (warmup, then
-  constant LR to the end) and its scored and merged weights are its
-  **σ_rel 0.10 power EMA**; the expert entry records `scored_weights =
-  "ema010"` and judges re-derive it from `train_block`. Before the key (and
-  while it is unset) today's rule holds. Lane A is unchanged (rev6.20).
+  and scores the raw cooled endpoint (W-EMA).~~ **(rev6.20b: no key)** Every
+  lane B leg has **no cooldown** (warmup, then constant LR to the end) and
+  its scored and merged weights are its **σ_rel 0.10 power EMA**; every
+  expert entry records `scored_weights = "ema010"` and judges refuse any
+  other value. Lane A is unchanged (rev6.20).
 - **Legs:** `[lane_b] leg_hours = 3.0`, `leg_funding = "miner"` (deployed).
   **(rev5)** Replaced by miner-chosen `train_hours` (0.5–6 h) on a lane B GPU
   list (D42, §12b.6); `leg_hours` stays the default when a miner sets none.
