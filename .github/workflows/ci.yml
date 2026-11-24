@@ -72,6 +72,11 @@ jobs:
       - name: Documentation interfaces and links
         run: uv run python scripts/check_docs.py
 
+      # One rule per incident a pattern could have caught (docs/INCIDENT_RULES.md).
+      # Stdlib only, no cascade imports, well under a second.
+      - name: Incident rules
+        run: uv run python scripts/check_incident_rules.py
+
       - name: Unit shard plan is a partition of tests/unit
         run: python3 scripts/ci_shard.py --verify --of 4
 

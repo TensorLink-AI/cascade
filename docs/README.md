@@ -32,7 +32,7 @@ configuration and signed records win. Protocol rationale is in
 
 | Doc | Read it for |
 |---|---|
-| [OPERATOR.md](OPERATOR.md) | The operator runbook: trainer, funding intake, provisioner, public pages. |
+| [INCIDENT_RULES.md](INCIDENT_RULES.md) | The incident lint rules CI enforces, and how to add one after an incident. |
 | [EVAL_POOL.md](EVAL_POOL.md) | Building the private eval pool with `cascade-pool`. |
 | [LANE_C_COMPETITIONS.md](LANE_C_COMPETITIONS.md) | Adding a new lane C competition (code plus config). |
 | [V2_DIRECT_MOE.md](V2_DIRECT_MOE.md), [V2_DIRECT_MOE_OPERATIONS.md](V2_DIRECT_MOE_OPERATIONS.md) | The separate direct-MoE protocol. Built but refused for live activation in this release. |

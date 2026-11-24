@@ -101,7 +101,7 @@ poll_seconds  = 30
 # market_sku   = "L40S"
 # gpus_per_pod = 1
 # max_pods     = 1
-# providers    = ["lium", "shadeform"]
+# providers    = ["lium"]          # GPUs are Lium only; Shadeform is CPU only (2026-11-24)
 # max_price_hr = 1.20
 
 # ── MarketCast pod (DEC-CA-0064; the MAIN validator only) ─────────────────────

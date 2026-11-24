@@ -3078,6 +3078,11 @@ class LaneDPay:
     detail: str = ""
     alerts: tuple[str, ...] = ()
     transient: str = ""
+    # DEC-CA-0076 (owner 2026-11-24): the signed report's KING_D is the house
+    # (no miner has ever held KING_D: the house never retakes after a miner
+    # crown, refused by ld_crown). Lane D's share then flows back to its
+    # ``takes_from`` lane: the vector is exactly the lane-D-off one.
+    genesis: bool = False
 
     @property
     def paid(self) -> bool:
@@ -3184,7 +3189,8 @@ def lane_d_pay(receipt: RoundReceipt, cfg: ChainConfig, lane_d) -> LaneDPay:
     if court is None:
         return LaneDPay(code="lane_d_report_unverified",
                         detail="ld_court: pay.court is not a list of slots", alerts=alerts)
-    return LaneDPay(court=court, alerts=alerts)
+    genesis = bool((report.get("king_after") or {}).get("house"))
+    return LaneDPay(court=court, alerts=alerts, genesis=genesis)
 
 
 def _lane_d_wants(receipt: RoundReceipt, cfg: ChainConfig, pol, n: int, pay: LaneDPay,
@@ -4290,6 +4296,15 @@ def derive_weights(receipt: RoundReceipt, cfg: ChainConfig, *,
             return None, why
         if not pay.paid:
             return burned, pay.why
+        if pay.genesis:
+            # DEC-CA-0076: no miner has held KING_D — lane D's share is not
+            # carved (it stays with its takes_from lane), lanes A/B/C exactly
+            # as with lane D off
+            from dataclasses import replace as _dc_replace
+
+            off = _dc_replace(cfg, lane_d=_dc_replace(cfg.lane_d, from_block=0))
+            vec, why = derive_weights(receipt, off, burn_lanes=burn_lanes)
+            return (vec, "") if vec is not None else (None, why)
         return paid, ""
     if (rec is not None or getattr(receipt, "lane_c_pay", None) is not None
             or burn_lanes):

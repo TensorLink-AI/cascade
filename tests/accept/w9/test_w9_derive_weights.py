@@ -238,9 +238,11 @@ def test_a_re_signed_report_the_audit_refutes_is_refused(run):
 def test_a_report_the_chain_refutes_alerts_and_keeps_paying(run):
     """b3 forged to undo X's crown (test_w9_chain), re-signed and re-bound.
     Its chain provenance fails (B3 `ld_chain`: alert-class), so it is
-    alerted and its signed court (the house slot, which burns) stays paid
-    (rev6.18 B3, owner 2026-11-23: "Every other failed check logs, alerts
-    and keeps paying")."""
+    alerted and its signed record stays in force (rev6.18 B3, owner
+    2026-11-23: "Every other failed check logs, alerts and keeps paying").
+    Its KING_D is the house, so it reads as lane D's genesis (DEC-CA-0076,
+    laned:tests-correction; was: the house slot burns): lane D carves
+    nothing and the vector is lane A's alone."""
     from cascade.audit.checks import lane_d_pay
 
     receipt, _, _ = _honest(run, "s3")
@@ -249,7 +251,7 @@ def test_a_report_the_chain_refutes_alerts_and_keeps_paying(run):
     rec = h.lane_d_record(run["s3"], report=forged, receipt=rebound,
                           prior=[run["s1"].report, run["s2"].report])
     vec, why = h.derive(receipt, run["ccfg"], lane_d=rec)
-    assert why == "" and h.close_vectors(vec, h.producer_vector(run["ccfg"], [None])), \
+    assert why == "" and h.close_vectors(vec, h.lane_a_only_vector(run["ccfg"])), \
         (vec, why)
     pay = lane_d_pay(receipt, run["ccfg"], rec)
-    assert pay.paid and any(a.startswith("ld_chain:") for a in pay.alerts), pay
+    assert pay.paid and pay.genesis and any(a.startswith("ld_chain:") for a in pay.alerts), pay

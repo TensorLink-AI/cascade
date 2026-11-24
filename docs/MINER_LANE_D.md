@@ -89,14 +89,18 @@ blocks, about 24 h) of `submit`, or the entry expires (`ready_expired`).
   it, the entry waits (`context_below_armed`). You are never run above your
   declaration. A context arms when enough long series exist and the eval host
   passes its time and memory check.
-- **The bar.** Your gain's LCB must clear the crown bar against **both**
-  the lane D king (KING_D) **and the house** (the current lane A king, always
-  entered). In effect you must beat max(KING_D, house). In the first round
-  there is no miner KING_D, so you must beat the lane A king.
+- **The bar.** Your gain's LCB must clear the crown bar against the lane D
+  king (KING_D). The house (the current lane A king) exists only for lane
+  D's genesis (owner 2026-11-24, DEC-CA-0076).
+  - **Before the first miner crown,** the house holds KING_D, so the first
+    crown must beat max(house, lane A king). The house is the lane A king,
+    so this is the lane A king.
+  - **After the first crown,** the house is gone. It is no second bar and it
+    never retakes the crown, so you only need to beat KING_D.
   - The bar is **3%** (`d_margin_start`) against a fresh king and falls
     linearly to **1%** (`d_margin`) over 32 lane D settlements of the king's
-    tenure (`d_margin_warmup_settlements`, about 4 days). House tenure
-    counts. The signed report records the bar used (`crown_bar`).
+    tenure (`d_margin_warmup_settlements`, about 4 days). The signed report
+    records the bar used (`crown_bar`).
   - The crown is decided at the first verdict. There is no confirmation
     duel.
 - **The gate.** Each settlement draws one public bench suite from GIFT-Eval,
@@ -109,9 +113,13 @@ blocks, about 24 h) of `submit`, or the entry expires (`ready_expired`).
 
 Lane D pays a **court**: the king and up to two prior kings, split
 **80% / 15% / 5%** (`court_weights`). Prior kings are paid with no time
-limit. Empty seats renormalise over the filled ones. If the house holds the
-crown, the king seat burns (`house_king`). A deregistered holder's seat
-burns.
+limit. Empty seats renormalise over the miner kings that exist. A
+deregistered king's seat burns to `burn_uid` (unchanged): its uid no longer
+resolves, so it is never paid to whoever holds that uid now.
+
+**Genesis (DEC-CA-0076).** Until a miner is first crowned, lane D pays nobody
+and burns nothing. Its share stays with lane A, its `takes_from` lane, so the
+weights are exactly what they would be with lane D's share at 0.
 
 **Worked example at the owner-proposed split A0 / B35 / C15 / D50.** This is
 the owner's proposal (plan rev6.24), set by the mainnet launch overlay at
@@ -122,7 +130,7 @@ block 9586800. Check `cascade status --json` for the live value.
 | Full court (80/15/5 of D's 50%) | 40% of emissions | 7.5% | 2.5% |
 | King + one prior (renormalised over 0.95) | 42.1% | 7.9% | — |
 | King only | 50% | — | — |
-| House holds the crown | burns | 7.5% | 2.5% |
+| Genesis (no miner crowned yet) | lane D's 50% stays with lane A | — | — |
 
 These are shares of the validators' weight vector, not TAO or dollars.
 
@@ -198,8 +206,8 @@ windows yet), `context_below_armed`, `coldkey_cap_settlement`, `bench_hold`.
 settlements of its tenure. The signed report records the bar each verdict
 used.
 
-**Does winning lane A help in lane D?** The lane A king is the house: a
-competitor you must beat, never a paid seat.
+**Does winning lane A help in lane D?** The lane A king is the house. It is
+the bar for the first crown only, and never a paid seat.
 
 **Where are kings published?** Hippius Hub, the R2 public mirror and the HF
 mirror, indexed in the signed `champions/lane_d/index.json`.

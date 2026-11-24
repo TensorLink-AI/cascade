@@ -21,6 +21,7 @@ UV_SHA="${UV_SHA%% *}"
 # POD_KNOWN_HOSTS (optional): a per-pod known_hosts file — recycled provider
 # IPs must never be checked against another pod's key in the shared file.
 KH_OPTS=(); [[ -n "${POD_KNOWN_HOSTS:-}" ]] && KH_OPTS=(-o "UserKnownHostsFile=$POD_KNOWN_HOSTS")
+# incident-ok: IR004 KH_OPTS pins a per-pod known_hosts when the caller passes POD_KNOWN_HOSTS (elastic.py does)
 SSH_OPTS=(-p "$POD_PORT" -i "$POD_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new "${KH_OPTS[@]}")
 DEST="$POD_USER@$POD_IP"
 
@@ -32,6 +33,7 @@ rsync -a --delete-after \
   "$SRC_ROOT/" "$DEST:$POD_WORKDIR/"
 
 if [[ -n "${CASCADE_CHAIN_TOML:-}" ]]; then
+  # incident-ok: IR004 KH_OPTS pins a per-pod known_hosts when POD_KNOWN_HOSTS is set
   scp -P "$POD_PORT" -i "$POD_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new "${KH_OPTS[@]}" \
     "$CASCADE_CHAIN_TOML" "$DEST:$POD_WORKDIR/$(basename "$CASCADE_CHAIN_TOML")"
 fi
@@ -42,6 +44,7 @@ fi
 
 printf -v REMOTE_MKDIR 'mkdir -p -- %q' "$POD_WORKDIR/.bootstrap"
 ssh "${SSH_OPTS[@]}" "$DEST" "$REMOTE_MKDIR"
+# incident-ok: IR004 KH_OPTS pins a per-pod known_hosts when POD_KNOWN_HOSTS is set
 scp -P "$POD_PORT" -i "$POD_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new "${KH_OPTS[@]}" \
   "$UV_BIN" "$DEST:$POD_WORKDIR/.bootstrap/uv"
 # SSH joins command arguments through a remote shell; quote them explicitly.

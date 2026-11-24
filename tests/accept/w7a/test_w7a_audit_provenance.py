@@ -82,8 +82,8 @@ def _pending(tmp) -> dict:
 
 def _challenger(tmp) -> dict:
     """The `pass` run (X crowned at its first verdict, boundary(1)), then Y's
-    first verdict at boundary(2) against KING_D = X with the house H0 as the
-    second bar. Y is `good`: it loses to X but beats the `bad` house."""
+    first verdict at boundary(2) against KING_D = X alone (DEC-CA-0076: the
+    house is no second bar after a miner crown). Y is `good`: it loses to X."""
     h = _h()
     run = dict(_build("pass", tmp))
     x, h0 = run["x"], run["h0"]
@@ -98,8 +98,8 @@ def _challenger(tmp) -> dict:
     assert v is not None and v.get("stage", "first") == "first" \
         and v["king_digest"] == x["digest"], \
         f"fixture: Y was not judged against KING_D = X: {v}"
-    assert v["cleared"] is False and v["house"]["cleared"] is True, \
-        f"fixture: Y must lose to X and beat the house: {v}"
+    assert v["cleared"] is False and "house" not in v, \
+        f"fixture: Y must lose to X, judged against X alone: {v}"
     return run
 
 
@@ -500,9 +500,10 @@ def test_a_ground_bootstrap_seed_fails_the_audit(runs, which):
 
 
 def test_a_cohort_judged_against_another_king_fails_the_audit(runs):
-    """Y's first verdict at boundary(2) relabelled as judged against the weak
-    house instead of KING_D = X (rows, LCBs and outcome all consistent with
-    that relabel, held as an ungated clear): a cohort's king must be
+    """Y's first verdict at boundary(2) relabelled as judged against the
+    house instead of KING_D = X (X's rows relabelled to the house, so rows,
+    LCBs and outcome stay consistent; DEC-CA-0076 laned:tests-correction:
+    there is no house judgement to reuse any more): a cohort's king must be
     `king_before`."""
     run = runs("challenger")
     r, cfg = copy.deepcopy(run["s2"]), run["cfg"]
@@ -511,17 +512,15 @@ def test_a_cohort_judged_against_another_king_fails_the_audit(runs):
     assert r["king_before"]["digest"] == x
     v = _verdict(r, y)
     c = r["cohorts"][int(v["cohort"])]
-    hd = c.pop("house_digest")
+    assert "house_digest" not in c
+    hd = r["house"]["digest"]
     c["king_digest"], c["king_reveal_ts"] = hd, int(r["house"]["reveal_ts"])
     c["t_max"] = max([int(r["house"]["reveal_ts"])]
                      + [int(_entry(r, m)["reveal_ts"]) for m in c["members"]])
-    r["rows"] = [row for row in r["rows"]
-                 if not (int(row["cohort"]) == int(c["index"]) and row["digest"] == x)]
-    house_j = v.pop("house")
-    v.update(king_digest=hd, lcb=house_j["lcb"], gain=house_j["gain"],
-             cleared=house_j["cleared"], outcome=_held_outcome(runs))
-    e = _entry(r, y)
-    e["status"], e["reason"] = "hold", "bench_hold"
+    for row in r["rows"]:
+        if int(row["cohort"]) == int(c["index"]) and row["digest"] == x:
+            row["digest"] = hd
+    v.update(king_digest=hd)
     _fails(_resign(r), cfg, "a first verdict judged against the house, not king_before")
 
 

@@ -1008,11 +1008,9 @@ class _Settlement:
                 for d in (fresh.pending, fresh.holds, fresh.used, fresh.status, fresh.reasons):
                     d.pop(k, None)
             self.chain = fresh
-            known = {self.king_before["digest"], *(p["digest"] for p in c.prior_kings)}
+            # DEC-CA-0076 (owner 2026-11-24): a new house opens no
+            # challenger after the first miner crown (no retake)
             he = None
-            if not self.king_before["house"] and hd not in known:
-                he = {"digest": hd, "reveal_ts": int(self.house["reveal_ts"]),
-                      "status": "pending"}
         if he is not None and (he["digest"] != hd or self.king_before["house"]):
             he = None
         self.house_ch = he
@@ -1407,7 +1405,9 @@ class _Settlement:
             d.add(f"{at}.refused")
         # The house is a second bar exactly when a miner holds the cohort's
         # KING_D and the house is not the challenger (never its own bar).
-        bars = [kd] if kd == bars_house or is_house else [kd, bars_house]
+        # DEC-CA-0076: KING_D is the only bar (the house only at genesis,
+        # as KING_D itself)
+        bars = [kd]
         if len(bars) == 1:
             if "house_digest" in c:
                 d.add(f"{at}.house_digest")
