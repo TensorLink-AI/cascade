@@ -35,7 +35,13 @@ import tomllib
 from pathlib import Path
 
 from ..shared.config import image_digest
-from ..shared.era import image_after_armed, image_decoupled_era, round_pins_at
+from ..shared.era import (
+    image_after_armed,
+    image_after_from,
+    image_decoupled_era,
+    image_epoch_from,
+    round_pins_at,
+)
 from .faults import _OperatorFault
 
 log = logging.getLogger(__name__)
@@ -89,7 +95,7 @@ def leg_round(runner):
     if not contract_runs_after(cfg, leg_contract(runner)):
         return cfg.round
     require_after_qualified(cfg, "rent")
-    return round_pins_at(cfg, int(cfg.v2.image_decoupled_from_block))
+    return round_pins_at(cfg, image_after_from(cfg))
 
 
 def proven_runtime_terms(cfg, contract, digest: str) -> tuple[str, str] | None:
@@ -252,17 +258,21 @@ def render_after_toml(text: str, cfg) -> str:
     worker of any release resolves the post-switch contract the orchestrator
     expects. Verified by re-parsing."""
     v2 = cfg.v2
-    rnd = round_pins_at(cfg, int(v2.image_decoupled_from_block))
+    rnd = round_pins_at(cfg, image_after_from(cfg))
     out = _set_keys(text, "v2.training", {"train_image_digest": str(v2.train_image_digest_after)})
     round_vals = {"funded_pod_image": rnd.funded_pod_image,
                   "worker_code_fingerprint": rnd.worker_code_fingerprint}
     if rnd.funded_sku_wall_measured_image:
         round_vals["funded_sku_wall_measured_image"] = rnd.funded_sku_wall_measured_image
     out = _set_keys(out, "round", round_vals)
-    out = _set_keys(out, "v2", {"image_decoupled_from_block": int(v2.image_decoupled_from_block)})
+    v2_vals = {"image_decoupled_from_block": int(v2.image_decoupled_from_block)}
+    if image_epoch_from(cfg):
+        # W-IMG: the worker resolves the same epoch-bound release block
+        v2_vals["image_after_epoch_block"] = int(image_after_from(cfg))
+    out = _set_keys(out, "v2", v2_vals)
     raw = tomllib.loads(out)
     want = {("v2", "training", "train_image_digest"): str(v2.train_image_digest_after),
-            ("v2", "image_decoupled_from_block"): int(v2.image_decoupled_from_block),
+            **{("v2", k): v for k, v in v2_vals.items()},
             **{("round", k): v for k, v in round_vals.items()}}
     for path, value in want.items():
         node = raw

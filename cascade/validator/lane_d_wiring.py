@@ -124,6 +124,22 @@ class LaneDInputs:
     prior_pool_dirs: tuple = ()
     armed: Mapping | None = None
     channel_block_hash: str | None = None
+    # W-IMG: the eval host's code identity the forecasts came from
+    # ({"git_head", "package_hash"}; None = not known)
+    eval_identity: Mapping | None = None
+
+
+def _eval_identity_of(cfg: Any, inp: Any, boundary: int) -> dict | None:
+    """W-IMG (plan rev6.24 (e)): the eval host's identity the settlement's
+    forecasts ran on, recorded in the signed report from ``[v2]
+    image_epoch_from_block`` (logged, never enforced; ``None`` before it so
+    every earlier report keeps its bytes)."""
+    from ..shared.era import image_record_at
+
+    ident = getattr(inp, "eval_identity", None)
+    if not ident or not image_record_at(cfg, int(boundary)):
+        return None
+    return {k: str(v) for k, v in dict(ident).items()}
 
 
 def _armed_of(inp: Any) -> dict | None:
@@ -293,7 +309,9 @@ class LaneDStep:
                               signer=self.signer, prior_pool_dirs=tuple(inp.prior_pool_dirs),
                               expect_prior_sha256=expect, boundary_block_hash=block_hash,
                               sentinel=sentinel, bench=bench, armed=_armed_of(inp),
-                              max_channels=_max_channels(self.cfg))
+                              max_channels=_max_channels(self.cfg),
+                              **({"eval_identity": ident} if (ident := _eval_identity_of(
+                                  self.cfg, inp, int(boundary))) else {}))
         except Exception as e:  # noqa: BLE001 — LaneDStateError, schema, pool or crash
             raise LaneDWiringError("settle_refused",
                                    f"settlement {boundary} refused ({e})") from e

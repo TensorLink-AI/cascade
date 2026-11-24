@@ -387,8 +387,12 @@ def bind_image_after(cfg):
     c = getattr(t, "v2_contract", None)
     if v2 is None or c is None:
         return cfg
+    from ..era import image_after_from
+
     img = str(getattr(v2, "train_image_digest_after", "") or "")
-    gate = int(getattr(v2, "image_decoupled_from_block", 0) or 0) if img else 0
+    # the generalised switch: image_decoupled_from_block, or with W-IMG the
+    # seed-epoch start the trainer bound the release at (0 = unbound)
+    gate = image_after_from(cfg) if img else 0
     if (c.train_image_digest_after, c.train_image_after_block) == (img, gate):
         return cfg
     return replace(cfg, training=replace(t, v2_contract=replace(

@@ -271,12 +271,12 @@ def mkt_contract_block_kw(cfg, era) -> dict:
     checks the pod's worker code, pushes the post-switch chain.toml and the
     worker resolves (and verifies) the after image — the rent already used the
     era's pins (``funded_contract``). Any other leg: no key (byte-identical)."""
-    from ..shared.era import image_after_armed, image_decoupled_era
+    from ..shared.era import image_after_era
 
     if getattr(getattr(cfg, "marketcast", None), "pod_image", ""):
         return {}       # its own image ([marketcast] pod_image): never the fleet's after pins
     start = int(getattr(era, "start_block", 0) or 0)
-    if image_after_armed(cfg) and image_decoupled_era(cfg, start):
+    if image_after_era(cfg, start):
         return {"contract_block": start}
     return {}
 
@@ -392,9 +392,16 @@ def train_mkt_leg(ops, leg: dict, recipe: MktLegRecipe) -> dict:  # pragma: no c
     record_mkt_lineage(r.work_root, entry.trained_pointer, train_time=recipe.train_time,
                        checkpoint_sha256=str(mkt.get("checkpoint_sha256", "")),
                        init_pointer=recipe.init_pointer)
+    from ..shared.config import image_digest
+
+    # W-IMG: the worker image the leg ran — its own [marketcast] pod_image
+    # release when set, else its contract's pin (the leg's pods run it)
+    mc = getattr(r.cfg, "marketcast", None)
+    image = image_digest(str(getattr(mc, "pod_image", "") or "")) or image_digest(
+        str(getattr(contract, "train_image_digest", "") or ""))
     return {"trained_pointer": entry.trained_pointer, "corpus_digest": entry.corpus_digest,
             "train_block": int(entry.train_block), "gpu_name": str(entry.gpu_name or ""),
-            "marketcast": dict(mkt)}
+            "marketcast": dict(mkt), **({"train_image_digest": image} if image else {})}
 
 
 __all__ = ["LINEAGE_FILE", "load_mkt_lineage", "record_mkt_lineage", "resolve_mkt_init",

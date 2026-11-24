@@ -1,0 +1,38 @@
+# W-IMG: one worker image per v2 seed epoch, chosen by the trainer; lanes B-D
+# log the image (plan rev6.24 (e); owner sign-off 2026-11-24, README.md).
+#
+# Config: the typed activation key + the trainer's bound epoch block, and the
+# loader's era-start / ordering checks.
+cascade/shared/config/v2.py
+cascade/shared/config/loader.py
+# The generalised DEC-CA-0067 switch (image_after_from) bound onto the v2
+# contract's image schedule.
+cascade/shared/config/chain_config.py
+# Consensus helpers: seed-epoch start from the era stamp, the rule's
+# activation per seed epoch, the lanes B-D record gate, the trainer binding.
+cascade/shared/era.py
+# Lane A validator gate: era_image_missing / _mixed / _changed; the epoch's
+# image recorded in epoch_init.
+cascade/validator/era_gate.py
+# Audit: image-epoch (per receipt) and image-epoch-chain (across receipts),
+# and the mainnet receipt replay.
+cascade/audit/checks.py
+scripts/replay_mainnet_receipts.py
+# Trainer: the per-seed-epoch binding (tick, persistence) and the pins that
+# follow it.
+cascade/trainer/image_epoch.py
+cascade/trainer/loop.py
+cascade/trainer/leg_pins.py
+cascade/trainer/marketcast_runner.py
+# Lanes B, C: the image recorded per leg in the signed records.
+cascade/shared/expert_manifest.py
+cascade/trainer/lane_b_driver.py
+cascade/shared/lane_c_manifest.py
+cascade/trainer/lane_c_driver.py
+# Lane D: the eval host identity recorded under the report's extensions.
+cascade/validator/lane_d.py
+cascade/validator/lane_d_inputs.py
+cascade/validator/lane_d_wiring.py
+# The decision record and the operator runbook.
+decisions/DEC-CA-0067-image-decoupled-training-contract.md
+docs/OPERATOR.md

@@ -462,9 +462,12 @@ class LaneDInputsSource:
             raise LaneDInputsError("forecasts_unavailable",
                                    f"eval host hello failed ({e})") from e
         try:
-            check_handshake(hello, expected=self._expected_identity)
+            ident = check_handshake(hello, expected=self._expected_identity)
         except HandshakeMismatch as e:
             raise LaneDInputsError("handshake_mismatch", str(e)) from e
+        # W-IMG: the identity the forecasts ran on (recorded in the report)
+        self._eval_identity = {"git_head": str(getattr(ident, "git_head", "") or ""),
+                               "package_hash": str(getattr(ident, "package_hash", "") or "")}
         pin = getattr(self._eval_host, "set_pinned", None)
         if callable(pin):
             pin(king_d=str(state["king"]["digest"]), house=str(house["digest"]))
@@ -544,7 +547,8 @@ class LaneDInputsSource:
         dirs = [d for d, _ in pools]
         return LaneDInputs(pool_dir=dirs[-1], entries=entries, forecasts=forecasts,
                            uid_of=uid_of, house=house, prior_pool_dirs=tuple(dirs[:-1]),
-                           armed=armed, channel_block_hash=self.channel_block_hash)
+                           armed=armed, channel_block_hash=self.channel_block_hash,
+                           eval_identity=getattr(self, "_eval_identity", None))
 
 
 def build_lane_d_inputs(cfg: Any, *, state_dir, intake_state_dir,

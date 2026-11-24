@@ -59,6 +59,11 @@ class ExpertEntry:
     # changes the reduction order). 0 = not recorded — dropped from the
     # canonical body, so an entry without it keeps its bytes.
     gpu_n: int = 0
+    # W-IMG (plan rev6.24 (e), owner 2026-11-24: "we just log what image pin
+    # was used, it's auditable"): the worker image digest the leg ran.
+    # Recorded, never enforced; "" = not recorded (every entry before
+    # ``[v2] image_epoch_from_block``) — dropped from the canonical body.
+    train_image_digest: str = ""
 
     def __post_init__(self) -> None:
         if isinstance(self.gpu_n, bool) or not isinstance(self.gpu_n, int) or self.gpu_n < 0:
@@ -105,6 +110,8 @@ class ExpertManifest:
                 e["targets"] = list(e["targets"])
             if not e.get("gpu_n"):
                 e.pop("gpu_n", None)          # not recorded: today's bytes
+            if not e.get("train_image_digest"):
+                e.pop("train_image_digest", None)   # W-IMG: not recorded
         return json.dumps(d, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
     def digest(self) -> str:
