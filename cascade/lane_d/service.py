@@ -508,6 +508,26 @@ class LaneDIntake:
             self._refreshed_block = block
         return block
 
+    def tick(self) -> int | None:
+        """One background refresh (#842): the same TTL / reveal evaluation a
+        request runs, under the request lock, persisted with the same atomic
+        write. Returns the head, or ``None`` when a chain read or the state
+        write failed (logged; the next tick retries; nothing changes)."""
+        with self._lock:
+            try:
+                return self._refresh()
+            except _Refusal as r:
+                log.warning("lane_d_intake_unavailable background refresh skipped (%s)", r.code)
+                return None
+
+    def refresh_timer(self, interval_s: float | None = None, *,
+                      wait: Callable[[float], bool] | None = None) -> RefreshTimer:
+        """A :class:`RefreshTimer` ticking every ``interval_s`` (default
+        ``[lane_d_ops] queue_poll_seconds``)."""
+        if interval_s is None:
+            interval_s = getattr(self.ops, "queue_poll_seconds", None)
+        return RefreshTimer(self, interval_s, wait=wait)
+
     # ── WSGI ─────────────────────────────────────────────────────────────────
 
     def __call__(self, environ, start_response):
@@ -838,9 +858,63 @@ class LaneDIntake:
             return self._row(rec)
 
 
+class RefreshTimer:
+    """Refresh the intake queue without traffic (#842).
+
+    The validator reads ``lane_d_intake_queue.json`` directly, so ``ready →
+    revealed`` and ``ready → ready_expired`` must land in the file in quiet
+    periods too. :meth:`run` ticks once at once (the startup refresh), then
+    every ``interval_s`` until :meth:`stop`. ``wait(timeout) -> bool`` is the
+    sleep (default: the stop event's ``wait``; ``True`` ends the loop), so a
+    test drives ticks without real sleeps. A tick never raises: an unexpected
+    error is logged and the loop keeps going."""
+
+    def __init__(self, app: LaneDIntake, interval_s, *,
+                 wait: Callable[[float], bool] | None = None):
+        if isinstance(interval_s, bool) or not isinstance(interval_s, int | float) \
+                or not math.isfinite(interval_s) or interval_s <= 0:
+            raise ValueError(f"refresh interval must be a positive number of seconds; "
+                             f"got {interval_s!r}")
+        self.app = app
+        self.interval_s = float(interval_s)
+        self._stop = threading.Event()
+        self._wait = wait or self._stop.wait
+        self._thread: threading.Thread | None = None
+        self.ticks = 0
+
+    def step(self) -> int | None:
+        """One tick; returns the head the refresh saw (``None`` = skipped)."""
+        self.ticks += 1
+        try:
+            return self.app.tick()
+        except Exception as e:  # noqa: BLE001 — the timer thread must never die
+            log.error("lane_d_intake_unavailable background refresh failed (%s)",
+                      type(e).__name__)
+            return None
+
+    def run(self) -> None:
+        while not self._stop.is_set():
+            self.step()
+            if self._wait(self.interval_s) or self._stop.is_set():
+                return
+
+    def start(self) -> RefreshTimer:
+        if self._thread is not None:
+            raise RuntimeError("refresh timer already started")
+        self._thread = threading.Thread(target=self.run, name="lane-d-intake-refresh",
+                                        daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self, timeout: float | None = 5.0) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout)
+
+
 __all__ = [
     "DEFAULT_PER_HOTKEY_RPM", "DEFAULT_PER_IP_RPM", "ENTRY_STATES", "FRESHNESS_SECONDS",
-    "GrantMinter", "LICENCES", "LICENCE_ATTESTATION", "LaneDIntake", "LaneDReads",
+    "GrantMinter", "LICENCES", "LICENCE_ATTESTATION", "LaneDIntake", "LaneDReads", "RefreshTimer",
     "MAX_BODY_BYTES", "OFFERED_UPLOAD_PATHS", "OPEN_STATES", "QUEUE_FILENAME", "QUEUE_PATH",
     "RATE_LIMIT_MAX_KEYS", "READY_PATH", "REFUSAL_CODES", "SUBMIT_PATH", "UPLOAD_PATH",
     "UPLOAD_PATH_IDS", "canonical_message", "client_ip", "commit_payload", "entry_prefix",

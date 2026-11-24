@@ -15,3 +15,6 @@ scripts/laned_king_sync.py
 # Lane D recurring jobs (ops tooling PR): the module of the w13 job these
 # tests pin (python -P -m cascade.lane_d.ops_jobs).
 cascade/lane_d/ops_jobs.py
+# Lane D ops gaps PR: the production mirror clients (Hub / HF / R2 over the
+# existing storage clients and key names) the king-publish / takedown jobs use.
+cascade/lane_d/mirrors.py

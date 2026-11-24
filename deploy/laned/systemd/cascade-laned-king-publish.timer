@@ -1,0 +1,13 @@
+# TEMPLATE: hourly backstop; cascade-laned-king-publish.path starts the job as
+# soon as a crowning leaves its publish request.
+
+[Unit]
+Description=cascade lane D king publication, hourly
+
+[Timer]
+OnBootSec=20min
+OnUnitActiveSec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
