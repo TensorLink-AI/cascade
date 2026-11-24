@@ -26,12 +26,16 @@
         BASE's code for a right reason, then the full Accept passes on HEAD
     accept <WP>[,<WP>...] --cross --base REF --head REF [--root R]
         cross-WP regressions (CROSS rule below); prints `CROSS <WP> PASS|KNOWN|FAIL`
-    accept [<WP>] --freshness --base REF --head REF --main REF [--root R]
+    accept [<WP>] --freshness --base REF --head REF --main REF [--warn-only] [--root R]
         stale-base guard (FRESHNESS rule below); prints `FRESH ...` or
-        `STALE BASE: update-branch and re-run` (exit 1)
+        `STALE BASE: update-branch and re-run` (exit 1); with --warn-only
+        `WARNING STALE BASE ...` (exit 0)
+    accept --merge-group --base REF --head REF --group-labels FILE [--root R]
+        the merge queue's combined ref (MERGE-GROUP rule below); prints
+        `GROUP-OWN <WPs>`, `GROUP <WP> <mode> PASS|FAIL (#N)` and `GROUP PASS|FAIL`
     accept selftest
         offline check of the review, tests-correction, verification,
-        evidence, cross and freshness modes
+        evidence, cross, freshness and merge-group modes
     accept --gate <STAGE> [--root R]
         evidence/gates/<stage>.json: right stage, every check passed
 
@@ -227,7 +231,24 @@ STALE when its diff (BASE...HEAD) and main's diff (MB..MAIN) interact, in the
 PR's tree or in MAIN's: a path both touch; a changed module of one side whose
 static import closure reaches a changed path of the other; or a WP test dir
 that depends (CROSS rule (b)) on both diffs. Unrelated main commits leave the
-PR fresh. The loop must update-branch and re-run a STALE PR before merging.
+PR fresh. Since the GitHub merge queue (ruleset 27870327, 2026-11-23) the
+pull_request job runs it with --warn-only: a stale PR gets a WARNING in the
+job summary, not a failure, so a green PR no longer chases main through
+update-branch / re-run loops. The gate moved to the queue (MERGE-GROUP rule).
+
+MERGE-GROUP rule (the merge_group run, owner 2026-11-24): HEAD is the queue's
+combined ref (its working tree at --root), BASE is merge_group.base_sha. Each
+first-parent commit C of BASE..HEAD is one queued PR (`... (#N)` squash or
+`Merge pull request #N ...`); --group-labels maps N to the PR's labels. For
+every laned:<WP> of N, `--check-pr --base C^1 --head C` names the mode and the
+WP's own run follows ON THE COMBINED TREE: implementation and combined -> the
+full Accept (the combined mode's base-failing half ran on the PR); tests-only
+-> --verification; tests-correction -> --tests-correction; evidence -> the full
+Accept with each EVIDENCE file; review -> nothing. A WP several queued PRs
+carry runs once. A commit naming no PR, a PR missing from the labels file, a
+check-pr failure or any failing run fails the group (closed). The CROSS rule
+then runs over BASE..HEAD excluding the `GROUP-OWN` WPs (their own Accept just
+ran). Nothing is ledger-recorded (the push job records after the merge).
 
 The pytest command is `uv run --frozen pytest` unless LANED_PYTEST_CMD is set
 (shlex-split). It always runs with cwd = --root. Exit 0 means pass.
@@ -1638,26 +1659,39 @@ def stale_reasons(root: Path, pr_diff: list[str], main_diff: list[str]) -> list[
     return why
 
 
-def cmd_freshness(root: Path, base: str, head: str, main_ref: str) -> int:
+STALE_LINE = "STALE BASE: update-branch and re-run"
+STALE_WARN = "WARNING STALE BASE (not enforced on PRs: the merge queue re-runs the Accept on the combined ref)"
+
+
+def cmd_freshness(root: Path, base: str, head: str, main_ref: str, warn_only: bool = False) -> int:
     """The PR job's last step (RV5): the run tested HEAD against BASE (the
     merge commit's first parent, i.e. github.event.pull_request.base.sha's
     tree; HEAD must not itself contain main's newer commits, or they count
     as the PR's changes). When MAIN (origin/main fetched at job time) is BASE, the result is
     fresh. Otherwise the PR is STALE when its changes (BASE...HEAD) interact
     with main's commits since the merge-base of BASE and MAIN (stale_reasons,
-    in the PR's tree and in MAIN's tree); a stale PR must update-branch and
-    re-run before it merges. Unrelated main commits do not make it stale."""
+    in the PR's tree and in MAIN's tree). Unrelated main commits do not make
+    it stale. With ``warn_only`` (the pull_request job since the merge queue,
+    2026-11-24) a stale result prints STALE_WARN and exits 0: the merge
+    queue's --merge-group run re-accepts every queued WP on the combined ref,
+    so the PR need not chase main. Without it a stale result exits 1."""
+
+    def stale(detail: str = "") -> int:
+        if warn_only:
+            print(STALE_WARN + (f" ({detail})" if detail else ""))
+            return 0
+        print(STALE_LINE + (f" ({detail})" if detail else ""))
+        return 1
+
     b, m = _rev(root, base), _rev(root, main_ref)
     if b is None or m is None:
-        print(f"STALE BASE: update-branch and re-run (cannot resolve {base if b is None else main_ref})")
-        return 1
+        return stale(f"cannot resolve {base if b is None else main_ref}")
     if b == m:
         print(f"FRESH base {b[:12]} is {main_ref}")
         return 0
     mb = lanedlib.git(root, "merge-base", b, m, check=False).stdout.strip()
     if not mb:
-        print(f"STALE BASE: update-branch and re-run (no merge-base of {base} and {main_ref})")
-        return 1
+        return stale(f"no merge-base of {base} and {main_ref}")
     pr_diff = lanedlib.git(root, "diff", "--name-only", f"{b}...{head}").stdout.split()
     main_diff = lanedlib.git(root, "diff", "--name-only", f"{mb}..{m}").stdout.split()
     n = lanedlib.git(root, "rev-list", "--count", f"{mb}..{m}").stdout.strip()
@@ -1668,8 +1702,7 @@ def cmd_freshness(root: Path, base: str, head: str, main_ref: str) -> int:
         wt = Path(tmp) / "main"
         proc = lanedlib.git(root, "worktree", "add", "--detach", "-q", str(wt), m, check=False)
         if proc.returncode != 0:
-            print(f"STALE BASE: update-branch and re-run (no worktree of {main_ref}: {proc.stderr.strip()[:200]})")
-            return 1
+            return stale(f"no worktree of {main_ref}: {proc.stderr.strip()[:200]}")
         try:
             why += [f"at {main_ref}: {w}" for w in stale_reasons(wt, pr_diff, main_diff)]
         finally:
@@ -1678,10 +1711,138 @@ def cmd_freshness(root: Path, base: str, head: str, main_ref: str) -> int:
     if why:
         for w in dict.fromkeys(why):
             print(f"stale: {w if len(w) <= 400 else w[:400] + ' ...'}")
-        print("STALE BASE: update-branch and re-run")
-        return 1
+        return stale()
     print(f"FRESH enough: no change on {main_ref} since {mb[:12]} touches or is imported by the PR's paths")
     return 0
+
+
+# ---------------------------------------------------------------------------
+# merge group (the GitHub merge queue's combined ref)
+# ---------------------------------------------------------------------------
+
+GROUP_PR_RE = (re.compile(r"\(#(\d+)\)$"), re.compile(r"^Merge pull request #(\d+) "))
+
+
+def group_prs(root: Path, base: str, head: str) -> list[tuple[str, int | None, str]]:
+    """``(commit, PR number or None, subject)`` for every first-parent commit
+    of BASE..HEAD, oldest first (a squash `... (#N)` or a merge commit
+    `Merge pull request #N ...`)."""
+    out = lanedlib.git(root, "log", "--first-parent", "--reverse", "--format=%H%x00%s",
+                       f"{base}..{head}").stdout
+    rows: list[tuple[str, int | None, str]] = []
+    for line in out.splitlines():
+        sha, _, subject = line.partition("\0")
+        n = None
+        for rx in GROUP_PR_RE:
+            mt = rx.search(subject.strip())
+            if mt:
+                n = int(mt.group(1))
+                break
+        rows.append((sha, n, subject))
+    return rows
+
+
+def read_group_labels(path: str) -> dict[int, list[str]]:
+    """--group-labels FILE: ``{"<PR>": ["laned:W0c", ...]}`` (the workflow
+    writes it with `gh pr view` for each queued PR)."""
+    raw = json.loads(Path(path).read_text())
+    if not isinstance(raw, dict):
+        raise ValueError("--group-labels must be a JSON object {PR: [labels]}")
+    return {int(k): [str(x) for x in (v or [])] for k, v in raw.items()}
+
+
+def group_wps(labels: list[str]) -> tuple[list[str], bool]:
+    """(the PR's WPs, carries laned:tests-correction) from its label names."""
+    names = [lab.split(":", 1)[1] for lab in labels if lab.startswith("laned:")]
+    correction = lanedlib.CORRECTION_LABEL in names
+    return [w for w in dict.fromkeys(names) if w != lanedlib.CORRECTION_LABEL], correction
+
+
+def group_own_wps(root: Path, base: str, head: str, labels: dict[int, list[str]]) -> list[str]:
+    """Every laned:<WP> of the queued PRs (the CROSS step excludes them:
+    --merge-group already ran their own Accept on the combined ref)."""
+    own: list[str] = []
+    for _, n, _ in group_prs(root, base, head):
+        if n is not None:
+            own += group_wps(labels.get(n, []))[0]
+    return list(dict.fromkeys(own))
+
+
+def cmd_merge_group(root: Path, base: str, head: str, labels: dict[int, list[str]]) -> int:
+    """MERGE-GROUP rule (module docstring). The working tree at ``root`` is
+    the queue's combined ref HEAD. For every queued PR commit C (BASE..HEAD,
+    first parent) and every laned:<WP> of its PR, the mode comes from
+    ``--check-pr --base C^1 --head C`` (the PR's own diff on top of the PRs
+    queued ahead of it), and the WP's own run follows on the combined tree:
+    implementation / combined -> the full Accept; tests-only ->
+    --verification; tests-correction -> --tests-correction; evidence -> the
+    full Accept with each EVIDENCE file; review -> nothing. A WP named by
+    several queued PRs runs its full Accept once. Prints ``GROUP <WP> <mode>
+    PASS|FAIL (#N)`` per run; any FAIL, a commit with no PR number, or a PR
+    without labels in the file fails closed (exit 1)."""
+    rows = group_prs(root, base, head)
+    if not rows:
+        print(f"GROUP FAIL: no commit in {base}..{head}")
+        return 1
+    own = group_own_wps(root, base, head, labels)
+    print(f"GROUP-OWN {' '.join(own) if own else 'none'}")
+    failed = False
+    done: set[tuple[str, str]] = set()
+    for sha, n, subject in rows:
+        if n is None:
+            print(f"GROUP FAIL: commit {sha[:12]} names no PR ({subject!r})")
+            failed = True
+            continue
+        if n not in labels:
+            print(f"GROUP FAIL: no labels for #{n} in --group-labels")
+            failed = True
+            continue
+        wps, correction = group_wps(labels[n])
+        if not wps:
+            print(f"GROUP #{n}: no laned:<WP> label (cross step only)")
+            continue
+        parent = f"{sha}^1"
+        for wp in wps:
+            with contextlib.redirect_stdout(io.StringIO()) as buf:
+                rc = cmd_check_pr(root, wp, parent, sha, wps, correction)
+            out = buf.getvalue()
+            sys.stdout.write(out)
+            if rc != 0:
+                print(f"GROUP {wp} check-pr FAIL (#{n})")
+                failed = True
+                continue
+            mode = next((ln[5:].strip() for ln in out.splitlines() if ln.startswith("MODE ")), "")
+            if mode == "review":
+                print(f"GROUP {wp} review PASS (#{n})")
+                continue
+            if mode == "evidence":
+                runs = [("evidence " + ln[9:].strip(), ln[9:].strip())
+                        for ln in out.splitlines() if ln.startswith("EVIDENCE ")]
+            elif mode in ("implementation", "combined"):
+                runs = [("accept", None)]
+            elif mode in ("tests-only", "tests-correction"):
+                runs = [(mode, None)]
+            else:
+                print(f"GROUP {wp} check-pr FAIL (#{n}): unknown MODE {mode!r}")
+                failed = True
+                continue
+            for label, ev in runs:
+                key = (wp, label)
+                if key in done:
+                    print(f"GROUP {wp} {label} already run on this ref (#{n})")
+                    continue
+                done.add(key)
+                print(f"group: {wp} ({mode} on #{n}) -> {label} on the combined ref", flush=True)
+                if label == "tests-only":
+                    rc = cmd_verification(root, wp, parent, sha)
+                elif label == "tests-correction":
+                    rc = cmd_tests_correction(root, wp, parent, sha)
+                else:
+                    rc = cmd_accept(root, wp, ev)
+                print(f"GROUP {wp} {label} {'PASS' if rc == 0 else 'FAIL'} (#{n})")
+                failed = failed or rc != 0
+    print("GROUP FAIL" if failed else "GROUP PASS")
+    return 1 if failed else 0
 
 
 # ---------------------------------------------------------------------------
@@ -2309,6 +2470,15 @@ def selftest_freshness(ident: tuple[str, ...]) -> list[str]:
             if (rc != 0) != want_stale or stale != want_stale or (want and want not in out):
                 failures.append(f"freshness {name}: rc={rc} stale={stale}, want stale={want_stale}"
                                 f"{' with ' + repr(want) if want else ''}: {out.strip()[-1500:]}")
+            # --warn-only (the pull_request job since the merge queue): the
+            # same analysis, but a stale base is a WARNING and never fails
+            with contextlib.redirect_stdout(io.StringIO()) as buf:
+                rc_w = cmd_freshness(root, base, head, main, warn_only=True)
+            out_w = buf.getvalue()
+            warned = STALE_WARN in out_w
+            if rc_w != 0 or warned != want_stale or STALE_LINE in out_w or (want and want not in out_w):
+                failures.append(f"freshness --warn-only {name}: rc={rc_w} warned={warned}, "
+                                f"want warned={want_stale} and rc 0: {out_w.strip()[-1500:]}")
 
         pr_a = branch("pr-a", base0, {"pkg_a.py": "A = 1\nEXTRA = 2\n"})
         # main has not moved -> fresh
@@ -2338,6 +2508,100 @@ def selftest_freshness(ident: tuple[str, ...]) -> list[str]:
         lanedlib.git(root, *ident, "merge", "-q", "--no-edit", "main")
         updated = lanedlib.git(root, "rev-parse", "HEAD").stdout.strip()
         case("second-pr-updated", main1, updated, main1, False, "FRESH base")
+    return failures
+
+
+def selftest_merge_group(ident: tuple[str, ...]) -> list[str]:
+    """The MERGE-GROUP rule on a real git repo (sys.executable -m pytest):
+    a queued W3 implementation green on an older base must FAIL on the
+    combined ref when a PR queued ahead of it (or merged since its base)
+    broke it; it passes alone; a PR missing from the labels file, a commit
+    naming no PR and a check-pr refusal fail closed; a tests-only PR runs
+    --verification (here --expect-fail) on the combined ref."""
+    failures: list[str] = []
+    saved = {k: os.environ.get(k) for k in ("LANED_PYTEST_CMD", "LANED_LEDGER", "LANED_PR_LABELS")}
+    os.environ["LANED_PYTEST_CMD"] = shlex.join([sys.executable, "-m", "pytest", "-p", "no:cacheprovider"])
+    os.environ.pop("LANED_PR_LABELS", None)
+    try:
+        with tempfile.TemporaryDirectory(prefix="laned-accept-selftest-group-") as tmp:
+            root = Path(tmp) / "repo"
+            root.mkdir()
+            os.environ["LANED_LEDGER"] = str(Path(tmp) / "no-ledger.json")
+
+            def commit(files: dict[str, str], msg: str) -> str:
+                for rel, text in files.items():
+                    (root / rel).parent.mkdir(parents=True, exist_ok=True)
+                    (root / rel).write_text(text)
+                lanedlib.git(root, "add", "-A")
+                lanedlib.git(root, *ident, "commit", "-q", "-m", msg)
+                return lanedlib.git(root, "rev-parse", "HEAD").stdout.strip()
+
+            lanedlib.git(root, "init", "-q")
+            base0 = commit({"README.md": "x\n", ".gitignore": "__pycache__/\n", "pkg_lib.py": "LIB = 1\n",
+                            "pkg_w3.py": "W3 = 0\n",
+                            "pkg_w4.py": "W4 = 0\n",
+                            "tests/accept/w3/PATHS": "pkg_w3.py\n",
+                            "tests/accept/w3/test_w3.py": "import pkg_lib\nimport pkg_w3\n\n\n"
+                                                          "def test_w3():\n    assert pkg_w3.W3 == pkg_lib.LIB\n",
+                            "tests/accept/w4/PATHS": "pkg_w4.py\n"}, "seed")
+
+            def queue(start: str, prs: list[tuple[dict[str, str], str]]) -> str:
+                lanedlib.git(root, "checkout", "-q", "--detach", start)
+                head = start
+                for files, msg in prs:
+                    head = commit(files, msg)
+                return head
+
+            def case(name: str, head: str, labels: dict[int, list[str]], want_ok: bool,
+                     want: tuple[str, ...] = ()) -> None:
+                lanedlib.git(root, "checkout", "-q", "--detach", head)
+                with contextlib.redirect_stdout(io.StringIO()) as buf:
+                    rc = cmd_merge_group(root, base0, head, labels)
+                out = buf.getvalue()
+                missing = [w for w in want if w not in out]
+                if (rc == 0) != want_ok or ("GROUP PASS" in out) != want_ok or missing:
+                    failures.append(f"merge-group {name}: rc={rc}, want ok={want_ok}"
+                                    f"{', missing ' + repr(missing) if missing else ''}: {out.strip()[-2000:]}")
+
+            impl = ({"pkg_w3.py": "W3 = 1\n"}, "w3 impl (#7)")
+            # W3's implementation alone: its own Accept runs on the combined ref
+            alone = queue(base0, [impl])
+            case("own-wp-passes", alone, {7: ["laned:W3"]}, True,
+                 ("GROUP-OWN W3", "GROUP W3 accept PASS (#7)", "PASS W3"))
+            # #6 queued ahead changes pkg_lib (W3 was green on base0 only): the
+            # CROSS over the group excludes W3, so only its own run catches it
+            broken = queue(base0, [({"pkg_lib.py": "LIB = 22\n"}, "lib bump (#6)"), impl])
+            case("own-wp-broken-by-group", broken, {6: [], 7: ["laned:W3"]}, False,
+                 ("GROUP #6: no laned:<WP> label", "GROUP W3 accept FAIL (#7)"))
+            # a stale-base PR the queue rebased onto a main that broke it
+            main1 = queue(base0, [({"pkg_lib.py": "LIB = 333\n"}, "lib on main (#5)")])
+            stale = queue(main1, [impl])
+            lanedlib.git(root, "checkout", "-q", "--detach", stale)
+            with contextlib.redirect_stdout(io.StringIO()) as buf:
+                rc = cmd_merge_group(root, main1, stale, {7: ["laned:W3"]})
+            if rc == 0 or "GROUP W3 accept FAIL (#7)" not in buf.getvalue():
+                failures.append(f"merge-group stale-base-broken: rc={rc}: {buf.getvalue().strip()[-2000:]}")
+            # fail closed: labels unknown, no PR number, check-pr refusal
+            case("labels-missing", alone, {}, False, ("GROUP FAIL: no labels for #7",))
+            nopr = queue(base0, [({"pkg_w3.py": "W3 = 1\n"}, "direct push")])
+            case("no-pr-number", nopr, {}, False, ("names no PR",))
+            outside = queue(base0, [({"pkg_w3.py": "W3 = 1\n", "README.md": "y\n"}, "w3 + readme (#8)")])
+            case("check-pr-refused", outside, {8: ["laned:W3"]}, False, ("GROUP W3 check-pr FAIL (#8)",))
+            # tests-only PR for unbuilt W4: --verification -> --expect-fail on the combined ref
+            tests_w4 = queue(base0, [({"tests/accept/w4/test_w4.py": "import pkg_w4\n\n\ndef test_w4():\n"
+                                                                     "    assert pkg_w4.W4 == 1\n"}, "w4 tests (#9)")])
+            case("tests-only", tests_w4, {9: ["laned:W4"]}, True,
+                 ("GROUP W4 tests-only PASS (#9)", "LEDGER-MODE expect-fail"))
+            # one WP on two queued PRs runs its full Accept once
+            twice = queue(base0, [({"pkg_w3.py": "W3 = 5\n"}, "w3 a (#10)"), impl])
+            case("dedupe", twice, {10: ["laned:W3"], 7: ["laned:W3"]}, True,
+                 ("GROUP W3 accept already run on this ref (#7)",))
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
     return failures
 
 
@@ -3016,6 +3280,10 @@ def cmd_selftest() -> int:
     tests-only / tests-correction MODE rules."""
     failures: list[str] = []
     ident = ("-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false")
+    # fixture modules are rewritten within one second at the same size; a
+    # cached .pyc (mtime + size check) would then hide the change from the
+    # pytest subprocesses (seen on CI 2026-11-24): never write bytecode
+    os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
     # the fixture repos' `(#N)` subjects must never meet the real repo's PR
     # labels or ledger (the PR job exports both)
     for k in ("LANED_PR_LABELS", "LANED_LEDGER"):
@@ -3066,6 +3334,7 @@ def cmd_selftest() -> int:
     failures += selftest_wb19_partial_evidence()
     failures += selftest_cross(ident)
     failures += selftest_freshness(ident)
+    failures += selftest_merge_group(ident)
     failures += selftest_batch(ident)
     failures += selftest_batch_impl(ident)
     failures += selftest_coupled(ident)
@@ -3104,6 +3373,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--freshness", action="store_true",
                     help="(needs --base/--head/--main) STALE BASE when main moved past the tested base "
                          "with changes the PR's paths touch or import")
+    ap.add_argument("--warn-only", action="store_true",
+                    help="--freshness: a stale base prints a WARNING and exits 0 (pull_request job; the "
+                         "merge queue's --merge-group run is the gate)")
+    ap.add_argument("--merge-group", action="store_true",
+                    help="(needs --base/--head/--group-labels) the merge queue's combined ref: every "
+                         "queued PR's own WP runs (MERGE-GROUP rule)")
+    ap.add_argument("--group-labels", metavar="FILE",
+                    help="--merge-group: JSON {PR number: [label names]} of the queued PRs")
     ap.add_argument("--pr-wps", metavar="WP[,WP...]",
                     help="--check-pr: every laned:<WP> label of the PR (BATCH rule for tests-only and "
                          "tests-correction PRs, FEATURE rule for any PR with code)")
@@ -3124,7 +3401,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.freshness:
         if not (args.base and args.head and args.main):
             ap.error("--freshness needs --base, --head and --main")
-        return cmd_freshness(root, args.base, args.head, args.main)
+        return cmd_freshness(root, args.base, args.head, args.main, args.warn_only)
+    if args.merge_group:
+        if not (args.base and args.head and args.group_labels):
+            ap.error("--merge-group needs --base, --head and --group-labels")
+        try:
+            labels = read_group_labels(args.group_labels)
+        except (OSError, ValueError) as e:
+            print(f"GROUP FAIL: unreadable --group-labels: {e}")
+            return 1
+        return cmd_merge_group(root, args.base, args.head, labels)
     if args.cross:
         if not (args.wp and args.base and args.head):
             ap.error("--cross needs the PR's WP(s), --base and --head")

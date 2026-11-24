@@ -1,0 +1,31 @@
+# TEMPLATE (testnet-ctl / builder VM, NOT the loaded 7 GB box): §11.1 king
+# publication. Every crowned persisted lane D report not yet in the signed
+# index (the validator's settlement step leaves
+# lane_d_publish_requests/<boundary>.json beside lane_d_state.json) is copied
+# from the vault to the Hub, R2 and HF mirrors with a read-back re-hash, the
+# index is re-signed with the validator hotkey (by name from the wallet dir),
+# put on the public manifest store and written to LANED_INDEX for king-check.
+# publish_king holds one checkpoint (~2.5 GB) plus one mirror read-back in
+# memory, hence MemoryMax. Exit 3 (lane_d_ops_king_publish_blocked) when the
+# intake has no ready licence record or an armed era's sentinel record is
+# missing: an owner step.
+#
+# Credentials (env names only, from the service environment, never this
+# file): HIPPIUS_S3_ACCESS_KEY / HIPPIUS_S3_SECRET_KEY (vault read, index
+# put), HIPPIUS_HUB_TOKEN, HF_TOKEN, BACKUP_S3_ACCESS_KEY /
+# BACKUP_S3_SECRET_KEY (R2). Ships in --dry-run; going live is a drop-in
+# without --dry-run. Log tag lane_d_ops_king_publish_* / lane_d_ops_king_published.
+
+[Unit]
+Description=cascade lane D king publication (dry-run template)
+
+[Service]
+Type=oneshot
+WorkingDirectory=/
+Environment=PYTHONPATH=/root/cascade
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/cascade-laned-jobs.env
+ExecStart=/root/cascade/.venv/bin/python -P -m cascade.lane_d.ops_jobs king-publish --state ${LANED_STATE} --intake-state-dir ${LANED_INTAKE_STATE} --index ${LANED_INDEX} --signer-ss58 ${LANED_SIGNER_SS58} --chain-toml ${LANED_CHAIN_TOML} --wallet-name ${LANED_WALLET_NAME} --wallet-hotkey ${LANED_WALLET_HOTKEY} --log-file ${LANED_LOG} --dry-run
+Nice=19
+MemoryMax=8G
+NoNewPrivileges=true

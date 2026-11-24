@@ -1,0 +1,13 @@
+# TEMPLATE: every 15 min, offset from the house-pointer job, so a staged house
+# source is installed before the pointer job looks for it.
+
+[Unit]
+Description=cascade lane D house source install, every 15 min
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
