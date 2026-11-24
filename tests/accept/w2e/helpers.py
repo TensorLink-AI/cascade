@@ -88,8 +88,38 @@ def _raw_text(name: str) -> str:
     return (REPO / name).read_text(encoding="utf-8")
 
 
-def shipped_raw(name: str) -> dict:
+# TESTNET-FAST profile (owner 2026-11-24: lanes B/C/D end-to-end on testnet in
+# hours): chain.testnet.toml scales these [lane_d] waits / caps to its 30-min
+# settlement grid, each line commented `# TESTNET-FAST (2026-11-24): <mainnet>`.
+# key -> (release default, testnet-fast value). The default tests run on the
+# testnet file with these restored (shipped_raw); the profile values
+# themselves are pinned by tests/accept/w2/test_w2_testnet_fast.py (same list).
+TESTNET = "chain.testnet.toml"
+TESTNET_FAST_LANE_D: dict[str, tuple[object, object]] = {
+    "eval_delay_hours": (6.0, 0.5),
+    "min_windows": (1000, 200),
+    "min_clusters": (20, 5),
+    "min_long_series": (300, 30),
+    "d_margin_warmup_settlements": (32, 4),
+    "embargo_hours": (48.0, 1.0),
+    "max_windows_per_settlement": (5000, 1000),
+}
+
+
+def file_raw(name: str) -> dict:
+    """The shipped file exactly as written (testnet-fast profile included)."""
     return tomllib.loads(_raw_text(name))
+
+
+def shipped_raw(name: str) -> dict:
+    """The shipped table; on the testnet file the TESTNET-FAST [lane_d] keys
+    are restored to their release default."""
+    raw = file_raw(name)
+    if name == TESTNET:
+        ld = raw.setdefault("lane_d", {})
+        for k, (default, _fast) in TESTNET_FAST_LANE_D.items():
+            ld[k] = default
+    return raw
 
 
 def raw_with(name: str, lane_d: dict | None = None, *, drop: tuple[str, ...] = ()) -> dict:
@@ -211,7 +241,11 @@ _TABLE_HEADER = re.compile(r"^\[")
 
 def splice_keys(name: str, values: dict) -> str:
     """The shipped file's text with ``values`` set inside ``[lane_d]`` (an
-    existing line for the key is replaced, else the key is appended)."""
+    existing line for the key is replaced, else the key is appended). On the
+    testnet file the TESTNET-FAST keys not in ``values`` are restored to their
+    release default first, as :func:`shipped_raw` does."""
+    if name == TESTNET:
+        values = {**{k: d for k, (d, _f) in TESTNET_FAST_LANE_D.items()}, **values}
     lines = _raw_text(name).splitlines(keepends=True)
     start = next(i for i, ln in enumerate(lines) if ln.strip() == "[lane_d]")
     end = next((i for i in range(start + 1, len(lines)) if _TABLE_HEADER.match(lines[i])),

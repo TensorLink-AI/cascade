@@ -37,3 +37,8 @@ cascade/funding/main.py
 tests/unit/test_marketcast_embargo.py
 tests/unit/test_marketcast_pay_duration.py
 tests/unit/test_marketcast_trainer.py
+# TESTNET-FAST (owner 2026-11-24): the unit pins of the shipped lane C /
+# MarketCast values carry testnet's scaled waits and window counts.
+tests/unit/test_lane_c_config.py
+tests/unit/test_marketcast_paths.py
+tests/unit/test_marketcast_flex_recipe.py
