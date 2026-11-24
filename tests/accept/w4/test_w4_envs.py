@@ -79,6 +79,20 @@ def test_the_committed_list_loads_with_the_launch_entries():
         assert "2.4.1" not in e.torch_build, "sm_120 cannot run torch 2.4.1+cu124"
 
 
+def test_the_reference_env_allows_h200_for_the_elastic_eval_host():
+    """The elastic eval host (#846) is an H200 until sm_120 is qualified:
+    Hopper runs the pinned torch 2.4.1+cu124, so cu124-torch241 lists it."""
+    from cascade.eval.lane_d_handshake import check_worker
+    from cascade.shared.config.lane_d import load_scoring_envs
+
+    envs = load_scoring_envs()
+    ref = {e.name: e for e in envs}["cu124-torch241"]
+    assert "NVIDIA H200" in ref.gpu_models
+    _, host = check_worker(_hello(gpu_model="NVIDIA H200", driver="570.133.20"), envs=envs,
+                           boundary=1000, expected=_expected())
+    assert host["gpu_model"] == "NVIDIA H200" and host["env"] == "cu124-torch241"
+
+
 def test_a_qualified_entry_pins_its_lock_and_lane_a_is_untouched():
     from cascade.shared.config.lane_d import load_scoring_envs
 

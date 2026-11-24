@@ -59,6 +59,9 @@ gpu_models = [
     "NVIDIA H100 80GB HBM3",
     "NVIDIA H100 PCIe",
     "NVIDIA H100 NVL",
+    # Hopper runs torch 2.4.1+cu124; the elastic eval host (#846) uses H200
+    # until the sm_120 environment is qualified.
+    "NVIDIA H200",
 ]
 driver_min = "550.54.14"
 driver_max = ""
