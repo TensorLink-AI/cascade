@@ -8,9 +8,9 @@ deploy/overlays/launch-20261125.pre.mainnet.toml
 deploy/overlays/launch-20261125.mainnet.toml
 deploy/overlays/launch-20261125.pre.testnet.toml
 deploy/overlays/launch-20261125.testnet.toml
-# Owner 2026-11-24 (option 1): Wed = step 1 only; lane D's step 2 is deferred
-# ([lane_d] from_block = "next-era", resolved by the publish tool) until the
-# #913 satellite fix is on >= 2/3 of stake.
+# Owner 2026-11-24: lane D's step 2 is launch-20261125.*.toml (live at launch,
+# gated on >= 2/3 of stake on the release); these fallbacks arm it at the next
+# era ([lane_d] from_block = "next-era", resolved by the publish tool).
 deploy/overlays/lane-d-step2.mainnet.toml
 deploy/overlays/lane-d-step2.testnet.toml
 # Unit tests and docs that pin the shipped lane C / MarketCast block.

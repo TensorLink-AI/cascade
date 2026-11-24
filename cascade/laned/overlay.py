@@ -65,7 +65,7 @@ BENIGN_KEYS = ("from_block", "until_block", "share")
 RELEASE_ONLY_KEYS = (("lane_d", "remainder"), ("lane_b", "remainder"),
                      ("lane_c", "remainder"), ("scoring", "burn_uid"))
 VALIDATOR = "cascade-validator"
-# Owner 2026-11-24 (deferred lane D step 2): a block the publish tool fills —
+# Owner 2026-11-24 (lane D step 2 fallback): a block the publish tool fills —
 # the first era start at least one era past --head-block.
 NEXT_ERA = "next-era"
 # ... and the stake share of the release that must signal before lane D arms

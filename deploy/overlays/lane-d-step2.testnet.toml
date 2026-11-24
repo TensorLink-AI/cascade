@@ -1,8 +1,8 @@
-# DEFERRED lane D step 2 (owner decision 2026-11-24, option 1). TESTNET
-# (netuid 259). This is the rehearsal of lane-d-step2.mainnet.toml and
-# supersedes launch-20261125.testnet.toml for the deferred rollout. Only step 1
-# (launch-20261125.pre.testnet.toml) is published at the launch. This file
-# arms lane D later, once >= 2/3 of stake signals the #913 release.
+# FALLBACK for lane D step 2. TESTNET (netuid 259); the rehearsal of
+# lane-d-step2.mainnet.toml. At the launch, step 2 is
+# launch-20261125.testnet.toml. Use this file only if that step 2 misses the
+# launch (for example, the 2/3 upgrade gate is not met). It then arms lane D
+# at the next era instead.
 #
 # The body is launch-20261125.testnet.toml's with [lane_d] from_block =
 # "next-era". `cascade-laned overlay publish --effective-block next-era

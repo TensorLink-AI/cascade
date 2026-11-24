@@ -3472,48 +3472,55 @@ The trainer runs the same resolver read-only (`netconfig_state.json` in its
 work root). It never signals, and it switches its rolling scheduler and
 promotion engine to the overlay at the same block.
 
-#### Mainnet launch runbook: step 1 on Wednesday, lane D later
+#### Mainnet launch runbook: lanes B, C and D live at 9586800
 
-Owner decision, 2026-11-24 (option 1):
+Owner decision (2026-11-24, 22:30): lane D goes live at the launch block
+9586800, together with lanes B and C. Publish two overlays, both at least
+one era (3600 blocks) before 9586800:
 
-1. **Wed 2026-11-25, at the launch era start 9586800: publish step 1 only.**
-   That is `deploy/overlays/launch-20261125.pre.mainnet.toml`, which splits
-   emission A 50 / B 35 / C 15. Do **not** publish
-   `launch-20261125.mainnet.toml` on mainnet. It is superseded and kept only
-   because tests pin it.
-2. **Later: arm lane D with `deploy/overlays/lane-d-step2.mainnet.toml`.**
-   This moves D 50 % from lane A (A 0 / B 35 / C 15 / D 50) with
-   `public_weight = 0.0`. Publish it only when both of these hold:
-   - the #913 satellite fix is released and deployed;
-   - at least 2/3 of eligible validator stake signals that release in its
-     readiness note.
-3. The file types `[lane_d] from_block = "next-era"`. The publish tool
-   resolves that to the first era start at least one era past
-   `--head-block`. It writes the resolved overrides (`--resolved-out`), and
-   the printed validator command uses that file. Step 1 is in force, so pass
-   its body as `--previous`:
+1. **Step 1: `deploy/overlays/launch-20261125.pre.mainnet.toml`.** This
+   overlay carries every non-lane-D key and splits emission
+   A 50 / B 35 / C 15.
+2. **Step 2: `deploy/overlays/launch-20261125.mainnet.toml`.** This overlay
+   restates step 1 and arms lane D: `from_block = 9586800`, share 0.5 taken
+   from lane A, `public_weight = 0.0`. The resulting split is
+   A 0 / B 35 / C 15 / D 50.
+
+   Before you publish step 2, check that at least 2/3 of eligible validator
+   stake signals the release with the #913 satellite fix in its readiness
+   note. Use the wrapper with step 1 as `--previous` (and as the overlay in
+   force):
 
    ```bash
    cascade-laned overlay publish --config chain.toml \
-       --overrides deploy/overlays/lane-d-step2.mainnet.toml \
-       --effective-block next-era --head-block <head> --previous <step 1 body.json> \
+       --overrides deploy/overlays/launch-20261125.mainnet.toml \
+       --effective-block 9586800 --head-block <head> --previous <step 1 body.json> \
        --upgrade-metagraph <metagraph.json> --upgrade-notes <notes.json> \
        --upgrade-feature <the #913 release's readiness segment>
    ```
 
-   Check the plan shows `LANE D: OFF -> ON` and
-   `LANE A SHARE: 0.5 -> 0.0`. The `UPGRADE` line prints the stake share
-   (computed with `cascade.laned.upgrade_tracker`). The tool refuses any
-   overlay that arms lane D below 2/3. `--force-upgrade-threshold`
-   overrides that refusal; it is an owner decision, so record it in the
-   OPSLOG. With no tracker inputs the share is unknown, and the overlay is
-   refused.
-4. From then on every overlay restates the RESOLVED `[lane_d] from_block`
-   (see the restate rule above).
+   The plan must show `LANE D: OFF -> ON` and
+   `LANE A SHARE: 0.5 -> 0.0 (from settlement …)`. The `UPGRADE` line prints
+   the stake share (computed with `cascade.laned.upgrade_tracker`).
 
-Testnet rehearses the same flow with `lane-d-step2.testnet.toml`. The gate
-lives in this wrapper only: `cascade-validator --netconfig-overlay` does not
-read the tracker, so use the wrapper for step 2.
+   The tool refuses any overlay that arms lane D below 2/3. Without tracker
+   inputs the share is unknown, and the overlay is also refused.
+   `--force-upgrade-threshold` overrides the refusal. That override is an
+   owner decision, so record it in the OPSLOG.
+3. **Fallback if step 2 misses the launch** (gate not met, or less than one
+   era left): publish `deploy/overlays/lane-d-step2.mainnet.toml` once the
+   gate passes. It carries the same body with `[lane_d] from_block =
+   "next-era"`. With `--effective-block next-era --head-block <head>`, the
+   tool resolves that placeholder to the first era start at least one era
+   past the head. It writes the resolved overrides to `--resolved-out`, and
+   the printed validator command uses that file.
+4. Every later overlay restates `[lane_d] from_block`: `9586800`, or the
+   resolved fallback block. See the restate rule above.
+
+Testnet rehearses the same flow with `launch-20261125.{pre.,}testnet.toml`
+and the fallback `lane-d-step2.testnet.toml`. The gate exists only in this
+wrapper. `cascade-validator --netconfig-overlay` does not read the tracker,
+so always publish step 2 through the wrapper.
 
 #### `cascade-laned overlay`: lane D bring-up kit (S0c)
 

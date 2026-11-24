@@ -1,11 +1,14 @@
-"""W-LAUNCH deferred lane D step 2 (owner decision 2026-11-24, option 1).
+"""W-LAUNCH lane D step 2 and its 2/3 upgrade gate (owner 2026-11-24, 22:30).
 
-Wed 2026-11-25 = step 1 only (A 50 / B 35 / C 15). Lane D's step 2 (D 50 %
-from lane A, so A 0, with ``public_weight = 0.0``) is published later, once the
-#913 satellite fix is deployed and >= 2/3 of stake has updated:
+Lane D goes live AT LAUNCH (9586800) with lanes B and C. Step 1
+(``launch-20261125.pre.*``) and then step 2 (``launch-20261125.*``, with
+``[lane_d] from_block = 9586800``, D 50 % from lane A, ``public_weight = 0.0``)
+are both published at least one era before the launch. Step 2 must clear the
+gate: >= 2/3 of stake signals the release that carries the #913 satellite fix.
 
-- ``deploy/overlays/lane-d-step2.{mainnet,testnet}.toml`` carry the launch
-  step-2 body with ``[lane_d] from_block = "next-era"``;
+- ``deploy/overlays/lane-d-step2.{mainnet,testnet}.toml`` are FALLBACKS for a
+  step 2 that misses the launch: the same body with
+  ``[lane_d] from_block = "next-era"``;
 - ``cascade-laned overlay publish --effective-block next-era --head-block H``
   resolves it to the first era start at least one era past H, and writes the
   resolved file that the printed validator command uses;
@@ -60,13 +63,19 @@ def _files(tmp_path, net, signed: int, total: int = 100):
     return base_name, str(prev)
 
 
-def _run(capsys, tmp_path, net, signed, *extra, tracker=True):
+def _run(capsys, tmp_path, net, signed, *extra, tracker=True, launch_step2=False):
     from cascade.laned.cli import main
 
     base_name, prev = _files(tmp_path, net, signed)
-    head = LAUNCH[net] + 3 * ERA[net] + 7
+    if launch_step2:
+        # the launch step 2 as published before the launch (>= one era ahead)
+        head = LAUNCH[net] - 2 * ERA[net]
+        rel, eff = PAIRS[net][2], str(LAUNCH[net])
+    else:
+        head = LAUNCH[net] + 3 * ERA[net] + 7
+        rel, eff = STEP2[net], "next-era"
     argv = ["overlay", "publish", "--config", str(ROOT / base_name),
-            "--overrides", str(ROOT / STEP2[net]), "--effective-block", "next-era",
+            "--overrides", str(ROOT / rel), "--effective-block", eff,
             "--head-block", str(head), "--previous", prev,
             "--resolved-out", str(tmp_path / "resolved.toml")]
     if tracker:
@@ -96,8 +105,9 @@ def test_deferred_step2_file_is_the_launch_step2_with_a_next_era_start(net):
     assert step2["lane_d"] == {"share": 0.5, "takes_from": "lane_a", "public_weight": 0.0}
     # step 1's keys restated byte-identically (R3 `non-lane-d`)
     assert {k: v for k, v in step2.items() if k != "lane_d"} == overrides(pre)
-    if net == "mainnet":
-        assert "SUPERSEDED FOR MAINNET" in (ROOT / full).read_text()
+    # the launch step 2 is live again (owner 2026-11-24 22:30): lane D at launch
+    assert overrides(full)["lane_d"]["from_block"] == LAUNCH[net]
+    assert "SUPERSEDED" not in (ROOT / full).read_text()
 
 
 @pytest.mark.parametrize("net", sorted(STEP2))
@@ -141,6 +151,24 @@ def test_publish_refuses_lane_d_below_two_thirds_unless_forced(tmp_path, capsys)
     # no tracker inputs at all: refused, never assumed
     rc, out, _ = _run(capsys, tmp_path, "mainnet", signed=90, tracker=False)
     assert rc == 1 and _vals(out, "UPGRADE")[0].startswith("unknown"), out
+
+
+@pytest.mark.parametrize("net", sorted(STEP2))
+def test_launch_step2_is_gated_before_the_launch(net, tmp_path, capsys):
+    """Lane D live at launch: step 2 (from_block = the launch block) after
+    step 1, both an era ahead; the 2/3 gate applies to it."""
+    _api()
+    rc, out, _ = _run(capsys, tmp_path, net, 60, launch_step2=True)
+    assert rc == 1 and "--force-upgrade-threshold" in _vals(out, "CHECK")[0], out
+    assert any(x.startswith("60.0% of eligible stake") for x in _vals(out, "UPGRADE")), out
+    rc, out, _ = _run(capsys, tmp_path, net, 67, launch_step2=True)
+    assert rc == 0, out
+    assert _vals(out, "SEQ") == ["2"] and _vals(out, "EFFECTIVE_BLOCK") == [str(LAUNCH[net])]
+    assert _vals(out, "RESOLVED") == []                    # nothing to resolve
+    lanes = _vals(out, "LANE")
+    assert any(x.startswith("LANE D: OFF -> ON") for x in lanes), lanes
+    assert any(x.startswith("LANE A SHARE: 0.5 -> 0.0") for x in lanes), lanes
+    assert f"--netconfig-overlay {ROOT / PAIRS[net][2]}" in _vals(out, "COMMAND")[0]
 
 
 def test_next_era_needs_a_head_and_only_fits_lane_d_from_block():
