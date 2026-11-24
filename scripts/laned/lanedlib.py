@@ -716,6 +716,45 @@ def verification_wps_at(root: Path, ref: str) -> set[str]:
     return parse_verification_wps(proc.stdout) if proc.returncode == 0 else set()
 
 
+# ---------------------------------------------------------------------------
+# Retired WPs (an owner decision dropped the WP: it is never built)
+# ---------------------------------------------------------------------------
+
+RETIRED_WPS_PATH = "scripts/laned/retired_wps"
+
+
+def parse_retired_wps(text: str | None) -> dict[str, str]:
+    """``{WP id: owner decision reference}`` from a ``retired_wps`` file: one
+    WP per line, ``<WP> <reference>``; ``#`` comments (whole-line or
+    trailing) and blank lines ignored. A line naming a WP without a
+    reference raises ValueError: a WP is retired only by a cited owner
+    decision, so a bare id fails closed instead of retiring silently."""
+    out: dict[str, str] = {}
+    for n, line in enumerate((text or "").splitlines(), 1):
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        wp, _, ref = line.partition(" ")
+        if not ref.strip():
+            raise ValueError(f"{RETIRED_WPS_PATH}:{n}: {wp} has no owner decision reference")
+        out[wp] = ref.strip()
+    return out
+
+
+def retired_wps_at(root: Path, ref: str) -> dict[str, str]:
+    """The retired WPs at ``ref``. Like verification_wps, the list lives under
+    scripts/laned/ (only a W0c PR may edit it) and is read at the base / board
+    ref, never from the PR, so a PR cannot retire a WP to dodge its Accept.
+    No file at ``ref`` means no retired WP."""
+    proc = git(root, "show", f"{ref}:{RETIRED_WPS_PATH}", check=False)
+    return parse_retired_wps(proc.stdout) if proc.returncode == 0 else {}
+
+
+def retired_dirs(retired: dict[str, str]) -> set[str]:
+    """The tests/accept dir names of the retired WPs."""
+    return {wp_dir(w) for w in retired}
+
+
 def is_test_path(rel: str) -> bool:
     return rel.split("/", 1)[0] == "tests"
 
