@@ -327,14 +327,17 @@ def test_report_bytes_unchanged_without_the_new_lists():
     assert load_bench_report(dump_bench_report(full)) == full
 
 
-def test_testnet_and_trainer_source_untouched(cfg):
+def test_testnet_validator_source_and_budget_defaults(cfg):
     from pathlib import Path
 
     from cascade.shared.config import load_chain_config
 
     root = Path(__file__).resolve().parents[2]
     test = load_chain_config(root / "chain.testnet.toml")
-    assert test.v2.bench_source == "trainer" and test.v2.bench_sweep_hours == 2.0
+    # TESTNET-FAST (owner 2026-11-24, option A): testnet benches on the main
+    # validator from 8515800; the budgets keep their defaults
+    assert test.v2.bench_source == "validator" and test.v2.bench_sweep_hours == 2.0
+    assert test.v2.bench_source_from_block == 8515800
     main = load_chain_config(root / "chain.toml")
     assert main.v2.bench_sweep_hours == 2.0 and main.v2.bench_budget_hours == 6.0
     runner, calls = _runner(replace(cfg, scoring=replace(cfg.scoring,

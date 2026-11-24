@@ -144,6 +144,10 @@ def test_v2_needs_its_contract_and_the_same_seed_salt(tmp_path):
 
 def test_lane_b_can_stay_off_or_launch_after_lane_a():
     raw = tomllib.loads(_text("chain.testnet.toml"))
+    # testnet arms lane C (taken from lane B) at 8515800 (TESTNET-FAST, owner
+    # 2026-11-24 option A); this test is about lane B alone, so lane C is off
+    raw["lane_c"]["from_block"] = 0
+    raw["marketcast"]["from_block"] = 0
     n = raw["v2"]["from_block"]
     era = raw["round"]["epoch_blocks"] * raw["round"]["era_settlements"]
     raw["lane_b"].pop("from_block")

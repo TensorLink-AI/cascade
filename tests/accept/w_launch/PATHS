@@ -16,5 +16,11 @@ tests/unit/test_marketcast_composite.py
 tests/unit/test_predecision_main.py
 tests/unit/test_validator_bench.py
 tests/unit/test_dec55_crown_tiers.py
+# TESTNET-FAST option A (owner 2026-11-24): testnet's king ladder is on, so
+# the DEC-CA-0055 shipped-value pin carries it.
+tests/unit/test_dec55_config_wire.py
+# ... and testnet's validator bench source (from 8515800) in the bench pins.
+tests/unit/test_validator_bench_budget.py
+tests/unit/test_validator_bench_liveness.py
 docs/MARKETCAST.md
 docs/AGENT_MINING.md

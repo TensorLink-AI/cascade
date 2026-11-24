@@ -629,7 +629,12 @@ random_init_eras = 0
 reign_warm_start_blocks = 0
 prelaunch_burn = 0.0
 carryover_king_share = 0.0
-king_ladder = false
+# TESTNET-FAST (owner 2026-11-24, option A): the king ladder is ON so the
+# validator bench source (below) and so MarketCast / lane C can arm. It has no
+# block of its own: it applies from [v2] from_block, so the past testnet v2
+# eras are RE-JUDGED under it (owner-accepted testnet-only fork; the whole
+# testnet fleet restarts on this file together).
+king_ladder = true                 # TESTNET-FAST (2026-11-24): true (mainnet; testnet was false)
 # DEC-CA-0067 (CONSENSUS, release-then-activate): the image-decoupled
 # training contract. From the era start TWO eras after the era of the
 # stake-majority lock-in of the "v2b-<hash>" feature ([activation] threshold;
@@ -671,10 +676,10 @@ funded_sku_wall_measured_image_after = ""
 # Enforced qualification rule for the *_after pins (see chain.toml).
 image_after_unqualified_override = false
 # The escalating key slash's minimum for a first lapse (eras; mainnet value).
-# Read only under king_ladder, so inert here.
+# Read only under king_ladder — LIVE on testnet since TESTNET-FAST (2026-11-24).
 key_slash_min_eras = 6
 # The margin-tiered start share (mainnet values; read only under king_ladder,
-# so inert here): [lcb_threshold, start_bp] tiers on the crowning's
+# LIVE on testnet since TESTNET-FAST 2026-11-24): [lcb_threshold, start_bp] tiers on the crowning's
 # increment-unit LCB, and the fixed level-unit / no-LCB start.
 ladder_start_tiers = [[0.50, 8000], [0.25, 6500], [0.10, 5000], [0.01, 2500]]
 ladder_start_level_bp = 5000
@@ -689,10 +694,15 @@ sentinel_from_block = 0
 sentinel_suites = ["gift", "boom", "time", "fev"]
 sentinel_ratchet = true
 sentinel_tau = 0.01
-# DEC-CA-0063 (validator-GPU benches) stays OFF here: bench_source defaults to
-# "trainer", so bench_budget_hours (cap, default 4.0) / bench_sweep_hours
-# (per-checkpoint allowance, default 2.0) are read by nothing on testnet. The
+# DEC-CA-0063 (validator-GPU benches): TESTNET-FAST (owner 2026-11-24) arms it
+# at the same era start as lane C / MarketCast, 8515800 = 14193 x 600 (testnet
+# head 8514564 at 2026-11-24 ~10:45 UTC, ~4.1 h). Needs king_ladder (above) and
+# [netconfig] owner_hotkey = [manifest] validator_hotkey (set). If the deploy
+# slips past it, move all three blocks to a later multiple of 600.
+# bench_budget_hours / bench_sweep_hours keep their defaults (4.0 / 2.0); the
 # mainnet chain.toml documents both.
+bench_source = "validator"         # TESTNET-FAST (2026-11-24): "validator" (mainnet; testnet was "trainer")
+bench_source_from_block = 8515800  # TESTNET-FAST (2026-11-24): "v2" (mainnet)
 
 [v2.training]
 # The supplied pyramid ladder replaces the earlier v2 candidate.
@@ -815,8 +825,9 @@ tau_anchor_domain        = 0.0
 
 
 [lane_c]
-# Fine-tuning lane (DEC-CA-0056). TESTNET: SHIPPED INERT: from_block = 0 (off). The
-# owner types an ERA-BOUNDARY block at or after [v2] from_block; every
+# Fine-tuning lane (DEC-CA-0056). TESTNET-FAST (owner 2026-11-24): ARMED at
+# 8515800 together with [marketcast] and the [v2] validator bench source
+# (was shipped inert, from_block = 0). The owner types an ERA-BOUNDARY block at or after [v2] from_block; every
 # validator must run the lane-C release before it (no readiness vote). The
 # era starting at from_block is the first lane-C era; the settlement AT it is
 # still a pre-lane-C receipt. CONSENSUS: share, takes_from, remainder,
@@ -826,7 +837,7 @@ tau_anchor_domain        = 0.0
 # one is MarketCast (DEC-CA-0064, mkt:<suite>); the generic domain: / freq: /
 # horizon: targets on the public-feed pool_c are refused at load (their
 # windows could be scraped and memorised). Lane C has no pool of its own.
-from_block = 0
+from_block = 8515800               # TESTNET-FAST (2026-11-24): 9586800 (mainnet; testnet was 0 = off). = [v2] bench_source_from_block
 share      = 0.25                  # owner-tunable: taken from lane B ⇒ A 50 / B 25 / C 25
 takes_from = "lane_b"
 remainder  = "burn"                # unpaid decay + empty target slots burn
@@ -1036,7 +1047,7 @@ ready_ttl_blocks = 7200          # B10: ~24 h at 12 s blocks (a timeout, not a w
 # source for every class that lists assets. Base, activation and data contract
 # are release-only; listed numeric verdict/payout/liveness controls allow overlays.
 [marketcast]
-from_block         = 0                          # off; an era-boundary block arms it
+from_block         = 8515800                    # TESTNET-FAST (2026-11-24): 9586800 (mainnet; testnet was 0 = off). = [lane_c] from_block
 base_ref           = "mistralai/Timestral-28M@180698bbf5a50dda3516aa6419798437fb03a430"
 base_sha256        = "dfc83c6220937ce5fc6687b35a4df94cd25e28a2cfe6fb92a23dad6301b2015d"  # model.safetensors (HF LFS oid)
 base_arch          = "timestral"

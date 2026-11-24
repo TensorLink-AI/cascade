@@ -38,11 +38,11 @@ from cascade.shared.netconfig import NetConfigError, check_overrides
 
 @pytest.mark.parametrize("toml", ["chain.toml", "chain.testnet.toml"])
 def test_shipped_tables_parse_inert(toml):
-    """Testnet ships MarketCast off; mainnet arms it at 9586800 (owner
-    2026-11-24) and is inert before that block."""
+    """Mainnet arms MarketCast at 9586800 (owner 2026-11-24); testnet arms it at
+    8515800 (TESTNET-FAST, owner 2026-11-24 option A); inert before the block."""
     cfg = load_chain_config(toml)
     mc = cfg.marketcast
-    fb = 9586800 if toml == "chain.toml" else 0
+    fb = 9586800 if toml == "chain.toml" else 8515800
     assert mc.from_block == fb and mc.active(10**9) == bool(fb)
     assert not mc.active(fb - 1)
     assert mc.target_suites == (("market",) if fb else ())
@@ -211,18 +211,21 @@ def test_mkt_targets_only_with_config():
 
 
 def test_shipped_marketcast_cannot_admit_mkt_targets():
-    """Off (testnet) ⇒ the intake / commit / recipe surfaces admit no mkt:
-    target, while the shipped [lane_c] targets still load (they are inactive).
-    Armed (mainnet, 9586800) ⇒ only the composite mkt:market is admitted."""
-    cfg = load_chain_config("chain.testnet.toml")
+    """Off (the testnet table with from_block = 0) ⇒ the intake / commit /
+    recipe surfaces admit no mkt: target, while the shipped [lane_c] targets
+    still load (they are inactive). Armed (mainnet 9586800; testnet 8515800,
+    TESTNET-FAST owner 2026-11-24 option A) ⇒ only the composite mkt:market."""
+    test = load_chain_config("chain.testnet.toml")
+    off = replace(test.marketcast, from_block=0)
     for t in ("mkt:returns", "mkt:market"):
         with pytest.raises(ValueError):
-            check_target(t, mkt_suites=cfg.marketcast.target_suites)
-    assert cfg.lane_c.targets == ("mkt:market",)
-    main = load_chain_config("chain.toml")
-    assert check_target("mkt:market", mkt_suites=main.marketcast.target_suites) == "mkt:market"
-    with pytest.raises(ValueError):
-        check_target("mkt:returns", mkt_suites=main.marketcast.target_suites)
+            check_target(t, mkt_suites=off.target_suites)
+    assert test.lane_c.targets == ("mkt:market",)
+    for cfg in (load_chain_config("chain.toml"), test):
+        assert check_target("mkt:market",
+                            mkt_suites=cfg.marketcast.target_suites) == "mkt:market"
+        with pytest.raises(ValueError):
+            check_target("mkt:returns", mkt_suites=cfg.marketcast.target_suites)
 
 
 # ── recipe ──────────────────────────────────────────────────────────────────
@@ -590,7 +593,9 @@ def test_miner_cli_refuses_mkt_while_inactive(tmp_path):
 
     from cascade.miner.lane_c import mkt_inactive, recipe_error
 
-    cfg = load_chain_config("chain.testnet.toml")      # ships MarketCast off
+    test = load_chain_config("chain.testnet.toml")     # armed at 8515800 (TESTNET-FAST)
+    assert mkt_inactive(test, "mkt:market") is None
+    cfg = replace(test, marketcast=replace(test.marketcast, from_block=0))   # MarketCast off
     assert "not active" in mkt_inactive(cfg, "mkt:returns")
     assert mkt_inactive(cfg, "domain:energy") is None
     from cascade.shared.config.lane_c import parse_lane_c as _plc
