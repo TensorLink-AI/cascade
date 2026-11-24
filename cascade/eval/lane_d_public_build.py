@@ -287,20 +287,26 @@ def dataset_files(listing: Sequence[Mapping], dataset: str) -> list[dict]:
                   key=lambda f: f["path"])
 
 
-def hf_fetcher(source: str) -> Callable[[str, Path], None]:
-    """Download one file of the pinned revision to ``dest`` (huggingface_hub)."""
-    spec = idx.PUBLIC_SOURCES[source]
+class HFFetcher:
+    """Download one file of the pinned revision to ``dest`` (huggingface_hub;
+    picklable, so ``--workers`` processes can carry it)."""
 
-    def fetch(path: str, dest: Path) -> None:
+    def __init__(self, source: str):
+        self.source = source
+
+    def __call__(self, path: str, dest: Path) -> None:
         from huggingface_hub import hf_hub_download
 
+        spec = idx.PUBLIC_SOURCES[self.source]
         tmp = dest.parent / ".hf"
         got = hf_hub_download(repo_id=spec.repo, repo_type="dataset", revision=spec.revision,
                               filename=path, local_dir=str(tmp))
         dest.parent.mkdir(parents=True, exist_ok=True)
         os.replace(got, dest)
 
-    return fetch
+
+def hf_fetcher(source: str) -> Callable[[str, Path], None]:
+    return HFFetcher(source)
 
 
 class Builder:

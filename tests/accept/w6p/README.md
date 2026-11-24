@@ -109,5 +109,5 @@ change**: the streaming build writes the very `index.jsonl.gz` /
 | tampered shard / index set refused | `test_a_tampered_shard_is_refused_and_the_backup_used`, `test_a_tampered_index_set_is_refused`, `test_build_refuses_a_file_that_is_not_the_listing` |
 | cache: warm reads, re-verify, refill, LRU budget | `test_the_cache_serves_repeat_reads_and_reverifies_every_read`, `test_cache_eviction_keeps_the_byte_budget_lru` |
 | draw → fetch touches only the drawn series | `test_draw_then_fetch_touches_only_the_drawn_series` |
-| resumable, idempotent build | `test_the_build_resumes_by_shard_and_is_idempotent` |
+| resumable, idempotent, parallel build | `test_the_build_resumes_by_shard_and_is_idempotent`, `test_parallel_workers_build_the_same_mirror` |
 | box index fetch, estimate, config | `test_fetch_index_gives_the_box_a_verified_index`, `test_estimate_extrapolates_the_measured_ratio`, `test_mirror_config_names_stores_and_the_volume_cache` |

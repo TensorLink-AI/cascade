@@ -389,6 +389,44 @@ def test_the_build_resumes_by_shard_and_is_idempotent(tmp_path):
     assert hip.puts == [] and log == []
 
 
+class DirStore:
+    """A picklable store on a directory (for the --workers processes)."""
+
+    def __init__(self, name, root):
+        self.name, self.root = name, Path(root)
+
+    def head(self, key):
+        p = self.root / key
+        return p.stat().st_size if p.is_file() else None
+
+    def put_file(self, key, path):
+        p = self.root / key
+        p.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(path, p)
+
+
+class CopyFetch:
+    def __init__(self, root):
+        self.root = Path(root)
+
+    def __call__(self, path, dest):
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(self.root / path, dest)
+
+
+def test_parallel_workers_build_the_same_mirror(tmp_path):
+    pb = _pb()
+    ref = _build(tmp_path / "ref", fx.GIFT)
+    root, ds = fx.gift_mirror(tmp_path / "par")
+    kw = {"source": fx.GIFT, "listing": _listing(root), "work_dir": tmp_path / "par" / "work",
+          "stores": [DirStore("hippius", tmp_path / "bucket")], "fetch": CopyFetch(root),
+          "rg_target": 4096, "shard_target": 20000}
+    pb.build_all(kw, ds, workers=2)
+    out = pb.Builder(**kw).finalize(ds, tmp_path / "par" / "ix")
+    assert out["shards"]["shardmap_sha256"] == ref["out"]["shards"]["shardmap_sha256"]
+    assert out["manifest"]["index_sha256"] == ref["out"]["manifest"]["index_sha256"]
+
+
 def test_build_refuses_a_file_that_is_not_the_listing(tmp_path):
     pb = _pb()
     root, ds = fx.gift_mirror(tmp_path)
