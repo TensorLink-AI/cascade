@@ -118,7 +118,7 @@ series longer than 4096 are cropped into random 4096-point windows.
 | A | Synthetic data for the full fixed model | Beats the king on private tests and active public benchmark gates; a later checked promotion can advance the shared starting checkpoint |
 | B | Synthetic data for declared targets; the trainer selects expert rows | Passes target and regression tests, then merge acceptance when enabled; accepted updates enter the shared starting model and earn target rewards |
 | C | Currently an eligible MarketCast recipe on a separately pinned Timestral base | Passes future-data tests and later confirmation, then wins an application slot; it does not merge into A/B |
-| D | Miner-trained BF16 weights for the fixed cascade_pyramid architecture (built, unarmed) | Beats the lane D king on forward-only private windows and the gate, then confirms; crowned kings are published. See [LANE_D.md](docs/LANE_D.md) |
+| D | Miner-trained BF16 weights for the fixed cascade_pyramid architecture (armed on mainnet at block 9586800 by the launch overlay) | Beats both the lane D king and the lane A king (the house) on forward-only private windows and the gate; crowned at the first verdict and published. See [LANE_D.md](docs/LANE_D.md) |
 
 V1 centred on full-model data competition with the Toto2 lineage. V2 starts a
 fresh Cascade mixture-of-experts lineage and adds B/C. Discover what is open;
