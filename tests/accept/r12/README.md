@@ -199,12 +199,26 @@ unique, then `RUN <command>` lines. The copied set is **exactly**:
   `id_ecdsa*`, `id_ed25519*`, `known_hosts*`, `.netrc`, or containing
   `secret` or `credential` (case-insensitive).
 
-Nothing else (`chain.toml`, `.env`, docs, tests, scripts, wallets). A file's
+- (#784) the project build's own inputs, DERIVED from the release's
+  `pyproject.toml`: `[project] readme` (a path or a table's `file`) and every
+  source of `[tool.hatch.build.targets.wheel.force-include]` (on this repo
+  `README.md`, `chain.toml`, `chain.testnet.toml`, `docs/AGENT_MINING.md`).
+  Each must be a regular file inside the release, not secret-named; a missing
+  one is exit 2 with no COPY (its `uv sync --frozen` would fail on the host).
+
+Nothing else (`.env`, other docs, tests, scripts, wallets). A file's
 contents are never printed. The `RUN` lines hold a pinned `rsync`/`scp`
 transfer to `--dest`, then `uv sync --frozen` on the host (never `uv lock`,
 `uv add`, `uv pip`, or `uv sync` without `--frozen`); every ssh/rsync/scp line
 names the port (`-p N`) and pins the host key. On this repo the set covers
 every tracked non-symlink file under `cascade/` and `benchmarks/`.
+
+`--extra NAME` (repeatable; only an `[project.optional-dependencies]` group of
+the release's pyproject, else exit 2) plans `uv sync --frozen --extra NAME`.
+A profile's optional `uv_extras` list (`profile-info --get uv_extras`, space
+separated) is what the owner scripts pass: `launch_eval.toml` has
+`uv_extras = ["train"]` (the pinned torch 2.4.1+cu124 lives in that extra;
+#784: a plain sync left the eval host without torch), `bench_gate.toml` none.
 
 ## `handshake`
 

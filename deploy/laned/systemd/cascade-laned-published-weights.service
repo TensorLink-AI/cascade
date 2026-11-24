@@ -1,0 +1,27 @@
+# TEMPLATE (not installed by any script): refresh the lane D intake's
+# published-weights registry (<intake state>/published_weights.json, W3 dedup;
+# the intake answers 503 dedup_unavailable until it exists) from the signed
+# lane D index and a local copy of one public mirror. Lane A legs / kings and
+# the house enter through extra --checkpoint-dir arguments (a drop-in), each a
+# checkpoint fetched from its published ref.
+#
+# Ships in --dry-run. Going live (drop-in without --dry-run) only rewrites the
+# registry when its sha set changed; shas are never dropped (no --replace).
+# Lines start "published_weights: " (wrote / current / dry-run / nothing written).
+
+[Unit]
+Description=cascade lane D published-weights registry refresh (dry-run template)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/
+Environment=PYTHONPATH=/root/cascade
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/cascade-laned-jobs.env
+ExecStart=/root/cascade/.venv/bin/python -P -m cascade.lane_d.published_weights --dry-run --out ${LANED_INTAKE_STATE}/published_weights.json --lane-d-index ${LANED_INDEX} --index-signer ${LANED_SIGNER_SS58} --mirror-dir ${LANED_MIRROR_DIR}
+Nice=19
+MemoryMax=256M
+NoNewPrivileges=true
+StandardOutput=append:/root/cascade/laned-jobs.log
+StandardError=append:/root/cascade/laned-jobs.log

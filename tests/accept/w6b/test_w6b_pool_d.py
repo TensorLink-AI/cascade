@@ -398,3 +398,29 @@ def test_evidence_snapshot_on_3h_boundary():
     doc = _evidence_doc()
     assert doc["as_of_ts"] % 10800 == 0
     assert doc["max_history_len"] >= 64
+
+
+# ── item 7: [lane_d] embargo_hours is always read from a chain config ────────
+
+
+def test_cli_reads_embargo_hours_from_the_chain_config_by_default(world, tmp_path, monkeypatch):
+    """Without `--chain-toml` the builder reads `[lane_d]` from the loader's
+    default chain.toml (item 7: no hard-coded 48 fallback). The loader is
+    patched to a 24 h embargo; the snapshot's global embargo must follow it."""
+    import cascade.shared.config as config_pkg
+    from cascade.shared.config.lane_d import LaneDConfig
+
+    b, _sel, _fs = mods()
+    seen = []
+
+    def fake_load(path=None, **_kw):
+        seen.append(path)
+        return types.SimpleNamespace(lane_d=types.SimpleNamespace(embargo_hours=24.0, horizon=64))
+
+    monkeypatch.setattr(config_pkg, "load_chain_config", fake_load)
+    rc, _ev = _cli(world, tmp_path, _lane_a_snapshot(world, tmp_path), out_name="dflt")
+    assert rc == 0
+    assert seen == [None], f"the builder did not read the default chain config: {seen}"
+    assert meta(tmp_path / "dflt")["embargo_hours_global"] == 24.0
+    # the module default is the loader's, never a second literal
+    assert LaneDConfig.embargo_hours == b.DEFAULT_EMBARGO_HOURS

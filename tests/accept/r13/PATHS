@@ -1,0 +1,12 @@
+# R13 elastic lane D hosts (plan §3.0 R13 row, §1.7 "Build host", W6d cadence;
+# owner 2026-11-24: Shadeform CPU-only pool_d builder, Lium-only eval hosts,
+# multi-host sharding; README.md has the contract).
+# The controller, its config, the 3-hourly systemd unit and timer.
+cascade/laned/elastic.py
+deploy/laned/elastic.toml
+deploy/laned/cascade-laned-pool-d.service
+deploy/laned/cascade-laned-pool-d.timer
+# cli.py: ONLY add "elastic": "cascade.laned.elastic" to COMMANDS.
+cascade/laned/cli.py
+# docs/OPERATOR.md: ONLY the "Elastic lane D hosts" section.
+docs/OPERATOR.md

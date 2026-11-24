@@ -390,9 +390,22 @@ def _window_ids(pool_dir: Path) -> set[str]:
             for s in meta.get("series") or [] if s.get("target_ts")}
 
 
+def lane_d_embargo_hours(chain_toml: Path | str | None = None) -> float:
+    """``[lane_d] embargo_hours`` of ``chain_toml`` (else the loader's default
+    chain.toml): what retention keeps snapshots for (item 7)."""
+    from ..shared.config import load_chain_config
+
+    return float(load_chain_config(chain_toml).lane_d.embargo_hours)
+
+
 def retention_plan(pins_path: Path | str, state: Mapping, *,
-                   embargo_hours: float = 48.0) -> dict:
-    """``{"keep", "expire"}``: the snapshots open entries can still reference."""
+                   embargo_hours: float | None = None) -> dict:
+    """``{"keep", "expire"}``: the snapshots open entries can still reference.
+    ``embargo_hours`` defaults to the loader's ``[lane_d] embargo_hours``."""
+    if embargo_hours is None:
+        from ..shared.config.lane_d import LaneDConfig
+
+        embargo_hours = float(LaneDConfig.embargo_hours)
     pins_path = Path(pins_path)
     pins = _load_pins(pins_path)["pins"]
     names = [p["snapshot"] for p in pins]
@@ -498,7 +511,10 @@ def main(argv: list[str] | None = None) -> int:
     ret.add_argument("--pins", type=Path, required=True)
     ret.add_argument("--local-root", type=Path, required=True)
     ret.add_argument("--state", type=Path, required=True)
-    ret.add_argument("--embargo-hours", type=float, default=48.0)
+    ret.add_argument("--embargo-hours", type=float, default=None,
+                     help="default: [lane_d] embargo_hours of --chain-toml (else the "
+                          "default chain.toml)")
+    ret.add_argument("--chain-toml", type=Path, default=None)
     ret.add_argument("--apply", action="store_true")
     ev = sub.add_parser("evidence")
     store_args(ev)
@@ -509,7 +525,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.cmd == "retention":
             state = json.loads(args.state.read_text(encoding="utf-8"))
-            plan = retention_plan(args.pins, state, embargo_hours=args.embargo_hours)
+            embargo = (args.embargo_hours if args.embargo_hours is not None
+                       else lane_d_embargo_hours(args.chain_toml))
+            plan = retention_plan(args.pins, state, embargo_hours=embargo)
             print(json.dumps(plan, sort_keys=True))
             if args.apply:
                 print(json.dumps({"removed": apply_retention(args.pins, args.local_root, plan)}))
@@ -564,6 +582,7 @@ __all__ = [
     "check_build_wall",
     "due_as_of",
     "fetch_hist",
+    "lane_d_embargo_hours",
     "main",
     "open_pool_store",
     "publish_snapshot",

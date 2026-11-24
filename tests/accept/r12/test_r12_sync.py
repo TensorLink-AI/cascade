@@ -177,8 +177,29 @@ def test_sync_of_this_repo_copies_every_tracked_package_and_bench_file(kit):
     missing = sorted(want - copies)
     assert not missing, f"tracked release files not synced: {missing[:20]}"
     assert {"pyproject.toml", "uv.lock"} <= copies
+    # #784: plus exactly the build inputs pyproject.toml names (README, hatch
+    # force-includes), derived here independently of the tool.
+    build = _repo_build_inputs()
+    assert build >= {"README.md", "chain.toml", "chain.testnet.toml", "docs/AGENT_MINING.md"}
     for p in copies:
         assert (p.startswith(("cascade/", "benchmarks/"))
-                or p in {"pyproject.toml", "uv.lock", ".python-version"}), p
+                or p in {"pyproject.toml", "uv.lock", ".python-version"} | build), p
         assert "__pycache__" not in p and not p.endswith((".pyc", ".pyo")), p
         assert "/.venv/" not in p, p
+    assert build <= copies, sorted(build - copies)
+
+
+def _repo_build_inputs() -> set[str]:
+    import tomllib
+
+    data = tomllib.loads((REPO / "pyproject.toml").read_text())
+    out = set()
+    readme = data["project"].get("readme")
+    if isinstance(readme, dict):
+        readme = readme.get("file")
+    if readme:
+        out.add(readme)
+    force = (data.get("tool", {}).get("hatch", {}).get("build", {}).get("targets", {})
+             .get("wheel", {}).get("force-include", {}))
+    out.update(force)
+    return out

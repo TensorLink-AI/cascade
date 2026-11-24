@@ -12,3 +12,6 @@ cascade/eval/lane_d_t7.py
 cascade/eval/lane_d_channels.py
 cascade/eval/lane_d_forecasts.py
 cascade/validator/lane_d_inputs.py
+# Lane D recurring jobs (ops tooling PR): the module of the w5d job these
+# tests pin (python -P -m cascade.lane_d.ops_jobs).
+cascade/lane_d/ops_jobs.py
