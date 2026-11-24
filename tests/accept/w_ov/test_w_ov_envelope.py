@@ -14,7 +14,11 @@ DANGEROUS = [
     ({"lane_c": {"alpha": 0.3}}, "lane_c] alpha"),                   # free win
     ({"lane_b": {"gain_margin": 0.0005}}, "lane_b] gain_margin"),    # a noise-level bar
     ({"lane_d": {"bootstrap_B": 10_000_000}}, "lane_d] bootstrap_B"),  # satellite DoS
-    ({"lane_d": {"d_margin": 0.0005, "backtest_weight_cap": 0.0}}, "lane_d] d_margin"),
+    ({"lane_d": {"d_margin": 0.0005}}, "lane_d] d_margin"),
+    # rev6.18 A3 (F4): one window may swing the score 20x (an outlier decides)
+    ({"lane_d": {"window_ratio_floor": 0.05}}, "lane_d] window_ratio_floor"),
+    # ... or a near-1 clamp flattens every window (nothing can ever clear)
+    ({"lane_d": {"window_ratio_floor": 0.95}}, "lane_d] window_ratio_floor"),
     ({"lane_d": {"max_windows_per_settlement": 1_000_000}}, "max_windows_per_settlement"),
     ({"lane_c": {"n_windows": 1_000_000}}, "lane_c] n_windows"),
     ({"marketcast": {"alpha": 0.4}}, "marketcast] alpha"),
@@ -34,6 +38,22 @@ def test_w_ov_envelope_refuses_loader_legal_dangerous_values(overrides, where):
     assert nb.value_refusals(overrides), f"{overrides} is inside the envelope"
     why = refusal(shipped_cfg(), overrides)
     assert why is not None and "out of bounds" in why and where in why, why
+
+
+@pytest.mark.parametrize("value", [-0.01, 1.01, 2.0])
+def test_w_ov_public_weight_is_bounded_to_the_unit_split(value):
+    """rev6.18 A3 (F4): [lane_d] public_weight is overlay-tweakable inside
+    [0, 1] (owner 2026-11-24: the 50/50 split moves by overlay, not by a
+    release); outside it the envelope refuses, and every split inside it
+    (0, 0.5, 0.99, 1; the loader keeps < 1) passes the envelope, a 0.4
+    overlay being adopted end to end."""
+    from cascade.shared import netconfig_bounds as nb
+
+    got = nb.value_refusals({"lane_d": {"public_weight": value}})
+    assert got and "lane_d] public_weight" in got[0], (value, got)
+    for inside in (0.0, 0.5, 0.99, 1.0):
+        assert not nb.value_refusals({"lane_d": {"public_weight": inside}}), inside
+    assert refusal(shipped_cfg(), {"lane_d": {"public_weight": 0.4}}) is None
 
 
 @pytest.mark.parametrize("name", SHIPPED)

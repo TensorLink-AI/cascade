@@ -1,8 +1,10 @@
-"""Shared spec and helpers for the W2e acceptance tests (the rev6.9 / rev6.10 /
-rev6.11 ``[lane_d]`` keys).
+"""Shared spec and helpers for the W2e acceptance tests (the rev6.10 /
+rev6.11 / rev6.18 ``[lane_d]`` keys).
 
 Copied from docs/plans/LANE_D_PLAN.md: the W2e row, rev6.10 (a) / (b),
-rev6.11 (a) / (e) and rev6.9 (a) "Loader check". README.md states the
+rev6.11 (a) / (e) and rev6.18 A3 / D24 (F4: ``public_weight`` and
+``window_ratio_floor`` added; the rev6.9 backtest keys and their loader
+inequality deleted, owner 2026-11-24). README.md states the
 contract. Every check that can fail is an ``assert`` so a missing behaviour on
 main fails as an ``AssertionError``.
 """
@@ -11,7 +13,6 @@ from __future__ import annotations
 
 import copy
 import json
-import math
 import re
 import subprocess
 import sys
@@ -30,13 +31,16 @@ ARM = {"from_block": ARM_BLOCK, "share": 0.25, "takes_from": "lane_a"}
 W2E_DEFAULTS: dict[str, object] = {
     "embargo_hours": 48.0,
     "max_windows_per_settlement": 5000,
-    "min_fresh_window_share": 0.5,
-    # Owner 2026-11-23: ON at launch (1 - 0.85 ** 0.05 ~ 0.0081 < d_margin 0.01).
-    "backtest_weight_cap": 0.05,
-    "backtest_ratio_floor": 0.85,
+    # Owner 2026-11-23 ("first verdict ~6 h"): 0.2, was 0.5 (tests-correction).
+    "min_fresh_window_share": 0.2,
+    # rev6.18 A3 (owner 2026-11-23): 50% live + 50% public; ratio clamp [0.5, 2].
+    "public_weight": 0.5,
+    "window_ratio_floor": 0.5,
     # rev6.14 (a): the judging start j = T + eval_delay_hours.
     "eval_delay_hours": 6.0,
 }
+# rev6.18 D24 / A7 (owner 2026-11-24 / 2026-11-23): retired, ignored by the loader.
+RETIRED = ("backtest_weight_cap", "backtest_ratio_floor", "lowfreq_freqs")
 W2E_KEYS = tuple(W2E_DEFAULTS)
 
 # (value A, value B, co-keys). Each pair differs and is legal on its own.
@@ -44,9 +48,8 @@ MUTATIONS: dict[str, tuple[object, object, dict]] = {
     "embargo_hours": (24.0, 12.0, {}),
     "max_windows_per_settlement": (2000, 8000, {}),
     "min_fresh_window_share": (0.75, 0.25, {}),
-    # 1 - 0.85 ** 0.02 ~ 0.0032 and 1 - 0.85 ** 0.04 ~ 0.0065, both < 0.01.
-    "backtest_weight_cap": (0.02, 0.04, {}),
-    "backtest_ratio_floor": (0.9, 0.95, {}),
+    "public_weight": (0.3, 0.7, {}),
+    "window_ratio_floor": (0.25, 0.75, {}),
     "eval_delay_hours": (3.0, 12.0, {}),
 }
 
@@ -54,16 +57,16 @@ REFUSED: dict[str, list[object]] = {
     "embargo_hours": [-1.0, -0.5, True, "48"],
     "max_windows_per_settlement": [0, -1, 999, True, 5000.5, "5000"],
     "min_fresh_window_share": [-0.1, 1.5, True, "0.5"],
-    "backtest_weight_cap": [-0.01, 1.0, 1.5, True, "0.05"],
-    "backtest_ratio_floor": [0.0, -0.1, 1.5, True, "0.85"],
+    "public_weight": [-0.01, 1.0, 1.5, True, "0.5"],
+    "window_ratio_floor": [0.0, 1.0, -0.1, 1.5, True, "0.5"],
     "eval_delay_hours": [-1.0, -0.5, True, "6"],
 }
 ACCEPTED: dict[str, list[object]] = {
     "embargo_hours": [0.0, 6.0, 48.0, 72.0],
     "max_windows_per_settlement": [1000, 5000, 20000],
     "min_fresh_window_share": [0.0, 0.5, 1.0],
-    "backtest_weight_cap": [0.0, 0.05],
-    "backtest_ratio_floor": [0.85, 0.95],
+    "public_weight": [0.0, 0.5, 0.99],
+    "window_ratio_floor": [0.01, 0.5, 0.99],
     "eval_delay_hours": [0.0, 6.0, 24.0],
 }
 
@@ -72,15 +75,10 @@ OVERLAY_VALUE: dict[str, object] = {
     "embargo_hours": 24.0,
     "max_windows_per_settlement": 3000,
     "min_fresh_window_share": 0.75,
-    "backtest_weight_cap": 0.03,           # 1 - 0.9 ** 0.03 ~ 0.0032 < 0.01
-    "backtest_ratio_floor": 0.9,
+    "public_weight": 0.3,
+    "window_ratio_floor": 0.6,
     "eval_delay_hours": 12.0,
 }
-
-
-def inequality_holds(cap: float, floor: float, d_margin: float) -> bool:
-    """rev6.9 (a): ``cap > 0`` needs ``1 - floor ** cap < d_margin``."""
-    return cap <= 0.0 or (1.0 - math.pow(floor, cap)) < d_margin
 
 
 @cache

@@ -68,7 +68,10 @@ def _expected_params(cfg) -> dict:
         "scoring_levels": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
         "gate_suites": [str(s) for s in cfg.gate_suites],
         "tau_public": float(cfg.tau_public),
-        "lowfreq_freqs": [str(f) for f in cfg.lowfreq_freqs],
+        # rev6.18 A3 (F4): the public weight and the ratio clamp (A7: no
+        # lowfreq_freqs).
+        "public_weight": float(getattr(cfg, "public_weight", 0.5)),
+        "window_ratio_floor": float(getattr(cfg, "window_ratio_floor", 0.5)),
         # RV4: the gate draw's weights as parsed (absent suites weigh 0), the
         # B14 source cap and the §1.7 context floor.
         "gate_weights": {str(s): float(w) for s, w in cfg.gate_weights},
@@ -78,7 +81,7 @@ def _expected_params(cfg) -> dict:
         # defaults, so the test never touches an attribute W2e hasn't added).
         "embargo_hours": float(getattr(cfg, "embargo_hours", 48.0)),
         "max_windows_per_settlement": int(getattr(cfg, "max_windows_per_settlement", 5000)),
-        "min_fresh_window_share": float(getattr(cfg, "min_fresh_window_share", 0.5)),
+        "min_fresh_window_share": float(getattr(cfg, "min_fresh_window_share", 0.2)),
     }
 
 
@@ -214,17 +217,22 @@ def test_e2e_no_confirmation_block_and_the_first_verdict_crowns(scratch):
         assert "confirm_on_king_change" not in s.report["params"]
 
 
-def test_e2e_lowfreq_result(scratch):
+def test_e2e_verdicts_carry_point_gains_not_lowfreq(scratch):
+    """rev6.18 A7 / A8 (F4): correction of the A10 `lowfreq` result test (the
+    check is removed, owner 2026-11-23). Every verdict carries its live
+    half's point gain (`halves.live`, = `sources.live`) and its per-domain
+    gains, whose windows add up to the half's; at public_weight 0 (this
+    fixture) there is no public half."""
     built = _built(scratch)
-    cfg = built["cfg"]
-    (v1,) = built["s1"].report["verdicts"]
-    (v2,) = built["s2"].report["verdicts"]
-    freqs = [str(f) for f in cfg.lowfreq_freqs]
-    assert v1["lowfreq"] == {"result": "not_candidate", "freqs": freqs, "n_windows": 0,
-                             "tau_public": float(cfg.tau_public)}
-    # The crowning candidate: the fixture is hourly only, so no low-frequency window.
-    assert v2["lowfreq"] == {"result": "no_windows", "freqs": freqs, "n_windows": 0,
-                             "tau_public": float(cfg.tau_public)}
+    for s in (built["s1"], built["s2"]):
+        for v in s.report["verdicts"]:
+            assert "lowfreq" not in v, "the A10 lowfreq block is removed (rev6.18 A7)"
+            assert set(v.get("halves") or {}) == {"live"}, v.get("halves")
+            live = v["halves"]["live"]
+            assert set(live) == {"n", "gain"} and live["n"] > 0
+            assert v["sources"] == {"live": live}
+            assert sum(d["n"] for d in v["domains"].values()) == live["n"]
+            assert all(k.startswith("live|") for k in v["domains"])
 
 
 def test_e2e_court_slots_carry_burn_reason(scratch):

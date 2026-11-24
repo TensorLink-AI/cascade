@@ -14,7 +14,16 @@ verifier. Checks, in order (the first failure is the verdict):
 5. per cohort: forward-only on both clocks against ``max(T) + margin``, the
    floors, and exactly one finite row per (window, model);
 6. per cohort: the max-T LCBs, gains, clears and outcomes re-derived from
-   the rows; when a miner holds KING_D the house is a second bar, and its
+   the rows under the rev6.18 A3 combined rule (F4, :func:`_judge`): live
+   (forward) rows of the cohort + the settlement's public rows
+   (``public.rows``, the kept public windows: drawn minus dropped), each
+   per-window ratio clamped to ``[window_ratio_floor, 1/window_ratio_floor]``,
+   ``L = (1 − w) L_live + w L_pub``, one two-part max-T cluster bootstrap
+   (live clusters = source, public = ``<source>|<family>``); a clear is
+   ``LCB ≥ d_margin`` ∧ live gain > 0 ∧ (``w > 0``) public gain > 0, and
+   every verdict's per-half / per-source / per-domain point gains (A8) are
+   re-derived (burn class ``ld_cohort``; ``public.rows_sha256`` is
+   ``ld_rows_sha256``); when a miner holds KING_D the house is a second bar, and its
    judgement (``cohorts[].house_digest``, ``verdicts[].house``) is
    re-derived the same way and must be present exactly then. W5f: a new
    house challenges a miner KING_D alone in its own cohort (its T is the
@@ -29,16 +38,13 @@ verifier. Checks, in order (the first failure is the verdict):
    outcome. Without a gate record nothing crowns (fail closed). The crown
    is the highest-LCB passing first clear or a held candidate re-gated
    ``pass``; the paid court follows from it. rev6.11 (b): there is no
-   confirmation stage; a crown is first clear ∧ A10 ∧ gate, and a cohort or
-   verdict of any stage but ``first`` is a problem.
+   confirmation stage; a crown is first clear ∧ gate (rev6.18 A7: no A10
+   check), and a cohort or verdict of any stage but ``first`` is a problem.
 
 RV7 B2 adds the crown's provenance (README "Correction (RV7 B2)"):
 
 - ``seed`` is ``lane-d/1:{boundary}:{pool.sha256}``; every cohort is
   stage ``first`` and judged against ``king_before``;
-- a cleared verdict whose A10 ``lowfreq`` block reads ``pass`` /
-  ``fail`` has that result re-derived from its LCBs; a ``fail`` is ``lost``
-  and never gated;
 - a held candidate's gate result carries ``held_from`` (its hold: an
   earlier boundary, an LCB that cleared ``d_margin``, the same KING_D: a
   king change drops a hold); a verdict-backed result carries none;
@@ -95,7 +101,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ..eval.bootstrap import cohort_maxt_lcbs
+from ..eval.bootstrap import clamped_log_ratios, log_gain, parts_maxt_lcbs
 from .checks import CheckResult, _fail, _ok, _warn
 
 NAME = "lane_d"
@@ -140,7 +146,9 @@ def _expected_params(cfg) -> dict:
             "max_mirror_lag_hours": float(cfg.max_mirror_lag_hours),
             "gate_suites": [str(s) for s in cfg.gate_suites],
             "tau_public": float(cfg.tau_public),
-            "lowfreq_freqs": [str(f) for f in cfg.lowfreq_freqs],
+            # rev6.18 A3 (F4): the public half's weight and the ratio clamp.
+            "public_weight": float(cfg.public_weight),
+            "window_ratio_floor": float(cfg.window_ratio_floor),
             # RV4: gate params W7a added to lane-d-report/1 params.
             "gate_weights": {str(s): float(w) for s, w in cfg.gate_weights},
             "max_source_share": float(cfg.max_source_share),
@@ -179,34 +187,65 @@ def _signature(report: dict, signer_hotkey: str) -> str | None:
     return None if verify_hotkey(signer_hotkey, body, str(sig)) else "signature does not verify"
 
 
-def _geo(crps: np.ndarray, mase: np.ndarray) -> float:
-    return math.sqrt(math.exp(float(np.mean(np.log(np.maximum(crps, 1e-12)))))
-                     * math.exp(float(np.mean(np.log(np.maximum(mase, 1e-9))))))
-
-
-def _comp(crps: np.ndarray, mase: np.ndarray):
-    return (crps[:, None] / 2.0, np.ones(len(crps)), mase)
-
-
 def _close(got, want: float) -> bool:
     return (isinstance(got, (int, float)) and not isinstance(got, bool)
             and math.isclose(float(got), want, rel_tol=1e-9, abs_tol=1e-12))
 
 
-def _judge(report: dict, cfg, scores: dict, bar: str, members: list[str],
-           clusters: list) -> list[tuple[float, float, bool]]:
-    """``(lcb, gain, cleared)`` per member: the max-T judgement of the
-    cohort against ``bar`` on the signed rows and ``report["seed"]``."""
-    lcbs = cohort_maxt_lcbs(_comp(*scores[bar]), [_comp(*scores[m]) for m in members],
-                            alpha=float(cfg.alpha), B=int(cfg.bootstrap_B),
-                            seed=str(report["seed"]), clusters=clusters)
-    bg = _geo(*scores[bar])
-    out = []
-    for m, lcb in zip(members, lcbs, strict=True):
-        gain = (bg - _geo(*scores[m])) / (bg if abs(bg) >= 1e-9 else 1e-9)
-        out.append((float(lcb), float(gain), bool(lcb >= _report_bar(report, cfg)
-                                                  and gain > 0.0)))
+def _groups(x: np.ndarray, labels: list[str]) -> dict:
+    """``{label: (n, gain)}`` of per-window log-ratios grouped by label."""
+    out: dict[str, tuple[int, float]] = {}
+    for key in sorted(set(labels)):
+        sel = np.asarray([lab == key for lab in labels])
+        out[str(key)] = (int(sel.sum()), log_gain(float(np.mean(x[sel]))))
     return out
+
+
+def _judge(report: dict, cfg, scores: dict, bar: str, members: list[str],
+           clusters: list, pub: dict | None) -> list[dict]:
+    """rev6.18 A3 (F4): per member the re-derived ``{lcb, gain, cleared,
+    halves, sources, domains}`` of the cohort against ``bar`` on the signed
+    live rows (``scores``), the settlement's signed public rows (``pub``:
+    ``{"scores": {digest: (crps, mase)}, "clusters", "sources"}``, required
+    at ``public_weight > 0``) and ``report["seed"]`` (module docstring, 6).
+    ``halves`` / ``sources`` / ``domains`` values are ``(n, gain)``."""
+    floor, w = float(cfg.window_ratio_floor), float(cfg.public_weight)
+    xl = [clamped_log_ratios(*scores[bar], *scores[m], floor=floor) for m in members]
+    parts = [(xl, list(clusters), 1.0 - w)]
+    xp = None
+    if w > 0.0:
+        xp = [clamped_log_ratios(*pub["scores"][bar], *pub["scores"][m], floor=floor)
+              for m in members]
+        parts.append((xp, list(pub["clusters"]), w))
+    lcbs = parts_maxt_lcbs(parts, alpha=float(cfg.alpha), B=int(cfg.bootstrap_B),
+                           seed=str(report["seed"]))
+    out = []
+    for j, lcb in enumerate(lcbs):
+        live = float(np.mean(xl[j]))
+        halves = {"live": (int(xl[j].size), log_gain(live))}
+        sources = {"live": halves["live"]}
+        domains = _groups(xl[j], [f"live|{c}" for c in clusters])
+        big_l = (1.0 - w) * live
+        if xp is not None:
+            p_ = float(np.mean(xp[j]))
+            halves["public"] = (int(xp[j].size), log_gain(p_))
+            sources.update(_groups(xp[j], list(pub["sources"])))
+            domains.update(_groups(xp[j], list(pub["clusters"])))
+            big_l += w * p_
+        ok = all(g > 0.0 for _, g in halves.values())
+        out.append({"lcb": float(lcb), "gain": log_gain(big_l),
+                    "cleared": bool(float(lcb) >= _report_bar(report, cfg) and ok),
+                    "halves": halves, "sources": sources, "domains": domains})
+    return out
+
+
+def _gains_problem(stated, want: dict) -> bool:
+    """True when a stated ``{key: {n, gain}}`` map is not the re-derived
+    ``{key: (n, gain)}`` one."""
+    if not isinstance(stated, dict) or set(stated) != set(want):
+        return True
+    return any(not isinstance(stated[k], dict) or stated[k].get("n") != n
+               or not _close(stated[k].get("gain"), g) for k, (n, g) in want.items())
 
 
 def crown_bar_of(cfg, tenure: int) -> float:
@@ -262,8 +301,7 @@ def _bars(kd: str, hd: str, members) -> list[str]:
     return [kd] if kd == hd or hd in members else [kd, hd]
 
 
-def _house_problems(idx: int, m: str, hv, hd: str, want: tuple[float, float, bool]
-                    ) -> list[str]:
+def _house_problems(idx: int, m: str, hv, hd: str, want: dict) -> list[str]:
     """The verdict's ``house`` judgement against the one re-derived from the rows."""
     if not isinstance(hv, dict):
         return [f"cohort {idx}: {m[:12]} has no house judgement (house {hd[:12]} is a bar)"]
@@ -273,7 +311,7 @@ def _house_problems(idx: int, m: str, hv, hd: str, want: tuple[float, float, boo
     if hv["digest"] != hd:
         out.append(f"cohort {idx}: {m[:12]} house judgement names {str(hv['digest'])[:12]}, "
                    f"not the house {hd[:12]}")
-    lcb, gain, cleared = want
+    lcb, gain, cleared = want["lcb"], want["gain"], want["cleared"]
     if not (_close(hv["lcb"], lcb) and _close(hv["gain"], gain)):
         out.append(f"cohort {idx}: {m[:12]} house lcb/gain {hv['lcb']}/{hv['gain']} != "
                    f"re-derived {lcb}/{gain}")
@@ -298,36 +336,13 @@ def _stage_problem(report: dict, cfg, cohort: dict, v: dict) -> str | None:
     return None
 
 
-def _lowfreq_problem(cfg, v: dict) -> tuple[str | None, bool]:
-    """W3b5 (A10) for a cleared first verdict: ``(problem, is_fail)``. A
-    ``pass`` / ``fail`` block carries four finite LCBs and its result is
-    re-derived from them (``fail`` iff one is below ``-tau_public``); a
-    ``fail`` is ``lost``. ``no_windows`` (and an unevaluated block) leaves
-    the candidate to the gate."""
-    lf = v.get("lowfreq")
-    if not isinstance(lf, dict) or lf.get("result") not in ("pass", "fail"):
-        return None, False
-    lcb = lf.get("lcb")
-    if not isinstance(lcb, dict) or set(lcb) != set(GATE_REFS) or any(
-            not isinstance(lcb[r], dict) or set(lcb[r]) != set(_GATE_METRICS)
-            or not all(_finite(lcb[r][q]) for q in _GATE_METRICS) for r in GATE_REFS):
-        return f"lowfreq {lf['result']} without four finite LCBs", False
-    worst = min(float(lcb[r][q]) for r in GATE_REFS for q in _GATE_METRICS)
-    want = "fail" if worst < -float(cfg.tau_public) else "pass"
-    if lf["result"] != want:
-        return (f"lowfreq {lf['result']}; its LCBs re-derive {want} "
-                f"(worst {worst}, -tau_public={-float(cfg.tau_public)})"), False
-    if want == "fail" and v["outcome"] != "lost":
-        return f"lowfreq fail with outcome {v['outcome']}, not lost", True
-    return None, want == "fail"
-
-
 def _cohort_problems(report: dict, cfg, cohort: dict, rows_by: dict, windows: dict,
-                     entries: dict, confirms: dict) -> list[str]:
+                     entries: dict, confirms: dict, pub: dict | None = None) -> list[str]:
     """The cohort's problems. Every member whose re-derived judgement clears
-    (rev6.11 (b): a first clear is the crowning candidate) and does not fail
-    A10 is added to ``confirms``; its outcome is the gate's to decide
-    (:func:`_crown_problems`)."""
+    (rev6.11 (b): a first clear is the crowning candidate) is added to
+    ``confirms``; its outcome is the gate's to decide
+    (:func:`_crown_problems`). ``pub``: the settlement's public half
+    (:func:`_public_half`), ``None`` at ``public_weight = 0``."""
     out = []
     idx = int(cohort["index"])
     kd, members, wids = cohort["king_digest"], list(cohort["members"]), list(cohort["window_ids"])
@@ -396,23 +411,32 @@ def _cohort_problems(report: dict, cfg, cohort: dict, rows_by: dict, windows: di
             crps.append(c)
             mase.append(m)
         scores[dg] = (np.asarray(crps), np.asarray(mase))
-    judged = {b: _judge(report, cfg, scores, b, members, clusters) for b in bars}
+    if pub is not None:
+        lost = [dg for dg in [*bars, *members] if dg not in pub["scores"]]
+        if lost:
+            return [f"cohort {idx}: no public rows for {[d[:12] for d in lost]}"]
+    judged = {b: _judge(report, cfg, scores, b, members, clusters, pub) for b in bars}
     verdicts = {v["digest"]: v for v in report.get("verdicts", []) if int(v["cohort"]) == idx}
     if set(verdicts) != set(members):
         return [f"cohort {idx}: verdicts {sorted(verdicts)} do not cover members {members}"]
     for i, m in enumerate(members):
         v = verdicts[m]
-        lcb, gain, cleared = judged[kd][i]
+        jd = judged[kd][i]
+        lcb, gain, cleared = jd["lcb"], jd["gain"], jd["cleared"]
         if not (_close(v["lcb"], lcb) and _close(v["gain"], gain)):
             out.append(f"cohort {idx}: {m[:12]} lcb/gain {v['lcb']}/{v['gain']} != "
                        f"re-derived {lcb}/{gain}")
+        # rev6.18 A8 (F4): the per-half, per-source and per-domain point gains.
+        for name in ("halves", "sources", "domains"):
+            if _gains_problem(v.get(name), jd[name]):
+                out.append(f"cohort {idx}: {m[:12]} {name} are not the re-derived ones")
         if len(bars) == 1:
             if "house" in v:
                 out.append(f"cohort {idx}: {m[:12]} carries a house judgement where the "
                            f"house holds KING_D or is the challenger")
         else:
             out += _house_problems(idx, m, v.get("house"), hd, judged[hd][i])
-            cleared = bool(cleared and judged[hd][i][2])
+            cleared = bool(cleared and judged[hd][i]["cleared"])
         if bool(v["cleared"]) != cleared:
             out.append(f"cohort {idx}: {m[:12]} cleared={v['cleared']} != re-derived {cleared}")
         stage = cohort["stage"]
@@ -425,11 +449,7 @@ def _cohort_problems(report: dict, cfg, cohort: dict, rows_by: dict, windows: di
                        f"{str(v['king_digest'])[:12]} != cohort {stage}/{kd[:12]}")
             continue
         if cleared:
-            why, lowfreq_fail = _lowfreq_problem(cfg, v)
-            if why:
-                out.append(f"cohort {idx}: {m[:12]} {why}")
-            elif not lowfreq_fail:
-                confirms[m] = v
+            confirms[m] = v
             continue
         want = "lost"
         if v["outcome"] != want:
@@ -903,18 +923,6 @@ _DRAW_SEED_TAG = "lane_d_windows"
 _FREQ_CLASS = {"D": "daily", "W": "weekly", "M": "monthly", "ME": "monthly", "MS": "monthly",
                "Q": "quarterly", "QE": "quarterly", "QS": "quarterly",
                "A": "yearly", "Y": "yearly", "YE": "yearly"}
-
-
-def combined_log_ratio(r_fwd: float, r_bt: float, *, n_fwd: int, n_bt: int, cap: float,
-                       floor: float) -> float:
-    """rev6.9 (W5i) combination, re-derived for the audit: ``(1 - c) log r_fwd
-    + c log clamp(r_bt, floor, 1/floor)``, ``c = min(cap, n_bt / (n_bt +
-    n_fwd))`` (0 without backtest windows: exactly ``log r_fwd``)."""
-    c = 0.0 if int(n_bt) == 0 else min(float(cap), int(n_bt) / (int(n_bt) + int(n_fwd)))
-    if c <= 0.0:
-        return math.log(float(r_fwd))
-    clamped = min(max(float(r_bt), float(floor)), 1.0 / float(floor))
-    return (1.0 - c) * math.log(float(r_fwd)) + c * math.log(clamped)
 
 
 def _confirmation_problem(report: dict) -> str | None:
@@ -1622,6 +1630,62 @@ def _public_draw_problems(report: dict, cfg, public_indexes) -> list[str]:
     return out
 
 
+def _public_half(report: dict, cfg) -> tuple[dict | None, tuple[str, str] | None]:
+    """rev6.18 A3 (F4): ``(public half, None)`` or ``(None, (code, why))``.
+
+    At ``public_weight > 0`` the report must carry the ``public`` block: its
+    ``rows_sha256`` binds ``public.rows`` (``ld_rows_sha256``), one row per
+    (kept window, digest) (``ld_rows_duplicate``), each on a kept public
+    window (drawn minus dropped) with a finite non-negative score
+    (``ld_cohort``). The half is ``{"scores": {digest: (crps, mase)} on the
+    kept windows in window_id order, "clusters": ["<source>|<family>"],
+    "sources", "n_windows", "n_rows"}`` (a digest missing a window is
+    ``ld_rows_count``). At ``public_weight = 0`` a ``public`` block is
+    ``ld_cohort`` (nothing is drawn)."""
+    w = float(cfg.public_weight)
+    if w <= 0.0:
+        if "public" in report:
+            return None, ("ld_cohort", "a public block at public_weight = 0")
+        return None, None
+    pubrec = report.get("public")
+    if not isinstance(pubrec, dict):
+        return None, ("ld_cohort", "public_weight > 0 but the report has no public half")
+    prows = list(pubrec.get("rows") or [])
+    if hashlib.sha256(_canon(prows)).hexdigest() != pubrec.get("rows_sha256"):
+        return None, ("ld_rows_sha256", "public.rows_sha256 does not match public.rows")
+    kept: dict[str, tuple[str, str]] = {}
+    for s in pubrec["sources"]:
+        gone = {d["window_id"] for d in s["dropped"]}
+        for x in s["windows"]:
+            if x["window_id"] not in gone:
+                kept[str(x["window_id"])] = (str(s["source"]), str(x["family"]))
+    order = sorted(kept)
+    pos = {wid: i for i, wid in enumerate(order)}
+    got: dict[str, dict[int, tuple[float, float]]] = {}
+    for r in prows:
+        wid, dg = str(r["window_id"]), str(r["digest"])
+        if wid not in pos:
+            return None, ("ld_cohort", f"public row on {wid}, not a kept public window")
+        c, m = float(r["crps"]), float(r["mase"])
+        if not (math.isfinite(c) and math.isfinite(m) and c >= 0.0 and m >= 0.0):
+            return None, ("ld_cohort", f"non-finite or negative public row {dg[:12]} on {wid}")
+        if pos[wid] in got.setdefault(dg, {}):
+            return None, ("ld_rows_duplicate", f"duplicate public row ({wid}, {dg[:12]})")
+        got[dg][pos[wid]] = (c, m)
+    scores = {}
+    for dg, byi in got.items():
+        if len(byi) != len(order):
+            return None, ("ld_rows_count", f"{dg[:12]} has {len(byi)} of {len(order)} kept "
+                                           f"public windows")
+        scores[dg] = (np.asarray([byi[i][0] for i in range(len(order))]),
+                      np.asarray([byi[i][1] for i in range(len(order))]))
+    if not order:
+        return None, ("ld_cohort", "public_weight > 0 but no public window is kept")
+    return {"scores": scores, "clusters": [f"{kept[x][0]}|{kept[x][1]}" for x in order],
+            "sources": [kept[x][0] for x in order], "n_windows": len(order),
+            "n_rows": len(prows)}, None
+
+
 _UNSET = object()
 
 # ── rev6.18 B3: per-check refusal codes (LANE_D_PLAN rev6.18 B3 table) ──────
@@ -1804,6 +1868,11 @@ def lane_d_findings(report: dict, cfg, *, signer_hotkey: str, prior_reports=None
                 f.add("ld_rows_duplicate", f"duplicate row {key}")
                 return f
             rows_by[key] = r
+        # rev6.18 A3 (F4): the public half's rows, bound by their own sha256.
+        pub, why = _public_half(report, cfg)
+        if why is not None:
+            f.add(why[0], why[1])
+            return f
         windows = {w["window_id"]: w for w in report.get("windows") or []}
         entries = {e["digest"]: e for e in report.get("entries") or []}
         cohorts = list(report.get("cohorts") or [])
@@ -1818,13 +1887,24 @@ def lane_d_findings(report: dict, cfg, *, signer_hotkey: str, prior_reports=None
         if expected_rows != len(rows):
             f.add("ld_rows_count", f"{len(rows)} rows; the cohorts account for {expected_rows}")
             return f
+        if pub is not None:
+            models = set()
+            for c in cohorts:
+                models |= set(_bars(c["king_digest"], house, c["members"])) | set(c["members"])
+            if set(pub["scores"]) != models or pub["n_rows"] != len(models) * pub["n_windows"]:
+                f.add("ld_rows_count", f"{pub['n_rows']} public rows for "
+                                       f"{sorted(d[:12] for d in pub['scores'])}; the cohorts' "
+                                       f"{len(models)} models on {pub['n_windows']} kept "
+                                       f"public windows")
+                return f
         # rev6.23: the crown bar applied is the config's at the stated
         # tenure; every verdict below clears against it.
         if one("ld_params", _crown_bar_problem(report, cfg)):
             return f
         problems, confirms = [], {}
         for c in cohorts:
-            problems += _cohort_problems(report, cfg, c, rows_by, windows, entries, confirms)
+            problems += _cohort_problems(report, cfg, c, rows_by, windows, entries, confirms,
+                                         pub)
         if many("ld_cohort", problems):
             return f
         # rev6.14 (a): no cohort frozen before its judging start (signed
@@ -2146,4 +2226,4 @@ def check_lane_d_absent(record, cfg, *, boundary: int, previous_posterior_sha256
 
 __all__ = ["ALERT", "ALERT_TAG", "BURN", "CONFIRMATION_STAGE_PRESENT", "REFUSAL_CODES",
            "TRANSIENT_CODE", "LaneDFindings", "check_lane_d", "check_lane_d_absent",
-           "combined_log_ratio", "lane_d_findings", "refusal_class", "window_refusal"]
+           "lane_d_findings", "refusal_class", "window_refusal"]

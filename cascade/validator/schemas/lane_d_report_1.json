@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/TensorLink-AI/cascade/cascade/validator/schemas/lane_d_report_1.json",
   "title": "lane-d-report/1",
-  "description": "The signed lane D settlement report (LANE_D_PLAN §1.5, §14.3). Every object is closed; the optional top-level `extensions` map is open and never consensus. `rows_sha256` is sha256 over json.dumps(rows, sort_keys=True, separators=(',', ':'), allow_nan=False). Numbers are finite.",
+  "description": "The signed lane D settlement report (LANE_D_PLAN §1.5, §14.3). Every object is closed; the optional top-level `extensions` map is open and never consensus. `rows_sha256` is sha256 over json.dumps(rows, sort_keys=True, separators=(',', ':'), allow_nan=False). Numbers are finite. Minor revision rev6.18 F4 (A3, A7, A8, D24): verdicts carry halves / sources / domains point gains, the public block carries its rows and rows_sha256, params carry public_weight / window_ratio_floor; the A10 lowfreq block, lowfreq_regression, params.lowfreq_freqs and the backtest window kind / bins are gone.",
   "type": "object",
   "required": ["schema", "boundary", "signer", "signature", "scoring_method", "params", "seed",
                "pool", "house", "king_before", "king_after", "crowned", "prior_kings", "entries",
@@ -123,7 +123,7 @@
                               "hotkey_has_open_entry", "context_not_armed", "checkpoint_fault",
                               "mirror_lag_exceeded", "lane_closed", "context_below_armed",
                               "before_eval_delay", "boundary_ts_missing",
-                              "lost_duel", "lowfreq_regression",
+                              "lost_duel",
                               "gate_regression", "crowned"]},
     "burn_reason": {"type": "string", "enum": ["house_king", "deregistered"]},
     "gate_outcome": {"type": "string",
@@ -137,8 +137,10 @@
     "confirmation_stage": {"type": "string", "enum": ["first"]},
     "window_rule": {"type": "string", "enum": ["embargo", "embargo0"],
                     "description": "rev6.10 (a): embargo when the window's effective embargo e > 0, else embargo0 (the rev3 rule)."},
-    "window_kind": {"type": "string", "enum": ["forward", "backtest"]},
-    "window_bin": {"type": "string", "enum": ["forward", "short", "medium", "long"]},
+    "window_kind": {"type": "string", "enum": ["forward"],
+                    "description": "rev6.18 D24: forward windows only (no backtest kind)."},
+    "window_bin": {"type": "string", "enum": ["forward"],
+                   "description": "rev6.18 D24: forward cells only (no backtest bins)."},
     "freq_class": {"type": "string",
                    "enum": ["subdaily", "daily", "weekly", "monthly", "quarterly", "yearly"]},
     "subscore": {
@@ -151,7 +153,6 @@
         "geomean": {"type": ["number", "null"], "minimum": 0}
       }
     },
-    "lowfreq_result": {"type": "string", "enum": ["pass", "fail", "no_windows", "not_candidate"]},
     "verdict_outcome": {"type": "string",
                         "enum": ["lost", "cleared", "crowned"]},
     "params": {
@@ -163,7 +164,8 @@
                    "bootstrap_B", "court_weights", "reward_prior_kings",
                    "max_entries_per_settlement",
                    "max_judged_per_coldkey_per_settlement", "scoring_levels", "gate_suites",
-                   "tau_public", "lowfreq_freqs", "gate_weights", "max_source_share",
+                   "tau_public", "public_weight", "window_ratio_floor", "gate_weights",
+                   "max_source_share",
                    "min_long_series", "embargo_hours", "max_windows_per_settlement",
                    "min_fresh_window_share", "eval_delay_hours"],
       "additionalProperties": false,
@@ -191,7 +193,10 @@
         "scoring_levels": {"type": "array", "items": {"type": "number"}},
         "gate_suites": {"type": "array", "items": {"type": "string", "minLength": 1}},
         "tau_public": {"type": "number", "minimum": 0},
-        "lowfreq_freqs": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "public_weight": {"type": "number", "minimum": 0, "maximum": 1,
+                          "description": "rev6.18 A3 (F4): w in L = (1 - w) L_live + w L_pub; 0 = the public half off."},
+        "window_ratio_floor": {"type": "number", "exclusiveMinimum": 0, "maximum": 1,
+                               "description": "rev6.18 A3 (F4): each per-window ratio is clamped to [floor, 1 / floor]."},
         "gate_weights": {
           "type": "object",
           "description": "{suite: weight} as parsed (§1.3b draw, W3b1): keys are gate_suites members; a suite absent from the table weighs 0 and is absent here.",
@@ -359,11 +364,46 @@
     "public": {
       "type": "object",
       "description": "rev6.18 A1/A2/A6 (F3, W5k): the settlement's public-source draws, one per source (sorted by source); present iff the public sources were drawn (absent, never null).",
-      "required": ["schema", "sources"],
+      "required": ["schema", "sources", "rows", "rows_sha256"],
       "additionalProperties": false,
       "properties": {
         "schema": {"type": "string", "const": "lane-d-public/1"},
-        "sources": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/public_source"}}
+        "sources": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/public_source"}},
+        "rows": {"type": "array", "items": {"$ref": "#/$defs/public_row"},
+                 "description": "rev6.18 A3 (F4): every judged digest's score on every kept public window (drawn minus dropped), windows in window_id order, digests sorted within a window."},
+        "rows_sha256": {"$ref": "#/$defs/digest",
+                        "description": "sha256 of the canonical public.rows (the rows_sha256 form)."}
+      }
+    },
+    "public_row": {
+      "type": "object",
+      "required": ["window_id", "digest", "crps", "mase"],
+      "additionalProperties": false,
+      "properties": {
+        "window_id": {"type": "string", "minLength": 1},
+        "digest": {"$ref": "#/$defs/digest"},
+        "crps": {"type": "number", "minimum": 0},
+        "mase": {"type": "number", "minimum": 0}
+      }
+    },
+    "point_gain": {
+      "type": "object",
+      "description": "rev6.18 A8 (F4): a point gain 1 - exp(-mean clamped log-ratio) on n windows.",
+      "required": ["n", "gain"],
+      "additionalProperties": false,
+      "properties": {
+        "n": {"type": "integer", "minimum": 1},
+        "gain": {"type": "number"}
+      }
+    },
+    "halves": {
+      "type": "object",
+      "description": "rev6.18 A3/A8 (F4): the live (forward) half's point gain and, at public_weight > 0, the public half's.",
+      "required": ["live"],
+      "additionalProperties": false,
+      "properties": {
+        "live": {"$ref": "#/$defs/point_gain"},
+        "public": {"$ref": "#/$defs/point_gain"}
       }
     },
     "public_source": {
@@ -437,32 +477,10 @@
                               "description": "sha256 of the sorted candidate window ids, one per line."}
       }
     },
-    "lowfreq": {
-      "type": "object",
-      "required": ["result", "freqs", "n_windows", "tau_public"],
-      "additionalProperties": false,
-      "properties": {
-        "result": {"$ref": "#/$defs/lowfreq_result"},
-        "freqs": {"type": "array", "items": {"type": "string", "minLength": 1}},
-        "n_windows": {"type": "integer", "minimum": 0},
-        "tau_public": {"type": "number", "minimum": 0},
-        "lcb": {"$ref": "#/$defs/lowfreq_lcbs"}
-      }
-    },
-    "lowfreq_lcbs": {
-      "type": "object",
-      "description": "W3b5 (A10): the candidate's paired LCB per reference and metric on the low-frequency slice; present iff result is pass or fail.",
-      "required": ["king_d", "house"],
-      "additionalProperties": false,
-      "properties": {
-        "king_d": {"$ref": "#/$defs/gate_lcb_pair"},
-        "house": {"$ref": "#/$defs/gate_lcb_pair"}
-      }
-    },
     "verdict": {
       "type": "object",
       "required": ["digest", "king_digest", "stage", "cohort", "lcb", "gain", "cleared",
-                   "outcome", "lowfreq", "fresh", "embargo"],
+                   "outcome", "halves", "sources", "domains", "fresh", "embargo"],
       "additionalProperties": false,
       "properties": {
         "digest": {"$ref": "#/$defs/digest"},
@@ -473,7 +491,15 @@
         "gain": {"type": "number"},
         "cleared": {"type": "boolean"},
         "outcome": {"$ref": "#/$defs/verdict_outcome"},
-        "lowfreq": {"$ref": "#/$defs/lowfreq"},
+        "halves": {"$ref": "#/$defs/halves"},
+        "sources": {"type": "object",
+                    "description": "rev6.18 A8 (F4): point gain per source: live, and at public_weight > 0 gift_eval_pretrain / rmisc.",
+                    "propertyNames": {"type": "string", "enum": ["live", "gift_eval_pretrain", "rmisc"]},
+                    "additionalProperties": {"$ref": "#/$defs/point_gain"}},
+        "domains": {"type": "object",
+                    "description": "rev6.18 A8 (F4): point gain per domain = bootstrap cluster: live|<source> and <public source>|<family>.",
+                    "propertyNames": {"type": "string", "pattern": "^[^|]+[|].+$"},
+                    "additionalProperties": {"$ref": "#/$defs/point_gain"}},
         "fresh": {"$ref": "#/$defs/subscore"},
         "embargo": {"$ref": "#/$defs/subscore"},
         "house": {"$ref": "#/$defs/house_judgement"}

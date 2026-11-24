@@ -1,6 +1,7 @@
 """W2e: every new key is overlay-settable lane D tuning (§14.2), and the
-cross-key checks re-run at overlay adoption (rev6.9 (a): "the check runs at
-every overlay adoption, so an overlay that breaks it is refused")."""
+cross-key checks re-run at overlay adoption (rev6.18 D24: the rev6.9 (a)
+backtest inequality is deleted; public_weight / window_ratio_floor carry
+their own ranges only)."""
 
 from __future__ import annotations
 
@@ -14,7 +15,6 @@ from .helpers import (
     field,
     load_ok,
     overrides_refusal,
-    raw_with,
     same,
     shipped_raw,
     validate_ok,
@@ -39,26 +39,21 @@ def test_w2e_every_key_overlay_takes_effect(name, key):
 
 
 @pytest.mark.parametrize("name", SHIPPED)
-def test_w2e_overlay_breaking_the_backtest_inequality_is_refused(name):
+def test_w2e_overlay_public_weight_and_clamp_have_no_cross_key_rule(name):
+    """rev6.18 A3 / D24 (correction of the two rev6.9 (a) overlay-inequality
+    tests: the backtest keys and their rule are deleted, owner 2026-11-24).
+    public_weight and window_ratio_floor are overlay-settable and an
+    overlay lowering d_margin is adopted at any w; their own ranges are
+    re-checked at adoption."""
     base = load_ok(shipped_raw(name))
-    assert validate_refused(base, {"lane_d": {**ARM, "backtest_weight_cap": 0.10}}), (
-        "an overlay arming backtest_weight_cap 0.10 at floor 0.85 / d_margin 0.01 "
-        "(1 - 0.85**0.1 ~ 0.016) was adopted")
-    assert validate_refused(base, {"lane_d": {**ARM, "backtest_weight_cap": 0.05,
-                                              "backtest_ratio_floor": 0.80}})
-
-
-@pytest.mark.parametrize("name", SHIPPED)
-def test_w2e_overlay_lowering_d_margin_under_an_armed_cap_is_refused(name):
-    """A config already carrying cap 0.05 / floor 0.85: an overlay that
-    lowers d_margin to 0.005 breaks the inequality and is refused; one that
-    also raises the floor to 0.95 is adopted."""
-    base = load_ok(raw_with(name, {"backtest_weight_cap": 0.05}))
-    assert same(field(base.lane_d, "backtest_weight_cap"), 0.05)
-    assert validate_refused(base, {"lane_d": {**ARM, "d_margin": 0.005}})
-    out = validate_ok(base, {"lane_d": {**ARM, "d_margin": 0.005,
-                                        "backtest_ratio_floor": 0.95}})
-    assert same(field(out.lane_d, "backtest_ratio_floor"), 0.95)
+    # d_margin 0.005: inside the W-OV overlay envelope [0.002, 0.25] (#859).
+    out = validate_ok(base, {"lane_d": {**ARM, "public_weight": 0.9, "d_margin": 0.005}})
+    assert same(field(out.lane_d, "public_weight"), 0.9)
+    assert validate_refused(base, {"lane_d": {**ARM, "public_weight": 1.0}})
+    assert validate_refused(base, {"lane_d": {**ARM, "window_ratio_floor": 1.0}})
+    # A retired key in an overlay changes nothing, so it is refused as having
+    # no effect (the overlay rule for an unknown key).
+    assert validate_refused(base, {"lane_d": {**ARM, "backtest_weight_cap": 0.5}})
 
 
 @pytest.mark.parametrize("name", SHIPPED)

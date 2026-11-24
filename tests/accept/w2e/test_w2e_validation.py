@@ -1,5 +1,6 @@
 """W2e: type and range validation of the new keys and the cross-key checks
-(max_windows_per_settlement >= min_windows; the rev6.9 backtest inequality)."""
+(max_windows_per_settlement >= min_windows; rev6.18 D24: the rev6.9 backtest
+inequality is deleted)."""
 
 from __future__ import annotations
 
@@ -11,7 +12,6 @@ from .helpers import (
     REFUSED,
     SHIPPED,
     field,
-    inequality_holds,
     load_ok,
     raw_with,
     refused,
@@ -60,30 +60,22 @@ def test_w2e_forward_margin_above_eval_delay_is_refused(name):
     load_ok(raw_with(name, {"forward_margin_hours": 0.0, "eval_delay_hours": 0.0}))
 
 
-# (backtest_weight_cap, backtest_ratio_floor, d_margin) -> loads?
+# rev6.18 D24 (owner 2026-11-24): the rev6.9 (a) loader inequality is deleted
+# with the backtest keys (correction of its table test). Every former case
+# loads now: the keys are retired and ignored, whatever d_margin is.
 INEQUALITY = [
-    (0.05, 0.85, 0.01),     # the rev6.9 defaults: 1 - 0.85**0.05 ~ 0.0081 < 0.01
-    (0.05, 0.80, 0.01),     # ~ 0.0111: refused
-    (0.10, 0.85, 0.01),     # ~ 0.0161: refused
-    (0.05, 0.85, 0.005),    # d_margin lowered by B1, floor kept: refused
-    (0.05, 0.70, 0.02),     # ~ 0.0177 < 0.02: loads
-    (0.05, 0.95, 0.005),    # ~ 0.0026 < 0.005: loads
-    (0.0, 0.50, 0.01),      # cap 0: off, no check
-    (0.0, 0.85, 0.002),     # cap 0: off, no check
+    (0.05, 0.80, 0.01),     # refused by the rev6.9 rule; loads
+    (0.10, 0.85, 0.01),     # refused by the rev6.9 rule; loads
+    (0.05, 0.85, 0.005),    # refused by the rev6.9 rule; loads
 ]
 
 
 @pytest.mark.parametrize("name", SHIPPED)
 @pytest.mark.parametrize(("cap", "floor", "d_margin"), INEQUALITY,
                          ids=[f"cap{c}-floor{f}-d{d}" for c, f, d in INEQUALITY])
-def test_w2e_backtest_inequality_at_load(name, cap, floor, d_margin):
-    """rev6.9 (a): cap > 0 loads only if 1 - floor ** cap < d_margin."""
+def test_w2e_backtest_inequality_is_gone(name, cap, floor, d_margin):
+    """rev6.18 D24: no backtest key is parsed or cross-checked."""
     raw = raw_with(name, {"backtest_weight_cap": cap, "backtest_ratio_floor": floor,
                           "d_margin": d_margin})
-    if inequality_holds(cap, floor, d_margin):
-        ld = load_ok(raw, f" (cap={cap}, floor={floor}, d_margin={d_margin})").lane_d
-        assert same(field(ld, "backtest_weight_cap"), cap)
-        assert same(field(ld, "backtest_ratio_floor"), floor)
-    else:
-        assert refused(raw), (f"cap={cap}, floor={floor}, d_margin={d_margin} loaded: "
-                              f"1 - floor**cap = {1 - floor ** cap:.5f} >= d_margin")
+    ld = load_ok(raw, f" (retired cap={cap}, floor={floor}, d_margin={d_margin})").lane_d
+    assert not hasattr(ld, "backtest_weight_cap") and not hasattr(ld, "backtest_ratio_floor")

@@ -703,6 +703,31 @@ with W9.
 On main these tests fail on the `public_indexes` assertion or the schema's
 top-level property set (`TOP_LEVEL_OPTIONAL` now lists `public`).
 
+## Schema minor (rev6.18 F4: A3, A7, A8, D24)
+
+`lane-d-report/1` gains, per verdict, `halves` (`live`, and at
+`public_weight > 0` `public`: `{n, gain}`), `sources` (`live`,
+`gift_eval_pretrain`, `rmisc`) and `domains` (`live|<source>`,
+`<source>|<family>`), every gain `1 - exp(-mean clamped log-ratio)`; the
+`public` block gains `rows` (every judged digest on every kept public window,
+window_id then digest order) and `rows_sha256`; `params` gains
+`public_weight` and `window_ratio_floor`. Removed: the A10 `lowfreq` block,
+`lowfreq_regression`, `params.lowfreq_freqs` (A7), the backtest window kind
+and bins (D24). `validate_report` binds them (`_check_halves`; the public
+rows digest is checked with `rows_sha256`). The house judgement keeps its
+four fields. `test_w7a_f4_fields.py` pins it; the A10 field tests are
+corrected (owner decisions A7 / D24), and `pub.py` gains the index-only
+public fixture (no pyarrow) and the eval host's public scores.
+
+## Correction (owner 2026-11-23): `min_fresh_window_share` default 0.5 -> 0.2
+
+Owner rule: "fresh data should always be in there, but trade off" and "first
+verdict ~6 h". The W1 forge measured ~250 fresh windows at T+6 h, so a 0.5
+share would hold verdicts ~24 h. The default (loader, both shipped files) is
+**0.2**; fresh windows are still drawn first and always included. The tests
+that pinned the 0.5 default now pin 0.2. Lane D is not rolled out, so there is
+no activation key.
+
 ## rev6.14 (a): judging start vs eligibility boundary (owner 2026-11-23)
 
 The report signs the optional top-level `boundary_ts` (the boundary block's on-chain `Timestamp.Now`; absent, never null, on the legacy call) and echoes `params.eval_delay_hours`; `SKIP_REASONS` gains `before_eval_delay` and `boundary_ts_missing`. `validate_report` refuses a cohort with `boundary_ts < t_max + 3600 * eval_delay_hours` (`bad_value` at `cohorts[i]`), a judged cohort without `boundary_ts` (`missing_field`), a `boundary_ts_missing` skip on a stamped settlement, a `before_eval_delay` skip whose start has passed, and `forward_margin_hours > eval_delay_hours`. `test_w7a_rev614.py`.

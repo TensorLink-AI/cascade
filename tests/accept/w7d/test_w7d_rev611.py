@@ -15,8 +15,6 @@ typed reason, and `combined_log_ratio` doesn't exist (`AttributeError` on
 
 from __future__ import annotations
 
-import math
-
 import pytest
 
 from .helpers import build_all, describe, doctored, has_path, replay, replay_module
@@ -89,14 +87,6 @@ def _lie(c, n, mutate, paths):
     assert any(has_path(r, p) for p in paths), f"no mismatch at {paths}; got {list(r.mismatches)}"
 
 
-def test_rev611_a_crown_whose_a10_check_failed_is_a_mismatch(chains):
-    def m(rep):
-        v = _crowned_verdict(rep)
-        v["lowfreq"] = {**v["lowfreq"], "result": "fail", "n_windows": 8}
-
-    _lie(chains["gated"], 2, m, ["crowned", "verdicts[0]"])
-
-
 def test_rev611_a_crown_without_a_gate_is_a_mismatch(chains):
     def m(rep):
         _crowned_verdict(rep)
@@ -120,45 +110,26 @@ def test_rev611_the_replay_crowns_at_the_first_verdict(chains):
                 assert v.get("stage", "first") == "first" and "confirmation" not in v
 
 
-# ── the backtest clamp (rev6.9 W5i), re-derived in the replay ───────────────
+# ── rev6.18 D24 / A7 (F4): no backtest statistic, no A10 ─────────────────────
+#
+# Correction (owner 2026-11-24: backtest windows dropped; owner 2026-11-23:
+# A10 removed): the W5i combined_log_ratio tests and the A10 crown test are
+# deleted with the rules they pinned.
 
 
-def _ref(r_fwd, r_bt, n_fwd, n_bt, cap, floor) -> float:
-    """The rev6.9 combination rule, re-derived here."""
-    c = 0.0 if n_bt == 0 else min(cap, n_bt / (n_bt + n_fwd))
-    clamped = min(max(r_bt, floor), 1.0 / floor)
-    return (1.0 - c) * math.log(r_fwd) + c * math.log(clamped)
-
-
-CLAMP_CASES = [
-    # (r_fwd, r_bt, n_fwd, n_bt, cap, floor)
-    (0.97, 0.5, 95, 5, 0.05, 0.85),         # cap binds, lower clamp binds
-    (0.97, 0.9, 95, 5, 0.05, 0.85),         # inside the clamp
-    (1.02, 3.0, 95, 5, 0.05, 0.85),         # upper clamp binds
-    (0.97, 0.5, 99, 1, 0.05, 0.85),         # the natural share binds: c = 0.01
-    (0.99, 1e-12, 900, 100, 0.05, 0.9),     # perfect memorisation, another floor
-]
-
-
-@pytest.mark.parametrize("case", CLAMP_CASES)
-def test_rev611_the_replay_rederives_the_clamped_combined_statistic(case):
+def test_rev618_the_replay_has_no_backtest_or_a10_rule():
     mod = replay_module()
-    r_fwd, r_bt, n_fwd, n_bt, cap, floor = case
-    got = mod.combined_log_ratio(r_fwd, r_bt, n_fwd=n_fwd, n_bt=n_bt, cap=cap, floor=floor)
-    assert math.isclose(got, _ref(*case), rel_tol=1e-12, abs_tol=1e-15), (case, got)
+    assert not hasattr(mod, "combined_log_ratio"), (
+        "the chain replay still re-derives the W5i backtest combination")
 
 
-@pytest.mark.parametrize("n_bt,cap", [(0, 0.05), (5, 0.0)], ids=["no_backtest", "cap_zero"])
-def test_rev611_off_the_combined_statistic_is_the_forward_ratio(n_bt, cap):
-    mod = replay_module()
-    for r_bt in (1e-12, 0.5, 1.0, 7.0):
-        got = mod.combined_log_ratio(0.97, r_bt, n_fwd=100, n_bt=n_bt, cap=cap, floor=0.85)
-        assert got == math.log(0.97), (n_bt, cap, r_bt, got)
+def test_rev618_a_verdict_with_doctored_point_gains_is_a_mismatch(chains):
+    """rev6.18 A8: each verdict's per-half point gains are re-derived."""
+    def m(rep):
+        v = _crowned_verdict(rep)
+        assert "halves" in v, "F4: verdicts carry their per-half point gains"
+        v["halves"]["live"]["gain"] = float(v["halves"]["live"]["gain"]) + 0.25
+
+    _lie(chains["gated"], 2, m, ["verdicts[0]"])
 
 
-def test_rev611_memorisation_gains_at_most_one_minus_floor_to_the_cap():
-    mod = replay_module()
-    got = mod.combined_log_ratio(1.0, 1e-12, n_fwd=10, n_bt=10_000, cap=0.05, floor=0.85)
-    gain = 1.0 - math.exp(got)
-    assert math.isclose(gain, 1.0 - 0.85 ** 0.05, rel_tol=1e-12)
-    assert gain < 0.01

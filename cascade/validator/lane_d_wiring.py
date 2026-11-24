@@ -124,7 +124,9 @@ class LaneDInputs:
     picked the channels of an over-cap multichannel window with (``None``
     when no window needed one); it must be the settlement's own. ``host``
     (rev6.18 B7) is the verified eval host's record, passed to
-    ``settle_lane_d(host=)`` (``None``: no ``host`` in the report)."""
+    ``settle_lane_d(host=)`` (``None``: no ``host`` in the report).
+    ``public_indexes`` / ``public_scores`` (rev6.18 A3, F4): the public
+    half, passed to ``settle_lane_d`` (``None`` at ``public_weight = 0``)."""
 
     pool_dir: Any
     entries: list
@@ -135,6 +137,8 @@ class LaneDInputs:
     armed: Mapping | None = None
     boundary_ts: int | None = None
     channel_block_hash: str | None = None
+    public_indexes: Mapping | None = None
+    public_scores: Mapping | None = None
     host: Mapping | None = None
     # W-IMG: the eval host's code identity the forecasts came from
     # ({"git_head", "package_hash"}; None = not known)
@@ -164,6 +168,13 @@ def _armed_of(inp: Any) -> dict | None:
     """``inp.armed`` as a plain dict (``None`` when absent: the legacy call)."""
     armed = getattr(inp, "armed", None)
     return None if armed is None else dict(armed)
+
+
+def _mapping_of(inp: Any, name: str) -> dict | None:
+    """``inp.<name>`` as a plain dict (``None`` when absent: rev6.18 F4's
+    public half off, or an older inputs source)."""
+    v = getattr(inp, name, None)
+    return None if v is None else dict(v)
 
 
 def _max_channels(cfg: Any) -> int | None:
@@ -329,6 +340,8 @@ class LaneDStep:
                               sentinel=sentinel, bench=bench, armed=_armed_of(inp),
                               boundary_ts=getattr(inp, "boundary_ts", None),
                               max_channels=_max_channels(self.cfg),
+                              public_indexes=_mapping_of(inp, "public_indexes"),
+                              public_scores=_mapping_of(inp, "public_scores"),
                               **({} if _host_of(inp) is None else {"host": _host_of(inp)}),
                               **({"eval_identity": ident} if (ident := _eval_identity_of(
                                   self.cfg, inp, int(boundary))) else {}))
