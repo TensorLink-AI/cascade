@@ -26,5 +26,3 @@ cascade/trainer/worker.py
 # The audit: every instance replayed.
 cascade/audit/checks.py
 cascade/audit/main.py
-# W-CMP's own tests follow the multi-instance runner (a new id now runs).
-tests/accept/w_cmp/test_w_cmp_spec.py
