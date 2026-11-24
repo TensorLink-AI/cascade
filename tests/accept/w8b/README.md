@@ -259,3 +259,15 @@ There is no `confirm` stage, no `confirm_pending` status or reason and no
 crowning chains move to that rule with nothing weakened. `helpers.Inputs` lists X from B2 (`listed_from`), so B1 still leaves the house on KING_D and X is crowned at its first verdict at B2. The foreign-state test lists X at B1 for validator A so its B1 state still differs from the no-entry state. On main the
 old code still runs the confirmation stage, so the changed tests fail on an
 assertion until the W5e implementation lands.
+
+## Satellite activation startup (#790, `test_w8b_satellite_activation.py`)
+
+The satellite reuses `ActivationMixin`, so it must declare every activation
+record (and its `_tally`) the full validator declares; on main it lacked the
+DEC-CA-0068 `_shared_ladder` / `_shared_ladder_tally`, so its startup raised
+`AttributeError` and it never signalled (nor tracked) the shared-ladder vote.
+The tests pin the field parity with `ValidatorRunner`, and that a satellite
+started with the shared-ladder rule decided on chain writes the `lad-`
+segment, locks in with the stake majority, persists
+`activation_shared_ladder_state.json` and restores it with the chain down; a
+typed block writes no note. The ladder values are untouched.

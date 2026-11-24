@@ -336,3 +336,122 @@ def test_house_at_4096_equals_its_lane_a_per_window_crps(ckpts):
         crps, m = s.score_window(q[i], w.target[0], w.history[0], SEASONAL_PERIOD)
         assert crps == pytest.approx(float(wql[i]), rel=1e-5), (i, crps, float(wql[i]))
         assert m == pytest.approx(float(mase_a[i]), rel=1e-5), (i, m, float(mase_a[i]))
+
+
+# ── #785: settlement-size micro-batching ─────────────────────────────────────
+# A settlement draws 1000-5000 windows; one forward over every window of a
+# length put windows x patches past the CUDA grid limit (~65,536 rows into
+# the pyramid's SDPA: "invalid configuration argument") or out of memory on
+# the launch 4090 (testnet E2E, issue #785). Each length's batch now runs in
+# deterministic micro-batches of forward_batch_size windows.
+
+CUDA_GRID_ROWS = 65_535          # the measured failure threshold (#785 table)
+
+
+def _microbatch_forecast():
+    """``forecast_quantiles`` with the #785 keyword ``max_tokens`` (asserted,
+    so the pre-#785 version fails here on an assertion, not a TypeError)."""
+    fq = _w5d_forecast()
+    params = inspect.signature(fq).parameters
+    assert "max_tokens" in params, (
+        "#785: forecast_quantiles(..., max_tokens=MAX_FORWARD_TOKENS) micro-batches each "
+        "length's windows")
+    assert params["max_tokens"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert params["max_tokens"].default == _scorer().MAX_FORWARD_TOKENS
+    return fq
+
+
+def test_forward_batch_size_is_tokens_over_patches():
+    s = _scorer()
+    assert s.MAX_FORWARD_TOKENS == 32768
+    extra = (HORIZON + PATCH - 1) // PATCH
+    # 4096 history + 2 horizon patches = 130 tokens a window: 252 windows.
+    assert s.forward_batch_size(4096, HORIZON, PATCH) == 32768 // (128 + extra) == 252
+    assert s.forward_batch_size(16384, HORIZON, PATCH) == 32768 // (512 + extra)
+    # A partial last patch counts as a patch; channels multiply the tokens.
+    assert s.forward_batch_size(4096, 33, PATCH) == 32768 // 130
+    assert s.forward_batch_size(4096, HORIZON, PATCH, channels=4) == 32768 // (4 * 130)
+    assert s.forward_batch_size(4096, HORIZON, PATCH, max_tokens=260) == 2
+    # Never zero: a window bigger than the cap still runs, alone.
+    assert s.forward_batch_size(131072, MAX_HORIZON, PATCH, channels=32) == 1
+    for bad in ({"input_len": 0}, {"horizon": 0}, {"patch_size": 0}, {"channels": 0},
+                {"max_tokens": 0}, {"max_tokens": True}, {"input_len": 4096.0}):
+        kw = {"input_len": 4096, "horizon": HORIZON, "patch_size": PATCH, **bad}
+        with pytest.raises(ValueError):
+            s.forward_batch_size(kw.pop("input_len"), kw.pop("horizon"), kw.pop("patch_size"),
+                                 **kw)
+
+
+def test_forward_batch_stays_under_the_grid_limit_at_every_context():
+    """Every scorer context, the launch horizon and the cap: a micro-batch's
+    rows (windows x patches) stay under half the measured CUDA limit, and the
+    #785 failures (1000 windows at 4096 = 130,000 rows) are cut below it."""
+    s = _scorer()
+    for c in ALL_CONTEXTS:
+        for h in (1, HORIZON, MAX_HORIZON):
+            for ch in (1, 2, 32):
+                patches = c // PATCH + -(-h // PATCH)
+                step = s.forward_batch_size(c, h, PATCH, channels=ch)
+                assert step >= 1
+                assert step * ch * patches <= s.MAX_FORWARD_TOKENS or step == 1, (c, h, ch)
+                assert step * patches < CUDA_GRID_ROWS, (c, h, ch)
+    assert CUDA_GRID_ROWS < 1000 * 130                     # the #785 failure, unchunked
+    assert s.forward_batch_size(4096, HORIZON, PATCH) * 130 <= 32768
+
+
+def test_forecast_refuses_a_non_positive_max_tokens_before_loading(no_torch, tmp_path):
+    fq = _microbatch_forecast()
+    absent = tmp_path / "no-checkpoint-here"
+    for bad in (0, -1, True, 1.5):
+        with pytest.raises(ValueError):
+            fq(absent, [series(256, 0)], context=TRAINED_CONTEXT, horizon=HORIZON,
+               max_tokens=bad)
+
+
+@torch_mark
+def test_micro_batched_forecast_is_deterministic_and_re_derivable(ckpts):
+    """#785: seven 4096-point windows and three 320-point windows.
+
+    * A cap that cuts nothing (the default, or exactly the batch's tokens)
+      is byte-identical to the pre-#785 one forward per length: small inputs
+      are unchanged.
+    * A cut into 1, 2 or 3 windows a forward is byte-identical to forecasting
+      each micro-batch's windows on their own: chunks are contiguous, in
+      window order, with no state across them, so the forecast is
+      re-derivable from the cap alone.
+    * Against the uncut forecast it agrees to float rounding only (CPU fp32
+      GEMM blocking depends on the batch rows; measured in CI: equal to ~8
+      digits, not bit-equal). That is why the cap is the release constant
+      MAX_FORWARD_TOKENS and never a runtime memory probe."""
+    fq = _microbatch_forecast()
+    s = _scorer()
+    hists = [series(TRAINED_CONTEXT + 17 * i, seed=200 + i) for i in range(7)]
+    hists[3:3] = [series(320 + i, seed=300 + i) for i in range(3)]
+    long_idx, short_idx = [0, 1, 2, 6, 7, 8, 9], [3, 4, 5]
+    extra = (HORIZON + PATCH - 1) // PATCH
+    kw = {"context": TRAINED_CONTEXT, "horizon": HORIZON}
+    with ModelInputs() as seen:
+        whole = np.asarray(fq(ckpts["entry"], hists, **kw))
+    assert sorted(seen.shapes) == sorted([(3, 1, 10 + extra, PATCH),
+                                          (7, 1, 128 + extra, PATCH)])
+    exact = np.asarray(fq(ckpts["entry"], hists, max_tokens=7 * (128 + extra), **kw))
+    assert np.array_equal(exact, whole), "a cap that cuts nothing changed the forecast"
+    for per in (1, 2, 3):
+        cap = per * (128 + extra)
+        with ModelInputs() as seen:
+            q = np.asarray(fq(ckpts["entry"], hists, max_tokens=cap, **kw))
+        assert q.shape == whole.shape == (10, HORIZON, len(SCORING_LEVELS))
+        long_batches = [b for b, _, p, _ in seen.shapes if p == 128 + extra]
+        assert sum(long_batches) == 7 and max(long_batches) == per
+        short_step = s.forward_batch_size(320, HORIZON, PATCH, max_tokens=cap)
+        short_batches = [b for b, _, p, _ in seen.shapes if p == 10 + extra]
+        assert sum(short_batches) == 3 and max(short_batches) == min(3, short_step)
+        # Re-derivation: each micro-batch forecast alone, in order.
+        want = np.empty_like(q)
+        for idx, step in ((long_idx, per), (short_idx, short_step)):
+            for j in range(0, len(idx), step):
+                part = idx[j:j + step]
+                want[part] = np.asarray(fq(ckpts["entry"], [hists[i] for i in part], **kw))
+        assert np.array_equal(q, want), f"{per} a forward is not its micro-batches alone"
+        np.testing.assert_allclose(q, whole, rtol=1e-5, atol=1e-6,
+                                   err_msg=f"{per} a forward moved past float rounding")
