@@ -105,6 +105,10 @@ def test_links_resolve_and_the_guides_are_linked_from_miner_md_and_llms_txt():
         assert f"]({path.name})" in miner, f"MINER.md does not link {path.name}"
         assert f"](docs/{path.name})" in llms, f"llms.txt does not link {path.name}"
     assert "cascade rules" in miner and "cascade rules" in llms
+    readme = (REPO / "README.md").read_text()
+    assert re.search(r"^## Competitions\b", readme, re.M), "README.md has no Competitions section"
+    for path in GUIDES.values():
+        assert f"](docs/{path.name})" in readme, f"README.md does not link {path.name}"
 
 
 def test_listed_values_match_chain_toml():
@@ -136,3 +140,35 @@ def test_guides_quote_the_measured_gpu_rates_where_miners_pay_for_training():
         text = _text(lane)
         for token in ("8×H100", "0.404", "847k", "8×RTX4090", "0.137", "286k", "4×H100", "0.212"):
             assert token in text, f"lane {lane} costs omit {token}"
+
+
+def _snippets(text: str, prefix: str) -> list[str]:
+    """Runnable examples: fenced-block command lines (continuations joined)."""
+    fenced = re.findall(r"^```[^\n]*\n(.*?)^```", text, re.M | re.S)
+    lines = [ln.strip() for block in fenced for ln in block.replace("\\\n", " ").splitlines()]
+    return [ln for ln in lines if ln.startswith(prefix)]
+
+
+def test_lane_d_md_has_no_confirmation_duel_old_court_or_lowfreq_check():
+    text = (REPO / "docs" / "LANE_D.md").read_text()
+    for stale in ("confirm_pending", "confirm_on_king_change", "lowfreq_regression",
+                  "lowfreq_freqs", "king_decay"):
+        assert stale not in text, f"docs/LANE_D.md still documents {stale}"
+    assert "court_weights" in text and "d_margin_start" in text
+    assert "public_weight" in text and "min_fresh_window_share" in text
+
+
+def test_marketcast_md_examples_carry_the_required_flags():
+    text = (REPO / "docs" / "MARKETCAST.md").read_text()
+    fetch = _snippets(text, "cascade lane-c fetch-base")
+    test = _snippets(text, "cascade lane-c test ")
+    assert fetch and test
+    for s in fetch:
+        assert "--out" in s, f"fetch-base example without --out: {s!r}"
+    for s in test:
+        assert "--base-dir" in s, f"lane-c test example without --base-dir: {s!r}"
+
+
+def test_miner_md_no_longer_says_the_marketcast_template_is_off():
+    text = (REPO / "docs" / "MINER.md").read_text()
+    assert "off on mainnet and testnet" not in text

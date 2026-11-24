@@ -1719,8 +1719,9 @@ eval — only MarketCast (mkt:) has one; see DEC-CA-0056". While MarketCast is
 off, no lane-C target is active. If Lane C has launched, its reserved share
 burns; before Lane C launches, no C pool is reserved.
 
-**Checked-in templates: off on mainnet and testnet** (`[marketcast] from_block =
-0`). Check live status separately. While it is off, the intake, `cascade lane-c check|commit|fund` and the
+**Launch block in the checked-in template:** mainnet `[marketcast]` and `[lane_c]
+from_block = 9586800` (about 2026-11-25 22:28 UTC; `cascade rules c` prints the
+value your release ships). Check live status separately. Before that block, the intake, `cascade lane-c check|commit|fund` and the
 trainer refuse every `mkt:` target with a clear message
 about inactive MarketCast. Their JSON codes differ: `check`/`upload` return
 `bad_recipe`, `commit` returns `bad_commit`, and `fund` returns `bad_target`;
@@ -2024,8 +2025,10 @@ command takes `--json`. No flag takes a key, token or upload URL.
 Lane D needs no compute keys: you train on your own hardware, on any data
 and with any recipe, and the operator pays for evaluation. Nothing is rented
 on your provider account. Use a dedicated hotkey: a lane D commit replaces
-that hotkey's lane A pointer. Lane D ships unarmed (`[lane_d] from_block = 0`);
-check `cascade status --json` before you submit.
+that hotkey's lane A pointer. Lane D's template ships unarmed
+(`[lane_d] from_block = 0`). On mainnet the signed launch overlay arms it at
+block 9586800 (with lane B, and lane C's template block); check
+`cascade status --json` before you submit.
 
 - `cascade lane-d export ./trained --out ./entry` writes the entry directory
   (the four files only) and prints its digest.

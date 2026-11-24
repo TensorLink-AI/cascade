@@ -182,10 +182,10 @@ MarketCast leg per **coldkey** (`max_open_legs_per_coldkey` = 1).
 ### 1. Test locally (no chain, no rental)
 
 ```bash
-cascade lane-c fetch-base --json                                   # pinned Timestral, digest-checked
+cascade lane-c fetch-base --out ./timestral --json                 # pinned Timestral, digest-checked
 cascade lane-c snapshot ./my-mkt --out train-snap                  # your recipe's training range
 cascade lane-c snapshot ./my-mkt --out eval-snap --evaluation --days 7   # recent held-out data
-cascade lane-c test ./my-mkt --target mkt:market \
+cascade lane-c test ./my-mkt --target mkt:market --base-dir ./timestral \
     --train-snapshot train-snap --eval-snapshot eval-snap --device cuda --json
 ```
 

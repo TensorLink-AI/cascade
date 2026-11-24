@@ -61,14 +61,15 @@ public path is `cascade deploy` plus `cascade fund`.
 
 ## How you are paid
 
-**Under the owner-proposed split A0 / B35 / C15 / D50 (plan rev6.24, signed
-overlay), lane A's pool is 0% once lane D is armed.** A lane A king then
+**Under the owner-proposed split A0 / B35 / C15 / D50 (plan rev6.24, set by
+the mainnet launch overlay at block 9,586,800, about 2026-11-25 22:28 UTC),
+lane A's pool is 0% once lane D is armed.** A lane A king then
 earns no emissions from lane A. Its model still matters: the lane A king is
 the **house** entry in lane D, and promoted kings become the shared init for
 later eras. Until lane D arms, lane D's share stays with lane A.
 
-Under today's checked-in template (all of A, B and C launched, A at 50%) the
-v2 ladder applies:
+Before that split takes effect, and on any network still on the checked-in
+template (all of A, B and C launched, A at 50%), the v2 ladder applies:
 
 | Event | Share of A's pool |
 |---|---:|

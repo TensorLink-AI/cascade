@@ -65,16 +65,25 @@ commits on chain with an immediate reveal. Commit within `ready_ttl_blocks`
   reference, over windows with a 64-step horizon (`horizon`). A paired cluster
   bootstrap over sources gives a one-sided lower confidence bound (LCB) at
   `alpha` = 0.05.
-- **The data: live half plus public half (plan rev6.18).**
-  - **Live (50%)** is forward windows only: target data that arrived after
-    your entry (plus the 48 h embargo top-up, `embargo_hours`), from the
-    private live pool. Nobody, including the operator, has those targets
-    when you submit.
-  - **Public (50%)** comes from GiftEvalPretrain and RMISC, sampled from the
-    whole dataset. Multivariate sets are scored as `(C, L)` panels (F2).
-  - A challenger must improve on the public half as well as the live half.
-- **Timing (plan rev6.14).** Judging starts no earlier than 6 h after your
-  entry is ready (`eval_delay_hours` = 6). Settlements are about 3 h apart.
+- **The data: live half plus public half.**
+  - **Live** is forward windows only, from the private live pool. A window is
+    *fresh* when all of its target data arrived after your entry, or
+    *embargo* when it was held back for up to 48 h (`embargo_hours`) and
+    released after your entry. At least 20% of the live windows are fresh
+    (`min_fresh_window_share` = 0.2). Nobody, including the operator, had
+    those targets when you submitted.
+  - **Public** is 5000 windows each from `Salesforce/GiftEvalPretrain` and
+    `nju-zhangsq/RMISC` per settlement, drawn from the whole dataset by the
+    settlement's block hash. Multivariate sets are scored as `(C, L)` panels.
+  - **Combined:** each window's score ratio against the king is clamped to
+    [0.5, 2] and log-averaged into L_live and L_public. The score is
+    `L = 0.5 · L_live + 0.5 · L_public` (`public_weight` = 0.5), and one
+    two-part max-T cluster bootstrap gives its LCB. You must also improve on
+    **each** half on its own (positive live gain **and** positive public
+    gain).
+- **Timing.** Judging starts no earlier than 6 h after your entry is ready
+  (`eval_delay_hours` = 6). Settlements are about 3 h apart. Lane D opens on
+  mainnet at block 9,586,800 (about 2026-11-25 22:28 UTC).
   Up to `max_windows_per_settlement` (5000) windows are drawn per settlement,
   and a verdict needs at least `min_windows` (1000) windows from
   `min_clusters` (20) sources, no source over `max_source_share` (25%).
@@ -86,11 +95,14 @@ commits on chain with an immediate reveal. Commit within `ready_ttl_blocks`
 - **The bar.** You crown when the LCB of your gain clears the crown bar
   against **both** the lane D king (KING_D) **and the house** (the lane A
   king, always entered). In effect you must beat max(KING_D, house).
-  - The bar decays with KING_D's tenure (plan rev6.23 part 2): **3%** against
-    a fresh king, falling linearly to **1%** (`d_margin`) over 32 settled
-    lane D settlements (about 4 days). House tenure counts too. A settlement
-    with no lane D scoring does not age the king.
-  - The crown is decided at the first verdict. There is no confirmation duel.
+  - The bar decays with KING_D's tenure: **3%** (`d_margin_start`) against a
+    fresh king, falling linearly to **1%** (`d_margin`) over
+    `d_margin_warmup_settlements` (32) settled lane D settlements, about 4
+    days. House tenure counts too. A settlement with no lane D scoring does
+    not age the king. The signed report records the bar applied
+    (`crown_bar`).
+  - The crown is decided at the first verdict. There is no confirmation duel
+    and no separate low-frequency check.
 - **The gate.** Each settlement draws one public bench suite from GIFT-Eval,
   BOOM, TIME and FEV (minus the era's sentinel). Your CRPS and MASE must each
   stay within `tau_public` (1%) of both KING_D and the house, or the entry is
@@ -101,14 +113,14 @@ commits on chain with an immediate reveal. Commit within `ready_ttl_blocks`
 ## How you are paid
 
 Lane D pays a **court**: the current king and up to two prior kings, by the
-court weights **80% / 15% / 5%** (plan rev6.23). Prior kings are paid with
+court weights **80% / 15% / 5%** (`court_weights`). Prior kings are paid with
 no time limit. A missing seat renormalises over the seats that are filled.
 If the house holds the lane D crown, the king seat burns (`house_king`).
 A deregistered holder's seat burns too.
 
 **Worked example at the owner-proposed split A0 / B35 / C15 / D50.** This is
-the owner's proposal (plan rev6.24, signed overlay), not a guaranteed live
-value. Check `cascade rules d` and `cascade status --json`.
+the owner's proposal (plan rev6.24, set by the launch overlay at block
+9,586,800), not a guaranteed live value. Check `cascade rules d` and `cascade status --json`.
 
 | Court | King | Prior king 1 | Prior king 2 |
 |---|---:|---:|---:|
@@ -195,9 +207,10 @@ roadmap decision, not a submission.
 in `cascade lane-d status`. Common ones: `pending_floor` (not enough fresh
 windows yet), `context_below_armed`, `coldkey_cap_settlement`, `bench_hold`.
 
-**Is the 3% bar live?** The decaying bar is plan rev6.23 part 2. Read
-`d_margin` and the crown bar fields in `cascade rules d` and the signed
-report for the value your entry was judged under.
+**What bar will my entry face?** 3% against a fresh king, down to 1% after
+32 settlements of its tenure. `cascade rules d` prints `d_margin_start`,
+`d_margin` and `d_margin_warmup_settlements`, and the signed report records
+the bar each verdict used.
 
 **Does winning lane A help me in lane D?** The lane A king is the house in
 lane D. It is a competitor you must beat, never a paid seat.

@@ -69,45 +69,55 @@ cascade lane-c status https://submissions.cascadesub.net --hotkey <ss58>
   confidently worse. The model must also beat simple baselines (random walk
   with EWMA volatility, seasonal AR(1)), and its 50% / 80% intervals and
   5% / 95% tails must be calibrated.
-- **Timing.** Your training data must end at least `embargo_days` (30) before
-  you submit. The 4h×42 and 1d×7 horizons are judged on that embargo gap, so
-  they need no wait. The other four horizons are forward-only: windows start
-  at least 1 h after dispatch, and an entry waits up to
-  `verdict_wait_blocks` (43,200 blocks, about 6 days).
-- **Stages.** A first pass is `pending` and unpaid. A later settlement on
-  fresh windows must confirm it, and you must beat the current slot holder
-  with a strictly higher LCB to take the slot.
+- **Embargo-data eval (no forward wait).** Your training data must end at
+  least `embargo_days` (30) before you submit. Every suite and horizon is
+  judged on windows drawn from the embargo: the `embargo_eval_days` (28) before
+  your leg's dispatch, which your recipe could not train on. Up to
+  `backtest_windows_per_cell` (48) windows are drawn per asset, series and
+  horizon, ranked by a hash of the settlement's block hash, so nobody can pick
+  them in advance. The short horizons (1m×60, 5m×36) also score forward
+  windows that have already closed. No window is waited for.
+- **Verdict at the first settlement after the leg.** An entry is judged at
+  the first settlement after its leg finishes. An inconclusive entry may wait
+  at most `verdict_wait_blocks` (3,900 blocks, about 13 h). That cap is fixed
+  in code.
+- **Stages.** The first pass (`judge`) and the confirmation (`confirm`) use
+  disjoint halves of the drawn windows. A first pass is `pending` and unpaid
+  until it confirms, and you must beat the current slot holder with a
+  strictly higher LCB to take the slot.
 
 ## How you are paid
 
 Lane C splits its pool by competition weight and then over each
 competition's targets. MarketCast has one target, so its holder can receive
-the **whole lane C pool**. The confirmed gain's LCB sets the full-pay period
-(`full_pay_tiers`):
+the **whole lane C pool**. The slot pays **100% for 5 to 20 days**, set by
+the confirmed gain's LCB, and then it ends:
 
-| Confirmed gain LCB | Full-pay eras | About |
+```
+frac = clamp((LCB - gain_margin) / (full_pay_max_gain - gain_margin), 0, 1)
+days = full_pay_min_days + (full_pay_max_days - full_pay_min_days) * frac
+eras = ceil(days / era length)        # at least 1
+```
+
+With `gain_margin` 0.01, `full_pay_min_days` 5, `full_pay_max_days` 20 and
+`full_pay_max_gain` 0.05, and 12 h eras:
+
+| Confirmed gain LCB | Days at full pay | Eras |
 |---:|---:|---:|
-| ≥ 0.05 | 10 | 5 days |
-| ≥ 0.02 | 5 | 2.5 days |
-| ≥ 0.01 | 2 | 1 day |
+| 0.01 | 5 | 10 |
+| 0.02 | 8.75 | 18 |
+| 0.03 | 12.5 | 25 |
+| 0.04 | 16.25 | 33 |
+| ≥ 0.05 | 20 | 40 |
 
-After that the slot halves every era (`half_life_rounds`) down to a 10%
-floor, and stops at age `win_ttl_eras` (28 eras, about 14 days). A new
-holder replaces you earlier.
+There is no decay tail and no floor: after the full-pay period the slot's
+pay burns. A new holder that beats you replaces you earlier.
 
 **Worked example at the owner-proposed split A0 / B35 / C15 / D50.** This is
-the owner's proposal (plan rev6.24, signed overlay), not a guaranteed live
-value. Check `cascade rules c` for `share`. A holder confirmed at LCB 0.02
-receives:
-
-| Age since confirmation (eras) | Slot multiplier | Share of emissions |
-|---|---:|---:|
-| 0–4 | 100% | 15% |
-| 5 | 50% | 7.5% |
-| 6 | 25% | 3.75% |
-| 7 | 12.5% | 1.875% |
-| 8–27 | 10% | 1.5% |
-| 28+ | 0% | 0% |
+the owner's proposal (plan rev6.24, set by the launch overlay), not a
+guaranteed live value. Check `cascade rules c` for `share`. A holder
+confirmed at LCB 0.03 receives **15% of emissions for 25 eras (12.5 days)**,
+then nothing. At LCB 0.05 or more it is 15% for 40 eras (20 days).
 
 ## Strategies worth trying
 
@@ -143,7 +153,9 @@ refunded.
   `max_steps` (100,000) steps, a batch above `max_batch` (512), LoRA rank
   above `max_lora_rank` (64), context above `max_context_length` (32,768),
   leg hours above 12, or an unknown `marketcast.json` key.
-- **Embargo:** training data ending less than 30 days before submission.
+- **Embargo:** training data ending less than 30 days before submission, or a
+  generator that embeds series from the embargo window
+  (`embargo_series_embedded`, checked by the trainer before the leg).
 - **Targets:** anything but `mkt:market` (generic `domain:` / `freq:` /
   `horizon:` targets are refused).
 - **Duplicates:** a recipe byte-identical or near-identical to an earlier
@@ -167,7 +179,14 @@ Timestral base, never the lane A or lane D king.
 trainer produced (the recipe's `init`).
 
 **Why is my entry still pending after a pass?** The first pass is unpaid.
-It needs a confirmation on fresh windows and a higher LCB than the holder's.
+It needs a confirmation on the other half of the drawn windows and a higher
+LCB than the holder's.
+
+**How long until a verdict?** The first settlement after your leg finishes.
+An inconclusive entry waits at most about 13 h (`verdict_wait_blocks`).
+
+**When does MarketCast open?** At block 9,586,800 (about 2026-11-25 22:28
+UTC) on mainnet, with lanes B and D. Read `from_block` in `cascade rules c`.
 
 **Do I need a GPU of my own?** Only for local tests. Live legs rent on your
 provider key.
