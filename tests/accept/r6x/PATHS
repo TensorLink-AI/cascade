@@ -25,3 +25,4 @@ tests/unit/test_packed_source_reject.py
 tests/unit/test_contract_block_gate.py
 tests/unit/test_rolling.py
 tests/unit/test_image_after_repin.py
+tests/unit/test_v2_golive.py
