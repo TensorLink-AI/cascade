@@ -95,14 +95,14 @@ and pay curve; the defaults are today's rules and change nothing:
 
 | Lane | Default family / curve | Runs in this release |
 |---|---|---|
-| B | `bonferroni` (a leg's own targets) / `tiered_decay` | families `plain_lcb`, `bonferroni`; all three curves |
+| B | `maxt` (two max-T families per slot, rev6.22) / `indefinite_until_beaten` (paid until replaced, rev6.22) | its defaults only |
 | C | `bonferroni` (weighted owner family, red-team F6) / `fixed_term` (DEC-CA-0073 5–20 d) | families `plain_lcb`, `bonferroni`; all three curves |
 | D | `maxt` (crown cohort) / `indefinite_until_beaten` (the court) | `maxt` / `indefinite_until_beaten` only |
 
 A curve other than the lane's legacy one is RECORDED on the win (`curve`), so
 a later overlay never changes a promise already made; legacy wins carry no
 field and their bytes are unchanged. Choosing something a lane does not run is
-refused at load (no silent no-op). `maxt` for lanes B and C needs the joint
+refused at load (no silent no-op). `maxt` for lane C (lane B runs its own since rev6.22) needs the joint
 bootstrap over a family's entries on the same windows — not in this release.
 
 ### 5. The contamination hash set by content hash
@@ -140,5 +140,5 @@ instance's pool snapshot to the pod (presigned link + sha256); the pod clips
 it to the recipe range before the dispatch. Instance legs train only on a
 worker image built from this release (rolled at a seed-epoch boundary).
 
-Still not done: joint `maxt` for lanes B and C (lane D keeps its own), and
+Still not done: joint `maxt` for lane C (lanes B and D run their own), and
 the pool_d / lane A projections (no lane-C competition reads them).
