@@ -970,10 +970,11 @@ def load_inputs_services(cfg: Any, path) -> dict:
                        public_root=raw.get("eval_public_root", ""))
     bench = None
     if raw.get("bench_hosts"):
-        from .lane_d_bench_host import SSHBenchHost
+        from .lane_d_bench_host import SSHBenchHost, bench_settings
 
         bench = SSHBenchHost(raw["bench_hosts"], cache_dir=raw["eval_cache_dir"],
-                             budget_bytes=raw["eval_cache_budget_bytes"], grants=grants)
+                             budget_bytes=raw["eval_cache_budget_bytes"], grants=grants,
+                             settings=bench_settings(cfg))
     return {"intake_state_dir": intake, "pool": PinFilePool(raw["pool_pins"]),
             "eval_host": host, "house_pointer": Path(raw["house_pointer"]),
             "house_signer_ss58": raw["house_signer_ss58"], "bench_host": bench,
