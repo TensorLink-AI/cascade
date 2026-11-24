@@ -23,7 +23,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from .marketcast import DEFAULT_SUITES as MKT_DEFAULT_SUITES
-from .v2 import FULL_PAY_TIERS
 
 # ── competitions (MarketCast-only lane C, owner 2026-10-20) ─────────────────
 #
@@ -215,8 +214,8 @@ class LaneCConfig:
     CONSENSUS terms (every validator must agree; replayed by cascade-audit):
     ``from_block``, ``share`` / ``takes_from`` / ``remainder`` (the emission
     split), ``targets`` (one emission slot each), the payout schedule
-    (``full_pay_tiers`` / ``half_life_rounds`` / ``floor`` in ERAS,
-    ``win_ttl_eras``), the verdict (``alpha``, ``bootstrap_B``,
+    (``full_pay_min_days`` / ``full_pay_max_days`` / ``full_pay_max_gain``,
+    DEC-CA-0073), the verdict (``alpha``, ``bootstrap_B``,
     ``gain_margin``, ``min_target_windows``, ``min_target_clusters``,
     ``n_windows``, ``guard_public``, ``tau_public``, ``min_public_items``).
     MarketCast's windows come from ``[marketcast] pool_prefix``; lane C has
@@ -231,16 +230,18 @@ class LaneCConfig:
     takes_from: str = "lane_b"
     remainder: str = "burn"
     targets: tuple[str, ...] = DEFAULT_TARGETS
-    # payout schedule in ERAS (owner-tunable), exactly lane B's rule: the
-    # full-pay period is GAIN-TIERED (owner 2026-10-20) — the ``full_eras``
-    # of the highest ``full_pay_tiers`` threshold the confirmed win's gain LCB
-    # meets, fixed at the win — then the decay below. An ``mkt:`` win uses
-    # ``[marketcast] full_pay_tiers`` instead (DEC-CA-0064: a different
-    # statistic), on this TTL and decay.
-    full_pay_tiers: tuple[tuple[float, int], ...] = FULL_PAY_TIERS
-    half_life_rounds: float = 1.0
-    floor: float = 0.1
-    win_ttl_eras: int = 28
+    # payout (owner 2026-11-24, DEC-CA-0073), CONSENSUS: a confirmed win is
+    # paid IN FULL for a duration that scales linearly with its gain LCB —
+    # ``full_pay_min_days`` at the competition's ``gain_margin`` up to
+    # ``full_pay_max_days`` at ``full_pay_max_gain`` or more — converted to
+    # eras on the grid in force at the win, fixed at the win; then the slot
+    # ENDS (burns) unless a newer win replaced it. No decay tail, no TTL
+    # (:func:`cascade.shared.lane_c.duration_full_pay`). The gain-tiered
+    # ``full_pay_tiers`` / ``half_life_rounds`` / ``floor`` / ``win_ttl_eras``
+    # are retired (``RETIRED_KEYS``).
+    full_pay_min_days: float = 5.0
+    full_pay_max_days: float = 20.0
+    full_pay_max_gain: float = 0.05
     # verdict: gain LCB_α of (base − fine-tune)/base on the target's windows
     # must clear ``gain_margin`` (> 0: a null fine-tune must not win ~α of the
     # time); optional public non-inferiority guard per target
@@ -433,7 +434,8 @@ def parse_lane_c(lc: dict, *, v2_from_block: int = 0, era_blocks: int = 0,
     start block of a kind whose start lives in a sibling table (``mkt`` →
     ``[marketcast] from_block``), ``era_blocks_at(block)`` the era length in
     force at a competition block (default ``era_blocks``)."""
-    from .v2 import _refuse_full_rounds, lane_b_replay_cover, parse_full_pay_tiers
+    from .chain_config import BLOCK_SECONDS
+    from .v2 import _refuse_full_rounds, lane_b_replay_cover
 
     mkt_suites = tuple(MKT_DEFAULT_SUITES if mkt_suites is None else mkt_suites)
     lc = dict(lc or {})
@@ -444,8 +446,14 @@ def parse_lane_c(lc: dict, *, v2_from_block: int = 0, era_blocks: int = 0,
     fb = _num(lc.get("from_block", 0), "from_block", integer=True)
     if fb < 0:
         raise ValueError(f"[lane_c] from_block must be >= 0; got {fb}")
-    ttl = _num(lc.get("win_ttl_eras", 28), "win_ttl_eras", integer=True)
-    cover = lane_b_replay_cover(ttl, era_settlements)
+    fp_days = {k: _num(lc.get(k, d), k) for k, d in (
+        ("full_pay_min_days", 5.0), ("full_pay_max_days", 20.0), ("full_pay_max_gain", 0.05))}
+    # a rebuilt validator's catch-up must hold every still-paying win: the
+    # longest full-pay duration, in eras of the era length at from_block
+    max_eras = (math.ceil(fp_days["full_pay_max_days"] * 86400 / BLOCK_SECONDS
+                          / int(era_blocks))
+                if int(era_blocks) > 0 and math.isfinite(fp_days["full_pay_max_days"]) else 0)
+    cover = lane_b_replay_cover(max_eras, era_settlements)
     if "replay_settlements" in lc:
         replay = _num(lc["replay_settlements"], "replay_settlements", integer=True)
         if cover and era_settlements and replay < cover:
@@ -485,11 +493,7 @@ def parse_lane_c(lc: dict, *, v2_from_block: int = 0, era_blocks: int = 0,
         takes_from=str(lc.get("takes_from", "lane_b")),
         remainder=str(lc.get("remainder", "burn")),
         targets=targets,
-        full_pay_tiers=parse_full_pay_tiers(lc.get("full_pay_tiers", FULL_PAY_TIERS),
-                                            section="lane_c", win_ttl_eras=ttl),
-        half_life_rounds=_num(lc.get("half_life_rounds", 1.0), "half_life_rounds"),
-        floor=_num(lc.get("floor", 0.1), "floor"),
-        win_ttl_eras=ttl,
+        **fp_days,
         alpha=_num(lc.get("alpha", 0.05), "alpha"),
         bootstrap_B=_num(lc.get("bootstrap_B", 10_000), "bootstrap_B", integer=True),
         gain_margin=_num(lc.get("gain_margin", 0.01), "gain_margin"),
@@ -521,13 +525,6 @@ def parse_lane_c(lc: dict, *, v2_from_block: int = 0, era_blocks: int = 0,
         raise ValueError(f"[lane_c] remainder must be one of {LANE_C_REMAINDERS}")
     if len(set(cfg.targets)) != len(cfg.targets):
         raise ValueError("[lane_c] targets must be unique")
-    if not 0.0 < cfg.floor <= 1.0:
-        raise ValueError(f"[lane_c] floor must be in (0, 1]; got {cfg.floor}")
-    if cfg.half_life_rounds <= 0:
-        raise ValueError("[lane_c] half_life_rounds must be > 0")
-    if cfg.win_ttl_eras < 0:
-        raise ValueError(f"[lane_c] win_ttl_eras={cfg.win_ttl_eras} must be 0 (no expiry) "
-                         "or > 0")
     if not 0.0 < cfg.alpha < 0.5:
         raise ValueError(f"[lane_c] alpha must be in (0, 0.5); got {cfg.alpha}")
     if cfg.bootstrap_B < 100:
@@ -549,6 +546,20 @@ def parse_lane_c(lc: dict, *, v2_from_block: int = 0, era_blocks: int = 0,
                          "in (0, 1]")
     if cfg.replay_settlements < 0:
         raise ValueError("[lane_c] replay_settlements must be >= 0")
+    # the gain-scaled pay duration (DEC-CA-0073)
+    for k in ("full_pay_min_days", "full_pay_max_days", "full_pay_max_gain"):
+        if not math.isfinite(getattr(cfg, k)):
+            raise ValueError(f"[lane_c] {k} must be finite")
+    if not 0.0 < cfg.full_pay_min_days <= cfg.full_pay_max_days:
+        raise ValueError(f"[lane_c] need 0 < full_pay_min_days ({cfg.full_pay_min_days}) <= "
+                         f"full_pay_max_days ({cfg.full_pay_max_days})")
+    if not 0.0 < cfg.full_pay_max_gain < 1.0:
+        raise ValueError(f"[lane_c] full_pay_max_gain must be in (0, 1); "
+                         f"got {cfg.full_pay_max_gain}")
+    if not cfg.gain_margin < cfg.full_pay_max_gain:
+        raise ValueError(f"[lane_c] gain_margin={cfg.gain_margin} must be < "
+                         f"full_pay_max_gain={cfg.full_pay_max_gain} (the pay-duration ramp "
+                         "runs from the margin to the max gain)")
     if fb:
         if not cfg.targets:
             raise ValueError("[lane_c] from_block set but no targets")

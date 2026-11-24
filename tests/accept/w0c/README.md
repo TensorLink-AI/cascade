@@ -401,3 +401,11 @@ longer chases main, merge-group CI gets longer (own Accepts + CROSS; the
   re-run: enqueue green PRs; the merge queue re-accepts them on latest main.
 - Plan text changes: one plan PR per batch of decisions (no `laned:` label;
   `docs/plans/` is PROTECTED from every WP PR).
+- Retired WPs (owner decision D24, plan rev6.18; `test_w0c_retired.py`):
+  `scripts/laned/retired_wps` lists `<WP> <owner decision reference>` (W5i).
+  Read at the base, never from the PR. A retired WP's PATHS never count for
+  scope, so a PR touching e.g. `cascade/validator/lane_d.py` needs no
+  `laned:W5i`; a leftover label of it is inert (`MODE retired`, nothing
+  runs, no ledger row). Its tests dir may only be deleted, under its label
+  plus `laned:tests-correction`. Never a CROSS or merge-group run; the board
+  keeps it at L0, side state `retired`, Level RETIRED.
