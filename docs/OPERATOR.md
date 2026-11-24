@@ -120,8 +120,9 @@ edited `chain.toml` before shipping it.
    qualifying the production VM image. A dependency import failure must stop
    provisioning before any miner generator runs.
 6. **Main validator identity.** Mainnet pins `[netconfig] owner_hotkey` to
-   its configured main validator. Testnet keeps a separate unset identity;
-   set it when enabling validator-sourced benches there. The
+   its configured main validator. Testnet pins its own main validator
+   (validator0, = testnet `[manifest] validator_hotkey`; owner 2026-11-24),
+   which also arms testnet overlays (S0c drill R7t). The
    loader refuses `[v2] bench_source = "validator"` with a resolved block >
    0 unless `owner_hotkey` is set, `[v2] king_ladder = true`, the block is an
    era boundary at/after `[v2] from_block`, and `owner_hotkey` equals
