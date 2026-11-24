@@ -289,7 +289,8 @@ def test_a_pod_failure_postpones_the_round_instead_of_deferring_entries(monkeypa
     entry = SimpleNamespace(miner_hotkey="hk", trained_pointer="p", target="mkt:market")
     monkeypatch.setattr(M, "_unpack", lambda c: (entry, "judge", None))
     monkeypatch.setattr(M, "entry_after", lambda *a, **k: 0.0)
-    monkeypatch.setattr(M, "entry_gap_end", lambda *a, **k: 0.0)
+    monkeypatch.setattr(M, "entry_draw", lambda *a, **k: {})
+    v.mkt_block_hash_fn = lambda b: "0x" + "00" * 32
     assert v._mkt_publish_round({"round_id": "r9", "block": 1, "candidates": [{}]}) is False
     assert calls == [1] and put == []
     # without a session the offloaded path never computes locally
