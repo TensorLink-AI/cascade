@@ -41,11 +41,12 @@ gets a `<Vertical>Cast` fine-tune and an `act:` scenario on the shared kit.
 8. [Scenarios](#8-scenarios)
 9. [Rewarding creative use of forecasts](#9-rewarding-creative-use-of-forecasts)
 10. [Explaining actions to the customer](#10-explaining-actions-to-the-customer)
-11. [Submission](#11-submission)
-12. [Rules](#12-rules)
-13. [Implementation map](#13-implementation-map)
-14. [Config sketch](#14-config-sketch)
-15. [Rollout](#15-rollout)
+11. [Incentives: king of the hill, privacy, duplicates](#11-incentives-king-of-the-hill-privacy-duplicates)
+12. [Submission](#12-submission)
+13. [Rules](#13-rules)
+14. [Implementation map](#14-implementation-map)
+15. [Config sketch](#15-config-sketch)
+16. [Rollout](#16-rollout)
 
 ## 1. Why
 
@@ -88,9 +89,10 @@ building blocks that every new vertical reuses.
 
 1. **Build.** The miner writes a harness on the kit (`cascade.harness`) and
    backtests it locally on recorded history (`cascade harness backtest`).
-2. **Commit and fund.** The miner commits
-   `metro-v1:ft:act:<scenario>:hippius:<repo>@sha256:<digest>` and funds a
-   short CPU leg.
+2. **Upload, commit and fund.** The miner uploads the harness to the
+   private vault, commits
+   `metro-v1:ft:act:<scenario>:hippius:vault/direct@sha256:<digest>` and
+   funds a short CPU leg.
 3. **Qualify.** The trainer runs the static guard and a smoke run. It then
    backtests the harness against the reference on public history. Failing
    entries stop here, before they cost validator GPU. The trainer freezes
@@ -99,8 +101,9 @@ building blocks that every new vertical reuses.
    `train_block` plus an embargo. The validator waits until enough forward
    data has been recorded (`verdict_wait_blocks`).
 5. **Judge.** The main validator draws the round's episodes (variants and
-   hard tiers from the round seed). It runs three passes on the same
-   episodes: the miner, the reference, and the miner on naive forecasts.
+   hard tiers from the round seed). It runs these passes on the same
+   episodes: the miner, the reference, the holder and every published
+   harness, and the miner on naive forecasts.
    Every model call goes through the gateway into a transcript.
 6. **Verdict.** Score terms → paired cluster bootstrap → the gates in §4.
    Explanations are checked in the same pass (§10): grounding, truth,
@@ -109,9 +112,12 @@ building blocks that every new vertical reuses.
 7. **Confirm.** At the next settlement the pending entry is re-judged on
    fresh episodes, on the current fine-tune holder. Pass → it takes the main
    slot or the novel-use slot.
-8. **Pay and publish.** The slot pays on the lane-C schedule. The harness
-   and its transcripts are published.
-9. **Audit.** Anyone replays the harness from the transcripts on CPU. They
+8. **Pay, then publish.** The slot pays on the lane-C schedule while the
+   harness stays private. When it is dethroned or decays to the floor, its
+   code, transcripts and explanations are published and join the reference
+   set.
+9. **Audit.** After publication, anyone replays the reign from the
+   transcripts on CPU. They
    check Engy proofs, re-query a sample of decision-model calls, and
    re-derive every score and LCB.
 
@@ -129,9 +135,11 @@ A judge-phase entry passes when **all** of these hold, at `alpha / k`
 | factual | false-claim and unsupported-sentence rates are under `max_false_rate` / `max_unsupported_rate` at their upper bounds (§10) |
 | explanation | explanation score LCB over the reference's ≥ −`tau`, so explanations can't be traded away for decision gain (§10) |
 
-Then the DEC-CA-0056 machinery applies unchanged: the best passer becomes
-pending, is confirmed at uncorrected `alpha` at the next settlement, and
-takes the slot by the slot rule. Each `act:<scenario>` has two slots:
+Then the DEC-CA-0056 machinery applies: the best passer becomes pending
+and is confirmed at uncorrected `alpha` at the next settlement. The slot
+rule is stricter than lane C's (§11): to take an occupied slot, the
+challenger must beat the holder **and every published harness**, paired on
+the same episodes, by `increment_margin` at the LCB. Each `act:<scenario>` has two slots:
 
 | slot | who | share |
 |---|---|---|
@@ -658,12 +666,11 @@ the room for new ideas is.
 
 ### 6. Open source, without paying copies
 
-Winning harnesses are published with their transcripts, so the field learns
-from each other. Copies are not paid: the exact-digest rule, the
-behavioural near-duplicate rule (action correlation ≥ 0.98) and the novel-use
-correlation rule all go to the earlier commitment. Building on a published
-idea is fine. Winning still needs a confident gain over the current holder,
-or a different way of winning.
+Harnesses are published **after** their reign, not during it (§11). A
+published harness then becomes part of the bar every new entry must beat,
+so copying it earns nothing. Building on a published idea is fine, but
+winning still needs a confident gain over the holder and over everything
+published.
 
 ## 10. Explaining actions to the customer
 
@@ -784,10 +791,151 @@ certainty ("the price will…") with no probability attached.
 - **Reference explanations.** The reference harness ships template
   explanations. They are the bar every entry must not fall below.
 
-## 11. Submission
+## 11. Incentives: king of the hill, privacy, duplicates
 
-The miner commits `metro-v1:ft:act:<scenario>:hippius:<repo>@sha256:<digest>`
-(the existing lane-C form, parsed generically). The tree:
+### The game
+
+| | |
+|---|---|
+| **Players** | Miners (each can hold many hotkeys and coldkeys); the main validator (operator-run, sees everything); satellites and auditors; copycats watching what is published. |
+| **What a miner can do** | Submit original work; resubmit near-copies to fish for noise; copy a published winner and nudge it; clone a winner's behaviour from its published actions or explanations; use many identities; hold a slot and stop improving. |
+| **Payoff** | Emissions, by far. Status (leaderboard, being the published winner) is a real second. |
+| **Costs** | Building the harness; the CPU qualifier leg; metered Engy and decisionmodels.io calls. |
+| **Information** | Code is private to the miner and the operator until publication. Scores are public. |
+| **Objective** | Pay for the best decision software on each vertical, keep it improving, and never pay for a copy. |
+
+### Recommendation: king of the hill with a paired increment, plus a novel-use slot
+
+**Yes, king of the hill, with four changes.**
+
+1. **Winner-take-the-slot, not a split by rank.** A rank split pays copies
+   and sybils: ten near-clones collect ten shares. With one slot holder per
+   scenario, a copy of yourself earns nothing, and a copy of someone else
+   must beat them. This is the existing lane-C slot model.
+2. **A paired challenge against the holder (better than lane C's rule).**
+   Lane C compares LCBs recorded at different settlements, because
+   re-training a fine-tune is costly (DEC-CA-0056). A harness is cheap to
+   re-run: it is CPU code on cached forecasts. So at each verdict the
+   holder **and every published harness** run on the challenger's episodes,
+   as extra references. To take the slot, a challenger must beat the
+   *strongest* of these, paired, by `increment_margin` (for example 1 %) at
+   the LCB. Noise alone does not flip a slot, and a nudged copy of the
+   holder cannot clear 1 % on the same episodes.
+3. **A decaying reign.** The gain-tiered full-pay period (lane C's
+   `full_pay_tiers`) then halves down to a floor, with a 28-era TTL. A
+   holder that stops improving earns less over time, and the slot opens up.
+4. **A second slot for a different way to win** (the novel-use slot, §9):
+   it rewards a different approach, so the field is not just tweaks of one
+   leader. It is the main defence against "the leader is unbeatable, so
+   nobody plays".
+
+**Alternatives considered**
+
+| Alternative | Why not |
+|---|---|
+| Pay top-k by rank | Pays copies and sybils; rewards being close, not better. |
+| Shapley or ensemble-contribution payouts | Gameable: miners craft entries that look additive. Hard to audit. Expensive. |
+| Bounties (fixed prize for beating a bar once) | Good for launch. Could seed a new scenario's first holder, then hand over to king of the hill. |
+
+### Privacy: private until it earns, published when it stops
+
+The DEC-CA-0036 vault pattern, applied to ActionCast:
+
+- **Private intake.** The miner uploads the harness ZIP to the operator
+  vault. On chain they commit only the digest:
+  `metro-v1:ft:act:<scenario>:hippius:vault/direct@sha256:<hex>`. The
+  earliest uploader owns a digest, and a copied digest committed by another
+  hotkey is dropped.
+- **What is public during evaluation:** the commitment, the verdict rows
+  (scores, LCBs, gate outcomes), and the digests of the transcripts and the
+  report. **Not public:** the code, the per-step actions or the explanation
+  texts. Actions and explanations would let anyone train a clone by
+  imitation.
+- **When the harness is published** (`[actioncast] publish`, proposed
+  `"dethrone"`): when the holder loses the slot, or when its reign decays to
+  the floor, whichever comes first. Then the code, transcripts, actions and
+  explanations all become public. Losers are never published.
+- **What publication does:** the published harness joins the **reference
+  set** (item 2 above), so every later entry must beat it by the increment
+  margin. Copying it earns nothing.
+- **Audit, stated plainly.** While a harness reigns, its verdicts are
+  verifiable only against the main validator's signed reports and digests.
+  Once it is published, anyone can replay the whole reign from the
+  transcripts, and the digests prove nothing changed. Every paid reign is
+  fully auditable, just later. Non-winners can only be audited by trusting
+  the operator. This is the same posture as DEC-CA-0036, and the price of
+  stopping copy-watching.
+- **Customer explanations** are a product output. They go to the customer
+  (Ephemeris or apps), not to the public, during the reign.
+
+### Duplicates and copies
+
+Each layer catches what the previous one misses:
+
+| Layer | Catches | Rule |
+|---|---|---|
+| 1. Digest ownership | byte copies | the earliest uploader owns a digest |
+| 2. Structural hash | renamed or reformatted copies | normalised AST hash (comments, whitespace and identifiers stripped); matching a senior entry or a published harness → duplicate |
+| 3. Behavioural near-duplicate | refactored copies, wrappers | action correlation ≥ 0.98 (and explanation-claim overlap) with a senior entry, the holder or a published harness, on the same episodes |
+| 4. Published-set reference | "copy the published winner plus a tweak" | must beat every published harness by `increment_margin`, paired (item 2) |
+| 5. Fishing limits | many near-variants hoping noise passes one | owner-weighted Bonferroni (MarketCast F6: one coldkey's entries share one owner's α), one open entry per coldkey, a paid leg per entry, and confirmation on fresh episodes |
+
+Seniority is always the commitment block, never the UID.
+
+### How each type of player fares
+
+- **Honest builder:** submits privately. If better by 1 % against the
+  holder and the published set, it takes the slot, earns while private, and
+  is published when dethroned. Best response: keep improving, because the
+  reign decays.
+- **Copycat:** can only copy published harnesses. Those are in the
+  reference set, so a copy earns nothing; even a good tweak must clear the
+  margin. It can't see the live holder's code, actions or explanations.
+- **Noise fisher:** many coldkeys, small variants. Each entry pays a leg and
+  must pass at α / k, then pass a fresh confirmation and the paired margin
+  against the holder. The false-pass rate under the null is about α × α, so
+  expected value is negative once the fee is above that rate times the
+  slot's value. Q5's noise study sets the fee floor.
+- **Lazy player:** ships the reference harness plus a tweak. The reference
+  is the bar, so it earns nothing without a real 1 % gain.
+- **Incumbent who coasts:** the reign decays and the slot opens. The incumbent
+  can defend only by submitting a better version, which is fine.
+- **Insider risk:** the operator sees all code. The mitigations are vault
+  access logs, per-dispatch staging (only the entry being judged is on the
+  pod), and full publication of every reign later. This is trust, stated as
+  trust.
+
+### Participation
+
+Winner-take-all can deter entrants. The counterweights:
+- **More slots:** a main and a novel-use slot per scenario, across many
+  scenarios and verticals, and possibly generalist slots (Q9).
+- **Cheap entry:** a CPU leg, with external calls metered by use.
+- **Local checking:** miners can backtest and run the explanation checker
+  locally, so they know their odds before paying.
+- **Status:** a public leaderboard of verdict scores for every entry,
+  showing no code.
+- **Launch bounties:** a bounty can seed each new scenario's first holder.
+
+### What to monitor
+
+- **Slot concentration** by coldkey, and how long it takes to dethrone a
+  holder.
+- **Near-duplicate distances** per round. A spike just under 0.98 means
+  tuned evasion; tighten the threshold.
+- **Pass rate of the owner's null entries:** the reference plus
+  noise-only changes. It must stay near zero.
+- **Entries per owner, and new coldkeys per round.**
+- **Clones soon after a publication:** gain against the published harness
+  clustered just above the margin.
+- **Holders whose explanation scores fall** while their decision gains rise
+  (trading explanations away).
+
+## 12. Submission
+
+The miner uploads the tree to the private vault and commits
+`metro-v1:ft:act:<scenario>:hippius:vault/direct@sha256:<digest>` (the
+existing lane-C form, with the DEC-CA-0036 vault ref; §11). The tree:
 
 ```
 harness.json      # {"scenario": "bess", "api": 1, "models": ["nrg:aemo", "mkt:market"], ...}
@@ -814,7 +962,7 @@ they draw on a per-episode budget of forecast series × horizon steps, with a
 context-length cap. `fc.budget_left()` reports what remains. Over budget
 means the call is refused, not that the episode fails.
 
-## 12. Rules
+## 13. Rules
 
 - **Sandbox.** The same static guard and network-isolated sandbox as
   generators (`cascade/interface/static_guard.py`): no network, no clock, no
@@ -832,13 +980,17 @@ means the call is refused, not that the episode fails.
   trusting the main validator.
 - **Forward-only.** Episodes start after the leg's `train_block`, plus an
   embargo. The harness can only see the past inside the episode.
-- **Duplicates.** An exact tree digest is a duplicate. So is a behavioural
-  near-duplicate: action correlation ≥ 0.98 with an earlier entry on the
-  same episodes (the MarketCast F4 approach). Seniority goes to the earlier
-  commitment block.
+- **Duplicates.** Five layers (§11): digest ownership, a structural (AST)
+  hash, behavioural near-duplicates (action correlation ≥ 0.98, against
+  senior entries, the holder and published harnesses), the published-set
+  reference, and fishing limits. Seniority goes to the earlier commitment
+  block.
+- **Privacy.** Submissions go through the private vault. Code, actions and
+  explanation texts stay private until the harness is dethroned or its reign
+  decays to the floor (§11).
 - **Model lift.** See §4.
 
-## 13. Implementation map
+## 14. Implementation map
 
 | piece | where | what |
 |---|---|---|
@@ -855,7 +1007,7 @@ means the call is refused, not that the episode fails.
 | audit | `cascade/audit/harness_reproduce.py` + a branch in `checks.py` | replays transcripts on CPU and re-derives scores and LCBs |
 | docs | `docs/ACTIONCAST_MINER.md` | the miner guide, in the MARKETCAST.md shape |
 
-## 14. Config sketch
+## 15. Config sketch
 
 ```toml
 [lane_c]
@@ -875,6 +1027,11 @@ forecast_budget      = 2000      # series x horizon/100 per episode (unit to fix
 novel_share          = 0.3
 novel_max_corr       = 0.5
 hard_tier_fraction   = 0.3
+increment_margin     = 0.01     # paired gain over holder and published set
+publish              = "dethrone"  # dethrone | floor | crown | delay:<eras>
+max_open_per_coldkey = 1
+ast_dedup            = true
+near_dup_action_corr = 0.98
 step_cpu_ms          = 200
 tree_max_bytes       = 2_000_000
 
@@ -905,7 +1062,7 @@ regions    = ["NSW1", "QLD1", "VIC1", "SA1", "TAS1"]
 episode_h  = 24
 ```
 
-## 15. Rollout
+## 16. Rollout
 
 0. Build the kit first (layers 1–4, golden vectors), and write the three
    first scenarios as specs on it. If a scenario needs a one-off module, the

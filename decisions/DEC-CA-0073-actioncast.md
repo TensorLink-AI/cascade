@@ -95,6 +95,24 @@ Owner rulings (2026-11-24) are marked **(owner)**. The rest is proposed.
     statements fail the entry. Explanation quality may not fall below the
     reference's. Design: ACTIONCAST.md §10.
 
+
+12. **King of the hill, private until it stops earning (proposed).**
+    * One holder per slot (main and novel-use), never a split by rank.
+    * A challenger takes an occupied slot only by beating the holder **and
+      every published harness**, paired on the same episodes, by
+      `increment_margin` (1 %). Harnesses are cheap to re-run, so this is
+      stricter than lane C's cross-settlement LCB rule.
+    * Submissions go through the DEC-CA-0036 private vault (digest-only
+      commitment, earliest uploader owns it).
+    * Code, actions and explanation texts stay private during the reign.
+      They are published when the holder is dethroned or its reign decays to
+      the floor, and then join the reference set.
+    * Duplicates are caught in five layers: digest, AST hash, behavioural
+      near-duplicate, published-set reference, and fishing limits
+      (owner-weighted Bonferroni, one open entry per coldkey, paid legs,
+      confirmation).
+    * Design: ACTIONCAST.md §11.
+
 ## Consequences
 
 - **New code:**
@@ -161,10 +179,15 @@ Owner rulings (2026-11-24) are marked **(owner)**. The rest is proposed.
   reference, as proposed), or also add to the composite gain? Which
   locales come after English? Is "material action" the right trigger, or
   should every step be explained?
+- **Q12. Incentives.** Should publication happen at `dethrone` (as
+  proposed), at `floor`, or after a fixed delay? Is `increment_margin` 1 %?
+  Should a launch bounty seed each new scenario? Is non-winners' code
+  private forever, or published after N eras? Should a public leaderboard
+  show verdict scores for every entry?
 
 ## Rollout
 
-See [docs/ACTIONCAST.md §15](../docs/ACTIONCAST.md#15-rollout). In short:
+See [docs/ACTIONCAST.md §16](../docs/ACTIONCAST.md#16-rollout). In short:
 
 1. Build the kit and the gateway.
 2. Run `act:perp` end to end on `mkt:market`, which already exists.
