@@ -151,7 +151,7 @@ def add_lane_d(sub: argparse._SubParsersAction) -> None:
     r.add_argument("--context", type=int, required=True, help="The submitted context length.")
     r.add_argument("--licence", required=True,
                    help="The open licence the checkpoint is published under "
-                        "(Apache-2.0 or OpenMDW-1.1).")
+                        "(MIT).")
     r.add_argument("--attest", action="store_true",
                    help="Confirm the licence attestation statement (shown without this "
                         "flag; nothing is sent until you confirm).")
@@ -564,7 +564,7 @@ def _submit(args, out) -> int:
                upload_path=chosen, uploaded_bytes=sent)
     out.info(f"uploaded {sent} bytes for entry {digest}; next, attest the licence and commit:\n"
              f"  cascade lane-d ready {base} --digest {digest} --context {context} "
-             "--licence <Apache-2.0|OpenMDW-1.1> --attest ...")
+             "--licence MIT --attest ...")
     return OK
 
 

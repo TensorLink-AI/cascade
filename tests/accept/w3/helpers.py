@@ -364,7 +364,7 @@ class Miner:
         for n, b in files.items():
             self.env.store.put(prefix + n, b)
 
-    def ready(self, files: dict[str, bytes], *, licence: str = "Apache-2.0",
+    def ready(self, files: dict[str, bytes], *, licence: str = "MIT",
               attestation: str | None = None, context: int = CONTEXT,
               body: bytes | None = None, **kw) -> Response:
         from cascade.lane_d import service

@@ -129,6 +129,7 @@ def test_ttl_comes_from_the_lane_d_config(tmp_path):
     env = Env(tmp_path, cfg=lane_d_cfg(ready_ttl_blocks=7))
     m = Miner(env, "ttl-d")
     r = m.enter(checkpoint("td"))
+    assert r.status == 200, r
     assert r.json["ready_expires_block"] == BLOCK + 7
     env.reads.block = BLOCK + 8
     assert env.entry(m.hotkey, r.json["digest"])["state"] == "ready_expired"

@@ -65,7 +65,7 @@ def test_the_dedicated_hotkey_rule():
 
 def test_the_licence_attestation_and_takedown():
     text = _doc()
-    _need(text, "Apache-2.0", "OpenMDW", "training data", "teacher",
+    _need(text, "MIT", "training data", "teacher",
           what="(the B13 licence attestation at ready)")
     _need(text, "takedown", what="(the Hub/HF takedown path)")
 
