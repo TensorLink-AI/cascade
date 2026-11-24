@@ -235,13 +235,17 @@ def build_window(series: np.ndarray, w: Mapping, *, block_hash: str | None, max_
             "target": tgt[0].copy() if uni else tgt.copy(), "channels": rec}, None
 
 
-def read_public_windows(draw: dict, *, index_dir, data_root, block_hash: str | None,
-                        max_channels: int) -> tuple[list[dict], list[dict]]:
-    """Read ONLY the drawn series of ``draw`` from the local mirror at
-    ``data_root`` and build its windows: ``(windows, dropped)``, both in
-    ``window_id`` order. Needs ``pyarrow`` (the eval host / builder, never
-    the box). ``index_dir`` is the source's index (the one ``draw`` was
-    drawn from)."""
+def read_public_windows(draw: dict, *, index_dir, data_root=None, block_hash: str | None,
+                        max_channels: int, reader=None) -> tuple[list[dict], list[dict]]:
+    """Read ONLY the drawn series of ``draw`` and build its windows:
+    ``(windows, dropped)``, both in ``window_id`` order. The series come
+    from ``reader(row) -> (C, L)`` when given (the Hippius mirror,
+    :meth:`cascade.eval.lane_d_public_mirror.PublicMirror.reader`), else
+    from the local mirror at ``data_root``. Needs ``pyarrow`` (the eval host
+    / builder, never the box). ``index_dir`` is the source's index (the one
+    ``draw`` was drawn from)."""
+    if reader is None and data_root is None:
+        raise ValueError("read_public_windows: a data_root or a reader is required")
     source = draw["source"]
     by_series: dict[str, list[dict]] = {}
     for w in draw["windows"]:
@@ -256,7 +260,8 @@ def read_public_windows(draw: dict, *, index_dir, data_root, block_hash: str | N
     windows, dropped = [], []
     for sid in sorted(by_series):
         row = rows[sid]
-        series = read_series(data_root, row, source=source)
+        series = (reader(row) if reader is not None
+                  else read_series(data_root, row, source=source))
         for w in by_series[sid]:
             win, why = build_window(series, w, block_hash=block_hash, max_channels=max_channels,
                                     min_history=int(draw["min_history"]))

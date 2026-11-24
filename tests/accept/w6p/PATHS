@@ -11,3 +11,9 @@ scripts/laned_public_mirror.py
 scripts/laned_rmisc_allowlist.py
 # The committed allowed list (a placeholder until the owner's finalize run).
 data/lane_d/rmisc_allowed.toml
+# Owner 2026-11-24 (#894): the canonical mirror is a Hippius S3 object set.
+# Shard / shard-map format, the eval host's ranged fetcher + volume blob cache,
+# the resumable streaming builder, and the store/cache config.
+cascade/eval/lane_d_public_mirror.py
+cascade/eval/lane_d_public_build.py
+deploy/laned/public_mirror.toml

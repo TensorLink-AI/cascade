@@ -9,11 +9,15 @@ them. Design record: [`docs/plans/LANE_D_PLAN.md`](plans/LANE_D_PLAN.md)
 (DEC-CA-0070). The short CLI reference is
 [MINER.md §15](MINER.md#15-open-weights-lane-d-the-cascade-lane-d-cli).
 
-Lane D ships **unarmed**. `[lane_d] from_block = 0` means the lane is never
-active; it is armed later by a signed network overlay at an era boundary,
-never by a `chain.toml` edit. Check `cascade status --json` (`lanes.d`) and
-the public queue before you spend anything. A listed feature is not live
-availability.
+The `chain.toml` template ships lane D **unarmed** (`[lane_d] from_block =
+0`). Networks arm it by a signed overlay at an era boundary, never by a
+`chain.toml` edit. On mainnet the launch overlay
+(`deploy/overlays/launch-20261125.mainnet.toml`) arms it at block 9586800
+(about Wed 2026-11-25 22:28 UTC) with a 50% share, and sets
+`public_weight = 0.0`: **at launch lane D is scored on the live half only**
+(see [How entries are judged](#how-entries-are-judged)). Check
+`cascade status --json` (`lanes.d`) and the public queue before you spend
+anything.
 
 ## Contents
 
@@ -205,20 +209,26 @@ and the rest may be embargo windows. Judging starts no earlier than
 `eval_delay_hours` (6 h) after max(T_E, T_K), and the crown is decided at the
 first verdict (FAQ).
 
-**Live half and public half.** Half of the score is the live forward windows
-above. The other half is public: 5000 windows each from
+**Live half and public half.** The score has a live half (the forward
+windows above) and an optional public half: 5000 windows each from
 `Salesforce/GiftEvalPretrain` and `nju-zhangsq/RMISC` per settlement, drawn by
 the settlement block hash from the whole dataset (multivariate sets are scored
 as `(C, L)` panels). Each window's score ratio is clamped to [0.5, 2]
 (`window_ratio_floor` = 0.5) and log-averaged into L_live and L_public, and the combined score is
-`L = (1 − public_weight) · L_live + public_weight · L_public` with
-`public_weight` = 0.5. A challenger must also gain on each half on its own.
+`L = (1 − public_weight) · L_live + public_weight · L_public`. A challenger
+must also gain on each half that is scored.
+
+- **At the mainnet launch** the overlay sets `public_weight = 0.0`. The
+  verdict is the live half alone; no public windows are drawn or required.
+- **Later**, once the public mirror exists, a signed overlay can raise it.
+  The template value is `public_weight` = 0.5 (a 50/50 live/public score).
+  `cascade status --json` shows the value in force.
 
 **Verdict.** A two-part paired cluster bootstrap of the combined score L
 (live clusters = source, public clusters = source and family) with lane A's
 quantile head scoring. The challenger clears if the LCB on the 1 − exp(−L)
 scale is `≥` the crown bar in force at the settlement (at `alpha = 0.05`),
-and both the live and the public point gains are strictly positive. The bar decays with the
+and the point gain on every scored half is strictly positive. The bar decays with the
 current KING_D's tenure (the lane D settlements it has held the crown, the
 house included): `d_margin_start` (0.03) at tenure 0, falling linearly to
 `d_margin` (0.01) over `d_margin_warmup_settlements` (32 settlements, about
@@ -252,7 +262,8 @@ house, run paired on one host in one sweep. A loss is `gate_regression`; a
 sweep that errors, returns partial results or NaN is the miner's
 `checkpoint_fault`; a bench host outage holds the crowning (`bench_hold`)
 for at most `max_bench_holds` settlements. There is no separate
-low-frequency check: the public half covers slow-cadence series. Public
+low-frequency check: the public half covers slow-cadence series once it is
+on. Public
 bench suites never pay and are never targets.
 
 **The sentinel** is the cross-lane rotating held-out suite: each era one suite

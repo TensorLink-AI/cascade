@@ -75,6 +75,14 @@ scoring_envs           = "deploy/laned/scoring_envs.toml"
 # pinned torch 2.4.1+cu124 today. NOTE #830's cu124-torch241 entry does not
 # list "NVIDIA H200" yet: once #830 merges, H200 is refused until it is added.
 fallback_qualified_gpu_models = ["NVIDIA H200"]
+# Public-mirror warm cache (owner 2026-11-24, #894): Lium persistent volume
+# HUIDs (`lium volumes new lane-d-public-0`, then `lium volumes list`); host i
+# of a cohort gets volume i via `lium up --volume id:<HUID>`, mounted at
+# public_cache_mount (deploy/laned/public_mirror.toml cache_dir lives under it).
+# 750 GB per volume holds the fully warm mirror. Empty = no volume (alerted:
+# every drawn series is fetched from Hippius on every host).
+public_cache_volumes   = []
+public_cache_mount     = "/workspace"
 
 [[eval_host.candidates]]
 lium_gpu_type = "H200"

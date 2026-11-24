@@ -75,6 +75,14 @@ by `deploy/laned/elastic.toml`. Owner execution WP: the live run writes
 | host count, same host per cohort | `test_hosts_needed`, `test_up_rents_n_hosts_cheapest_first_under_cap`, `test_same_hosts_for_a_cohort_and_down_waits_for_it` |
 | deterministic shards, king on every host, 3 hosts = 1 host | `test_assignment_is_deterministic_and_anchors_every_host`, `test_three_identical_hosts_give_the_one_host_verdict`, `test_merge_refuses_a_king_that_differs_between_hosts`, `test_shard_plan_maps_shards_to_live_hosts` |
 | R12 kit for the eval host | `test_eval_bootstrap_uses_the_r12_kit` |
+| public-mirror Lium volume per host (#894) | `test_each_host_is_rented_with_its_volume`, `test_dry_run_plans_the_volumes`, `test_bad_volume_lists_are_refused`, `test_the_shipped_config_names_the_volume_mount_of_the_mirror_cache`, `test_lium_up_carries_the_volume` |
+
+Public-mirror warm cache (owner 2026-11-24, #894): `[eval_host]
+public_cache_volumes` = Lium volume HUIDs (unique), `public_cache_mount`
+(absolute, default `/workspace`, where `deploy/laned/public_mirror.toml`'s
+`cache_dir` lives). Host i of a cohort is launched with `LaunchSpec.volumes =
+(HUID i,)` → `lium up … --volume id:<HUID>`; a host past the list gets none
+and `lane_d_eval_no_volume` is alerted (it fetches from Hippius).
 
 Not here (consensus, owner/plan decision): the signed report's per-model host
 fields and per-host king scores, and a verdict that pairs each challenger with

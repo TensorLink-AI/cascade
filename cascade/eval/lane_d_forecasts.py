@@ -26,11 +26,14 @@ box's SSH transport (:class:`cascade.validator.lane_d_inputs.SSHEvalHost`):
 * ``hello [--env NAME]`` prints the W4 :func:`~cascade.eval.lane_d_handshake.worker_hello`
   as one JSON line, with (rev6.18 B7) this host's scoring environment
   (:func:`~cascade.eval.lane_d_handshake.probe_environment`);
-* ``public --cache-dir D --budget-bytes N --public-root R`` (rev6.18 A3,
+* ``public --cache-dir D --budget-bytes N [--public-root R]`` (rev6.18 A3,
   F4) reads one JSON :data:`PUBLIC_REQUEST_SCHEMA` request (one digest, the
   settlement's public draws) and prints one :data:`PUBLIC_REPLY_SCHEMA` line:
-  the digest's per-window scores on the drawn series this host reads from
-  its public mirror, plus the windows dropped at read time;
+  the digest's per-window scores on the drawn series, plus the windows
+  dropped at read time. Without ``--public-root`` the drawn series come from
+  the Hippius mirror (``deploy/laned/public_mirror.toml``, ranged GETs behind
+  the Lium-volume blob cache; owner 2026-11-24, #894), else from a local
+  mirror at R;
 * ``forecast --cache-dir D --budget-bytes N`` reads one request (an ``.npz``
   of the window histories plus a JSON ``meta`` record, :data:`REQUEST_SCHEMA`)
   from stdin and prints one :data:`REPLY_SCHEMA` JSON line: the quantiles, or
@@ -310,10 +313,14 @@ def public_scores_entry(cache: PrefetchCache, digest: str, draws: Sequence[Mappi
                         public_root, context: int, horizon: int, contexts,
                         block_hash: str | None, max_channels: int,
                         grant: Mapping | None = None, contract=None, expect=None,
-                        device: str = "cpu", forecast: Callable | None = None) -> dict:
+                        device: str = "cpu", forecast: Callable | None = None,
+                        mirror=None) -> dict:
     """One checkpoint's per-window scores on the settlement's public draws
-    (rev6.18 A3, F4): each source's drawn series are read from this host's
-    mirror (``<public_root>/<source>/data``, its index at ``.../index``:
+    (rev6.18 A3, F4): each source's drawn series are read from the Hippius
+    mirror when ``mirror`` is given (:class:`~cascade.eval.lane_d_public_mirror.
+    PublicMirror`: only the drawn series' row groups, volume cache first;
+    owner 2026-11-24, #894), else from this host's local mirror
+    (``<public_root>/<source>/data``, its index at ``.../index``):
     :func:`~cascade.validator.lane_d_public.read_public_windows`, F2's
     channel rule with ``block_hash`` / ``max_channels``), forecast at
     ``context`` (:func:`forecast_entry`, each history cut to its last
@@ -324,14 +331,24 @@ def public_scores_entry(cache: PrefetchCache, digest: str, draws: Sequence[Mappi
     they are the same for every digest. Raises :class:`LaneDForecastError`."""
     from ..validator.lane_d_public import read_public_windows, score_public_windows
 
-    root = Path(public_root)
+    if mirror is None and public_root is None:
+        raise LaneDForecastError("forecast_failed", "no public mirror: neither a Hippius "
+                                 "mirror nor a local public root")
     windows, dropped = [], {}
     for d in draws:
         src = str(d["source"])
         try:
-            ws, drops = read_public_windows(dict(d), index_dir=root / src / PUBLIC_INDEX_DIR,
-                                            data_root=root / src / PUBLIC_DATA_DIR,
-                                            block_hash=block_hash, max_channels=int(max_channels))
+            if mirror is not None:
+                index_dir, reader = mirror.reader(dict(d))
+                ws, drops = read_public_windows(dict(d), index_dir=index_dir, reader=reader,
+                                                block_hash=block_hash,
+                                                max_channels=int(max_channels))
+            else:
+                root = Path(public_root)
+                ws, drops = read_public_windows(dict(d), index_dir=root / src / PUBLIC_INDEX_DIR,
+                                                data_root=root / src / PUBLIC_DATA_DIR,
+                                                block_hash=block_hash,
+                                                max_channels=int(max_channels))
         except Exception as e:  # noqa: BLE001 — this host's mirror, never the miner's bytes
             raise LaneDForecastError("forecast_failed",
                                      f"public {src}: mirror read failed ({type(e).__name__}: "
@@ -348,10 +365,22 @@ def public_scores_entry(cache: PrefetchCache, digest: str, draws: Sequence[Mappi
     return {"scores": {src: per.get(src, []) for src in sorted(dropped)}, "dropped": dropped}
 
 
-def serve_public(raw: bytes, *, cache_dir, budget_bytes: int, device: str, public_root,
-                 chain_toml=None) -> dict:
+def public_mirror(*, mirror_config=None, cache_dir=None, budget_bytes: int | None = None):
+    """The Hippius mirror of ``deploy/laned/public_mirror.toml`` (or
+    ``mirror_config``): its stores in order (Hippius, then R2) behind the
+    volume cache at ``cache_dir`` (default: the config's, the Lium volume)."""
+    from .lane_d_public_mirror import load_mirror_config, mirror_from_config
+
+    return mirror_from_config(load_mirror_config(mirror_config), cache_dir=cache_dir,
+                              budget_bytes=budget_bytes)
+
+
+def serve_public(raw: bytes, *, cache_dir, budget_bytes: int, device: str, public_root=None,
+                 chain_toml=None, mirror=None) -> dict:
     """Answer one :data:`PUBLIC_REQUEST_SCHEMA` request (JSON): the
-    :data:`PUBLIC_REPLY_SCHEMA` record. ``ValueError`` on a malformed request."""
+    :data:`PUBLIC_REPLY_SCHEMA` record. ``ValueError`` on a malformed request.
+    Without ``public_root`` the series come from ``mirror`` (default: the
+    release's Hippius mirror config, :func:`public_mirror`)."""
     try:
         meta = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as e:
@@ -383,11 +412,18 @@ def serve_public(raw: bytes, *, cache_dir, budget_bytes: int, device: str, publi
             except Exception as e:  # noqa: BLE001 — this host's config, not the miner's bytes
                 raise LaneDForecastError("checkpoint_unavailable",
                                          f"no lane D contract to ingest against ({e})") from e
+        if public_root is None and mirror is None:
+            try:
+                mirror = public_mirror()
+            except Exception as e:  # noqa: BLE001 — this host's config, not the miner's bytes
+                raise LaneDForecastError("forecast_failed",
+                                         f"no public mirror config ({e})") from e
         got = public_scores_entry(cache, digest, draws, public_root=public_root,
                                   context=context, horizon=horizon, contexts=tuple(contexts),
                                   block_hash=meta.get("block_hash"),
                                   max_channels=max_channels, grant=grant, contract=contract,
-                                  device=device)
+                                  device=device, mirror=None if public_root is not None
+                                  else mirror)
     except LaneDForecastError as e:
         log.warning("lane_d_public_refused %s digest=%s detail=%s", e.code, digest, e.detail)
         return {"schema": PUBLIC_REPLY_SCHEMA, "ok": False, "code": e.code, "detail": e.detail}
@@ -418,8 +454,17 @@ def _build_parser() -> argparse.ArgumentParser:
     q.add_argument("--cache-dir", type=Path, required=True, help="the W15 prefetch cache root")
     q.add_argument("--budget-bytes", type=int, required=True, help="the cache byte budget")
     q.add_argument("--device", default="cuda")
-    q.add_argument("--public-root", type=Path, required=True,
-                   help="the public mirror root: <root>/<source>/{index,data}")
+    q.add_argument("--public-root", type=Path, default=None,
+                   help="a LOCAL public mirror root <root>/<source>/{index,data}; without it "
+                        "the drawn series come from the Hippius mirror (--mirror-config)")
+    q.add_argument("--mirror-config", type=Path, default=None,
+                   help="the Hippius mirror config (default: the release's "
+                        "deploy/laned/public_mirror.toml)")
+    q.add_argument("--public-cache-dir", type=Path, default=None,
+                   help="the public blob cache (default: the config's cache_dir, the Lium "
+                        "volume)")
+    q.add_argument("--public-cache-budget-bytes", type=int, default=None,
+                   help="the public blob cache byte budget (default: the config's)")
     q.add_argument("--chain-toml", type=Path, default=None,
                    help="this host's chain.toml (the contract a cache miss ingests against)")
     return p
@@ -438,9 +483,19 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     try:
         if args.cmd == "public":
+            mirror = None
+            if args.public_root is None:
+                try:
+                    mirror = public_mirror(mirror_config=args.mirror_config,
+                                           cache_dir=args.public_cache_dir,
+                                           budget_bytes=args.public_cache_budget_bytes)
+                except (OSError, ValueError, KeyError) as e:
+                    print(f"lane D public mirror config refused: {e}", file=sys.stderr)
+                    return 2
             reply = serve_public(sys.stdin.buffer.read(), cache_dir=args.cache_dir,
                                  budget_bytes=args.budget_bytes, device=args.device,
-                                 public_root=args.public_root, chain_toml=args.chain_toml)
+                                 public_root=args.public_root, chain_toml=args.chain_toml,
+                                 mirror=mirror)
         else:
             reply = serve_forecast(sys.stdin.buffer.read(), cache_dir=args.cache_dir,
                                    budget_bytes=args.budget_bytes, device=args.device,

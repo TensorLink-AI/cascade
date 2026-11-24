@@ -10,3 +10,6 @@ deploy/laned/cascade-laned-pool-d.timer
 cascade/laned/cli.py
 # docs/OPERATOR.md: ONLY the "Elastic lane D hosts" section.
 docs/OPERATOR.md
+# provision/core.py: ONLY LaunchSpec.volumes and LiumProvider.launch's
+# `--volume id:<HUID>` (owner 2026-11-24, #894: the eval host's Lium volume).
+cascade/provision/core.py
