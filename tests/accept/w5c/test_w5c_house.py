@@ -90,28 +90,25 @@ def _cohort_of(report, dg) -> dict:
     return c
 
 
-def test_house_change3_copy_of_the_house_ties_and_loses(tmp_path):
+def test_house_change3_retired_a_copy_of_the_house_beating_king_d_crowns(tmp_path):
+    """DEC-CA-0076 (owner 2026-11-24, laned:tests-correction; was change 3:
+    a copy of the current house ties the house and loses): after the first
+    miner crown the house is no bar, so Y — the sharp house's forecasts —
+    beats KING_D = K1 (fair) and crowns."""
     s, state, k1, h1, y, recs = _duel(tmp_path, "sharp", None)
     v = verdict_of(s.report, y["digest"])
-    assert v is not None, "Y was not judged"
-    assert v["king_digest"] == k1["digest"], "Y must be judged against KING_D"
-    rec = state["entries"][y["digest"]]
-    assert (rec["status"], rec["reason"]) == ("lost", "lost_duel"), \
-        "a copy of the current house cleared: the house must rank first on ties"
-    assert v["cleared"] is False and v["outcome"] == "lost"
-    assert state["king"]["digest"] == k1["digest"]
-
-
-def test_house_change3_challenger_short_of_d_margin_vs_house_loses(tmp_path):
+    assert v is not None and v["king_digest"] == k1["digest"]
+    assert v["cleared"] is True and "house" not in v, v
+    assert s.report["crowned"] == y["digest"] and state["king"]["digest"] == y["digest"]
+def test_house_change3_retired_beating_king_d_alone_is_enough(tmp_path):
+    """DEC-CA-0076 (laned:tests-correction; was: short of d_margin against
+    the house loses): Y (good) beats KING_D = K1 (fair) under a sharp house
+    and crowns."""
     s, state, k1, h1, y, _ = _duel(tmp_path, "sharp", "good")
     v = verdict_of(s.report, y["digest"])
     assert v is not None and v["king_digest"] == k1["digest"]
-    rec = state["entries"][y["digest"]]
-    assert (rec["status"], rec["reason"]) == ("lost", "lost_duel"), \
-        "Y beat KING_D but not the current house by d_margin, and still cleared"
-    assert v["cleared"] is False
-
-
+    assert v["cleared"] is True, v
+    assert state["entries"][y["digest"]]["status"] == "crowned"
 def test_house_change3_control_beating_king_and_a_weak_house_clears(tmp_path):
     s, state, k1, h1, y, _ = _duel(tmp_path, "bad", "good")
     v = verdict_of(s.report, y["digest"])
@@ -130,11 +127,13 @@ def test_house_change3_challenger_clearing_king_and_house_clears(tmp_path):
     assert s.report["crowned"] == y["digest"] and state["king"]["digest"] == y["digest"]
 
 
-def test_house_change3_house_is_scored_on_the_cohorts_set(tmp_path):
+def test_house_change3_retired_the_house_is_not_scored(tmp_path):
+    """DEC-CA-0076 (laned:tests-correction; was: the house is scored on the
+    cohort's set as the second bar): only KING_D and the members are."""
     s, _, k1, h1, y, recs = _duel(tmp_path, "sharp", None)
     cohort = _cohort_of(s.report, y["digest"])
     shared = set(cohort["window_ids"])
     assert shared == set(wids(recs))
     assert rows_of(s.report, k1["digest"]) == shared
-    assert rows_of(s.report, h1["digest"]) == shared, \
-        "the house was not scored on the same set as the cohort"
+    assert not rows_of(s.report, h1["digest"]), "the house was scored after a miner crown"
+    assert "house_digest" not in cohort
