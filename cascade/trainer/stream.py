@@ -127,7 +127,8 @@ def _inprocess_stream(
         cfg, extra_series_check=corr_enforce_gate(cfg)
     )
     gen = _load_generator(repo, int(seed), interface_version=cfg.interface_version,
-                          real_corpus_dir=cfg.real_corpus_dir)
+                          real_corpus_dir=cfg.real_corpus_dir,
+                          curriculum_stage=getattr(cfg, "curriculum_stage", ""))
     for i, item in enumerate(gen.generate(n_upper)):
         yield validator.process(item, i)
 
@@ -300,14 +301,24 @@ class _ShardStream(RoundStream):
 
     def __init__(self, corpus_dir: Path | str, token_budget: int, *,
                  budget_denomination: str = "points", epochs: int = 0, eager_accounting=False,
-                 channel_bounds: tuple[int, int] | None = None, accepted_fields: tuple[str, ...] = ()) -> None:
-        from ..generation.shards import read_index, verify_shards
+                 channel_bounds: tuple[int, int] | None = None, accepted_fields: tuple[str, ...] = (),
+                 curriculum: tuple = ()) -> None:
+        from ..generation.shards import ShardError, read_index, verify_shards
 
         # A missing or corrupt shard is an infrastructure fault (the tier or
         # the transfer), never the miner's: ShardError is deliberately NOT a
         # CorpusError, so the worker exits as infra and the leg requeues.
         self._dir = Path(corpus_dir)
-        verify_shards(self._dir, read_index(self._dir))
+        index = read_index(self._dir)
+        verify_shards(self._dir, index)
+        # WB27 (plan rev6.21): a lane B curriculum leg reads its stage corpora
+        # in order, stage i to its share of the budget; the merged index must
+        # name exactly the contract's stages (the trainer built it)
+        self._curriculum = tuple((str(n), int(h)) for n, h in (curriculum or ()))
+        got = tuple((str(n), int(h)) for n, h in (index.get("curriculum") or ()))
+        if got != self._curriculum:
+            raise ShardError(f"corpus index curriculum {list(got)} is not the leg contract's "
+                             f"{list(self._curriculum)}")
         self._budget = int(token_budget)
         self._denom = budget_denomination
         self._passes = max(1, int(epochs or 0))
@@ -319,12 +330,26 @@ class _ShardStream(RoundStream):
         self._points = 0
 
     def series(self) -> Iterator[np.ndarray]:
+        if not self._curriculum:
+            yield from self._series(None, self._budget)
+            return
+        from ..shared.lane_b_levers import curriculum_points
+
+        # stage i stops at the cumulative budget of stages 0..i
+        cap = 0
+        for i, pts in enumerate(curriculum_points(self._budget, self._curriculum)):
+            cap += pts
+            yield from self._series(i, cap)
+
+    def _series(self, stage: int | None, cap: int) -> Iterator[np.ndarray]:
         from ..generation.shards import iter_corpus
 
-        total = 0
+        total = self._points
+        if total >= cap:
+            return
         for _ in range(self._passes):
             # shards were verified at open; a re-read pass skips the re-hash
-            for arr in iter_corpus(self._dir, verify=False):
+            for arr in iter_corpus(self._dir, verify=False, stage=stage):
                 if isinstance(arr, dict) and set(arr) - {"values", *self._accepted_fields}:
                     from ..generation.shards import ShardError
 
@@ -347,7 +372,7 @@ class _ShardStream(RoundStream):
                     self._n += 1
                     total += element_points(arr, self._denom)
                     self._points = total
-                if total >= self._budget:
+                if total >= cap:
                     return
 
     @property
@@ -537,6 +562,7 @@ def open_round_stream(
     corpus_epochs: int = 0,
     corpus_dir: Path | str | None = None,
     continuation_protocol: str = "",
+    curriculum: tuple = (),
 ) -> RoundStream:
     """Open the round's corpus stream for ``mode`` (see module docstring).
 
@@ -578,11 +604,13 @@ def open_round_stream(
             # operator misconfiguration, not a miner fault (not CorpusError)
             raise ValueError(
                 f"corpus_mode='shards' needs a corpus_dir (or ${CORPUS_DIR_ENV})")
-        return _ShardStream(where, token_budget,
+        return _ShardStream(where, token_budget, curriculum=tuple(curriculum or ()),
                             budget_denomination=budget_denomination, epochs=epochs,
                             eager_accounting=continuation_protocol == "cascade-continuation/1",
                             channel_bounds=(cfg.min_channels, cfg.max_channels) if cfg is not None else None,
                             accepted_fields=tuple(cfg.accepted_fields) if cfg is not None else ())
+    if curriculum:
+        raise CorpusError("a lane B curriculum needs corpus_mode='shards'")
     if epochs and mode != "cache_reuse":
         raise CorpusError("corpus_epochs requires corpus_mode='cache_reuse' or 'shards'")
     if n_mix > 1:

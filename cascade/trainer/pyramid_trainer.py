@@ -197,6 +197,49 @@ def lane_b_schedule_factor(step, total_steps):
     return step / warmup if step < warmup else 1.0
 
 
+def lane_b_lever_terms(contract, expert_selection, no_cooldown, ema_sigmas, ema_eval):
+    """``(lr_scale, ema_sigmas, ema_eval)`` of a leg from its contract's lane B
+    lever terms (WB27, plan rev6.21): ``lane_b_lr_scale`` (1.0 = none)
+    multiplies every optimizer group's base LR; on a lane B EMA /
+    no-cooldown leg ``power_ema_sigma_rels = (s,)`` with ``power_ema_eval =
+    0`` is the miner's ONE EMA width (owner 2026-11-24: only it is computed,
+    scored and merged; code bounds 0.01-0.30); ``()`` / ``-1`` keep the
+    image's EMAs (``ema_sigmas`` / ``ema_eval`` as passed). Refused on a lane
+    A leg, off the EMA schedule, or out of bounds. Pure."""
+    lr_scale = float(getattr(contract, "lane_b_lr_scale", 1.0))
+    chosen = tuple(float(x) for x in (getattr(contract, "power_ema_sigma_rels", ()) or ()))
+    pick = int(getattr(contract, "power_ema_eval", -1))
+    if expert_selection is None and (lr_scale != 1.0 or chosen or pick != -1):
+        raise ValueError("pyramid recipe: lane_b_lr_scale / power_ema_sigma_rels are lane B "
+                         "leg levers (need an expert selection)")
+    if not 0.25 <= lr_scale <= 4.0:
+        raise ValueError(f"pyramid recipe: lane_b_lr_scale {lr_scale} outside [0.25, 4]")
+    if not chosen and pick == -1:
+        return lr_scale, tuple(ema_sigmas), ema_eval
+    if not no_cooldown:
+        raise ValueError("pyramid recipe: a chosen EMA needs the lane B EMA schedule")
+    if len(chosen) != 1 or pick != 0 or not 0.01 <= chosen[0] <= 0.30:
+        raise ValueError(f"pyramid recipe: the lane B EMA choice must be one width in "
+                         f"[0.01, 0.30] with power_ema_eval 0; got {chosen!r}, {pick}")
+    return lr_scale, chosen, 0
+
+
+def lane_b_leg_record(step, steps, tokens, duration, max_train_seconds, token_budget=None):
+    """owner 2026-11-24 (rev6.21): a lane B limits leg's record — the steps
+    and tokens it trained and the limit that stopped it: ``"steps"`` (its
+    token limit / steps cap), ``"tokens"`` (the point budget), ``"hours"`` (its hour limit: a normal stop,
+    not a failure) or ``"corpus"`` (the corpus ran out first). Pure."""
+    if int(step) >= int(steps):
+        stop = "steps"
+    elif token_budget is not None and int(tokens) >= int(token_budget):
+        stop = "tokens"
+    elif float(duration) >= float(max_train_seconds):
+        stop = "hours"
+    else:
+        stop = "corpus"
+    return {"steps": int(step), "tokens": int(tokens), "stop": stop}
+
+
 def power_ema_state(emas):
     """Every EMA's shadows and step counter as one flat tensor dict."""
     flat = {}
@@ -205,7 +248,7 @@ def power_ema_state(emas):
     return flat
 
 
-def save_checkpoint(out, state, cfg, contract, *, power_ema=None):
+def save_checkpoint(out, state, cfg, contract, *, power_ema=None, lane_b_leg=None):
     import json
 
     from .ckpt_digest import save_tensors_hashed
@@ -219,6 +262,10 @@ def save_checkpoint(out, state, cfg, contract, *, power_ema=None):
     if power_ema is not None:
         # only on EMA-scored legs; a raw leg's config.json is byte-identical
         meta[POWER_EMA_MARKER] = power_ema
+    if lane_b_leg is not None:
+        # owner 2026-11-24: only on a lane B limits leg (what it trained and
+        # the limit that stopped it); every other config.json is unchanged
+        meta["lane_b_leg"] = lane_b_leg
     (out / "config.json").write_text(json.dumps(meta, sort_keys=True))
     (out / "model.py").write_bytes(Path(__file__).with_name("pyramid_model.py").read_bytes())
     (out / "forecast_wrapper.py").write_bytes(Path(__file__).with_name("pyramid_wrapper.py").read_bytes())
@@ -243,11 +290,21 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
         muon_row_beta2=0.999, adamw_beta1=0.91, adamw_beta2=0.972,
         adamw_lr_scale=0.2, mup_lr_exponent=1.42, umup_base_d_model=512,
         warm_lr_scale=1.0)
+    if expert_selection is not None:
+        # WB27: a lane B leg may carry its ONE chosen EMA width; checked by
+        # lane_b_lever_terms below (lane A keeps power_ema_sigma_rels=())
+        expected.pop("power_ema_sigma_rels")
     for name, value in expected.items():
         if getattr(contract, name) != value:
             raise ValueError(f"pyramid recipe requires {name}={value!r}")
     no_cooldown = lane_b_ema_leg(contract.lr_schedule, expert_selection)
     ema_sigmas, ema_eval = power_ema_settings()
+    # WB27 (plan rev6.21): the miner's lane B levers (1.0 / -1 on every other leg)
+    lever_lr_scale, ema_sigmas, ema_eval = lane_b_lever_terms(
+        contract, expert_selection, no_cooldown, ema_sigmas, ema_eval)
+    stop_record = bool(getattr(contract, "lane_b_stop_record", False))
+    if stop_record and expert_selection is None:
+        raise ValueError("pyramid recipe: lane_b_stop_record is a lane B leg term")
     if no_cooldown and not ema_sigmas:
         raise ValueError("the lane B EMA schedule needs the image's power EMA "
                          "(POWER_EMA_SIGMA_RELS is empty)")
@@ -303,6 +360,14 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
         for group in optimizer.adamw.param_groups:
             if any(id(p) in router_ids for p in group["params"]):
                 group["base_lr"] *= router_lr_scale(contract)
+    if lever_lr_scale != 1.0:
+        # WB27: the lane B leg's lr_scale on every group (NorMuon and AdamW)
+        seen = set()
+        for group in [*optimizer.param_groups,
+                      *(optimizer.adamw.param_groups if optimizer.adamw else [])]:
+            if id(group) not in seen:
+                seen.add(id(group))
+                group["base_lr"] *= lever_lr_scale
     bias_scale = route_bias_scale(contract)
     resumed_optimizer = False
     if warm_start_dir is not None and slices is None:
@@ -518,7 +583,9 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
         {"sigma_rels": list(ema_sigmas), "scored_sigma_rel": ema_sigmas[ema_eval],
          # plan rev6.20: the leg's schedule, the record settlement checks
          **({"schedule": contract.lr_schedule} if no_cooldown else {})}
-        if ema_scored else None))
+        if ema_scored else None),
+        lane_b_leg=(lane_b_leg_record(step, steps, tokens, duration, contract.max_train_seconds,
+                                      token_budget) if stop_record else None))
     from .ckpt_digest import save_tensors_hashed
 
     # comparison extras, never scored (validators load only weights.safetensors);

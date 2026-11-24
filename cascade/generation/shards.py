@@ -374,15 +374,18 @@ def _child_iter(corpus_dir: Path, child: dict, urls: dict[str, str]) -> Iterator
         ex.shutdown(wait=False, cancel_futures=True)
 
 
-def iter_corpus(corpus_dir: Path | str, *, verify: bool = True) -> Iterator[np.ndarray]:
+def iter_corpus(corpus_dir: Path | str, *, verify: bool = True,
+                stage: int | None = None) -> Iterator[np.ndarray]:
     """Yield the corpus in training order: round-robin over children, one
-    series each, a child dropping out once exhausted."""
+    series each, a child dropping out once exhausted. ``stage`` (WB27, a
+    merged curriculum index) restricts it to the children of that stage."""
     d = Path(corpus_dir)
     idx = read_index(d)
     if verify:
         verify_shards(d, idx)
     urls = read_urls(d)
-    live = [_child_iter(d, c, urls) for c in sorted(idx["children"], key=lambda c: c["index"])]
+    kids = [c for c in idx["children"] if stage is None or c.get("stage") == stage]
+    live = [_child_iter(d, c, urls) for c in sorted(kids, key=lambda c: c["index"])]
     try:
         while live:
             nxt = []
@@ -397,6 +400,40 @@ def iter_corpus(corpus_dir: Path | str, *, verify: bool = True) -> Iterator[np.n
         # Close every child if a sibling fails or a training budget stops early.
         for it in live:
             it.close()
+
+
+def merge_curriculum_index(indexes: list[dict], curriculum) -> tuple[dict, dict[str, str]]:
+    """WB27 (plan rev6.21): one pod index of a lane B curriculum leg from the
+    stage corpora's indexes, in stage order. Child ``j`` of stage ``i`` keeps
+    its shards (renamed ``s<i>-<name>``, so stages never collide), is
+    re-indexed ``i * 1000 + j`` and tagged ``"stage": i``; the index records
+    ``"curriculum": [[name, hundredths], ...]``, which the pod checks against
+    its contract. Returns ``(index, {new shard name: old shard name})``."""
+    stages = [[str(n), int(h)] for n, h in curriculum]
+    if len(indexes) != len(stages) or len(stages) < 2:
+        raise ShardError("a curriculum index needs one corpus per stage (>= 2)")
+    children: list[dict] = []
+    renames: dict[str, str] = {}
+    schemas = set()
+    for i, idx in enumerate(indexes):
+        schemas.add(idx.get("schema", SCHEMA))
+        for j, c in enumerate(sorted(idx["children"], key=lambda c: c["index"])):
+            if j >= 1000:
+                raise ShardError("a curriculum stage has more than 1000 children")
+            shards = []
+            for sh in c["shards"]:
+                new = f"s{i}-{sh['name']}"
+                renames[new] = sh["name"]
+                shards.append({**sh, "name": new})
+            children.append({**c, "index": i * 1000 + j, "stage": i, "shards": shards})
+    if len(schemas) != 1:
+        raise ShardError(f"curriculum stage corpora disagree on the shard schema {sorted(schemas)}")
+    merged = {"schema": schemas.pop(), "curriculum": stages, "children": children,
+              "stage_digests": [str(x.get("corpus_digest", "")) for x in indexes],
+              "corpus_digest": "", "n_series": sum(int(x.get("n_series", 0) or 0) for x in indexes),
+              "points": sum(int(x.get("points", 0) or 0) for x in indexes),
+              "stored_bytes": sum(int(x.get("stored_bytes", 0) or 0) for x in indexes)}
+    return merged, renames
 
 
 def stream_digest(series: Iterable[np.ndarray]) -> tuple[str, int, int]:

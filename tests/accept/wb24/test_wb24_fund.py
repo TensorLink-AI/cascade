@@ -274,17 +274,18 @@ def test_target_suite_refused_locally(armed, target, tmp_path, cli_env, intake, 
     _no_key(run)
 
 
-# ── --train-hours (WB23 not built: refused locally) ─────────────────────────
+# ── --train-hours (WB23 built; rev6.21 owner 2026-11-24, tests-correction:
+# the flag is sent, off-grid hours are refused locally with the intake's code)
 
 
-def test_train_hours_refused_locally_until_wb23(tmp_path, cli_env, intake, capsys):  # noqa: F811
+def test_train_hours_off_grid_refused_locally(tmp_path, cli_env, intake, capsys):  # noqa: F811
     toml = h.write_toml(tmp_path / "chain.toml")
-    run = h.run_cli(capsys, h.fund_argv(intake.base, toml, "--train-hours", "2"))
+    run = h.run_cli(capsys, h.fund_argv(intake.base, toml, "--train-hours", "2.3"))
     assert run.rc == h.USAGE, f"exit {run.rc}, expected {h.USAGE}"
-    assert run.code() not in (None, "usage"), (
-        f"--train-hours must be a known flag refused with a typed code, got {run.code()!r}")
+    assert run.code() == "bad_train_hours", (
+        f"--train-hours off the 0.5 h grid must be refused bad_train_hours, got {run.code()!r}")
     assert "--train-hours" in run.err, "the refusal must name --train-hours"
-    assert intake.requests == [], "nothing may be sent while WB23 is unbuilt"
+    assert intake.requests == [], "nothing may be sent for a refused --train-hours"
     _no_key(run)
 
 

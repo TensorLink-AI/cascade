@@ -3226,7 +3226,9 @@ def _check_lane_b_weights(name: str, receipt: RoundReceipt, cfg: ChainConfig,
 
 
 # "scored_weights": plan rev6.20 ([lane_b] ema_no_cooldown_from_block)
-LANE_B_STAGES = ("stale", "selection", "merge", "verdict", "targets", "scored_weights")
+# "levers": WB27, plan rev6.21 (the miner's lane B leg levers)
+LANE_B_STAGES = ("stale", "selection", "merge", "verdict", "targets", "scored_weights",
+                 "levers")
 
 
 def _lane_b_row_verdict(r: dict, lb, slots: tuple[str, ...]) -> str | None:

@@ -380,6 +380,11 @@ class _GenerationMixin:
         :class:`~cascade.generation.stage.GenerationInfraError` (requeue)."""
         if getattr(contract, "corpus_mode", "") != "shards":
             return None
+        if getattr(contract, "curriculum", ()):
+            # WB27 (plan rev6.21): one corpus per curriculum stage, one merged
+            # pod index read stage by stage (never the lane A corpus key)
+            return self._curriculum_leg_corpus(gen, seeds, tuple(contract.curriculum),
+                                               era_index=era_index)
         # One corpus per leg: a rent that falls back (operator lane, operator
         # rent) reuses it instead of repeating the generation window. Cache
         # the corpus metadata, not the expiring download links: retries can
@@ -406,6 +411,42 @@ class _GenerationMixin:
         finally:
             _GenerationMixin._want_leg_corpus(self, key, -1)
         return self._generation_stage().pod_files(result)
+
+    def _curriculum_leg_corpus(self, gen, seeds, curriculum: tuple, *,
+                               era_index: int | None = None) -> dict[str, str]:
+        """WB27: the pod files of a lane B curriculum leg. Stage ``i`` is its
+        own CPU-tier corpus: round ``<leg round>-cur<i>``, seed
+        ``curriculum_stage_seed(generation_seed, i)``, the generator built
+        with ``curriculum_stage=<name>``. The pod gets ONE merged index (stage
+        tagged children, renamed shards) and the union of the links."""
+        import json
+
+        from ..generation.shards import INDEX_NAME, URLS_NAME, merge_curriculum_index
+        from ..generation.transfer import download_plan
+        from ..shared.lane_b_levers import curriculum_stage_seed
+
+        cache = self.__dict__.setdefault("_leg_corpus_cache", {})
+        locks = self.__dict__.setdefault("_leg_corpus_locks", {})
+        stage = self._generation_stage()
+        results = []
+        for i, (name, _h) in enumerate(curriculum):
+            seed = curriculum_stage_seed(int(seeds.generation_seed), i)
+            key = (gen.hotkey, str(seeds.base_seed), gen.ref, "curriculum", i, str(name))
+            with locks.setdefault(key, threading.Lock()):
+                if key not in cache:
+                    _GenerationMixin._cache_leg_corpus(cache, key, self._build_leg_corpus(
+                        gen, seeds, era_index, curriculum_stage=str(name),
+                        stage_index=i, stage_seed=seed))
+                results.append(cache[key])
+        merged, renames = merge_curriculum_index([r.index for r in results], curriculum)
+        urls: dict[str, str] = {}
+        for i, r in enumerate(results):
+            plan = download_plan(stage.store, r.base, r.index)
+            for new, old in renames.items():
+                if new.startswith(f"s{i}-") and old in plan:
+                    urls[new] = plan[old]
+        return {INDEX_NAME: json.dumps(merged, sort_keys=True),
+                URLS_NAME: json.dumps(urls, sort_keys=True)}
 
     @staticmethod
     def _cache_leg_corpus(cache: dict, key, result) -> None:
@@ -471,7 +512,8 @@ class _GenerationMixin:
             return False
 
     def _build_leg_corpus(self, gen, seeds, era_index: int | None, *,
-                          background: bool = False, cancel=None) -> StageResult:
+                          background: bool = False, cancel=None, curriculum_stage: str = "",
+                          stage_index: int = 0, stage_seed: int | None = None) -> StageResult:
         from ..generation.stage import GenerationInfraError
         from ..shared.hippius import fetch_from_hub
 
@@ -479,6 +521,9 @@ class _GenerationMixin:
         # its own fetch (never the first ref's cached tree), its own dataset
         # prefix and its own VM.
         round_id = _GenerationMixin._leg_round_id(gen, seeds)
+        if curriculum_stage:
+            # WB27: a curriculum stage is its own corpus identity
+            round_id = f"{round_id}-cur{int(stage_index)}"
         repo = Path(self.work_root) / "_generation" / f"{gen.hotkey[:16]}-{round_id}"
         try:
             fetch_from_hub(gen.ref, repo, self.hub())
@@ -496,7 +541,9 @@ class _GenerationMixin:
             stage = self._generation_stage()
             return stage.generate(
                 round_id=round_id, hotkey=gen.hotkey, uid=gen.uid, era=era_index,
-                gen_ref=gen.ref, repo_dir=repo, seed=int(seeds.generation_seed),
+                gen_ref=gen.ref, repo_dir=repo,
+                seed=int(seeds.generation_seed if stage_seed is None else stage_seed),
+                **({"curriculum_stage": curriculum_stage} if curriculum_stage else {}),
                 **({"priority": True,
                     "min_channels": self.cfg.for_king(gen.ref).generator.min_channels}
                    if getattr(self.__dict__.get("_leg_local_obj"), "funded_is_king", False)

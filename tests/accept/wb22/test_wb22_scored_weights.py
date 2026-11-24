@@ -62,7 +62,9 @@ def test_scored_weights_round_trips_and_is_dropped_when_raw():
     assert load_expert_manifest(raw.to_json()).entries[0].scored_weights == ""
 
 
-@pytest.mark.parametrize("bad", ["raw", "ema005", "EMA010", None])
+# rev6.21 (owner 2026-11-24; tests-correction): "ema005" etc. are the miner's
+# EMA choices (WB27, widths 0.01-0.30) — valid labels now; "ema999" stays unknown
+@pytest.mark.parametrize("bad", ["raw", "ema999", "EMA010", None])
 def test_scored_weights_refuses_unknown_labels(bad):
     _has_field()
     with pytest.raises(ValueError):
@@ -88,7 +90,9 @@ def test_leg_scored_weights_reads_the_checkpoint_marker(tmp_path):
     # an EMA scored under any other rule never matches an expected value
     assert read(_ckpt(tmp_path / "w_ema", {"sigma_rels": [0.05, 0.10],
                                             "scored_sigma_rel": 0.10})) == "?"
-    assert read(_ckpt(tmp_path / "s005", {**MARKER, "scored_sigma_rel": 0.05})) == "?"
+    # rev6.21 (WB27; tests-correction): the miner's EMA choice 0.05
+    assert read(_ckpt(tmp_path / "s005", {**MARKER, "scored_sigma_rel": 0.05})) == "ema005"
+    assert read(_ckpt(tmp_path / "s050", {**MARKER, "scored_sigma_rel": 0.50})) == "?"
 
 
 def test_dispatch_paths_apply_the_leg_contract_rule():

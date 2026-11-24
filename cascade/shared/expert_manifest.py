@@ -74,16 +74,32 @@ class ExpertEntry:
     train_hours: float = 0.0
     leg_steps: int = 0
     leg_guard_seconds: int = 0
+    # WB27 (plan rev6.21): the miner-chosen levers the leg trained (canonical
+    # non-default values, ``lane_b_levers.LegLevers.as_dict``); {} = every
+    # default — dropped from the canonical body, so an entry without levers
+    # keeps its bytes. Judges re-check them (``check_entry_levers``).
+    levers: dict = field(default_factory=dict)
+    # owner 2026-11-24 (rev6.21) limits legs: the token limit (0 = none), an
+    # own-risk GPU (False; True dropped), and what the leg actually trained
+    # (steps, tokens, the limit that stopped it: "steps" | "hours" |
+    # "corpus"), read from the leg checkpoint — judges re-derive from these.
+    # Each is dropped from the canonical body at its default.
+    train_tokens: int = 0
+    gpu_measured: bool = True
+    trained_steps: int = 0
+    trained_tokens: int = 0
+    stop: str = ""
 
     def __post_init__(self) -> None:
-        from .config.lane_b import LANE_B_SCORED_WEIGHTS
+        from .config.lane_b import LANE_B_SCORED_WEIGHTS, lane_b_scored_label_ok
 
-        if self.scored_weights not in LANE_B_SCORED_WEIGHTS:
+        if not lane_b_scored_label_ok(self.scored_weights):
             raise ValueError(f"expert entry scored_weights must be one of "
                              f"{LANE_B_SCORED_WEIGHTS}; got {self.scored_weights!r}")
         if isinstance(self.gpu_n, bool) or not isinstance(self.gpu_n, int) or self.gpu_n < 0:
             raise ValueError(f"expert entry gpu_n must be an int >= 0; got {self.gpu_n!r}")
-        for name in ("leg_steps", "leg_guard_seconds"):
+        for name in ("leg_steps", "leg_guard_seconds", "train_tokens", "trained_steps",
+                     "trained_tokens"):
             v = getattr(self, name)
             if isinstance(v, bool) or not isinstance(v, int) or v < 0:
                 raise ValueError(f"expert entry {name} must be an int >= 0; got {v!r}")
@@ -93,6 +109,9 @@ class ExpertEntry:
             raise ValueError(f"expert entry train_hours must be a finite number >= 0; "
                              f"got {th!r}")
         object.__setattr__(self, "train_hours", float(th))
+        if not isinstance(self.levers, dict):
+            raise ValueError(f"expert entry levers must be an object; got {self.levers!r}")
+        object.__setattr__(self, "levers", json.loads(json.dumps(self.levers, sort_keys=True)))
         for name in ("selection", "exclude"):
             object.__setattr__(self, name, {int(k): sorted(int(x) for x in v)
                                             for k, v in sorted(getattr(self, name).items())})
@@ -140,6 +159,13 @@ class ExpertManifest:
             for k in ("train_hours", "leg_steps", "leg_guard_seconds"):
                 if not e.get(k):
                     e.pop(k, None)            # WB23: no leg length = today's bytes
+            if not e.get("levers"):
+                e.pop("levers", None)         # WB27: every lever default = today's bytes
+            for k in ("train_tokens", "trained_steps", "trained_tokens", "stop"):
+                if not e.get(k):
+                    e.pop(k, None)            # limits legs only
+            if e.get("gpu_measured", True) is True:
+                e.pop("gpu_measured", None)   # a measured GPU = today's bytes
         return json.dumps(d, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
     def digest(self) -> str:

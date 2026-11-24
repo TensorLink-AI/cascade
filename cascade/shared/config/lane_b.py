@@ -42,10 +42,17 @@ LANE_B_TRACK_DEFAULTS: dict[str, object] = {
     "sentinel_target_rule": "defer",
     "sentinel_max_defer_eras": 4,
     "funded_pod_skus": (),             # loader: the same file's [round] funded_pod_skus
-    "max_leg_hours": 6.0,
-    "max_leg_seconds": 27_000,         # 6 h x 1.25
+    # owner 2026-11-24 (rev6.21): up to 12 h legs (lane B is not rolled out:
+    # the default lane B behaviour, no activation block)
+    "max_leg_hours": 12.0,
+    "max_leg_seconds": 54_000,         # 12 h x 1.25
     "guard_factor": 1.25,
     "ema_no_cooldown_from_block": 0,   # 0 = never (rev6.20; loader: era boundary)
+    # plan rev6.21 (WB27): the bounds of the miner-chosen lr_scale lever
+    "lr_scale_min": 0.5,
+    "lr_scale_max": 2.0,
+    # owner 2026-11-24: the miner's EMA choice set (code bounds 0.01-0.30)
+    "ema_sigma_rels": (0.03, 0.05, 0.10, 0.15, 0.20),
 }
 
 # Lane B EMA, no cooldown (plan rev6.20, owner 2026-11-24: "let's just do EMA,
@@ -60,7 +67,32 @@ LANE_B_EMA_SCHEDULE = "warmup_constant_ema"
 LANE_B_EMA_SIGMA_REL = 0.10
 LANE_B_SCORED_EMA = "ema010"
 # "" = the raw cooled endpoint (W-EMA; dropped from the manifest body)
-LANE_B_SCORED_WEIGHTS = ("", LANE_B_SCORED_EMA)
+# plan rev6.21 (WB27, owner 2026-11-24): the miner chooses the scored width
+# from ``[lane_b] ema_sigma_rels`` (overlay-settable, code bounds below); only
+# that EMA is computed, scored and merged. Its label is ``ema<width x 100,
+# 3 digits>`` ("ema003", "ema005", "ema010", "ema015", "ema020").
+LANE_B_EMA_SIGMA_BOUNDS = (0.01, 0.30)
+LANE_B_EMA_SIGMA_RELS = (0.03, 0.05, 0.10, 0.15, 0.20)
+LANE_B_SCORED_EMA005 = "ema005"
+
+
+def lane_b_ema_label(sigma_rel: float) -> str:
+    """``scored_weights`` of a lane B EMA of width ``sigma_rel``."""
+    return f"ema{int(round(float(sigma_rel) * 100)):03d}"
+
+
+def lane_b_scored_label_ok(label) -> bool:
+    """``""`` (the raw endpoint) or the label of a width in the code bounds."""
+    if label == "":
+        return True
+    if not isinstance(label, str) or len(label) != 6 or not label.startswith("ema") \
+            or not label[3:].isdigit():
+        return False
+    lo, hi = LANE_B_EMA_SIGMA_BOUNDS
+    return lo <= int(label[3:]) / 100 <= hi + 1e-12
+
+
+LANE_B_SCORED_WEIGHTS = ("", LANE_B_SCORED_EMA, LANE_B_SCORED_EMA005)   # examples
 
 
 def lane_b_scored_weights(lane_b_cfg, block: int | None) -> str:
@@ -84,6 +116,15 @@ def lane_b_leg_schedule(lane_b_cfg, contract, block: int | None):
                          "needs a cascade_pyramid leg contract; got "
                          f"{getattr(contract, 'base_arch', '')!r}")
     return replace(contract, lr_schedule=LANE_B_EMA_SCHEDULE)
+
+
+def lane_b_leg_caps(lane_b_cfg, block: int | None = None) -> tuple[float, int]:
+    """``(max_leg_hours, max_leg_seconds)`` of a lane B leg (owner 2026-11-24:
+    12 h / 54000 s shipped; no activation block — lane B is not rolled out).
+    ``block`` is accepted for call-site symmetry and not consulted."""
+    del block
+    return (float(getattr(lane_b_cfg, "max_leg_hours", 12.0)),
+            int(getattr(lane_b_cfg, "max_leg_seconds", 54_000)))
 
 
 _HASHSET_RE = re.compile(r"sha256:[0-9a-f]{64}")
@@ -133,6 +174,25 @@ def _min_hits(v: object) -> tuple[tuple[str, int], ...]:
                          f"{{exact = <int>, normalised = <int>}}; got {v!r}")
     return tuple((k, _int(f"contamination_min_hits.{k}", v[k], lo=1))
                  for k in LANE_B_CONTAMINATION_HIT_KINDS)
+
+
+def _ema_set(v: object) -> tuple[float, ...]:
+    """owner 2026-11-24: the EMA choice set — unique widths in the code bounds
+    with at most 2 decimals, containing 0.10 (the default choice)."""
+    lo, hi = LANE_B_EMA_SIGMA_BOUNDS
+    if not isinstance(v, (list, tuple)) or not v:
+        raise ValueError(f"[lane_b] ema_sigma_rels must be a non-empty list; got {v!r}")
+    out = []
+    for x in v:
+        f = _float("ema_sigma_rels", x)
+        if not lo <= f <= hi or round(f * 100) != f * 100:
+            raise ValueError(f"[lane_b] ema_sigma_rels entries must be in [{lo}, {hi}] with "
+                             f"at most 2 decimals; got {x!r}")
+        out.append(f)
+    if len(set(out)) != len(out) or LANE_B_EMA_SIGMA_REL not in out:
+        raise ValueError(f"[lane_b] ema_sigma_rels must be unique and contain "
+                         f"{LANE_B_EMA_SIGMA_REL}; got {v!r}")
+    return tuple(out)
 
 
 def _skus(v: object) -> tuple[str, ...]:
@@ -193,6 +253,9 @@ def parse_lane_b_track(lb: dict, *,
         "ema_no_cooldown_from_block": _int(
             "ema_no_cooldown_from_block",
             lb.get("ema_no_cooldown_from_block", d["ema_no_cooldown_from_block"]), lo=0),
+        "lr_scale_min": _float("lr_scale_min", lb.get("lr_scale_min", d["lr_scale_min"])),
+        "lr_scale_max": _float("lr_scale_max", lb.get("lr_scale_max", d["lr_scale_max"])),
+        "ema_sigma_rels": _ema_set(lb.get("ema_sigma_rels", d["ema_sigma_rels"])),
     }
     if out["suite_targets"] and not out["contamination_hashset"]:
         raise ValueError("[lane_b] suite_targets = true needs contamination_hashset pinned "
@@ -215,6 +278,10 @@ def parse_lane_b_track(lb: dict, *,
     if mlh < _LEG_HOURS_STEP or steps != math.floor(steps):
         raise ValueError(f"[lane_b] max_leg_hours must be >= {_LEG_HOURS_STEP} on the "
                          f"{_LEG_HOURS_STEP} h grid; got {mlh}")
+    lr_lo, lr_hi = out["lr_scale_min"], out["lr_scale_max"]
+    if not 0.0 < lr_lo <= 1.0 <= lr_hi <= 4.0:
+        raise ValueError(f"[lane_b] lr_scale_min/lr_scale_max must satisfy "
+                         f"0 < min <= 1.0 <= max <= 4.0; got {lr_lo}, {lr_hi}")
     if out["guard_factor"] < 1.0:
         raise ValueError(f"[lane_b] guard_factor must be >= 1.0 (a factor below 1 truncates "
                          f"every leg); got {out['guard_factor']}")

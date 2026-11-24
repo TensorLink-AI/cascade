@@ -246,7 +246,8 @@ def lane_b_targets(header_value: str) -> tuple[str, ...]:
     return tuple(t.strip() for t in str(header_value or "").split(",") if t.strip())
 
 
-def lane_b_signed_ref(targets, ref: str, declared_rows=None, *, train_hours: str = "") -> str:
+def lane_b_signed_ref(targets, ref: str, declared_rows=None, *, train_hours: str = "",
+                      levers: str = "", train_tokens: str = "") -> str:
     """The ``ref`` field a lane-B request signs: ``"<t1>,<t2>|<ref>"`` with
     the targets EXACTLY as the request lists them — the signature binds the
     declared targets and the ref (and, through the canonical message, the key
@@ -260,7 +261,11 @@ def lane_b_signed_ref(targets, ref: str, declared_rows=None, *, train_hours: str
 
     With ``train_hours`` (WB23, the ``X-Lane-B-Train-Hours`` value as sent)
     ``"|hours=<value>"`` is appended after everything else, so the signature
-    binds the leg length; without it the field is unchanged."""
+    binds the leg length; without it the field is unchanged.
+
+    With ``levers`` (WB27, the ``X-Lane-B-Levers`` value as sent)
+    ``"|levers=<sha256 of it>"`` is appended last; without it the field is
+    unchanged."""
     from ..shared.lane_b_leg import train_hours_tag
     from .queue import lane_b_entry_ref
 
@@ -270,7 +275,24 @@ def lane_b_signed_ref(targets, ref: str, declared_rows=None, *, train_hours: str
 
         signed = f"{signed}|{_DECLARED_ROWS_SIGNED_TAG}{declared_rows_digest(declared_rows)}"
     tag = train_hours_tag(train_hours)
-    return f"{signed}|{tag}" if tag else signed
+    signed = f"{signed}|{tag}" if tag else signed
+    # owner 2026-11-24: the token limit as sent, after the hours
+    from ..shared.lane_b_leg import train_tokens_tag
+
+    ttag = train_tokens_tag(train_tokens)
+    signed = f"{signed}|{ttag}" if ttag else signed
+    from ..shared.lane_b_levers import levers_tag
+
+    ltag = levers_tag(levers)
+    return f"{signed}|{ltag}" if ltag else signed
+
+
+def _replace_catalog(cat, sku: str):
+    """``cat`` with ``sku`` added (an own-risk lane B type, owner 2026-11-24)."""
+    from dataclasses import replace as _r
+
+    skus = tuple(cat.skus or ())
+    return _r(cat, skus=skus if any(s.lower() == sku.lower() for s in skus) else (*skus, sku))
 
 
 def lane_c_signed_ref(target: str, ref: str) -> str:
@@ -1219,8 +1241,18 @@ class FundingIntake:
         # WB23: the fund's train_hours header, as sent, is bound by the signature
         hours_raw = ((headers.get(TRAIN_HOURS_HEADER) or "").strip()
                      if action == "lane-b-fund" else "")
+        # WB27: the fund's levers header, as sent, is bound by the signature
+        from ..shared.lane_b_levers import LEVERS_HEADER
+
+        levers_raw = ((headers.get(LEVERS_HEADER) or "").strip()
+                      if action == "lane-b-fund" else "")
+        from ..shared.lane_b_leg import TRAIN_TOKENS_HEADER
+
+        tokens_raw = ((headers.get(TRAIN_TOKENS_HEADER) or "").strip()
+                      if action == "lane-b-fund" else "")
         try:
-            signed = (lane_b_signed_ref(sent, ref, declared_rows, train_hours=hours_raw)
+            signed = (lane_b_signed_ref(sent, ref, declared_rows, train_hours=hours_raw,
+                                        levers=levers_raw, train_tokens=tokens_raw)
                       if ref else None)
         except ValueError as e:
             return 400, {"code": "bad_ref", "message": str(e)}
@@ -1279,7 +1311,13 @@ class FundingIntake:
             # WB22 (D42): lane B's own list; a type with no measured step rate
             # (WB19) is refused before anything is queued or vaulted (TB24)
             choice, segment, gpu_err = parse_gpu_headers(headers, lb_gpus.catalog)
-            if gpu_err is None:
+            own_risk = self._lane_b_own_risk_gpu(headers)
+            if own_risk:
+                # owner 2026-11-24: any GPU type at the miner's own risk when
+                # the leg has a token or hour limit
+                choice, segment, gpu_err = parse_gpu_headers(
+                    headers, _replace_catalog(lb_gpus.catalog, own_risk))
+            elif gpu_err is None:
                 gpu_err = lb_gpus.refusal(choice)
         if gpu_err is not None:
             return 400, gpu_err
@@ -1288,6 +1326,11 @@ class FundingIntake:
         length, length_err = self._lane_b_leg_length(headers, choice)
         if length_err is not None:
             return 400, length_err
+        # WB27 (plan rev6.21): the miner-chosen levers, refused with typed
+        # codes before anything is queued or vaulted (nothing charged)
+        levers, levers_err = self._lane_b_levers(headers, choice)
+        if levers_err is not None:
+            return 400, levers_err
         status, ctx = self._lane_b_request("lane-b-fund", headers, gpu_segment=segment)
         if status is not None:
             return status, ctx
@@ -1324,7 +1367,9 @@ class FundingIntake:
             receipt_kw = {"contamination": checked}
         outcome = self.lane_b_queue.add_lane_b(  # type: ignore[union-attr]
             hotkey, targets, ref, int(reveal_block), label=label, gpu_choice=choice,
-            declared_rows=ctx["declared_rows"], leg_length=length, **receipt_kw)
+            declared_rows=ctx["declared_rows"], leg_length=length,
+            levers=(levers.as_dict() if levers is not None and not levers.is_default
+                    else None), **receipt_kw)
         self.vault.insert(hotkey, api_key)
         rows = ctx["declared_rows"]
         log.info("lane-B fund %s: %s targets=%s (reveal_block=%d%s%s)", hotkey, outcome,
@@ -1340,6 +1385,8 @@ class FundingIntake:
                 rate = lb_gpus.rate(choice.gpu)
                 if rate is not None:
                     body["steps_per_s"] = float(rate.steps_per_s)
+            if levers is not None and not levers.is_default:
+                body["levers"] = levers.as_dict()     # WB27: what the leg will train
             if length is not None:
                 body.update(length.as_dict())
                 landing = self._lane_b_landing_estimate(length.guard_seconds)
@@ -1352,11 +1399,19 @@ class FundingIntake:
 
     def _lane_b_leg_length(self, headers, choice) -> tuple[object | None, dict | None]:
         """WB23: ``(LegLength | None, None)`` or ``(None, refusal)``. No
-        ``X-Lane-B-Train-Hours`` header is ``(None, None)``: today's leg."""
+        ``X-Lane-B-Train-Hours`` / ``X-Lane-B-Train-Tokens`` header is
+        ``(None, None)``: today's leg.
+
+        owner 2026-11-24 (rev6.21), the default lane B behaviour: hours up to 12, a token limit (``train_tokens``) and/or an hour limit
+        — the leg stops at whichever comes first — and any GPU type at the
+        miner's own risk (no WB19 rate: ``gpu_measured = False``, steps from
+        the limits, no refund if it OOMs, cannot boot or crashes). Hours only
+        on a measured type is WB23's leg, byte for byte."""
         from ..shared import lane_b_leg as lbl
 
         raw = (headers.get(lbl.TRAIN_HOURS_HEADER) or "").strip()
-        if not raw:
+        raw_t = (headers.get(lbl.TRAIN_TOKENS_HEADER) or "").strip()
+        if not raw and not raw_t:
             return None, None
         lb_gpus, cfg = self.lane_b_gpus, self.lane_b_cfg
         if lb_gpus is None or cfg is None:
@@ -1364,7 +1419,9 @@ class FundingIntake:
                           "message": f"this intake has no lane B GPU list wired — fund "
                                      f"without {lbl.TRAIN_HOURS_HEADER}"}
         try:
-            hours = lbl.parse_train_hours(raw, max_leg_hours=float(cfg.max_leg_hours))
+            hours = (lbl.parse_train_hours(raw, max_leg_hours=lbl.leg_caps(cfg)[0])
+                     if raw else None)
+            tokens = lbl.parse_train_tokens(raw_t) if raw_t else None
         except lbl.LegLengthError as e:
             return None, {"code": e.code, "message": e.message}
         if not getattr(choice, "chosen", False):
@@ -1377,21 +1434,96 @@ class FundingIntake:
                                      "GPU; a fallback type would train them at another rate — "
                                      "drop X-Gpu-Allow-Fallback"}
         rate = lb_gpus.rate(choice.gpu)
+        measured = lb_gpus.measured(choice.gpu)
         try:
-            if self.lane_b_contract is not None:
-                length = lbl.admit_leg_length(cfg, rate, hours, contract=self.lane_b_contract)
+            if tokens is None and measured:
+                if self.lane_b_contract is not None:
+                    length = lbl.admit_leg_length(cfg, rate, hours, contract=self.lane_b_contract)
+                else:
+                    length = lbl.LegLength(
+                        train_hours=hours,
+                        steps=lbl.leg_steps(hours, rate.steps_per_s, cap=10 ** 12),
+                        guard_seconds=lbl.leg_guard_seconds(
+                            hours, guard_factor=float(cfg.guard_factor),
+                            overhead_seconds=float(rate.overhead_seconds),
+                            max_leg_seconds=lbl.leg_caps(cfg)[1]))
             else:
-                length = lbl.LegLength(
-                    train_hours=hours,
-                    steps=lbl.leg_steps(hours, rate.steps_per_s, cap=10 ** 12),
-                    guard_seconds=lbl.leg_guard_seconds(
-                        hours, guard_factor=float(cfg.guard_factor),
-                        overhead_seconds=float(rate.overhead_seconds),
-                        max_leg_seconds=int(cfg.max_leg_seconds)))
+                if self.lane_b_contract is None:
+                    return None, {"code": lbl.UNAVAILABLE,
+                                  "message": "this intake has no lane B base contract wired"}
+                length = lbl.admit_leg_limits(cfg, rate, train_hours=hours, train_tokens=tokens,
+                                              contract=self.lane_b_contract)
+                if not measured:
+                    from dataclasses import replace as _replace
+
+                    length = _replace(length, gpu_measured=False)
+        except lbl.LegLengthError as e:
+            return None, {"code": e.code, "message": e.message}
         except (AttributeError, TypeError, ValueError) as e:
             return None, {"code": lbl.BAD_TRAIN_HOURS,
-                          "message": f"{raw} h on {choice.gpu} is not a trainable leg ({e})"}
+                          "message": f"{raw or raw_t} on {choice.gpu} is not a trainable leg ({e})"}
         return length, None
+
+    def _lane_b_own_risk_gpu(self, headers) -> str:
+        """owner 2026-11-24: the chosen GPU type when it may be rented at the
+        miner's own risk (not measured, or not in ``[lane_b] funded_pod_skus``):
+        a token or hour limit sent, a valid
+        layout SKU (``<n>x<model>``), no fallback; else ``""``."""
+        from ..funding.gpu_choice import GPU_FALLBACK_HEADER, GPU_HEADER
+        from ..shared import lane_b_leg as lbl
+
+        cfg, lb_gpus = self.lane_b_cfg, self.lane_b_gpus
+        gpu = str(headers.get(GPU_HEADER) or "").strip()
+        if not gpu or cfg is None or lb_gpus is None:
+            return ""
+        if not ((headers.get(lbl.TRAIN_TOKENS_HEADER) or "").strip()
+                or (headers.get(lbl.TRAIN_HOURS_HEADER) or "").strip()):
+            return ""
+        if str(headers.get(GPU_FALLBACK_HEADER) or "").strip().lower() in ("1", "true", "yes"):
+            return ""
+        if lb_gpus.rate(gpu) is not None:
+            return ""                             # measured: the WB22 path
+        from .providers import CREDENTIALS_HEADER
+
+        if (headers.get(CREDENTIALS_HEADER) or "").strip():
+            return ""                             # the own-risk rule is Lium only
+        try:
+            from ..provision.layout import layout_gpus
+
+            if layout_gpus(gpu) < 1:
+                return ""
+        except Exception:  # noqa: BLE001 — not a layout SKU: the catalog refuses it
+            return ""
+        return gpu
+
+    def _lane_b_levers(self, headers, choice) -> tuple[object | None, dict | None]:
+        """WB27: ``(LegLevers | None, None)`` or ``(None, refusal)``. No
+        ``X-Lane-B-Levers`` header is ``(None, None)``: every lever at its
+        default. A context above 4096 additionally needs the chosen GPU's
+        measured memory to fit (``context_length_unfit``) once trainable."""
+        from ..shared import lane_b_levers as lv
+
+        raw = (headers.get(lv.LEVERS_HEADER) or "").strip()
+        if not raw:
+            return None, None
+        cfg = self.lane_b_cfg
+        if cfg is None:
+            return None, {"code": lv.BAD_LEVERS,
+                          "message": f"this intake has no lane B config — fund without "
+                                     f"{lv.LEVERS_HEADER}"}
+        try:
+            levers = lv.parse_levers(raw, cfg)
+        except lv.LeversError as e:
+            return None, {"code": e.code, "message": e.message}
+        if levers is not None and levers.context_length != lv.DEFAULT_CONTEXT:
+            rate = None
+            if self.lane_b_gpus is not None and getattr(choice, "chosen", False):
+                rate = self.lane_b_gpus.rate(choice.gpu)
+            if rate is None or not lv.context_fits(rate, levers.context_length):
+                return None, {"code": lv.CONTEXT_UNFIT,
+                              "message": f"context_length {levers.context_length} does not fit "
+                                         "the chosen GPU's measured memory"}
+        return levers, None
 
     def _lane_b_landing_estimate(self, guard_seconds: int) -> dict | None:
         """WB23 (TB26): where a leg of that wall is expected to land; never

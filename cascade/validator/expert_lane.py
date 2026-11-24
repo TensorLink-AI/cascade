@@ -5,6 +5,8 @@ Per entry, in order — the first failure rejects the entry:
 
 1. ``stale``     the leg must be rebased onto THIS validator's current king
                  (``ExpertManifest.king_pointer`` == the king pointer it holds);
+1a. ``levers`` (WB27, plan rev6.21) recorded miner levers must re-validate
+                 against ``[lane_b]``;
 1b. ``scored_weights`` (plan rev6.20) the entry's recorded scored weights must
                  be what ``[lane_b] ema_no_cooldown_from_block`` gives at its
                  ``train_block`` ("ema010" from it, "" = raw before / unset);
@@ -183,7 +185,11 @@ def judge_entry(entry: ExpertEntry, *, manifest: ExpertManifest, king_pointer: s
 
         why = check_leg_record(train_hours=entry.train_hours, steps=entry.leg_steps,
                                guard_seconds=entry.leg_guard_seconds, lb_cfg=cfg,
-                               contract=contract)
+                               contract=contract, block=entry.train_block,
+                               train_tokens=entry.train_tokens,
+                               gpu_measured=entry.gpu_measured,
+                               trained_steps=entry.trained_steps,
+                               trained_tokens=entry.trained_tokens, stop=entry.stop)
         if why is not None:
             return ExpertJudgement(entry, False, "leg_length", why)
     declared = entry.declared
@@ -192,9 +198,18 @@ def judge_entry(entry: ExpertEntry, *, manifest: ExpertManifest, king_pointer: s
         return ExpertJudgement(entry, False, "targets",
                                f"declared targets {list(declared)} are not 1..max_domains_per_leg"
                                f" configured lane-B targets")
+    # WB27 (plan rev6.21): the miner's levers must re-validate against [lane_b]
+    if entry.levers:
+        from ..shared.lane_b_levers import check_entry_levers
+
+        why = check_entry_levers(entry.levers, lb_cfg=cfg, train_block=entry.train_block)
+        if why is not None:
+            return ExpertJudgement(entry, False, "levers",
+                                   f"recorded levers {entry.levers} refused: {why}")
     # plan rev6.20: the weights the leg scored (and that merge) are re-derived
-    # from its dispatch block and [lane_b] ema_no_cooldown_from_block
-    want = _scored_weights_rule(cfg, entry.train_block)
+    # from its dispatch block and [lane_b] ema_no_cooldown_from_block (WB27:
+    # and the entry's EMA choice)
+    want = _scored_weights_rule(cfg, entry.train_block, entry.levers)
     if entry.scored_weights != want:
         return ExpertJudgement(entry, False, "scored_weights",
                                f"entry scored {entry.scored_weights or 'raw'!r}, the rule at "
@@ -268,12 +283,17 @@ def judge_entry(entry: ExpertEntry, *, manifest: ExpertManifest, king_pointer: s
                            targets=tv)
 
 
-def _scored_weights_rule(cfg, block) -> str:
+def _scored_weights_rule(cfg, block, levers=None) -> str:
     """``scored_weights`` the rule expects at ``block`` (``""`` for a config
-    without the key: the raw cooled endpoint, today's judgement)."""
+    without the key: the raw cooled endpoint, today's judgement); WB27: an
+    entry's EMA choice 0.05 expects ``"ema005"``."""
     from ..shared.config.lane_b import lane_b_scored_weights
 
-    return lane_b_scored_weights(cfg, block)
+    if not levers:
+        return lane_b_scored_weights(cfg, block)
+    from ..shared.lane_b_levers import lane_b_scored_weights_for, levers_from_dict
+
+    return lane_b_scored_weights_for(cfg, block, levers_from_dict(dict(levers), cfg))
 
 
 def _targets(cfg) -> tuple[str, ...]:

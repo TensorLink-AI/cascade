@@ -305,6 +305,14 @@ class FundedEntry:
     train_hours: float = 0.0
     leg_steps: int = 0
     leg_guard_seconds: int = 0
+    # WB27 (plan rev6.21): the miner-chosen lane B leg levers of the fund
+    # (``X-Lane-B-Levers``, canonical non-default values; None = every
+    # default). Written only when set, like the leg length.
+    levers: dict | None = None
+    # owner 2026-11-24 (rev6.21): the token limit (0 = none) and whether the
+    # chosen GPU had a WB19 rate (False = at the miner's own risk)
+    train_tokens: int = 0
+    gpu_measured: bool = True
     # WB14 / LB2 lane B miner-declared expert rows: ``{MoE ordinal: sorted
     # expert indices}`` as parsed by
     # :func:`cascade.trainer.declared_rows.parse_declared_rows` at intake;
@@ -389,7 +397,8 @@ _ROWS_FIELD_DEFAULTS = {"declared_rows": None, "queued_declared_rows": None}
 _CONTAMINATION_FIELD_DEFAULTS = {"contamination": None, "queued_contamination": None}
 # WB23 leg length, likewise written only when set (an entry funded without
 # train_hours serialises exactly as before).
-_LEG_FIELD_DEFAULTS = {"train_hours": 0.0, "leg_steps": 0, "leg_guard_seconds": 0}
+_LEG_FIELD_DEFAULTS = {"train_hours": 0.0, "leg_steps": 0, "leg_guard_seconds": 0,
+                       "levers": None, "train_tokens": 0, "gpu_measured": True}
 
 
 def _receipt_copy(value) -> dict | None:
@@ -420,9 +429,12 @@ def _gpu_fields(choice) -> dict:
 def _leg_length_fields(length) -> dict:
     """``replace()`` kwargs for a fund's WB23 leg length (None = cleared)."""
     if length is None:
-        return {"train_hours": 0.0, "leg_steps": 0, "leg_guard_seconds": 0}
+        return {"train_hours": 0.0, "leg_steps": 0, "leg_guard_seconds": 0,
+                "train_tokens": 0, "gpu_measured": True}
     return {"train_hours": float(length.train_hours), "leg_steps": int(length.steps),
-            "leg_guard_seconds": int(length.guard_seconds)}
+            "leg_guard_seconds": int(length.guard_seconds),
+            "train_tokens": int(getattr(length, "train_tokens", 0) or 0),
+            "gpu_measured": bool(getattr(length, "gpu_measured", True))}
 
 
 LABEL_MAX_CHARS = 32
@@ -572,6 +584,10 @@ class FundedQueue:
                 train_hours=float(item.get("train_hours", 0.0) or 0.0),
                 leg_steps=int(item.get("leg_steps", 0) or 0),
                 leg_guard_seconds=int(item.get("leg_guard_seconds", 0) or 0),
+                levers=(dict(item["levers"]) if isinstance(item.get("levers"), dict)
+                        and item["levers"] else None),
+                train_tokens=int(item.get("train_tokens", 0) or 0),
+                gpu_measured=bool(item.get("gpu_measured", True)),
                 extra=extra,
             )
             entries[entry.hotkey] = entry
@@ -639,7 +655,8 @@ class FundedQueue:
 
     def add(self, hotkey: str, ref: str, reveal_block: int, *,
             label: str = "", gpu_choice=None, max_total_spend_usd=_KEEP,
-            declared_rows=_KEEP, contamination=_KEEP, leg_length=_KEEP) -> str:
+            declared_rows=_KEEP, contamination=_KEEP, leg_length=_KEEP,
+            levers=_KEEP) -> str:
         """Fund (or re-fund) a submission; returns the outcome for the caller.
 
         ``leg_length`` (WB23, lane B; a ``lane_b_leg.LegLength`` or None = no
@@ -677,6 +694,9 @@ class FundedQueue:
             "max_total_spend_usd": (float(max_total_spend_usd)
                                     if max_total_spend_usd is not None else None)})
         length = {} if leg_length is _KEEP else _leg_length_fields(leg_length)
+        if levers is not _KEEP:
+            # WB27: the levers follow the leg length's rule (latest fund wins)
+            length["levers"] = dict(levers) if levers else None
         keep_rows = declared_rows is _KEEP
         rows = {} if keep_rows else {"declared_rows": _rows_copy(declared_rows)}
         keep_receipt = contamination is _KEEP
@@ -1466,7 +1486,7 @@ class LaneBQueue(FundedQueue):
 
     def add_lane_b(self, hotkey: str, targets, ref: str, reveal_block: int, *,
                    label: str = "", gpu_choice=None, declared_rows=_KEEP,
-                   contamination=_KEEP, leg_length=None) -> str:
+                   contamination=_KEEP, leg_length=None, levers=None) -> str:
         """``declared_rows``: the parsed WB14 rows of this fund (None = none
         declared, ESFT picks); ``contamination``: the WB13 intake receipt
         (``_KEEP`` = unpinned, nothing recorded); ``leg_length``: the WB23
@@ -1474,7 +1494,8 @@ class LaneBQueue(FundedQueue):
         see :meth:`FundedQueue.add`."""
         return self.add(hotkey, lane_b_entry_ref(targets, ref), int(reveal_block), label=label,
                         gpu_choice=gpu_choice, declared_rows=declared_rows,
-                        contamination=contamination, leg_length=leg_length)
+                        contamination=contamination, leg_length=leg_length,
+                        levers=levers)
 
     def queued(self, *, now: float | None = None) -> list[FundedEntry]:
         """Startable entries, earliest reveal first: ``queued`` and not
@@ -1492,6 +1513,12 @@ class LaneBQueue(FundedQueue):
                 # WB23: the leg length the miner chose (steps fixed at the fund)
                 row.update(train_hours=float(e.train_hours), leg_steps=int(e.leg_steps),
                            leg_guard_seconds=int(e.leg_guard_seconds))
+            if e is not None and e.train_tokens:
+                row["train_tokens"] = int(e.train_tokens)
+            if e is not None and not e.gpu_measured:
+                row["gpu_measured"] = False      # own risk: no refund on a failure
+            if e is not None and e.levers:
+                row["levers"] = dict(e.levers)       # WB27: the funded levers
             try:
                 targets, row["ref"] = split_lane_b_ref(row["ref"])
                 row["targets"] = list(targets)
