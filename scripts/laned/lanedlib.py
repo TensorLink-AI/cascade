@@ -9,6 +9,7 @@ Stdlib only.
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import itertools
 import json
 import os
@@ -128,9 +129,57 @@ def check_json_evidence(text: str | None, wp: str) -> tuple[bool, str]:
         return False, f"evidence wp={data.get('wp')!r}, expected {wp!r}"
     if wp == "W3a" and w3a_nolock_path_verified(data):
         return True, "ok"
+    if wp == "WB19" and data.get("passed") is False:
+        why = wb19_partial_problem(data)
+        return (True, "ok (partial WB19 evidence, rev6.16)") if why is None else (False, why)
     if data.get("passed") is not True:
         return False, "evidence does not record passed: true"
     return True, "ok"
+
+
+_WB19_MISSING = re.compile(r"missing expert runs: \[(.*)\]")
+
+
+def wb19_partial_problem(data: dict) -> str | None:
+    """Partial WB19 evidence (owner 2026-11-23, plan rev6.16) records
+    ``passed: false`` by design. It is accepted only when ``coverage`` is
+    its sole failing check, that check's detail names the missing SKUs (a
+    non-empty list, none of which has a table row), and ``body_sha256``
+    matches the body. WB19's own ``test_evidence_*`` tests re-derive the
+    candidate list from the shipped chain.toml and OA8; this is the
+    tooling's shape check. None = accepted, else the refusal reason."""
+    checks = data.get("checks")
+    if not isinstance(checks, list) or not checks or not all(
+            isinstance(c, dict) and isinstance(c.get("name"), str)
+            and isinstance(c.get("passed"), bool) for c in checks):
+        return "partial WB19 evidence: checks malformed"
+    failing = [c for c in checks if not c["passed"]]
+    if [c["name"] for c in failing] != ["coverage"]:
+        return ("partial WB19 evidence: coverage must be the sole failing check (failing: "
+                + ", ".join(sorted(c["name"] for c in failing)) + ")")
+    m = _WB19_MISSING.search(str(failing[0].get("detail", "")))
+    missing = re.findall(r"'([^']+)'", m.group(1)) if m else []
+    if not missing:
+        return "partial WB19 evidence: the coverage detail names no missing SKU"
+    table = data.get("table")
+    rows = table.get("rows") if isinstance(table, dict) else None
+    if not isinstance(rows, dict) or not rows:
+        return "partial WB19 evidence: no measured rows"
+    measured = {str(k).lower() for k in rows}
+    named_measured = sorted(s for s in missing if s.lower() in measured)
+    if named_measured:
+        return (f"partial WB19 evidence: coverage names measured SKU(s) as missing: "
+                f"{named_measured}")
+    sha = data.get("body_sha256")
+    body = {k: v for k, v in data.items() if k != "body_sha256"}
+    try:
+        want = hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":"),
+                                         allow_nan=False).encode()).hexdigest()
+    except ValueError:
+        return "partial WB19 evidence: body is not canonical JSON"
+    if sha != want:
+        return "partial WB19 evidence: body_sha256 does not match the body"
+    return None
 
 
 def w3a_nolock_path_verified(data: dict) -> bool:

@@ -68,14 +68,14 @@ BENCH_ITEMS = 40
 
 def lane_d_cfg(**over):
     """The real W2 parse of an armed `[lane_d]` table with `over` applied
-    (floors lowered to 24 windows / 4 sources; 2 prior kings, decay 0.5)."""
+    (floors lowered to 24 windows / 4 sources; 2 prior kings, court_weights 80 / 15 / 5)."""
     from cascade.shared.config.lane_d import parse_lane_d
 
     raw = {"from_block": ARM_BLOCK, "share": 0.25, "takes_from": "lane_a",
            "remainder": "burn", "contexts": [4096, 8192, 16384], "horizon": HORIZON,
            "forward_margin_hours": MARGIN_H, "max_mirror_lag_hours": 6.0,
            "min_windows": 24, "min_clusters": 4, "bootstrap_B": 200,
-           "reward_prior_kings": 2, "king_decay": 0.5}
+           "reward_prior_kings": 2, "court_weights": [0.80, 0.15, 0.05]}
     return parse_lane_d({**raw, **over}, era_blocks_at=lambda _block: ERA)
 
 

@@ -1,0 +1,13 @@
+# TEMPLATE: hourly. A crowned king enters the index at its settlement; the
+# registry follows within the hour.
+
+[Unit]
+Description=cascade lane D published-weights registry refresh, hourly
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

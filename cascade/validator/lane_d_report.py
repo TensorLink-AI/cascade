@@ -469,6 +469,41 @@ def _check_below_armed(report: dict) -> None:
                                     "an armed variant is <= the declared context")
 
 
+CHANNEL_FIELDS = ("series_id", "n_channels_raw", "empty_channels", "n_channels",
+                  "channels", "channels_sha256")
+
+
+def _check_window_channels(report: dict) -> None:
+    """rev6.18 A4 (F2): a window carries all of :data:`CHANNEL_FIELDS` or
+    none; its dropped channels are distinct, ascending and inside
+    ``n_channels_raw``, and it scores at most the channels left."""
+    for i, w in enumerate(report["windows"]):
+        at = _join("windows", i)
+        have = [k for k in CHANNEL_FIELDS if k in w]
+        if not have:
+            continue
+        if len(have) != len(CHANNEL_FIELDS):
+            missing = next(k for k in CHANNEL_FIELDS if k not in w)
+            raise ReportSchemaError("missing_field", _join(at, missing),
+                                    "a multichannel window carries every channel field")
+        raw, empty = int(w["n_channels_raw"]), list(w["empty_channels"])
+        if empty != sorted(set(empty)) or any(not 0 <= int(c) < raw for c in empty):
+            raise ReportSchemaError("bad_value", _join(at, "empty_channels"),
+                                    "not distinct ascending channel indices below n_channels_raw")
+        if int(w["n_channels"]) > raw - len(empty):
+            raise ReportSchemaError("bad_value", _join(at, "n_channels"),
+                                    "more channels scored than are non-empty")
+        chans = [int(c) for c in w["channels"]]
+        if (len(chans) != int(w["n_channels"]) or chans != sorted(set(chans))
+                or any(not 0 <= c < raw or c in empty for c in chans)):
+            raise ReportSchemaError("bad_value", _join(at, "channels"),
+                                    "not n_channels distinct ascending non-empty channel indices")
+        body = json.dumps(chans, separators=(",", ":")).encode()
+        if hashlib.sha256(body).hexdigest() != w["channels_sha256"]:
+            raise ReportSchemaError("bad_value", _join(at, "channels_sha256"),
+                                    "not the sha256 of the channels list")
+
+
 def _check_windows_embargo(report: dict) -> None:
     """rev6.10 (a) / rev6.12 / W5j: each window's embargo record and draw cell
     agree with themselves, its id and the config echo."""
@@ -591,6 +626,7 @@ def _cross_field(report: dict) -> None:
     _check_below_armed(report)
     _check_judging_start(report)
     _check_windows_embargo(report)
+    _check_window_channels(report)
     _check_cohort_split(report)
     _check_subscores(report)
     _check_draw(report)

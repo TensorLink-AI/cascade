@@ -37,9 +37,11 @@ lazily, only when a checkpoint is scored or ingested.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import io
 import json
 import logging
+import re
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -49,6 +51,7 @@ import numpy as np
 from .lane_d_cache import CacheError, PrefetchCache, prefetch_grant
 
 log = logging.getLogger("cascade.eval.lane_d_forecasts")
+_HEX64 = re.compile(r"[0-9a-f]{64}")
 
 FORECAST_ERROR_CODES = (
     "checkpoint_unavailable",   # not cached and no grant, or the vault fetch failed
@@ -118,6 +121,15 @@ def _checkpoint(cache: PrefetchCache, digest: str, grant: Mapping | None, *, con
                                  f"{digest}: prefetch failed ({type(e).__name__}: {e})") from e
 
 
+def _scoring_lease(cache, digest):
+    """``cache.lease(digest)`` (W15 shared-root lease) for a well-formed
+    digest; a malformed one is left to :func:`_checkpoint` to refuse."""
+    lease = getattr(cache, "lease", None)
+    if lease is None or not isinstance(digest, str) or not _HEX64.fullmatch(digest):
+        return contextlib.nullcontext()
+    return lease(digest)
+
+
 def forecast_entry(cache: PrefetchCache, digest: str, windows: Sequence[Mapping], *,
                    context: int, horizon: int, contexts, grant: Mapping | None = None,
                    contract=None, expect=None, device: str = "cpu",
@@ -127,22 +139,27 @@ def forecast_entry(cache: PrefetchCache, digest: str, windows: Sequence[Mapping]
     ``context``; ``contexts`` is the armed ``[lane_d] contexts``. Raises
     :class:`LaneDForecastError` (see the module docstring)."""
     wins = list(windows)
-    ckpt = _checkpoint(cache, digest, grant, contract=contract, expect=expect)
-    scorer = _default_scorer() if forecast is None else forecast
-    try:
-        out = scorer(ckpt, [w["history"] for w in wins], context=context, horizon=horizon,
-                     contexts=contexts, device=device)
-    except ValueError as e:
-        raise LaneDForecastError("forecast_malformed", f"{digest}: scorer refused ({e})") from e
-    except Exception as e:  # noqa: BLE001 — a crash (OOM, driver) is the host's
-        raise LaneDForecastError("forecast_failed",
-                                 f"{digest}: scorer failed ({type(e).__name__}: {e})") from e
+    # The entry is leased from before the fetch until the forecast is done, so
+    # no other process sharing the cache root evicts it mid-score.
+    with _scoring_lease(cache, digest):
+        ckpt = _checkpoint(cache, digest, grant, contract=contract, expect=expect)
+        scorer = _default_scorer() if forecast is None else forecast
+        try:
+            out = scorer(ckpt, [w["history"] for w in wins], context=context, horizon=horizon,
+                         contexts=contexts, device=device)
+        except ValueError as e:
+            raise LaneDForecastError("forecast_malformed",
+                                     f"{digest}: scorer refused ({e})") from e
+        except Exception as e:  # noqa: BLE001 — a crash (OOM, driver) is the host's
+            raise LaneDForecastError("forecast_failed",
+                                     f"{digest}: scorer failed ({type(e).__name__}: {e})") from e
     try:
         arr = np.asarray(out, dtype=np.float64)
     except (TypeError, ValueError) as e:
         raise LaneDForecastError("forecast_malformed",
                                  f"{digest}: the scorer returned no array ({e})") from e
-    want = (len(wins), int(horizon), N_LEVELS)
+    # rev6.18 A4 (F2): one row per univariate window, C per (C, L) window.
+    want = (sum(_forecast_rows([w["history"] for w in wins])), int(horizon), N_LEVELS)
     if arr.shape != want or not np.isfinite(arr).all():
         raise LaneDForecastError("forecast_malformed",
                                  f"{digest}: forecasts {arr.shape} are not a finite {want}")
@@ -152,11 +169,28 @@ def forecast_entry(cache: PrefetchCache, digest: str, windows: Sequence[Mapping]
 # ── the eval host's end of the SSH transport ─────────────────────────────────
 
 
+def _forecast_rows(histories) -> list[int]:
+    """Rows per window of the scorer's output (numpy only; the scorer's
+    :func:`~cascade.eval.lane_d_scorer.forecast_rows` rule)."""
+    out = []
+    for h in histories:
+        shape = np.shape(h)
+        out.append(int(shape[0]) if len(shape) == 2 and int(shape[0]) > 1 else 1)
+    return out
+
+
+def _history_array(h) -> np.ndarray:
+    """A univariate history flat ``(L,)``; a ``(C, L)`` one (C ≥ 2) kept 2-D."""
+    a = np.asarray(h, dtype=np.float64)
+    return a if a.ndim == 2 and a.shape[0] > 1 else a.reshape(-1)
+
+
 def encode_request(meta: Mapping, histories: Sequence) -> bytes:
     """The ``.npz`` request bytes: ``meta`` as JSON bytes, one float64 array
-    per window history (``h0``, ``h1``, ...), in window order."""
-    arrays = {HISTORY_KEY.format(i): np.asarray(h, dtype=np.float64).reshape(-1)
-              for i, h in enumerate(histories)}
+    per window history (``h0``, ``h1``, ...), in window order. A univariate
+    history is flat ``(L,)`` as before; a multichannel one is ``(C, L)``
+    (rev6.18 A4)."""
+    arrays = {HISTORY_KEY.format(i): _history_array(h) for i, h in enumerate(histories)}
     arrays[META_KEY] = np.frombuffer(json.dumps(dict(meta), sort_keys=True).encode("utf-8"),
                                      dtype=np.uint8)
     buf = io.BytesIO()
@@ -177,6 +211,8 @@ def decode_request(raw: bytes) -> tuple[dict, list[np.ndarray]]:
                 raise ValueError("window_ids must be a list of str")
             histories = [np.asarray(z[HISTORY_KEY.format(i)], dtype=np.float64)
                          for i in range(len(ids))]
+            if any(h.ndim not in (1, 2) for h in histories):
+                raise ValueError("a history is neither (L,) nor (C, L)")
     except (OSError, KeyError, UnicodeDecodeError, json.JSONDecodeError) as e:
         raise ValueError(f"malformed lane D forecast request ({type(e).__name__}: {e})") from e
     return meta, histories

@@ -306,8 +306,8 @@ code. The checks run in this order:
   pool `1 - b - c - d`, where `d = min(share, max(0, 1 - b - c))` for
   `takes_from = "lane_a"`. Lane D's part is added from the signed
   `pay.court` alone:
-  - slot `i` is worth `cfg.lane_d.king_decay ** i`, normalised over the
-    slots, times `pay.share`;
+  - slot `i` is worth `cfg.lane_d.court_weights[i]` (rev6.23: 0.80 /
+    0.15 / 0.05), normalised over the slots, times `pay.share`;
   - a slot whose `uid` is null, out of range or repeated burns to
     `cfg.scoring.burn_uid`;
   - an empty court burns the whole share.
@@ -406,6 +406,25 @@ report PASSes.
 
 Run locally with `-m "not torch"`. Nothing here imports torch.
 
+## Multichannel windows (rev6.18 F2): `test_w9_multivariate.py`
+
+- `check_lane_d(..., max_channels=)`: `[generator] max_channels` at the
+  boundary (`derive_weights` passes it, `checks._lane_d_max_channels`).
+  Every judged window carrying the channel fields must carry all of them and
+  its `channels` must equal `channel_pick(draw.boundary_block_hash,
+  series_id, range(n_channels_raw) minus empty_channels, max_channels)` (the
+  rule re-stated in `cascade.audit.lane_d.channel_pick`, equal to the
+  producer's `cascade.eval.lane_d_channels.pick_channels` and the spec),
+  with `n_channels` and `channels_sha256` to match; an empty pick fails;
+  `max_channels=None` fails any multichannel window.
+- With `pool_dirs`: the scored snapshot's `hist.npz` series has
+  `n_channels_raw` channels and the window's `series_id`, every scored
+  channel holds a finite value, and a C >= 2 series is never recorded
+  univariate.
+
+On main these tests fail on the `settle_mv` / `max_channels` assertions or
+`cannot import name` (`channel_pick` from `cascade.audit.lane_d`,
+`_lane_d_max_channels` from `cascade.audit.checks`, both in PATHS).
 ## rev6.14 (a): judging start vs eligibility boundary (owner 2026-11-23)
 
 The audit re-derives the judging start (`frozen_before_eval_delay` FAILs, a judged cohort without `boundary_ts` FAILs) and judges eligibility at `b = T + forward_margin_hours` (default 0). `test_w9_rev614.py`.

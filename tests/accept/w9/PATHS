@@ -11,3 +11,7 @@ cascade/audit/lane_d.py
 # signed report and the W7c receipt record, without the producer's lane D
 # emission functions.
 cascade/audit/checks.py
+# rev6.18 B1/B3: the lane D refusal codes (REFUSAL_CODES, lane_d_findings),
+# lane D's burn scoped to its share (derive_weights, lane_d_pay, the lane_d
+# tier-0 row) and the audit's fetch of the lane D record (audit_receipt).
+cascade/audit/main.py

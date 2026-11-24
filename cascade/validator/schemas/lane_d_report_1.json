@@ -6,7 +6,8 @@
   "type": "object",
   "required": ["schema", "boundary", "signer", "signature", "scoring_method", "params", "seed",
                "pool", "house", "king_before", "king_after", "crowned", "prior_kings", "entries",
-               "judged", "skipped", "cohorts", "windows", "verdicts", "rows", "rows_sha256", "pay"],
+               "judged", "skipped", "cohorts", "windows", "verdicts", "rows", "rows_sha256", "pay",
+               "crown_bar"],
   "additionalProperties": false,
   "properties": {
     "schema": {"type": "string", "const": "lane-d-report/1"},
@@ -32,6 +33,16 @@
     "rows": {"type": "array", "items": {"$ref": "#/$defs/row"}},
     "rows_sha256": {"$ref": "#/$defs/digest"},
     "pay": {"$ref": "#/$defs/pay"},
+    "crown_bar": {
+      "type": "object",
+      "description": "rev6.23: KING_D's tenure (lane D settlements it has held the crown, the house included) and the crown bar applied: d_margin_start falling linearly to d_margin over d_margin_warmup_settlements.",
+      "required": ["tenure", "margin"],
+      "additionalProperties": false,
+      "properties": {
+        "tenure": {"type": "integer", "minimum": 0},
+        "margin": {"type": "number", "exclusiveMinimum": 0}
+      }
+    },
     "gate": {"$ref": "#/$defs/gate"},
     "draw": {"$ref": "#/$defs/draw"},
     "boundary_ts": {"$ref": "#/$defs/timestamp",
@@ -132,7 +143,8 @@
       "description": "§14.3 item 2: every [lane_d] value a satellite needs, as parsed.",
       "required": ["share", "takes_from", "remainder", "horizon", "horizons", "contexts",
                    "forward_margin_hours", "max_mirror_lag_hours", "min_windows", "min_clusters",
-                   "d_margin", "alpha", "bootstrap_B", "king_decay", "reward_prior_kings",
+                   "d_margin", "d_margin_start", "d_margin_warmup_settlements", "alpha",
+                   "bootstrap_B", "court_weights", "reward_prior_kings",
                    "max_entries_per_settlement",
                    "max_judged_per_coldkey_per_settlement", "scoring_levels", "gate_suites",
                    "tau_public", "lowfreq_freqs", "gate_weights", "max_source_share",
@@ -153,7 +165,10 @@
         "d_margin": {"type": "number"},
         "alpha": {"type": "number", "minimum": 0},
         "bootstrap_B": {"type": "integer", "minimum": 1},
-        "king_decay": {"type": "number", "minimum": 0},
+        "d_margin_start": {"type": "number"},
+        "d_margin_warmup_settlements": {"type": "integer", "minimum": 1},
+        "court_weights": {"type": "array", "minItems": 1,
+                          "items": {"type": "number", "minimum": 0}},
         "reward_prior_kings": {"type": "integer", "minimum": 0},
         "max_entries_per_settlement": {"type": "integer", "minimum": 0},
         "max_judged_per_coldkey_per_settlement": {"type": "integer", "minimum": 0},
@@ -302,8 +317,16 @@
         "kind": {"$ref": "#/$defs/window_kind"},
         "freq_class": {"$ref": "#/$defs/freq_class"},
         "h": {"type": "integer", "minimum": 1, "description": "The drawn horizon: the window id's h<h>."},
-        "origin": {"$ref": "#/$defs/timestamp", "description": "The target start: the window id's middle field."}
-      }
+        "origin": {"$ref": "#/$defs/timestamp", "description": "The target start: the window id's middle field."},
+        "series_id": {"type": "string", "minLength": 1, "description": "rev6.18 A4 (F2): a multichannel window's pool series id, the channel pick's seed input. Present exactly on a multichannel window (absent on a univariate one)."},
+        "n_channels_raw": {"type": "integer", "minimum": 2, "description": "rev6.18 A4 (F2): the stored series' channel count C."},
+        "empty_channels": {"type": "array", "items": {"type": "integer", "minimum": 0}, "description": "rev6.18 A4 (F2): the all-empty channels dropped before the cap, ascending."},
+        "n_channels": {"type": "integer", "minimum": 1, "description": "rev6.18 A4 (F2): the channels scored (at most [generator] max_channels); 1 scores as a univariate window."},
+        "channels": {"type": "array", "minItems": 1, "items": {"type": "integer", "minimum": 0}, "description": "rev6.18 A4 (F2): the scored channel indices, ascending: the non-empty channels, cut to [generator] max_channels by sha256(boundary_block_hash || series_id || 'lane_d_channels') for a wider series."},
+        "channels_sha256": {"$ref": "#/$defs/digest", "description": "rev6.18 A4 (F2): sha256 of the canonical JSON list of the scored channel indices (ascending)."}
+      },
+      "if": {"required": ["n_channels"]},
+      "then": {"required": ["series_id", "n_channels_raw", "empty_channels", "n_channels", "channels", "channels_sha256"]}
     },
     "draw": {
       "type": "object",
