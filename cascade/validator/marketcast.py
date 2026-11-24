@@ -311,14 +311,17 @@ def mkt_family_sizes(cands) -> dict[tuple[str, str, str], int]:
 def judge_marketcast_entry(entry: LaneCEntry, rows: MktEntryRows | None, *, mc, k: int,
                            phase: str, seed: str, round_block: int, origin_block: int,
                            base_pointer: str = "", report: dict | None = None,
-                           why_infra: str = "", infra_deferrals: int = 0):
+                           why_infra: str = "", infra_deferrals: int = 0,
+                           lc=None, era_blocks: int = 0):
     """The judgement of one MarketCast entry from its signed rows (a
     :class:`~cascade.validator.lane_c.LaneCJudgement`). ``rows`` None, or
     rows the main validator marked ``infra_deferred``, is an ``infra``
     judgement (``why_infra``): never a loss — it waits (``infra_deferrals``
     + 1 ≤ ``max_infra_deferrals``) or drops with the operator error class
     (requeue-eligible, uncharged). ``within_wait`` is measured on the
-    ROUND's block."""
+    ROUND's block. A passing verdict carries its gain-scaled full-pay
+    duration (DEC-CA-0073) on ``[lane_c]`` (``lc``) terms at ``era_blocks``
+    (the era length at the confirming settlement); ``lc`` None = no record."""
     from ..funding.queue import OPERATOR_FAULT_CLASS
     from .lane_c import LaneCJudgement
 
@@ -396,10 +399,12 @@ def judge_marketcast_entry(entry: LaneCEntry, rows: MktEntryRows | None, *, mc, 
         rec["coverage_passed"] = bool(v.coverage.passed)
     gain = float(v.gain) if np.isfinite(v.gain) else None
     lcb = float(v.gain_lcb) if np.isfinite(v.gain_lcb) else None
-    # an mkt: win's full-pay period is tiered by [marketcast] full_pay_tiers
-    from ..eval.expert_lane import full_pay
+    # DEC-CA-0073: an mkt: win's full-pay duration scales with its gain LCB
+    # from [marketcast] gain_margin (5 days) to [lane_c] full_pay_max_gain (20)
+    from ..shared.lane_c import target_full_pay_record
 
-    fp = full_pay(lcb, mc.full_pay_tiers).record() if v.passed else None
+    fp = (target_full_pay_record(entry.target, lcb, lc, mc, era_blocks=int(era_blocks))
+          if v.passed and lc is not None else None)
     return _j(v.passed, "verdict", v.reason, gain_lcb=lcb, gain=gain, n=int(v.n),
               clusters=int(v.n_clusters), inconclusive=inc, full_pay=fp)
 
@@ -968,8 +973,10 @@ class MarketCastMixin:
         from ..shared.lane_c import win_expired
 
         for target, holder in list(work.slots.items()):
+            # DEC-CA-0073: the holder's full-pay duration ran out — the slot ends
             expired = win_expired(work.eras_since(holder, block,
-                                                 era_length_blocks(self.cfg.round, block)), self.cfg.lane_c)
+                                                 era_length_blocks(self.cfg.round, block)),
+                                  holder)
             unregistered = registration is not None and self._mkt_registration(
                 registration, holder.hotkey, max(0, block - 1), rid=rid) is None
             if expired or unregistered:
@@ -1175,6 +1182,9 @@ class MarketCastMixin:
         if rep is not None:
             info["snapshot_sha256"] = str(rep.snapshot.get("sha256", ""))
             info["snapshot_end"] = float(rep.snapshot.get("end", 0) or 0)
+        from ..shared.era import era_length_blocks
+
+        settle_eb = int(era_length_blocks(self.cfg.round, int(settle_block)))
         js = []
         for e, phase, p in cands:
             base = e.marketcast or {}
@@ -1229,7 +1239,9 @@ class MarketCastMixin:
                 j = judge_marketcast_entry(
                     e, rows, mc=mc, k=k, phase=phase, seed=f"{R}|{e.miner_hotkey}|{e.target}",
                     round_block=B, origin_block=origin, base_pointer=mc.base_pointer, report=rec,
-                    why_infra=why_e, infra_deferrals=int(pm.get("infra_deferrals", 0) or 0))
+                    why_infra=why_e, infra_deferrals=int(pm.get("infra_deferrals", 0) or 0),
+                    # the duration is on the era grid at the CONFIRMING settlement
+                    lc=self.cfg.lane_c, era_blocks=settle_eb)
             if p is not None:
                 j.carried = phase == "judge"
                 j.origin_round = str(p.round_id)

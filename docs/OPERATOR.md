@@ -147,9 +147,11 @@ edited `chain.toml` before shipping it.
    - `[v2] ladder_start_tiers`: seed replicas on the private pool (the 0.50
      tier must be rare under noise); keep the lowest threshold at `[v2]
      win_margin_end`.
-   - `[lane_b]` / `[lane_c] full_pay_tiers` and `[marketcast]
-     full_pay_tiers` (overlay-settable): from real win LCBs (testnet receipts'
-     `target_lcb` / `gain_lcb`); lowest threshold at `gain_margin`.
+   - `[lane_b] full_pay_tiers` (overlay-settable): from real win LCBs
+     (testnet receipts' `target_lcb`); lowest threshold at `gain_margin`.
+     Lane C pays a gain-scaled duration instead (`[lane_c]
+     full_pay_min_days` / `full_pay_max_days` / `full_pay_max_gain`,
+     DEC-CA-0073).
    - `[marketcast] near_dup_tol` (0.02, overlay-settable) and the liquidity
      floor `min_dollar_volume_24h` (release-only): once the recorder shows
      real volumes.
@@ -2933,12 +2935,18 @@ Schema 1:
   pending[]}}, holders_source, trainer}` — only once `[lane_c] from_block`
   is typed (absent ⇒ the pages read "not live"). A holder carries its win's
   `tier` / `full_eras` / `below_floor`.
-- **Gain-tiered full-pay period (owner 2026-10-20).** `[lane_b]` / `[lane_c]
-  full_pay_tiers` (overlay-settable) and `[marketcast] full_pay_tiers`
-  (overlay-settable) replace `full_rounds` (a config still typing it is refused
+- **Lane C full-pay duration (owner 2026-11-24, DEC-CA-0073).** A lane-C
+  win pays in full for `full_pay_min_days` (5) at the competition's
+  `gain_margin`, rising linearly to `full_pay_max_days` (20) at
+  `full_pay_max_gain` (0.05) or more, rounded up to eras on the grid at the
+  win; then its slot ends. `[lane_c] full_pay_tiers` / `half_life_rounds` /
+  `floor` / `win_ttl_eras` and `[marketcast] full_pay_tiers` are retired
+  (`RETIRED_KEYS`: ignored at load, refused in overlays).
+- **Gain-tiered full-pay period (owner 2026-10-20), lane B.** `[lane_b]
+  full_pay_tiers` (overlay-settable) replaces `full_rounds` (a config still typing it is refused
   at load): `[[lcb_threshold, full_eras], ...]`, default `[[0.05, 10], [0.02,
   5], [0.01, 2]]`, thresholds strictly descending in (0, 1), `full_eras`
-  non-increasing and `<= win_ttl_eras` (lane C's TTL for `[marketcast]`). A
+  non-increasing and `<= win_ttl_eras`. A
   win pays in full for the `full_eras` of the highest threshold its gain LCB
   meets, then the unchanged decay and TTL; the tier is fixed at the win and
   stamped on every `lane_b_pay` / `lane_c_pay` win (`gain_lcb`, `tier`,

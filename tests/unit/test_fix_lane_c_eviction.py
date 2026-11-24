@@ -157,7 +157,9 @@ def test_expired_holder_is_evicted_on_a_quiet_settlement(cfg, tmp_path):
     f = T._three_rounds(cfg, tmp_path)
     r, store = f.r, f.store
     assert r._lane_c().slots[TARGET].hotkey == "alice"
-    r.cfg = replace(r.cfg, lane_c=replace(r.cfg.lane_c, win_ttl_eras=1))
+    # DEC-CA-0073: a one-era full-pay duration (the slot ends after it)
+    st0 = r._lane_c()
+    st0.slots[TARGET] = replace(st0.slots[TARGET], full_eras=1)
     assert r._lane_c().mkt_backlog == [] and not r._lane_c().pending
     eb = era_length_blocks(r.cfg.round, 0)
     soon = T.BLOCK + 2 * T.EB + eb - r.cfg.round.epoch_blocks  # age 0: still the holder

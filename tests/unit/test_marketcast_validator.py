@@ -278,7 +278,7 @@ def test_ineligible_holder_cannot_block_a_lower_lcb_confirmed_win(cfg, tmp_path,
 
     def holder(r):
         if reason == "expired":
-            r.cfg = replace(r.cfg, lane_c=replace(r.cfg.lane_c, win_ttl_eras=10))
+            pass       # DEC-CA-0073: its own 10-era duration has run out by BLOCK
         else:
             r.registration_at_block_fn = lambda hotkey, block: None if hotkey == "former" else 1
         old = TargetWin("mkt:returns", "former", 5, "old", 0 if reason == "expired" else BLOCK,

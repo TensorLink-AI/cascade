@@ -162,7 +162,8 @@ def test_wind_down_pays_full_through_full_pay_capped_then_stops():
     assert FA in p and FB in p
     p, _ = paid(10 * ERA)                     # "short" leaves its full-pay period: no decay tail
     assert FA not in p and p[FB] == (1.0, True)
-    assert p[M] == (0.5, False)               # an active competition still decays normally
+    # an active competition's win ends with its full-pay duration (DEC-CA-0073)
+    assert M not in p
     p, _ = paid(11 * ERA + 5400)
     assert FB in p
     p, rec = paid(12 * ERA)                   # wind_down_max_eras = 6 eras after the end
