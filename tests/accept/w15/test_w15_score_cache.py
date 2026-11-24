@@ -17,6 +17,7 @@ import hashlib
 
 import numpy as np
 import pytest
+
 from tests.accept.w8c import helpers as w8c
 
 H = 64

@@ -205,7 +205,6 @@ def test_cli_hello_prints_the_probed_environment(monkeypatch, capsys, tmp_path):
 
 def test_check_worker_accepts_a_qualified_host_and_returns_its_record():
     from cascade.eval.lane_d_handshake import check_worker
-
     from cascade.shared.config.lane_d import HOST_KEYS, host_identity
 
     ident, host = check_worker(_hello(), envs=_envs(), boundary=1000, expected=_expected())
