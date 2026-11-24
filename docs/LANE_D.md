@@ -187,7 +187,8 @@ index marks the king `takedown`.
 only if every target point has **both** a data timestamp **and** a first-seen
 time (when our mirror first ingested it) after the wall time of
 max(T_E, T_K) plus `[lane_d] forward_margin_hours` (0 h since rev6.14: data
-after your submission is fresh; the embargo rules add older data). The feed's
+after your submission is fresh; the embargo rules add older data; the 6 h
+wait is the separate judging delay, `eval_delay_hours`). The feed's
 measured mirror lag must also be within `max_mirror_lag_hours`. A series
 without both timestamps is never eligible. Judging waits: nothing of an entry
 is drawn, frozen or judged before max(T_E, T_K) plus `eval_delay_hours`
@@ -198,14 +199,26 @@ frequency. Evidence accumulates over every daily `pool_d` snapshot since T
 and freezes at the first settlement that meets the floors, `min_windows`
 (1000) and `min_clusters` (20 sources). Five-minute and hourly feeds fill the
 floors in days; daily and slower series rarely reach a forward-only set at
-h = 64, which is why the low-frequency check below uses the private pool.
-Expect about one extra day for the forward margin and then the mandatory
-confirmation duel (FAQ).
+h = 64. The 48 h embargo top-up (`embargo_hours`) fills the live half
+sooner: at least `min_fresh_window_share` (0.2) of the live windows are fresh,
+and the rest may be embargo windows. Judging starts no earlier than
+`eval_delay_hours` (6 h) after max(T_E, T_K), and the crown is decided at the
+first verdict (FAQ).
 
-**Verdict.** A paired cluster bootstrap of the CRPS/MASE geomean ratio
-(clusters = source) with lane A's quantile head scoring. The challenger
-clears if `LCB ≥` the crown bar in force at the settlement (at `alpha =
-0.05`) and the point gain is strictly positive. The bar decays with the
+**Live half and public half.** Half of the score is the live forward windows
+above. The other half is public: 5000 windows each from
+`Salesforce/GiftEvalPretrain` and `nju-zhangsq/RMISC` per settlement, drawn by
+the settlement block hash from the whole dataset (multivariate sets are scored
+as `(C, L)` panels). Each window's score ratio is clamped to [0.5, 2] and
+log-averaged into L_live and L_public, and the combined score is
+`L = (1 − public_weight) · L_live + public_weight · L_public` with
+`public_weight` = 0.5. A challenger must also gain on each half on its own.
+
+**Verdict.** A two-part paired cluster bootstrap of the combined score L
+(live clusters = source, public clusters = source and family) with lane A's
+quantile head scoring. The challenger clears if the LCB on the 1 − exp(−L)
+scale is `≥` the crown bar in force at the settlement (at `alpha = 0.05`),
+and both the live and the public point gains are strictly positive. The bar decays with the
 current KING_D's tenure (the lane D settlements it has held the crown, the
 house included): `d_margin_start` (0.03) at tenure 0, falling linearly to
 `d_margin` (0.01) over `d_margin_warmup_settlements` (32 settlements, about
@@ -216,10 +229,10 @@ holds KING_D, each member must also clear the current house on the same set.
 An entry is
 judged once; a loser is never re-judged on new windows.
 
-**Confirmation.** A candidate that clears must clear again on the next
-disjoint eligible window set before it is crowned (`confirm_pending` in
-between). If the king changes in between, `confirm_on_king_change =
-"restart"` restarts the duel against the new king.
+**Crowned at the first verdict.** There is no confirmation stage. An entry
+that clears the bar, the gate and (when a miner holds KING_D) the house is
+crowned at that settlement's verdict. A clear held only by a bench outage
+is `bench_hold` and is decided when the sweep runs.
 
 ## The house, the gate, the sentinel
 
@@ -237,10 +250,9 @@ satisfy `LCB ≥ -tau_public` (`tau_public = 0.01`) against both KING_D and the
 house, run paired on one host in one sweep. A loss is `gate_regression`; a
 sweep that errors, returns partial results or NaN is the miner's
 `checkpoint_fault`; a bench host outage holds the crowning (`bench_hold`)
-for at most `max_bench_holds` settlements. Every crowning candidate also runs
-the low-frequency check on the private pool's daily-and-slower slice
-(`lowfreq_freqs`): a loss there is `lowfreq_regression`. Public suites never
-pay and are never targets.
+for at most `max_bench_holds` settlements. There is no separate
+low-frequency check: the public half covers slow-cadence series. Public
+bench suites never pay and are never targets.
 
 **The sentinel** is the cross-lane rotating held-out suite: each era one suite
 is held out for every lane and never gates. It is swept for each new KING_D
@@ -258,8 +270,8 @@ limit. Unpaid share (a house king, an
 empty or deregistered slot) burns; the remainder destination is release-only
 (`remainder = "burn"`). The shipped default is `share = 0.0` and
 `takes_from = "lane_b"`; the activation overlay sets the live split. Check
-signed reports and on-chain weights for payment: queue state, a first clear
-or `confirm_pending` are not paid wins.
+signed reports and on-chain weights for payment: queue state or a held
+(`bench_hold`) clear is not a paid win.
 
 Every settlement the main validator signs a `lane-d-report/1` report (see
 [VALIDATOR.md](VALIDATOR.md#lane-d-what-satellites-verify)); satellites
@@ -326,12 +338,12 @@ with one typed reason, and the queue shows it:
 - `lane_closed`: the kill switch `until_block` was reached: nothing is
   judged and every open entry closes.
 
-**When will I be crowned?** Not at the first clear. The confirmation duel
-means a candidate that clears waits for the next disjoint eligible window set
-(the next freeze of new forward windows) and must clear again: about 1–4
-days more depending on data frequency, at the earliest a later settlement.
-Until then its status is `confirm_pending`. A king change in between restarts
-the duel under the default rule.
+**When will I be crowned?** At the first verdict that clears. There is no
+confirmation duel and no second clear: the settlement that first freezes
+enough eligible windows for your entry decides it, so the latency is the time
+your data frequency needs to fill the floors, not a later settlement on top.
+A bench outage can hold the decision (`bench_hold`) for up to
+`max_bench_holds` settlements.
 
 **What are the two clocks?** Each target point has a data time (the
 timestamp the feed gives it) and a first-seen time (when our mirror first

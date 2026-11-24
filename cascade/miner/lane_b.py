@@ -43,8 +43,19 @@ SCAN_REFUSAL_CODES = {"embedded": "benchmark_series_embedded",
 _RELEASE_ROOT = Path(__file__).resolve().parents[2]
 
 
+LANE_B_EPILOG = """\
+examples (commit first with `cascade deploy --expert-domain energy,h720`):
+  cascade lane-b verify-repo ./my-generator
+  cascade lane-b test ./my-generator --targets energy,h720 --base live --pool-dir ./pool
+  cascade lane-b fund https://submissions.cascadesub.net --targets energy,h720 --ref REPO@DIGEST --declared-rows rows.json --gpu 8xH100 --wallet-name W --wallet-hotkey H --yes
+  cascade lane-b status https://submissions.cascadesub.net --hotkey SS58
+rules: `cascade rules b` prints the live [lane_b] values (targets, gain bar, guards,
+GPU list, leg hours, pay tiers); guide: docs/MINER_LANE_B.md."""
+
+
 def add_lane_b(sub: argparse._SubParsersAction) -> None:
-    p = sub.add_parser("lane-b", help="Lane B (domain experts): fund and track a leg.")
+    p = sub.add_parser("lane-b", help="Lane B (domain experts): fund and track a leg.",
+                       epilog=LANE_B_EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
     lsub = p.add_subparsers(dest="lane_b_cmd", required=True)
     from .lane_tests import add_lane_test
     add_lane_test(lsub, "b")

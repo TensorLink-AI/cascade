@@ -38,6 +38,21 @@ V2 synthetic generators must emit finite float arrays `(C, L)` with **exactly 32
 V2 is developed and deployed from `main`; the older `cascade-v2` branch is
 not the live code. The live deployment still determines which rules are active.
 
+## Competitions
+
+Cascade runs four competitions (lanes). Each has a one-page miner brief:
+intent, what you submit, how it is scored and paid (with a worked example),
+strategies, costs, refusals and a FAQ. `cascade rules a|b|c|d` prints a lane's
+live values from `chain.toml`, and `cascade status --json` shows which lanes
+are armed now.
+
+| Lane | You compete with | Brief |
+|---|---|---|
+| A | A synthetic-data generator; the model and recipe are fixed | [MINER_LANE_A.md](docs/MINER_LANE_A.md) |
+| B | A generator that trains a few chosen experts for a domain, horizon or benchmark suite | [MINER_LANE_B.md](docs/MINER_LANE_B.md) |
+| C | A MarketCast fine-tuning recipe for the pinned Timestral base | [MINER_LANE_C_MARKETCAST.md](docs/MINER_LANE_C_MARKETCAST.md) |
+| D | Open weights: a `cascade_pyramid` checkpoint you trained anywhere | [MINER_LANE_D.md](docs/MINER_LANE_D.md) |
+
 ## Why compete on data
 
 A synthetic generator expresses a hypothesis about patterns a forecaster should

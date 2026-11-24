@@ -11,6 +11,12 @@ on your compute account. Local training experiments need suitable compute too.
 | C | An eligible MarketCast fine-tuning recipe, optionally with a generator | Beat the pinned application base on future data, then confirm and take a slot | [Lane C](#what-you-submit) |
 | D | A trained cascade_pyramid checkpoint (BF16 weights you trained anywhere) | Beat the lane D king on forward-only private windows, then confirm (built, unarmed) | [Lane D](LANE_D.md) |
 
+**One competition brief per lane** (intent, scoring and pay numbers with a
+worked example, strategies, costs, refusals, FAQ):
+[lane A](MINER_LANE_A.md) · [lane B](MINER_LANE_B.md) ·
+[lane C, MarketCast](MINER_LANE_C_MARKETCAST.md) · [lane D](MINER_LANE_D.md).
+`cascade rules a|b|c|d` prints each lane's live values from `chain.toml`.
+
 The submission contract (what the code must be) is [INTERFACE.md](INTERFACE.md).
 This guide is the end-to-end walkthrough.
 Coding agents can follow [AGENT_MINING.md](AGENT_MINING.md) for lane starters,
@@ -1735,8 +1741,9 @@ eval — only MarketCast (mkt:) has one; see DEC-CA-0056". While MarketCast is
 off, no lane-C target is active. If Lane C has launched, its reserved share
 burns; before Lane C launches, no C pool is reserved.
 
-**Checked-in templates: off on mainnet and testnet** (`[marketcast] from_block =
-0`). Check live status separately. While it is off, the intake, `cascade lane-c check|commit|fund` and the
+**Launch block in the checked-in template:** mainnet `[marketcast]` and `[lane_c]
+from_block = 9586800` (about 2026-11-25 22:28 UTC; `cascade rules c` prints the
+value your release ships). Check live status separately. Before that block, the intake, `cascade lane-c check|commit|fund` and the
 trainer refuse every `mkt:` target with a clear message
 about inactive MarketCast. Their JSON codes differ: `check`/`upload` return
 `bad_recipe`, `commit` returns `bad_commit`, and `fund` returns `bad_target`;
@@ -2047,8 +2054,10 @@ command takes `--json`. No flag takes a key, token or upload URL.
 Lane D needs no compute keys: you train on your own hardware, on any data
 and with any recipe, and the operator pays for evaluation. Nothing is rented
 on your provider account. Use a dedicated hotkey: a lane D commit replaces
-that hotkey's lane A pointer. Lane D ships unarmed (`[lane_d] from_block = 0`);
-check `cascade status --json` before you submit.
+that hotkey's lane A pointer. Lane D's template ships unarmed
+(`[lane_d] from_block = 0`). On mainnet the signed launch overlay arms it at
+block 9586800 (with lane B, and lane C's template block); check
+`cascade status --json` before you submit.
 
 - `cascade lane-d export ./trained --out ./entry` writes the entry directory
   (the four files only) and prints its digest.
