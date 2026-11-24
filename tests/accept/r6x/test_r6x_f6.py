@@ -62,6 +62,7 @@ def _decided_fails(cfg) -> list[str]:
 
 def _edits() -> list[tuple[str, str, object]]:
     """(table, key, value) of the notes file's ```toml block."""
+    assert NOTES.is_file(), f"{NOTES.relative_to(REPO)} is missing"
     text = NOTES.read_text(encoding="utf-8")
     blocks = re.findall(r"```toml\n(.*?)```", text, flags=re.S)
     assert len(blocks) == 1, f"{NOTES.name}: want exactly one ```toml block, got {len(blocks)}"
@@ -109,7 +110,7 @@ def test_main_types_the_b9_live_values():
     assert not wrong, f"main does not carry the B9 live values (main, want): {wrong}"
 
 
-def test_main_b9_values_take_effect(tmp_path):
+def test_main_b9_values_take_effect_and_decided_is_green(tmp_path):
     from cascade.shared.config import funded_sku_wall_for
 
     cfg = _load(_main_text(), tmp_path)
@@ -121,10 +122,7 @@ def test_main_b9_values_take_effect(tmp_path):
         assert funded_sku_wall_for(cfg.round.funded_sku_wall_seconds, sku, 1) == float(wall)
     assert cfg.round.funded_sku_wall_measured_image == B9_MAIN[
         ("round", "funded_sku_wall_measured_image")]
-
-
-def test_cascade_audit_decided_is_green_on_main(tmp_path):
-    cfg = _load(_main_text(), tmp_path)
+    # `cascade-audit decided` against the release file: no failing finding
     assert not _decided_fails(cfg), _decided_fails(cfg)
 
 
@@ -136,7 +134,7 @@ def test_notes_list_exactly_the_decided_votes_and_the_retire_block():
     main = tomllib.loads(_main_text())
     want = dict(DECIDED_VOTES)
     want[("scoring", "init_gate_retired_from_block")] = (
-        main["scoring"]["init_gate_retired_from_block"])
+        main["scoring"].get("init_gate_retired_from_block"))
     assert edits == want, f"notes edits {edits} != {want}"
 
 
@@ -144,12 +142,13 @@ def test_notes_edits_turn_a_stale_deployed_file_green(tmp_path):
     """Main with the two votes untyped (the deployed state) and no retire
     block fails `decided`; the notes' lines make it pass and give the same
     init-gate window as main."""
+    edits = _edits()
     stale = _set_in_table(_main_text(), "v2", "image_decoupled_from_block", 0)
     stale = _drop_in_table(stale, "v2", "prelaunch_burn_from_block")
     stale = _drop_in_table(stale, "scoring", "init_gate_retired_from_block")
     assert len(_decided_fails(_load(stale, tmp_path, "stale.toml"))) == 2
     fixed = stale
-    for t, k, v in _edits():
+    for t, k, v in edits:
         fixed = _set_in_table(fixed, t, k, v)
     cfg = _load(fixed, tmp_path, "fixed.toml")
     assert not _decided_fails(cfg), _decided_fails(cfg)
@@ -210,6 +209,8 @@ def test_init_gate_runs_as_before_the_block_and_stops_from_it(tmp_path):
 
 
 def test_archived_shadow_receipt_round_trips_and_verifies(tmp_path):
+    # the release file carries the typed retire block the replay resolves by
+    assert "init_gate_retired_from_block" in tomllib.loads(_main_text())["scoring"]
     pytest.importorskip("bittensor.sp_core")
     from cascade.audit.checks import check_koth_params
     from cascade.shared.receipt import (

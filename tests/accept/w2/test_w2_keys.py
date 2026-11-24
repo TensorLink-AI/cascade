@@ -154,7 +154,8 @@ def test_w2_retired_keys_load_and_change_nothing(name, key):
     from cascade.shared.config import RETIRED_KEYS
     from cascade.shared.config.lane_d import LaneDConfig
 
-    assert key in RETIRED_KEYS["lane_d"], f"[lane_d] {key} is not a listed retired key"
+    assert key in RETIRED_KEYS.get("lane_d", frozenset()), (
+        f"[lane_d] {key} is not a listed retired key")
     assert key not in {f.name for f in dataclasses.fields(LaneDConfig)}, (
         f"retired [lane_d] {key} is still a LaneDConfig field")
     for extra in ({}, ARM):
