@@ -358,10 +358,14 @@ def _forward_chunked(pm, cfg, model, rows: np.ndarray, horizon: int, device: str
                      max_tokens: int) -> np.ndarray:
     """:func:`_forward` over ``rows`` (``(B, ..., L)``, one input length) in
     contiguous micro-batches of :func:`forward_batch_size` windows, in order,
-    concatenated along the window axis. Each window's forward is independent
-    of the others in its batch (per-row standardization, per-series
-    attention, per-token routing with no capacity drop), so the cut only
-    bounds the launch size and memory."""
+    concatenated along the window axis. In exact arithmetic a window's
+    forward is independent of its batch (per-row standardization, per-series
+    attention, per-token routing with no capacity drop); in fp32 the GEMM
+    blocking depends on the batch rows, so the cut moves the last bits
+    (~1e-8 relative, measured on CPU). The cut is therefore part of the
+    deterministic recipe: fixed by :data:`MAX_FORWARD_TOKENS`, and each
+    micro-batch equals forecasting its windows on their own. An input that
+    fits under the cap is not cut (the pre-#785 forward, bit for bit)."""
     rows = np.asarray(rows)
     channels = int(np.prod(rows.shape[1:-1], dtype=np.int64)) if rows.ndim > 2 else 1
     step = forward_batch_size(rows.shape[-1], horizon, int(cfg.patch_size), channels=channels,

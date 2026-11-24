@@ -409,29 +409,49 @@ def test_forecast_refuses_a_non_positive_max_tokens_before_loading(no_torch, tmp
 
 
 @torch_mark
-def test_micro_batched_forecast_is_byte_identical_to_one_forward_per_length(ckpts):
-    """#785: chunking must not change a forecast. Seven 4096-point windows and
-    three 320-point windows, forecast unchunked (the default cap holds them
-    all) and at caps that cut them into 1, 2 and 3 windows a forward: the
-    forecasts are byte-identical, and every forward respects the cap."""
+def test_micro_batched_forecast_is_deterministic_and_re_derivable(ckpts):
+    """#785: seven 4096-point windows and three 320-point windows.
+
+    * A cap that cuts nothing (the default, or exactly the batch's tokens)
+      is byte-identical to the pre-#785 one forward per length: small inputs
+      are unchanged.
+    * A cut into 1, 2 or 3 windows a forward is byte-identical to forecasting
+      each micro-batch's windows on their own: chunks are contiguous, in
+      window order, with no state across them, so the forecast is
+      re-derivable from the cap alone.
+    * Against the uncut forecast it agrees to float rounding only (CPU fp32
+      GEMM blocking depends on the batch rows; measured in CI: equal to ~8
+      digits, not bit-equal). That is why the cap is the release constant
+      MAX_FORWARD_TOKENS and never a runtime memory probe."""
     fq = _microbatch_forecast()
     s = _scorer()
     hists = [series(TRAINED_CONTEXT + 17 * i, seed=200 + i) for i in range(7)]
     hists[3:3] = [series(320 + i, seed=300 + i) for i in range(3)]
+    long_idx, short_idx = [0, 1, 2, 6, 7, 8, 9], [3, 4, 5]
     extra = (HORIZON + PATCH - 1) // PATCH
+    kw = {"context": TRAINED_CONTEXT, "horizon": HORIZON}
     with ModelInputs() as seen:
-        whole = np.asarray(fq(ckpts["entry"], hists, context=TRAINED_CONTEXT, horizon=HORIZON))
+        whole = np.asarray(fq(ckpts["entry"], hists, **kw))
     assert sorted(seen.shapes) == sorted([(3, 1, 10 + extra, PATCH),
                                           (7, 1, 128 + extra, PATCH)])
+    exact = np.asarray(fq(ckpts["entry"], hists, max_tokens=7 * (128 + extra), **kw))
+    assert np.array_equal(exact, whole), "a cap that cuts nothing changed the forecast"
     for per in (1, 2, 3):
         cap = per * (128 + extra)
         with ModelInputs() as seen:
-            q = np.asarray(fq(ckpts["entry"], hists, context=TRAINED_CONTEXT, horizon=HORIZON,
-                              max_tokens=cap))
+            q = np.asarray(fq(ckpts["entry"], hists, max_tokens=cap, **kw))
         assert q.shape == whole.shape == (10, HORIZON, len(SCORING_LEVELS))
-        assert np.array_equal(q, whole), f"{per} windows a forward changed the forecast"
         long_batches = [b for b, _, p, _ in seen.shapes if p == 128 + extra]
         assert sum(long_batches) == 7 and max(long_batches) == per
         short_step = s.forward_batch_size(320, HORIZON, PATCH, max_tokens=cap)
         short_batches = [b for b, _, p, _ in seen.shapes if p == 10 + extra]
         assert sum(short_batches) == 3 and max(short_batches) == min(3, short_step)
+        # Re-derivation: each micro-batch forecast alone, in order.
+        want = np.empty_like(q)
+        for idx, step in ((long_idx, per), (short_idx, short_step)):
+            for j in range(0, len(idx), step):
+                part = idx[j:j + step]
+                want[part] = np.asarray(fq(ckpts["entry"], [hists[i] for i in part], **kw))
+        assert np.array_equal(q, want), f"{per} a forward is not its micro-batches alone"
+        np.testing.assert_allclose(q, whole, rtol=1e-5, atol=1e-6,
+                                   err_msg=f"{per} a forward moved past float rounding")
