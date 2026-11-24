@@ -273,6 +273,16 @@ def test_the_lock_file_is_never_an_entry(tmp_path, name):
 # shared across processes: eviction by ANY process skips them.
 
 
+def _require_lease_api() -> None:
+    """The shared-root lease surface (README): asserted, so a cache without
+    it fails here on an assertion rather than an AttributeError."""
+    from cascade.eval.lane_d_cache import PrefetchCache
+
+    for name in ("lease", "leased", "protected"):
+        assert callable(getattr(PrefetchCache, name, None)), \
+            f"W15: PrefetchCache.{name}() (shared pins and scoring leases)"
+
+
 def _lease_files(root: Path) -> list[str]:
     from cascade.eval.lane_d_cache import LEASE_PREFIX
 
@@ -350,6 +360,7 @@ def test_a_scorer_lease_blocks_eviction_by_another_process(tmp_path):
 
 
 def test_a_lease_taken_before_the_fill_protects_the_entry_once_admitted(tmp_path):
+    _require_lease_api()
     root = tmp_path / "shared"
     scorer, other = _cache(root, 2000), _cache(root, 2000)
     x, y, z = Entry(1), Entry(2), Entry(3)
@@ -397,6 +408,7 @@ def test_stale_leases_are_reclaimed(tmp_path):
 def test_lease_refuses_a_bad_digest_or_ttl(tmp_path):
     from cascade.eval.lane_d_cache import CacheError
 
+    _require_lease_api()
     c = _cache(tmp_path / "c", 2000)
     with pytest.raises(CacheError), c.lease("../etc"):
         pass
@@ -446,6 +458,7 @@ def test_forecast_entry_holds_a_lease_while_scoring(tmp_path):
 
     from cascade.eval.lane_d_forecasts import LaneDForecastError, forecast_entry
 
+    _require_lease_api()
     root = tmp_path / "shared"
     cache = _cache(root, 10_000)
     x = Entry(1)
