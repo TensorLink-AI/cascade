@@ -1018,7 +1018,7 @@ ready_ttl_blocks = 7200          # B10: ~24 h at 12 s blocks
 # Fine-tunes of a PINNED third-party base (mistralai/Timestral-28M, Modified
 # MIT licence with a USD 20M/month revenue restriction that extends to
 # derivatives — owner/legal open item) are judged paired vs the untouched base
-# on market windows drawn from the embargo no leg reads (DEC-CA-0073), one lane-C slot per suite (target
+# on market windows drawn from the embargo no leg reads (DEC-CA-0074), one lane-C slot per suite (target
 # "mkt:<suite>", listed in [lane_c] targets). Arming (from_block > 0) is
 # load-checked: an era boundary >= [v2] from_block and >= [lane_c] from_block,
 # [v2] bench_source = "validator" in force (the main validator's GPU scores
@@ -1045,7 +1045,7 @@ embargo_days       = 30                         # recipe training data ends this
 max_synthetic_fraction = 1.0                    # miner generator share of the training mix (1.0 = pure synthetic allowed)
 max_leg_hours      = 12.0                       # cap on a recipe's own leg_hours (miner-paid wall); no leg_hours = [lane_c] leg_hours
 eval_context_length = 32768                     # owner 2026-11-21: UP TO 32k context steps the base and the fine-tune both see (shorter while the bank's history is shorter)
-# Owner 2026-11-24 (DEC-CA-0073): a verdict within 13 h of submission; every
+# Owner 2026-11-24 (DEC-CA-0074): a verdict within 13 h of submission; every
 # horizon drawn from the embargo by the round block's hash (as chain.toml).
 embargo_eval_days  = 28                         # overlay-settable, 1 .. embargo_days - 1
 backtest_windows_per_cell = 48                  # overlay-settable, 1 .. 256: drawn per (asset, series, horizon)
@@ -1090,7 +1090,7 @@ guards             = ["mase", "qlike", "tail"]  # no-regression vs base: median 
 guard_floor        = 0.0                        # a guard CONFIDENTLY worse than the base (UCB < -this) fails the entry
 # Owner 2026-11-18: every suite on every timeframe, each a multi-step PATH
 # (<bar>x<steps>): 1m x 60 (1 h), 5m x 36 (3 h), 15m x 96 (1 d), 1h x 48 (2 d),
-# 4h x 42 and 1d x 7 (7 d). Owner 2026-11-24 (DEC-CA-0073): every path is
+# 4h x 42 and 1d x 7 (7 d). Owner 2026-11-24 (DEC-CA-0074): every path is
 # drawn from the embargo (embargo_eval_days above); gap_horizons is gone.
 baseline_gate      = true                       # must beat random walk + EWMA/FHS and seasonal AR(1): composite LCB >= 0, no suite confidently worse
 # Owner 2026-11-19: the official calendars (federalreserve.gov FOMC calendar — statement 14:00 ET

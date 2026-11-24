@@ -113,7 +113,7 @@ class MarketCastTrainer(TrainerCompetition):
         # the commit time, the pod clipped to train_time (review M12)
         from .marketcast_runner import load_mkt_lineage, read_mkt_recipe
 
-        # DEC-CA-0073 guard (b): the generator is scanned against the embargo
+        # DEC-CA-0074 guard (b): the generator is scanned against the embargo
         # before anything is rented; without a scanner the leg could never be
         # judged, so it is the operator's side (requeued uncharged)
         scan = getattr(ops, "mkt_embargo_scan", None)

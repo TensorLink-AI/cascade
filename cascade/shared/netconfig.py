@@ -137,7 +137,7 @@ ALLOWED: dict[str, frozenset[str] | None] = {
         # leg record and the draw / scan / verdict use THAT, so a change
         # never scores a leg on its own training data (code-bounded).
         "embargo_days", "test_family", "pay_curve",
-        # DEC-CA-0073: the embargo eval-draw length, backtest windows per cell
+        # DEC-CA-0074: the embargo eval-draw length, backtest windows per cell
         # and the <= 13 h inconclusive wait (code-bounded by the loader)
         "embargo_eval_days", "backtest_windows_per_cell", "verdict_wait_blocks",
     }),

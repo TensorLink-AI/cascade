@@ -44,7 +44,7 @@ the canonical body; the signature covers the same bytes.
 
 Windows (:func:`snapshot_windows`) are cut with the pure rule in
 :mod:`cascade.eval.marketcast`. The validator and the audit cut them by an
-entry's signed DRAW (DEC-CA-0073, :func:`embargo_draw`): per (asset, series,
+entry's signed DRAW (DEC-CA-0074, :func:`embargo_draw`): per (asset, series,
 horizon) the ``backtest_windows_per_cell`` best-ranked windows by the round
 block's hash lying wholly in the ``embargo_eval_days`` before the leg's
 dispatch (the embargo no leg reads), in the phase's half of a fixed window
@@ -605,7 +605,7 @@ def embargo_span(mc: MarketCastConfig, end: float) -> tuple[float, float]:
     return first - 1.0, float(end)
 
 
-# ── DEC-CA-0073: the embargo draw ───────────────────────────────────────────
+# ── DEC-CA-0074: the embargo draw ───────────────────────────────────────────
 
 HALF_TAG = "cascade-mkt-embargo-half/1|"
 PHASE_HALF = {"judge": 0, "confirm": 1}
@@ -633,7 +633,7 @@ def draw_rank(block_hash: str, wid: str) -> str:
 
 def embargo_draw(mc: MarketCastConfig, *, train_time: float, phase: str, block: int,
                  block_hash: str, after: float) -> dict:
-    """The signed draw record of one entry (DEC-CA-0073): every number
+    """The signed draw record of one entry (DEC-CA-0074): every number
     the windows are cut from, re-derivable from the config, the trainer's
     dispatch time ``train_time``, the round ``block`` and its hash. Backtest
     windows lie wholly inside ``(lo, hi]`` = the ``embargo_eval_days`` before
@@ -701,7 +701,7 @@ def snapshot_windows(snap: MktSnapshot, mc: MarketCastConfig, suite: str, *,
     Without ``draw`` this is the plain forward-only cut (``cascade lane-c
     test`` on a held-out snapshot).
 
-    ``draw`` (DEC-CA-0073, :func:`embargo_draw`; every validator / audit
+    ``draw`` (DEC-CA-0074, :func:`embargo_draw`; every validator / audit
     path): every horizon takes the ``n`` best-ranked (:func:`draw_rank`)
     eligible windows of the phase's half (:func:`window_half`) lying wholly
     in ``(lo, hi]``, plus — for a ``forward_horizons`` horizon — up to

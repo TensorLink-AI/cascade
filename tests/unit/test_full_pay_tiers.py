@@ -3,7 +3,7 @@
 A lane-B / lane-C win pays its slot in full for the ``full_eras`` of the
 highest ``full_pay_tiers`` threshold its gain LCB meets (fixed at the win,
 recorded on it), then the unchanged decay / TTL. Lane C (MarketCast) pays a
-gain-scaled duration instead (DEC-CA-0073, tests/unit/test_marketcast_pay_v2.py);
+gain-scaled duration instead (DEC-CA-0073, tests/unit/test_marketcast_pay_duration.py);
 its gain-tiered keys are retired. The audit re-derives the tier and rejects a
 forged one."""
 
