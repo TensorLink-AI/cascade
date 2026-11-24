@@ -36,7 +36,7 @@ REF = "fixtures/testnet-baseline@sha256:" + "c" * 64
 
 
 @pytest.fixture(scope="module")
-def testnet_cfg():
+def cfg_testnet():
     from cascade.shared.config import load_chain_config
 
     return load_chain_config(REPO / "chain.testnet.toml")
@@ -60,10 +60,10 @@ def _full_proof(cfg, ref, work_root, **verification):
     return path
 
 
-def test_report_names_every_blocker_and_writes_nothing(testnet_cfg, tmp_path):
+def test_report_names_every_blocker_and_writes_nothing(cfg_testnet, tmp_path):
     from cascade.trainer.launch_preflight import preflight_report
 
-    cfg = _unpinned(testnet_cfg, anchor="")
+    cfg = _unpinned(cfg_testnet, anchor="")
     work = tmp_path / "work"
     r = preflight_report(cfg, REF, work)
     assert r["ready"] is False
@@ -73,10 +73,10 @@ def test_report_names_every_blocker_and_writes_nothing(testnet_cfg, tmp_path):
     assert not work.exists(), "the check must write nothing"
 
 
-def test_report_ready_with_a_full_proof_and_never_writes_the_launch_root(testnet_cfg, tmp_path):
+def test_report_ready_with_a_full_proof_and_never_writes_the_launch_root(cfg_testnet, tmp_path):
     from cascade.trainer.launch_preflight import preflight_report, ready
 
-    cfg = _unpinned(testnet_cfg)
+    cfg = _unpinned(cfg_testnet)
     work = tmp_path / "work"
     proof = _full_proof(cfg, REF, work)
     r = preflight_report(cfg, REF, work)
@@ -87,10 +87,10 @@ def test_report_ready_with_a_full_proof_and_never_writes_the_launch_root(testnet
     assert (work / "v2-launch.json").exists()
 
 
-def test_report_refuses_stale_and_quick_proofs(testnet_cfg, tmp_path):
+def test_report_refuses_stale_and_quick_proofs(cfg_testnet, tmp_path):
     from cascade.trainer.launch_preflight import preflight_report, proof_path
 
-    cfg = _unpinned(testnet_cfg)
+    cfg = _unpinned(cfg_testnet)
     work = tmp_path / "work"
     _full_proof(cfg, REF, work, scope="quick")
     r = preflight_report(cfg, REF, work)
@@ -106,21 +106,21 @@ def test_report_refuses_stale_and_quick_proofs(testnet_cfg, tmp_path):
     assert r["ready"] is False and r["blockers"][0].startswith("proof_unreadable")
 
 
-def test_report_names_the_unqualified_worker_release(testnet_cfg, tmp_path):
+def test_report_names_the_unqualified_worker_release(cfg_testnet, tmp_path):
     from cascade.trainer.launch_preflight import preflight_report
 
     # The shipped testnet file carries [v2] from_block: the release check runs.
-    r = preflight_report(replace(testnet_cfg, manifest=replace(
-        testnet_cfg.manifest, validator_hotkey="fixture-validator")), REF, tmp_path / "w")
+    r = preflight_report(replace(cfg_testnet, manifest=replace(
+        cfg_testnet.manifest, validator_hotkey="fixture-validator")), REF, tmp_path / "w")
     assert r["ready"] is False
-    if testnet_cfg.v2.from_block or testnet_cfg.v2.launch_at_utc:
+    if cfg_testnet.v2.from_block or cfg_testnet.v2.launch_at_utc:
         assert any(b.startswith("worker_release: ") for b in r["blockers"])
 
 
-def test_bad_ref_is_an_identity_blocker(testnet_cfg, tmp_path):
+def test_bad_ref_is_an_identity_blocker(cfg_testnet, tmp_path):
     from cascade.trainer.launch_preflight import preflight_report
 
-    r = preflight_report(_unpinned(testnet_cfg), "not-an-immutable-ref", tmp_path / "w")
+    r = preflight_report(_unpinned(cfg_testnet), "not-an-immutable-ref", tmp_path / "w")
     assert r["ready"] is False and any(b.startswith("identity: ") for b in r["blockers"])
 
 
@@ -139,10 +139,10 @@ def test_cli_flags_parse():
     assert a.preflight_v2_baseline_check == REF and a.preflight_v2_baseline is None
 
 
-def test_check_flag_exit_codes(testnet_cfg, tmp_path, capsys):
+def test_check_flag_exit_codes(cfg_testnet, tmp_path, capsys):
     from cascade.trainer.main import PREFLIGHT_BLOCKED, PREFLIGHT_READY, _preflight_v2_baseline
 
-    cfg = _unpinned(testnet_cfg)
+    cfg = _unpinned(cfg_testnet)
     assert _preflight_v2_baseline(cfg, _args(tmp_path, check=REF)) == PREFLIGHT_BLOCKED == 3
     out = json.loads(capsys.readouterr().out)
     assert out["preflight"]["blockers"] == ["no_proof"] and "qualification" not in out
@@ -150,7 +150,7 @@ def test_check_flag_exit_codes(testnet_cfg, tmp_path, capsys):
     assert _preflight_v2_baseline(cfg, _args(tmp_path, check=REF)) == PREFLIGHT_READY == 0
 
 
-def test_qualify_flag_exits_blocked_when_a_blocker_remains(testnet_cfg, tmp_path, capsys,
+def test_qualify_flag_exits_blocked_when_a_blocker_remains(cfg_testnet, tmp_path, capsys,
                                                          monkeypatch):
     from cascade.trainer import launch_preflight
     from cascade.trainer.main import PREFLIGHT_BLOCKED, PREFLIGHT_ERROR, _preflight_v2_baseline
@@ -159,13 +159,13 @@ def test_qualify_flag_exits_blocked_when_a_blocker_remains(testnet_cfg, tmp_path
         return json.loads(_full_proof(cfg, ref, work_root).read_text())
 
     monkeypatch.setattr(launch_preflight, "qualify", fake_qualify)
-    no_anchor = _unpinned(testnet_cfg, anchor="")
+    no_anchor = _unpinned(cfg_testnet, anchor="")
     # Qualified, but the launch is still blocked: never exit 0.
     assert _preflight_v2_baseline(no_anchor, _args(tmp_path, qualify=REF)) == PREFLIGHT_BLOCKED
     out = json.loads(capsys.readouterr().out)
     assert out["qualification"]["ref"] == REF
     assert out["preflight"]["blockers"] == ["no_validator_anchor"]
-    assert _preflight_v2_baseline(_unpinned(testnet_cfg), _args(tmp_path, qualify=REF)) == 0
+    assert _preflight_v2_baseline(_unpinned(cfg_testnet), _args(tmp_path, qualify=REF)) == 0
 
     def failing(cfg, ref, work_root):
         raise ValueError("v2 baseline verification failed: fixture")
@@ -174,13 +174,13 @@ def test_qualify_flag_exits_blocked_when_a_blocker_remains(testnet_cfg, tmp_path
     assert _preflight_v2_baseline(no_anchor, _args(tmp_path, qualify=REF)) == PREFLIGHT_ERROR
 
 
-def test_blocked_log_line_names_the_king_ref_and_work_root(testnet_cfg, tmp_path, caplog):
+def test_blocked_log_line_names_the_king_ref_and_work_root(cfg_testnet, tmp_path, caplog):
     from types import SimpleNamespace
 
     from cascade.trainer.runner_generation import _GenerationMixin
 
-    cfg = replace(testnet_cfg, v2=replace(testnet_cfg.v2, from_block=max(1, testnet_cfg.v2.from_block)),
-                  manifest=replace(testnet_cfg.manifest, validator_hotkey="fixture-validator"))
+    cfg = replace(cfg_testnet, v2=replace(cfg_testnet.v2, from_block=max(1, cfg_testnet.v2.from_block)),
+                  manifest=replace(cfg_testnet.manifest, validator_hotkey="fixture-validator"))
 
     class _Runner(_GenerationMixin):
         def __init__(self):
