@@ -247,11 +247,24 @@ class LaneBMixin:
                 cfg=self.cfg.lane_b, seed=str(base_seed),
                 # DEC-CA-0050 merge guards: refuse a non-finite expert delta
                 strict=self.cfg.lane_b.merge_guard_at_settlement(block),
+                # WB23 (TB27): the contract a lane B leg derives from, for the
+                # consensus check of a recorded leg length
+                contract=self._lane_b_leg_base_contract(block),
                 **sentinel_kw,
             )
         except Exception as e:  # noqa: BLE001 — fetch/eval failure: retried, never a verdict
             raise LaneBTransient(f"judging {rid} failed: {type(e).__name__}: {e}") from e
         return _LaneBRound(rid, block, judgements_record(js), js)
+
+    def _lane_b_leg_base_contract(self, block: int):
+        """WB23: the throne contract at the settlement's contract block — what
+        the trainer derives a lane B leg from (``throne_contracts_at``)."""
+        from ..shared.era import settlement_contract_block
+
+        throne = getattr(self.cfg, "throne_contracts_at", None)
+        if throne is None:   # a config without a throne schedule (unit stubs)
+            return None
+        return throne(settlement_contract_block(self.cfg.round, int(block)))[0]
 
     def _lane_b_sentinel_kw(self, manifest: TrainingManifest) -> dict:
         """W-S2 (LANE_D_PLAN §16 rule 2, D35): ``{"sentinel": suite}`` for a

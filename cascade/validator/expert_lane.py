@@ -163,14 +163,29 @@ def _arrays(scores) -> dict:
 def judge_entry(entry: ExpertEntry, *, manifest: ExpertManifest, king_pointer: str,
                 king_scores, evaluate: Callable[[str], list], fetch_dir: Callable[[str], Path],
                 cfg, seed: str, recompute_selection: Callable | None = None,
-                strict: bool = False, sentinel: str | None = None) -> ExpertJudgement:
+                strict: bool = False, sentinel: str | None = None,
+                contract=None) -> ExpertJudgement:
     """``sentinel`` is the settlement era's LANE_D_PLAN §16 suite (W-S2, D35):
     its ``<suite>_crps`` / ``<suite>_mase`` public guards are not built and
     ``require_public`` minus it is what must pair; every other guard is judged
-    exactly as unarmed. ``None`` (unarmed) is today's judgement."""
+    exactly as unarmed. ``None`` (unarmed) is today's judgement.
+
+    ``contract`` (WB23, TB27) is the contract a lane B leg derives from: an
+    entry whose recorded leg length (``train_hours`` / ``leg_steps`` /
+    ``leg_guard_seconds``) breaks the ``[lane_b]`` consensus caps is refused
+    at stage ``leg_length`` before any fetch. An entry without one is judged
+    as before; ``contract`` None skips the check."""
     if manifest.king_pointer != king_pointer:
         return ExpertJudgement(entry, False, "stale",
                                f"rebased onto {manifest.king_pointer}, king is {king_pointer}")
+    if contract is not None:
+        from ..shared.lane_b_leg import check_leg_record
+
+        why = check_leg_record(train_hours=entry.train_hours, steps=entry.leg_steps,
+                               guard_seconds=entry.leg_guard_seconds, lb_cfg=cfg,
+                               contract=contract)
+        if why is not None:
+            return ExpertJudgement(entry, False, "leg_length", why)
     declared = entry.declared
     if (any(t not in _targets(cfg) for t in declared)
             or len(declared) > int(getattr(cfg, "max_domains_per_leg", 1) or 1)):

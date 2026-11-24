@@ -111,6 +111,8 @@ def test_single_domain_commit_and_manifest_bytes_unchanged():
         x.pop("targets")
         x.pop("gpu_n", None)   # WB22: 0 = not recorded, dropped from the body
         x.pop("scored_weights", None)   # plan rev6.20: "" = raw, dropped from the body
+        for k in ("train_hours", "leg_steps", "leg_guard_seconds"):
+            x.pop(k, None)     # WB23: no leg length, dropped from the body
         x["selection"] = {str(k): sorted(v) for k, v in sorted(x["selection"].items())}
         x["exclude"] = {}
     assert m.canonical_body() == json.dumps(old, sort_keys=True,
