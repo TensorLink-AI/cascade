@@ -486,6 +486,28 @@ can select another validator's receipt from the shared pointer. Investigate
 FAILs and read WARNs for missing evidence. See
 [`AUDIT.md`](AUDIT.md).
 
+### No archive node needed
+
+Reads AS OF a past block go to your `--network` node first. When it has
+pruned that block (the default `finney` endpoint is a lite node), the read is
+retried once on `--history-network` (default `archive`, the SDK's public
+archive endpoint), after a genesis-hash check that both are the same chain.
+Writes and head reads never use it; `--history-network none` turns it off.
+The same flag exists on `cascade-satellite` and `cascade-audit`.
+
+Lane C's slot-holder deregistration check does not need history at all: each
+validator snapshots the netuid's `hotkey → uid` live at every lane-C boundary
+− 1, and the receipt records the holders it judged
+(`lane_c_registrations`: `block`, `rows` of `{target, hotkey, uid}`,
+`sha256`). Satellites and `cascade-audit` replay that record from the
+signed receipt (`lane_c_registrations` row: digest, block, and that a
+deregistered holder no longer holds its slot while every remaining holder
+has a row). A validator catching up late takes the registrations from the
+main validator's signed record, and reads the chain only if no record
+exists. The stake-weighted activation tally and the audit's
+`block-hash-onchain` check still read past blocks; they use the history
+fallback.
+
 ## What can go wrong
 
 | symptom | cause |
@@ -503,10 +525,12 @@ FAILs and read WARNs for missing evidence. See
 | INFO `bittensor.transport: Connection to wss://… lost (…no response… in 60.0s); reconnecting` every few minutes | expected with SDK 11.3: it drops and reopens an idle chain connection. Harmless while `weights set:` lines keep appearing |
 | every pool read `SignatureDoesNotMatch` | you set `POOL_S3_*` with the default endpoint — unset them |
 | gift gate / bench slow | those want a GPU — `--eval-hosts`, or pin `gift_gate_data_dir` on a CUDA box |
-| audit WARNs on `block-hash-onchain` | lite node without history — use an archive node for zero WARNs |
-| `activation: as-of read at boundary B failed …` repeating | your endpoint pruned the boundary block; it retries while the boundary is under 300 blocks old, then skips it unless a note names a lock-in there — an archive endpoint avoids it |
-| `lane_c_unverifiable: … registration of slot holder … as of block B unreadable` holding | MarketCast deregistration eviction reads the metagraph AS OF the settlement boundary (historical state): your endpoint pruned it — the settlement holds (retried every poll) until it reads; an archive endpoint is required while lane C has slot holders |
-| `marketcast round=R: the chain client has no uid_for_hotkey_at_block hook` | this client build cannot read historical registrations: a deregistered holder keeps its slot on this validator (verdicts unchanged, expiry still evicts) — run the current release against an archive endpoint |
+| WARNING `chain read at block N pruned on finney (…); serving it from history endpoint archive (logged once per reason)` | expected on a lite node: a read AS OF a past block (block hash, as-of stakes / notes, a registration) was pruned there and was retried once on `--history-network` (default the SDK's `archive`, wss://archive.chain.opentensor.ai:443). Same chain state, same result; writes and head reads never go there. Nothing to do — no archive node of your own is needed |
+| WARNING `chain history endpoint … is another chain …; history fallback disabled` | your `--network` is a testnet / local node and the history endpoint is mainnet's (genesis hashes differ): the fallback stays off. Pass `--history-network <that chain's archive>` or `none` |
+| audit WARNs on `block-hash-onchain` | both the node and the history endpoint failed the read (or `--history-network none`): the check is a warning only — retry later or pass `--history-network <archive>` |
+| `activation: as-of read at boundary B failed …` repeating | both your endpoint and the history endpoint failed the boundary read (the as-of tally reads the history endpoint automatically when your node pruned the block); it retries while the boundary is under 300 blocks old, then skips it unless a note names a lock-in there. Check that the history endpoint is reachable (or not `none`) |
+| `lane_c_unverifiable: … registration of slot holder … as of block B unreadable` holding | rare now: eviction reads come from the boundary snapshot this node takes live at every lane-C boundary − 1 (`<state_db>.lane_c_registrations.json`), else — catching up late — from the MAIN validator's signed receipt record (`lane_c_registrations`), and only without either from the chain (with the archive fallback). Holding means all three failed: the node was down at the boundary, the main's receipt is not published yet, and the history endpoint is unreachable — it retries every poll |
+| `marketcast round=R: the chain client has no uid_for_hotkey_at_block hook` | this client build cannot read historical registrations: a deregistered holder keeps its slot on this validator (verdicts unchanged, expiry still evicts) — run the current release |
 
 **Emergency: stop endorsing without going dark.** If something looks wrong —
 a suspect manifest, a scoring result you don't trust, a possibly-compromised

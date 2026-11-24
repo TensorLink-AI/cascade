@@ -3727,6 +3727,30 @@ def _lane_c_holder_kept(row: dict, boundary: int, round_id: str) -> bool:
     return not win_beats(new, cur)
 
 
+def check_lane_c_registrations(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
+    """Owner 2026-11-24: the slot holders' registrations the settlement
+    judged eviction from (``lane_c_registrations``), replayed at the same
+    trust level as the rows — inside the signed body, digest re-derived,
+    block = boundary − 1, and consistent with the slots the receipt's
+    ``state_post`` leaves (a deregistered holder is evicted; every holder
+    still holding a pre-settlement win on a recorded competition has a row).
+    No chain read: no archive node is needed."""
+    from ..shared.lane_c_registrations import registration_record_problem
+
+    name = "lane_c_registrations"
+    rec = getattr(receipt, "lane_c_registrations", None)
+    boundary = int(receipt.epoch_start_block)
+    if not cfg.lane_c.active(boundary):
+        return _fail(name, f"registration record at block {boundary}, but lane C is not "
+                           "active there")
+    why = registration_record_problem(rec, boundary=boundary,
+                                      state_post=getattr(receipt, "state_post", None))
+    if why:
+        return _fail(name, why)
+    return _ok(name, f"{len(rec.get('rows') or ())} slot-holder registration(s) as of block "
+                     f"{rec.get('block')} replayed from the signed record")
+
+
 def check_lane_c(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
     """DEC-CA-0056 verdict consistency, selected by ``cfg.lane_c.active``:
 
@@ -4883,6 +4907,10 @@ def run_tier0(
         check_transition(receipt),
         check_lane_b(receipt, cfg),
         check_lane_c(receipt, cfg),
+        # owner 2026-11-24: only on a receipt carrying the record, so every
+        # other receipt's audit output is unchanged
+        *([check_lane_c_registrations(receipt, cfg)]
+          if getattr(receipt, "lane_c_registrations", None) is not None else []),
         *([check_marketcast(receipt, cfg, marketcast_reports,
                             **_instance_inputs(marketcast_inputs, None))]
           if cfg.marketcast.active(int(receipt.epoch_start_block)) else []),

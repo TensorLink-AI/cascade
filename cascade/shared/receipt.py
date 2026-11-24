@@ -613,6 +613,11 @@ class RoundReceipt:
     # the 3-lane vector. None on every pre-lane-C receipt (bytes unchanged).
     lane_c: tuple[dict, ...] | None = None
     lane_c_pay: dict | None = None
+    # Owner 2026-11-24: the slot holders' registrations as of the boundary −
+    # 1 this settlement judged ({block, rows, sha256};
+    # :mod:`cascade.shared.lane_c_registrations`) — replayed, never re-read
+    # from chain history. Drop-when-None (every other receipt's bytes kept).
+    lane_c_registrations: dict | None = None
     # DEC-CA-0057 (drop-when-default, so every receipt judged without an
     # overlay keeps its exact bytes): the owner-signed network-config overlay
     # this settlement was judged under — its ``seq`` and body digest; the
@@ -720,6 +725,9 @@ class RoundReceipt:
             body["lane_c"] = [json.loads(json.dumps(r, sort_keys=True)) for r in self.lane_c]
         if self.lane_c_pay is not None:
             body["lane_c_pay"] = json.loads(json.dumps(self.lane_c_pay, sort_keys=True))
+        if self.lane_c_registrations is not None:
+            body["lane_c_registrations"] = json.loads(
+                json.dumps(self.lane_c_registrations, sort_keys=True))
         if self.netconfig_seq:
             body["netconfig_seq"] = int(self.netconfig_seq)
             body["netconfig_digest"] = str(self.netconfig_digest)
@@ -784,6 +792,7 @@ def build_receipt(
     king_check_scores: tuple[EntryScores, ...] = (),
     lane_c: list[dict] | None = None,
     lane_c_pay: dict | None = None,
+    lane_c_registrations: dict | None = None,
     netconfig_seq: int = 0,
     netconfig_digest: str = "",
     manifest_sha256: str = "",
@@ -831,6 +840,8 @@ def build_receipt(
         king_check_scores=tuple(king_check_scores),
         lane_c=None if lane_c is None else tuple(dict(r) for r in lane_c),
         lane_c_pay=None if lane_c_pay is None else dict(lane_c_pay),
+        lane_c_registrations=(None if lane_c_registrations is None
+                              else json.loads(json.dumps(lane_c_registrations))),
         netconfig_seq=int(netconfig_seq or 0),
         netconfig_digest=str(netconfig_digest or "") if netconfig_seq else "",
         manifest_sha256=str(manifest_sha256 or ""),
@@ -1023,6 +1034,8 @@ def _receipt_from_obj(obj: dict) -> RoundReceipt:
                 else tuple(dict(r) for r in obj["lane_c"])),
         lane_c_pay=(dict(obj["lane_c_pay"]) if isinstance(obj.get("lane_c_pay"), dict)
                     else None),
+        lane_c_registrations=(dict(obj["lane_c_registrations"])
+                              if isinstance(obj.get("lane_c_registrations"), dict) else None),
         netconfig_seq=int(obj.get("netconfig_seq", 0) or 0),
         netconfig_digest=str(obj.get("netconfig_digest", "") or ""),
         manifest_sha256=str(obj.get("manifest_sha256", "") or ""),

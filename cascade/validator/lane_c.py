@@ -271,6 +271,9 @@ class _LaneCRound:
     consume_pending: bool = True     # False: no king — the pending set carries over
     mkt: object = None               # DEC-CA-0064 MktPlan (None = no MarketCast change)
     plans: dict = field(default_factory=dict)   # every other competition's plan, by kind
+    # slot-holder registrations consulted (every competition's plan), for the
+    # receipt's ``lane_c_registrations`` record (owner 2026-11-24)
+    registrations: list = field(default_factory=list)
 
 
 class LaneCMixin:
@@ -326,7 +329,11 @@ class LaneCMixin:
         pay = getattr(self, "_last_lane_c_pay", None)
         if rows is None and pay is not None:
             rows = []
-        return {"lane_c": rows, "lane_c_pay": pay}
+        kw = {"lane_c": rows, "lane_c_pay": pay}
+        reg = self.__dict__.get("_last_lane_c_registrations")
+        if reg is not None and rows is not None:
+            kw["lane_c_registrations"] = reg
+        return kw
 
     def _lane_c_settle_block(self, client: object) -> int | None:
         """The block a lane-C vector is paid at: this session's last judged
@@ -433,9 +440,11 @@ class LaneCMixin:
                                    commitments_fn=self._lane_c_commitments)
             plans[comp.kind] = plan
             js += list(cjs)
+        regs = [r for plan in plans.values()
+                for r in (getattr(plan, "registrations", None) or ())]
         mplan = plans.pop("mkt", None)
         return _LaneCRound(rid, block, rows + judgements_record(js), js, era_index,
-                           mkt=mplan, plans=plans)
+                           mkt=mplan, plans=plans, registrations=regs)
 
     @staticmethod
     def _lane_c_fold(st: LaneCState, r: _LaneCRound) -> list[TargetWin]:
@@ -527,8 +536,14 @@ class LaneCMixin:
     def _lane_c_commit(self, rounds: list[_LaneCRound] | None) -> list[dict] | None:
         """Fold prepared rounds (idempotent per round id), persist atomically,
         and return the CURRENT round's receipt rows."""
+        from ..shared.lane_c_registrations import registration_record
+
         if rounds is None:
+            self.__dict__["_last_lane_c_registrations"] = None
             return None
+        cur = rounds[-1]
+        self.__dict__["_last_lane_c_registrations"] = registration_record(
+            max(0, int(cur.block) - 1), cur.registrations)
         st = self._lane_c()
         for r in rounds:
             for w in self._lane_c_fold(st, r):
