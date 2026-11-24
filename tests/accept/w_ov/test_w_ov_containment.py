@@ -219,20 +219,25 @@ def test_loader_round_trip_of_the_new_keys(name, tmp_path):
     import tomllib
 
     from cascade.shared.config import load_chain_config
+    from cascade.shared.era import era_length_blocks
 
     raw = shipped_raw(name)
-    v2 = int(load_chain_config(ROOT / name).v2.from_block or 0)
-    start = ((max(v2, LAUNCH) + ERA - 1) // ERA) * ERA
+    shipped = load_chain_config(ROOT / name)
+    v2 = int(shipped.v2.from_block or 0)
+    lc_from = int(shipped.lane_c.from_block or 0)
+    era = int(era_length_blocks(shipped.round, max(v2, lc_from, LAUNCH)))
+    # lane B launches at lane C's start when lane C is armed (a lane C taken
+    # from lane B needs it live), else at the first era start from the launch
+    start = lc_from or ((max(v2, LAUNCH) + era - 1) // era) * era
     raw.setdefault("lane_b", {})["from_block"] = start
-    raw["lane_b"]["until_block"] = start + 8 * ERA
-    raw.setdefault("lane_c", {})["until_block"] = (
-        max(int(raw["lane_c"].get("from_block", 0) or 0), start) + 8 * ERA)
+    raw["lane_b"]["until_block"] = start + 8 * era
+    raw.setdefault("lane_c", {})["until_block"] = max(lc_from, start) + 8 * era
     text = _dump_toml(raw)
     p = tmp_path / "chain.toml"
     p.write_text(text)
-    assert tomllib.loads(text)["lane_b"]["until_block"] == start + 8 * ERA
+    assert tomllib.loads(text)["lane_b"]["until_block"] == start + 8 * era
     cfg = load_chain_config(p)
-    assert getattr(cfg.lane_b, "until_block", None) == start + 8 * ERA
+    assert getattr(cfg.lane_b, "until_block", None) == start + 8 * era
     assert getattr(cfg.lane_c, "until_block", None) == raw["lane_c"]["until_block"]
     assert getattr(cfg.marketcast, "until_block", None) == raw["lane_c"]["until_block"]
 
