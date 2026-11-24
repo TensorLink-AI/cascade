@@ -1,7 +1,7 @@
 ---
 id: DEC-CA-0073
 type: decision
-title: "Lane C harness competition (`app:<scenario>`): miners submit decision software that calls a Cascade forecaster; judged forward-only on simulated real-data episodes, paired against a reference harness on the same model"
+title: "Lane C harness competition (`app:<scenario>`): miners submit decision software that calls our fine-tuned model for the vertical; judged forward-only on simulated real-data episodes, paired against a reference harness on the same model"
 status: draft
 date: 2026-11-24
 tags: [lane-c, competitions, harness, applications, v2]
@@ -32,11 +32,12 @@ fine-tuned models with a decision-based measure, not only CRPS.
    observation and a handle to a validator-hosted forecaster, and returns an
    action at each decision step. It is not trained and needs no GPU of its
    own.
-2. **The model is fixed by the competition, not by the miner.** Each scenario
-   names its forecaster: the current holder of a lane-C slot (for example
-   `mkt:market`), or a pinned base when no slot is held. Miners compete on
-   decision logic, not on which weights they load. A harness may not ship
-   weights or a model of its own beyond a size cap (see Rules).
+2. **The model is our fine-tune for that vertical (owner, 2026-11-24).** We
+   fine-tune one model per vertical in lane C. Each harness scenario is paired
+   with its vertical's fine-tune target and always calls that target's
+   current slot holder (see **Vertical pairing**). Miners compete on decision
+   logic, not on which weights they load. A harness may not ship weights or a
+   model of its own beyond a size cap (see Rules).
 3. **Scenarios are targets.** A target is `app:<scenario>`. Each scenario is a
    simulator driven by real data that is recorded **after** the harness was
    committed (forward-only, like MarketCast). Proposed first scenarios:
@@ -58,6 +59,40 @@ fine-tuned models with a decision-based measure, not only CRPS.
    with the existing gain-tiered slot schedule and TTL.
 7. **Separate product.** Winning harnesses are published (open source, with
    their recorded episodes) as reference apps for the models.
+
+## Vertical pairing
+
+Each vertical has two lane-C competitions that feed each other:
+
+| vertical | fine-tune target (the model) | harness target (the app) |
+|---|---|---|
+| markets / trading | `mkt:market` (MarketCast, live) | `app:perp` |
+| energy | an energy-price fine-tune, e.g. `nrg:<market>` (to build) | `app:bess` |
+| inventory / demand | a demand fine-tune, e.g. `dmd:<suite>` (to build) | `app:inventory` |
+
+Rules:
+
+- **The forecaster is the fine-tune's slot holder.** At judging, the validator
+  loads the trained pointer of the paired fine-tune target's current holder.
+  Before that target has a holder, it uses the fine-tune competition's pinned
+  base (Timestral-28M for MarketCast). This is the same model a winning
+  fine-tune would ship.
+- **Harness entries are judged on one model.** Each judge-phase row records
+  the forecaster pointer. The miner's run, the reference run and the
+  naive-model run in a verdict all use that pointer.
+- **When the fine-tune holder changes.** The harness slot holder keeps its
+  slot, but its next confirm runs on the new model. A pending entry whose
+  confirm would run on a different model than its judge phase is dropped as
+  `stale` and requeued uncharged, like `base_moved` in DEC-CA-0056. A harness
+  that only worked with the old weights loses its slot at that confirm.
+- **An app arms only after its vertical's fine-tune.** `app:<scenario>`
+  needs its paired fine-tune target configured (load-checked). Running on the
+  pinned base until the first holder is allowed.
+- **Feedback to the fine-tune (later, not consensus at first).** Each verdict
+  also reports the reference harness's score on the new holder against the
+  old one: a decision-based check on whether a CRPS win helped in use. It is
+  published as a diagnostic only. Making it a guard on fine-tune wins is a
+  later decision.
 
 ## Scenarios
 
@@ -84,9 +119,10 @@ oracle-normalised and so scale-free across assets, markets and days.
   difference against the reference harness.
 - **Reference harness.** A rolling-horizon LP on the forecaster's median
   (P50) path, re-solved every hour.
-- **Forecaster.** Needs an energy-price model. Candidates are the
-  `domain:energy` lane-C slot holder, or a MarketCast-style pinned base
-  fine-tuned for prices (Q4).
+- **Forecaster.** The energy-price fine-tune's slot holder (`nrg:<market>`).
+  That competition is MarketCast-shaped: a pinned base, forward-only CRPS on
+  the same AEMO prices. Both the recorder and the data adapter are shared
+  between the two.
 
 This is the cleanest scenario. It has a bounded oracle, so the score is
 scale-free and the noise is low. Quantile forecasts help in a way you can
@@ -109,7 +145,8 @@ measure: reserving SoC for spikes depends on the upper tail.
   or the cost ratio. This is Q3.
 - **Reference harness.** A base-stock policy at the critical fractile
   `p / (p + h)`, using the forecaster's quantile of lead-time demand.
-- **Forecaster.** The lane-A king, or the `domain:sales` slot holder.
+- **Forecaster.** The demand fine-tune's slot holder (`dmd:<suite>`), trained
+  on the same forward count series.
 
 ### `app:perp` — crypto perp trading on MarketCast bars
 
@@ -127,8 +164,8 @@ measure: reserving SoC for spikes depends on the upper tail.
   count as one observation.
 - **Reference harness.** A vol-targeted position on the forecaster's
   median / IQR (size ∝ P50 / (P75 − P25)), with a no-trade band.
-- **Forecaster.** The `mkt:market` slot holder, or Timestral-28M base before
-  that.
+- **Forecaster.** The `mkt:market` slot holder (the MarketCast fine-tune), or
+  the pinned Timestral-28M base before the first holder.
 
 This is the scenario people ask for most, and the hardest to judge. Returns
 are noisy, so it needs many more episodes per verdict. Read the noise budget
@@ -159,7 +196,7 @@ class Harness(HarnessBase):
 ```
 
 `fc.forecast(context, horizon, levels, covariates=…)` is the only way to reach
-the model. It returns quantiles from the scenario's pinned forecaster. Each
+the model. It returns quantiles from the vertical's fine-tuned model. Each
 step has a call budget (`calls_per_step`, cap 8) and a context-length cap.
 
 ## Rules
@@ -218,27 +255,26 @@ step_cpu_ms          = 200
 tree_max_bytes       = 2_000_000
 
 [harness.bess]
-forecaster = "slot:domain:energy"   # or "pinned:<repo>@<rev>"
+model      = "nrg:aemo"   # paired fine-tune target; its holder (or pinned base) is the forecaster
 regions    = ["NSW1", "QLD1", "VIC1", "SA1", "TAS1"]
 episode_h  = 24
 ```
 
 ## Open (owner to answer)
 
-- **Q1. Forecaster change.** When the forecaster's slot holder changes, does
-  the harness slot holder keep the slot, or is it re-scored on the new model?
-  Proposal: it keeps the slot, but its next confirm runs on the new model.
-  An entry judged on a model that has since been replaced is stale, like
-  `base_moved`.
+- **Q1. Forecaster change.** Proposed in **Vertical pairing**: the holder
+  keeps its slot, and its next confirm runs on the new model. Confirm this,
+  or choose to re-score every harness holder at each fine-tune change.
 - **Q2. Model-lift gate.** Should a harness be *required* to beat its own
   naive-forecast run? Requiring it keeps the competition about the model.
   Dropping it widens the field to any good policy.
 - **Q3. Score per scenario.** Use the oracle-normalised capture or regret
   ratio, or the raw cost ratio? Should `app:perp` use log-growth minus CVaR,
   or a Sharpe-like score?
-- **Q4. Which forecaster for energy and inventory?** MarketCast only covers
-  markets. `app:bess` needs an energy-price forecaster: a `domain:energy`
-  slot or a new pinned base. Or should `app:bess` start on the lane-A king?
+- **Q4. The energy and demand fine-tunes.** Resolved in principle: each
+  vertical uses its own fine-tune (owner, 2026-11-24). Still open: the pinned
+  base and suites for `nrg:` and `dmd:` (Timestral-28M again?), and whether
+  each app scenario arms with its fine-tune or one era after it.
 - **Q5. Noise budget.** Before any `from_block`, run the reference harness
   against small perturbations of itself on recorded data. Measure how many
   episodes a 1 % gain needs to pass at α/k. This decides
@@ -252,10 +288,14 @@ episode_h  = 24
 
 ## Rollout
 
-1. Build `app:bess` first: scenario, reference, oracle, runner and audit
-   replay. Run the Q5 noise study offline on recorded AEMO data.
+1. Build `app:perp` plumbing on `mkt:market` first: it is the only vertical
+   whose fine-tune exists, so the forecaster pairing can be tested end to
+   end. In parallel, build the `nrg:` fine-tune and `app:bess` together, since
+   they share the AEMO recorder. Run the Q5 noise study offline for each
+   scenario.
 2. Testnet with the reference harness and two or three variants written by
    us (good, bad, model-blind), to check that the verdicts rank them
    correctly.
-3. Ship the release, then arm `app:bess` at an era boundary. Add
-   `app:inventory`, then `app:perp`, each after its own noise study.
+3. Ship the release, then arm each `app:` scenario at an era boundary, after
+   its fine-tune target and its own noise study. `app:bess` is the likely
+   first to pass the noise study; `app:perp` the last.
