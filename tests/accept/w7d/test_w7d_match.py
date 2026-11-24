@@ -148,19 +148,22 @@ def test_the_replay_rederives_pay_shares(chains, name):
         assert math.isclose(sum(s for _, _, s in got), float(c.cfg.share), rel_tol=1e-12)
 
 
-def test_the_house_bar_court_pays_the_new_king_and_the_prior_king_by_decay(chains):
+def test_the_house_bar_court_pays_the_new_king_and_the_prior_king_by_court_weights(chains):
     c = chains["house_bar"]
     last = replay(c.pub, uid_of=dict(c.pub.uid_of))[-1]
     assert len(last.pay) == 2, f"fixture: Y crowned over X, two paid slots; got {last.pay}"
-    share, decay = float(c.cfg.share), float(c.cfg.king_decay)
+    # rev6.23: a two-slot court renormalises court_weights[:2] (80 / 15).
+    share, (w0, w1) = float(c.cfg.share), [float(w) for w in c.cfg.court_weights[:2]]
     (y_d, y_uid, y_s), (x_d, x_uid, x_s) = [tuple(s) for s in last.pay]
     assert (y_d, y_uid, x_d, x_uid) == (c.y["digest"], 12, c.x["digest"], 11)
-    assert math.isclose(y_s, share / (1 + decay)) and math.isclose(x_s, share * decay / (1 + decay))
+    assert math.isclose(y_s, share * w0 / (w0 + w1)) and math.isclose(x_s, share * w1 / (w0 + w1))
+    assert math.isclose(y_s, share * 0.80 / 0.95) and math.isclose(x_s, share * 0.15 / 0.95)
     # The weights the producer's emission derives from the same court agree
     # (the test may import it; the replay may not).
     from cascade.shared.emission import lane_d_vector
 
-    vec = lane_d_vector(16, share=share, court_uids=[12, 11], king_decay=decay, burn_uid=0)
+    vec = lane_d_vector(16, share=share, court_uids=[12, 11],
+                        court_weights=c.cfg.court_weights, burn_uid=0)
     assert math.isclose(vec[12], y_s) and math.isclose(vec[11], x_s)
 
 

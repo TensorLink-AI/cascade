@@ -17,6 +17,7 @@ from .helpers import (
     UNTIL_BLOCK_2,
     W2_DEFAULTS,
     W2_KEYS,
+    co_for,
     comparable,
     dump_lane_d,
     field,
@@ -90,9 +91,9 @@ def test_w2_shipped_table_carries_every_key_at_its_default(name):
 def test_w2_key_mutation_changes_the_parsed_value(name, key):
     """Two different values give two different parsed values (an unread key
     would give the same config twice)."""
-    a, b, co = MUTATIONS[key]
-    ld_a = load_ok(raw_with(name, {**co, key: a}), f" with {key}={a!r}").lane_d
-    ld_b = load_ok(raw_with(name, {**co, key: b}), f" with {key}={b!r}").lane_d
+    a, b, _co = MUTATIONS[key]
+    ld_a = load_ok(raw_with(name, {**co_for(key, a), key: a}), f" with {key}={a!r}").lane_d
+    ld_b = load_ok(raw_with(name, {**co_for(key, b), key: b}), f" with {key}={b!r}").lane_d
     va, vb = field(ld_a, key), field(ld_b, key)
     if key == "gate_weights":
         assert weights(va) == weights(a) and weights(vb) == weights(b), (va, vb)
@@ -118,6 +119,9 @@ ROUND_TRIP = {
     **LEGACY_VALUES,
     "notes": {"owner": "w2 round-trip"},
 }
+# rev6.23: one court weight per slot of the mutated reward_prior_kings.
+ROUND_TRIP["court_weights"] = [0.9] + [0.1 / ROUND_TRIP["reward_prior_kings"]] * \
+    ROUND_TRIP["reward_prior_kings"]
 DUMP_KEYS = W2_KEYS + LEGACY_KEYS + ("notes",)
 
 

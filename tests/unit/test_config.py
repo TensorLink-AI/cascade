@@ -412,6 +412,7 @@ def test_retired_keys_load_and_are_ignored(tmp_path):
         DEFAULT_CHAIN_TOML,
         RETIRED_KEYS,
         EvalConfig,
+        LaneDConfig,
         RoundConfig,
         TelemetryConfig,
         ValidatorConfig,
@@ -421,7 +422,8 @@ def test_retired_keys_load_and_are_ignored(tmp_path):
     live = {"round": {f.name for f in dataclasses.fields(RoundConfig)},
             "telemetry": {f.name for f in dataclasses.fields(TelemetryConfig)},
             "eval": {f.name for f in dataclasses.fields(EvalConfig)},
-            "validator": {f.name for f in dataclasses.fields(ValidatorConfig)}}
+            "validator": {f.name for f in dataclasses.fields(ValidatorConfig)},
+            "lane_d": {f.name for f in dataclasses.fields(LaneDConfig)}}
     for section, keys in RETIRED_KEYS.items():
         assert not keys & live[section], f"[{section}] retired key is a live field"
 

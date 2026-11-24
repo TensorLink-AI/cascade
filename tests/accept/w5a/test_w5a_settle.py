@@ -261,5 +261,5 @@ def test_e2e_skeleton_refuses_trap_windows_and_still_pays_the_challenger(tmp_pat
         "the challenger was not crowned: trap windows sank it"
     assert s2.pay["court_uids"][0] == CHALLENGER_UID
     vec = lane_d_vector(N_UIDS, share=s2.pay["share"], court_uids=s2.pay["court_uids"],
-                        king_decay=cfg.king_decay, burn_uid=0)
+                        court_weights=cfg.court_weights, burn_uid=0)
     assert vec[CHALLENGER_UID] > 0.0

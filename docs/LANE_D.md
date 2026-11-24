@@ -179,8 +179,13 @@ confirmation duel (FAQ).
 
 **Verdict.** A paired cluster bootstrap of the CRPS/MASE geomean ratio
 (clusters = source) with lane A's quantile head scoring. The challenger
-clears if `LCB ≥ d_margin` (`d_margin = 0.01`, at `alpha = 0.05`) and the
-point gain is strictly positive. Several entries freezing in one settlement
+clears if `LCB ≥` the crown bar in force at the settlement (at `alpha =
+0.05`) and the point gain is strictly positive. The bar decays with the
+current KING_D's tenure (the lane D settlements it has held the crown, the
+house included): `d_margin_start` (0.03) at tenure 0, falling linearly to
+`d_margin` (0.01) over `d_margin_warmup_settlements` (32 settlements, about
+4 days at 3 h each), flat after. A new crown restarts it. The signed report
+records the tenure and the bar applied (`crown_bar`). Several entries freezing in one settlement
 form a cohort judged with max-T on their shared window set. When a miner
 holds KING_D, each member must also clear the current house on the same set.
 An entry is
@@ -219,8 +224,12 @@ and only published, so the board shows whether lane D generalises.
 ## Pay and the court
 
 KING_D is paid from lane D's `share` of emissions. The court is KING_D plus
-up to `reward_prior_kings` (2) prior **miner** kings, decayed by
-`king_decay` (0.5) inside lane D's share. Unpaid share (a house king, an
+up to `reward_prior_kings` (2) prior **miner** kings, paid by the explicit
+`court_weights` `[0.80, 0.15, 0.05]` inside lane D's share: 80% to KING_D,
+15% to the newest prior king, 5% to the next. A court with fewer slots splits
+over the slots it has (KING_D alone takes all of it; KING_D plus one prior
+king take 0.80/0.95 and 0.15/0.95). Prior kings keep being paid with no time
+limit. Unpaid share (a house king, an
 empty or deregistered slot) burns; the remainder destination is release-only
 (`remainder = "burn"`). The shipped default is `share = 0.0` and
 `takes_from = "lane_b"`; the activation overlay sets the live split. Check

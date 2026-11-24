@@ -101,6 +101,10 @@ RETIRED_KEYS: dict[str, frozenset[str]] = {
     # Parsed by older releases (hf_cache_seconds was REQUIRED there), read by none.
     "eval": frozenset({"eval_source"}),
     "validator": frozenset({"hf_cache_seconds"}),
+    # rev6.23 (owner 2026-11-24): lane D's court pays explicit
+    # ``court_weights``; the geometric ``[lane_d] king_decay`` is read by no
+    # release. (Lane A's ``[scoring] king_decay`` is a different, live key.)
+    "lane_d": frozenset({"king_decay"}),
 }
 
 

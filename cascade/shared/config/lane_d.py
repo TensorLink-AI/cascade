@@ -17,6 +17,7 @@ schedule, ``notes``) keep parsing as written: the deployed file carries them.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -40,6 +41,16 @@ LANE_D_GATE_SUITES = ("gift", "boom", "time", "fev")
 LANE_D_LOWFREQ_FREQS = ("D", "W", "M", "ME", "MS", "Q", "QE", "QS", "A", "Y", "YE")
 
 
+def lane_d_crown_bar(start: float, end: float, warmup: int, tenure: int) -> float:
+    """``start - (start - end) * tenure / warmup`` (rev6.23): exactly
+    ``start`` at tenure 0 and exactly ``end`` from tenure ``warmup`` on. One
+    expression, so every re-derivation gets the same float."""
+    t, w = max(0, int(tenure)), int(warmup)
+    if t >= w:
+        return float(end)
+    return float(start) - (float(start) - float(end)) * t / w
+
+
 @dataclass(frozen=True)
 class LaneDConfig:
     # Activation (D10/D45): 0 = off; an era-boundary block arms it. The lane
@@ -61,7 +72,12 @@ class LaneDConfig:
     min_clusters: int = 20
     min_long_series: int = 300
     max_source_share: float = 0.25
+    # rev6.23 (owner 2026-11-24): the crown bar decays with KING_D's tenure,
+    # linearly from ``d_margin_start`` to ``d_margin`` (the end, the floor)
+    # over ``d_margin_warmup_settlements`` settlements (see :meth:`crown_bar`).
     d_margin: float = 0.01
+    d_margin_start: float = 0.03
+    d_margin_warmup_settlements: int = 32
     alpha: float = 0.05
     bootstrap_B: int = 10_000
     # W2e (rev6.10 (a)/(b), rev6.11 (a), rev6.12 (b)): the per-series embargo
@@ -80,9 +96,11 @@ class LaneDConfig:
     gate_weights: tuple[tuple[str, float], ...] = tuple((s, 1.0) for s in LANE_D_GATE_SUITES)
     tau_public: float = 0.01
     lowfreq_freqs: tuple[str, ...] = LANE_D_LOWFREQ_FREQS
-    # Court (§1.4, D7).
+    # Court (§1.4, D7). rev6.23 (owner 2026-11-24): explicit slot weights,
+    # KING_D first, one per slot (``1 + reward_prior_kings``), summing to 1;
+    # they replace the retired geometric ``king_decay``.
     reward_prior_kings: int = 2
-    king_decay: float = 0.5
+    court_weights: tuple[float, ...] = (0.80, 0.15, 0.05)
     confirm_on_king_change: str = "restart"
     # Rate limits, queue and TTLs (D3, D8, A1, A8, A9, B10).
     max_entries_per_settlement: int = 8
@@ -115,6 +133,14 @@ class LaneDConfig:
     win_ttl_eras: int = 28
     # Free-form owner notes carried through for the dashboards.
     notes: dict = field(default_factory=dict)
+
+    def crown_bar(self, tenure: int) -> float:
+        """rev6.23: the bar a combined LCB must reach to crown at a settlement
+        where KING_D (a miner or the house) has held the crown ``tenure``
+        lane D settlements: ``d_margin_start`` at tenure 0, falling linearly
+        to ``d_margin`` at ``d_margin_warmup_settlements`` and flat after."""
+        return lane_d_crown_bar(self.d_margin_start, self.d_margin,
+                                self.d_margin_warmup_settlements, tenure)
 
     def active(self, boundary: int | None) -> bool:
         """Whether the SETTLEMENT at ``boundary`` judges lane D: its era starts
@@ -209,6 +235,26 @@ def _gate_weights(raw: object, suites: tuple[str, ...]) -> tuple[tuple[str, floa
     return tuple(out)
 
 
+def _court_weights(raw: object, reward_prior_kings: int) -> tuple[float, ...]:
+    """rev6.23: one finite weight >= 0 per court slot (KING_D, then
+    ``reward_prior_kings`` prior kings), summing to 1 within 1e-9."""
+    want = 1 + int(reward_prior_kings)
+    if not isinstance(raw, (list, tuple)) or len(raw) != want:
+        raise ValueError(f"[lane_d] court_weights must be a list of {want} numbers "
+                         f"(1 + reward_prior_kings); got {raw!r}")
+    out = []
+    for i, w in enumerate(raw):
+        v = _float(w, f"court_weights[{i}]")
+        if not math.isfinite(v) or v < 0.0:
+            raise ValueError(f"[lane_d] court_weights[{i}] must be a finite number >= 0; "
+                             f"got {w!r}")
+        out.append(v)
+    if abs(math.fsum(out) - 1.0) > 1e-9:
+        raise ValueError(f"[lane_d] court_weights must sum to 1 (within 1e-9); got "
+                         f"{math.fsum(out)!r}")
+    return tuple(out)
+
+
 def _str_list(raw: object, name: str) -> tuple[str, ...]:
     if not isinstance(raw, (list, tuple)) or not all(isinstance(x, str) for x in raw):
         raise ValueError(f"[lane_d] {name} must be a list of strings; got {raw!r}")
@@ -293,6 +339,15 @@ def parse_lane_d(raw: object, *, era_blocks_at: Callable[[int], int] | None = No
     # netconfig.validate_overlay rebuilds the merged config through here).
     min_windows = _int(ld.get("min_windows", 1000), "min_windows", lo=1)
     d_margin = _open_unit(ld.get("d_margin", 0.01), "d_margin")
+    # rev6.23: the tenure-decaying crown bar; ``d_margin`` is its end.
+    d_start = _open_unit(ld.get("d_margin_start", 0.03), "d_margin_start")
+    if d_margin > d_start:
+        raise ValueError(f"[lane_d] d_margin={d_margin} (the bar's end) must be <= "
+                         f"d_margin_start={d_start} (rev6.23)")
+    d_warmup = _int(ld.get("d_margin_warmup_settlements", 32),
+                    "d_margin_warmup_settlements", lo=1)
+    rpk = _int(ld.get("reward_prior_kings", 2), "reward_prior_kings", lo=0)
+    court_w = _court_weights(ld.get("court_weights", [0.80, 0.15, 0.05]), rpk)
     embargo = _float(ld.get("embargo_hours", 48.0), "embargo_hours")
     if embargo < 0.0:
         raise ValueError(f"[lane_d] embargo_hours must be >= 0; got {embargo!r}")
@@ -331,8 +386,8 @@ def parse_lane_d(raw: object, *, era_blocks_at: Callable[[int], int] | None = No
         min_fresh_window_share=fresh, backtest_weight_cap=bt_cap,
         backtest_ratio_floor=bt_floor,
         gate_suites=suites, gate_weights=gate_w, tau_public=tau, lowfreq_freqs=lowfreq,
-        reward_prior_kings=_int(ld.get("reward_prior_kings", 2), "reward_prior_kings", lo=0),
-        king_decay=_half_open_unit(ld.get("king_decay", 0.5), "king_decay"),
+        d_margin_start=d_start, d_margin_warmup_settlements=d_warmup,
+        reward_prior_kings=rpk, court_weights=court_w,
         confirm_on_king_change=coc,
         max_entries_per_settlement=_int(ld.get("max_entries_per_settlement", 8),
                                         "max_entries_per_settlement", lo=1),
@@ -376,5 +431,6 @@ __all__ = [
     "LANE_D_REMAINDERS",
     "LANE_D_TAKES_FROM",
     "LaneDConfig",
+    "lane_d_crown_bar",
     "parse_lane_d",
 ]

@@ -386,7 +386,12 @@ def expected_params(cfg) -> dict:
             "max_mirror_lag_hours": float(cfg.max_mirror_lag_hours),
             "min_windows": int(cfg.min_windows), "min_clusters": int(cfg.min_clusters),
             "d_margin": float(cfg.d_margin), "alpha": float(cfg.alpha),
-            "bootstrap_B": int(cfg.bootstrap_B), "king_decay": float(cfg.king_decay),
+            "bootstrap_B": int(cfg.bootstrap_B),
+            # rev6.23: the tenure-decaying crown bar (d_margin is its end) and
+            # the explicit court weights (they replace king_decay).
+            "d_margin_start": float(cfg.d_margin_start),
+            "d_margin_warmup_settlements": int(cfg.d_margin_warmup_settlements),
+            "court_weights": [float(w) for w in cfg.court_weights],
             "reward_prior_kings": int(cfg.reward_prior_kings),
             "max_entries_per_settlement": int(cfg.max_entries_per_settlement),
             "max_judged_per_coldkey_per_settlement":
@@ -405,10 +410,25 @@ def expected_params(cfg) -> dict:
             "min_fresh_window_share": float(cfg.min_fresh_window_share)}
 
 
+def crown_bar_at(cfg, tenure: int) -> float:
+    """rev6.23: the crown bar at KING_D's ``tenure`` (lane D settlements it
+    has held the crown): ``d_margin_start`` at 0, linear to ``d_margin``
+    at ``d_margin_warmup_settlements``, flat after."""
+    w = int(cfg.d_margin_warmup_settlements)
+    t = max(0, int(tenure))
+    start, end = float(cfg.d_margin_start), float(cfg.d_margin)
+    if t >= w:
+        return end
+    return start - (start - end) * t / w
+
+
 def court_shares(cfg, n_slots: int) -> list[float]:
-    """§1.4 pay: slot ``i`` of an ``n_slots`` court is worth
-    ``share * king_decay**i / sum_j king_decay**j``."""
-    raw = [float(cfg.king_decay) ** i for i in range(n_slots)]
+    """§1.4 pay (rev6.23, owner 2026-11-24): slot ``i`` of an ``n_slots``
+    court is worth ``share * court_weights[i] / sum_{j < n_slots}
+    court_weights[j]`` (a short court renormalises over its slots; a slot
+    past ``court_weights`` weighs 0)."""
+    weights = [float(w) for w in cfg.court_weights]
+    raw = [weights[i] if i < len(weights) else 0.0 for i in range(n_slots)]
     total = sum(raw)
     return [float(cfg.share) * w / total for w in raw] if total > 0 else [0.0] * n_slots
 
@@ -443,10 +463,11 @@ def _geomean(crps: np.ndarray, mase: np.ndarray) -> float:
 
 
 def _judge(cfg, scores: dict, bar: str, members: list[str], clusters: list[str],
-           seed: str) -> list[tuple[float, float, bool]]:
+           seed: str, crown_bar: float) -> list[tuple[float, float, bool]]:
     """``(lcb, gain, cleared)`` per member against ``bar``: the max-T LCB
     over the cohort, the full-sample relative gain, and the clear
-    ``lcb >= d_margin and gain > 0``."""
+    ``lcb >= crown_bar and gain > 0`` (rev6.23: the bar at KING_D's
+    re-derived tenure, :func:`crown_bar_at`)."""
     lcbs = cohort_maxt_lcbs(_parts(*scores[bar]), [_parts(*scores[m]) for m in members],
                             alpha=float(cfg.alpha), B=int(cfg.bootstrap_B), seed=seed,
                             clusters=clusters)
@@ -456,7 +477,7 @@ def _judge(cfg, scores: dict, bar: str, members: list[str], clusters: list[str],
     for m, lcb in zip(members, lcbs, strict=True):
         gain = (bg - _geomean(*scores[m])) / denom
         out.append((float(lcb), float(gain),
-                    bool(float(lcb) >= float(cfg.d_margin) and gain > 0.0)))
+                    bool(float(lcb) >= float(crown_bar) and gain > 0.0)))
     return out
 
 
@@ -694,6 +715,8 @@ class _Chain:
     entries: dict = field(default_factory=dict)
     # W5f: the open house challenger {digest, reveal_ts, status}, or None
     house_entry: dict | None = None
+    # rev6.23: KING_D's tenure at the next settlement (0 at genesis)
+    tenure: int = 0
 
 
 def _house_key(digest: str) -> str:
@@ -771,6 +794,11 @@ class _Settlement:
         self._guarded("boundary", self.check_top)
         self._guarded("params", lambda: _compare(self.d, "params", expected_params(self.cfg),
                                                  self.r.get("params")))
+        # rev6.23: the tenure is the chain's, the bar the config's at it.
+        self._guarded("crown_bar", lambda: _compare(
+            self.d, "crown_bar", {"tenure": self.chain.tenure,
+                                  "bar": crown_bar_at(self.cfg, self.chain.tenure)},
+            self.r.get("crown_bar")))
         self._guarded("rows_sha256", self.check_rows_sha)
         self._guarded("armed_evidence", self.check_armed)
         self._guarded("house", self.check_house)
@@ -1303,7 +1331,8 @@ class _Settlement:
                 crps.append(float(row["crps"]))
                 mase.append(float(row["mase"]))
             scores[dg] = (np.asarray(crps, dtype=np.float64), np.asarray(mase, dtype=np.float64))
-        judged = {bar: _judge(cfg, scores, bar, members, clusters, self.seed) for bar in bars}
+        judged = {bar: _judge(cfg, scores, bar, members, clusters, self.seed,
+                              crown_bar_at(cfg, self.chain.tenure)) for bar in bars}
         for n, (m, key) in enumerate(zip(members, keys, strict=True)):
             j = by_digest[m]
             covered.add(m)
@@ -1679,6 +1708,9 @@ class _Settlement:
             got = ({k: king.get(k) for k in self.king_after} if isinstance(king, dict)
                    and set(self.king_after) <= set(king) else king)
             _compare(d, "state.king", self.king_after, got)
+        if not _same(state.get("king_tenure"), self.chain.tenure + 1
+                     if self.crown_key is None else 1):
+            d.add("state.king_tenure")
         pk = state.get("prior_kings")
         got_pk = ([{k: p.get(k) for k in ("digest", "hotkey", "house", "reveal_ts")}
                    if isinstance(p, dict) else p for p in pk] if isinstance(pk, list) else pk)
@@ -1726,6 +1758,8 @@ class _Settlement:
         c.king = dict(self.king_after) if self.king_after is not None else c.king
         c.house = self.house["digest"] if self.house is not None else c.house
         c.prior_kings = [dict(k) for k in self.prior_kings]
+        # rev6.23: a crown (or a house retake) restarts KING_D's tenure.
+        c.tenure = 1 if self.crown_key is not None else self.chain.tenure + 1
         for dg in self.dropped_holds:
             c.holds.pop(dg, None)
             c.pending.pop(dg, None)
@@ -1893,4 +1927,4 @@ def replay_chain(reports, receipts, cfg, *, signer_ss58: str,
 
 __all__ = ["MATCH", "MISMATCH", "RECEIPT_SCHEMA", "REPORT_SCHEMA", "STATE_SCHEMA", "STATUSES",
            "UNVERIFIABLE", "UNVERIFIABLE_REASONS", "SettlementReplay", "check_gate_rows",
-           "combined_log_ratio", "court_shares", "expected_params", "gate_draw", "replay_chain"]
+           "combined_log_ratio", "court_shares", "crown_bar_at", "expected_params", "gate_draw", "replay_chain"]

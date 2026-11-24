@@ -38,7 +38,7 @@ weights compare after normalising to shares of their sum.
 |---|---|---|---|
 | `from_block` | 0 | `tau_public` | 0.01 |
 | `until_block` | 0 (no end) | `reward_prior_kings` | 2 |
-| `share` | 0.0 | `king_decay` | 0.5 |
+| `share` | 0.0 | `court_weights` (rev6.23; `king_decay` retired) | `[0.80, 0.15, 0.05]` |
 | `takes_from` | `"lane_b"` (today's; D1's `lane_a` comes by overlay) | `max_entries_per_settlement` | 8 |
 | `remainder` | `"burn"` | `max_open_per_coldkey` | 2 |
 | `contexts` | `[4096, 8192, 16384, 32768, 65536, 131072]` (rev6.6) | `max_bench_holds` | 4 |
@@ -74,7 +74,11 @@ integers refuse bools and floats; floats refuse bools and strings;
 `contexts` a non-empty subset of {4096, 8192, 16384, 32768, 65536, 131072}
 (**the 131072 cap**); `0 < horizon <= 512` (720 refused, §1.1); `dtypes` a
 non-empty subset of {"BF16"}; `0 < d_margin < 1`; `0 < alpha < 1`;
-`0 < king_decay <= 1`; `0 < max_source_share <= 1`; floors and caps >= 1;
+**(rev6.23)** `court_weights` has `1 + reward_prior_kings` finite entries,
+each >= 0, summing to 1 within 1e-9 (`reward_prior_kings` alone is a length
+mismatch); `d_margin <= d_margin_start < 1` (defaults 0.01 / 0.03) and
+`d_margin_warmup_settlements >= 1` (32); `[lane_d] king_decay` is in
+`RETIRED_KEYS["lane_d"]` (loads, ignored); `0 < max_source_share <= 1`; floors and caps >= 1;
 `confirm_on_king_change` in `restart|original`; `gate_suites` non-empty unique
 non-empty strings (names are data, not a hardcoded list); `gate_weights` keys
 within `gate_suites`, non-negative, positive sum. `from_block > 0` loads at an
