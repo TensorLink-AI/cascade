@@ -3472,6 +3472,49 @@ The trainer runs the same resolver read-only (`netconfig_state.json` in its
 work root). It never signals, and it switches its rolling scheduler and
 promotion engine to the overlay at the same block.
 
+#### Mainnet launch runbook: step 1 on Wednesday, lane D later
+
+Owner decision, 2026-11-24 (option 1):
+
+1. **Wed 2026-11-25, at the launch era start 9586800: publish step 1 only.**
+   That is `deploy/overlays/launch-20261125.pre.mainnet.toml`, which splits
+   emission A 50 / B 35 / C 15. Do **not** publish
+   `launch-20261125.mainnet.toml` on mainnet. It is superseded and kept only
+   because tests pin it.
+2. **Later: arm lane D with `deploy/overlays/lane-d-step2.mainnet.toml`.**
+   This moves D 50 % from lane A (A 0 / B 35 / C 15 / D 50) with
+   `public_weight = 0.0`. Publish it only when both of these hold:
+   - the #913 satellite fix is released and deployed;
+   - at least 2/3 of eligible validator stake signals that release in its
+     readiness note.
+3. The file types `[lane_d] from_block = "next-era"`. The publish tool
+   resolves that to the first era start at least one era past
+   `--head-block`. It writes the resolved overrides (`--resolved-out`), and
+   the printed validator command uses that file. Step 1 is in force, so pass
+   its body as `--previous`:
+
+   ```bash
+   cascade-laned overlay publish --config chain.toml \
+       --overrides deploy/overlays/lane-d-step2.mainnet.toml \
+       --effective-block next-era --head-block <head> --previous <step 1 body.json> \
+       --upgrade-metagraph <metagraph.json> --upgrade-notes <notes.json> \
+       --upgrade-feature <the #913 release's readiness segment>
+   ```
+
+   Check the plan shows `LANE D: OFF -> ON` and
+   `LANE A SHARE: 0.5 -> 0.0`. The `UPGRADE` line prints the stake share
+   (computed with `cascade.laned.upgrade_tracker`). The tool refuses any
+   overlay that arms lane D below 2/3. `--force-upgrade-threshold`
+   overrides that refusal; it is an owner decision, so record it in the
+   OPSLOG. With no tracker inputs the share is unknown, and the overlay is
+   refused.
+4. From then on every overlay restates the RESOLVED `[lane_d] from_block`
+   (see the restate rule above).
+
+Testnet rehearses the same flow with `lane-d-step2.testnet.toml`. The gate
+lives in this wrapper only: `cascade-validator --netconfig-overlay` does not
+read the tracker, so use the wrapper for step 2.
+
 #### `cascade-laned overlay`: lane D bring-up kit (S0c)
 
 `cascade-laned overlay --help` lists four commands. None of them reads a

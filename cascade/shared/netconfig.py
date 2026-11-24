@@ -1387,7 +1387,40 @@ def lane_switches(cfg: ChainConfig, prev_cfg: ChainConfig, new: ChainConfig,
             a, b = getattr(lp, attr, None), getattr(ln, attr, None)
             if a != b:
                 lines.append(f"{label} {attr.upper()}: {a!r} -> {b!r}")
+    lines += _lane_a_moves(prev_cfg, new, block)
     return lines, implicit
+
+
+def lane_a_share(cfg: ChainConfig, boundary: int) -> float | None:
+    """Presentational: lane A's pool at settlement ``boundary`` (``1 - b - c -
+    d`` over the lanes active there, before lane B's unpaid refund)."""
+    from .lane_c import lane_pool_shares
+
+    b = cfg.lane_b if cfg.lane_b.active(boundary) else None
+    c = cfg.lane_c if cfg.lane_c.active(boundary) else None
+    d = cfg.lane_d if cfg.lane_d.active(boundary) else None
+    try:
+        s = lane_pool_shares(b, c, d)
+    except ValueError:
+        return None
+    return round(1.0 - s.b - s.c - s.d, 6)
+
+
+def _lane_a_moves(prev_cfg: ChainConfig, new: ChainConfig, block: int) -> list[str]:
+    """``LANE A SHARE: a -> b (from settlement S)`` at the first settlement
+    after ``block`` or after a lane start past it where lane A's pool moves."""
+    starts = {int(block)}
+    for c in (prev_cfg, new):
+        for table, _ in LANE_LABELS:
+            fb = int(getattr(getattr(c, table), "from_block", 0) or 0)
+            if fb > int(block):
+                starts.add(fb)
+    for s in sorted(starts):
+        probe = s + int(effective_epoch_blocks(new.round, s))
+        a, b = lane_a_share(prev_cfg, probe), lane_a_share(new, probe)
+        if a != b:
+            return [f"LANE A SHARE: {a!r} -> {b!r} (from settlement {probe})"]
+    return []
 
 
 _PREVIOUS = object()
