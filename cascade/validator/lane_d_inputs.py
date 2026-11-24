@@ -851,10 +851,15 @@ class SSHEvalHost:
     def __init__(self, hosts_path, *, cache_dir: str, budget_bytes: int, contexts,
                  host_name: str = "", device: str = "cuda", timeout_s: float = 3600.0,
                  grants: Callable[[str], dict | None] | None = None,
-                 run: Callable | None = None, public_root: str = ""):
+                 run: Callable | None = None, public_root: str = "",
+                 public_cache_dir: str = "", public_cache_budget_bytes: int = 0):
         self.hosts_path = Path(hosts_path)
-        # rev6.18 A3 (F4): the public mirror root ON the eval host.
+        # rev6.18 A3 (F4): a LOCAL public mirror root ON the eval host; empty =
+        # the Hippius mirror (owner 2026-11-24, #894: the eval host fetches only
+        # the drawn series, behind its Lium-volume cache).
         self.public_root = str(public_root or "")
+        self.public_cache_dir = str(public_cache_dir or "")
+        self.public_cache_budget_bytes = int(public_cache_budget_bytes or 0)
         self.host_name = host_name
         self.cache_dir = cache_dir
         self.budget_bytes = int(budget_bytes)
@@ -954,15 +959,14 @@ class SSHEvalHost:
     def public_scores(self, digest: str, *, context: int, horizon: int, draws,
                       block_hash: str, max_channels: int) -> dict:
         """rev6.18 A3 (F4): ``digest``'s per-window scores on the public
-        ``draws``, read and scored on the eval host from its public mirror
-        (``public`` request, JSON; the drawn window list only)."""
+        ``draws``, read and scored on the eval host (``public`` request, JSON;
+        the drawn window list only): from the Hippius mirror by default, from
+        a local mirror when ``eval_public_root`` is set."""
         from ..eval.lane_d_forecasts import PUBLIC_REPLY_SCHEMA, PUBLIC_REQUEST_SCHEMA
 
         host = self._host
         if host is None:
             raise RuntimeError("lane D eval host: public scores before a matching hello")
-        if not self.public_root:
-            raise RuntimeError("lane D eval host: no eval_public_root configured")
         grant = None
         if self._grants is not None:
             try:
@@ -974,8 +978,13 @@ class SSHEvalHost:
                 "max_channels": int(max_channels), "block_hash": block_hash,
                 "draws": list(draws), "pinned": dict(self._pinned), "grant": grant}
         args = ["public", "--cache-dir", self.cache_dir, "--budget-bytes",
-                str(self.budget_bytes), "--device", self.device,
-                "--public-root", self.public_root]
+                str(self.budget_bytes), "--device", self.device]
+        if self.public_root:
+            args += ["--public-root", self.public_root]
+        if self.public_cache_dir:
+            args += ["--public-cache-dir", self.public_cache_dir]
+        if self.public_cache_budget_bytes > 0:
+            args += ["--public-cache-budget-bytes", str(self.public_cache_budget_bytes)]
         if host.chain_toml:
             args += ["--chain-toml", host.chain_toml]
         reply = json.loads(self._ssh(host, args, json.dumps(meta, sort_keys=True).encode()))
@@ -990,6 +999,7 @@ INPUTS_FILE_KEYS = ("intake_state_dir", "pool_pins", "house_pointer", "house_sig
                     "eval_hosts", "eval_host_name", "eval_cache_dir", "eval_cache_budget_bytes",
                     "eval_device", "eval_timeout_seconds", "grant_expires_seconds",
                     "readiness", "t7", "bench_hosts", "public_indexes", "eval_public_root",
+                    "eval_public_cache_dir", "eval_public_cache_budget_bytes",
                     "scoring_envs", "score_cache_dir")
 _REQUIRED_KEYS = ("intake_state_dir", "pool_pins", "house_pointer", "house_signer_ss58",
                   "eval_hosts", "eval_cache_dir", "eval_cache_budget_bytes", "readiness", "t7")
@@ -1014,9 +1024,14 @@ def load_inputs_services(cfg: Any, path) -> dict:
         readiness = "/abs/laned_readiness.json"     # rev6.6: laned_readiness/1 (DocumentFile)
         t7 = "/abs/t7.json"                         # rev6.6: laned_t7/1 pod evidence
         bench_hosts = "/abs/lane_d_bench_hosts.toml"  # optional (W3b6a): [[host]] bench pod
-        eval_public_root = "/root/lane_d_public"    # rev6.18 F4: the public mirror ON the host
+        eval_public_root = "/root/lane_d_public"    # optional (rev6.18 F4): a LOCAL public
+                                                    # mirror ON the host; absent = the Hippius
+                                                    # mirror (deploy/laned/public_mirror.toml)
+        eval_public_cache_dir = "/workspace/lane_d_public_cache"  # optional: the host's public
+        eval_public_cache_budget_bytes = 600000000000             # blob cache (Lium volume)
         public_indexes = { gift_eval_pretrain = "/abs/idx/gift", rmisc = "/abs/idx/rmisc" }
                                                     # rev6.18 F4: the W6p indexes on the box
+                                                    # (`laned_public_mirror.py fetch-index`)
         scoring_envs = "/abs/scoring_envs.toml"   # optional (rev6.18 B5): default the
                                                   # release's deploy/laned/scoring_envs.toml
         score_cache_dir = "/abs/lane_d_score_cache"  # optional (B6): no cache without it
@@ -1041,7 +1056,7 @@ def load_inputs_services(cfg: Any, path) -> dict:
     bad = [k for k in strs if not isinstance(raw[k], str) or (k != "eval_host_name"
                                                              and not raw[k])]
     nums = [k for k in ("eval_cache_budget_bytes", "eval_timeout_seconds",
-                        "grant_expires_seconds") if k in raw]
+                        "grant_expires_seconds", "eval_public_cache_budget_bytes") if k in raw]
     bad += [k for k in nums if not _is_int(raw[k]) or raw[k] <= 0]
     pidx = raw.get("public_indexes", {})
     if not isinstance(pidx, dict) or not all(isinstance(v, str) and v for v in pidx.values()):
@@ -1065,7 +1080,9 @@ def load_inputs_services(cfg: Any, path) -> dict:
                        host_name=raw.get("eval_host_name", "") or ops.eval_host,
                        device=raw.get("eval_device", "cuda"),
                        timeout_s=float(raw.get("eval_timeout_seconds", 3600)), grants=grants,
-                       public_root=raw.get("eval_public_root", ""))
+                       public_root=raw.get("eval_public_root", ""),
+                       public_cache_dir=raw.get("eval_public_cache_dir", ""),
+                       public_cache_budget_bytes=int(raw.get("eval_public_cache_budget_bytes", 0)))
     from ..shared.config.lane_d import ScoringEnvError, load_scoring_envs
 
     try:
