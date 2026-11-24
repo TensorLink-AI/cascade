@@ -124,7 +124,7 @@ def test_a_better_model_clears_the_tenure_zero_bar_live_only(tmp_path, run):
     assert rc == 0, doc
     d = doc["data"]
     assert d["public_weight"] == 0.0
-    assert d["crown_bar"]["bar"] == pytest.approx(0.03)
+    assert d["crown_bar"]["margin"] == pytest.approx(0.03)
     assert d["floors"]["met"] and d["floors"]["sources"] == SOURCES
     assert d["verdict"]["cleared"] and d["would_clear"]
     assert set(d["verdict"]["halves"]) == {"live"}
@@ -146,7 +146,7 @@ def test_the_verdict_is_the_validators_judge_cohort_on_the_same_rows(tmp_path, r
     ld =dataclasses.replace(ld, public_weight=0.0)
     king = (np.array([r["king_crps"] for r in rows]), np.array([r["king_mase"] for r in rows]))
     cand = (np.array([r["crps"] for r in rows]), np.array([r["mase"] for r in rows]))
-    assert d["crown_bar"]["bar"] == pytest.approx(ld.crown_bar(32)) == pytest.approx(0.01)
+    assert d["crown_bar"]["margin"] == pytest.approx(ld.crown_bar(32)) == pytest.approx(0.01)
     newest = hashlib.sha256((tmp_path / "series.npz").read_bytes()).hexdigest()
     (want,) = judge_cohort(king, [cand], clusters=[r["source"] for r in rows], cfg=ld,
                            seed=f"lane-d/1:local:3:{newest}", bar=ld.crown_bar(32))

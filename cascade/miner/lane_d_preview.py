@@ -409,7 +409,7 @@ def run_preview(args, cfg) -> dict:
         "contexts": {"declared": int(args.context), "effective": int(cand_ctx),
                      "king": int(king_ctx), "armed": list(armed)},
         "public_weight": w_pub,
-        "crown_bar": {"tenure": int(args.tenure), "bar": float(bar),
+        "crown_bar": {"tenure": int(args.tenure), "margin": float(bar),
                       "start": float(ld.d_margin_start), "end": float(ld.d_margin),
                       "warmup_settlements": int(ld.d_margin_warmup_settlements)},
         "windows": {"eligible": len(triples), "after_source_cap": len(capped),
@@ -461,7 +461,7 @@ def describe(d: dict, *, show: int = DEFAULT_SHOW) -> list[str]:
     for half, rec in (v.get("halves") or {}).items():
         lines.append(f"  {half} half: point gain {_pct(rec.get('gain'))} on {rec.get('n')} windows")
     lines.append(f"  combined gain {_pct(v.get('gain'))}, LCB {_pct(v.get('lcb'))} vs the crown "
-                 f"bar {_pct(cb['bar'])} (tenure {cb['tenure']}; {_pct(cb['start'])} at tenure 0 "
+                 f"bar {_pct(cb['margin'])} (tenure {cb['tenure']}; {_pct(cb['start'])} at tenure 0 "
                  f"falling to {_pct(cb['end'])} after {cb['warmup_settlements']} settlements)")
     if not fl["met"]:
         lines.append(f"  floors NOT met: a verdict needs {fl['min_windows']} windows from "
@@ -472,7 +472,7 @@ def describe(d: dict, *, show: int = DEFAULT_SHOW) -> list[str]:
         verdict = "clears the statistic but the floors are not met here"
     else:
         why = []
-        if (_num(v.get("lcb")) or -1.0) < cb["bar"]:
+        if (_num(v.get("lcb")) or -1.0) < cb["margin"]:
             why.append("the LCB is below the bar")
         if any((_num(r.get("gain")) or 0.0) <= 0.0 for r in (v.get("halves") or {}).values()):
             why.append("a half's point gain is not positive")
