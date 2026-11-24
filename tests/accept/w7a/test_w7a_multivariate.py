@@ -17,11 +17,11 @@ from . import helpers as h
 from . import mv
 
 
-@pytest.fixture
-def mv_report(tmp_path):
-    r = mv.crowned_mv(tmp_path, channels={"src1": 3, "src3": 40},
-                      empty={"src3": (5, 17, 22, 30, 33, 38, 39)})
-    return r
+def _mv_report(tmp_path):
+    """Built in the test body (never a fixture): on main the build fails on
+    settle_mv's assertion, a failure of the test itself."""
+    return mv.crowned_mv(tmp_path, channels={"src1": 3, "src3": 40},
+                         empty={"src3": (5, 17, 22, 30, 33, 38, 39)})
 
 
 def test_schema_declares_the_channel_fields_on_a_window():
@@ -34,7 +34,8 @@ def test_schema_declares_the_channel_fields_on_a_window():
     assert sorted(then) == sorted(mv.CHANNEL_FIELDS)
 
 
-def test_every_multichannel_window_records_its_pick_and_univariate_ones_none(mv_report):
+def test_every_multichannel_window_records_its_pick_and_univariate_ones_none(tmp_path):
+    mv_report = _mv_report(tmp_path)
     rep, chain = mv_report["s1"].report, mv_report["chain"]
     h.assert_valid(rep)
     picks = chain["picks"][1]
@@ -69,7 +70,8 @@ def _refused(report, *codes: str, field: str | None = None) -> None:
         assert str(e.value.field).endswith(field)
 
 
-def test_a_partial_channel_record_is_refused(mv_report):
+def test_a_partial_channel_record_is_refused(tmp_path):
+    mv_report = _mv_report(tmp_path)
     rep = mv_report["s1"].report
     h.assert_valid(rep)
     # The schema's if/then states the all-or-none rule (a then-branch defect is
@@ -78,7 +80,8 @@ def test_a_partial_channel_record_is_refused(mv_report):
         _refused(_mutated(rep, lambda w, k=k: w.pop(k)), "missing_field", "bad_value", field=k)
 
 
-def test_an_inconsistent_channel_record_is_refused(mv_report):
+def test_an_inconsistent_channel_record_is_refused(tmp_path):
+    mv_report = _mv_report(tmp_path)
     rep = mv_report["s1"].report
     h.assert_valid(rep)
 

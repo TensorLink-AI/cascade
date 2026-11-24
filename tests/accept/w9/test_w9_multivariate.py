@@ -16,7 +16,6 @@ import inspect
 from pathlib import Path
 
 import numpy as np
-import pytest
 
 from tests.accept.w7a import mv
 
@@ -25,8 +24,9 @@ from . import helpers as h
 WIDE_EMPTY = (5, 17, 22, 30, 33, 38, 39)
 
 
-@pytest.fixture
-def run(tmp_path):
+def _run(tmp_path):
+    """Built in the test body (never a fixture): on main the build fails on
+    settle_mv's assertion, a failure of the test itself."""
     return mv.crowned_mv(tmp_path, channels={"src1": 3, "src3": 40},
                          empty={"src3": WIDE_EMPTY})
 
@@ -51,7 +51,8 @@ def _tampered(report: dict, fn) -> dict:
     return h.resign(out)
 
 
-def test_an_honest_multichannel_report_passes(run):
+def test_an_honest_multichannel_report_passes(tmp_path):
+    run = _run(tmp_path)
     rep = run["s1"].report
     assert any("n_channels" in w for w in rep["windows"])
     res = _audit(rep)
@@ -60,7 +61,8 @@ def test_an_honest_multichannel_report_passes(run):
     assert res.status == "PASS", res.detail
 
 
-def test_another_channel_pick_fails(run):
+def test_another_channel_pick_fails(tmp_path):
+    run = _run(tmp_path)
     rep = run["s1"].report
 
     def swap(w):
@@ -72,7 +74,8 @@ def test_another_channel_pick_fails(run):
     assert res.status == "FAIL" and "channels" in res.detail
 
 
-def test_a_hidden_empty_channel_claim_fails(run):
+def test_a_hidden_empty_channel_claim_fails(tmp_path):
+    run = _run(tmp_path)
     """Declaring more channels empty changes the candidates, so the pick no
     longer re-derives (and, with the snapshot, the claim is checked)."""
     rep = run["s1"].report
@@ -84,7 +87,8 @@ def test_a_hidden_empty_channel_claim_fails(run):
     assert res.status == "FAIL"
 
 
-def test_the_record_must_match_the_stored_series(run):
+def test_the_record_must_match_the_stored_series(tmp_path):
+    run = _run(tmp_path)
     rep = run["s1"].report
 
     def fewer(w):
@@ -102,7 +106,8 @@ def test_the_record_must_match_the_stored_series(run):
     assert res.status == "FAIL" and "snapshot" in res.detail
 
 
-def test_a_multichannel_series_recorded_univariate_fails_with_the_snapshot(run):
+def test_a_multichannel_series_recorded_univariate_fails_with_the_snapshot(tmp_path):
+    run = _run(tmp_path)
     rep = copy.deepcopy(run["s1"].report)
     w = next(x for x in rep["windows"] if x.get("n_channels_raw") == 3)
     for k in mv.CHANNEL_FIELDS:
@@ -112,7 +117,8 @@ def test_a_multichannel_series_recorded_univariate_fails_with_the_snapshot(run):
     assert res.status == "FAIL" and "univariate" in res.detail
 
 
-def test_without_max_channels_a_multichannel_report_fails(run):
+def test_without_max_channels_a_multichannel_report_fails(tmp_path):
+    run = _run(tmp_path)
     res = _audit(run["s1"].report, max_channels=None)
     assert res.status == "FAIL" and "max_channels" in res.detail
 
