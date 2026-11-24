@@ -32,10 +32,6 @@ cascade/audit/main.py
 cascade/interface/contamination_scan.py
 cascade/funding/intake.py
 cascade/funding/main.py
-# Tests-correction (owner 2026-11-24): the embargo and the hash-set pin are
-# overlay-settable now (W-OV / WB10 tests that pinned them release-only).
-tests/accept/w_ov/test_w_ov_envelope.py
-tests/accept/wb10/test_wb10_overlay.py
 # Plan rev6.25 + DEC-CA-0075 (PR #878).
 docs/plans/LANE_D_PLAN.md
 decisions/DEC-CA-0075-declarative-competitions-standard-pool-rule-menu.md
