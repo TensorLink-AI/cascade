@@ -65,6 +65,10 @@ class ExpertLaneParams:
     min_public_items: int = 10
     # rev6.22: the bar an UNDECLARED slot must clear (judge_expert_slots)
     undeclared_gain_margin: float = 0.02
+    # WB26 (DEC-CA-0071 §3 guard 5): a cleared suite slot is also no worse
+    # than the anchor king, at these tolerances
+    tau_anchor_public: float = 0.0
+    tau_anchor_domain: float = 0.0
 
 
 DEFAULT_PARAMS = ExpertLaneParams()
@@ -93,6 +97,8 @@ class ExpertVerdict:
     metric_gains: dict[str, float] = field(default_factory=dict)
     metric_ni_lcbs: dict[str, float] = field(default_factory=dict)
     gain_metric: str = ""
+    # WB26: a suite slot's guard 4 + anchor-guard record (``{}`` = not computed)
+    suite_guards: dict = field(default_factory=dict)
 
 
 def paired_geomean_lcb(king: Sequence[float], chal: Sequence[float], *, alpha: float,
@@ -246,6 +252,9 @@ class TargetsVerdict:
     guard_n: dict[str, int] = field(default_factory=dict)
     public_lcbs: dict[str, float] = field(default_factory=dict)
     unguarded: list[str] = field(default_factory=list)
+    # WB26: guard 4 + the anchor guard, computed once when a suite slot clears
+    suite_guards: dict = field(default_factory=dict)
+    suite_guard_reason: str = ""
 
     @property
     def k(self) -> int:
@@ -415,6 +424,11 @@ def judge_expert_targets(
 # ── every-slot judging (LANE_D_PLAN rev6.22, owner 2026-11-24) ───────────────
 
 SUITE_PREFIX = "suite:"
+ANCHOR_MISSING = "anchor_missing"
+
+
+def is_suite_target(target: str) -> bool:
+    return str(target).startswith(SUITE_PREFIX)
 SLOT_METRICS = ("crps", "mase")
 SLOT_FAMILIES = ("declared", "undeclared")
 # _cluster_sums fields: (numerator, count) per metric half
@@ -468,6 +482,7 @@ def judge_expert_slots(
     seed: int | str = 42,
     horizons: Sequence[int | None] | None = None,
     horizon_targets: Sequence[str] = (),
+    anchor=None,
 ) -> TargetsVerdict:
     """Judge one lane-B leg on EVERY slot (LANE_D_PLAN rev6.22, owner
     2026-11-24: "allow someone to take all slots").
@@ -497,6 +512,17 @@ def judge_expert_slots(
       pool domain (small ones pooled into ``_rest``), every horizon target and
       every public metric, on the combined metric — each ``LCB >= -tau``. Any
       guard failure blocks every slot.
+
+    * **Suite slots, guards 4-5** (WB26, DEC-CA-0071 §3): a suite slot that
+      clears is claimable only if the whole-pool point gain is ``>= 0``
+      (guard 4, the contamination tripwire) and every guard above also holds
+      against the anchor king (guard 5, at ``tau_anchor_domain`` /
+      ``tau_anchor_public``). ``anchor`` is ``{"pointer", "qloss", "abs",
+      "mase", "public"}`` (the anchor's per-window scores on the SAME windows
+      and its paired ``{name: (anchor_items, chal_items)}``), or a callable
+      returning it, resolved only when a suite slot clears; None (or a
+      guarded name the anchor lacks) refuses the suite slots
+      (``anchor_missing``). Domain and horizon slots are never affected.
 
     Every cleared slot is claimable (one leg may claim every slot). Pure and
     deterministic in ``seed``."""
@@ -608,10 +634,70 @@ def judge_expert_slots(
         elif out.guard_reason:
             v.reason = out.guard_reason                   # blocks every slot
         else:
+            if t.startswith(SUITE_PREFIX):
+                # WB26: guard 4 + the anchor guard, computed ONCE per leg, and
+                # only when a suite slot would otherwise be claimed
+                if not out.suite_guards:
+                    out.suite_guards, out.suite_guard_reason = _suite_slot_guards(
+                        anchor() if callable(anchor) else anchor, out, domains,
+                        (kq, ka, km), (cq, ca, cm), clusters, p, s, horizons,
+                        horizon_targets)
+                v.suite_guards = dict(out.suite_guards)
+                if out.suite_guard_reason:
+                    v.reason = out.suite_guard_reason
+                    continue
             v.gain_metric = best
             v.passed = True
             v.reason = "merge"
     return out
+
+
+def _suite_slot_guards(anchor, out: TargetsVerdict, domains, king, chal, clusters,
+                       p: ExpertLaneParams, s: str, horizons, horizon_targets
+                       ) -> tuple[dict, str]:
+    """WB26 / DEC-CA-0071 §3 guards 4-5 for a leg about to claim a suite
+    slot: ``(record, reason)``, reason ``""`` = both hold.
+
+    * guard 4: the whole-pool paired point gain (every window, the combined
+      metric) ``>= 0`` — a public-suite gain with nothing behind it on
+      private data is refused (the contamination tripwire);
+    * guard 5: the leg's guards (every domain, horizon and public metric)
+      re-run by the SAME guard engine with the anchor king as the baseline,
+      at ``tau_anchor_domain`` / ``tau_anchor_public``, seed
+      ``<seed>|anchor``. A missing anchor, unpaired anchor windows or a
+      guarded public metric the anchor lacks is ``anchor_missing``."""
+    kq, ka, km = king
+    cq, ca, cm = chal
+    rec: dict = {"pool_gain": paired_point_rel(kq, ka, km, cq, ca, cm, clusters),
+                 "anchor_pointer": "", "anchor_guard_lcbs": {}, "anchor_public_lcbs": {}}
+    why = ""
+    if not rec["pool_gain"] >= 0.0:                       # NaN fails
+        why = f"regression on the whole pool: point gain {rec['pool_gain']:.4f} < 0"
+    if anchor is None:
+        return rec, why or f"{ANCHOR_MISSING}: no anchor king to guard against"
+    rec["anchor_pointer"] = str(anchor.get("pointer") or "")
+    aq, aa, am = (np.asarray(anchor[x], dtype=np.float64) for x in ("qloss", "abs", "mase"))
+    if aq.shape[0] != kq.shape[0] or not rec["anchor_pointer"]:
+        return rec, why or f"{ANCHOR_MISSING}: anchor windows not paired"
+    apub = dict(anchor.get("public") or {})
+    lacking = sorted(n for n in out.public_lcbs if n not in apub)
+    if lacking:
+        return rec, why or f"{ANCHOR_MISSING}: anchor has no paired {lacking[0]} items"
+    ag = judge_expert_targets(
+        targets=(), guards_only=True, domains=domains, king_qloss=aq, king_abs_target=aa,
+        king_mase=am, chal_qloss=cq, chal_abs_target=ca, chal_mase=cm, clusters=clusters,
+        public={n: apub[n] for n in out.public_lcbs},
+        params=replace(p, tau_domain=p.tau_anchor_domain, tau_public=p.tau_anchor_public),
+        seed=f"{s}|anchor", horizons=horizons, horizon_targets=horizon_targets)
+    rec["anchor_guard_lcbs"] = dict(ag.guard_lcbs)
+    rec["anchor_public_lcbs"] = dict(ag.public_lcbs)
+    if why:
+        return rec, why
+    if set(ag.public_lcbs) != set(out.public_lcbs):
+        return rec, f"{ANCHOR_MISSING}: anchor public items below the floor"
+    if ag.guard_reason:
+        return rec, f"regression vs anchor: {ag.guard_reason}"
+    return rec, ""
 
 
 # ── payout ───────────────────────────────────────────────────────────────────

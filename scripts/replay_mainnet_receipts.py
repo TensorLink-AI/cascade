@@ -182,6 +182,7 @@ def main(argv: list[str] | None = None) -> int:
         client = None
 
     fails, replayed, unreachable = [], 0, 0
+    loaded = []
     for r in picked:
         rid = str(r["round_id"])
         try:
@@ -190,6 +191,7 @@ def main(argv: list[str] | None = None) -> int:
             unreachable += 1
             print(f"round {rid}: receipt unreadable ({e})")
             continue
+        loaded.append(rc)
         results = audit_receipt(rc, cfg, tier=0, client=client)
         pin = KNOWN_UNSTAMPED_EMISSION.get(rid)
         if pin is not None:
@@ -201,6 +203,18 @@ def main(argv: list[str] | None = None) -> int:
         print(f"round {rid}: {status} — " + ", ".join(f"{x.name}={x.status}" for x in results))
         for x in bad:
             fails.append(f"round {rid} {x.name}: {x.detail}")
+
+    from cascade.shared.era import image_epoch_from
+
+    if image_epoch_from(cfg) and loaded:
+        # W-IMG: one image per seed epoch across the replayed settlements
+        from cascade.audit.checks import check_image_epoch_chain
+
+        row = check_image_epoch_chain(
+            sorted(loaded, key=lambda x: int(x.epoch_start_block)), cfg)
+        print(f"image-epoch-chain={row.status} — {row.detail}")
+        if row.status == FAIL:
+            fails.append(f"image-epoch-chain: {row.detail}")
 
     for f in fails:
         _gh("error", f"CONSENSUS DIVERGENCE vs a settled mainnet receipt — {f}")

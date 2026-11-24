@@ -605,6 +605,94 @@ def v2_quantile_head_at(cfg: Any, boundary: int | None) -> bool:
     return v2_settlement_active(cfg, boundary) and image_decoupled_at(cfg, boundary)
 
 
+# ── W-IMG (plan rev6.24 (e), owner 2026-11-24): one image per seed epoch ────
+
+
+def image_epoch_from(cfg: Any) -> int:
+    """``[v2] image_epoch_from_block`` (0 = off): the W-IMG activation."""
+    return max(0, int(getattr(getattr(cfg, "v2", None), "image_epoch_from_block", 0) or 0))
+
+
+def seed_epoch_start_block(round_cfg: RoundConfig, era: EraSpec) -> int:
+    """The START block of the seed epoch ``era`` belongs to, read from the
+    era stamp alone: a v2 era stamps its seed epoch's FIRST era's seed block
+    (DEC-CA-0055, :func:`v2_era_seed_block`), one era before that era starts
+    — so every era of one seed epoch maps to the same block, and a new seed
+    epoch to a new one. Stateless: a validator, the audit and the trainer
+    derive the same value from the same signed stamp."""
+    return int(era.seed_block) + era_length_blocks(round_cfg, int(era.start_block))
+
+
+def image_epoch_rule_for(cfg: Any, epoch_start: int | None) -> bool:
+    """CONSENSUS: whether the seed epoch starting at ``epoch_start`` is
+    judged under the W-IMG one-image rule — from the first seed epoch
+    starting at or after ``[v2] image_epoch_from_block`` (a block inside an
+    epoch never splits it: that epoch keeps today's rule)."""
+    n = image_epoch_from(cfg)
+    return bool(n > 0 and epoch_start is not None and int(epoch_start) >= n)
+
+
+def image_epoch_rule_at(cfg: Any, boundary: int | None, era: EraSpec | None) -> bool:
+    """CONSENSUS: the W-IMG rule is in force for a v2 settlement at
+    ``boundary`` whose era stamp is ``era``: a v2 settlement under the
+    DEC-CA-0067 decoupled check, of a seed epoch :func:`image_epoch_rule_for`
+    admits. False everywhere before the activation (byte-identical)."""
+    if boundary is None or era is None or not image_epoch_from(cfg):
+        return False
+    if not (v2_settlement_active(cfg, int(boundary)) and image_decoupled_at(cfg, int(boundary))):
+        return False
+    return image_epoch_rule_for(cfg, seed_epoch_start_block(cfg.round, era))
+
+
+def image_record_at(cfg: Any, block: int | None) -> bool:
+    """Lanes B-D: whether a record at ``block`` carries the image its leg /
+    eval ran (W-IMG; drop-when-default before ``image_epoch_from_block``, so
+    every earlier record keeps its bytes and an older parser never meets it)."""
+    n = image_epoch_from(cfg)
+    return bool(n > 0 and block is not None and int(block) >= n)
+
+
+def image_after_from(cfg: Any) -> int:
+    """The block the ``[v2] *_after`` release runs from — the generalised
+    DEC-CA-0067 switch. Before W-IMG it is ``image_decoupled_from_block``
+    (unchanged); with W-IMG armed it is the SEED-EPOCH start the trainer bound
+    the release at (``[v2] image_after_epoch_block``, 0 = not bound yet), so
+    the image only ever changes at a seed-epoch boundary."""
+    if image_epoch_from(cfg):
+        return max(0, int(getattr(cfg.v2, "image_after_epoch_block", 0) or 0))
+    return image_decoupled_from(cfg)
+
+
+def image_after_era(cfg: Any, era_start: int | None) -> bool:
+    """Whether legs of the era starting at ``era_start`` run the after pins."""
+    n = image_after_from(cfg)
+    return bool(image_after_armed(cfg) and n > 0 and era_start is not None
+                and int(era_start) >= n)
+
+
+def next_image_epoch_block(cfg: Any, warm_eras: Iterable[int], now_block: int) -> int | None:
+    """TRAINER: the seed-epoch start block a newly configured ``*_after``
+    release binds at — the first known seed-epoch start (a v2-lineage warm
+    start, ``warm_eras``) at least TWO eras after the era containing
+    ``now_block`` and at or after ``image_epoch_from_block``. A promotion
+    takes effect no earlier than two eras after it is recorded
+    (:func:`min_effective_era`) and an era's legs are prepared in the era
+    before it, so a binding made now always precedes the epoch's first leg
+    (nothing prepared or in flight changes image); an epoch learned later is
+    skipped and the release binds at the following one. ``None`` until such
+    an epoch is scheduled."""
+    n = image_epoch_from(cfg)
+    if n <= 0:
+        return None
+    length = era_length_blocks(cfg.round, int(now_block))
+    now_era = era_index_of(cfg.round, int(now_block))
+    starts = sorted(int(e) * length for e in warm_eras if int(e) > now_era + 1)
+    for s in starts:
+        if s >= n:
+            return s
+    return None
+
+
 def image_after_armed(cfg: Any) -> bool:
     """DEC-CA-0067: an automatic image repin is configured (``[v2]
     train_image_digest_after`` and its companion pins)."""
@@ -614,11 +702,12 @@ def image_after_armed(cfg: Any) -> bool:
 def round_pins_at(cfg: Any, era_start: int | None) -> Any:
     """The ``[round]`` image pins a leg of the era starting at ``era_start``
     runs under: the ``[v2] *_after`` pins from the DEC-CA-0067 switch on
-    (:func:`image_decoupled_era`), else ``cfg.round`` itself (same object —
+    (:func:`image_after_era`: the switch, or with W-IMG the seed-epoch start
+    the trainer bound the release at), else ``cfg.round`` itself (same object —
     byte-identical while no repin is configured or the switch is unresolved)."""
     from dataclasses import replace as _replace
 
-    if not image_after_armed(cfg) or not image_decoupled_era(cfg, era_start):
+    if not image_after_era(cfg, era_start):
         return cfg.round
     v2 = cfg.v2
     return _replace(cfg.round, funded_pod_image=str(v2.funded_pod_image_after),

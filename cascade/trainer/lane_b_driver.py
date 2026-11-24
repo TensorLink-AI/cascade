@@ -58,6 +58,7 @@ from typing import Protocol
 import numpy as np
 
 from ..shared.atomic import read_text_with_backup, write_text_atomic
+from ..shared.era import image_record_at
 from . import expert_lane as _tel
 from .expert_lane import (
     GATE_TOKENS_SHORT,
@@ -115,9 +116,12 @@ class LaneBOps(Protocol):
     def publish_expert_manifest(self, manifest) -> None:
         """Sign and publish the expert manifest."""
 
-    def judge(self, manifest, round_id: str, block: int, sentinel: str | None = None) -> list:
+    def judge(self, manifest, round_id: str, block: int, sentinel: str | None = None,
+              anchor_pointer: str | None = None) -> list:
         """The manifest's ExpertJudgement list; ``sentinel`` (W-S2) is the
-        settlement era's §16 suite, passed only while armed."""
+        settlement era's §16 suite, passed only while armed; ``anchor_pointer``
+        (WB26) the era's anchor king, passed only when the settling legs
+        carry anchor rows (suite slots configured)."""
 
     def merge_scores(self, pointer: str, block: int) -> list:
         """The held-out acceptance scores of ``pointer``."""
@@ -145,6 +149,8 @@ class FinishedExpertLeg:
     gpu_name: str = ""
     # WB22 / WB25: GPUs the leg trained on (the rented layout); 0 = not recorded
     gpu_n: int = 0
+    # W-IMG: the worker image digest the leg ran ("" = not recorded)
+    train_image_digest: str = ""
 
 
 @dataclass
@@ -268,6 +274,8 @@ class LaneBDriver:
         self.ops = ops
         self.path = Path(state_path)
         self._lock = threading.Lock()
+        # WB26: the anchor king's public bench rows, swept once per anchor
+        self._anchor_rows: dict[str, dict] = {}
         self.st = self._load()
         self.queue = LaneBQueue.from_json(self.st.queue)
         # Routing probes (one king forward over one domain's affinity slice:
@@ -1122,7 +1130,7 @@ class LaneBDriver:
 
     def _leg_done(self, leg: OpenLeg, leg_pointer: str | None, corpus_digest: str = "",
                   train_block: int = 0, gpu_name: str = "", failure=None,
-                  gpu_n: int = 0) -> None:
+                  gpu_n: int = 0, train_image_digest: str = "") -> None:
         """A leg returned. ``failure`` (a funded leg's
         :class:`~cascade.trainer.lane_c_driver.LegFailure`) decides its queue
         entry: a miner fault ends it; anything else requeues it — a capacity
@@ -1141,7 +1149,8 @@ class LaneBDriver:
                 self.queue.finish(leg, ok=True)
                 self.st.finished.append(asdict(FinishedExpertLeg(
                     leg=asdict(leg), leg_pointer=leg_pointer, corpus_digest=corpus_digest,
-                    train_block=int(train_block), gpu_name=gpu_name, gpu_n=int(gpu_n))))
+                    train_block=int(train_block), gpu_name=gpu_name, gpu_n=int(gpu_n),
+                    train_image_digest=str(train_image_digest or ""))))
             elif leg.funding and not getattr(failure, "miner_fault", False):
                 msg = str(getattr(failure, "msg", "") or "leg produced no checkpoint")
                 cls = str(getattr(failure, "error_class", "") or "operator")
@@ -1164,6 +1173,23 @@ class LaneBDriver:
                             " — entry ended (miner fault)" if leg.funding else "")
             self.save()
 
+    def _anchor_bench_rows(self, anchor_pointer: str, require: tuple[str, ...]) -> dict:
+        """WB26: the anchor king's public bench rows, swept once per anchor.
+        Unavailable or incomplete rows raise OSError (the settlement retries,
+        as for the king's and the candidates' rows)."""
+        from ..eval.public_guards import MissingPublicGuard, pair_public_rows
+
+        rows = self._anchor_rows.get(anchor_pointer)
+        if rows is None:
+            rows = self.ops.bench_rows(self.ops.fetch(anchor_pointer)) or {}
+            try:
+                pair_public_rows(rows, rows, require=require,
+                                 min_items=self.cfg.lane_b.min_public_items)
+            except MissingPublicGuard as e:
+                raise OSError(f"lane-B anchor public benchmarks unavailable: {e}") from e
+            self._anchor_rows = {anchor_pointer: rows}     # one anchor at a time
+        return rows
+
     def _funded_outcome(self, sub: LaneBSubmission, outcome: str, detail) -> None:
         self.st.outcomes.append({"round_id": "", "hotkey": sub.hotkey, "uid": int(sub.uid),
                                  "domain": sub.domain, "gen_ref": sub.gen_ref,
@@ -1175,7 +1201,7 @@ class LaneBDriver:
     # ── settlement ───────────────────────────────────────────────────────────
 
     def settle(self, *, round_id: str, block: int, era_index: int, king_pointer: str,
-               work_dir: Path) -> list:
+               work_dir: Path, anchor_pointer: str | None = None) -> list:
         """Rebase every finished leg onto this settlement's king, publish the
         expert manifest, self-judge it, and queue the winners for merge.
 
@@ -1184,7 +1210,15 @@ class LaneBDriver:
         settlement without its expert legs. Finished legs leave the queue only
         once the whole settlement succeeded — an I/O failure anywhere keeps
         them for the next settlement (and binds nothing this round).
-        Idempotent per ``round_id``."""
+        Idempotent per ``round_id``.
+
+        ``anchor_pointer`` (WB26, DEC-CA-0071 §3 guard 5): the era's anchor
+        king — the promotion member the validator derives from the signed
+        training manifest; the caller passes it only while suite slots are
+        configured. Every leg is tested on every suite slot (rev6.22), so
+        every settling leg carries the anchor's public rows as
+        ``public_rows["anchor"]`` (benched once per anchor), and the
+        self-judge is guarded against the same anchor."""
         from ..shared.expert_manifest import ExpertEntry, ExpertManifest, leg_label
         from .moe_model import MergeError
 
@@ -1265,6 +1299,8 @@ class LaneBDriver:
                                      min_items=lb.min_public_items)
                 except MissingPublicGuard as e:
                     raise OSError(f"lane-B candidate public benchmarks unavailable: {e}") from e
+                if anchor_pointer:
+                    rows["anchor"] = self._anchor_bench_rows(anchor_pointer, require)
             entries.append(ExpertEntry(
                 miner_hotkey=sub["hotkey"], miner_uid=int(sub["uid"]), gen_ref=sub["gen_ref"],
                 domain=sub["domain"], selection=sel,
@@ -1275,6 +1311,9 @@ class LaneBDriver:
                 corpus_digest=f["corpus_digest"], train_block=int(f["train_block"]),
                 commit_block=int(sub["commit_block"]), gpu_name=f.get("gpu_name", ""),
                 gpu_n=int(f.get("gpu_n", 0) or 0), public_rows=rows, targets=declared if len(declared) > 1 else (),
+                # W-IMG: logged, never enforced; absent before the activation
+                train_image_digest=(str(f.get("train_image_digest", "") or "")
+                                    if image_record_at(self.cfg, int(block)) else ""),
                 # WB23: the signed leg length (0s = no train_hours: today's bytes)
                 train_hours=float((leg.get("funding") or {}).get("train_hours", 0.0) or 0.0),
                 leg_steps=int((leg.get("funding") or {}).get("leg_steps", 0) or 0),
@@ -1289,8 +1328,10 @@ class LaneBDriver:
                                       lineage_tokens=self.st.lineage_tokens,
                                       entries=tuple(entries))
             self.ops.publish_expert_manifest(manifest)
-            judgements = (self.ops.judge(manifest, rid, int(block)) if sentinel is None
-                          else self.ops.judge(manifest, rid, int(block), sentinel=sentinel))
+            judge_kw = {} if sentinel is None else {"sentinel": sentinel}
+            if anchor_pointer and any("anchor" in (e.public_rows or {}) for e in entries):
+                judge_kw["anchor_pointer"] = anchor_pointer     # WB26
+            judgements = self.ops.judge(manifest, rid, int(block), **judge_kw)
             digest = manifest.digest()
         # DEC-CA-0059: a leg that took at least one slot merges ONCE, however
         # many of its targets won (keyed by its judged checkpoint)
@@ -1891,8 +1932,14 @@ class RunnerLaneBOps:
                 # WB22 / WB25: the leg's GPU count is the rented layout's (every
                 # GPU of it trains); 0 = not known (no rent recorded)
                 sku = str(getattr(loc, "funded_pod_sku", "") or "")
+                from ..shared.config import image_digest
+
                 done(leg, entry.trained_pointer, entry.corpus_digest, entry.train_block,
-                     getattr(entry, "gpu_name", ""), gpu_n=layout_gpus(sku) if sku else 0)
+                     getattr(entry, "gpu_name", ""), gpu_n=layout_gpus(sku) if sku else 0,
+                     # W-IMG: the image the leg ran (its contract's pin, which
+                     # the worker's FINAL image check enforced on the pod)
+                     train_image_digest=image_digest(str(
+                         getattr(contract, "train_image_digest", "") or "")))
             except LegFailure as f:
                 done(leg, None, failure=f)
             except Exception as e:  # noqa: BLE001 — an unclassified failure is ours
@@ -1983,7 +2030,8 @@ class RunnerLaneBOps:
         self.r.manifest_store().put_text(expert_manifest_key(manifest.round_id),
                                          manifest.to_json(), content_type="application/json")
 
-    def judge(self, manifest, round_id: str, block: int, sentinel: str | None = None) -> list:
+    def judge(self, manifest, round_id: str, block: int, sentinel: str | None = None,
+              anchor_pointer: str | None = None) -> list:
         from ..validator.evaluator import evaluate_checkpoint
         from ..validator.expert_lane import judge_manifest, verdict_windows
 
@@ -2013,7 +2061,8 @@ class RunnerLaneBOps:
                               king_scores=_eval(manifest.king_pointer), evaluate=_eval,
                               fetch_dir=self.fetch, cfg=cfg.lane_b, seed=str(round_id),
                               strict=cfg.lane_b.merge_guard_at_settlement(int(block)),
-                              sentinel=sentinel)
+                              sentinel=sentinel,
+                              **({"anchor_pointer": anchor_pointer} if anchor_pointer else {}))
 
     def merge_scores(self, pointer: str, block: int) -> list:
         from ..validator.evaluator import evaluate_checkpoint

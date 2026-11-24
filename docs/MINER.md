@@ -1521,6 +1521,8 @@ only a release can change. Read the effective values with
 | `max_leg_hours` | `6.0` | The most training hours a lane B leg may ask for, in 0.5 h steps. |
 | `max_leg_seconds` | `27000` | Hard wall-clock cap on a lane B leg (6 h × 1.25). |
 | `guard_factor` | `1.25` | Leg guard: train hours × this factor plus overhead, capped at `max_leg_seconds`. |
+| `tau_anchor_public` | `0.0` | A cleared suite slot also needs every public guard to hold against the anchor king (the era's promotion member) at this tolerance. |
+| `tau_anchor_domain` | `0.0` | The same anchor guard for every pool domain and horizon. A cleared suite slot also needs the whole-pool point gain to be at least 0. |
 
 ### Lane B suite targets
 

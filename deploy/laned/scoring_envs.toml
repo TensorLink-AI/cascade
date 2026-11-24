@@ -40,6 +40,11 @@
 #   4. evidence/lane_d_env_<name>.json committed, status = "qualified",
 #      from_block set to an activation block after the release ships;
 #      the owner merges.
+# Steps 2-4 are produced and re-checked by cascade.eval.lane_d_env_qual
+# (golden / forecast / compare / check; docs/OPERATOR.md "Qualifying a lane D
+# scoring environment"). tests/accept/w4/test_w4_env_qual.py re-derives the
+# evidence of every qualified non-reference entry, so a stale or hand-edited
+# file cannot qualify one.
 # Scores are only compared within one cohort on one host (B6), so
 # cross-environment bit-identity is not required; satellites re-derive from
 # the signed rows, never by re-forecasting.
@@ -68,18 +73,21 @@ driver_max = ""
 evidence = "reference"
 
 # RTX PRO 6000 Blackwell (sm_120). torch 2.4.1+cu124 cannot run on sm_120, so
-# this is its own scoring venv on the bench sidecar's torch line (torch 2.12.1,
-# CUDA 13.0, benchmarks/uv.lock). Its scoring lock and the B5 evidence do not
-# exist yet: candidate until qualified (steps 2-4 above need an owner pod).
+# this is its own scoring venv on the bench sidecar's torch line: the lock
+# below (torch 2.12.1, the same PyPI cu130 wheel as benchmarks/uv.lock; numpy
+# and safetensors at the release lock's versions). The PyPI wheel reports
+# torch.__version__ = "2.12.1+cu130" (torch/version.py), so the hello's
+# torch_build is "2.12.1+cu130/cuda-13.0". The B5 evidence does not exist
+# yet: candidate until qualified (steps 2-4 above need an owner pod).
 [[env]]
 name = "sm120-torch212"
 status = "candidate"
 from_block = 0
 until_block = 0
-lock = ""
-lock_sha256 = ""
-torch_build = "2.12.1/cuda-13.0"
+lock = "deploy/laned/envs/sm120-torch212/uv.lock"
+lock_sha256 = "e03cdda974c17c5ce04f85bc2303d5cbe16da10765bf3e54a7d3a07c7ab82989"
+torch_build = "2.12.1+cu130/cuda-13.0"
 gpu_models = ["NVIDIA RTX PRO 6000 Blackwell Workstation Edition"]
 driver_min = "580"
 driver_max = ""
-evidence = ""
+evidence = "evidence/lane_d_env_sm120-torch212.json"
