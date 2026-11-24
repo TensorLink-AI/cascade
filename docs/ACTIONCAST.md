@@ -126,7 +126,7 @@ A judge-phase entry passes when **all** of these hold, at `alpha / k`
 | no term worse | every score term's LCB ≥ −`tau`: a gain on one term cannot buy a confident loss on another |
 | model lift | the harness's score with the real fine-tune beats its own naive-forecast run (`LCB ≥ model_lift_margin`) |
 | clusters | at least `min_target_clusters` distinct clusters (start days / regions / SKUs) |
-| factual | every explanation claim checks out against the transcript; an entry with any false claim at the gate rate fails (§10) |
+| factual | false-claim and unsupported-sentence rates are under `max_false_rate` / `max_unsupported_rate` at their upper bounds (§10) |
 | explanation | explanation score LCB over the reference's ≥ −`tau`, so explanations can't be traded away for decision gain (§10) |
 
 Then the DEC-CA-0056 machinery applies unchanged: the best passer becomes
