@@ -19,6 +19,7 @@ validator draws identical bootstrap samples on the same comparison.
 from __future__ import annotations
 
 import hashlib
+import math
 from collections.abc import Sequence
 
 import numpy as np
@@ -499,6 +500,98 @@ def cohort_maxt_lcbs(
     # challenger — the whole simultaneous band from the ACTUAL joint spread.
     crit = float(np.quantile(np.max(dev / se[:, None], axis=0), 1.0 - alpha))
     return [float(x) for x in (t - crit * se)]
+
+
+LOG_CRPS_FLOOR = 1e-12
+LOG_MASE_FLOOR = 1e-9
+
+
+def clamped_log_ratios(bar_crps, bar_mase, chal_crps, chal_mase, *, floor: float
+                       ) -> np.ndarray:
+    """Lane D (rev6.18 A3) per-window log-ratios of a challenger against a bar:
+    ``log clamp(s_bar / s_chal, floor, 1 / floor)`` with the per-window score
+    ``s = sqrt(max(crps, 1e-12) · max(mase, 1e-9))`` (the lane D geomean of
+    one window). Positive = the challenger is better on that window; the clamp
+    caps one window's effect at ``± log(1 / floor)``. ``floor`` in (0, 1)."""
+    f = float(floor)
+    if not 0.0 < f < 1.0:
+        raise ValueError(f"ratio floor must be in (0, 1); got {floor!r}")
+
+    def logs(c, m) -> np.ndarray:
+        c = np.asarray(c, dtype=np.float64)
+        m = np.asarray(m, dtype=np.float64)
+        return 0.5 * (np.log(np.maximum(c, LOG_CRPS_FLOOR)) + np.log(np.maximum(m, LOG_MASE_FLOOR)))
+
+    x = logs(bar_crps, bar_mase) - logs(chal_crps, chal_mase)
+    lim = math.log(1.0 / f)
+    return np.clip(x, -lim, lim)
+
+
+def log_gain(mean_log_ratio: float) -> float:
+    """The relative gain ``1 − exp(−L)`` of a mean log-ratio ``L`` (the lane D
+    gain scale: at no clamp, ``(bar_geo − chal_geo) / bar_geo`` exactly)."""
+    return float(-math.expm1(-float(mean_log_ratio)))
+
+
+def parts_maxt_lcbs(
+    parts: Sequence[tuple[Sequence[np.ndarray], list | None, float]],
+    *,
+    alpha: float = 0.05,
+    B: int = 10_000,
+    seed: int | str = 42,
+) -> list[float]:
+    """Max-T family-wise LCBs of a cohort on a WEIGHTED multi-part statistic
+    (lane D rev6.18 A3: the live and the public half, two-part bootstrap).
+
+    ``parts`` is ``[(X, clusters, w)]`` in a fixed order: ``X[j]`` the
+    per-window log-ratios of member ``j`` on that part (``(n_p,)``, every
+    member on the same windows), ``clusters`` the part's per-window cluster
+    labels (``None``: each window its own), ``w`` the part's weight. A part
+    with ``w == 0`` or no windows is left out (no draw). Each bootstrap
+    replicate resamples clusters WITHIN each part (one ``(B, g_p)`` cluster
+    draw per part, parts in order, from one generator seeded by ``seed``),
+    takes each part's mean log-ratio over the resampled windows and combines
+    ``T[j, b] = Σ_p w_p · M_p[j, b]``. The band is the studentised, centred
+    max-T of :func:`cohort_maxt_lcbs` on the gain scale ``1 − exp(−T)``:
+    ``L[j] = g[j] − c · se[j]`` with ``g[j]`` the full-sample gain. With one
+    part of weight 1 and no clamp this is :func:`cohort_maxt_lcbs` on the lane
+    D geomean (the same cluster draw: the identical generator call).
+
+    Returns ``L[j]`` per member (NaN for every member when no part has a
+    window)."""
+    live = [(list(X), clusters, float(w)) for X, clusters, w in parts
+            if float(w) > 0.0 and len(X) and np.asarray(X[0]).size > 0]
+    k = len(parts[0][0]) if parts else 0
+    if k == 0:
+        return []
+    if not live:
+        return [float("nan")] * k
+    rng = np.random.default_rng(_seed_to_int(seed))
+    T = np.zeros((k, int(B)))
+    t = np.zeros(k)
+    for X, clusters, w in live:
+        if len(X) != k:
+            raise ValueError(f"a part has {len(X)} members, not {k}")
+        n = np.asarray(X[0]).size
+        codes = cluster_codes(clusters, n)
+        g = int(codes.max()) + 1
+        idx = rng.integers(0, g, size=(int(B), g))
+        cnt_c = np.bincount(codes, minlength=g).astype(np.float64)
+        bag_n = np.maximum(cnt_c[idx].sum(axis=1), 1.0)                    # (B,)
+        for j in range(k):
+            x = np.asarray(X[j], dtype=np.float64)
+            if x.shape != (n,):
+                raise ValueError(f"member {j}: {x.shape} log-ratios, not ({n},)")
+            s_c = np.bincount(codes, weights=x, minlength=g)
+            T[j] += w * (s_c[idx].sum(axis=1) / bag_n)
+            t[j] += w * float(x.sum() / n)
+    rel = -np.expm1(-T)                                                    # (k, B)
+    tg = -np.expm1(-t)                                                     # (k,)
+    dev = tg[:, None] - rel
+    se = np.std(rel, axis=1, ddof=1)
+    se = np.where(se < 1e-12, 1e-12, se)
+    crit = float(np.quantile(np.max(dev / se[:, None], axis=0), 1.0 - alpha))
+    return [float(x) for x in (tg - crit * se)]
 
 
 def paired_bootstrap_quantiles_aggregated(

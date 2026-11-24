@@ -251,7 +251,7 @@ def test_board_is_the_latest_reports_judgement(crowned):
     assert board["crowned"] == crowned["fx"].x["digest"] == rep["crowned"]
     assert board["judged"] == rep["judged"]
     assert board["skipped"] == rep["skipped"]
-    assert board["verdicts"] == [{k: v[k] for k in sorted(h.VERDICT_KEYS)}
+    assert board["verdicts"] == [{k: v.get(k) for k in sorted(h.VERDICT_KEYS)}
                                  for v in rep["verdicts"]]
     assert board["gate"] == rep["gate"], "the gate record (suite, results, LCBs) verbatim"
 

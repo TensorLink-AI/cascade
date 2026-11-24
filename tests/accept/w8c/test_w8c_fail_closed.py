@@ -148,7 +148,8 @@ def test_bars_malformed_array_fails_closed(tmp_path):
 
 
 def _fault_inputs(rig):
-    from cascade.validator.lane_d_lowfreq import forecast_ok
+    # rev6.18 A7 (F4): lane_d_lowfreq is deleted; forecast_ok lives in lane_d.
+    from cascade.validator.lane_d import _forecast_ok as forecast_ok
 
     got = rig.source(h.B1)
     x = rig.fx["x"]

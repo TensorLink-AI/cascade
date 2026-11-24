@@ -31,8 +31,7 @@ OVERLAY_KEYS = [k for k in W2_KEYS if k not in ("remainder", "dtypes")]
 # Overlay values that differ from both the plan default and ARM (an overlay
 # restating a default is refused as "no effect"). takes_from moves the armed
 # carve (ARM: lane_a) to another lane.
-OVERLAY_VALUE = {"takes_from": "lane_b",
-                 "lowfreq_freqs": ["Q"], "ready_ttl_blocks": 54321}
+OVERLAY_VALUE = {"takes_from": "lane_b", "ready_ttl_blocks": 54321}
 
 
 def test_w2_allowed_has_lane_d():

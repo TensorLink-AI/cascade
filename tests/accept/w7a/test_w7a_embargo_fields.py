@@ -273,11 +273,12 @@ def test_cohort_counts_agree_with_the_window_flags(scratch):
 
 def test_a_frozen_set_below_the_minimum_fresh_share_is_refused(scratch):
     """rev6.12 (b): F / (F + E) >= min_fresh_window_share on every frozen set
-    (0.5: 24 of 48 passes, 25 embargo windows don't)."""
-    r = _base(scratch, embargo_windows=25)
+    (default 0.2, owner 2026-11-23, was 0.5: 9 fresh of 48 with 39 embargo
+    windows is 0.1875 < 0.2 and is refused; at 0.15 it passes)."""
+    r = _base(scratch, embargo_windows=39)
     _refused(r, "bad_value", "cohorts[0].embargo_windows")
-    r = _base(scratch, embargo_windows=25)
-    r["params"]["min_fresh_window_share"] = 0.25
+    r = _base(scratch, embargo_windows=39)
+    r["params"]["min_fresh_window_share"] = 0.15
     assert_valid(r)
 
 

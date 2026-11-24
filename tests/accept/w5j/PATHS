@@ -12,3 +12,5 @@ cascade/validator/lane_d_inputs.py
 # The report carries the draw record and the per-window draw fields.
 cascade/validator/lane_d_report.py
 cascade/validator/schemas/lane_d_report_1.json
+# rev6.18 D24 (F4): the backtest keys leave the config.
+cascade/shared/config/lane_d.py

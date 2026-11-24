@@ -72,6 +72,13 @@ QUALITY = {"sharp": (0.005, 0.1, 0.0), "good": (0.02, 0.2, 0.0),
            "fair": (0.05, 0.3, 0.0), "bad": (0.0, 0.3, 3.0)}
 
 
+# rev6.18 F4 (A3): these fixtures pin the live-only rule: the public half off
+# (public_weight = 0, a spec setting) and no per-window ratio clamp in effect
+# (a floor far below any fixture ratio), so their pre-F4 numbers stand. F4's
+# own tests (tests/accept/w5e/test_w5e_combined.py) pin the combined rule.
+LIVE_ONLY = {"public_weight": 0.0, "window_ratio_floor": 1e-9}
+
+
 def lane_d_cfg(**over):
     from cascade.shared.config.lane_d import parse_lane_d
 
@@ -79,7 +86,7 @@ def lane_d_cfg(**over):
            "remainder": "burn", "contexts": [4096, 8192, 16384], "horizon": HORIZON,
            "forward_margin_hours": MARGIN_H, "max_mirror_lag_hours": 6.0,
            "min_windows": 24, "min_clusters": 4, "bootstrap_B": 200}
-    return parse_lane_d({**raw, **over}, era_blocks_at=lambda _block: ERA)
+    return parse_lane_d({**raw, **LIVE_ONLY, **over}, era_blocks_at=lambda _block: ERA)
 
 
 def _bound(t: int) -> int:

@@ -62,6 +62,37 @@ carry 0.05; `test_w2e_backtest_cap_default_is_on_and_meets_the_inequality`
 pins it; the overlay value moves to 0.03 so it still differs from the
 default. Every other assertion is unchanged.
 
+## Correction (rev6.18 F4; owner 2026-11-23 A3, owner 2026-11-24 D24)
+
+The backtest windows are dropped (D24) and the public half replaces them
+(A3). `backtest_weight_cap` and `backtest_ratio_floor` are **deleted**: the
+loader no longer parses them or checks the rev6.9 (a) inequality, and lists
+them (with A7's `lowfreq_freqs`) in `RETIRED_KEYS["lane_d"]`, so a
+deployed table that still carries them loads and ignores them. Two keys
+replace them in `W2E_DEFAULTS`:
+
+| key | default | type / range | refused |
+|---|---|---|---|
+| `public_weight` | `0.5` | float in `[0, 1)` (0 = the public half off) | negative, `>= 1`, bool, string |
+| `window_ratio_floor` | `0.5` | float in `(0, 1)` (each per-window ratio clamped to `[floor, 1/floor]`) | `<= 0`, `>= 1`, bool, string |
+
+Neither is tied to any other key (`public_weight` is NOT subject to the
+deleted backtest rule). The inequality tests become
+`test_w2e_backtest_inequality_is_gone` (the former refusals load),
+`test_w2e_backtest_and_lowfreq_keys_are_retired` replaces the 0.05-default
+pin, and the two overlay-inequality tests become
+`test_w2e_overlay_public_weight_and_clamp_have_no_cross_key_rule`. Both
+shipped files carry the two new keys at their defaults and none of the
+retired ones.
+
+## Correction (owner 2026-11-23): `min_fresh_window_share` default 0.5 -> 0.2
+
+Owner rule: "fresh data should always be in there, but trade off" and "first
+verdict ~6 h". The W1 forge measured ~250 fresh windows at T+6 h, so a 0.5
+share would hold verdicts ~24 h. The default (loader, both shipped files) is
+**0.2**; fresh windows are still drawn first and always included. The tests
+that pinned the 0.5 default now pin 0.2. Lane D is not rolled out, so there is
+no activation key.
 ## rev6.14 (a): judging start vs eligibility boundary (owner 2026-11-23)
 
 New key `eval_delay_hours` (default 6.0, >= 0, parsed, mutation- and round-trip-tested, shipped in both tables); `forward_margin_hours` defaults to 0.0 (6 -> 0) and the shipped tables state 0.0; the loader refuses `forward_margin_hours > eval_delay_hours` (b <= j). Tests: `test_w2e_forward_margin_hours_defaults_to_0`, `test_w2e_forward_margin_above_eval_delay_is_refused` and the table rows.
