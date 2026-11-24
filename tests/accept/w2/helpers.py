@@ -64,7 +64,6 @@ W2_DEFAULTS: dict[str, object] = {
     "loser_ttl_eras": 4,
     "dtypes": ("BF16",),
     "max_mirror_lag_hours": 6.0,
-    "confirm_on_king_change": "restart",
     "max_judged_per_coldkey_per_settlement": 2,
     "max_coldkey_unresolved_settlements": 4,
     "max_reveal_delay_days": 14,
@@ -73,9 +72,12 @@ W2_DEFAULTS: dict[str, object] = {
 }
 W2_KEYS = tuple(W2_DEFAULTS)
 
-# DEC-CA-0062 placeholder / legacy keys that must keep parsing (the deployed
-# file carries the first block of them).
-LEGACY_VALUES: dict[str, object] = {
+# rev6.18 B11 (owner brief 2026-11-23): the DEC-CA-0062 placeholder keys and
+# confirm_on_king_change are RETIRED. The deployed file still carries them, so
+# each must load and change nothing (listed in the loader's RETIRED_KEYS);
+# the shipped files carry none of them.
+RETIRED_VALUES: dict[str, object] = {
+    "confirm_on_king_change": "original",
     "targets": ("energy",),
     "teacher_ref": "ephemeris:panel@1",
     "teacher_api": "ephemeris",
@@ -93,7 +95,7 @@ LEGACY_VALUES: dict[str, object] = {
     "floor": 0.2,
     "win_ttl_eras": 20,
 }
-LEGACY_KEYS = tuple(LEGACY_VALUES)
+RETIRED_LANE_D = tuple(RETIRED_VALUES)
 
 # Per key: (value A, value B) for the mutation test, plus co-keys the value
 # needs to load (until_block needs an armed from_block; a co-key set to None is
@@ -127,7 +129,6 @@ MUTATIONS: dict[str, tuple[object, object, dict]] = {
     "max_bench_holds": (6, 2, {}),
     "loser_ttl_eras": (8, 2, {}),
     "max_mirror_lag_hours": (3.0, 12.0, {}),
-    "confirm_on_king_change": ("original", "restart", {}),
     "max_judged_per_coldkey_per_settlement": (1, 3, {}),
     "max_coldkey_unresolved_settlements": (6, 2, {}),
     "max_reveal_delay_days": (7, 21, {}),
@@ -168,7 +169,6 @@ REFUSED: dict[str, list[object]] = {
     "loser_ttl_eras": [-1, True, 1.5],
     "dtypes": [[], ["F32"], ["BF16", "F32"], ["bf16"], "BF16"],
     "max_mirror_lag_hours": [0.0, -1.0, True],
-    "confirm_on_king_change": ["", "both", True],
     "max_judged_per_coldkey_per_settlement": [0, -1, True],
     "max_coldkey_unresolved_settlements": [0, -1, True],
     "max_reveal_delay_days": [0, -1, True],
@@ -182,7 +182,6 @@ ACCEPTED: dict[str, list[object]] = {
     "horizon": [1, 64, 512],
     "takes_from": ["lane_a", "lane_b", "lane_c"],
     "dtypes": [["BF16"]],
-    "confirm_on_king_change": ["restart", "original"],
     "max_source_share": [1.0, 0.25],
 }
 
