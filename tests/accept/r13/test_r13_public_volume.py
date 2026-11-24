@@ -18,8 +18,14 @@ from .helpers import FakeClock, FakeLium, config, mod
 H200 = [("H200", {"id": f"ex-{i}", "price_per_hour": 3.0 + i}) for i in range(5)]
 
 
+def _has_volumes(m):
+    assert "public_cache_volumes" in m.EvalConfig.__dataclass_fields__, (
+        "#894: [eval_host] public_cache_volumes (the Lium volume per eval host) is missing")
+
+
 def test_each_host_is_rented_with_its_volume(tmp_path):
     m = mod()
+    _has_volumes(m)
     cfg = config(tmp_path, public_cache_volumes=("brave-fox-3a", "calm-owl-7b"))
     lium = FakeLium(executors=H200)
     out = m.eval_up(cfg, lium, entries=5, cohort="b200", dry_run=False, clock=FakeClock())
@@ -34,6 +40,7 @@ def test_each_host_is_rented_with_its_volume(tmp_path):
 
 def test_dry_run_plans_the_volumes(tmp_path):
     m = mod()
+    _has_volumes(m)
     cfg = config(tmp_path, public_cache_volumes=("brave-fox-3a",))
     out = m.eval_up(cfg, FakeLium(executors=H200), entries=1, cohort="b1", dry_run=True,
                     clock=FakeClock())
@@ -48,19 +55,25 @@ def test_bad_volume_lists_are_refused(tmp_path, bad):
 
 
 def test_the_shipped_config_names_the_volume_mount_of_the_mirror_cache():
-    m = mod()
-    from cascade.eval.lane_d_public_mirror import load_mirror_config
+    import tomllib
 
-    from .helpers import CONFIG
+    m = mod()
+    _has_volumes(m)
+    from .helpers import CONFIG, REPO
 
     ev = m.load_config(CONFIG).eval_host
     assert ev.public_cache_mount == "/workspace"
-    assert load_mirror_config()["cache_dir"].startswith(ev.public_cache_mount + "/")
+    mirror = REPO / "deploy" / "laned" / "public_mirror.toml"
+    assert mirror.is_file(), "#894: deploy/laned/public_mirror.toml is missing"
+    cache_dir = tomllib.loads(mirror.read_text())["cache_dir"]
+    assert cache_dir.startswith(ev.public_cache_mount + "/")
 
 
 def test_lium_up_carries_the_volume(monkeypatch, tmp_path):
     from cascade.provision import core
 
+    assert "volumes" in core.LaunchSpec.__dataclass_fields__, (
+        "#894: LaunchSpec.volumes (lium up --volume) is missing")
     monkeypatch.setenv(core.LIUM_COOLDOWN_FILE_ENV, str(tmp_path / "cooldown.json"))
     monkeypatch.setenv(core.LIUM_QUARANTINE_FILE_ENV, str(tmp_path / "quarantine.json"))
     spawned = []

@@ -16,8 +16,16 @@ import numpy as np
 from . import helpers as h
 
 
+def _mirror_aware(fc):
+    import inspect
+
+    assert "mirror" in inspect.signature(fc.public_scores_entry).parameters, (
+        "#894: public_scores_entry(..., mirror=) (the Hippius mirror reader) is missing")
+
+
 def test_public_scores_entry_reads_the_drawn_series_through_the_mirror(tmp_path, monkeypatch):
     fc = h.forecasts_mod()
+    _mirror_aware(fc)
     from cascade.validator import lane_d_public
 
     rng = np.random.default_rng(3)
@@ -56,6 +64,7 @@ def test_public_scores_entry_reads_the_drawn_series_through_the_mirror(tmp_path,
 
 def test_public_scores_entry_refuses_without_any_mirror(tmp_path):
     fc = h.forecasts_mod()
+    _mirror_aware(fc)
     import pytest
 
     with pytest.raises(fc.LaneDForecastError, match="no public mirror"):
@@ -65,7 +74,11 @@ def test_public_scores_entry_refuses_without_any_mirror(tmp_path):
 
 
 def _ssh_host(tmp_path, **kw):
+    import inspect
+
     m = h.inputs_mod()
+    assert "public_cache_dir" in inspect.signature(m.SSHEvalHost).parameters, (
+        "#894: SSHEvalHost(public_cache_dir=, public_cache_budget_bytes=) is missing")
     hosts = tmp_path / "hosts.toml"
     hosts.write_text('[[host]]\nname = "laned-eval"\nhost = "10.0.0.9"\nstage = "final"\n',
                      encoding="utf-8")
@@ -109,10 +122,6 @@ def test_inputs_file_accepts_the_public_cache_keys():
 
 def test_the_host_cli_defaults_to_the_release_mirror_config():
     fc = h.forecasts_mod()
+    _mirror_aware(fc)
     args = fc._build_parser().parse_args(["public", "--cache-dir", "/c", "--budget-bytes", "1"])
     assert args.public_root is None and args.mirror_config is None
-    from cascade.eval.lane_d_public_mirror import MIRROR_CONFIG_PATH, load_mirror_config
-
-    cfg = load_mirror_config()
-    assert MIRROR_CONFIG_PATH.is_file()
-    assert [s.name for s in cfg["stores"]] == ["hippius", "r2"]

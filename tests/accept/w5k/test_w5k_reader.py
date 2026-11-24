@@ -17,7 +17,12 @@ GIFT, RMISC = "gift_eval_pretrain", "rmisc"
 
 
 def _pub():
-    return importlib.import_module("cascade.validator.lane_d_public")
+    import inspect
+
+    pub = importlib.import_module("cascade.validator.lane_d_public")
+    assert "reader" in inspect.signature(pub.read_public_windows).parameters, (
+        "#894: read_public_windows(..., reader=) (the Hippius mirror reader) is missing")
+    return pub
 
 
 @pytest.mark.parametrize("source", [GIFT, RMISC])
