@@ -1,0 +1,85 @@
+# Lane D qualified scoring environments (LANE_D_PLAN rev6.18 B5, D11).
+#
+# Lane D forecasts may be computed on any GPU running an environment listed
+# here and qualified at the settlement boundary (owner 2026-11-23: "Lane D may
+# be scored on any GPU, including RTX PRO 6000 Blackwell"). Lane A's pinned
+# training contract (uv.lock, torch==2.4.1+cu124, contract_digest) is NOT
+# touched by this file: a lane D scoring environment is a separate venv.
+#
+# Read by cascade.shared.config.lane_d.load_scoring_envs: the validator's
+# handshake refuses an eval host whose hello does not fit a qualified entry
+# (cascade/eval/lane_d_handshake.py check_worker), the signed report records
+# the host (report.host) and the audit (check_lane_d) re-checks it against
+# this file at the report's boundary.
+#
+# One entry per environment:
+#   name          unique id, [a-z0-9][a-z0-9._-]*; the eval host names it
+#                 (`hello --env NAME`) and the report records it
+#   status        "qualified" (may score) or "candidate" (listed, refused)
+#   from_block    a qualified entry scores settlements with boundary >
+#                 from_block (release first, then activate: outside validators
+#                 must hold the entry before it is used, the same
+#                 release-then-activate rule as every consensus constant)
+#   until_block   0 = no end; else qualified only for boundaries <= it
+#   lock          the scoring venv's lock file (repo-relative), lock_sha256
+#                 its sha256 (both required when qualified)
+#   torch_build   exactly what the eval host reports:
+#                 "<torch.__version__>/cuda-<torch.version.cuda>"
+#   gpu_models    exact `nvidia-smi --query-gpu=name` strings allowed
+#   driver_min    lowest NVIDIA driver allowed (dotted ints, inclusive)
+#   driver_max    optional highest driver allowed (inclusive; "" = none)
+#   evidence      the qualification evidence file, or "reference"
+#
+# Qualifying a new environment (plan B5):
+#   1. a PR adding the entry with status = "candidate";
+#   2. on that GPU, run the W0b context-equivalence test and a golden set
+#      (500 live + 500 public windows, 3 models) against cu124-torch241:
+#      per-window score relative difference <= 1e-3 and identical crown
+#      decisions on a replayed cohort;
+#   3. A9 timing passes on that GPU;
+#   4. evidence/lane_d_env_<name>.json committed, status = "qualified",
+#      from_block set to an activation block after the release ships;
+#      the owner merges.
+# Scores are only compared within one cohort on one host (B6), so
+# cross-environment bit-identity is not required; satellites re-derive from
+# the signed rows, never by re-forecasting.
+
+[[env]]
+name = "cu124-torch241"
+status = "qualified"
+from_block = 0
+until_block = 0
+lock = "uv.lock"
+lock_sha256 = "2ad5ceac524d3fff397e261a7c45887dfbbebc71f58f2ebfa04ac100d53cf93e"
+torch_build = "2.4.1+cu124/cuda-12.4"
+gpu_models = [
+    "NVIDIA GeForce RTX 4090",
+    "NVIDIA A100-SXM4-80GB",
+    "NVIDIA A100 80GB PCIe",
+    "NVIDIA H100 80GB HBM3",
+    "NVIDIA H100 PCIe",
+    "NVIDIA H100 NVL",
+    # Hopper runs torch 2.4.1+cu124; the elastic eval host (#846) uses H200
+    # until the sm_120 environment is qualified.
+    "NVIDIA H200",
+]
+driver_min = "550.54.14"
+driver_max = ""
+evidence = "reference"
+
+# RTX PRO 6000 Blackwell (sm_120). torch 2.4.1+cu124 cannot run on sm_120, so
+# this is its own scoring venv on the bench sidecar's torch line (torch 2.12.1,
+# CUDA 13.0, benchmarks/uv.lock). Its scoring lock and the B5 evidence do not
+# exist yet: candidate until qualified (steps 2-4 above need an owner pod).
+[[env]]
+name = "sm120-torch212"
+status = "candidate"
+from_block = 0
+until_block = 0
+lock = ""
+lock_sha256 = ""
+torch_build = "2.12.1/cuda-13.0"
+gpu_models = ["NVIDIA RTX PRO 6000 Blackwell Workstation Edition"]
+driver_min = "580"
+driver_max = ""
+evidence = ""
