@@ -24,6 +24,7 @@ class _C:
 
 
 def test_lever_terms_are_lane_b_only():
+    h.require_built()
     f = h.trainer_namespace()["lane_b_lever_terms"]
     sig = (0.05, 0.10)
     assert f(_C(), None, False, sig, 1) == (1.0, sig, 1)            # every lane A leg
@@ -41,6 +42,7 @@ def test_lever_terms_are_lane_b_only():
 
 
 def test_context_window_is_lane_b_only():
+    h.require_built()
     f = h.trainer_namespace()["lane_b_context_patches"]
     assert f(4096, None, 32) == 128 and f(4096, SEL, 32) == 128
     assert f(16384, SEL, 32) == 512 and f(32768, SEL, 32) == 1024
@@ -53,6 +55,7 @@ def test_context_window_is_lane_b_only():
 
 
 def test_leg_record_names_the_limit_that_stopped_it():
+    h.require_built()
     f = h.trainer_namespace()["lane_b_leg_record"]
     assert f(10, 10, 99, 5.0, 100) == {"steps": 10, "tokens": 99, "stop": "steps"}
     assert f(4, 10, 99, 100.0, 100) == {"steps": 4, "tokens": 99, "stop": "hours"}
@@ -61,6 +64,7 @@ def test_leg_record_names_the_limit_that_stopped_it():
 
 
 def test_train_pyramid_applies_the_levers():
+    h.require_built()
     src = h.trainer_path().read_text(encoding="utf-8")
     assert "lane_b_lever_terms(contract, expert_selection, no_cooldown" in src
     assert 'group["base_lr"] *= lever_lr_scale' in src
@@ -77,6 +81,7 @@ def _stage_corpus(d, n, value, seed):
 
 
 def test_curriculum_stream_reads_stages_in_order(tmp_path):
+    h.require_built()
     import shutil
 
     pytest.importorskip("pyarrow")       # the [generation] extra (CI installs it)
@@ -109,6 +114,7 @@ def test_curriculum_stream_reads_stages_in_order(tmp_path):
 
 
 def test_curriculum_needs_a_shards_leg(tmp_path):
+    h.require_built()
     from cascade.trainer.corpus import CorpusError
     from cascade.trainer.stream import open_round_stream
 
@@ -118,6 +124,7 @@ def test_curriculum_needs_a_shards_leg(tmp_path):
 
 
 def test_generator_keyword_is_opt_in():
+    h.require_built()
     from cascade.trainer import corpus
 
     class Old:
@@ -138,6 +145,7 @@ def test_generator_keyword_is_opt_in():
 
 
 def test_generation_cli_takes_the_stage():
+    h.require_built()
     from cascade.generation.cli import build_parser
 
     args = build_parser().parse_args(["r", "o", "--seed", "1", "--curriculum-stage", "easy"])
@@ -146,6 +154,7 @@ def test_generation_cli_takes_the_stage():
 
 
 def test_cli_levers_and_limits(tmp_path):
+    h.require_built()
     from cascade.miner.lane_b import generator_declares_curriculum_stage, lane_b_levers_json
     from cascade.shared.lane_b_levers import LeversError
 
@@ -170,6 +179,7 @@ def test_cli_levers_and_limits(tmp_path):
 
 
 def test_lane_b_gpu_help_lists_every_lane_b_type_and_the_own_risk_rule():
+    h.require_built()
     from cascade.miner.cli import LANE_B_GPU_HELP
 
     lb = h.chain_cfg().lane_b

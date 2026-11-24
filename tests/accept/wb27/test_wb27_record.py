@@ -32,6 +32,7 @@ def _manifest(*entries):
 
 
 def test_default_entry_keeps_todays_bytes():
+    h.require_built()
     body = json.loads(_manifest(_entry()).canonical_body())
     e = body["entries"][0]
     for k in ("levers", "train_tokens", "gpu_measured", "trained_steps", "trained_tokens",
@@ -40,6 +41,7 @@ def test_default_entry_keeps_todays_bytes():
 
 
 def test_record_fields_round_trip():
+    h.require_built()
     from cascade.shared.expert_manifest import load_expert_manifest
 
     e = _entry(levers={"lr_scale": 1.5}, train_tokens=20 * 10**9, gpu_measured=False,
@@ -54,6 +56,7 @@ def test_record_fields_round_trip():
 
 
 def test_leg_record_check_for_limits_legs():
+    h.require_built()
     m = h.leg()
     cfg, b = h.armed_cfg()
     c = h.base_contract(cfg)
@@ -81,6 +84,7 @@ def test_leg_record_check_for_limits_legs():
 
 
 def test_judge_refuses_bad_levers_at_stage_levers():
+    h.require_built()
     from cascade.validator.expert_lane import judge_entry
 
     cfg, b = h.armed_cfg()
@@ -93,6 +97,7 @@ def test_judge_refuses_bad_levers_at_stage_levers():
 
 
 def test_judge_rederives_the_ema_choice():
+    h.require_built()
     from cascade.validator.expert_lane import judge_entry
 
     cfg, b = h.armed_cfg()
@@ -103,12 +108,14 @@ def test_judge_rederives_the_ema_choice():
 
 
 def test_audit_knows_the_levers_stage():
+    h.require_built()
     from cascade.audit import checks
 
     assert "levers" in checks.LANE_B_STAGES and "scored_weights" in checks.LANE_B_STAGES
 
 
 def test_settlement_reads_the_leg_record(tmp_path):
+    h.require_built()
     from cascade.trainer.lane_b_driver import _scored_weights_for, leg_actuals
 
     d = tmp_path / "leg"

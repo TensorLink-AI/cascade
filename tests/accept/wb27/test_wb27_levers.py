@@ -27,12 +27,14 @@ def _code(raw, lb=None):
 
 
 def test_refusal_codes_are_exported():
+    h.require_built()
     lv = h.levers()
     assert set(lv.LEVER_CODES) == set(h.CODES)
     assert lv.LEVERS_HEADER == h.LEVERS_HEADER
 
 
 def test_no_header_is_todays_leg():
+    h.require_built()
     lv = h.levers()
     assert lv.parse_levers("", _armed_lb()) is None
     assert lv.parse_levers(None, h.chain_cfg().lane_b) is None
@@ -43,6 +45,7 @@ def test_no_header_is_todays_leg():
 
 def test_levers_are_the_default_lane_b_behaviour():
     """owner 2026-11-24: no activation block — the shipped config takes them."""
+    h.require_built()
     lv, lb = h.levers(), h.chain_cfg().lane_b
     assert not hasattr(lb, "miner_levers_from_block")
     assert lv.parse_levers('{"lr_scale": 1.5}', lb).lr_scale == 1.5
@@ -54,6 +57,7 @@ def test_levers_are_the_default_lane_b_behaviour():
 
 
 def test_lr_scale_range():
+    h.require_built()
     lv, lb = h.levers(), _armed_lb()
     assert (lb.lr_scale_min, lb.lr_scale_max) == (0.5, 2.0)
     for ok, want in (("0.5", 0.5), (2, 2.0), ("1.25", 1.25), (0.125 * 5, 0.625)):
@@ -63,6 +67,7 @@ def test_lr_scale_range():
 
 
 def test_curriculum_rules():
+    h.require_built()
     lv, lb = h.levers(), _armed_lb()
     got = lv.parse_levers('{"curriculum": [["easy", 0.3], ["mid", "0.3"], ["hard", 0.4]]}', lb)
     assert got.curriculum == (("easy", 30), ("mid", 30), ("hard", 40))
@@ -79,6 +84,7 @@ def test_curriculum_rules():
 
 
 def test_context_length_wire_format_and_refusals():
+    h.require_built()
     lv, lb = h.levers(), _armed_lb()
     assert lv.parse_levers('{"context_length": 4096}', lb).context_length == 4096
     for c in (8192, 16384, 32768):
@@ -90,6 +96,7 @@ def test_context_length_wire_format_and_refusals():
 
 
 def test_context_memory_fit_rule():
+    h.require_built()
     lv = h.levers()
     from cascade.funding.step_rates import StepRate
 
@@ -102,6 +109,7 @@ def test_context_memory_fit_rule():
 
 
 def test_ema_choice():
+    h.require_built()
     lv = h.levers()
     lb = _armed_lb()
     assert lb.sigma_rel_choices == (0.03, 0.05, 0.10, 0.15, 0.20)
@@ -115,11 +123,13 @@ def test_ema_choice():
 
 
 def test_malformed_headers():
+    h.require_built()
     for raw in ("nope", "[1]", '{"x": 1}', '"lr_scale"', "{"):
         assert _code(raw) == "bad_levers", raw
 
 
 def test_signed_tag_binds_the_header_as_sent():
+    h.require_built()
     lv = h.levers()
     raw = ' {"lr_scale":1.5} '
     assert lv.levers_tag(raw) == "levers=" + hashlib.sha256(raw.strip().encode()).hexdigest()
@@ -135,6 +145,7 @@ def test_signed_tag_binds_the_header_as_sent():
 
 
 def test_curriculum_points_and_stage_seeds():
+    h.require_built()
     lv = h.levers()
     assert lv.curriculum_points(1001, (("a", 30), ("b", 70))) == [300, 701]
     assert lv.curriculum_points(1000, ()) == [1000]
@@ -148,6 +159,7 @@ def test_curriculum_points_and_stage_seeds():
 
 
 def test_entry_levers_check():
+    h.require_built()
     lv = h.levers()
     cfg, b = h.armed_cfg()
     good = {"lr_scale": 1.5, "ema": 0.05}

@@ -13,6 +13,7 @@ LEVERS = {"lr_scale": 1.5, "curriculum": [["easy", "0.4"], ["hard", "0.6"]], "em
 
 
 def test_empty_spec_is_todays_leg_contract():
+    h.require_built()
     lv = h.levers()
     cfg = h.chain_cfg()
     base = h.base_contract(cfg)
@@ -30,6 +31,7 @@ def test_empty_spec_is_todays_leg_contract():
 
 
 def test_armed_levers_fold_into_the_leg_contract():
+    h.require_built()
     lv = h.levers()
     from cascade.shared.manifest import contract_digest, contract_payload
 
@@ -54,6 +56,7 @@ def test_armed_levers_fold_into_the_leg_contract():
 
 
 def test_limits_leg_contract_records_the_stop():
+    h.require_built()
     lv = h.levers()
     cfg, b = h.armed_cfg()
     base = h.base_contract(cfg)
@@ -68,6 +71,7 @@ def test_limits_leg_contract_records_the_stop():
 
 
 def test_lane_a_contracts_are_byte_identical():
+    h.require_built()
     from cascade.shared.manifest import contract_digest
 
     off = h.chain_cfg()
@@ -77,6 +81,7 @@ def test_lane_a_contracts_are_byte_identical():
 
 
 def test_ema_choice_applies_only_to_an_ema_leg_contract():
+    h.require_built()
     lv = h.levers()
     base = h.base_contract(h.chain_cfg())
     off = lv.apply_levers(base.for_hours(1.0), lv.LegLevers(ema=0.05))   # a wsd contract
@@ -88,6 +93,7 @@ def test_ema_choice_applies_only_to_an_ema_leg_contract():
 
 
 def test_trainer_and_worker_make_the_same_three_steps():
+    h.require_built()
     from cascade.trainer import lane_b_driver
 
     src = inspect.getsource(lane_b_driver.RunnerLaneBOps._dispatch_funded)
@@ -104,6 +110,7 @@ def test_trainer_and_worker_make_the_same_three_steps():
 
 
 def test_remote_argv_carries_the_spec_only_when_set():
+    h.require_built()
     from types import SimpleNamespace
 
     from cascade.trainer.remote import worker_argv
@@ -120,6 +127,7 @@ def test_remote_argv_carries_the_spec_only_when_set():
 
 
 def test_driver_leg_spec_fixes_levers_at_dispatch():
+    h.require_built()
     from cascade.trainer.lane_b_driver import _leg_spec
 
     cfg, b = h.armed_cfg()

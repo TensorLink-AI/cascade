@@ -15,6 +15,7 @@ KEYS = {"lr_scale_min": 0.5, "lr_scale_max": 2.0, "max_leg_hours": 12.0,
 
 
 def test_keys_ship_at_their_defaults():
+    h.require_built()
     from cascade.shared.config import load_chain_config
     from cascade.shared.config.lane_b import LANE_B_TRACK_DEFAULTS
     from cascade.shared.config.v2 import LaneBConfig, parse_lane_b
@@ -32,6 +33,7 @@ def test_keys_ship_at_their_defaults():
 
 
 def test_lr_scale_bounds_refusals():
+    h.require_built()
     from cascade.shared.config.v2 import parse_lane_b
 
     lb = parse_lane_b({"lr_scale_min": 0.75, "lr_scale_max": 1.5})
@@ -45,6 +47,7 @@ def test_lr_scale_bounds_refusals():
 
 
 def test_ema_set_bounds():
+    h.require_built()
     from cascade.shared.config.v2 import parse_lane_b
 
     assert parse_lane_b({"sigma_rel_choices": [0.01, 0.1, 0.3]}).sigma_rel_choices == (0.01, 0.1, 0.3)
@@ -54,6 +57,7 @@ def test_ema_set_bounds():
 
 
 def test_twelve_hour_caps_bind_everywhere():
+    h.require_built()
     cfg = h.chain_cfg()
     lb = cfg.lane_b
     assert lb.leg_caps_at(0) == lb.leg_caps_at(10 ** 9) == (12.0, 54_000)
@@ -68,6 +72,7 @@ def test_twelve_hour_caps_bind_everywhere():
 
 
 def test_no_lane_a_contract_moves():
+    h.require_built()
     from cascade.shared.manifest import contract_payload
 
     cfg = h.chain_cfg()

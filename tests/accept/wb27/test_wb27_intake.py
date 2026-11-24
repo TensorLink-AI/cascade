@@ -13,6 +13,7 @@ from . import helpers as h
 
 
 def test_fund_without_any_new_header_is_todays_fund(tmp_path):
+    h.require_built()
     it, q = h.intake(tmp_path, h.chain_cfg())
     status, body = it.lane_b_fund(h.fund_headers())
     assert status == 202, body
@@ -22,6 +23,7 @@ def test_fund_without_any_new_header_is_todays_fund(tmp_path):
 
 
 def test_levers_admitted_and_recorded(tmp_path):
+    h.require_built()
     cfg, _ = h.armed_cfg()
     it, q = h.intake(tmp_path, cfg)
     lv = {"lr_scale": 1.5, "curriculum": [["easy", 0.4], ["hard", 0.6]], "ema": 0.05}
@@ -40,6 +42,7 @@ def test_levers_admitted_and_recorded(tmp_path):
     ({"bogus": 1}, "bad_levers"),
 ])
 def test_out_of_range_levers_refused_nothing_charged(tmp_path, lv, code):
+    h.require_built()
     cfg, _ = h.armed_cfg()
     it, q = h.intake(tmp_path, cfg)
     status, body = it.lane_b_fund(h.fund_headers(**{h.LEVERS_HEADER: json.dumps(lv)}))
@@ -48,6 +51,7 @@ def test_out_of_range_levers_refused_nothing_charged(tmp_path, lv, code):
 
 
 def test_longer_context_admitted_and_its_steps_scale(tmp_path):
+    h.require_built()
     cfg = h.chain_cfg()
     c = h.base_contract(cfg)
     it, q = h.intake(tmp_path, cfg)
@@ -67,6 +71,7 @@ def test_longer_context_admitted_and_its_steps_scale(tmp_path):
 
 
 def test_twelve_hours_admitted(tmp_path):
+    h.require_built()
     cfg = h.chain_cfg()
     it, q = h.intake(tmp_path, cfg)
     status, body = it.lane_b_fund(h.fund_headers(**{h.HOURS_HEADER: "12"}))
@@ -80,6 +85,7 @@ def test_twelve_hours_admitted(tmp_path):
 
 
 def test_token_limit_admission(tmp_path):
+    h.require_built()
     cfg, _ = h.armed_cfg()
     c = h.base_contract(cfg)
     tps = h.want_tokens_per_step(c)
@@ -96,6 +102,7 @@ def test_token_limit_admission(tmp_path):
 
 
 def test_token_and_hour_limits_together(tmp_path):
+    h.require_built()
     cfg, _ = h.armed_cfg()
     c = h.base_contract(cfg)
     it, _q = h.intake(tmp_path, cfg)
@@ -112,6 +119,7 @@ def test_token_and_hour_limits_together(tmp_path):
                                       ("abc", "bad_train_tokens"),
                                       ("1000", "train_tokens_out_of_range")])
 def test_bad_token_limits_refused(tmp_path, raw, code):
+    h.require_built()
     cfg, _ = h.armed_cfg()
     it, q = h.intake(tmp_path, cfg)
     status, body = it.lane_b_fund(h.fund_headers(**{h.TOKENS_HEADER: raw}))
@@ -120,6 +128,7 @@ def test_bad_token_limits_refused(tmp_path, raw, code):
 
 
 def test_own_risk_gpu(tmp_path):
+    h.require_built()
     cfg, _ = h.armed_cfg()
     it, q = h.intake(tmp_path, cfg)
     status, body = it.lane_b_fund(h.fund_headers(**{h.TOKENS_HEADER: "20e9",
@@ -135,6 +144,7 @@ def test_own_risk_gpu(tmp_path):
 
 
 def test_own_risk_gpu_refused_without_a_limit_or_off_lium(tmp_path):
+    h.require_built()
     cfg = h.chain_cfg()
     it, q = h.intake(tmp_path / "f", cfg)
     status, body = it.lane_b_fund(h.fund_headers(**{h.TOKENS_HEADER: "20e9",

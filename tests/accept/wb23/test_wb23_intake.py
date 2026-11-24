@@ -95,8 +95,14 @@ def test_tb25_six_hours_admitted(tmp_path):
 
 
 def test_tb25_over_the_cap_hours_refused_nothing_charged(tmp_path):
-    # rev6.21 (owner 2026-11-24; tests-correction): the cap is 12 h
-    intake, lane_b = _intake(tmp_path)
+    # rev6.21 (owner 2026-11-24; tests-correction): the cap is 12 h, so 6.5 h
+    # (refused under the rev5 6 h cap) is admitted and 12.5 h is refused
+    (tmp_path / "in").mkdir()
+    (tmp_path / "over").mkdir()
+    intake, lane_b = _intake(tmp_path / "in")
+    status, body = intake.lane_b_fund(_h(**{TRAIN_HOURS_HEADER: "6.5"}))
+    assert status == 202 and body["train_hours"] == 6.5, body
+    intake, lane_b = _intake(tmp_path / "over")
     status, body = intake.lane_b_fund(_h(**{TRAIN_HOURS_HEADER: "12.5"}))
     assert status == 400 and body["code"] == BAD_TRAIN_HOURS, body
     _nothing_charged(intake, lane_b)

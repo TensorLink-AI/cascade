@@ -174,3 +174,34 @@ def trainer_namespace() -> dict:
             except NameError:
                 continue
     return ns
+
+
+def require_built() -> None:
+    """WB27's surface exists (an AssertionError, never an import or attribute
+    error, on a tree without it): every test calls this first."""
+    import dataclasses
+
+    assert importlib.util.find_spec(LEVERS) is not None, f"{LEVERS} is missing (WB27)"
+    from cascade.shared.config.v2 import LaneBConfig
+
+    names = {f.name for f in dataclasses.fields(LaneBConfig)}
+    for k in ("lr_scale_min", "lr_scale_max", "sigma_rel_choices", "max_context_length"):
+        assert k in names, f"LaneBConfig has no {k} (WB27)"
+    from cascade.shared.expert_manifest import ExpertEntry
+
+    entry = {f.name for f in dataclasses.fields(ExpertEntry)}
+    for k in ("levers", "train_tokens", "gpu_measured", "trained_steps", "trained_tokens",
+              "stop"):
+        assert k in entry, f"ExpertEntry has no {k} (WB27)"
+    from cascade.funding.intake import FundingIntake
+
+    assert hasattr(FundingIntake, "_lane_b_levers"), "the intake parses no levers (WB27)"
+    src = trainer_path().read_text(encoding="utf-8")
+    for name in ("lane_b_lever_terms", "lane_b_context_patches", "lane_b_leg_record"):
+        assert f"def {name}(" in src, f"pyramid_trainer.{name} is missing (WB27)"
+    cli = (REPO / "cascade" / "generation" / "cli.py").read_text(encoding="utf-8")
+    assert "--curriculum-stage" in cli, "the generation CLI takes no --curriculum-stage (WB27)"
+    import cascade.shared.lane_b_leg as leg_mod
+
+    for name in ("admit_leg_limits", "tokens_per_step", "TRAIN_TOKENS_HEADER"):
+        assert hasattr(leg_mod, name), f"lane_b_leg.{name} is missing (WB27)"
