@@ -214,8 +214,8 @@ def test_mainnet_arms_validator_source_with_v2_testnet_at_its_fast_block(tmp_pat
     assert pre.v2.bench_source_from_block == 0           # "v2" while from_block = 0
     test = load_chain_config(root / "chain.testnet.toml")
     # TESTNET-FAST (owner 2026-11-24, option A): testnet benches on the main
-    # validator from 8515200, with the king ladder it needs
-    assert test.v2.bench_source == "validator" and test.v2.bench_source_from_block == 8515200
+    # validator from 8515800, with the king ladder it needs
+    assert test.v2.bench_source == "validator" and test.v2.bench_source_from_block == 8515800
     assert test.v2.king_ladder and test.v2.bench_source_from_block >= test.v2.from_block
 
 

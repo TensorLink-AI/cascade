@@ -39,10 +39,10 @@ from cascade.shared.netconfig import NetConfigError, check_overrides
 @pytest.mark.parametrize("toml", ["chain.toml", "chain.testnet.toml"])
 def test_shipped_tables_parse_inert(toml):
     """Mainnet arms MarketCast at 9586800 (owner 2026-11-24); testnet arms it at
-    8515200 (TESTNET-FAST, owner 2026-11-24 option A); inert before the block."""
+    8515800 (TESTNET-FAST, owner 2026-11-24 option A); inert before the block."""
     cfg = load_chain_config(toml)
     mc = cfg.marketcast
-    fb = 9586800 if toml == "chain.toml" else 8515200
+    fb = 9586800 if toml == "chain.toml" else 8515800
     assert mc.from_block == fb and mc.active(10**9) == bool(fb)
     assert not mc.active(fb - 1)
     assert mc.target_suites == (("market",) if fb else ())
@@ -213,7 +213,7 @@ def test_mkt_targets_only_with_config():
 def test_shipped_marketcast_cannot_admit_mkt_targets():
     """Off (the testnet table with from_block = 0) ⇒ the intake / commit /
     recipe surfaces admit no mkt: target, while the shipped [lane_c] targets
-    still load (they are inactive). Armed (mainnet 9586800; testnet 8515200,
+    still load (they are inactive). Armed (mainnet 9586800; testnet 8515800,
     TESTNET-FAST owner 2026-11-24 option A) ⇒ only the composite mkt:market."""
     test = load_chain_config("chain.testnet.toml")
     off = replace(test.marketcast, from_block=0)
@@ -593,7 +593,7 @@ def test_miner_cli_refuses_mkt_while_inactive(tmp_path):
 
     from cascade.miner.lane_c import mkt_inactive, recipe_error
 
-    test = load_chain_config("chain.testnet.toml")     # armed at 8515200 (TESTNET-FAST)
+    test = load_chain_config("chain.testnet.toml")     # armed at 8515800 (TESTNET-FAST)
     assert mkt_inactive(test, "mkt:market") is None
     cfg = replace(test, marketcast=replace(test.marketcast, from_block=0))   # MarketCast off
     assert "not active" in mkt_inactive(cfg, "mkt:returns")

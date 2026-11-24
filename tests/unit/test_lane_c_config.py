@@ -26,15 +26,15 @@ SUITES = ("returns", "vol")
 ROOT = Path(__file__).resolve().parents[2]
 
 
-# testnet: TESTNET-FAST (owner 2026-11-24, option A) arms lane C at 8515200
-SHIPPED_FROM = {"chain.toml": 9586800, "chain.testnet.toml": 8515200}
+# testnet: TESTNET-FAST (owner 2026-11-24, option A) arms lane C at 8515800
+SHIPPED_FROM = {"chain.toml": 9586800, "chain.testnet.toml": 8515800}
 
 
 def test_shipped_configs_are_inert_with_the_defaults():
     for f in ("chain.toml", "chain.testnet.toml"):
         lc = load_chain_config(ROOT / f).lane_c
         # owner 2026-11-24: mainnet arms lane C at 9586800 (an era boundary);
-        # testnet at 8515200 (TESTNET-FAST, owner 2026-11-24 option A)
+        # testnet at 8515800 (TESTNET-FAST, owner 2026-11-24 option A)
         fb = SHIPPED_FROM[f]
         assert lc.from_block == fb and lc.active(10**12) == bool(fb)
         if fb:
@@ -77,7 +77,7 @@ def test_c_from_a_cannot_overallocate_the_remaining_pool():
 
 def test_shipped_configs_count_no_active_slot_before_marketcast_arms():
     """Before [marketcast] from_block (mainnet 9586800, owner 2026-11-24;
-    testnet 8515200, TESTNET-FAST) the shipped mkt: targets load and count no active slot, so
+    testnet 8515800, TESTNET-FAST) the shipped mkt: targets load and count no active slot, so
     lane C would burn its whole share; from it, the one composite slot."""
     for f in ("chain.toml", "chain.testnet.toml"):
         cfg = load_chain_config(ROOT / f)

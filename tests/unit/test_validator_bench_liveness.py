@@ -584,8 +584,8 @@ def test_testnet_validator_source_keeps_the_defaults(cfg):
     root = Path(__file__).resolve().parents[2]
     test = load_chain_config(root / "chain.testnet.toml")
     # TESTNET-FAST (owner 2026-11-24, option A): testnet benches on the main
-    # validator from 8515200; the timeout / budget keep their defaults
-    assert test.v2.bench_source == "validator" and test.v2.bench_source_from_block == 8515200
+    # validator from 8515800; the timeout / budget keep their defaults
+    assert test.v2.bench_source == "validator" and test.v2.bench_source_from_block == 8515800
     assert test.v2.bench_report_timeout_settlements == 8 and test.v2.bench_budget_hours == 4.0
     runner, calls = _runner(replace(cfg, scoring=replace(cfg.scoring, bench_gate_mode="enforce")))
     m = _manifest(cfg)

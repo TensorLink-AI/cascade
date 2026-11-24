@@ -335,9 +335,9 @@ def test_testnet_validator_source_and_budget_defaults(cfg):
     root = Path(__file__).resolve().parents[2]
     test = load_chain_config(root / "chain.testnet.toml")
     # TESTNET-FAST (owner 2026-11-24, option A): testnet benches on the main
-    # validator from 8515200; the budgets keep their defaults
+    # validator from 8515800; the budgets keep their defaults
     assert test.v2.bench_source == "validator" and test.v2.bench_sweep_hours == 2.0
-    assert test.v2.bench_source_from_block == 8515200
+    assert test.v2.bench_source_from_block == 8515800
     main = load_chain_config(root / "chain.toml")
     assert main.v2.bench_sweep_hours == 2.0 and main.v2.bench_budget_hours == 6.0
     runner, calls = _runner(replace(cfg, scoring=replace(cfg.scoring,
