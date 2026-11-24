@@ -16,7 +16,7 @@
   ``publish_king`` and ``check_one_digest`` run unchanged over them.
 
 The filesystem mode (``--vault-dir``, ``--mirror NAME=DIR``,
-``--index-store-dir``) is what testnet and these tests run; the live clients
+``--index-store-dir``) is what rig and these tests run; the live clients
 are tested with fakes of the API objects. No network. Every PATHS import is
 inside a test body.
 """
@@ -89,7 +89,7 @@ def _testnet_report(tmp: Path, run: dict) -> dict:
 
 
 @pytest.fixture
-def testnet(tmp_path, monkeypatch, crowned_run):
+def rig(tmp_path, monkeypatch, crowned_run):
     import cascade.shared.chain as chain
 
     t = _testnet_report(tmp_path, crowned_run)
@@ -153,69 +153,69 @@ def test_an_armed_sentinel_needs_its_record_for_this_king(crowned_run):
         sentinel_entry(report, {**rec, "king_digest": "f" * 64})
 
 
-# ── king-publish -> king-check on a crowned testnet report ───────────────────
+# ── king-publish -> king-check on a crowned rig report ───────────────────
 
 
-def test_king_check_is_red_before_and_green_after_king_publish(testnet, capsys):
-    assert _check(testnet) == 1
+def test_king_check_is_red_before_and_green_after_king_publish(rig, capsys):
+    assert _check(rig) == 1
     assert "index_missing" in json.dumps(_last(capsys)["problems"])
-    assert _publish(testnet) == 0
+    assert _publish(rig) == 0
     out = _last(capsys)
-    assert out["action"] == "published" and out["planned"][0]["digest"] == testnet["digest"]
-    assert _check(testnet) == 0
+    assert out["action"] == "published" and out["planned"][0]["digest"] == rig["digest"]
+    assert _check(rig) == 0
     out = _last(capsys)
     assert out["scope"] == "full" and out["problems"] == {} and out["crowned_reports"] == 1
-    index = json.loads((testnet["tmp"] / "index.json").read_text())
-    public = json.loads((testnet["tmp"] / "public" / "champions" / "lane_d" / "index.json")
+    index = json.loads((rig["tmp"] / "index.json").read_text())
+    public = json.loads((rig["tmp"] / "public" / "champions" / "lane_d" / "index.json")
                         .read_text())
-    assert public == index and [k["digest"] for k in index["kings"]] == [testnet["digest"]]
+    assert public == index and [k["digest"] for k in index["kings"]] == [rig["digest"]]
 
 
-def test_king_publish_is_idempotent_and_dry_run_writes_nothing(testnet, capsys):
-    assert _publish(testnet, "--dry-run") == 0
+def test_king_publish_is_idempotent_and_dry_run_writes_nothing(rig, capsys):
+    assert _publish(rig, "--dry-run") == 0
     assert _last(capsys)["action"] == "planned"
-    assert not (testnet["tmp"] / "index.json").exists()
-    assert not (testnet["tmp"] / "mirrors").exists()
-    assert _publish(testnet) == 0
+    assert not (rig["tmp"] / "index.json").exists()
+    assert not (rig["tmp"] / "mirrors").exists()
+    assert _publish(rig) == 0
     capsys.readouterr()
-    before = (testnet["tmp"] / "index.json").read_bytes()
-    assert _publish(testnet) == 0
+    before = (rig["tmp"] / "index.json").read_bytes()
+    assert _publish(rig) == 0
     assert _last(capsys)["action"] == "current"
-    assert (testnet["tmp"] / "index.json").read_bytes() == before
+    assert (rig["tmp"] / "index.json").read_bytes() == before
 
 
-def test_king_publish_blocks_without_the_ready_licence(testnet, capsys):
-    (testnet["intake"] / "lane_d_intake_queue.json").write_text(json.dumps({"entries": []}))
-    assert _publish(testnet) == 3
+def test_king_publish_blocks_without_the_ready_licence(rig, capsys):
+    (rig["intake"] / "lane_d_intake_queue.json").write_text(json.dumps({"entries": []}))
+    assert _publish(rig) == 3
     assert _last(capsys)["action"] == "blocked"
-    assert not (testnet["tmp"] / "index.json").exists()
+    assert not (rig["tmp"] / "index.json").exists()
 
 
-def test_king_publish_refuses_a_wallet_that_is_not_the_pinned_signer(testnet, monkeypatch,
+def test_king_publish_refuses_a_wallet_that_is_not_the_pinned_signer(rig, monkeypatch,
                                                                      capsys):
     import cascade.shared.chain as chain
 
     monkeypatch.setattr(chain, "open_wallet", lambda *a, **k: fixture_key("stranger"))
-    assert _publish(testnet) == 1
-    assert not (testnet["tmp"] / "index.json").exists()
+    assert _publish(rig) == 1
+    assert not (rig["tmp"] / "index.json").exists()
 
 
-def test_takedown_unpublishes_hub_and_hf_and_king_check_stays_green(testnet, capsys):
-    assert _publish(testnet) == 0
-    argv = ["takedown", "--digest", testnet["digest"], "--reason", "licence", "--block",
-            str(testnet["report"]["boundary"] + 1), "--index", str(testnet["tmp"] / "index.json"),
-            "--signer-ss58", testnet["signer"].ss58_address, *_fs(testnet)]
+def test_takedown_unpublishes_hub_and_hf_and_king_check_stays_green(rig, capsys):
+    assert _publish(rig) == 0
+    argv = ["takedown", "--digest", rig["digest"], "--reason", "licence", "--block",
+            str(rig["report"]["boundary"] + 1), "--index", str(rig["tmp"] / "index.json"),
+            "--signer-ss58", rig["signer"].ss58_address, *_fs(rig)]
     assert _main([*argv, "--dry-run"]) == 0
     capsys.readouterr()
     assert _main(argv) == 0
-    index = json.loads((testnet["tmp"] / "index.json").read_text())
+    index = json.loads((rig["tmp"] / "index.json").read_text())
     assert index["kings"][0]["takedown"] == {"reason": "licence",
-                                             "block": testnet["report"]["boundary"] + 1}
+                                             "block": rig["report"]["boundary"] + 1}
     for m in ("hub", "hf"):
-        assert not list((testnet["tmp"] / "mirrors" / m).rglob("*.safetensors"))
-    assert list((testnet["tmp"] / "mirrors" / "r2").rglob("*.safetensors")), "R2 copy stays"
+        assert not list((rig["tmp"] / "mirrors" / m).rglob("*.safetensors"))
+    assert list((rig["tmp"] / "mirrors" / "r2").rglob("*.safetensors")), "R2 copy stays"
     capsys.readouterr()
-    assert _check(testnet) == 0
+    assert _check(rig) == 0
 
 
 # ── the live mirror adapters (fakes of the API / client objects) ─────────────
