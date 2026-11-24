@@ -9,7 +9,7 @@ on your compute account. Local training experiments need suitable compute too.
 | A | A deterministic Python generator of synthetic time series | Beat the current king with a fully trained model | [Steps 1–7](#1-install) |
 | B | A generator and up to the allowed number of targets | Improve selected experts, then pass merge acceptance when enabled | [Lane B](#13-cascade-v2-and-domain-experts-lane-b) |
 | C | An eligible MarketCast fine-tuning recipe, optionally with a generator | Beat the pinned application base on future data, then confirm and take a slot | [Lane C](#what-you-submit) |
-| D | A trained cascade_pyramid checkpoint (BF16 weights you trained anywhere) | Beat the lane D king on forward-only private windows, then confirm (built, unarmed) | [Lane D](LANE_D.md) |
+| D | A trained cascade_pyramid checkpoint (BF16 weights you trained anywhere) | Beat both the lane D king and the lane A king on forward-only private windows; crowned at the first verdict | [Lane D](LANE_D.md) |
 
 **One competition brief per lane** (intent, scoring and pay numbers with a
 worked example, strategies, costs, refusals, FAQ):
@@ -915,6 +915,16 @@ records determine the actual rules. Testnet retains older economics and must
 not be used to infer mainnet payments. Percentages below refer to the validator's
 competition reward vector, not a fixed TAO/day or dollar payment.
 
+**Mainnet launch split (block 9586800).** The signed launch overlay
+(`deploy/overlays/launch-20261125.mainnet.toml`, owner proposal plan rev6.24)
+replaces the template shares below with **A 0% / B 35% / C 15% / D 50%**
+once lane D is armed. Under it a B slot is 35% / 10 = 3.5% of emissions, the
+MarketCast slot is 15%, and lane D pays its court (80/15/5) from 50%; lane A's
+king earns nothing directly but is the house in lane D. The per-lane guides
+([A](MINER_LANE_A.md), [B](MINER_LANE_B.md), [C](MINER_LANE_C_MARKETCAST.md),
+[D](MINER_LANE_D.md)) work examples at this split. The tables below are the
+checked-in template and the scripted documentation check computes them.
+
 **First allocate pools; then calculate eligible payments inside each pool.**
 
 <!-- cascade:rewards:allocation:start -->
@@ -983,10 +993,10 @@ See [key recovery](#as-the-v2-king-keep-your-key-funded-dec-ca-0055).
 
 **Lane B: accepted expert updates.** With acceptance enabled, training,
 individual qualification and waiting for a warm start earn nothing by
-themselves. Committed warm-start acceptance starts the target's clock.
+themselves. Committed warm-start acceptance starts the slot's pay.
 There are currently **10 targets** (seven domains plus three horizons), so
-each reserves **25% / 10 = 2.5% of total emissions** at a full multiplier.
-A miner can hold multiple target slots; each has its own clock. A rejected
+under the template each slot is **25% / 10 = 2.5% of total emissions**.
+A miner can hold several slots. A rejected
 update neither merges nor earns; a deferred update waits unpaid. Existing
 holders keep their remaining eligible pay while replacements are pending.
 
@@ -1393,9 +1403,10 @@ train the full model. B's generators train selected experts inside that model.
 B opens separately from A: an activation block alone does not bypass its
 measured-lineage and routing checks. Use fresh `cascade status --json`.
 
-The planned rollout allocates A 100%, then A/C 75/25, then A/B/C 50/25/25.
-The [reward schedule](#rewards-allocation-burn-and-progression) explains the
-launch cap, king ladder, acceptance clocks and burns.
+On mainnet, lanes B, C and D open together at block 9586800 under the
+launch overlay's split A 0 / B 35 / C 15 / D 50. The
+[reward schedule](#rewards-allocation-burn-and-progression) explains the
+template tables, slot pay and burns.
 
 ### Choose targets, not expert IDs
 
@@ -1491,14 +1502,19 @@ rental until it is resolved, so a leg is never billed twice at once.
 
 ### Qualification, merge acceptance and payment
 
-1. **Qualify.** Each declared target needs a positive point gain and an LCB
-   at least `gain_margin`, with enough independent sources
-   (`min_target_clusters`). The confidence level is corrected by the number
-   of declared targets. A horizon target uses windows scored at that horizon.
+1. **Qualify.** The leg is tested on every slot (see "Every slot is tested"
+   in the reward schedule). A slot clears when its CRPS or MASE gain LCB
+   reaches the bar (`gain_margin` for declared targets, `undeclared_gain_margin`
+   for the rest) with a positive point gain, the other metric is
+   non-inferior, and there are enough independent sources
+   (`min_target_clusters`). A horizon target uses windows scored at that
+   horizon.
 2. **Check regressions.** Other domains/horizons and required public benchmarks
    must satisfy their non-inferiority limits (`LCB ≥ −tau`). A guard failure
-   blocks every target in that leg; a target missing only its own gain test
-   is unpaid. Required public rows and compatible data revisions must exist.
+   blocks every slot in that leg. A suite slot also needs a whole-pool point
+   gain ≥ 0 and every guard to hold against the anchor king
+   (`tau_anchor_domain`, `tau_anchor_public`). Required public rows and
+   compatible data revisions must exist.
 3. **Wait for a scheduled warm start.** With acceptance enabled, qualification
    is unpaid and leaves current holders in place. Qualified deltas wait for
    the next compatible shared starting checkpoint.
@@ -1507,15 +1523,14 @@ rental until it is resolved, so a leg is never billed twice at once.
    so far while all domain, horizon and public guards remain within the
    original init's regression limits. Validators verify intermediate weights
    and private verdicts; public rows use signed trainer evidence.
-5. **Merge and pay.** Only committed accepted targets enter the scheduled
-   init and start their reward clocks. Their pay tiers use accepted marginal
-   gain. The delta merges once, even if it wins several target slots.
+5. **Merge and pay.** Only accepted slots enter the scheduled init and
+   start paying. Pay has no tiers: a held slot pays in full until it is
+   replaced. The delta merges once, even if it wins several slots.
 
 Rejected combinations neither merge nor earn; there is no extra slash, but
 training costs already used remain spent. Deferral is unpaid. Later compatible
 candidates can still pass. A later candidate for a target already accepted
-in the same batch waits for another warm start. Reward expiry does not undo a
-merge. Mainnet enables this acceptance rule with v2; testnet keeps its older
+in the same batch waits for another warm start. Mainnet enables this acceptance rule with v2; testnet keeps its older
 rule until separately activated. See the [reward tables](#rewards-allocation-burn-and-progression).
 
 ### Lane B track settings
@@ -1833,8 +1848,8 @@ earliest block it can lift.
 New to MarketCast? Start with the step-by-step [MarketCast miner guide](MARKETCAST.md); this section is the full rule reference.
 
 **Lane C currently accepts MarketCast recipes only.** Its tests use market
-windows that start after training is dispatched and are scored once they
-close. Training data has a separate embargo cutoff.
+windows drawn from the embargo period your recipe could not train on, so a
+verdict comes at the first settlement after your leg (see "How it is judged").
 Today the only such competition is MarketCast, and its shipped lane-C target is
 ONE composite, `mkt:market`, judged over every `[marketcast] suites` member at
 once (`composite = true`; `composite = false` is the per-suite shape,
@@ -2135,8 +2150,9 @@ Every lane-C entry (DEC-CA-0056 review 2026-10-19):
   positive point gain, ≥ `min_windows` windows over ≥ `min_clusters`
   (asset class × 6 h block) clusters, and the calibration gate above.
 - An initial pass is **pending confirmation**, with no payment. A later
-  settlement must pass it again at `alpha` on windows starting after the first
-  snapshot ended. Confirmation must also win the target slot: the main
+  settlement must pass it again at `alpha` on the other half of the drawn
+  windows (plus short-horizon forward windows that closed after the first
+  pass's snapshot). Confirmation must also win the target slot: the main
   validator forecasts the current holder on YOUR windows, and you take the
   slot only by beating it there (paired gain `LCB ≥ gain_margin`, recorded as
   `mkt.vs_holder`), not by a higher LCB the holder recorded on another week.
@@ -2162,8 +2178,10 @@ and with any recipe, and the operator pays for evaluation. Nothing is rented
 on your provider account. Use a dedicated hotkey: a lane D commit replaces
 that hotkey's lane A pointer. Lane D's template ships unarmed
 (`[lane_d] from_block = 0`). On mainnet the signed launch overlay arms it at
-block 9586800 (with lane B, and lane C's template block); check
-`cascade status --json` before you submit.
+block 9586800 (with lane B, and lane C's template block) and scores it on
+the **live half only** (`public_weight = 0.0`); the 50/50 live/public rule
+switches on later by overlay. Check `cascade status --json` before you
+submit. The [lane D brief](MINER_LANE_D.md) covers scoring, pay and tips.
 
 - `cascade lane-d export ./trained --out ./entry` writes the entry directory
   (the four files only) and prints its digest.

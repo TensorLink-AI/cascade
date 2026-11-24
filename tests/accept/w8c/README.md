@@ -338,6 +338,15 @@ the settlement). `test_w8c_public.py` pins it, including the host end
 (`public_scores_entry`). The fault tests import `_forecast_ok` from
 `cascade.validator.lane_d` (A7 deletes `lane_d_lowfreq`).
 
+Hippius mirror (owner 2026-11-24, #894): `eval_public_root` is optional.
+Without it the box sends `public` with no `--public-root` and the host reads
+the drawn series from the Hippius mirror of the release's
+`deploy/laned/public_mirror.toml` (`public_scores_entry(..., mirror=)`,
+W6p `PublicMirror`; volume cache, then Hippius, then R2). Optional inputs
+keys `eval_public_cache_dir` / `eval_public_cache_budget_bytes` become
+`--public-cache-dir` / `--public-cache-budget-bytes`. With it, the local
+mirror path is unchanged. `test_w8c_public_mirror.py`.
+
 ## rev6.14 (a): judging start vs eligibility boundary (owner 2026-11-23)
 
 Option A (orchestrator 2026-11-23): the source reads the boundary block's on-chain timestamp with its chain reader and returns it as `LaneDInputs.boundary_ts` (W8b passes it to `settle_lane_d`); unreadable is `boundary_ts_unreadable`, never a guessed time. The fake reader answers a boundary block with W8b's fixture clock. `test_w8c_rev614.py`.

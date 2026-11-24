@@ -819,6 +819,37 @@ A settlement with no lane D report is re-derived from its absent receipt
 record (`check_lane_d_absent`); on a pass a satellite burns lane D's share,
 and only lane D's.
 
+**Lane D payees at the push (#913).** When lane D pays its signed court
+(KING_D, then prior kings, at the `[lane_d] court_weights` in force at the
+settlement), the court's `uid -> hotkey` slots join the satellite's
+`reward-uid` attribution. If the satellite's own metagraph registers a lane D
+court uid to a different hotkey, lane D's share (and only lane D's) burns to
+`burn_uid`; lanes A/B/C are set as derived (log tag `lane_d_check_burn …
+reward-uid`). A lane A/B/C payee mismatch still burns the whole vector.
+
+### Lane D: rebuilt from empty state (#910)
+
+Lane D's state (`lane_d_state.json` and `lane_d_state_reports/`, next to the
+validator state DB) lives only on the main validator, which produces the
+settlements. It is not rebuilt from the published reports. The rules:
+
+- A node that cannot settle a boundary itself pays the court of the signed
+  published settlement at that boundary (`lane-d/reports/…`,
+  `lane-d/receipts/…`) when the audit's lane D checker verifies it, exactly
+  as a satellite does. This covers a main validator restarted with a lost
+  state and a full validator that does not produce lane D (no
+  `--lane-d-inputs`). Otherwise lane D's share burns, and lanes A/B/C are
+  unchanged. A rebuilt node never starts from genesis: it stops at
+  `state_digest_mismatch` / `state_missing`.
+- To produce new settlements after a state loss, the main validator needs
+  its state restored from a backup whose digest equals the last published
+  receipt's `posterior_state_sha256` (`restore_state`). Until then lane D's
+  share burns everywhere, per lane. Keep both paths in the main
+  validator's backup set before lane D arms.
+- Satellites hold no lane D state. A satellite rebuilt from empty state
+  replays lane D from the published records and anchors continuity at its
+  first receipt.
+
 ## Satellite validators (DEC-CA-0058)
 
 A satellite does not evaluate anything. It replays the main validator's

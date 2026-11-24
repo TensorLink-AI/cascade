@@ -31,6 +31,29 @@ host (never the validator box); ``size`` reads Hugging Face metadata only.
 
     index  --source S --data-root DIR --index-dir DIR [--allowed FILE]
         Steps 3 only, over an existing local copy.
+
+    build  --source S --work-dir DIR --index-dir DIR [--workers N]
+           [--mirror-config FILE] [--stores hippius,r2] [--datasets a,b]
+           [--listing FILE] [--allowed FILE] [--no-finalize]
+        THE canonical mirror (owner 2026-11-24, #894): streams the pinned
+        revision folder by folder into content-addressed Parquet shards on
+        the stores of ``deploy/laned/public_mirror.toml`` (Hippius, then R2),
+        then writes the W6p index (byte-identical to ``index``) + the shard
+        map + ``shards.json`` into ``--index-dir`` and uploads them under
+        ``index/<index_sha256>/``. CPU only, on a Shadeform CPU VM (never the
+        validator box); resumable (rerun the same command) and idempotent.
+        Prints ``SHARD`` / ``DONE`` lines per folder and the ``INDEX`` line.
+        Write keys by env NAME: ``HIPPIUS_S3_*`` / ``BACKUP_S3_*``.
+
+    estimate --source S --work-dir DIR [--datasets a,b | --sample N] [--listing FILE]
+        Builds sample folders WITHOUT uploading and prints ``ESTIMATE`` (the
+        measured shard/raw ratio, the projected compressed size and the
+        single-worker conversion hours for the whole source).
+
+    fetch-index --source S --index-sha256 HEX --index-dir DIR [--mirror-config FILE]
+        Downloads the index + shard map of ``index_sha256`` from the mirror
+        (Hippius, then R2) into ``--index-dir`` and verifies every hash: the
+        box's ``public_indexes`` dir.
 """
 
 from __future__ import annotations
@@ -197,17 +220,136 @@ def cmd_index(args) -> int:
     return 0
 
 
+def _full_listing(args) -> list[dict]:
+    """The HF tree entries (with LFS oids) of the pinned revision, or ``--listing``."""
+    if args.listing:
+        return json.loads(Path(args.listing).read_text(encoding="utf-8"))
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from laned_rmisc_allowlist import hf_tree
+
+    spec = idx.PUBLIC_SOURCES[args.source]
+    return [e for e in hf_tree(spec.repo, spec.revision, recursive=True)
+            if e.get("type") == "file"]
+
+
+def _picked(args, listing: list[dict]) -> list[str]:
+    ds, _ = selected_files(args.source, listing, args.allowed)
+    if getattr(args, "datasets", None):
+        want = [d for d in args.datasets.split(",") if d]
+        bad = sorted(set(want) - set(ds))
+        if bad:
+            raise SystemExit(f"--datasets not in the source: {bad}")
+        return sorted(want)
+    return ds
+
+
+def _write_stores(args) -> tuple[dict, list]:
+    from cascade.eval import lane_d_public_build as pb
+    from cascade.eval import lane_d_public_mirror as pm
+
+    cfg = pm.load_mirror_config(args.mirror_config)
+    names = [s for s in (args.stores or "").split(",") if s] or [s.name for s in cfg["stores"]]
+    by = {s.name: s for s in cfg["stores"]}
+    bad = sorted(set(names) - set(by))
+    if bad:
+        raise SystemExit(f"--stores not in {args.mirror_config or pm.MIRROR_CONFIG_PATH}: {bad}")
+    return cfg, [pb.S3PutStore(by[n]) for n in names]
+
+
+def cmd_build(args) -> int:
+    from cascade.eval import lane_d_public_build as pb
+
+    listing = _full_listing(args)
+    ds = _picked(args, listing)
+    cfg, stores = _write_stores(args)
+    kw = {"source": args.source, "listing": listing, "work_dir": args.work_dir,
+          "stores": stores, "fetch": pb.hf_fetcher(args.source), "prefix": cfg["prefix"]}
+    pb.build_all(kw, ds, workers=int(args.workers))
+    if not args.no_finalize:
+        pb.Builder(**kw).finalize(ds, args.index_dir)
+    return 0
+
+
+def cmd_estimate(args) -> int:
+    from cascade.eval import lane_d_public_build as pb
+
+    listing = _full_listing(args)
+    every, files = selected_files(args.source, listing, args.allowed)
+    total = sum(int(f["size"]) for f in files)
+    if args.datasets:
+        ds = _picked(args, listing)
+    else:
+        # A deterministic spread: every k-th folder by size (the small, the
+        # median and the large ones), at most --sample.
+        sizes = sorted(every, key=lambda d: sum(f["size"] for f in pb.dataset_files(listing, d)))
+        k = max(1, len(sizes) // max(1, int(args.sample)))
+        ds = sizes[::k][:int(args.sample)]
+    kw = {"source": args.source, "listing": listing, "work_dir": args.work_dir, "stores": [],
+          "fetch": pb.hf_fetcher(args.source)}
+    docs = pb.build_all(kw, ds, workers=int(args.workers))
+    est = pb.estimate(docs, total)
+    print("ESTIMATE " + " ".join(f"{k}={v}" for k, v in est.items())
+          + f" total_raw={total} ({total / 2**30:.1f} GiB) projected="
+          f"{est['projected_shard_bytes'] / 2**30:.1f} GiB datasets={','.join(ds)}")
+    return 0
+
+
+def cmd_fetch_index(args) -> int:
+    from cascade.eval import lane_d_public_mirror as pm
+
+    cfg = pm.load_mirror_config(args.mirror_config)
+    stores = [pm.S3RangeStore(s) for s in cfg["stores"]]
+    mirror = pm.PublicMirror(cache=pm.BlobCache(args.index_dir, budget_bytes=1), stores=stores,
+                             prefix=cfg["prefix"])
+    out = Path(args.index_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    for name in pm.INDEX_FILES:
+        try:
+            data = mirror._fetch(pm.index_key(cfg["prefix"], args.source, args.index_sha256,
+                                              name), sha=None)
+        except pm.MirrorError as e:
+            raise SystemExit(str(e)) from e
+        (out / name).write_bytes(data)
+    m = idx.load_manifest(out)
+    if m["source"] != args.source or m["index_sha256"] != args.index_sha256:
+        raise SystemExit(f"{out}: not the {args.source} index {args.index_sha256}")
+    n = sum(1 for _ in idx.iter_index(out))
+    doc = pm.load_shards(out, index_sha256=args.index_sha256)
+    sum(1 for _ in pm.iter_shardmap(out, doc))
+    print(f"INDEX {args.source} series={n} index_sha256={m['index_sha256']} "
+          f"files_sha256={m['files_sha256']} shardmap_sha256={doc['shardmap_sha256']} -> {out}")
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name, fn in (("size", cmd_size), ("mirror", cmd_mirror), ("index", cmd_index)):
+    for name, fn in (("size", cmd_size), ("mirror", cmd_mirror), ("index", cmd_index),
+                     ("build", cmd_build), ("estimate", cmd_estimate),
+                     ("fetch-index", cmd_fetch_index)):
         p = sub.add_parser(name)
         p.add_argument("--source", required=True, choices=sorted(idx.PUBLIC_SOURCES))
         p.add_argument("--allowed", default=None, help="RMISC allowed list (default: repo's)")
         p.set_defaults(fn=fn)
-        if name in ("size", "mirror"):
+        if name in ("size", "mirror", "build", "estimate"):
             p.add_argument("--listing", default=None,
                            help="offline file listing JSON [{path, size}] instead of the HF API")
+        if name in ("build", "estimate"):
+            p.add_argument("--work-dir", required=True, help="scratch + resumable state")
+            p.add_argument("--workers", type=int, default=1, help="folders converted at once")
+            p.add_argument("--datasets", default="", help="comma-separated folder subset")
+        if name in ("build", "fetch-index"):
+            p.add_argument("--index-dir", required=True)
+            p.add_argument("--mirror-config", default=None,
+                           help="default: deploy/laned/public_mirror.toml")
+        if name == "build":
+            p.add_argument("--stores", default="", help="store names (default: all, in order)")
+            p.add_argument("--no-finalize", action="store_true",
+                           help="build folders only (finalize on a later run)")
+        if name == "estimate":
+            p.add_argument("--sample", type=int, default=6, help="folders to convert")
+        if name == "fetch-index":
+            p.add_argument("--index-sha256", required=True)
         if name == "mirror":
             p.add_argument("--local-dir", required=True)
             p.add_argument("--index-dir", required=True)

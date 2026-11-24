@@ -33,7 +33,8 @@ Read fresh live status before proposing mining work; B/C have separate gates.
 
 Paid A entries open at **30 October 2026, 09:00 UTC**. Use a fresh revealed
 commitment from that opening; accepted entries wait for the actual v2 era,
-and submissions stay open after launch. The planned order is **A → C → B**.
+and submissions stay open after launch. Lanes B, C and D open together at
+block 9586800 (about 2026-11-25 22:28 UTC).
 
 ## One contribution, from idea to the next experiment
 
@@ -69,8 +70,10 @@ on any data and with any recipe, and submits only the BF16 weights; the
 operator only evaluates, on forward-only private windows whose targets reached
 our data after both models were committed. Our own lane A king is always
 entered as the house, so lane D pays only for weights better than our
-pipeline. It is built and unarmed until a signed overlay arms it. The guide
-is [docs/LANE_D.md](docs/LANE_D.md).
+pipeline. On mainnet the signed launch overlay arms it at block 9586800,
+scored on live windows only at first. The guide is
+[docs/LANE_D.md](docs/LANE_D.md); the brief is
+[docs/MINER_LANE_D.md](docs/MINER_LANE_D.md).
 
 An agent can export and verify an entry locally. Uploading, attesting the
 licence and committing on chain need the human's explicit authorisation, as

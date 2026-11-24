@@ -503,6 +503,75 @@ class LaneDStep:
                 return None
         if not self.cfg.lane_d.active(b):
             return None
+        try:
+            return self._produce(b)
+        except LaneDWiringError as e:
+            # #910: a node that cannot settle ``b`` itself (rebuilt from empty
+            # state, a lost or rolled-back lane_d_state.json, or no inputs:
+            # a full validator that does not produce lane D) pays the court
+            # of the SIGNED PUBLISHED settlement at ``b`` when the audit's
+            # lane D checker verifies it, exactly as a satellite does;
+            # otherwise lane D's share burns (lanes A/B/C unchanged).
+            followed = self._follow_published(b)
+            if followed and self._inputs is None:
+                return None
+            if not followed:
+                log.warning("lane D settlement %d: not settled here (%s) and no verified "
+                            "published settlement to follow; lane D's share burns (lanes "
+                            "A/B/C unchanged). A lost state is restored from a backup "
+                            "bound to the last published posterior (restore_state).", b, e)
+            raise
+
+    def _follow_published(self, b: int) -> bool:
+        """#910: set the court of ``b`` from the published lane D report and
+        receipt record at ``b``, verified by the audit's lane D checker
+        (:func:`cascade.audit.checks.lane_d_pay`: the owner's signature, the
+        receipt binding, every burn-class check, under the config in force
+        at ``b``; the signer pinned as the producer pins it). True when the
+        court is set (or already was). Never raises."""
+        with self._lock:
+            if b in self._courts:
+                return True
+        if self.store is None:
+            return False
+        try:
+            from types import SimpleNamespace
+
+            from ..audit.checks import lane_d_pay
+
+            try:
+                report = json.loads(self.store.get_text(report_key(b)))
+                rec = json.loads(self.store.get_text(receipt_key(b)))
+            except ObjectNotFound:
+                return False
+            if not isinstance(report, dict) or not isinstance(rec, dict):
+                return False
+            # the pinned lane D report signer (W7b pinned_report_signer:
+            # [manifest] validator_hotkey), else the main validator
+            owner = (str(getattr(self.cfg.manifest, "validator_hotkey", "") or "")
+                     or str(getattr(getattr(self.cfg, "netconfig", None), "owner_hotkey", "")
+                            or ""))
+            if not owner:
+                return False
+            from dataclasses import replace as _replace
+
+            cfg_v = _replace(self.cfg, manifest=_replace(self.cfg.manifest,
+                                                          validator_hotkey=owner))
+            pay = lane_d_pay(SimpleNamespace(epoch_start_block=b), cfg_v,
+                             {"report": report, "receipt": rec})
+        except Exception as e:  # noqa: BLE001 — following never raises
+            log.warning("lane D settlement %d: published settlement unreadable (%s)", b, e)
+            return False
+        if not pay.paid:
+            log.warning("lane D settlement %d: the published settlement does not verify "
+                        "(%s); not followed", b, pay.why or pay.transient)
+            return False
+        self._set_court(b, report)
+        log.warning("lane D settlement %d: court taken from the signed published settlement "
+                    "(not settled by this node)", b)
+        return True
+
+    def _produce(self, b: int) -> LaneDSettlement | None:
         if self.signer is None:
             raise LaneDWiringError("signer_unavailable",
                                    "lane D is armed but no validator hotkey signs its reports")
