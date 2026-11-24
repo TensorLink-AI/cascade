@@ -16,8 +16,10 @@ from . import helpers as h
 # Plan rev6.11 (b) removes the `confirmation` block (no confirmation duel;
 # W7a "a verdict carrying `confirmation` is `unknown_field`"), so it is no
 # longer a report field the guide must name.
+# rev6.18 A7 / A8 (F4): the A10 `lowfreq` block is removed (owner
+# 2026-11-23); the per-half point gains (`halves`) replace it.
 REPORT_FIELDS = {"rows_sha256": "", "judged": "", "skipped": "", "coldkey": "entries",
-                 "lowfreq": "verdicts",
+                 "halves": "verdicts",
                  "min_target_ts": "windows", "min_first_seen_ts": "windows",
                  "mirror_lag_hours": "windows"}
 

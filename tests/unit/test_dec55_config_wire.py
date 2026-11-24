@@ -36,7 +36,8 @@ def test_mainnet_and_testnet_values(tmp_path):
     assert predecision_main(tmp_path).v2.prelaunch_burn_from_block == 0   # the vote decided it
     t = load_chain_config(ROOT / "chain.testnet.toml").v2
     assert (t.random_init_eras, t.reign_warm_start_blocks, t.prelaunch_burn,
-            t.carryover_king_share, t.king_ladder) == (0, 0, 0.0, 0.0, False)
+            t.carryover_king_share, t.king_ladder) == (0, 0, 0.0, 0.0, True)   # TESTNET-FAST
+    # (owner 2026-11-24, option A): the ladder is on for testnet's validator bench
 
 
 @pytest.mark.parametrize("key,value", [

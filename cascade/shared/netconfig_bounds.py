@@ -219,8 +219,19 @@ BOUNDS: dict[tuple[str, str], Bound] = {
     ("lane_d", "reward_prior_kings"): _PRIOR_KINGS,
     ("lane_d", "embargo_hours"): Bound(0.0, 168.0, why="the reveal delay caps it"),
     ("lane_d", "forward_margin_hours"): Bound(0.0, 48.0, why="forward-only gap"),
-    ("lane_d", "backtest_weight_cap"): Bound(0.0, 0.25, why=_FREE_WIN),
-    ("lane_d", "backtest_ratio_floor"): Bound(0.5, 1.0, hi_open=True, why=_FREE_WIN),
+    # rev6.18 D24 (F4): backtest_weight_cap / backtest_ratio_floor are retired
+    # keys (no parser reads them), so they carry no overlay bound.
+    # rev6.18 A3 (F4): the live/public split L = (1 - w) L_live + w L_pub,
+    # overlay-tweakable after the release (owner 2026-11-24). The loader keeps
+    # w < 1 (a live half always counts).
+    ("lane_d", "public_weight"): Bound(0.0, 1.0, why="the live / public split of the verdict"),
+    # The per-window ratio clamp [floor, 1 / floor] (0.5 = [0.5, 2]); there is
+    # no separate ceiling key. Below 0.1 one window may move the score by more
+    # than 10x (a single outlier decides); above 0.9 the clamp flattens every
+    # window and nothing can clear.
+    ("lane_d", "window_ratio_floor"): Bound(0.1, 0.9, why=_FREE_WIN + " (one window moves "
+                                             "the score by at most 1 / floor; a floor near 1 "
+                                             "stalls every verdict)"),
     ("lane_d", "max_source_share"): Bound(0.0, 1.0, lo_open=True, why=_FREE_WIN),
     ("lane_d", "max_open_per_coldkey"): _count(1, 64),
     ("lane_d", "max_judged_per_coldkey_per_settlement"): _count(1, 64),

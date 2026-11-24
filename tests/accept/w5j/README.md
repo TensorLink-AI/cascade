@@ -113,3 +113,9 @@ W5a (rev6.10 (a)) refuses every window of a listed feed whose
 (`settle_helpers.write_pool`) now pins `embargo_hours: 0.0` on every feed, so
 every window stays eligible and fresh once W5a lands; on main the key is
 ignored. No assertion changed.
+
+## Forward cells only (rev6.18 D24, owner 2026-11-24)
+
+The slow-cadence backtest windows are dropped: the draw has forward cells
+only, the schema's `window_kind` / `window_bin` enums are `["forward"]`, and
+the backtest keys are not parsed (`test_w5j_forward_only.py`).

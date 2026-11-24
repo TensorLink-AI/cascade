@@ -242,3 +242,8 @@ as X. `test_pending_progress_counts_windows_and_clusters_against_the_floors`
 now expects `(24, 4, False)` for Z (it expected the rev3 `(0, 0, False)`). X's
 row and the floors are unchanged. On main (rev3 rule) the changed test fails
 on that assertion until the W5a implementation (#800) lands.
+
+## Per-half point gains on the board (rev6.18 A8, F4)
+
+Each board verdict also carries the signed report's `halves` and `sources`
+(absent on a report signed before F4). `VERDICT_KEYS` gains both.

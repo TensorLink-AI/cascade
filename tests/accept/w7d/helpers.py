@@ -157,6 +157,13 @@ def genesis_digest(house: dict) -> str:
 # ── config ──────────────────────────────────────────────────────────────────
 
 
+# rev6.18 F4 (A3): these fixtures pin the live-only rule: the public half off
+# (public_weight = 0, a spec setting) and no per-window ratio clamp in effect
+# (a floor far below any fixture ratio), so their pre-F4 numbers stand. F4's
+# own tests (tests/accept/w5e/test_w5e_combined.py) pin the combined rule.
+LIVE_ONLY = {"public_weight": 0.0, "window_ratio_floor": 1e-9}
+
+
 def lane_d_cfg(**over):
     """The real W2 parse of an armed `[lane_d]` table. Floors 48 windows / 4
     sources (rev6.11, as in the W7c fixture): two snapshots of 24 windows, so
@@ -168,7 +175,7 @@ def lane_d_cfg(**over):
            "remainder": "burn", "contexts": [4096, 8192, 16384], "horizon": HORIZON,
            "forward_margin_hours": MARGIN_H, "max_mirror_lag_hours": 6.0,
            "min_windows": FLOOR_WINDOWS, "min_clusters": 4, "bootstrap_B": 200}
-    return parse_lane_d({**raw, **over}, era_blocks_at=lambda _block: ERA)
+    return parse_lane_d({**raw, **LIVE_ONLY, **over}, era_blocks_at=lambda _block: ERA)
 
 
 # ── pool_d fixtures (trimmed copy of tests/accept/w7c/helpers.py) ───────────

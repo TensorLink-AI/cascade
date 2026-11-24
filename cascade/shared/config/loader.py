@@ -11,7 +11,7 @@ from pathlib import Path
 from .chain_config import ChainConfig
 from .generation import parse_generation
 from .lane_c import parse_lane_c
-from .lane_d import RETIRED_LANE_D_KEYS, parse_lane_d
+from .lane_d import RETIRED_LANE_D_F4_KEYS, RETIRED_LANE_D_KEYS, parse_lane_d
 from .marketcast import check_marketcast_arming, parse_marketcast
 from .money import parse_money_safety, parse_validator_cache
 from .reliability import parse_reliability
@@ -100,8 +100,9 @@ RETIRED_KEYS: dict[str, frozenset[str]] = {
     # rev6.18 B12: the DEC-CA-0034 init gate's mode / tolerance. Its legacy
     # shadow window is [scoring] init_gate_retired_from_block.
     "scoring": frozenset({"init_gate_mode", "init_gate_tolerance"}),
-    # rev6.18 B11: confirm_on_king_change and the DEC-CA-0062 keys.
-    "lane_d": RETIRED_LANE_D_KEYS,
+    # rev6.18 B11: confirm_on_king_change and the DEC-CA-0062 keys; rev6.18
+    # F4 (A7, D24): the W5i backtest keys and the A10 slice.
+    "lane_d": RETIRED_LANE_D_KEYS | RETIRED_LANE_D_F4_KEYS,
     # Parsed by older releases (hf_cache_seconds was REQUIRED there), read by none.
     "eval": frozenset({"eval_source"}),
     "validator": frozenset({"hf_cache_seconds"}),

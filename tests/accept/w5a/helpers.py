@@ -46,6 +46,13 @@ _Z = tuple(NormalDist().inv_cdf(level) for level in SCORING_LEVELS)
 _ABSENT = object()                # "the series records no frontier key"
 
 
+# rev6.18 F4 (A3): these fixtures pin the live-only rule: the public half off
+# (public_weight = 0, a spec setting) and no per-window ratio clamp in effect
+# (a floor far below any fixture ratio), so their pre-F4 numbers stand. F4's
+# own tests (tests/accept/w5e/test_w5e_combined.py) pin the combined rule.
+LIVE_ONLY = {"public_weight": 0.0, "window_ratio_floor": 1e-9}
+
+
 def lane_d_cfg(**over):
     """The real W2 parse of an armed `[lane_d]` table with `over` applied."""
     from cascade.shared.config.lane_d import parse_lane_d
@@ -54,7 +61,7 @@ def lane_d_cfg(**over):
            "remainder": "burn", "contexts": [4096, 8192, 16384], "horizon": HORIZON,
            "forward_margin_hours": MARGIN_H, "max_mirror_lag_hours": LAG_H,
            "min_windows": 12, "min_clusters": 3, "bootstrap_B": 200}
-    return parse_lane_d({**raw, **over}, era_blocks_at=lambda _block: 3600)
+    return parse_lane_d({**raw, **LIVE_ONLY, **over}, era_blocks_at=lambda _block: 3600)
 
 
 def window_id(series_id: str, target_ts) -> str:

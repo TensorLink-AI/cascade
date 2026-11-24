@@ -81,7 +81,8 @@ def _lie(c, n, mutate, paths, *, alt_reason=None):
 def _check_fields(rep: dict, cfg, bh: str, *, cohort: int = 0) -> None:
     p = rep["params"]
     assert p.get("embargo_hours") == EMBARGO_HOURS, p.get("embargo_hours")
-    assert p.get("min_fresh_window_share") == 0.5, p.get("min_fresh_window_share")
+    # owner 2026-11-23: the default is 0.2 (was 0.5; "first verdict ~6 h")
+    assert p.get("min_fresh_window_share") == 0.2, p.get("min_fresh_window_share")
     assert p.get("max_windows_per_settlement") == int(cfg.max_windows_per_settlement)
     assert "embargo_window_share_cap" not in p, "rev6.12 (b) replaced the share cap"
     b = int(rep["cohorts"][cohort]["t_max"]) + int(HOUR * MARGIN_H)

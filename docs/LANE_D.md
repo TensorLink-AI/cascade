@@ -209,8 +209,8 @@ first verdict (FAQ).
 above. The other half is public: 5000 windows each from
 `Salesforce/GiftEvalPretrain` and `nju-zhangsq/RMISC` per settlement, drawn by
 the settlement block hash from the whole dataset (multivariate sets are scored
-as `(C, L)` panels). Each window's score ratio is clamped to [0.5, 2] and
-log-averaged into L_live and L_public, and the combined score is
+as `(C, L)` panels). Each window's score ratio is clamped to [0.5, 2]
+(`window_ratio_floor` = 0.5) and log-averaged into L_live and L_public, and the combined score is
 `L = (1 − public_weight) · L_live + public_weight · L_public` with
 `public_weight` = 0.5. A challenger must also gain on each half on its own.
 
@@ -223,7 +223,8 @@ current KING_D's tenure (the lane D settlements it has held the crown, the
 house included): `d_margin_start` (0.03) at tenure 0, falling linearly to
 `d_margin` (0.01) over `d_margin_warmup_settlements` (32 settlements, about
 4 days at 3 h each), flat after. A new crown restarts it. The signed report
-records the tenure and the bar applied (`crown_bar`). Several entries freezing in one settlement
+records the tenure and the bar applied (`crown_bar`) and your gain per half, per
+source (live, GiftEvalPretrain, RMISC) and per domain. Several entries freezing in one settlement
 form a cohort judged with max-T on their shared window set. When a miner
 holds KING_D, each member must also clear the current house on the same set.
 An entry is

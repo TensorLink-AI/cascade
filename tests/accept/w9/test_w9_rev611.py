@@ -1,6 +1,6 @@
-"""W9 (plan rev6.11 (b), W9 row; rev6.9 W5i): the audit expects no
-confirmation stage, re-derives crowning as first clear ∧ A10 ∧ gate, and
-re-derives the backtest clamp independently of producer code.
+"""W9 (plan rev6.11 (b), W9 row; rev6.18 F4): the audit expects no
+confirmation stage and re-derives crowning as first clear ∧ gate (rev6.18
+A7: no A10; D24: no backtest clamp).
 
 README.md "rev6.11" has the contract. Every forgery is re-signed by the
 validator's key with `rows_sha256` recomputed (`helpers.resign`), so the
@@ -14,7 +14,6 @@ exist (`ImportError` from `cascade.audit.lane_d`, in PATHS).
 from __future__ import annotations
 
 import copy
-import math
 
 import pytest
 
@@ -91,14 +90,6 @@ def _crowned_verdict(rep: dict, x: str) -> dict:
     return v
 
 
-def test_rev611_a_crown_whose_a10_check_failed_fails(run):
-    """A10 `fail` is a judged, final loss: never gated, never crowned."""
-    report = _s1(run)
-    v = _crowned_verdict(report, run["entry"]["digest"])
-    v["lowfreq"] = {**v["lowfreq"], "result": "fail", "n_windows": 8}
-    h.assert_fail(h.resign(report), run["cfg"], "crowned although A10 failed")
-
-
 def test_rev611_a_crown_without_a_gate_fails(run):
     """No §1.3b gate result, no crown (the first clear alone never crowns)."""
     report = _s1(run)
@@ -114,53 +105,29 @@ def test_rev611_a_crown_without_a_clear_fails(run):
     h.assert_fail(h.resign(report), run["cfg"], "crowned although the first verdict did not clear")
 
 
-# ── the backtest clamp (rev6.9 W5i), re-derived in the audit ────────────────
+# ── rev6.18 D24 / A7 (F4): no backtest statistic, no A10 ─────────────────────
+#
+# Correction (owner 2026-11-24: backtest windows dropped; owner 2026-11-23:
+# A10 removed): the W5i combined_log_ratio tests and the A10 crown test are
+# deleted with the rules they pinned; the audit no longer has either.
 
 
-def _ref(r_fwd, r_bt, n_fwd, n_bt, cap, floor) -> float:
-    """The rev6.9 combination rule, re-derived here."""
-    c = 0.0 if n_bt == 0 else min(cap, n_bt / (n_bt + n_fwd))
-    clamped = min(max(r_bt, floor), 1.0 / floor)
-    return (1.0 - c) * math.log(r_fwd) + c * math.log(clamped)
+def test_rev618_the_audit_has_no_backtest_or_a10_rule():
+    from cascade.audit import lane_d
+
+    assert not hasattr(lane_d, "combined_log_ratio"), (
+        "cascade.audit.lane_d still re-derives the W5i backtest combination")
+    assert not hasattr(lane_d, "_lowfreq_problem"), "the audit still re-derives A10"
 
 
-CLAMP_CASES = [
-    # (r_fwd, r_bt, n_fwd, n_bt, cap, floor)
-    (0.97, 0.5, 95, 5, 0.05, 0.85),         # cap binds, lower clamp binds
-    (0.97, 0.9, 95, 5, 0.05, 0.85),         # inside the clamp
-    (1.02, 3.0, 95, 5, 0.05, 0.85),         # upper clamp binds
-    (0.97, 0.5, 99, 1, 0.05, 0.85),         # the natural share binds: c = 0.01
-    (0.99, 1e-12, 900, 100, 0.05, 0.9),     # perfect memorisation, another floor
-]
+def test_rev618_a_crown_whose_public_half_regressed_fails(run):
+    """rev6.18 A3: a clear needs a positive point gain on every half; a
+    verdict whose stated live gain is made negative no longer re-derives."""
+    report = _s1(run)
+    v = _crowned_verdict(report, run["entry"]["digest"])
+    assert "halves" in v, "F4: verdicts carry their per-half point gains"
+    v["halves"]["live"]["gain"] = -abs(v["halves"]["live"]["gain"])
+    v["sources"]["live"] = dict(v["halves"]["live"])
+    h.assert_fail(h.resign(report), run["cfg"], "crowned with a negative live half")
 
 
-@pytest.mark.parametrize("case", CLAMP_CASES)
-def test_rev611_the_audit_rederives_the_clamped_combined_statistic(case):
-    from cascade.audit.lane_d import combined_log_ratio
-
-    r_fwd, r_bt, n_fwd, n_bt, cap, floor = case
-    got = combined_log_ratio(r_fwd, r_bt, n_fwd=n_fwd, n_bt=n_bt, cap=cap, floor=floor)
-    assert math.isclose(got, _ref(*case), rel_tol=1e-12, abs_tol=1e-15), (case, got)
-
-
-@pytest.mark.parametrize("n_bt,cap", [(0, 0.05), (5, 0.0)], ids=["no_backtest", "cap_zero"])
-def test_rev611_off_the_combined_statistic_is_the_forward_ratio(n_bt, cap):
-    """`backtest_weight_cap = 0` (the default) or no backtest window: exactly
-    the forward log ratio, whatever the backtest ratio."""
-    from cascade.audit.lane_d import combined_log_ratio
-
-    for r_bt in (1e-12, 0.5, 1.0, 7.0):
-        got = combined_log_ratio(0.97, r_bt, n_fwd=100, n_bt=n_bt, cap=cap, floor=0.85)
-        assert got == math.log(0.97), (n_bt, cap, r_bt, got)
-
-
-def test_rev611_memorisation_gains_at_most_one_minus_floor_to_the_cap():
-    """Forward equal (R_fwd = 1) and perfect backtest memorisation: the gain
-    1 − R is at most 1 − floor^cap, below `d_margin` 0.01 at the defaults
-    (cap 0.05, floor 0.85)."""
-    from cascade.audit.lane_d import combined_log_ratio
-
-    got = combined_log_ratio(1.0, 1e-12, n_fwd=10, n_bt=10_000, cap=0.05, floor=0.85)
-    gain = 1.0 - math.exp(got)
-    assert math.isclose(gain, 1.0 - 0.85 ** 0.05, rel_tol=1e-12)
-    assert gain < 0.01

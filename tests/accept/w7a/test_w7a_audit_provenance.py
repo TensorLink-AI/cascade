@@ -560,7 +560,9 @@ def test_a_restated_sentinel_with_a_consistent_draw_fails_against_the_era(runs):
     _fails(_resign(r), cfg, "a restated sentinel", era_sentinel=_era(SENTINEL))
 
 
-# ── (d) W3b5: a lowfreq fail is lost, never gated, never crowned ────────────
+# ── (d) W3b5: REMOVED (rev6.18 A7, owner 2026-11-23) ────────────────────────
+# Correction: the A10 check is removed, so its two audit tests (an honest
+# lowfreq fail passes, a doctored one fails) are deleted with it.
 
 
 def _pin_embargo_zero(pool_dir) -> None:
@@ -577,71 +579,3 @@ def _pin_embargo_zero(pool_dir) -> None:
     meta_path.write_text(json.dumps(meta, sort_keys=True))
 
 
-def _lowfreq_fail_run(tmp_path) -> dict:
-    """W3b5's T4b case at the first verdict (rev6.11): X clears on the hourly
-    set at boundary(1) but regresses on the snapshot's low-frequency slice
-    (every level 1.3x further from the target)."""
-    from tests.accept.w3b5 import helpers as w3
-
-    cfg = w3.lane_d_cfg()
-    h0, x = w3.house(), w3.entry("x", reveal_ts=w3.T_FIRST)
-    hd, xd = h0["digest"], x["digest"]
-    path = tmp_path / "state" / "lane_d_state.json"
-    lf1 = w3.lowfreq_records("lf1", 8, "D")
-    pool1, recs1 = w3.snapshot(tmp_path, 1, w3.T_FIRST, lf1)
-    _pin_embargo_zero(pool1)
-    fc1 = w3.merge({hd: w3.hourly_forecasts(recs1, "bad", "house-0"),
-                    xd: w3.hourly_forecasts(recs1, "sharp", "x")},
-                   {hd: w3.lowfreq_forecasts(lf1, w3.flat(1.0)),
-                    xd: w3.lowfreq_forecasts(lf1, w3.flat(1.3))})
-    s1 = w3.settle(cfg, w3.boundary(1), pool1, [x], h0, fc1, w3.uids(x), path)
-    v = w3.verdict_of(s1.report, xd)
-    assert v is not None and v.get("stage", "first") == "first" and v["cleared"], \
-        f"fixture: {v}"
-    if "lcb" not in v["lowfreq"]:
-        pytest.skip("W3b5 (#651) not on this base: verdicts[].lowfreq.lcb is absent, the "
-                    "A10 check does not decide yet")
-    assert v["lowfreq"]["result"] == "fail" and v["outcome"] == "lost", f"fixture: {v}"
-    return {"w3": w3, "cfg": cfg, "x": x, "s1": s1.report}
-
-
-def test_w3b5_an_honest_lowfreq_fail_passes_the_audit(tmp_path):
-    run = _lowfreq_fail_run(tmp_path)
-    r, x = run["s1"], run["x"]["digest"]
-    assert r["crowned"] is None
-    assert "gate" not in r or all(g["digest"] != x for g in r["gate"]["results"]), \
-        "fixture: a lowfreq fail is never swept by the gate"
-    _passes(r, run["cfg"], "a cleared first verdict lost to lowfreq_regression",
-            helpers=run["w3"])
-    _passes(r, run["cfg"], "the same, chain mode", helpers=run["w3"], prior=[])
-
-
-def _lowfreq_doctor(run, how: str, held_outcome: str) -> dict:
-    w3 = run["w3"]
-    r = copy.deepcopy(run["s1"])
-    x = run["x"]
-    v = _verdict(r, x["digest"])
-    if how in ("crowned", "crowned_result_pass"):
-        if how == "crowned_result_pass":
-            v["lowfreq"]["result"] = "pass"
-        r["gate"] = _forged_gate(run["cfg"], w3.boundary(1), x["digest"], "lowfreq")
-        _crown(r, x, 10)
-    elif how == "result_pass_still_lost":
-        v["lowfreq"]["result"] = "pass"
-    elif how == "held_not_lost":
-        v["outcome"] = held_outcome
-        e = _entry(r, x["digest"])
-        e["status"], e["reason"] = "hold", "bench_hold"
-    else:
-        raise KeyError(how)
-    return _resign(r, w3)
-
-
-@pytest.mark.parametrize("how", ["crowned", "crowned_result_pass", "result_pass_still_lost",
-                                 "held_not_lost"])
-def test_w3b5_a_doctored_lowfreq_fail_fails_the_audit(tmp_path, runs, how):
-    run = _lowfreq_fail_run(tmp_path)
-    _passes(run["s1"], run["cfg"], "the honest lowfreq fail", helpers=run["w3"])
-    res = _audit(_lowfreq_doctor(run, how, _held_outcome(runs)), run["cfg"],
-                 helpers=run["w3"])
-    assert res.status == "FAIL", f"lowfreq fail doctored {how}: check_lane_d {res.status}"
