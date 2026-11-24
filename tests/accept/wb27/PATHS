@@ -1,0 +1,38 @@
+# WB27: miner-chosen lane B leg levers (plan rev6.21, owner 2026-11-24;
+# README.md has the contract). No activation block: lane B is not rolled out.
+# The shared stdlib rules: levers, the token/hour limits leg, the caps.
+cascade/shared/lane_b_levers.py
+cascade/shared/lane_b_leg.py
+cascade/shared/config/lane_b.py
+cascade/shared/config/v2.py
+cascade/shared/config/training.py
+cascade/shared/config/sections.py
+cascade/shared/manifest.py
+cascade/shared/expert_manifest.py
+# Intake (typed refusals, signed tags), the funded queue record.
+cascade/funding/intake.py
+cascade/funding/queue.py
+cascade/funding/lane_b_gpus.py
+# Trainer: dispatch spec, curriculum corpora, settlement record, the worker.
+cascade/trainer/lane_b_driver.py
+cascade/trainer/runner_generation.py
+cascade/trainer/remote.py
+cascade/trainer/worker.py
+cascade/trainer/loop.py
+cascade/trainer/stream.py
+cascade/trainer/corpus.py
+cascade/trainer/sandbox.py
+cascade/trainer/pyramid_trainer.py
+# CPU-tier generation: the curriculum stage keyword and merged pod index.
+cascade/generation/cli.py
+cascade/generation/stage.py
+cascade/generation/shards.py
+# Judges: the levers stage, the limits-leg record check, audit stages.
+cascade/validator/expert_lane.py
+cascade/audit/checks.py
+# Miner CLI and docs; shipped files carry max_leg_hours = 12.
+cascade/miner/lane_b.py
+cascade/miner/cli.py
+docs/MINER.md
+chain.toml
+chain.testnet.toml

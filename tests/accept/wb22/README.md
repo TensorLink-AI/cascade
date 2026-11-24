@@ -123,3 +123,10 @@ Run locally (tests only, no torch):
 nice -n 19 env PYTHONPATH=<wt> python -P -m pytest --rootdir <wt> \
   -p no:cacheprovider -m 'not torch' <wt>/tests/accept/wb22
 ```
+
+## rev6.20 (owner 2026-11-24): `scored_weights`
+
+`ExpertEntry.scored_weights` defaults to `"ema010"` and is always in the
+signed body; a manifest without it loads as `""` (refused by the judge). The
+dispatch paths build `lane_b_leg_contract(...)`; `settle` records `"ema010"`
+on every entry. `test_wb22_scored_weights.py`.

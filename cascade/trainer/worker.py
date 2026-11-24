@@ -271,13 +271,46 @@ def main(argv: list[str] | None = None) -> int:
             guard_floor_seconds=cfg.round.heat_guard_floor_seconds,
         )
     elif expert_hours is not None:
-        # the lane-B leg budget scales the token budget AND the wall guard
-        # exactly like a reduced leg, without the heat label
-        contract = contract.for_hours(
-            expert_hours,
-            guard_factor=cfg.round.heat_guard_factor,
-            guard_floor_seconds=cfg.round.heat_guard_floor_seconds,
-        )
+        # WB27 (plan rev6.21): the trainer's lane B leg spec (WB23 length +
+        # the levers) rides --recipe-json on the expert role; absent = today's
+        # leg (no spec)
+        lane_b_spec = None
+        if args.recipe_json:
+            try:
+                lane_b_spec = json.loads(args.recipe_json)
+                if not isinstance(lane_b_spec, dict):
+                    raise ValueError("the lane B leg spec must be a JSON object")
+            except ValueError as e:
+                log.error("lane-B leg spec (--recipe-json) unreadable: %s", e)
+                return 2
+        if lane_b_spec and (float(lane_b_spec.get("train_hours", 0.0) or 0.0) > 0):
+            # WB23: the steps fixed at admission and the lane B guard
+            from ..shared.lane_b_levers import leg_length_contract
+
+            contract = leg_length_contract(cfg, contract, lane_b_spec)
+        else:
+            # the lane-B leg budget scales the token budget AND the wall guard
+            # exactly like a reduced leg, without the heat label
+            contract = contract.for_hours(
+                expert_hours,
+                guard_factor=cfg.round.heat_guard_factor,
+                guard_floor_seconds=cfg.round.heat_guard_floor_seconds,
+            )
+        # plan rev6.20: every lane B leg trains with no cooldown and scores its
+        # power EMA — the same rule the trainer applies to the contract whose
+        # digest it expects back
+        from ..shared.config.lane_b import lane_b_leg_contract
+
+        contract = lane_b_leg_contract(contract)
+        if lane_b_spec:
+            # WB27: the miner's levers, the same step the trainer applies
+            from ..shared.lane_b_levers import apply_spec_levers
+
+            try:
+                contract = apply_spec_levers(cfg.lane_b, contract, lane_b_spec, int(args.block))
+            except ValueError as e:
+                log.error("lane-B leg levers refused: %s", e)
+                return 2
     if args.anneal:
         contract = anneal_recipe(contract)
     if args.router_slow:

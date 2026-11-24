@@ -597,8 +597,8 @@ class GenerationStage:
     def _generate(self, *, round_id: str, hotkey: str, uid: int | None, era: int | None,
                  gen_ref: str, repo_dir: Path | str, seed: int,
                  priority: bool = False, min_channels: int | None = None,
-                 background: bool = False, cancel: Callable[[], bool] | None = None
-                 ) -> StageResult:
+                 background: bool = False, cancel: Callable[[], bool] | None = None,
+                 curriculum_stage: str = "") -> StageResult:
         from ..trainer.admission import FairSlots
 
         if not self.cfg.generation.enabled:
@@ -643,10 +643,12 @@ class GenerationStage:
                 raise GenerationInfraError("CPU generation admission is full — requeued")
             return self._generate_admitted(round_id=round_id, hotkey=hotkey, uid=uid, era=era,
                                            gen_ref=gen_ref, repo_dir=repo_dir, seed=seed,
-                                           min_channels=min_channels, priority=priority)
+                                           min_channels=min_channels, priority=priority,
+                                           **({"curriculum_stage": curriculum_stage}
+                                              if curriculum_stage else {}))
 
     def _generate_admitted(self, *, round_id, hotkey, uid, era, gen_ref, repo_dir, seed,
-                           min_channels=None, priority=False):
+                           min_channels=None, priority=False, curriculum_stage: str = ""):
         gcfg = self.cfg.generation
         if not gcfg.enabled:
             raise GenerationInfraError("[generation] enabled = false")
@@ -665,7 +667,9 @@ class GenerationStage:
         try:
             return self._generate_on(provider, shape, name, round_id=round_id, hotkey=hotkey,
                                      uid=uid, era=era, gen_ref=gen_ref, repo_dir=repo_dir,
-                                     seed=seed, min_channels=min_channels, tier=tier)
+                                     seed=seed, min_channels=min_channels, tier=tier,
+                                     **({"curriculum_stage": curriculum_stage}
+                                        if curriculum_stage else {}))
         finally:
             with _LIVE_GUARD:
                 _LIVE.discard(name)
@@ -698,7 +702,7 @@ class GenerationStage:
     def _generate_on(self, provider, shape, name: str, *, round_id: str, hotkey: str,
                      uid: int | None, era: int | None, gen_ref: str, repo_dir: Path | str,
                      seed: int, min_channels: int | None = None,
-                     tier: int | None = None) -> StageResult:
+                     tier: int | None = None, curriculum_stage: str = "") -> StageResult:
         gcfg = self.cfg.generation
         # The tier rented sets this leg's children and its equal-budget window.
         leg = gcfg.at_shape(tier if tier is not None else gcfg.vcpus)
@@ -751,7 +755,9 @@ class GenerationStage:
             base = leg_prefix(round_id, hotkey, gcfg.storage_prefix)
             summary = self._run(host, repo_dir, seed=seed, gen_ref=gen_ref,
                                 urls=upload_plan(self.store, base, gcfg),
-                                min_channels=min_channels, leg=leg)
+                                min_channels=min_channels, leg=leg,
+                                **({"curriculum_stage": curriculum_stage}
+                                   if curriculum_stage else {}))
             index = self._uploaded_index(base, summary)
             row = register_corpus(self.store, index, round_id=round_id, hotkey=hotkey,
                                   uid=uid, era=era, provider=provider.name,
@@ -863,7 +869,7 @@ class GenerationStage:
 
     def _run(self, host: RemoteHost, repo_dir: Path | str, *, seed: int, gen_ref: str,
              urls: dict[str, str], min_channels: int | None = None,
-             leg=None) -> dict:
+             leg=None, curriculum_stage: str = "") -> dict:
         leg = leg if leg is not None else self.cfg.generation.at_shape(self.cfg.generation.vcpus)
         gen = f"{host.workdir}/_gen"
         self.runner(build_ssh_argv(host, f"rm -rf {shlex.quote(gen)} && "
@@ -884,7 +890,11 @@ class GenerationStage:
                # Explicit, never the VM's copy of chain.toml: the rented tier's
                # children and window travel with the command.
                f"--vcpus {int(leg.vcpus)} --window-seconds {int(leg.window_seconds)}"
-               + (f" --min-channels {int(min_channels)}" if min_channels is not None else ""))
+               + (f" --min-channels {int(min_channels)}" if min_channels is not None else "")
+               # WB27 (plan rev6.21): a lane B curriculum stage's corpus — the
+               # generator is constructed with curriculum_stage=<name>
+               + (f" --curriculum-stage {shlex.quote(curriculum_stage)}"
+                  if curriculum_stage else ""))
         timeout = int(leg.window_seconds + self.upload_slack_s)
         stop = threading.Event()
         watcher = None

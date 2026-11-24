@@ -185,6 +185,18 @@ def _check_declared_interface(
         )
 
 
+def _ctor_accepts_kwarg(generator_cls: type, name: str) -> bool:
+    """Whether the constructor declares keyword ``name`` (named or **kwargs)."""
+    import inspect
+
+    try:
+        params = inspect.signature(generator_cls.__init__).parameters
+    except (TypeError, ValueError):
+        return False
+    return name in params or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
 def _ctor_accepts_real_corpus(generator_cls: type) -> bool:
     """Whether the submitted constructor declares the opt-in ``real_corpus_dir``
     keyword (named parameter or ``**kwargs``). Signature inspection, not a
@@ -205,6 +217,7 @@ def _load_generator(
     repo_dir: Path, generation_seed: int, *,
     interface_version: int = SUPPORTED_INTERFACE_VERSION,
     real_corpus_dir: str = "",
+    curriculum_stage: str = "",
 ) -> DataGenerator:
     # In-process execution of miner code: never in a process that holds the
     # trainer wallet / private eval pool (a sandbox child is a fresh process
@@ -236,6 +249,14 @@ def _load_generator(
     kwargs: dict[str, str] = {}
     if real_corpus_dir and _ctor_accepts_real_corpus(Generator):
         kwargs["real_corpus_dir"] = str(real_corpus_dir)
+    if curriculum_stage:
+        # WB27 (plan rev6.21): a lane B curriculum stage — the miner declared
+        # the stages, so its constructor must take the keyword (passed only
+        # here, never on any other corpus)
+        if not _ctor_accepts_kwarg(Generator, "curriculum_stage"):
+            raise CorpusError("generator_curriculum_unsupported: Generator.__init__ does not "
+                              "declare the curriculum_stage keyword its funded curriculum needs")
+        kwargs["curriculum_stage"] = str(curriculum_stage)
     try:
         gen = Generator(str(repo_dir), seed=generation_seed, **kwargs)
     except Exception as e:  # noqa: BLE001
@@ -270,6 +291,7 @@ def build_corpus(
     gen = _load_generator(
         Path(repo_dir), generation_seed, interface_version=cfg.interface_version,
         real_corpus_dir=cfg.real_corpus_dir,
+        curriculum_stage=getattr(cfg, "curriculum_stage", ""),
     )
     target = int(cfg.corpus_target_points)
     n_request = (

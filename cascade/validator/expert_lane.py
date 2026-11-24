@@ -5,6 +5,11 @@ Per entry, in order — the first failure rejects the entry:
 
 1. ``stale``     the leg must be rebased onto THIS validator's current king
                  (``ExpertManifest.king_pointer`` == the king pointer it holds);
+1a. ``levers`` (WB27, plan rev6.21) recorded miner levers must re-validate
+                 against ``[lane_b]``;
+1b. ``scored_weights`` (plan rev6.20) every lane B leg scores (and merges) its
+                 power EMA: the entry must record the label of its EMA width
+                 ("ema010" by default; WB27: the miner's chosen width);
 2. ``selection`` only when a re-derivation hook is passed (tests, tools):
                  the expert rows must equal the ESFT selection on the king +
                  affinity slice + recorded ``exclude``. The live validator
@@ -192,10 +197,15 @@ def judge_entry(entry: ExpertEntry, *, manifest: ExpertManifest, king_pointer: s
                                f"rebased onto {manifest.king_pointer}, king is {king_pointer}")
     if contract is not None:
         from ..shared.lane_b_leg import check_leg_record
+        from ..shared.lane_b_levers import leg_context_contract
 
         why = check_leg_record(train_hours=entry.train_hours, steps=entry.leg_steps,
                                guard_seconds=entry.leg_guard_seconds, lb_cfg=cfg,
-                               contract=contract)
+                               contract=leg_context_contract(contract, entry.levers), block=entry.train_block,
+                               train_tokens=entry.train_tokens,
+                               gpu_measured=entry.gpu_measured,
+                               trained_steps=entry.trained_steps,
+                               trained_tokens=entry.trained_tokens, stop=entry.stop)
         if why is not None:
             return ExpertJudgement(entry, False, "leg_length", why)
     declared = entry.declared
@@ -204,6 +214,21 @@ def judge_entry(entry: ExpertEntry, *, manifest: ExpertManifest, king_pointer: s
         return ExpertJudgement(entry, False, "targets",
                                f"declared targets {list(declared)} are not 1..max_domains_per_leg"
                                f" configured lane-B targets")
+    # WB27 (plan rev6.21): the miner's levers must re-validate against [lane_b]
+    if entry.levers:
+        from ..shared.lane_b_levers import check_entry_levers
+
+        why = check_entry_levers(entry.levers, lb_cfg=cfg, train_block=entry.train_block)
+        if why is not None:
+            return ExpertJudgement(entry, False, "levers",
+                                   f"recorded levers {entry.levers} refused: {why}")
+    # plan rev6.20: every lane B leg scores (and merges) its power EMA (WB27:
+    # at the entry's chosen width)
+    want = _scored_weights_rule(cfg, entry.levers)
+    if entry.scored_weights != want:
+        return ExpertJudgement(entry, False, "scored_weights",
+                               f"entry scored {entry.scored_weights or 'raw'!r}; this lane B "
+                               f"leg scores {want!r}")
     if recompute_selection is not None:
         from ..trainer.expert_lane import union_selection
 
@@ -282,6 +307,16 @@ def judge_entry(entry: ExpertEntry, *, manifest: ExpertManifest, king_pointer: s
                            targets=tv)
 
 
+def _scored_weights_rule(cfg, levers=None) -> str:
+    """The ``scored_weights`` every lane B entry must carry: rev6.20's EMA
+    (``"ema010"``), or the label of the entry's WB27 chosen width."""
+    from ..shared.config.lane_b import LANE_B_SCORED_EMA
+
+    if not levers:
+        return LANE_B_SCORED_EMA
+    from ..shared.lane_b_levers import lane_b_scored_weights_for, levers_from_dict
+
+    return lane_b_scored_weights_for(cfg, None, levers_from_dict(dict(levers), cfg))
 def _anchor_input(rows: dict, king: dict, pointer: str | None,
                   scores: Callable[[], list] | None, cfg, sentinel: str | None) -> dict | None:
     """The anchor-guard input of :func:`judge_expert_slots` (WB26), or None

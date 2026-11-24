@@ -1518,11 +1518,90 @@ only a release can change. Read the effective values with
 | `sentinel_target_rule` | `"defer"` | What happens to a suite-target entry whose suite is the era's sentinel. This is the only allowed value. |
 | `sentinel_max_defer_eras` | `4` | The most distinct eras such an entry can be deferred in. |
 | `funded_pod_skus` | the same file's `[round] funded_pod_skus` | Lane B's own GPU list. When the key is absent, it starts as a copy of the lane A list. |
-| `max_leg_hours` | `6.0` | The most training hours a lane B leg may ask for, in 0.5 h steps. |
-| `max_leg_seconds` | `27000` | Hard wall-clock cap on a lane B leg (6 h × 1.25). |
+| `max_leg_hours` | `12.0` | The most training hours a lane B leg may ask for, in 0.5 h steps (owner 2026-11-24: was 6). |
+| `max_leg_seconds` | `54000` | Hard wall-clock cap on a lane B leg (12 h × 1.25). |
 | `guard_factor` | `1.25` | Leg guard: train hours × this factor plus overhead, capped at `max_leg_seconds`. |
+| `lr_scale_min` | `0.5` | Lower bound of the `lr_scale` leg lever. |
+| `lr_scale_max` | `2.0` | Upper bound of the `lr_scale` leg lever. |
+| `sigma_rel_choices` | `[0.03, 0.05, 0.10, 0.15, 0.20]` | The power-EMA widths a miner may choose with the `ema` lever (each in 0.01 … 0.30, must contain 0.10). |
+| `max_context_length` | `32768` | Ceiling of the `context_length` lever (a power of two, 4096 … 32768). |
 | `tau_anchor_public` | `0.0` | A cleared suite slot also needs every public guard to hold against the anchor king (the era's promotion member) at this tolerance. |
 | `tau_anchor_domain` | `0.0` | The same anchor guard for every pool domain and horizon. A cleared suite slot also needs the whole-pool point gain to be at least 0. |
+
+Every lane B leg trains with no learning-rate cooldown: the learning rate
+warms up, then stays at its peak to the last step. Its scored and merged
+weights are its own power EMA (σ_rel 0.10 unless you choose another width
+with the `ema` lever), not the raw endpoint. The expert manifest records
+this on every entry as `scored_weights` (`"ema010"` by default), and
+validators refuse an entry without it. No key turns this on or off. Lane A
+is unaffected.
+
+### Lane B leg levers and limits
+
+These are the default lane B behaviour (no activation block). Each is set on
+the fund and bound by your signature; an out-of-range value is refused with
+a typed code before anything is queued or your key is stored (nothing
+charged). The expert manifest entry records what the leg trained, and every
+validator re-checks it.
+
+**Limits: tokens and/or hours, whichever comes first.** `--train-hours H`
+(`X-Lane-B-Train-Hours`, 0.5 h steps, up to `max_leg_hours` = 12) and/or
+`--train-tokens N` (`X-Lane-B-Train-Tokens`, e.g. `20e9`). The leg stops at
+the first limit it reaches. With tokens only, the hour limit is
+`max_leg_hours`. The steps are the token limit's (`N ÷ tokens per step`,
+where tokens per step = the contract's batch × context, 2,097,152 on the
+shipped contract), never more than a lane A leg of the same hours. Hitting
+the hour limit is a normal stop: the leg is judged on what it trained (lane
+B has no cooldown and scores its EMA weights). Hours only on a measured GPU
+is the WB23 leg: steps from that GPU's measured rate. Both need `--gpu`
+without a fallback. Your key pays for the rented hours.
+
+**Any GPU type, at your own risk.** With a token or hour limit you may choose
+a GPU type that has no measured rate (or is not in `funded_pod_skus`), on a
+Lium key only. The record says `gpu_measured: false`. **At your own risk: no
+refund if the leg fails (it OOMs, cannot boot or crashes).** Image pinning
+and the sandbox still apply.
+
+**Levers** (`X-Lane-B-Levers`, a JSON object; the CLI builds it):
+
+| Flag | Key | Range | Default |
+|---|---|---|---|
+| `--lr-scale X` | `lr_scale` | `lr_scale_min` … `lr_scale_max` (0.5 … 2.0), at most 3 decimals | 1.0 |
+| `--curriculum easy:0.3,hard:0.7` | `curriculum` | 1 to 3 ordered stages, names `[a-z][a-z0-9_-]{0,23}`, fractions with at most 2 decimals summing to exactly 1 | one stage |
+| `--context-length N` | `context_length` | 4096 … `max_context_length` (32768), powers of two | 4096 |
+| `--ema 0.15` | `ema` | one of `sigma_rel_choices` (0.03, 0.05, 0.10, 0.15, 0.20) | 0.10 |
+
+- `lr_scale` multiplies the leg's base LR (every optimizer group).
+- A curriculum trains stage by stage: each stage is its own corpus,
+  generated with your generator constructed with `curriculum_stage=<name>`,
+  and the leg reads stage 1 for its fraction of the steps, then stage 2, and
+  so on. Your `Generator.__init__` must declare the `curriculum_stage`
+  keyword (check with `cascade lane-b verify-repo <dir> --curriculum`);
+  otherwise the leg fails as your fault (`generator_curriculum_unsupported`).
+- `context_length` is the leg's training window. Each step then consumes
+  `context ÷ 4096` times the points, so on a measured GPU the steps of an
+  hours-only leg scale down by that factor and a token limit gives fewer
+  steps. The context must fit the chosen GPU's measured memory (WB19 peak ×
+  context ÷ 4096 ≤ 90 % of its memory), else `context_length_unfit`; on an
+  own-risk GPU it is your risk. Judging is unchanged (the scored model reads
+  4096-point histories).
+- `ema` picks the power-EMA width; only that EMA is computed, scored and
+  merged, and the record says which (`scored_weights`, e.g. `ema015`).
+
+The judging guards are unchanged by any lever: other suites, undeclared pool
+domains, horizons, the whole-pool gain and the anchor king.
+
+| Code | Meaning |
+|---|---|
+| `bad_levers` | The levers header is not a JSON object of known keys. |
+| `lr_scale_out_of_range` | `lr_scale` outside the bounds or with more than 3 decimals. |
+| `bad_curriculum` | Wrong stage count, names, fractions, or fractions not summing to 1. |
+| `context_length_out_of_range` | Not a power of two in 4096 … `max_context_length`. |
+| `context_length_unfit` | The context does not fit the chosen GPU's measured memory. |
+| `ema_out_of_range` | `ema` is not in `sigma_rel_choices`. |
+| `bad_train_tokens` | `--train-tokens` is not a whole number > 0. |
+| `train_tokens_out_of_range` | Fewer tokens than one step. |
+| `bad_train_hours` | Hours off the 0.5 h grid or above `max_leg_hours`. |
 
 ### Lane B suite targets
 
@@ -1664,9 +1743,10 @@ receipt the intake attaches (`hashset_version`, `result`, `suite`,
 Without the pinned hash set the command never reports `clean`. A clean local
 result does not bind the intake, which scans the committed tree again.
 
-`cascade lane-b fund --train-hours` is refused locally (exit 2,
-`train_hours_unavailable`) until the intake accepts a training-hours request.
-The leg budget is `[lane_b] leg_hours`.
+`cascade lane-b fund --train-hours` / `--train-tokens` set the leg's limits
+(see "Lane B leg levers and limits"); without either the leg budget is
+`[lane_b] leg_hours`. An off-grid value is refused locally (exit 2) with the
+intake's code.
 
 ### When lane B opens
 
