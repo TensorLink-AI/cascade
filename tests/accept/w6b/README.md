@@ -75,6 +75,16 @@ feed is left out of `feeds` and its series out of the snapshot, so the
 snapshot stays valid), `target_gap` (a non-finite value in the target),
 `not_in_forge`, `too_short`, `too_much_missing`, `degenerate`.
 
+Event / irregular feeds (#841, testnet 2026-11-24): data timestamps are
+compared in epoch seconds, so sub-second events can repeat a timestamp. A
+series whose repeated timestamps all carry the same value (and first-seen
+time) is de-duplicated deterministically (first row of each run kept); any
+disagreement refuses that series as `duplicate_ts_conflict`. A series cut
+that would still break a per-series invariant `validate_pool_d` checks is
+refused per series (`target_ts_not_increasing`, `first_seen_not_before_as_of`)
+and the rest of the snapshot is built; it never voids the whole snapshot.
+A feed without repeats is cut byte-identically to before.
+
 `validate_pool_d` reports (at least): a series with no `frontier` (absent or
 `null`), a series whose feed has no `feeds` entry, a feed entry missing
 `embargo_hours` / `forecast_product` / `mirror_lag_hours`, an `embargo_hours`
@@ -128,5 +138,6 @@ without `digest`.
 | deterministic, content-addressed, re-derivable | `test_build_is_deterministic`, `test_loads_with_lane_d_loader` |
 | W6fs roots + verify | `test_first_seen_roots_and_verify` |
 | typed refusals | `test_rollup_and_target_gap_refused` |
+| event feeds: per-series refusal, dedupe (#841) | `test_w6b_event_feeds.py` |
 | builder CLI + lane A replay guard | `test_cli_builds_with_lane_a_replay`, `test_cli_refuses_lane_a_mismatch` |
 | evidence from the real run | `test_evidence_*` |
