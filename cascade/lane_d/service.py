@@ -45,6 +45,12 @@ from http import HTTPStatus
 from pathlib import Path
 
 from ..shared import sr25519
+from .entry_config import (
+    ENTRY_CONFIG_CODES,
+    ENTRY_CONFIG_FILE,
+    MAX_ENTRY_CONFIG_BYTES,
+    check_entry_config,
+)
 from .intake import ALLOWED_FILES, MANIFEST_OBJECT, IntakeError, canonical_manifest
 from .storage import LaneDStorage
 
@@ -113,6 +119,8 @@ REFUSAL_CODES = (
     "unknown_entry", "bad_body", "licence_not_open", "licence_attestation_missing",
     "context_mismatch", "missing_object", "size_mismatch", "stray_object",
     "upload_incomplete", "coldkey_cap_open", "queue_full", "ready_expired", "entry_closed",
+    # ready: the whole config.json pinned (cascade.lane_d.entry_config)
+    "config_unreadable", "config_key_not_allowed", "config_value_not_allowed",
     # fail closed
     "storage_unavailable", "chain_unavailable", "grants_unavailable", "dedup_unavailable",
     "state_unavailable", "internal_error",
@@ -755,8 +763,11 @@ class LaneDIntake:
                            "retry") from None
 
     def _check_objects(self, prefix: str, digest: str, files: dict[str, int]) -> str:
-        """The object list and sizes against the stored manifest; nothing but
-        ``manifest.json`` is read. Returns the weights sha256."""
+        """The object list and sizes against the stored manifest, then the
+        whole ``config.json`` against the pinned allowlist
+        (:func:`cascade.lane_d.entry_config.check_entry_config`); nothing but
+        ``manifest.json`` and that small JSON file is read, never the weights.
+        Returns the weights sha256."""
         try:
             try:
                 raw = self.storage.get(prefix + MANIFEST_OBJECT)
@@ -783,6 +794,22 @@ class LaneDIntake:
                     raise _Refusal(409, "missing_object", name) from None
                 if size != int(files[name]):
                     raise _Refusal(409, "size_mismatch", f"{name}: {size} != {files[name]}")
+            if int(files.get(ENTRY_CONFIG_FILE, 0)) > MAX_ENTRY_CONFIG_BYTES:
+                raise _Refusal(409, "config_unreadable",
+                               f"{ENTRY_CONFIG_FILE} is larger than {MAX_ENTRY_CONFIG_BYTES} bytes")
+            try:
+                raw_config = self.storage.get(prefix + ENTRY_CONFIG_FILE)
+            except KeyError:
+                raise _Refusal(409, "missing_object", ENTRY_CONFIG_FILE) from None
+            if hashlib.sha256(bytes(raw_config)).hexdigest() \
+                    != str(manifest["files"][ENTRY_CONFIG_FILE]["sha256"]):
+                raise _Refusal(409, "digest_mismatch",
+                               f"{ENTRY_CONFIG_FILE} does not hash to its manifest entry")
+            try:
+                check_entry_config(bytes(raw_config))
+            except IntakeError as e:
+                code = e.code if e.code in ENTRY_CONFIG_CODES else "config_unreadable"
+                raise _Refusal(409, code, e.detail[:300]) from None
         except _Refusal:
             raise
         except Exception as e:  # noqa: BLE001 — a transient error is never "absent"
