@@ -1,0 +1,13 @@
+# TEMPLATE (builder VM): every 3 h, after the 3-hourly pool_d build; counts
+# only grow, so a later run can only arm more contexts.
+
+[Unit]
+Description=cascade lane D readiness re-measure, every 3 h
+
+[Timer]
+OnBootSec=20min
+OnUnitActiveSec=3h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
