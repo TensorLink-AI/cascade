@@ -50,6 +50,7 @@ def test_dry_run_plans_the_volumes(tmp_path):
 @pytest.mark.parametrize("bad", [["a b"], ["x", "x"], "brave-fox", [""]])
 def test_bad_volume_lists_are_refused(tmp_path, bad):
     m = mod()
+    _has_volumes(m)
     with pytest.raises(m.ElasticError):
         m._eval_from({"public_cache_volumes": bad})
 
