@@ -23,3 +23,6 @@ cascade/validator/weights.py
 # share ONLY (lanes A/B/C set as derived), an alert-class one is logged
 # (lane_d_check_alert) and the signed court stays paid.
 cascade/validator/satellite.py
+# rev6.18 B2: the published-chain replay test reads the chain rules at their
+# new home (the former cascade/satellite/lane_d_replay.py).
+cascade/audit/lane_d_chain.py
