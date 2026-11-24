@@ -55,6 +55,11 @@ LANE_B_TRACK_DEFAULTS: dict[str, object] = {
     # owner 2026-11-24: the ceiling of the context_length lever ([training]
     # has no max_context_length; the deployed file's 32768 is [lane_d]'s)
     "max_context_length": 32768,
+    # WB26 (DEC-CA-0071 §3 guards 4-5): the anchor-king guard tolerances (no
+    # worse than the anchor at alpha). CONSENSUS verdict terms, read only when
+    # a suite slot clears.
+    "tau_anchor_public": 0.0,
+    "tau_anchor_domain": 0.0,
 }
 
 # Lane B EMA, no cooldown (plan rev6.20, owner 2026-11-24: "let's just do EMA,
@@ -254,6 +259,10 @@ def parse_lane_b_track(lb: dict, *,
         "max_context_length": _int("max_context_length",
                                    lb.get("max_context_length", d["max_context_length"]),
                                    lo=4096),
+        "tau_anchor_public": _float("tau_anchor_public",
+                                    lb.get("tau_anchor_public", d["tau_anchor_public"])),
+        "tau_anchor_domain": _float("tau_anchor_domain",
+                                    lb.get("tau_anchor_domain", d["tau_anchor_domain"])),
     }
     if out["suite_targets"] and not out["contamination_hashset"]:
         raise ValueError("[lane_b] suite_targets = true needs contamination_hashset pinned "
@@ -287,4 +296,7 @@ def parse_lane_b_track(lb: dict, *,
     if out["guard_factor"] < 1.0:
         raise ValueError(f"[lane_b] guard_factor must be >= 1.0 (a factor below 1 truncates "
                          f"every leg); got {out['guard_factor']}")
+    for key in ("tau_anchor_public", "tau_anchor_domain"):
+        if not 0.0 <= out[key] < 1.0:
+            raise ValueError(f"[lane_b] {key} must be in [0, 1); got {out[key]}")
     return out

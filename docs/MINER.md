@@ -1525,6 +1525,8 @@ only a release can change. Read the effective values with
 | `lr_scale_max` | `2.0` | Upper bound of the `lr_scale` leg lever. |
 | `sigma_rel_choices` | `[0.03, 0.05, 0.10, 0.15, 0.20]` | The power-EMA widths a miner may choose with the `ema` lever (each in 0.01 … 0.30, must contain 0.10). |
 | `max_context_length` | `32768` | Ceiling of the `context_length` lever (a power of two, 4096 … 32768). |
+| `tau_anchor_public` | `0.0` | A cleared suite slot also needs every public guard to hold against the anchor king (the era's promotion member) at this tolerance. |
+| `tau_anchor_domain` | `0.0` | The same anchor guard for every pool domain and horizon. A cleared suite slot also needs the whole-pool point gain to be at least 0. |
 
 Every lane B leg trains with no learning-rate cooldown: the learning rate
 warms up, then stays at its peak to the last step. Its scored and merged

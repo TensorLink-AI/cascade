@@ -1490,6 +1490,10 @@ funded_pod_skus          = ["8xH200", "8xH100", "4xH200", "4xH100", "8xRTX4090"]
 max_leg_hours            = 12.0
 max_leg_seconds          = 54000       # 12 h x 1.25
 guard_factor             = 1.25
+# WB26 (DEC-CA-0071 §3 guards 4-5): a cleared suite slot must also be no
+# worse than the anchor king (the era's promotion member) at these tolerances.
+tau_anchor_public        = 0.0
+tau_anchor_domain        = 0.0
 
 
 [lane_c]

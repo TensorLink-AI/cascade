@@ -226,6 +226,46 @@ Tier 2 uses the match to decide when a byte-exact checkpoint comparison
 applies. Rented pods boot `[round] funded_pod_image`; pin it as described in
 [Credentials on payer pods](#credentials-on-payer-pods).
 
+### Changing the worker image per seed epoch (W-IMG, plan rev6.24 (e))
+
+Once the fleet runs the W-IMG release and `[v2] image_epoch_from_block` is
+typed (an era start, deployed to every validator before it), validators no
+longer need a config change for a new training image:
+
+1. Commit the qualification record and measure the SKU walls on the new
+   image (the rent gates are unchanged).
+2. Set the trainer's `[v2] *_after` pins to the new release and restart the
+   trainer outside a scoring window with no legs in flight.
+3. The trainer binds the release at the next seed-epoch start at least two
+   eras ahead (log: `W-IMG: after image … BOUND at seed-epoch start block N`,
+   file `image_epoch_state.json`). Every leg of that epoch runs it; earlier
+   eras keep the current pins.
+4. Once that epoch has started and no earlier-epoch leg is in flight, move the
+   after pins into `[v2.training] train_image_digest` / `[round]` pins, append
+   the old pin to `[v2] prior_train_image_digests` and clear the `*_after`
+   pins (or set the next release).
+
+Validators reject a settlement whose entries ran mixed images
+(`era_image_mixed`) or whose image changed inside a seed epoch
+(`era_image_changed`).
+
+**An image without measured pod walls (owner 2026-11-24).** If
+`[round] funded_sku_wall_measured_image` names another image than the one a
+funded leg or king pod would rent, the rent is no longer refused. Instead:
+
+- every SKU's leg wall is planned at `[round]
+  unmeasured_image_wall_cap_seconds` (default 18000 = 5 h, never above the
+  contract's `max_train_seconds`), instead of the measured table;
+- the progress watchdog holds the leg to that cap;
+- the completed-leg record carries `walls_measured: false` and
+  `wall_cap_seconds`;
+- the trainer logs `image … has NO measured pod walls — renting with the
+  leg wall capped at 18000 s`.
+
+Measure the walls on the new image and set `funded_sku_wall_measured_image`
+to return to the table. `unmeasured_image_wall_cap_seconds = 0` restores the
+old refusal. A measured image behaves exactly as before.
+
 ### Re-pinning the image inside a v2 seed epoch (DEC-CA-0067)
 
 `train_image_digest` is part of `contract_digest`. Before DEC-CA-0067 is in
@@ -3542,7 +3582,18 @@ model of a settlement is forecast on that one host; the optional
 identity and code, so moving to another host re-scores the whole cohort.
 Qualifying a new environment: the procedure in the file's header (candidate
 PR, W0b + golden-set agreement vs `cu124-torch241`, A9 timing, evidence file,
-owner merge with an activation `from_block`). Bring the host up at S4 with an
+owner merge with an activation `from_block`). The kit is
+`python -P -m cascade.eval.lane_d_env_qual {golden,forecast,compare,check}`:
+`golden` picks 500 live + 500 public windows from `pool_d/1` directories,
+`forecast` runs on the pod in the environment under test (and, for the
+reference, in the release venv on a `cu124-torch241` GPU), `compare` scores
+both, replays the cohort and attaches the W0b junit XML and the A9
+`laned_t7/1` pod document (`cascade.eval.lane_d_t7_pod --window-counts 15000
+--n-models 10`), and `check --env NAME` re-derives the committed evidence
+file (the W4 acceptance test does the same for every qualified entry). The
+`sm120-torch212` venv is `uv sync --project deploy/laned/envs/sm120-torch212
+--frozen --group qualify` with the repo on `PYTHONPATH`; its hello reports
+`torch_build = 2.12.1+cu130/cuda-13.0`. Bring the host up at S4 with an
 on-rent check (`nvidia-smi -L`, VRAM, driver, disk), pinned known_hosts and a
 dry run. It gets presigned GETs only, never a credential.
 

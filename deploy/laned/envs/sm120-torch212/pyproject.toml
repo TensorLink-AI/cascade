@@ -1,0 +1,40 @@
+# Lane D scoring environment `sm120-torch212` (LANE_D_PLAN rev6.18 B5):
+# the eval-host venv for RTX PRO 6000 Blackwell (sm_120). torch 2.4.1+cu124
+# has no sm_120 kernels, so this is its own venv on the bench sidecar's torch
+# line (benchmarks/uv.lock: torch 2.12.1 from PyPI = the cu130 build, which
+# reports torch.__version__ "2.12.1+cu130", torch.version.cuda "13.0" and
+# needs NVIDIA driver >= 580).
+#
+# NOT the lane A contract: uv.lock / torch==2.4.1+cu124 / contract_digest are
+# untouched. The lane D forecast path (cascade.eval.lane_d_forecasts ->
+# lane_d_scorer -> cascade.trainer.pyramid_model) imports only numpy, torch
+# and safetensors at run time; the repo itself is put on PYTHONPATH (no
+# package install), so the code the eval host runs is the release checkout
+# the handshake identifies. numpy and safetensors are the release lock's
+# versions (uv.lock) so only torch differs from cu124-torch241.
+#
+# Build on the eval host (never the production box):
+#   uv sync --project deploy/laned/envs/sm120-torch212 --frozen [--group qualify]
+# The lock's sha256 is `lock_sha256` of the sm120-torch212 entry in
+# deploy/laned/scoring_envs.toml; changing this file or the lock means
+# re-qualifying (B5) and a new entry.
+
+[project]
+name = "cascade-laned-scoring-sm120-torch212"
+version = "0.0.1"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "torch==2.12.1",
+    "numpy==2.4.6",
+    "safetensors==0.8.0",
+]
+
+[dependency-groups]
+# The B5 qualification run only (W0b's pytest on the eval host).
+qualify = [
+    "pytest==9.1.1",
+]
+
+[tool.uv]
+package = false
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]

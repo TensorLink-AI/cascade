@@ -162,6 +162,14 @@ class _FundedCapacityMixin:
         contract = getattr(self.__dict__.get("_leg_local_obj"), "funded_contract", None)
         cap = (int(contract.max_train_seconds) if contract is not None else
                max(int(c.max_train_seconds) for c in self.cfg.throne_contracts()))
+        # W-IMG (owner 2026-11-24): the leg's image has no measured walls ⇒
+        # every SKU is planned at the unmeasured-image cap, never the table
+        from .cost_guards import unmeasured_wall_cap
+        from .leg_pins import leg_round_view
+
+        ucap = unmeasured_wall_cap(leg_round_view(self))
+        if ucap > 0:
+            return min(float(cap), ucap)
         walls = tuple(getattr(rnd, "funded_sku_wall_seconds", ()) or ())
         if sku:
             return min(float(cap), funded_sku_wall_for(walls, sku, cap))

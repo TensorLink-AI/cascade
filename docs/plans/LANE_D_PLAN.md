@@ -45,9 +45,10 @@ standard pool and the judge reads either form with byte-identical windows.
 Today no other lane C competition exists in code (the DEC-CA-0056
 `domain:`/`freq:`/`horizon:` kinds are retired as not forward-only; "energy"
 is a lane B domain). An energy lane C competition is a builder job emitting a
-standard pool + a spec — once the generic runner (W-CMP2) can host a second
-competition. Domain metrics (liquidity / range ...) stay registry blocks over
-the channels the spec's pool carries.
+standard pool + a spec, hosted by the multi-instance runner (f). Domain
+metrics (liquidity / range ...) stay registry blocks over the channels the
+spec's pool carries (`channels` maps a metric channel to the pool's, e.g.
+`{close = "load"}`).
 
 **(c) Embargo.** The trainer records `embargo_days` / `embargo_eval_days` at
 DISPATCH in the signed leg record; draw / scan / verdict / audit use the
@@ -56,9 +57,10 @@ recorded values. `[marketcast] embargo_days` becomes overlay-settable in
 
 **(d) Rule menu.** Test families {`plain_lcb`, `maxt`, `bonferroni`}; pay
 curves {`tiered_decay`, `fixed_term` (DEC-CA-0073 5–20 d), `indefinite_until_beaten`}.
-Lane defaults = today: B `bonferroni`/`tiered_decay`; C `bonferroni`/`fixed_term`;
-D `maxt`/`indefinite_until_beaten`. Runs in this release: B and C families
-`plain_lcb`/`bonferroni`, all three curves; D its defaults only. A
+Lane defaults = today: B `maxt`/`indefinite_until_beaten` (rev6.22, #854: two
+max-T families per slot, full pay until replaced); C `bonferroni`/`fixed_term`;
+D `maxt`/`indefinite_until_beaten`. Runs in this release: C families
+`plain_lcb`/`bonferroni`, all three curves; B and D their defaults only. A
 non-default curve is recorded on the win; the audit re-derives it.
 
 **(e) Contamination hash set.** `[lane_b] contamination_hashset` (sha256 pin) +
@@ -66,14 +68,38 @@ non-default curve is recorded on the win; the audit re-derives it.
 sha256 against the pin before parsing, fail closed (`HashsetMismatch`, 503).
 Amends rev5's release-only pin (WB10 tests corrected).
 
+**(f) Multi-instance runner (W-CMP2; owner 2026-11-24: "build W-CMP2 for
+THIS release").** The `marketcast` runner hosts N specs at once. `mkt` is its
+legacy instance (`[marketcast]`, `mkt_reports`, `mkt_backlog`, report key
+`marketcast/round-<R>.json` — byte-identical, pinned with an instance
+configured beside it). Any other id is a spec INSTANCE with its own kind and
+targets `<id>:<name>`, legs, rows, report (`marketcast/<id>/round-<R>.json`,
+arbitrated by `reports[<id>]` in the lane-C manifest), verdicts, slots,
+payouts (its competition weight) and audit (`check_marketcast(kind=<id>)`).
+An instance spec must name its pool, metrics, universe, timeframes, horizons
+and `from_block` (an era boundary at or after `[lane_c] from_block`, never
+before the overlay's apply block); it inherits the deployed `[marketcast]`
+model pins, recipe bounds and verdict statistics. Its classes are its pool's
+`class` tags (any label; no market feed). The standard pool of ANY builder is
+projected generically (grid step → bank: 1 m bars, 5 m / 15 m native, 1 h
+coarse; `class` / `asset` tags; channels renamed by the spec). The trainer
+relays the instance's pool snapshot to the pod (one presigned link + its
+sha256); the pod clips it to the recipe's range before the dispatch. Lane-C
+pods must run a worker image built from this release to train an instance
+leg (the image changes only at a seed-epoch boundary, W-IMG); validators need
+nothing further. Not in this release: joint `maxt` for lane C (lane B runs its own since rev6.22), the pool_d
+/ lane A projections (no lane C competition reads them).
+
 **Consensus.** One release to all validators, satellites and the trainer;
-nothing changes until an overlay selects something. After it, specs, menu
-choices, embargo and hash-set pins are overlay data. A new block is a release.
+nothing changes until an overlay selects something. After it, specs (new
+competitions included), menu choices, embargo and hash-set pins are overlay
+data. A new block (metric, family, curve, schema version, runner) is a
+release; a new data source is a builder job, never a release.
 
 | WP | What | Keys / fields | Depends | Runs in | Accept |
 |---|---|---|---|---|---|
 | W-CMP | **(rev6.25)** `std_pool` (schema, writer, reader, MarketCast projection + builder); `competition_spec` (registry, parse with typed refusals, bounds, compile onto MarketCast, `marketcast_spec`); `rules_menu` wired into lanes B / C / D and the audit; per-leg embargo record; hash set by content hash + key with fetch-verify and intake reload | (a)–(e) | W-OV | ci | `scripts/laned/accept W-CMP` |
-| W-CMP2 | **(rev6.25, plan only)** generic runner: a second concurrent lane C competition on a standard pool (per-instance judge / legs / reports / audit), `maxt` for lanes B and C, the pool_d / lane A pool projections | (a), (b), (d) | W-CMP | ci + testnet | `scripts/laned/accept W-CMP2` |
+| W-CMP2 | **(rev6.25, DECIDED owner 2026-11-24: this release)** multi-instance runner (f): spec instances with their own kind / targets / legs / rows / reports / verdicts / slots / payouts / audit; generic standard-pool projection with channel map; trainer pool relay + pod clip; `mkt` byte-identical. Out: joint `maxt` for lane C, pool_d / lane A projections | (a), (b), (f) | W-CMP | ci + testnet | `scripts/laned/accept W-CMP2` |
 
 ## rev6.24 (owner 2026-11-24; main @ ce27dfb): competition tweaks by signed overlay, with a code envelope
 

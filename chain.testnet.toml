@@ -810,6 +810,8 @@ funded_pod_skus          = ["RTX4090", "RTX3090", "L40S", "L40", "A6000"]   # = 
 max_leg_hours            = 12.0        # owner 2026-11-24 (rev6.21)
 max_leg_seconds          = 54000
 guard_factor             = 1.25
+tau_anchor_public        = 0.0
+tau_anchor_domain        = 0.0
 
 
 [lane_c]
