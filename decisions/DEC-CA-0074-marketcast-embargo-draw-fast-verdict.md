@@ -1,5 +1,5 @@
 ---
-id: DEC-CA-0073
+id: DEC-CA-0074
 type: decision
 title: "MarketCast: a verdict within 13 h, every horizon judged on windows drawn from the embargo by the round block hash"
 status: accepted

@@ -2916,6 +2916,16 @@ function renderLbDomains(){
 function renderLbPay(){
   var svg=document.getElementById("lb-pay-svg"), note=document.getElementById("lb-pay-note"), when=document.getElementById("lb-pay-when"); if(!svg) return;
   var p=lbPayout(), W=1000,H=330,PL=52,PR=16,PT=14,PB=30; svg.setAttribute("viewBox","0 0 "+W+" "+H);
+  if(p.rule==="indefinite"){
+    // LANE_D_PLAN rev6.22: a held slot pays its full slot share until replaced
+    var y1=PT+14;
+    svg.innerHTML='<line x1="'+PL+'" x2="'+(W-PR)+'" y1="'+y1+'" y2="'+y1+'" stroke="var(--good)" stroke-width="2.4"/>'+
+      '<text x="'+PL+'" y="'+(y1+24)+'" fill="var(--muted)" font-size="13">100% of the slot every settlement, no decay, no expiry, until a newer leg&rsquo;s merge passes on top of the holder</text>';
+    when.textContent=""; note.innerHTML="";
+    document.getElementById("lb-pay-title").innerHTML="Payout"+infoTip("Payout",
+      "A held slot pays 100% of its slot every settlement until a newer leg's merge passes acceptance on top of the holder. Empty slots "+(p.remainder==="lane_a"?"return to lane A.":"burn."));
+    return;
+  }
   if(!payTiers(p).length){ svg.innerHTML='<text x="'+(W/2)+'" y="'+(H/2)+'" text-anchor="middle" fill="var(--muted)" font-size="14">awaiting status/v2.json</text>'; note.textContent=""; when.textContent=""; return; }
   var unit=p.unit||"eras", ttl=Number(p.ttl)||0, maxA=ttl>0?ttl+2:Math.max(12,Number((payTiers(p)[0]||[0,0])[1])+8);
   function X(a){ return PL+a/maxA*(W-PL-PR); } function Y(v){ return PT+(1-v)*(H-PT-PB); }

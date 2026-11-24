@@ -3,7 +3,7 @@
 A lane-B / lane-C win pays its slot in full for the ``full_eras`` of the
 highest ``full_pay_tiers`` threshold its gain LCB meets (fixed at the win,
 recorded on it), then the unchanged decay / TTL. Lane C (MarketCast) pays a
-gain-scaled duration instead (DEC-CA-0073, tests/unit/test_marketcast_pay_v2.py);
+gain-scaled duration instead (DEC-CA-0073, tests/unit/test_marketcast_pay_duration.py);
 its gain-tiered keys are retired. The audit re-derives the tier and rejects a
 forged one."""
 
@@ -48,8 +48,9 @@ def test_defaults_are_the_placeholders():
     assert FULL_PAY_TIERS == TIERS
     for f in ("chain.toml", "chain.testnet.toml"):
         c = load_chain_config(ROOT / f)
-        assert c.lane_b.full_pay_tiers == TIERS
-        # DEC-CA-0073: lane C / MarketCast no longer carry tiers
+        # rev6.22 (lane B) and DEC-CA-0073 (lane C / MarketCast): no lane
+        # carries gain tiers any more
+        assert not hasattr(c.lane_b, "full_pay_tiers")
         assert not hasattr(c.lane_c, "full_pay_tiers")
         assert not hasattr(c.marketcast, "full_pay_tiers")
 
@@ -82,40 +83,19 @@ def test_payout_curve_is_tiered_full_period_then_the_unchanged_decay():
         reward_multiplier(0, full_eras=-1)
 
 
-def test_lane_b_payout_reads_the_recorded_tier_and_stops_at_the_ttl():
-    lb = parse_lane_b({"from_block": 1, "domains": ["energy", "web"], "win_ttl_eras": 12})
+def test_lane_b_payout_is_untiered_and_never_expires():
+    """rev6.22: lane B ignores any recorded tier; every held slot pays 1.0."""
+    lb = parse_lane_b({"from_block": 1, "domains": ["energy", "web"]})
     st = LaneBState()
     st.record(DomainWin(domain="energy", hotkey="a", uid=3, round_id="r", merge_block=0,
-                        target_lcb=0.07).with_full_pay(full_pay(0.07, lb.full_pay_tiers)))
+                        target_lcb=0.07, tier=0.05, full_eras=10))
     st.record(DomainWin(domain="web", hotkey="b", uid=4, round_id="r", merge_block=0,
-                        target_lcb=0.015).with_full_pay(full_pay(0.015, lb.full_pay_tiers)))
-
-    def pays(age):
-        return {p["domain"]: p for p in lane_b_payouts(st, block=age * 10, era_blocks=10,
+                        target_lcb=0.015))
+    for age in (0, 9, 10, 12, 1000):
+        pays = {p["domain"]: p for p in lane_b_payouts(st, block=age * 10, era_blocks=10,
                                                       cfg=lb, n_uids=8)}
-
-    assert pays(9)["energy"]["multiplier"] == 1.0          # 10 full eras
-    assert pays(10)["energy"]["multiplier"] == 0.5
-    assert pays(1)["web"]["multiplier"] == 1.0             # 2 full eras
-    assert pays(2)["web"]["multiplier"] == 0.5
-    p = pays(9)["energy"]
-    assert (p["gain_lcb"], p["tier"], p["full_eras"], p["below_floor"]) == (0.07, 0.05, 10,
-                                                                             False)
-    assert pays(12) == {}                                  # TTL unchanged: both expired
-    # an untiered win is refused, never paid on a default
-    st.wins["web"] = replace(st.wins["web"], full_eras=None)
-    with pytest.raises(ValueError, match="full-pay tier"):
-        pays(1)
-
-
-def test_the_tier_is_fixed_at_the_win():
-    lb = parse_lane_b({"from_block": 1, "domains": ["energy"]})
-    st = LaneBState()
-    st.record(DomainWin(domain="energy", hotkey="a", uid=3, round_id="r", merge_block=0,
-                        target_lcb=0.03).with_full_pay(full_pay(0.03, lb.full_pay_tiers)))
-    later = replace(lb, full_pay_tiers=((0.02, 1),))      # e.g. a later overlay
-    p = lane_b_payouts(st, block=40, era_blocks=10, cfg=later, n_uids=8)[0]
-    assert p["full_eras"] == 5 and p["multiplier"] == 1.0  # still the win's 5 eras
+        assert {d: p["multiplier"] for d, p in pays.items()} == {"energy": 1.0, "web": 1.0}
+        assert pays["energy"]["gain_lcb"] == 0.07 and "tier" not in pays["energy"]
 
 
 # ── lane B: tiers at the win, per target ────────────────────────────────────
@@ -126,7 +106,7 @@ def _verdict(target, lcb):
                          target_n=200, target_gain=lcb + 0.01, target_clusters=8)
 
 
-def test_multi_target_leg_tiers_each_target_by_its_own_lcb():
+def test_multi_target_leg_claims_each_slot_untiered():
     from cascade.shared.expert_manifest import ExpertEntry
     from cascade.validator import expert_lane as vel
 
@@ -134,7 +114,7 @@ def test_multi_target_leg_tiers_each_target_by_its_own_lcb():
                     selection={0: [1]}, exclude={}, base_king_pointer=_ptr("k"),
                     rebased_pointer=_ptr("r"), corpus_digest="c", train_block=5,
                     commit_block=4, targets=("energy", "web", "sales"))
-    tv = TargetsVerdict(targets=e.declared, alpha=0.05 / 3,
+    tv = TargetsVerdict(targets=e.declared, alpha=0.05,
                         verdicts={"energy": _verdict("energy", 0.06),
                                   "web": _verdict("web", 0.02),
                                   "sales": _verdict("sales", 0.012)})
@@ -142,15 +122,14 @@ def test_multi_target_leg_tiers_each_target_by_its_own_lcb():
                             king_pointer=_ptr("k"), targets=tv)
     st = LaneBState()
     wins = {w.domain: w for w in vel.apply_judgements(st, [j], round_id="r1",
-                                                       settle_block=100, tiers=TIERS)}
-    assert {d: (w.tier, w.full_eras) for d, w in wins.items()} == {
-        "energy": (0.05, 10), "web": (0.02, 5), "sales": (0.01, 2)}
-    # persisted and reloaded verbatim
+                                                       settle_block=100)}
+    assert {d: (w.target_lcb, w.tier, w.full_eras) for d, w in wins.items()} == {
+        "energy": (0.06, None, None), "web": (0.02, None, None),
+        "sales": (0.012, None, None)}
     again = LaneBState.from_json(st.to_json())
     assert again.wins == st.wins
-    # the settlement state carries the tier (bound across receipts)
     post = settlement_state(SimpleNamespace(), lane_b=st)
-    assert post["lane_b"]["web"][4:] == [0.02, 0.02, 5]
+    assert post["lane_b"]["web"][4:] == [0.02, None, None]
 
 
 # ── lane C / MarketCast ─────────────────────────────────────────────────────
@@ -163,6 +142,14 @@ def _pay_win(**kw):
     w = {"domain": "energy", "hotkey": "alice", "uid": 9, "merge_block": 7200, "age": 0,
          "multiplier": 1.0, "gain_lcb": 0.03, "tier": 0.02, "full_eras": 5,
          "below_floor": False}
+    w.update(kw)
+    return w
+
+
+def _lane_b_pay_win(**kw):
+    """A rev6.22 (untiered) lane B payout row."""
+    w = {"domain": "energy", "hotkey": "alice", "uid": 9, "merge_block": 7200, "age": 0,
+         "multiplier": 1.0, "gain_lcb": 0.03}
     w.update(kw)
     return w
 
@@ -188,35 +175,32 @@ def _audit_cfg(cfg):
     return replace(cfg, lane_b=lb)
 
 
-def test_audit_payout_replay_rejects_forged_tiers(cfg):
+def test_audit_payout_replay_rejects_forged_rows(cfg):
     from cascade.audit.checks import _lane_b_paid_wins
-    from cascade.shared.era import era_length_blocks
+    from cascade.shared.era import era_index_of, era_length_blocks
 
     acfg = _audit_cfg(cfg)
     eb = int(era_length_blocks(acfg.round, 7200))
 
-    def run(win, block=7200, post=None):
-        rc = _lane_b_receipt(block, win, state_post=post)
+    def win(**kw):
+        mb = kw.get("merge_block", 7200)
+        return _lane_b_pay_win(**{"since_era": era_index_of(acfg.round, mb), **kw})
+
+    def run(w, block=7200, post=None):
+        rc = _lane_b_receipt(block, w, state_post=post)
         rc.lane_b_pay["era_blocks"] = eb
         return _lane_b_paid_wins(rc, acfg, 16)
 
-    assert run(_pay_win())[1] is None
-    for bad in (_pay_win(full_eras=10), _pay_win(tier=0.05), _pay_win(gain_lcb=0.07),
-                _pay_win(full_eras=29), {k: v for k, v in _pay_win().items()
-                                         if k != "tier"}):
+    assert run(win())[1] is None
+    for bad in (win(multiplier=0.5), win(gain_lcb=float("nan")), win(since_era=3),
+                {k: v for k, v in win().items() if k != "since_era"}):
         assert run(bad)[1] is not None, bad
-    # an OLDER win: fixed at its own settlement (not re-derived under today's
-    # tiers) but bound to the settlement state and self-consistent
-    old = _pay_win(merge_block=7200 - eb, age=1)
-    post_ok = {"lane_b": {"energy": ["alice", 9, 7200 - eb, "r", 0.03, 0.02, 5]}}
+    # an old holder is paid in full (no decay, no TTL), bound to the state
+    old = win(merge_block=0, age=7200 // eb)
+    post_ok = {"lane_b": {"energy": ["alice", 9, 0, "r", 0.03, None, None]}}
     assert run(old, post=post_ok)[1] is None
-    post_bad = {"lane_b": {"energy": ["alice", 9, 7200 - eb, "r", 0.03, 0.05, 10]}}
+    post_bad = {"lane_b": {"energy": ["bob", 9, 0, "r", 0.03, None, None]}}
     assert "settlement state" in run(old, post=post_bad)[1]
-    assert "below_floor" in run(_pay_win(merge_block=7200 - eb, age=1, gain_lcb=0.01))[1]
-    # the multiplier is replayed from the RECORDED full_eras
-    late = _pay_win(merge_block=7200 - 6 * eb, age=6, multiplier=1.0)
-    assert "multiplier" in run(late)[1]
-    assert run(dict(late, multiplier=0.25))[1] is None     # full 5, then 0.5, 0.25
 
 
 def test_check_lane_b_ties_the_pay_record_to_the_winning_row(cfg):
@@ -230,11 +214,9 @@ def test_check_lane_b_ties_the_pay_record_to_the_winning_row(cfg):
         return SimpleNamespace(epoch_start_block=7200, lane_b=[row], manifest={},
                                lane_b_pay={"block": 7200, "wins": [win]})
 
-    assert check_lane_b(rc(_pay_win()), acfg).status == "PASS"
-    r = check_lane_b(rc(_pay_win(gain_lcb=0.06, tier=0.05, full_eras=10)), acfg)
+    assert check_lane_b(rc(_lane_b_pay_win()), acfg).status == "PASS"
+    r = check_lane_b(rc(_lane_b_pay_win(gain_lcb=0.06)), acfg)
     assert r.status == "FAIL" and "gain_lcb" in r.detail
-    r = check_lane_b(rc(_pay_win(full_eras=10)), acfg)
-    assert r.status == "FAIL" and "forged" in r.detail
 
 
 def test_check_lane_c_rejects_a_forged_confirm_tier(cfg):
@@ -291,9 +273,9 @@ def test_check_lane_c_rejects_a_forged_confirm_tier(cfg):
 def test_full_pay_tiers_validation(raw, msg):
     with pytest.raises(ValueError, match=msg):
         parse_full_pay_tiers(raw, section="lane_b", win_ttl_eras=28)
-    with pytest.raises(ValueError, match=msg):
-        parse_lane_b({"full_pay_tiers": raw})
-    # [lane_c] full_pay_tiers is retired (DEC-CA-0073): ignored, never validated
+    # [lane_b] (rev6.22) and [lane_c] (DEC-CA-0073) full_pay_tiers are retired:
+    # ignored, never validated
+    assert not hasattr(parse_lane_b({"full_pay_tiers": raw}), "full_pay_tiers")
     assert not hasattr(parse_lane_c({"full_pay_tiers": raw}), "full_pay_tiers")
 
 
@@ -301,8 +283,9 @@ def test_full_pay_tiers_accepts_equal_full_eras_and_ttl_bound():
     assert parse_full_pay_tiers([[0.3, 28], [0.1, 28], [0.01, 0]], section="lane_c",
                                 win_ttl_eras=28) == ((0.3, 28), (0.1, 28), (0.01, 0))
     assert parse_full_pay_tiers([[0.3, 99]], section="lane_c", win_ttl_eras=0) == ((0.3, 99),)
-    with pytest.raises(ValueError, match="win_ttl_eras"):
-        parse_lane_b({"full_pay_tiers": [[0.05, 10]], "win_ttl_eras": 9})
+    # rev6.22: [lane_b] no longer reads its retired tiers / TTL
+    assert not hasattr(parse_lane_b({"full_pay_tiers": [[0.05, 10]], "win_ttl_eras": 9}),
+                       "full_pay_tiers")
 
 
 def test_full_rounds_is_replaced_not_read():
@@ -313,28 +296,13 @@ def test_full_rounds_is_replaced_not_read():
 
 
 def test_overlay_consistency():
-    """``full_pay_tiers`` is overlay-settable on [lane_b] exactly as
-    ``full_rounds`` was (every key of the table); on [lane_c] / [marketcast]
-    it is retired (DEC-CA-0073) and refused."""
+    """``full_pay_tiers`` is retired on [lane_b] (rev6.22) and on [lane_c] /
+    [marketcast] (DEC-CA-0073): an overlay naming it is refused."""
     from cascade.shared.netconfig import ALLOWED, NetConfigError, check_overrides
 
     assert ALLOWED["lane_b"] is None and ALLOWED["lane_c"] is None
-    check_overrides({"lane_b": {"full_pay_tiers": [[0.1, 8], [0.01, 1]]}})
-    for table in ("lane_c", "marketcast"):
+    for table in ("lane_b", "lane_c", "marketcast"):
         with pytest.raises(NetConfigError, match="retired"):
             check_overrides({table: {"full_pay_tiers": [[0.1, 8]]}})
     with pytest.raises(NetConfigError):
         check_overrides({"marketcast": {"base_ref": "other@pin"}})
-
-
-def test_overlay_applies_new_tiers_and_refuses_bad_ones():
-    from cascade.shared.netconfig import NetConfigError, build_config
-
-    base = load_chain_config(ROOT / "chain.toml")
-    body = {"protocol": "cascade-netconfig/2", "network": {"netuid": 91, "chain": "bittensor:finney"}, "seq": 1, "prev": "", "effective_block": 0,
-            "overrides": {"lane_b": {"full_pay_tiers": [[0.3, 7], [0.01, 1]]}}}
-    out = build_config(base, body)
-    assert out.lane_b.full_pay_tiers == ((0.3, 7), (0.01, 1))
-    body["overrides"]["lane_b"]["full_pay_tiers"] = [[0.01, 1], [0.3, 7]]
-    with pytest.raises((NetConfigError, ValueError)):
-        build_config(base, body)

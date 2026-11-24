@@ -66,7 +66,7 @@ def _html(els: dict, el: str) -> str:
 
 def _cfg(from_block: int):
     lb = LaneBConfig(from_block=from_block + 1 if from_block else 0,
-                    domains=DOMAINS if from_block else (), win_ttl_eras=28)
+                    domains=DOMAINS if from_block else ())
     return SimpleNamespace(lane_b=lb, subnet=SimpleNamespace(netuid=91),
                            training=SimpleNamespace(v2_from_block=from_block))
 
@@ -274,10 +274,12 @@ def test_testnet_live_lane_b(tmp_path):
     assert "● open" in gate and "260B" in gate
     doms = _html(els, "lb-domains")
     for want in ("energy", "retail", "uid 12", "40% of the slot", "guard: energy", "✓ pass",
-                 "routing_stale", "expires in 21 eras"):
+                 "routing_stale"):
         assert want in doms, want
     assert "<polyline" in _html(els, "lb-sat-svg")
-    assert "<path" in _html(els, "lb-pay-svg") and "expires" in _html(els, "lb-pay-svg")
+    # LANE_D_PLAN rev6.22: a held slot pays in full until replaced (no decay curve)
+    assert "100% of the slot every settlement" in _html(els, "lb-pay-svg")
+    assert "expires" not in _html(els, "lb-pay-svg")
     moe = _html(els, "lb-moe")
     assert "block 1" in moe and 'class="dead"' in moe
     assert "metro-v1:expert:" in _html(els, "lb-enter")

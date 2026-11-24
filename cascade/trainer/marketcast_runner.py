@@ -48,7 +48,7 @@ class MktLegRecipe:
     # recipe's ``init`` against its lineage (:func:`resolve_mkt_init`)
     init_pointer: str = ""
     init_sha256: str = ""
-    # DEC-CA-0073 guard (b): the trainer's pre-rent embargo contamination
+    # DEC-CA-0074 guard (b): the trainer's pre-rent embargo contamination
     # receipt (cascade.shared.marketcast_embargo.scan_receipt); it rides the
     # leg's trainer-signed marketcast record, never the pod's recipe
     embargo_scan: tuple[tuple[str, object], ...] = ()
@@ -133,7 +133,7 @@ def resolve_mkt_init(init: str, lineage: dict, *, submission_time: float | None)
 
 def embargo_scan_or_refuse(d: Path, has_generator: bool, scan, *, train_time: float | None
                            ) -> tuple[tuple[str, object], ...]:
-    """DEC-CA-0073 guard (b), before anything is rented: the receipt of
+    """DEC-CA-0074 guard (b), before anything is rented: the receipt of
     ``scan(tree | None, train_time=...)`` (a tree is scanned only when it
     ships a generator). ``embedded`` / ``budget_exceeded`` is
     :class:`~cascade.trainer.finetune.RecipeError` ``embargo_series_embedded``
@@ -165,7 +165,7 @@ def read_mkt_recipe(d: Path, cfg, *, target: str, submission_time: float | None 
     fault) on anything wrong. ``submission_time`` (the commitment's time on
     the dispatch clock) enforces ``data.end <= submission − embargo_days``
     HERE, on the trainer, before anything is rented (review M12) — the miner
-    CLI's check is advisory. ``embargo_scan`` (DEC-CA-0073,
+    CLI's check is advisory. ``embargo_scan`` (DEC-CA-0074,
     :func:`embargo_scan_or_refuse`) scans the generator against the embargo
     (None = no scan: the miner CLI's local check; the trainer always passes
     one, :class:`~cascade.trainer.lane_c_competitions.MarketCastTrainer`)."""

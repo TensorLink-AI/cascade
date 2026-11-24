@@ -115,9 +115,21 @@ def _chain_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--wallet-path", default=None, help="Optional non-default wallet root.")
 
 
+LANE_D_EPILOG = """\
+examples (one dedicated hotkey; BF16 weights; MIT is the only licence):
+  cascade lane-d export ./trained-ckpt --out ./entry
+  cascade lane-d verify ./entry
+  cascade lane-d submit https://submissions.cascadesub.net ./entry --context 16384 --wallet-name W --wallet-hotkey H
+  cascade lane-d ready https://submissions.cascadesub.net --digest D --context 16384 --licence MIT --attest --wallet-name W --wallet-hotkey H
+  cascade lane-d status https://submissions.cascadesub.net --hotkey SS58
+rules: `cascade rules d` prints the live [lane_d] values (contexts, bar, caps);
+guide: docs/MINER_LANE_D.md (competition brief), docs/LANE_D.md (mechanics)."""
+
+
 def add_lane_d(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser("lane-d", help="Lane D (open weights): export, verify, submit, ready "
-                                      "and track a checkpoint entry.")
+                                      "and track a checkpoint entry.",
+                       epilog=LANE_D_EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
     lsub = p.add_subparsers(dest="lane_d_cmd", required=True)
 
     e = lsub.add_parser("export", help="Write a lane D entry directory from a trained "
@@ -140,7 +152,8 @@ def add_lane_d(sub: argparse._SubParsersAction) -> None:
     s.add_argument("entry_dir", type=Path, help="The entry directory (from `lane-d export`).")
     s.add_argument("--context", type=int, required=True,
                    help="The context length the entry is judged at (one of chain.toml "
-                        "[lane_d] contexts).")
+                        "[lane_d] contexts, see `cascade rules d`; scored at the highest "
+                        "armed context at or below it, never above).")
     _chain_args(s)
     s.set_defaults(func=cmd_submit, command="lane-d submit")
 
@@ -150,8 +163,9 @@ def add_lane_d(sub: argparse._SubParsersAction) -> None:
     r.add_argument("--digest", required=True, help="The entry digest (from `lane-d submit`).")
     r.add_argument("--context", type=int, required=True, help="The submitted context length.")
     r.add_argument("--licence", required=True,
-                   help="The open licence the checkpoint is published under "
-                        "(MIT).")
+                   help="The open licence the checkpoint is published under: MIT, the "
+                        "only accepted licence (weights and training data; no "
+                        "restricted-licence teacher outputs).")
     r.add_argument("--attest", action="store_true",
                    help="Confirm the licence attestation statement (shown without this "
                         "flag; nothing is sent until you confirm).")

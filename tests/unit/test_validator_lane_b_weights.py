@@ -68,15 +68,13 @@ def test_active_lane_b_pays_domain_slot_and_burns_rest(cfg, tmp_path):
 def test_reassert_without_settlement_uses_current_boundary(cfg, tmp_path):
     r = _runner(cfg, tmp_path, 1)
     r._lane_b().record(DomainWin(domain="web", hotkey="bob", uid=4, round_id="r",
-                                 merge_block=0, target_lcb=0.03, tier=0.02, full_eras=5))
+                                 merge_block=0, target_lcb=0.03))
     era = r._lane_b_era_blocks(0)
-    c = _Client(20 * era, {KING: 3, "bob": 4})
-    vec = r._apply_weights(c, "r", [3])
-    assert vec[4] == pytest.approx(0.25 * 0.1)  # past the full window, inside the TTL → floor
-    # past win_ttl_eras the payout stops: the slot burns
-    c = _Client(40 * era, {KING: 3, "bob": 4})
-    vec = r._apply_weights(c, "r", [3])
-    assert vec[4] == 0.0 and vec[cfg.scoring.burn_uid] == pytest.approx(0.5)
+    # rev6.22: the holder is paid its full slot however old the win is
+    for eras in (20, 40, 400):
+        c = _Client(eras * era, {KING: 3, "bob": 4})
+        vec = r._apply_weights(c, "r", [3])
+        assert vec[4] == pytest.approx(0.25) and vec[cfg.scoring.burn_uid] == pytest.approx(0.25)
 
 
 def test_audit_accepts_lane_b_vector_and_flags_tampering(cfg, tmp_path):

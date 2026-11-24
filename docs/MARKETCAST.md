@@ -84,7 +84,7 @@ Directions, not a recipe — the field is open:
 | Who pays | You pay the training pod (your provider key). The main validator pays for forecasting and scoring |
 | Leg length | Your `leg_hours` (≤ 12), default `[lane_c] leg_hours` = 1 h |
 | Training data | Public market bars the trainer fetches itself, ending ≥ 30 days before you submit |
-| Judged on | Windows drawn from the 28 days before your leg's dispatch (`embargo_eval_days`; inside the 30-day embargo no leg reads), 48 per asset, series and timeframe, ranked by the registering settlement's block hash; plus the closed `1mx60` / `5mx36` forward windows (DEC-CA-0073) |
+| Judged on | Windows drawn from the 28 days before your leg's dispatch (`embargo_eval_days`; inside the 30-day embargo no leg reads), 48 per asset, series and timeframe, ranked by the registering settlement's block hash; plus the closed `1mx60` / `5mx36` forward windows (DEC-CA-0074) |
 | Time to a verdict | The first settlement after your leg finishes (an inconclusive entry waits ≤ 13 h, `verdict_wait_blocks` = 3900) |
 | To win | Composite gain LCB ≥ 0.01 over the base, no suite / guard / baseline confidently worse, calibration gate, then a **confirmation** on fresh windows and a paired win over the current holder |
 | Reward | Lane C's share (25 % of emissions, taken from lane A), paid to the slot holder by a gain-tiered schedule |
@@ -186,10 +186,10 @@ MarketCast leg per **coldkey** (`max_open_legs_per_coldkey` = 1).
 ### 1. Test locally (no chain, no rental)
 
 ```bash
-cascade lane-c fetch-base --json                                   # pinned Timestral, digest-checked
+cascade lane-c fetch-base --out ./timestral --json                 # pinned Timestral, digest-checked
 cascade lane-c snapshot ./my-mkt --out train-snap                  # your recipe's training range
 cascade lane-c snapshot ./my-mkt --out eval-snap --evaluation --days 7   # recent held-out data
-cascade lane-c test ./my-mkt --target mkt:market \
+cascade lane-c test ./my-mkt --target mkt:market --base-dir ./timestral \
     --train-snapshot train-snap --eval-snapshot eval-snap --device cuda --json
 ```
 

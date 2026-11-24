@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import asdict, dataclass, field, replace
 
 from .manifest import parse_trained_pointer
@@ -65,9 +66,28 @@ class ExpertEntry:
     # ``[v2] image_epoch_from_block``) — dropped from the canonical body.
     train_image_digest: str = ""
 
+    # WB23 (D42, D42b): the miner-chosen leg length fixed at admission — the
+    # hours, the steps (real hours on the chosen GPU) and the wall guard. All
+    # 0 = a leg funded without ``train_hours``; each is dropped from the
+    # canonical body at 0, so such an entry keeps its bytes. Validators check
+    # them against ``[lane_b]`` (``lane_b_leg.check_leg_record``).
+    train_hours: float = 0.0
+    leg_steps: int = 0
+    leg_guard_seconds: int = 0
+
     def __post_init__(self) -> None:
         if isinstance(self.gpu_n, bool) or not isinstance(self.gpu_n, int) or self.gpu_n < 0:
             raise ValueError(f"expert entry gpu_n must be an int >= 0; got {self.gpu_n!r}")
+        for name in ("leg_steps", "leg_guard_seconds"):
+            v = getattr(self, name)
+            if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+                raise ValueError(f"expert entry {name} must be an int >= 0; got {v!r}")
+        th = self.train_hours
+        if (isinstance(th, bool) or not isinstance(th, (int, float))
+                or not math.isfinite(th) or th < 0):
+            raise ValueError(f"expert entry train_hours must be a finite number >= 0; "
+                             f"got {th!r}")
+        object.__setattr__(self, "train_hours", float(th))
         for name in ("selection", "exclude"):
             object.__setattr__(self, name, {int(k): sorted(int(x) for x in v)
                                             for k, v in sorted(getattr(self, name).items())})
@@ -112,6 +132,9 @@ class ExpertManifest:
                 e.pop("gpu_n", None)          # not recorded: today's bytes
             if not e.get("train_image_digest"):
                 e.pop("train_image_digest", None)   # W-IMG: not recorded
+            for k in ("train_hours", "leg_steps", "leg_guard_seconds"):
+                if not e.get(k):
+                    e.pop(k, None)            # WB23: no leg length = today's bytes
         return json.dumps(d, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
     def digest(self) -> str:

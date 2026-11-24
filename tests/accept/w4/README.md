@@ -207,3 +207,36 @@ The package stays torch-free.
 - `test_w4_torch.py` is marked `torch`. The production box must never run
   it: run `-m "not torch"` locally (also inside `LANED_PYTEST_CMD`). CI
   installs torch.
+
+## Scoring environments (rev6.18 B5/B7)
+
+Plan rev6.18 B5, B7 (owner 2026-11-23: lane D may be scored on any GPU,
+including RTX PRO 6000 Blackwell). Tests: `test_w4_envs.py`.
+
+- **`deploy/laned/scoring_envs.toml`** is the committed list (`[[env]]`
+  only). Each entry: `name`, `status` (`qualified` | `candidate`),
+  `from_block`, `until_block`, `lock` + `lock_sha256`, `torch_build`
+  (`<torch.__version__>/cuda-<torch.version.cuda>`), `gpu_models` (exact
+  nvidia-smi names), `driver_min`, `driver_max` (`""` = none), `evidence`.
+  Launch list: `cu124-torch241` (qualified reference, the release venv) and
+  `sm120-torch212` (RTX PRO 6000 Blackwell, candidate until its B5 evidence).
+  A qualified entry's lock hashes to `lock_sha256`. Lane A's `uv.lock` /
+  `torch==2.4.1+cu124` contract is untouched.
+- **`cascade.shared.config.lane_d`**: `parse_scoring_envs` /
+  `load_scoring_envs` (`ScoringEnvError`, a `ValueError`, on any defect),
+  `ScoringEnv.qualified_at(boundary)` (qualified and
+  `from_block < boundary <= until_block` when set), `host_identity`,
+  `host_problem(host, envs, boundary)`, `host_record_problem(host)`.
+- **Handshake**: `HANDSHAKE_FIELDS` = `CODE_FIELDS` + `ENV_FIELDS`
+  (`env`, `torch_build`, `gpu_model`, `driver`, `fingerprint` = sha256 of
+  the GPU UUID). `probe_environment(env=None, *, envs, smi, torch_build)`;
+  `worker_hello(root, *, environment=None)` (legacy three fields without it);
+  the `lane_d_forecasts hello [--env NAME]` CLI always probes.
+  `check_worker(hello, *, envs, boundary, expected)` -> `(CodeIdentity, host)`:
+  code identity first (`check_handshake`), then the environment; refusal is
+  CRITICAL `lane_d_handshake_env_refused` + `HandshakeMismatch` naming env
+  fields only.
+- **Qualifying a new environment**: the procedure in the file header (PR with
+  a candidate entry; W0b + golden set vs `cu124-torch241`, rel. diff <= 1e-3,
+  identical crowns; A9 timing; `evidence/lane_d_env_<name>.json`; owner merge
+  with `from_block` after the release ships).

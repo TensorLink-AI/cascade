@@ -9,9 +9,10 @@ charging the miner for a second rental.
 
 * ``fund <intake> --targets T[,T2[,T3]] --ref R --yes`` — ``POST
   /v1/lane-b/fund``, signed by your hotkey over the key digest, the targets
-  (exactly as listed) and the ref. ``--target suite:<s>`` names one suite
-  target (WB18, while ``[lane_b] suite_targets`` is on) instead of
-  ``--targets``. ``--declared-rows <file>`` sends your expert rows (WB14) as
+  (exactly as listed) and the ref. ``--target T`` (repeatable, rev6.22)
+  names the targets one per flag instead of ``--targets`` — e.g. a suite
+  target (WB18, while ``[lane_b] suite_targets`` is on) with domains.
+  ``--declared-rows <file>`` sends your expert rows (WB14) as
   ``X-Lane-B-Declared-Rows``, checked locally with the intake's own parser
   and signed (``|rows=<sha256>``). ``--withdraw`` takes a still-queued entry
   back out. ``--gpu`` / ``--allow-fallback`` / ``--max-price`` as ``cascade
@@ -42,8 +43,19 @@ SCAN_REFUSAL_CODES = {"embedded": "benchmark_series_embedded",
 _RELEASE_ROOT = Path(__file__).resolve().parents[2]
 
 
+LANE_B_EPILOG = """\
+examples (commit first with `cascade deploy --expert-domain energy,h720`):
+  cascade lane-b verify-repo ./my-generator
+  cascade lane-b test ./my-generator --targets energy,h720 --base live --pool-dir ./pool
+  cascade lane-b fund https://submissions.cascadesub.net --targets energy,h720 --ref REPO@DIGEST --declared-rows rows.json --gpu 8xH100 --wallet-name W --wallet-hotkey H --yes
+  cascade lane-b status https://submissions.cascadesub.net --hotkey SS58
+rules: `cascade rules b` prints the live [lane_b] values (targets, gain bar, guards,
+GPU list, leg hours, pay tiers); guide: docs/MINER_LANE_B.md."""
+
+
 def add_lane_b(sub: argparse._SubParsersAction) -> None:
-    p = sub.add_parser("lane-b", help="Lane B (domain experts): fund and track a leg.")
+    p = sub.add_parser("lane-b", help="Lane B (domain experts): fund and track a leg.",
+                       epilog=LANE_B_EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
     lsub = p.add_subparsers(dest="lane_b_cmd", required=True)
     from .lane_tests import add_lane_test
     add_lane_test(lsub, "b")
@@ -54,9 +66,10 @@ def add_lane_b(sub: argparse._SubParsersAction) -> None:
     which.add_argument("--targets",
                        help="The committed targets, comma-separated (as for `cascade deploy "
                             "--expert-domain`, e.g. energy or energy,h720).")
-    which.add_argument("--target", metavar="suite:<s>",
-                       help="One committed suite target (e.g. suite:gift), while [lane_b] "
-                            "suite_targets is on.")
+    which.add_argument("--target", metavar="T", action="append",
+                       help="One committed target; repeat it to list several (e.g. "
+                            "--target suite:gift --target energy), up to [lane_b] "
+                            "max_domains_per_leg. suite:<s> needs [lane_b] suite_targets on.")
     f.add_argument("--ref", required=True, help="The committed generator ref (repo@digest).")
     f.add_argument("--declared-rows", type=Path, default=None, metavar="FILE",
                    help="JSON file of the expert rows you train, keyed by MoE ordinal "
@@ -160,14 +173,19 @@ def read_declared_rows(path: Path, lane_b) -> dict:
 
 
 def _target_spec(args, out) -> str | int:
-    """The target spec of ``--targets`` or ``--target suite:<s>``, or a USAGE exit."""
+    """The target spec of ``--targets`` or the repeated ``--target T`` flags
+    (rev6.22: one leg may target several slots — domains, horizons and
+    suites mixed), or a USAGE exit. The list is validated as one
+    ``--expert-domain`` value (configured, unique, at most ``[lane_b]
+    max_domains_per_leg``)."""
     if args.target is None:
         return args.targets
-    target = str(args.target).strip()
-    if not target.startswith("suite:"):
-        return out.fail("bad_targets", f"--target takes one suite target (suite:<s>), got "
-                        f"{target!r}; use --targets for domain targets", USAGE)
-    return target
+    targets = [str(t).strip() for t in args.target]
+    bad = [t for t in targets if not t or "," in t]
+    if bad:
+        return out.fail("bad_targets", f"--target takes one target per flag, got {bad[0]!r}; "
+                        "repeat --target (or use --targets T1,T2)", USAGE)
+    return ",".join(targets)
 
 
 def _receipt_lines(out, receipt) -> None:

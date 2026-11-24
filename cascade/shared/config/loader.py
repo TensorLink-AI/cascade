@@ -111,6 +111,10 @@ RETIRED_KEYS: dict[str, frozenset[str]] = {
     # decay and the TTL are gone. Overlays naming these are refused.
     "lane_c": frozenset({"full_pay_tiers", "half_life_rounds", "floor", "win_ttl_eras"}),
     "marketcast": frozenset({"full_pay_tiers"}),
+    # LANE_D_PLAN rev6.22 (owner 2026-11-24): lane B slots pay in full until
+    # replaced, so the gain-tiered decay and the payout TTL are gone. Lane C
+    # keeps its own keys of the same names.
+    "lane_b": frozenset({"full_pay_tiers", "half_life_rounds", "floor", "win_ttl_eras"}),
 }
 
 

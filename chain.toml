@@ -1407,33 +1407,21 @@ power_ema_scope = "leg"
 # Domain-expert lane (DEC-CA-0050), launched separately from lane A.
 # 0 = off: no B pool is reserved. To launch B, announce an era start at/after
 # [v2] from_block. A/B split 75/25 while C is off, A/B/C 50/25/25 while C is on.
-# CONSENSUS: from_block, share, decay,
-# TTL, remainder, domains, verdict params. Owner-tunable values marked.
+# CONSENSUS: from_block, share, remainder, domains, verdict params.
+# Owner-tunable values marked.
 from_block = 0
 share     = 0.25                   # owner-tunable: B keeps 25% when C launches
-remainder = "burn"                 # unpaid decay + empty domain slots burn
+remainder = "burn"                 # empty slots (and deregistered holders') burn
 # The tsbench-forge domain labels (TSBench-Forge src/sources/sources.yaml,
 # copied verbatim onto every pool window) — one emission slot each.
 domains = ["econ_fin", "energy", "healthcare", "nature", "sales", "transport", "web_cloudops"]
-# Payout schedule, counted in ERAS (era_settlements settlements): 100 % for
-# a GAIN-TIERED full period, then halving every half_life_rounds eras to
-# `floor`; payout STOPS at win_ttl_eras (merged weights stay in the king
-# forever). Gain-tiered full-pay period (owner 2026-10-20, CONSENSUS,
-# overlay-settable): full_pay_tiers = [[lcb_threshold, full_eras], ...],
-# thresholds strictly descending in (0, 1), full_eras non-increasing and
-# <= win_ttl_eras; a win pays in full for the full_eras of the HIGHEST
-# threshold its target gain LCB meets (a multi-target leg: per target, each
-# by its own LCB), fixed at the win and recorded on it (never re-evaluated).
-# Below the lowest threshold (cannot happen while it is <= gain_margin) pays
-# the lowest tier, flagged below_floor. UNCALIBRATED PLACEHOLDERS: lane-B
-# domain LCBs are noisy (few windows / sources per domain) — set the
-# thresholds from real win LCBs before arming.
-full_pay_tiers   = [[0.05, 10], [0.02, 5], [0.01, 2]]   # owner-tunable
-half_life_rounds = 1.0             # owner-tunable
-floor            = 0.1             # owner-tunable
-win_ttl_eras     = 28              # owner-tunable: 14 days of 12 h eras
-# replay_settlements: unset ⇒ (win_ttl_eras + 1) × era_settlements, so a
-# rebuilt validator's lane-B state holds every still-paying win.
+# Pay (LANE_D_PLAN rev6.22, owner 2026-11-24): a held slot pays its FULL slot
+# share (share / slots) every settlement — no decay, no TTL — until a newer
+# leg's merge passes acceptance on that slot, judged on top of the base that
+# already carries the holder (ties / inconclusive keep the holder). One leg
+# may target several slots (max_domains_per_leg) and hold each it wins. The
+# gain-tiered decay / TTL keys (full_pay_tiers, half_life_rounds, floor,
+# win_ttl_eras) are RETIRED (loader RETIRED_KEYS): an older file still loads.
 # Verdict (gain = superiority, guards = non-inferiority, all at alpha)
 alpha              = 0.05
 bootstrap_B        = 10000
@@ -1669,7 +1657,8 @@ remainder       = "burn"         # release-only burn destination (D21)
 contexts        = [4096, 8192, 16384, 32768, 65536, 131072]  # D2 rev6.6: declarable from launch (cap 131072); each arms per settlement on its gates
 horizon         = 64             # points; <= 512 (§1.1)
 dtypes          = ["BF16"]       # D14: BF16 only
-forward_margin_hours = 6.0       # D5
+forward_margin_hours = 0.0       # D5; rev6.14 (a): the eligibility / fresh boundary b = T + this (6 -> 0)
+eval_delay_hours = 6.0           # rev6.14 (a): judging start j = T + this ("delay eval by 6 hours"); >= forward_margin_hours
 min_windows     = 1000           # D5
 min_clusters    = 20             # D5: sources
 min_long_series = 300
@@ -1707,7 +1696,7 @@ ready_ttl_blocks = 7200          # B10: ~24 h at 12 s blocks
 # Fine-tunes of a PINNED third-party base (mistralai/Timestral-28M, Modified
 # MIT licence with a USD 20M/month revenue restriction that extends to
 # derivatives — owner/legal open item) are judged paired vs the untouched base
-# on market windows drawn from the embargo no leg reads (DEC-CA-0073), one lane-C slot per suite (target
+# on market windows drawn from the embargo no leg reads (DEC-CA-0074), one lane-C slot per suite (target
 # "mkt:<suite>", listed in [lane_c] targets). Arming (from_block > 0) is
 # load-checked: an era boundary >= [v2] from_block and >= [lane_c] from_block,
 # [v2] bench_source = "validator" in force (the main validator's GPU scores
@@ -1734,7 +1723,7 @@ embargo_days       = 30                         # recipe training data ends this
 max_synthetic_fraction = 1.0                    # miner generator share of the training mix (1.0 = pure synthetic allowed)
 max_leg_hours      = 12.0                       # cap on a recipe's own leg_hours (miner-paid wall); no leg_hours = [lane_c] leg_hours
 eval_context_length = 32768                     # owner 2026-11-21: UP TO 32k context steps the base and the fine-tune both see (shorter while the bank's history is shorter)
-# Owner 2026-11-24 (DEC-CA-0073): a verdict within 13 h of submission. Every
+# Owner 2026-11-24 (DEC-CA-0074): a verdict within 13 h of submission. Every
 # horizon is judged on windows DRAWN from the embargo (the embargo_eval_days
 # before the leg's dispatch: bars no training leg reads), ranked by the round
 # block's hash; the 1m / 5m paths also take their forward windows already
@@ -1788,7 +1777,7 @@ guards             = ["mase", "qlike", "tail"]  # no-regression vs base: median 
 guard_floor        = 0.0                        # a guard CONFIDENTLY worse than the base (UCB < -this) fails the entry
 # Owner 2026-11-18: every suite on every timeframe, each a multi-step PATH
 # (<bar>x<steps>): 1m x 60 (1 h), 5m x 36 (3 h), 15m x 96 (1 d), 1h x 48 (2 d),
-# 4h x 42 and 1d x 7 (7 d). Owner 2026-11-24 (DEC-CA-0073): every path is
+# 4h x 42 and 1d x 7 (7 d). Owner 2026-11-24 (DEC-CA-0074): every path is
 # drawn from the embargo (embargo_eval_days above); gap_horizons is gone.
 baseline_gate      = true                       # must beat random walk + EWMA/FHS and seasonal AR(1): composite LCB >= 0, no suite confidently worse
 # Owner 2026-11-19: the official calendars (federalreserve.gov FOMC calendar — statement 14:00 ET

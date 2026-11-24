@@ -648,6 +648,16 @@ passed every W7a, W5e and W5a test (462).
 **Order:** the W7a implementation needs W2e's keys and lands after W5e's
 (the audit's honest fixtures crown at the first verdict).
 
+### Scoring host (rev6.18 B7)
+
+Tests: `test_w7a_host.py`. `settle_lane_d(..., host=None)` (keyword-only)
+takes the verified eval host record; given, it must pass
+`host_record_problem` (else `ValueError` before anything is written) and is
+signed as the top-level `host` (schema `$defs.host`: exactly `env`,
+`gpu_model`, `driver`, `torch_build`, `fingerprint`, `identity`).
+`validate_report` re-checks the identity (`bad_value` at `host`).
+`LaneDInputs.host` (W8b) carries it to `settle_lane_d`. Absent without a host.
+
 ## Multichannel windows (rev6.18 F2): `test_w7a_multivariate.py`, `mv.py`
 
 `mv.py` is the multichannel chain fixture the F2 tests of W5d/W5e/W7a/W9
@@ -664,3 +674,6 @@ channel pick re-stated from the plan, and `settle_mv` (asserts
   window's `if {required: [n_channels]} then {required: all six}` and the
   cross-field check enforce all-or-none. A univariate window carries none
   of them, so a univariate report is unchanged.
+## rev6.14 (a): judging start vs eligibility boundary (owner 2026-11-23)
+
+The report signs the optional top-level `boundary_ts` (the boundary block's on-chain `Timestamp.Now`; absent, never null, on the legacy call) and echoes `params.eval_delay_hours`; `SKIP_REASONS` gains `before_eval_delay` and `boundary_ts_missing`. `validate_report` refuses a cohort with `boundary_ts < t_max + 3600 * eval_delay_hours` (`bad_value` at `cohorts[i]`), a judged cohort without `boundary_ts` (`missing_field`), a `boundary_ts_missing` skip on a stamped settlement, a `before_eval_delay` skip whose start has passed, and `forward_margin_hours > eval_delay_hours`. `test_w7a_rev614.py`.

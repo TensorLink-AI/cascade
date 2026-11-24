@@ -1,4 +1,4 @@
-"""DEC-CA-0073 (owner 2026-11-24): a MarketCast verdict within 13 hours —
+"""DEC-CA-0074 (owner 2026-11-24): a MarketCast verdict within 13 hours —
 every horizon judged on windows DRAWN from the embargo by the round block's
 hash, the generator scanned for embargoed prices before a leg rents, and the
 draw recorded, re-derived and audited."""

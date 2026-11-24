@@ -11,6 +11,12 @@ on your compute account. Local training experiments need suitable compute too.
 | C | An eligible MarketCast fine-tuning recipe, optionally with a generator | Beat the pinned application base on future data, then confirm and take a slot | [Lane C](#what-you-submit) |
 | D | A trained cascade_pyramid checkpoint (BF16 weights you trained anywhere) | Beat the lane D king on forward-only private windows, then confirm (built, unarmed) | [Lane D](LANE_D.md) |
 
+**One competition brief per lane** (intent, scoring and pay numbers with a
+worked example, strategies, costs, refusals, FAQ):
+[lane A](MINER_LANE_A.md) · [lane B](MINER_LANE_B.md) ·
+[lane C, MarketCast](MINER_LANE_C_MARKETCAST.md) · [lane D](MINER_LANE_D.md).
+`cascade rules a|b|c|d` prints each lane's live values from `chain.toml`.
+
 The submission contract (what the code must be) is [INTERFACE.md](INTERFACE.md).
 This guide is the end-to-end walkthrough.
 Coding agents can follow [AGENT_MINING.md](AGENT_MINING.md) for lane starters,
@@ -317,7 +323,7 @@ byte-identical to what validators scored. Each
 |---|---|
 | `block-<N>.tar` | the exact tar validators scored |
 | `POOL_SHA256` | its sha256 (matches receipts and the publisher index) |
-| `<series_id>.npy` | the same series, unpacked |
+| `<series_id>.npy` | the same series, unpacked (folders revealed before 2026-11-24 only; for newer folders run `tar -xf block-<N>.tar` in the folder, or use `--pool-hf`) |
 | `metadata.json` | `{series_id: {freq, seasonal_period, domain, source, …}}` |
 | `provenance.json` | the build configuration recorded at publish time |
 
@@ -969,17 +975,16 @@ target (`mkt:market`), its full-pay slot reserves **all 25% of total emissions**
 That is a slot maximum, not a promise of paying an unfilled slot. Pending,
 unstarted or ended competitions do not donate their allocation to active ones.
 
-**B/C reward progression.** B records its tier from accepted marginal gain.
-MarketCast C records a full-pay duration from the confirmed gain (DEC-CA-0073):
-5 days at the 0.01 gain margin, rising linearly to 20 days at a gain LCB of
-0.05 or more, rounded up to whole eras. Current full-pay periods are:
+**B/C reward progression.** B has no tiers and no decay (plan rev6.22,
+owner 2026-11-24): a B slot holder is paid 100% of its slot every settlement
+until it is replaced. MarketCast C records a full-pay duration from the
+confirmed gain (DEC-CA-0073): 5 days at the 0.01 gain margin, rising linearly
+to 20 days at a gain LCB of 0.05 or more, rounded up to whole eras. Current C
+full-pay periods are:
 
 <!-- cascade:rewards:slot-tiers:start -->
 | Lane | Target gain LCB | Full-pay eras |
 |---|---:|---:|
-| B: accepted marginal gain | ≥ 0.05 | 10 |
-| B: accepted marginal gain | ≥ 0.02 | 5 |
-| B: accepted marginal gain | ≥ 0.01 | 2 |
 | C: confirmed MarketCast gain | 0.01 | 10 |
 | C: confirmed MarketCast gain | 0.02 | 18 |
 | C: confirmed MarketCast gain | 0.03 | 25 |
@@ -991,29 +996,42 @@ it is a different statistic from A's increment-unit crowning LCB. Full pay
 means **100% of that target's slot**, not 100% of the lane or subnet. The tier
 is fixed on the recorded win; a later tier retune does not restart that win.
 
-After B's full-pay period, the configured one-era half-life gives multipliers
-50% → 25% → 12.5% → a **10% slot floor**. The win stops paying at **age 28
-eras**, measured from B acceptance, including its full-pay eras. A C win has
-no decay: its slot ends (burns) when its full-pay duration ends, unless a
-newer win has already replaced it. It does not get another 28 eras after decay starts. Replacement by a new
+A C win has no decay: its slot ends (burns) when its full-pay duration
+ends, unless a newer win has already replaced it. Replacement by a new
 holder stops the old holder earlier. At approximately 12 hours per mainnet
-era, 28 eras is approximately 14 days; blocks, not wall-clock estimates, govern.
+era, 10 eras is approximately 5 days; blocks, not wall-clock estimates, govern.
 
 <!-- cascade:rewards:slot-decay:start -->
-B example: accepted marginal gain LCB 0.02, recorded full-pay period 5 eras.
-
-| Age since acceptance (eras) | Slot multiplier | Share of total emissions |
-|---|---:|---:|
-| 0–4 | 100% | 2.5% |
-| 5 | 50% | 1.25% |
-| 6 | 25% | 0.625% |
-| 7 | 12.5% | 0.3125% |
-| 8–27 | 10% | 0.25% |
-| 28+ | 0% | 0% |
+B: a held slot pays 100% of its slot (2.5% of total emissions) every settlement, with no decay and no expiry, until a newer leg's merge passes acceptance on that slot. C has no decay: its slot pays 100% for its recorded full-pay duration, then ends.
 <!-- cascade:rewards:slot-decay:end -->
 
-C uses its own decay/expiry configuration, currently the same half-life,
-floor and TTL. When a competition ends, `finish_full_pay` permits an existing
+**B slots pay until replaced.** A B slot holder is paid **100% of its slot
+every settlement, with no decay and no expiry**, for as long as it holds the
+slot. A holder loses the slot only when a newer leg's merge passes acceptance
+on that slot. Acceptance is judged against the init that already contains the
+holder's experts, so the newer leg must improve on top of the holder. A tie or
+an inconclusive result leaves the holder in place. A deregistered holder's
+slot burns, and empty slots still burn. Each receipt's `lane_b_pay` record
+lists every paid holder with its `merge_block`, `age` and `since_era`.
+
+**Every slot is tested.** Every judged B leg is tested on every slot: the 7
+domains, the scored horizons and, while suite targets are on, the public
+suites. A slot clears when its CRPS **or** MASE gain LCB clears the bar with a
+positive point gain, the other metric is non-inferior, and every guard holds
+(no domain, horizon or public metric regresses). There are two bars and two
+test families:
+
+- your **declared targets** (up to `[lane_b] max_domains_per_leg`, 4) clear at
+  `gain_margin` (1%). They are corrected only among themselves (a max-T
+  family), so a one-target leg is a single test of its two metrics;
+- every **other slot** clears at the stricter `undeclared_gain_margin` (2%),
+  in its own max-T family.
+
+Every slot a leg clears is claimable, replacing that slot's holder, so one
+miner may hold every slot. The signed verdict rows list every tested slot
+with its family, bar, CRPS/MASE LCBs, point gains and whether it passed.
+
+C follows its own rule above (DEC-CA-0073). When a competition ends, `finish_full_pay` permits an existing
 holder only its remaining recorded full-pay period, capped at six wind-down
 eras; there is no decay tail after the end. Under `stop`, a settlement after
 `until_block` pays nothing. That ended competition's unpaid allocation burns.
@@ -1357,7 +1375,7 @@ launch cap, king ladder, acceptance clocks and burns.
 
 ### Choose targets, not expert IDs
 
-Declare 1–3 targets under the checked-in mainnet limit
+Declare 1–4 targets under the checked-in mainnet limit
 (`[lane_b] max_domains_per_leg`). Choose from:
 
 - Domains: `econ_fin`, `energy`, `healthcare`, `nature`, `sales`, `transport`,
@@ -1368,7 +1386,13 @@ Declare 1–3 targets under the checked-in mainnet limit
 
 The trainer measures which experts the king routes each target to and chooses
 eligible rows. Multiple targets train the union of their selections in one
-leg, with the same budget as a single-target leg. Miners do not supply expert
+leg, with the same budget as a single-target leg. The leg is then tested on
+every slot (see "Every slot is tested" above): every target that passes
+claims its own slot, so one leg can hold several slots, including undeclared
+ones at the stricter bar. A guard failure blocks every slot of the leg. Fund such a leg with `cascade lane-b fund ... --targets
+energy,h720`, or repeat `--target` once per target (for example `--target
+energy --target suite:gift` while suite targets are on). The intake and the
+local check both refuse more than `max_domains_per_leg` targets. Miners do not supply expert
 IDs. Domain selection uses context patches; horizon selection uses masked
 forecast patches and context, never the future target values.
 
@@ -1717,8 +1741,9 @@ eval — only MarketCast (mkt:) has one; see DEC-CA-0056". While MarketCast is
 off, no lane-C target is active. If Lane C has launched, its reserved share
 burns; before Lane C launches, no C pool is reserved.
 
-**Checked-in templates: off on mainnet and testnet** (`[marketcast] from_block =
-0`). Check live status separately. While it is off, the intake, `cascade lane-c check|commit|fund` and the
+**Launch block in the checked-in template:** mainnet `[marketcast]` and `[lane_c]
+from_block = 9586800` (about 2026-11-25 22:28 UTC; `cascade rules c` prints the
+value your release ships). Check live status separately. Before that block, the intake, `cascade lane-c check|commit|fund` and the
 trainer refuse every `mkt:` target with a clear message
 about inactive MarketCast. Their JSON codes differ: `check`/`upload` return
 `bad_recipe`, `commit` returns `bad_commit`, and `fund` returns `bad_target`;
@@ -1897,7 +1922,7 @@ Every lane-C entry (DEC-CA-0056 review 2026-10-19):
 ### How it is judged
 
 - The **main validator** forecasts the untouched base and your fine-tune on
-  its GPU (DEC-CA-0073, owner 2026-11-24: a verdict within 13 hours). The
+  its GPU (DEC-CA-0074, owner 2026-11-24: a verdict within 13 hours). The
   windows are DRAWN from the embargo — the `embargo_eval_days` (28) before
   the time the trainer dispatched your leg (`train_time`, signed by the
   trainer), days no leg ever reads (`data.end` ≤ your commit's UTC date −
@@ -2029,8 +2054,10 @@ command takes `--json`. No flag takes a key, token or upload URL.
 Lane D needs no compute keys: you train on your own hardware, on any data
 and with any recipe, and the operator pays for evaluation. Nothing is rented
 on your provider account. Use a dedicated hotkey: a lane D commit replaces
-that hotkey's lane A pointer. Lane D ships unarmed (`[lane_d] from_block = 0`);
-check `cascade status --json` before you submit.
+that hotkey's lane A pointer. Lane D's template ships unarmed
+(`[lane_d] from_block = 0`). On mainnet the signed launch overlay arms it at
+block 9586800 (with lane B, and lane C's template block); check
+`cascade status --json` before you submit.
 
 - `cascade lane-d export ./trained --out ./entry` writes the entry directory
   (the four files only) and prints its digest.

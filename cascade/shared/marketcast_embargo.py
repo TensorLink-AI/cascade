@@ -1,4 +1,4 @@
-"""MarketCast embargo contamination check (DEC-CA-0073 guard (b)).
+"""MarketCast embargo contamination check (DEC-CA-0074 guard (b)).
 
 Every MarketCast horizon is judged on windows drawn from the embargo — the
 ``[marketcast] embargo_eval_days`` before a leg's dispatch, bars no training
