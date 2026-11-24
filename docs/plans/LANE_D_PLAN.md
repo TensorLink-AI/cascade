@@ -1,10 +1,79 @@
 # Plan: lane D "open weights" (anything goes on our architecture), with lane E and lane A flexibility — v3
 
-Status: **PLAN v3, ~~rev6.12~~ ~~rev6.14~~ ~~rev6.15~~ ~~rev6.16~~ ~~rev6.17~~ ~~rev6.18~~ ~~rev6.20~~ rev6.21, rev6.22, rev6.23, rev6.24 (proposed 2026-11-22; ~~rev6.12~~ ~~rev6.14~~ ~~rev6.15~~ ~~rev6.16~~ ~~rev6.17~~ rev6.18 2026-11-23; rev6.20, rev6.21, rev6.22, rev6.23, rev6.24 2026-11-24)**: v2's design, made buildable by an
+Status: **PLAN v3, ~~rev6.12~~ ~~rev6.14~~ ~~rev6.15~~ ~~rev6.16~~ ~~rev6.17~~ ~~rev6.18~~ ~~rev6.20~~ rev6.21, rev6.22, rev6.23, rev6.24, rev6.25 (proposed 2026-11-22; ~~rev6.12~~ ~~rev6.14~~ ~~rev6.15~~ ~~rev6.16~~ ~~rev6.17~~ rev6.18 2026-11-23; rev6.20, rev6.21, rev6.22, rev6.23, rev6.24, rev6.25 2026-11-24)**: v2's design, made buildable by an
 autonomous loop. A work package is done **only when its Accept command exits
 0**; **(rev6)** its level is only what `scripts/laned/status` computes (§17),
 never a claim. Owner decisions are marked **[DECIDE]**. Nothing is armed. **No calendar
 dates**: stages are gated (§5).
+
+## rev6.25 (owner 2026-11-24): lane C competitions, tests, pay and embargo by overlay (W-CMP)
+
+Owner (firm): "new test or formula and embargo days etc. should be up to our
+choice, and we should bring new lane C competitions without validators
+updating." Clarified the same day: lane C is the umbrella; MarketCast is ONE
+lane C competition; a new domain must not need a validator release, not even
+for its data source. Validators never execute owner-supplied code, so the
+owner's choice is a choice among BLOCKS every validator runs, selected by a
+signed overlay. Record: DEC-CA-0075. Builds on W-OV (#859; merge order #859 →
+this plan → the W-CMP feature PR).
+
+**(a) Declarative competitions.** `[lane_c.specs.<id>]` = runner, pool
+(prefix + signer + schema version), series selection (pool tags), universe /
+timeframes / horizons, metrics, score, guards, metric weights, `gain_margin`,
+`alpha`, `test_family`, `pay_curve`, weight in lane C, `until_block`,
+`embargo_days` / `embargo_eval_days`. Registry (`competition_spec.py`,
+published in `overlay_policy()["competition_registry"]`): runner `marketcast`;
+series metrics `returns vol range high low liquidity ohlcv funding alpha`;
+score `crps`; guards `mase qlike tail`; pool schema `cascade-std-pool/1`;
+the menu in (d). A spec compiles onto its runner's tables and goes through the
+same parser. MarketCast (`mkt:market`) is one such spec, byte-identical
+(pinned). Unknown block / key / runner / schema → typed refusal: the
+competition judges nothing, its weight stays in the split (its share burns),
+logged and recorded; out-of-bounds known keys are refused on the overlay path
+(W-OV style); unknown NAMES are adopted as a refusal so a node one release
+behind burns that share only, never forks on the whole overlay.
+
+**(b) One data format.** Every lane C competition reads a signed,
+content-addressed STANDARD POOL (`cascade-std-pool/1`: per series grid or
+timestamps, channels (C, L), freq, tags, first_seen / embargo_until; sha256
+manifest; signer) through ONE reader. Source code (market APIs, relays,
+energy feeds, scrapers) lives ONLY in pool builders (owner infra). A new
+domain = a new builder job + an overlay spec; **no validator release for a
+new data source**. The MarketCast snapshot is the special case (series
+`<bank>/<class>/<asset>`, fields as channels); its builder re-emits a
+standard pool and the judge reads either form with byte-identical windows.
+Today no other lane C competition exists in code (the DEC-CA-0056
+`domain:`/`freq:`/`horizon:` kinds are retired as not forward-only; "energy"
+is a lane B domain). An energy lane C competition is a builder job emitting a
+standard pool + a spec — once the generic runner (W-CMP2) can host a second
+competition. Domain metrics (liquidity / range ...) stay registry blocks over
+the channels the spec's pool carries.
+
+**(c) Embargo.** The trainer records `embargo_days` / `embargo_eval_days` at
+DISPATCH in the signed leg record; draw / scan / verdict / audit use the
+recorded values. `[marketcast] embargo_days` becomes overlay-settable in
+[2, 120] (amends rev6.24 (b): the training-data overlap reason is gone).
+
+**(d) Rule menu.** Test families {`plain_lcb`, `maxt`, `bonferroni`}; pay
+curves {`tiered_decay`, `fixed_term` (DEC-CA-0073 5–20 d), `indefinite_until_beaten`}.
+Lane defaults = today: B `bonferroni`/`tiered_decay`; C `bonferroni`/`fixed_term`;
+D `maxt`/`indefinite_until_beaten`. Runs in this release: B and C families
+`plain_lcb`/`bonferroni`, all three curves; D its defaults only. A
+non-default curve is recorded on the win; the audit re-derives it.
+
+**(e) Contamination hash set.** `[lane_b] contamination_hashset` (sha256 pin) +
+`contamination_hashset_key` are overlay-settable; readers fetch, verify the
+sha256 against the pin before parsing, fail closed (`HashsetMismatch`, 503).
+Amends rev5's release-only pin (WB10 tests corrected).
+
+**Consensus.** One release to all validators, satellites and the trainer;
+nothing changes until an overlay selects something. After it, specs, menu
+choices, embargo and hash-set pins are overlay data. A new block is a release.
+
+| WP | What | Keys / fields | Depends | Runs in | Accept |
+|---|---|---|---|---|---|
+| W-CMP | **(rev6.25)** `std_pool` (schema, writer, reader, MarketCast projection + builder); `competition_spec` (registry, parse with typed refusals, bounds, compile onto MarketCast, `marketcast_spec`); `rules_menu` wired into lanes B / C / D and the audit; per-leg embargo record; hash set by content hash + key with fetch-verify and intake reload | (a)–(e) | W-OV | ci | `scripts/laned/accept W-CMP` |
+| W-CMP2 | **(rev6.25, plan only)** generic runner: a second concurrent lane C competition on a standard pool (per-instance judge / legs / reports / audit), `maxt` for lanes B and C, the pool_d / lane A pool projections | (a), (b), (d) | W-CMP | ci + testnet | `scripts/laned/accept W-CMP2` |
 
 ## rev6.24 (owner 2026-11-24; main @ ce27dfb): competition tweaks by signed overlay, with a code envelope
 

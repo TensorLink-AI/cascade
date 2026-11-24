@@ -1669,7 +1669,8 @@ remainder       = "burn"         # release-only burn destination (D21)
 contexts        = [4096, 8192, 16384, 32768, 65536, 131072]  # D2 rev6.6: declarable from launch (cap 131072); each arms per settlement on its gates
 horizon         = 64             # points; <= 512 (§1.1)
 dtypes          = ["BF16"]       # D14: BF16 only
-forward_margin_hours = 6.0       # D5
+forward_margin_hours = 0.0       # D5; rev6.14 (a): the eligibility / fresh boundary b = T + this (6 -> 0)
+eval_delay_hours = 6.0           # rev6.14 (a): judging start j = T + this ("delay eval by 6 hours"); >= forward_margin_hours
 min_windows     = 1000           # D5
 min_clusters    = 20             # D5: sources
 min_long_series = 300

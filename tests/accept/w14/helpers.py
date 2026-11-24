@@ -77,7 +77,7 @@ def settle_b4(chain: Chain, state_path: Path):
     if w7c.settle_takes_gate_inputs():
         kw.update(boundary_block_hash=w7c.block_hash("b4"), sentinel=None,
                   bench=SweepSession("w14-sess-b4", chain.passing_host()))
-    return settle_lane_d(cfg=lane_d_cfg(), boundary=boundary(4), pool_dir=chain.pools[2],
+    return settle_lane_d(**_rev614_ts(settle_lane_d, boundary(4)), cfg=lane_d_cfg(), boundary=boundary(4), pool_dir=chain.pools[2],
                          entries=[dict(chain.x)], house=dict(chain.house),
                          forecasts=chain.forecasts, uid_of=dict(chain.uid_of),
                          state_path=state_path, signer=chain.signer,
@@ -103,3 +103,14 @@ def receipt_error_code(excinfo) -> str:
 
 def json_bytes(obj) -> bytes:
     return json.dumps(obj, sort_keys=True).encode()
+
+
+def _rev614_ts(settle, boundary) -> dict:
+    """rev6.14 (a): the fixture's on-chain boundary timestamp (far after every
+    fixture T + eval_delay_hours, 12 s per block), passed only where
+    ``settle_lane_d`` takes it."""
+    import inspect
+
+    if "boundary_ts" not in inspect.signature(settle).parameters:
+        return {}
+    return {"boundary_ts": 2_000_000_000 + 12 * int(boundary)}
