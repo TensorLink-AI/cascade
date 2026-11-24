@@ -53,6 +53,27 @@ def _lane_b_rent_skus(runner) -> tuple[str, ...] | None:
     return None if skus is None else tuple(skus)
 
 
+def _mkt_rent_skus(runner) -> tuple[str, ...] | None:
+    """Owner 2026-11-24: a MarketCast leg's GPU types (``[marketcast]
+    funded_pod_skus`` plus an own-risk chosen type) while this thread runs one
+    (``mkt_gpus.mkt_rent_scope``), else None."""
+    skus = getattr(getattr(runner, "__dict__", {}).get("_leg_local_obj"),
+                   "mkt_rent_skus", None)
+    return None if skus is None else tuple(skus)
+
+
+def _scoped_rent_skus(runner) -> tuple[tuple[str, ...], str] | None:
+    """``(skus, what)`` of the lane scope this thread rents under (lane B's
+    measured list, or a MarketCast leg's list), else None (lane A: unchanged)."""
+    lane_b = _lane_b_rent_skus(runner)
+    if lane_b is not None:
+        return lane_b, "lane B's measured [lane_b] funded_pod_skus"
+    mkt = _mkt_rent_skus(runner)
+    if mkt is not None:
+        return mkt, "the MarketCast GPU list ([marketcast] funded_pod_skus + own-risk choice)"
+    return None
+
+
 class _FundedCapacityMixin:
     """Marketplace capacity waits, per-SKU walls and rent deadlines (DEC-CA-0036)."""
 
@@ -61,8 +82,8 @@ class _FundedCapacityMixin:
         GPU type that still fits instead of one locked type. Safe because
         rolling runs only past ``era_king_from_block``, where validators lift
         the gpu_mismatch gate on mixed types. A lane B leg (WB22 rent scope)
-        always picks per leg from lane B's own list."""
-        if _lane_b_rent_skus(self) is not None:
+        always picks per leg from lane B's own list, a MarketCast leg from its."""
+        if _scoped_rent_skus(self) is not None:
             return True
         return bool(getattr(self.cfg.round, "funded_sku_per_leg", False))
 
@@ -119,15 +140,14 @@ class _FundedCapacityMixin:
             log.warning("%s: chosen GPU %s ignored — [round] funded_sku_per_leg is off "
                         "(one locked type)", who, gpu)
             return None
-        lane_b = _lane_b_rent_skus(self)
-        listed = (lane_b if lane_b is not None
+        scoped = _scoped_rent_skus(self)
+        listed = (scoped[0] if scoped is not None
                   else tuple(getattr(self.cfg.round, "funded_pod_skus", ()) or ()))
         sku = next((s for s in listed if s.lower() == gpu.lower()), None)
         if sku is None:
             log.warning("%s: chosen GPU %s is no longer in %s — renting the default "
                         "(cheapest fitting) type", who, gpu,
-                        "lane B's measured [lane_b] funded_pod_skus" if lane_b is not None
-                        else "[round] funded_pod_skus")
+                        scoped[1] if scoped is not None else "[round] funded_pod_skus")
             return None
         caps = dict(self._funded_price_caps())
         caps["max_price_per_hour"] = float(getattr(choice, "max_price_per_hour", 0.0) or 0.0)
@@ -138,10 +158,10 @@ class _FundedCapacityMixin:
         """GPU types a rent may pick: the locked ``funded_pod_sku``, or — with
         ``[round] funded_sku_per_leg`` (the open market) — every listed type,
         cheapest fitting executor first. A lane B leg (WB22) rents from lane
-        B's measured list only."""
-        lane_b = _lane_b_rent_skus(self)
-        if lane_b is not None:
-            return lane_b
+        B's measured list only; a MarketCast leg from its own list."""
+        scoped = _scoped_rent_skus(self)
+        if scoped is not None:
+            return scoped[0]
         rnd = self.cfg.round
         if self._sku_per_leg_active():
             skus = tuple(getattr(rnd, "funded_pod_skus", ()) or ())
@@ -170,6 +190,10 @@ class _FundedCapacityMixin:
         ucap = unmeasured_wall_cap(leg_round_view(self))
         if ucap > 0:
             return min(float(cap), ucap)
+        if _mkt_rent_skus(self) is not None:
+            # a MarketCast leg trains its recipe's wall (the contract's), on
+            # any GPU: lane A's full-budget wall table never applies to it
+            return float(cap)
         walls = tuple(getattr(rnd, "funded_sku_wall_seconds", ()) or ())
         if sku:
             return min(float(cap), funded_sku_wall_for(walls, sku, cap))

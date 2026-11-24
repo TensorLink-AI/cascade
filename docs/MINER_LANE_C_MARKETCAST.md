@@ -147,6 +147,16 @@ You pay the provider's listed price for the GPU you rent. Pick it with
 `--gpu` and cap it with `--max-price`. A failed or losing leg is not
 refunded.
 
+The leg runs on one GPU, so you may rent any Lium GPU type. The recommended
+types are in `[marketcast] funded_pod_skus` (shipped: `1xRTX4090`, `1xA100`,
+`1xH100`, `8xH100`). Without `--gpu`, the leg rents the cheapest of these that
+fits. You can choose any other Lium type (for example `1xRTX3090` or
+`1xH200`) at your own risk. The fund reply then carries a warning. The leg is
+still capped by `max_leg_hours` and your recipe's `leg_hours`. It rents on
+your own Lium key: send a plain Lium key, because MarketCast never rents on
+Shadeform. Nothing is refunded if the type is slow, cannot boot, runs out of
+memory or crashes.
+
 ## What gets you refused
 
 - **Recipe limits:** learning rate above `max_lr` (1e-3), more than

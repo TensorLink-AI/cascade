@@ -741,8 +741,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     # well-formed SKU is accepted (dev only; the trainer still checks).
     gpu_catalog = None
     lane_b_gpus = None
+    mkt_gpu_catalog = None
     if cfg is not None:
         gpu_catalog, lane_b_gpus = gpu_catalogs(cfg)
+        from .mkt_gpus import mkt_catalog
+
+        # owner 2026-11-24: MarketCast legs may rent ANY Lium GPU (own risk
+        # off the recommended [marketcast] funded_pod_skus)
+        mkt_gpu_catalog = mkt_catalog(cfg)
+        log.info("MarketCast GPU choice: recommended %s; any other Lium type at the "
+                 "miner's own risk", ",".join(mkt_gpu_catalog.skus or ()) or "none")
         log.info("GPU choice: %s", ",".join(gpu_catalog.skus or ()) or
                  "OFF (one locked type)")
         if args.lane_b != "off":
@@ -770,6 +778,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         lane_c_closed=lane_c_closed,
         gpu_catalog=gpu_catalog,
         lane_b_gpus=lane_b_gpus,
+        mkt_gpu_catalog=mkt_gpu_catalog,
         # WB23: the reference steps of the lane B base contract cap the steps
         # a train_hours fund fixes (the validator's consensus cap). The lane B
         # queue itself is wired by ``lanes.apply`` (EffectiveLanes, #874).

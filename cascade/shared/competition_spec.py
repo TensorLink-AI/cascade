@@ -402,7 +402,9 @@ _NOT_INHERITED = ("from_block", "suites", "assets", "frequencies", "horizons", "
                   "pool_prefix", "pool_signer", "pool_schema", "pool_select", "pool_channels",
                   "refused", "bar_relay", "native_intervals", "native_history_days",
                   "composite", "composite_suite_weights", "forward_horizons", "gap_horizons",
-                  "min_dollar_volume_24h", "event_times")
+                  "min_dollar_volume_24h", "event_times",
+                  # trainer rent policy (owner 2026-11-24), never a compiled table's
+                  "funded_pod_skus")
 
 
 def compile_instance(spec: CompetitionSpec, mc_raw: dict) -> tuple[dict, dict]:
