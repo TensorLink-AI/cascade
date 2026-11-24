@@ -59,7 +59,9 @@ def test_config_defaults_and_bounds():
 @pytest.mark.parametrize("toml", ["chain.toml", "chain.testnet.toml"])
 def test_shipped_tomls_carry_the_flexible_recipe_bounds(toml):
     mc = load_chain_config(ROOT / toml).marketcast
-    assert mc.max_leg_hours == 12.0 and mc.max_synthetic_fraction == 1.0
+    # TESTNET-FAST (owner 2026-11-24): a recipe leg is capped at 1 h on testnet
+    want_hours = 1.0 if toml == "chain.testnet.toml" else 12.0
+    assert mc.max_leg_hours == want_hours and mc.max_synthetic_fraction == 1.0
 
 
 # ── recipe: leg_hours ────────────────────────────────────────────────────────

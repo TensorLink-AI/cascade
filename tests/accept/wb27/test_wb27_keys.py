@@ -26,9 +26,11 @@ def test_keys_ship_at_their_defaults():
     for k, v in KEYS.items():
         assert LANE_B_TRACK_DEFAULTS[k] == v and k in names
         assert getattr(parse_lane_b({}), k) == v
+    # TESTNET-FAST (owner 2026-11-24): testnet caps a lane B leg at 1 h (x 1.25)
+    caps = {"chain.toml": (12.0, 54_000), "chain.testnet.toml": (1.0, 4500)}
     for name in ("chain.toml", "chain.testnet.toml"):
         lb = load_chain_config(str(h.REPO / name)).lane_b
-        assert lb.leg_caps_at(None) == (12.0, 54_000), name
+        assert lb.leg_caps_at(None) == caps[name], name
         assert (lb.lr_scale_min, lb.lr_scale_max) == (0.5, 2.0), name
 
 

@@ -104,8 +104,9 @@ def test_shipped_configs_carry_the_duration_terms_and_no_retired_keys():
         assert not set(raw["lane_c"]) & set(RETIRED_LC), f
         assert "full_pay_tiers" not in raw["marketcast"], f
         lc = load_chain_config(ROOT / f).lane_c
+        # TESTNET-FAST (owner 2026-11-24): testnet scales days to ~hours (6 h .. 24 h)
         assert (lc.full_pay_min_days, lc.full_pay_max_days, lc.full_pay_max_gain) == (
-            5.0, 20.0, 0.05)
+            (0.25, 1.0, 0.05) if f == "chain.testnet.toml" else (5.0, 20.0, 0.05))
     # the lane C activation the owner typed (moved to 9586800 by #870) is untouched
     main = load_chain_config(ROOT / "chain.toml")
     assert main.lane_c.from_block == 9586800 == main.marketcast.from_block

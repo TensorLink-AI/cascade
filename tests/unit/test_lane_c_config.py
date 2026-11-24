@@ -44,12 +44,16 @@ def test_shipped_configs_are_inert_with_the_defaults():
         # the code-level default keeps the per-suite shape
         assert lc.targets == ("mkt:market",)
         assert DEFAULT_TARGETS == ("mkt:returns", "mkt:vol")
-        # DEC-CA-0073: the gain-scaled full-pay duration (5 .. 20 days)
+        # DEC-CA-0073: the gain-scaled full-pay duration (5 .. 20 days); the
+        # TESTNET-FAST profile (owner 2026-11-24) scales it to 6 h .. 24 h and
+        # lane C's own window counts down
+        fast = f == "chain.testnet.toml"
         assert (lc.full_pay_min_days, lc.full_pay_max_days, lc.full_pay_max_gain) == (
-            5.0, 20.0, 0.05)
+            (0.25, 1.0, 0.05) if fast else (5.0, 20.0, 0.05))
         assert not hasattr(lc, "win_ttl_eras") and not hasattr(lc, "full_pay_tiers")
         assert (lc.alpha, lc.bootstrap_B, lc.gain_margin, lc.min_target_windows) == \
-            (0.05, 10_000, 0.01, 100)
+            (0.05, 10_000, 0.01, 30 if fast else 100)
+        assert lc.n_windows == (100 if fast else 1000)
         assert lc.guard_public == () and lc.tau_public == 0.01
         assert (lc.leg_hours, lc.legs_per_target, lc.max_base_age_eras) == (1.0, 2, 2)
         assert (lc.max_lr_scale, lc.max_steps_fraction) == (1.0, 1.0)
