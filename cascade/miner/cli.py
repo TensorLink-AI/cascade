@@ -30,8 +30,9 @@ Direct-MoE lane (DEC-CA-0052): ``cascade direct status|deposit-key|fund``, see
 ``cascade/miner/direct.py``.
 
 Fine-tuning lane (DEC-CA-0056; MarketCast-only: ``mkt:<suite>`` targets):
-``cascade lane-c check|commit|fund|status``, see ``cascade/miner/lane_c.py``. Domain-expert lane funding (DEC-CA-0059 item
-8): ``cascade lane-b fund|status``, see ``cascade/miner/lane_b.py``.
+``cascade lane-c upload|check|commit|fund|status|test``, see ``cascade/miner/lane_c.py``. Domain-expert
+lane (DEC-CA-0059 item 8): ``cascade lane-b fund|status|verify-repo|test``, see
+``cascade/miner/lane_b.py`` (``test``: ``cascade/miner/lane_tests.py``).
 
 Open-weights lane (DEC-CA-0062, DEC-CA-0070): ``cascade lane-d
 export|verify|submit|ready|status``, see ``cascade/miner/lane_d.py``.
@@ -153,11 +154,13 @@ def _add_deploy(sub: argparse._SubParsersAction) -> None:
         metavar="DOMAIN",
         help="Lane B (v2, DEC-CA-0050): commit the generator as a DOMAIN-EXPERT entry "
         "(metro-v1:expert:<DOMAIN>:hippius:<ref>) instead of a lane-A entry. DOMAIN must "
-        "be one of chain.toml [lane_b] domains — or a comma-separated list of up to "
-        "[lane_b] max_domains_per_leg targets (DEC-CA-0059: domains and/or horizon "
-        "targets horizon:<h> / h<h>, h a scored horizon), trained as ONE leg and judged "
-        "and paid per target. A hotkey holds ONE commitment: this replaces your lane-A "
-        "entry until you commit again.",
+        "be one of chain.toml [lane_b] targets — or a comma-separated list of up to "
+        "[lane_b] max_domains_per_leg of them (domains, horizon targets horizon:<h> / h<h> "
+        "for a scored horizon h, and suite:<s> while [lane_b] suite_targets is on), "
+        "trained as ONE leg. The leg is judged on EVERY slot: declared targets clear at "
+        "[lane_b] gain_margin, every other slot at undeclared_gain_margin, and each "
+        "cleared slot is paid. Preview locally with `cascade lane-b test`. A hotkey "
+        "holds ONE commitment: this replaces your lane-A entry until you commit again.",
     )
     p.set_defaults(func=_cmd_deploy)
 
