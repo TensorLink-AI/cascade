@@ -62,20 +62,45 @@ A and B are paths into the shared model lineage. C asks whether an application
 fine-tune helps on genuinely future observations, using its own base and reward
 slots. Not every lane or target is necessarily open on a deployment.
 
+## The four competitions at launch, and the offline loop for each
+
+Mainnet launch (the signed overlay `deploy/overlays/launch-20261125.mainnet.toml`):
+lanes B, C (MarketCast) and D open together at block **9586800** (about
+Wed 2026-11-25 22:28 UTC). From that block the emission split is
+**A 0 / B 35 / C 15 / D 50**; lanes C and D carve their shares from lane A.
+Until a miner first wins the lane D crown, lane D's 50% stays with lane A
+(owner decision DEC-CA-0076: the house, our lane A king, only seeds lane D).
+Lane D launches **live-only** (`public_weight = 0.0`); the 50/50 live/public
+rule is switched on later by overlay. Read `cascade status --json` (`lanes`)
+for what is armed now.
+
+| Lane | What to optimise | Offline loop (local, free, never spends) | Submit and fund (human authorisation) |
+|---|---|---|---|
+| **A** | Generator data that trains the fixed MoE to beat the king on private windows (geomean of CRPS and MASE) | `cascade score DIR --pool-dir P`; `cascade iterate DIR --pool-dir P --seeds 0,1` (add `--warm-start live` for the final check) | `cascade submit`, or `cascade deploy` plus `cascade fund`; your compute key |
+| **B** | Generator data for 1–4 declared targets, training only selected expert rows: gain on a target, no regression elsewhere | `cascade lane-b test DIR --targets energy --base live --pool-dir P` (the validators' slot judge on every slot) | `cascade deploy DIR --expert-domain energy` plus `cascade lane-b fund`; your compute key |
+| **C** (MarketCast) | A fine-tuning recipe on the pinned Timestral base that beats it on future market windows | `cascade lane-c fetch-base`, `cascade lane-c snapshot`, then `cascade lane-c test DIR --target mkt:market --base-dir B --train-snapshot S --eval-snapshot E` (the validators' MarketCast scorer and verdict) | `cascade lane-c upload`, `cascade lane-c commit`, `cascade lane-c fund`; your compute key |
+| **D** | BF16 `cascade_pyramid` weights trained anywhere that beat the lane D king on forward-only live windows (before the first crown: the house, the lane A king) | `cascade lane-d test CKPT --king KING --context C --pool-dir P` (or `--series S.npz`): the validators' window draw, `score_window` and `judge_cohort`, against the crown bar (3% at a new king's tenure 0, falling to 1%; `--tenure`); `--public-weight 0.5` previews the later rule | `cascade lane-d export`, `verify`, `submit`, `ready`; free, no compute key |
+
+Every offline result is directional: the live pools are private and newer
+than anything a miner holds. The per-lane briefs are
+[A](docs/MINER_LANE_A.md), [B](docs/MINER_LANE_B.md),
+[C MarketCast](docs/MINER_LANE_C_MARKETCAST.md) and [D](docs/MINER_LANE_D.md).
+
 ## Lane D: open weights on the same architecture
 
 Lane D asks how far the fixed cascade architecture can go when training is
 unconstrained. A contributor trains a `cascade_pyramid` checkpoint anywhere,
 on any data and with any recipe, and submits only the BF16 weights; the
 operator only evaluates, on forward-only private windows whose targets reached
-our data after both models were committed. Our own lane A king is always
-entered as the house, so lane D pays only for weights better than our
-pipeline. On mainnet the signed launch overlay arms it at block 9586800,
+our data after both models were committed. Our own lane A king (the house)
+is the bar for the first crown, so lane D pays only for weights better than
+our pipeline. On mainnet the signed launch overlay arms it at block 9586800,
 scored on live windows only at first. The guide is
 [docs/LANE_D.md](docs/LANE_D.md); the brief is
 [docs/MINER_LANE_D.md](docs/MINER_LANE_D.md).
 
-An agent can export and verify an entry locally. Uploading, attesting the
+An agent can preview (`cascade lane-d test`), export and verify an entry
+locally. Uploading, attesting the
 licence and committing on chain need the human's explicit authorisation, as
 for every submission, publication or spend ([AGENTS.md](AGENTS.md)).
 

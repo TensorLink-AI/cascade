@@ -35,7 +35,8 @@ lane (DEC-CA-0059 item 8): ``cascade lane-b fund|status|verify-repo|test``, see
 ``cascade/miner/lane_b.py`` (``test``: ``cascade/miner/lane_tests.py``).
 
 Open-weights lane (DEC-CA-0062, DEC-CA-0070): ``cascade lane-d
-export|verify|submit|ready|status``, see ``cascade/miner/lane_d.py``.
+export|verify|submit|ready|status|test``, see ``cascade/miner/lane_d.py``
+(``test``: ``cascade/miner/lane_d_preview.py``, loaded at call time).
 
 Rules of every lane: ``cascade rules a|b|c|d [--all | --key K]`` prints the
 values the lane is judged and paid under, read from ``chain.toml`` (see

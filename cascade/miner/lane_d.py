@@ -22,6 +22,10 @@ D14) and the repo's own ``model.py`` / ``forecast_wrapper.py`` bytes.
   ``blocks_until_reveal`` is the one-block floor, whatever the block).
 * ``status <intake> [--hotkey H]`` — the public lane D queue
   (``GET /v1/lane-d/queue``); no wallet.
+* ``test <ckpt> --king K --context C --pool-dir P | --series S`` — score a
+  local checkpoint offline with the validators' own lane D code (draw,
+  ``score_window``, ``judge_cohort``, the crown bar); directional, submits
+  nothing (``cascade.miner.lane_d_preview``, loaded at call time).
 
 No flag takes a credential or a URL to a grant (§1.2). The hotkey signs; the
 coldkey is never opened. The lane D intake and ingest helpers are loaded at
@@ -117,6 +121,7 @@ def _chain_args(p: argparse.ArgumentParser) -> None:
 
 LANE_D_EPILOG = """\
 examples (one dedicated hotkey; BF16 weights; MIT is the only licence):
+  cascade lane-d test ./trained-ckpt --king ./king --context 16384 --pool-dir ./pool_d --device cuda
   cascade lane-d export ./trained-ckpt --out ./entry
   cascade lane-d verify ./entry
   cascade lane-d submit https://submissions.cascadesub.net ./entry --context 16384 --wallet-name W --wallet-hotkey H
@@ -127,8 +132,8 @@ guide: docs/MINER_LANE_D.md (competition brief), docs/LANE_D.md (mechanics)."""
 
 
 def add_lane_d(sub: argparse._SubParsersAction) -> None:
-    p = sub.add_parser("lane-d", help="Lane D (open weights): export, verify, submit, ready "
-                                      "and track a checkpoint entry.",
+    p = sub.add_parser("lane-d", help="Lane D (open weights): test offline, export, verify, "
+                                      "submit, ready and track a checkpoint entry.",
                        epilog=LANE_D_EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
     lsub = p.add_subparsers(dest="lane_d_cmd", required=True)
 
@@ -176,6 +181,10 @@ def add_lane_d(sub: argparse._SubParsersAction) -> None:
     q.add_argument("intake_url", help="Operator lane D intake base URL.")
     q.add_argument("--hotkey", default=None, help="Show only this hotkey's entries.")
     q.set_defaults(func=cmd_status, command="lane-d status")
+
+    # `lane-d test`: the offline preview, loaded at call time (W9 invariant 12:
+    # it imports the validators' lane D scoring code).
+    importlib.import_module("cascade.miner.lane_d_preview").add_lane_d_test(lsub)
 
 
 def _run(args: argparse.Namespace, body) -> int:

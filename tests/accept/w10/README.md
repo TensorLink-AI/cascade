@@ -197,6 +197,29 @@ It sends `GET /v1/lane-d/queue` and nothing else. `data.entries` is the
 intake's rows verbatim, or only `H`'s with `--hotkey`. No `ChainClient` is
 built. Unreachable or 5xx is exit 3.
 
+## `test <ckpt> --king K --context C --pool-dir P | --series S` (owner 2026-11-24)
+
+The offline preview (`test_w10_test_preview.py`). It runs the validators'
+own lane D code, imported from `cascade.validator.lane_d` and
+`cascade.eval.lane_d_scorer`, never a copy: `load_pool`, `_pick_channels`,
+the optional §1.3 eligibility at `--as-of`, `cap_source_share`, the seeded
+draw `_drawn`, `forecast_quantiles` at `effective_context`, `score_window`
+and `judge_cohort` at `LaneDConfig.crown_bar(--tenure)`. The tests pin:
+
+- the verdict equals `judge_cohort` called directly on the reported
+  per-window rows, and the bar is `crown_bar(tenure)` (3% at 0, 1% at 32);
+- a better model clears, a copy of the king (gain 0) and a worse model do
+  not, and below the `min_windows` / `min_clusters` floors `would_clear` is
+  false;
+- it is live-only by default (`public_weight` 0, one `live` half);
+  `--public-weight > 0` needs a public set and then reports both halves;
+- an undeclarable context is `bad_context`, and a declaration with no armed
+  context at or below it is `context_below_armed`.
+
+The only fake is the model forward (`forecast_quantiles`); its torch path is
+the scorer's own and CI covers it. The module is loaded with `importlib`
+from `cascade/miner/lane_d.py` (W9 invariant 12).
+
 ## Secrets (every flow)
 
 stdout, stderr and every log record never contain any of these:
