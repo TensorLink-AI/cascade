@@ -455,22 +455,27 @@ def train_mkt_leg(ops, leg: dict, recipe: MktLegRecipe, *, mc=None,
     gen = ResolvedGenerator(hotkey=leg["hotkey"], uid=int(leg["uid"]), ref=leg["ref"])
     r._funded_leg_failures.pop(leg["hotkey"], None)
     r._mkt_harvested.pop(leg["hotkey"], None)
+    from ..funding.mkt_gpus import mkt_rent_scope, mkt_rent_skus
     from .leg_pins import mkt_leg_scope
 
     leg_cfg = mc if mc is not None else r.cfg.marketcast
+    choice = GpuChoice(
+        gpu=str(leg.get("gpu", "") or ""),
+        allow_fallback=bool(leg.get("gpu_allow_fallback", False)),
+        max_price_per_hour=float(leg.get("gpu_max_price_per_hour", 0.0) or 0.0))
     try:
-        with mkt_leg_scope(r), _leg_mc_scope(r, leg_cfg):
+        # owner 2026-11-24: the leg rents the miner's chosen type (any Lium
+        # GPU: the worker is one process on cuda:0), else the cheapest fitting
+        # recommended type ([marketcast] funded_pod_skus); Lium only
+        with mkt_leg_scope(r), _leg_mc_scope(r, leg_cfg), \
+                mkt_rent_scope(r, mkt_rent_skus(r.cfg, choice)):
             entry = r._run_funded_leg(
                 r._dispatcher(), gen, seeds, int(leg["started_block"]), contract,
                 leg_suffix(leg["target"], int(leg["uid"])),
                 warm_start_ref=leg_cfg.base_ref, era_index=era.index,
                 **mkt_contract_block_kw(r.cfg, era),
                 role="mkt_finetune", finetune_recipe=recipe.to_json(), bench=False,
-                funded_queue=ops.queue(),
-                gpu_choice=GpuChoice(
-                    gpu=str(leg.get("gpu", "") or ""),
-                    allow_fallback=bool(leg.get("gpu_allow_fallback", False)),
-                    max_price_per_hour=float(leg.get("gpu_max_price_per_hour", 0.0) or 0.0)))
+                funded_queue=ops.queue(), gpu_choice=choice)
     except _FundedOperatorFallback as e:
         q = ops.queue()
         recovery = q.get(gen.hotkey) if q is not None else None

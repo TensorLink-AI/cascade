@@ -484,6 +484,7 @@ class FundingIntake:
         lane_c_closed: Callable[[str], str | None] | None = None,
         gpu_catalog: GpuCatalog | None = None,
         lane_b_gpus: object | None = None,        # WB22 LaneBGpus; None = lane A's catalog
+        mkt_gpu_catalog: GpuCatalog | None = None,  # MarketCast GPUs; None = lane A's catalog
         lane_b_landing: Callable[[int], dict | None] | None = None,  # WB23 landing estimate
         lane_b_contract: object | None = None,    # WB23 base contract (steps cap); None = no cap
         lane_b_queue: object | None = None,       # funding LaneBQueue; None = lane B off
@@ -570,6 +571,11 @@ class FundingIntake:
         # funds read ``gpu_catalog`` with no rate gate (unit construction only;
         # the production intake always wires it, main.gpu_catalogs).
         self.lane_b_gpus = lane_b_gpus
+        # owner 2026-11-24: a MarketCast (mkt family) lane-C fund's GPU list
+        # (``mkt_gpus.mkt_catalog``: [marketcast] funded_pod_skus recommended,
+        # any other Lium type at the miner's own risk). None = lane A's catalog
+        # (unit construction; the production intake wires it, main.gpu_catalogs).
+        self.mkt_gpu_catalog = mkt_gpu_catalog
         # WB23: ``lane_b_landing(guard_seconds) -> {target_boundary, era_index,
         # cross_era} | None`` (the miner sees where a leg of that wall lands;
         # it never fails a fund) and the contract a lane B leg derives from
@@ -1170,7 +1176,7 @@ class FundingIntake:
                 self.lane_c_queue.expire_stale()
         except Exception:  # noqa: BLE001 — housekeeping never fails a request
             log.exception("lane-C queue TTL sweep failed")
-        choice, segment, gpu_err = self._gpu_choice(headers)
+        choice, segment, gpu_err, own_risk_warn = self._lane_c_gpu_choice(headers)
         if gpu_err is not None:
             return 400, gpu_err
         status, ctx = self._lane_c_request("lane-c-fund", headers, gpu_segment=segment)
@@ -1207,9 +1213,54 @@ class FundingIntake:
         log.info("lane-C fund %s: %s target=%s (reveal_block=%d%s)", hotkey, outcome, target,
                  reveal_block, f", gpu={choice.gpu}" if choice.chosen else "")
         if outcome == "already-queued":
-            return 200, self._gpu_reply(
+            body = self._gpu_reply(
                 {"status": "already-queued", "lane": "c", "target": target}, choice)
-        return 202, self._gpu_reply({"status": outcome, "lane": "c", "target": target}, choice)
+            return 200, ({**body, "warning": own_risk_warn, "gpu_own_risk": True}
+                         if own_risk_warn else body)
+        body = self._gpu_reply({"status": outcome, "lane": "c", "target": target}, choice)
+        return 202, ({**body, "warning": own_risk_warn, "gpu_own_risk": True}
+                     if own_risk_warn else body)
+
+    def _lane_c_gpu_choice(self, headers) -> tuple[GpuChoice, str, dict | None, str]:
+        """``(choice, signed_segment, error, own_risk_warning)`` of a lane-C
+        fund. A MarketCast (``mkt`` family) target checks the choice against
+        the MarketCast list (owner 2026-11-24: ``[marketcast] funded_pod_skus``
+        recommended, ANY other well-formed Lium type at the miner's own risk,
+        Shadeform never); any other lane-C target keeps ``[round]`` lane A's
+        catalog. Header-only, before the signature."""
+        cat = self.mkt_gpu_catalog
+        target = (headers.get(LANE_C_TARGET_HEADER) or "").strip()
+        try:
+            from ..shared.config.lane_c import is_mkt_family
+
+            mkt = is_mkt_family(target)
+        except ImportError:   # pragma: no cover — shared lane-C config not shipped
+            mkt = False
+        if cat is None or not mkt:
+            return (*self._gpu_choice(headers), "")
+        from .gpu_choice import GPU_HEADER
+        from .mkt_gpus import own_risk_gpu, own_risk_warning, with_own_risk
+        from .providers import CREDENTIALS_HEADER
+
+        gpu = (headers.get(GPU_HEADER) or "").strip()
+        bundle = bool((headers.get(CREDENTIALS_HEADER) or "").strip())
+        own = own_risk_gpu(gpu, cat, bundle=bundle)
+        choice, segment, err = parse_gpu_headers(headers, with_own_risk(cat, own) if own else cat)
+        if err is not None and err.get("code") == "unknown_gpu" and gpu and bundle:
+            from .mkt_gpus import LIUM_ONLY
+
+            err = {"code": LIUM_ONLY,
+                   "message": f"{gpu!r} is not on the recommended MarketCast GPU list "
+                              f"({', '.join(cat.skus or ()) or 'none'}); another type is "
+                              "accepted at your own risk only with a plain Lium key "
+                              "(X-Lium-Api-Key) — MarketCast GPUs rent on Lium only"}
+        if err is not None:
+            return GpuChoice(), "", err, ""
+        warn = own_risk_warning(choice.gpu, cat) if own and choice.chosen else ""
+        if warn:
+            log.warning("lane-C fund: own-risk MarketCast GPU %s (not in [marketcast] "
+                        "funded_pod_skus)", choice.gpu)
+        return choice, segment, None, warn
 
     def lane_c_withdraw(self, headers) -> tuple[int, dict]:
         """Withdraw a still-queued lane-C entry (``POST /v1/lane-c/withdraw``).

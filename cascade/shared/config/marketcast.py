@@ -135,6 +135,13 @@ TIMESTRAL_MAX_CONTEXT = 32768
 # a recipe's leg_hours ceiling: a week (the cap a recipe may ask for is
 # [marketcast] max_leg_hours; the verdict never waits on the leg's length)
 MAX_LEG_HOURS_CEILING = 168.0
+# Owner 2026-11-24: a MarketCast leg fine-tunes Timestral-28M on ONE GPU (the
+# worker is one process on cuda:0), so a miner may rent ANY Lium GPU type.
+# ``[marketcast] funded_pod_skus`` is the RECOMMENDED list (no warning; the
+# default leg rents the cheapest fitting one); any other well-formed type is
+# accepted at the miner's own risk (cascade.funding.mkt_gpus). Trainer and
+# intake policy only: no validator, satellite or audit path reads it.
+_SKU_RE = re.compile(r"^(?:[1-9]\d?x)?[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$")
 CRPS_SCALES = ("level", "seasonal_naive")
 # Owner 2026-11-24 (DEC-CA-0074): a verdict within 13 hours of submission,
 # judged on windows drawn from the embargo. Code bounds of its overlay knobs.
@@ -435,6 +442,10 @@ class MarketCastConfig:
     near_dup_tol: float = 0.02
     # F6 — trainer policy: open MarketCast legs per coldkey.
     max_open_legs_per_coldkey: int = 1
+    # Owner 2026-11-24: the RECOMMENDED GPU types a MarketCast leg rents (the
+    # default leg: cheapest fitting of these; any other Lium type is the
+    # miner's own risk). () = [round] funded_pod_skus (pre-2026-11-24).
+    funded_pod_skus: tuple[str, ...] = ()
     # Owner 2026-11-10 — one composite target (``mkt:market``) over every
     # enabled suite: the gain is the geomean over suites of each suite's
     # (class × horizon)-balanced gain, one cluster bootstrap for all; an entry
@@ -760,6 +771,30 @@ def _per_suite(raw, name: str, default: dict, suites: tuple[str, ...]):
     return out
 
 
+def _funded_pod_skus(v: object) -> tuple[str, ...]:
+    """``[marketcast] funded_pod_skus``: a list of unique GPU types (``"H100"``
+    or a layout ``"<n>x<model>"``, n 1..99); ``[]`` / absent = ``()`` (the
+    trainer then rents from ``[round] funded_pod_skus``)."""
+    if v is None or v == () or v == []:
+        return ()
+    if isinstance(v, (str, bytes)) or not isinstance(v, (list, tuple)):
+        raise ValueError(f"[marketcast] funded_pod_skus must be a list of GPU types; got {v!r}")
+    out: list[str] = []
+    for x in v:
+        if not isinstance(x, str) or not _SKU_RE.match(x.strip()):
+            raise ValueError(f"[marketcast] funded_pod_skus entry {x!r} is not a GPU type "
+                             "('H100' or '<n>x<model>', letters/digits/._-)")
+        out.append(x.strip())
+    if len({s.lower() for s in out}) != len(out):
+        raise ValueError(f"[marketcast] funded_pod_skus must be unique; got {v!r}")
+    return tuple(out)
+
+
+def is_gpu_type(sku: object) -> bool:
+    """Whether ``sku`` is a well-formed GPU type (``"H100"``, ``"1xRTX4090"``)."""
+    return isinstance(sku, str) and bool(_SKU_RE.match(sku.strip()))
+
+
 def _parse_spec_fields(mc: dict) -> dict:
     """DEC-CA-0075: the spec-compiled keys (``pool_signer``, ``pool_schema``,
     ``pool_select``, ``test_family``, ``pay_curve``, ``refused``); absent =
@@ -1025,6 +1060,7 @@ def parse_marketcast(raw: object, *, open_classes: bool = False) -> MarketCastCo
                 integer=True)
     if molc < 1:
         raise ValueError("[marketcast] max_open_legs_per_coldkey must be >= 1")
+    mkt_skus = _funded_pod_skus(mc.get("funded_pod_skus", ()))
     comp = mc.get("composite", False)
     if not isinstance(comp, bool):
         raise ValueError(f"[marketcast] composite must be true or false; got {comp!r}")
@@ -1139,7 +1175,7 @@ def parse_marketcast(raw: object, *, open_classes: bool = False) -> MarketCastCo
         micro_batch_tokens=mbt,
         coverage_gate_levels=cgl, zero_scale_frac=zsf, cell_ratio_cap=cap, tail_levels=tls,
         tail_tolerance=ttol, calibration_z=cz, near_dup_tol=ndt,
-        max_open_legs_per_coldkey=molc,
+        max_open_legs_per_coldkey=molc, funded_pod_skus=mkt_skus,
         composite=comp, composite_suite_floor=floor, ohlcv_open_weight=ow,
         composite_suite_weights=tuple(sorted(sw.items())), guards=gd, guard_floor=gfl,
         baseline_gate=bgate, event_times=tuple(sorted(evs)),
@@ -1199,5 +1235,5 @@ __all__ = [
     "mkt_base_pointer", "scorability_problems", "COMPOSITE_LAUNCH_SUITES", "COMPOSITE_TARGET",
     "NATIVE_INTERVALS", "OHLCV_FIELDS", "OHLCV_FIELD_NAMES", "base_suite",
     "horizon_path", "COMPOSITE_SUITE_WEIGHTS", "GUARD_METRICS", "GUARD_SUITES", "TAIL_SCORE_LEVELS",
-    "BACKTEST_WINDOWS_PER_CELL_MAX", "draw_problems", "EMBARGO_RULE", "VERDICT_MAX_HOURS", "VERDICT_WAIT_MAX_BLOCKS",
+    "BACKTEST_WINDOWS_PER_CELL_MAX", "draw_problems", "is_gpu_type", "EMBARGO_RULE", "VERDICT_MAX_HOURS", "VERDICT_WAIT_MAX_BLOCKS",
 ]
