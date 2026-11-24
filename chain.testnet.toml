@@ -759,12 +759,8 @@ from_block = 8190000
 share     = 0.5
 remainder = "burn"
 domains = ["econ_fin", "energy", "healthcare", "nature", "sales", "transport", "web_cloudops"]
-# gain-tiered full-pay period (owner 2026-10-20; see chain.toml) —
-# uncalibrated placeholders
-full_pay_tiers   = [[0.05, 10], [0.02, 5], [0.01, 2]]
-half_life_rounds = 1.0
-floor            = 0.1
-win_ttl_eras     = 28
+# Pay (rev6.22, see chain.toml): a held slot pays in full until replaced; the
+# decay / TTL keys are retired.
 alpha              = 0.05
 bootstrap_B        = 10000
 gain_margin        = 0.01          # > 0 (load-checked): an unchanged expert must not merge

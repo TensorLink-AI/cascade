@@ -347,10 +347,11 @@ def test_reward_uid_not_registered_burns(scfg, tmp_path):
 
 
 def test_lane_payout_tamper_burns(scfg, tmp_path):
-    """A lane-B payout record whose multiplier does not re-derive."""
-    from cascade.eval.expert_lane import LaneBWin, reward_multiplier
+    """A lane-B payout record whose multiplier does not re-derive (rev6.22: a
+    held slot pays 1.0 at any age)."""
+    from cascade.eval.expert_lane import LaneBWin
     from cascade.shared.emission import lane_parts
-    from cascade.shared.era import era_length_blocks
+    from cascade.shared.era import era_index_of, era_length_blocks
 
     lb_cfg = replace(scfg, lane_b=replace(scfg.lane_b, from_block=BOUNDARIES[0] - GRID))
     domain = lb_cfg.lane_b.domains[0]
@@ -361,19 +362,17 @@ def test_lane_payout_tamper_burns(scfg, tmp_path):
             eb = int(era_length_blocks(lb_cfg.round, b))
             merge = BOUNDARIES[0] - GRID          # merged at an earlier settlement
             age = max(0, (b - merge) // eb)
-            mult = reward_multiplier(age, full_eras=5,
-                                     half_life_rounds=lb_cfg.lane_b.half_life_rounds,
-                                     floor=lb_cfg.lane_b.floor)
+            mult = 1.0
             a, bb = lane_parts(list(rc.reward_uids), len(rc.weights),
                                king_decay=lb_cfg.scoring.king_decay,
                                burn_uid=lb_cfg.scoring.burn_uid, lane_b_cfg=lb_cfg.lane_b,
                                wins=[LaneBWin(uid=2, domain=domain, multiplier=mult)])
             pay = {"block": b, "era_blocks": eb,
                    "wins": [{"domain": domain, "hotkey": "x2_hk", "uid": 2, "merge_block": merge,
-                             "age": age, "multiplier": mult * mult_bump,
-                             "gain_lcb": 0.03, "tier": 0.02, "full_eras": 5,
-                             "below_floor": False}]}
-            post = dict(rc.state_post, lane_b={domain: ["x2_hk", 2, merge, "r0", 0.03, 0.02, 5]})
+                             "age": age, "since_era": era_index_of(lb_cfg.round, merge),
+                             "multiplier": mult * mult_bump, "gain_lcb": 0.03}]}
+            post = dict(rc.state_post, lane_b={domain: ["x2_hk", 2, merge, "r0", 0.03, None,
+                                                        None]})
             return replace(rc, lane_b=(), lane_b_pay=pay, state_post=post,
                            weights=tuple(x + y for x, y in zip(a, bb, strict=True)))
         return tamper

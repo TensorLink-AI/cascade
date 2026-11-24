@@ -969,17 +969,16 @@ target (`mkt:market`), its full-pay slot reserves **all 25% of total emissions**
 That is a slot maximum, not a promise of paying an unfilled slot. Pending,
 unstarted or ended competitions do not donate their allocation to active ones.
 
-**B/C reward progression.** B records its tier from accepted marginal gain.
-MarketCast C records a full-pay duration from the confirmed gain (DEC-CA-0073):
-5 days at the 0.01 gain margin, rising linearly to 20 days at a gain LCB of
-0.05 or more, rounded up to whole eras. Current full-pay periods are:
+**B/C reward progression.** B has no tiers and no decay (plan rev6.22,
+owner 2026-11-24): a B slot holder is paid 100% of its slot every settlement
+until it is replaced. MarketCast C records a full-pay duration from the
+confirmed gain (DEC-CA-0073): 5 days at the 0.01 gain margin, rising linearly
+to 20 days at a gain LCB of 0.05 or more, rounded up to whole eras. Current C
+full-pay periods are:
 
 <!-- cascade:rewards:slot-tiers:start -->
 | Lane | Target gain LCB | Full-pay eras |
 |---|---:|---:|
-| B: accepted marginal gain | ≥ 0.05 | 10 |
-| B: accepted marginal gain | ≥ 0.02 | 5 |
-| B: accepted marginal gain | ≥ 0.01 | 2 |
 | C: confirmed MarketCast gain | 0.01 | 10 |
 | C: confirmed MarketCast gain | 0.02 | 18 |
 | C: confirmed MarketCast gain | 0.03 | 25 |
@@ -991,29 +990,42 @@ it is a different statistic from A's increment-unit crowning LCB. Full pay
 means **100% of that target's slot**, not 100% of the lane or subnet. The tier
 is fixed on the recorded win; a later tier retune does not restart that win.
 
-After B's full-pay period, the configured one-era half-life gives multipliers
-50% → 25% → 12.5% → a **10% slot floor**. The win stops paying at **age 28
-eras**, measured from B acceptance, including its full-pay eras. A C win has
-no decay: its slot ends (burns) when its full-pay duration ends, unless a
-newer win has already replaced it. It does not get another 28 eras after decay starts. Replacement by a new
+A C win has no decay: its slot ends (burns) when its full-pay duration
+ends, unless a newer win has already replaced it. Replacement by a new
 holder stops the old holder earlier. At approximately 12 hours per mainnet
-era, 28 eras is approximately 14 days; blocks, not wall-clock estimates, govern.
+era, 10 eras is approximately 5 days; blocks, not wall-clock estimates, govern.
 
 <!-- cascade:rewards:slot-decay:start -->
-B example: accepted marginal gain LCB 0.02, recorded full-pay period 5 eras.
-
-| Age since acceptance (eras) | Slot multiplier | Share of total emissions |
-|---|---:|---:|
-| 0–4 | 100% | 2.5% |
-| 5 | 50% | 1.25% |
-| 6 | 25% | 0.625% |
-| 7 | 12.5% | 0.3125% |
-| 8–27 | 10% | 0.25% |
-| 28+ | 0% | 0% |
+B: a held slot pays 100% of its slot (2.5% of total emissions) every settlement, with no decay and no expiry, until a newer leg's merge passes acceptance on that slot. C has no decay: its slot pays 100% for its recorded full-pay duration, then ends.
 <!-- cascade:rewards:slot-decay:end -->
 
-C uses its own decay/expiry configuration, currently the same half-life,
-floor and TTL. When a competition ends, `finish_full_pay` permits an existing
+**B slots pay until replaced.** A B slot holder is paid **100% of its slot
+every settlement, with no decay and no expiry**, for as long as it holds the
+slot. A holder loses the slot only when a newer leg's merge passes acceptance
+on that slot. Acceptance is judged against the init that already contains the
+holder's experts, so the newer leg must improve on top of the holder. A tie or
+an inconclusive result leaves the holder in place. A deregistered holder's
+slot burns, and empty slots still burn. Each receipt's `lane_b_pay` record
+lists every paid holder with its `merge_block`, `age` and `since_era`.
+
+**Every slot is tested.** Every judged B leg is tested on every slot: the 7
+domains, the scored horizons and, while suite targets are on, the public
+suites. A slot clears when its CRPS **or** MASE gain LCB clears the bar with a
+positive point gain, the other metric is non-inferior, and every guard holds
+(no domain, horizon or public metric regresses). There are two bars and two
+test families:
+
+- your **declared targets** (up to `[lane_b] max_domains_per_leg`, 4) clear at
+  `gain_margin` (1%). They are corrected only among themselves (a max-T
+  family), so a one-target leg is a single test of its two metrics;
+- every **other slot** clears at the stricter `undeclared_gain_margin` (2%),
+  in its own max-T family.
+
+Every slot a leg clears is claimable, replacing that slot's holder, so one
+miner may hold every slot. The signed verdict rows list every tested slot
+with its family, bar, CRPS/MASE LCBs, point gains and whether it passed.
+
+C follows its own rule above (DEC-CA-0073). When a competition ends, `finish_full_pay` permits an existing
 holder only its remaining recorded full-pay period, capped at six wind-down
 eras; there is no decay tail after the end. Under `stop`, a settlement after
 `until_block` pays nothing. That ended competition's unpaid allocation burns.
@@ -1357,7 +1369,7 @@ launch cap, king ladder, acceptance clocks and burns.
 
 ### Choose targets, not expert IDs
 
-Declare 1–3 targets under the checked-in mainnet limit
+Declare 1–4 targets under the checked-in mainnet limit
 (`[lane_b] max_domains_per_leg`). Choose from:
 
 - Domains: `econ_fin`, `energy`, `healthcare`, `nature`, `sales`, `transport`,
@@ -1368,7 +1380,13 @@ Declare 1–3 targets under the checked-in mainnet limit
 
 The trainer measures which experts the king routes each target to and chooses
 eligible rows. Multiple targets train the union of their selections in one
-leg, with the same budget as a single-target leg. Miners do not supply expert
+leg, with the same budget as a single-target leg. The leg is then tested on
+every slot (see "Every slot is tested" above): every target that passes
+claims its own slot, so one leg can hold several slots, including undeclared
+ones at the stricter bar. A guard failure blocks every slot of the leg. Fund such a leg with `cascade lane-b fund ... --targets
+energy,h720`, or repeat `--target` once per target (for example `--target
+energy --target suite:gift` while suite targets are on). The intake and the
+local check both refuse more than `max_domains_per_leg` targets. Miners do not supply expert
 IDs. Domain selection uses context patches; horizon selection uses masked
 forecast patches and context, never the future target values.
 
