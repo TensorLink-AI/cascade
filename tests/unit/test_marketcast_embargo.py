@@ -15,7 +15,11 @@ import pytest
 
 from cascade.pool import marketcast as P
 from cascade.shared.config import load_chain_config
-from cascade.shared.config.marketcast import EMBARGO_RULE, VERDICT_WAIT_MAX_BLOCKS
+from cascade.shared.config.marketcast import (
+    EMBARGO_RULE,
+    VERDICT_WAIT_MAX_BLOCKS,
+    draw_problems,
+)
 from cascade.shared.marketcast_report import MktEntryRows, MktWindowRow, kind_scores
 from cascade.validator.marketcast import (
     _draw_mismatch,
@@ -38,12 +42,20 @@ def _entry(tt, scan=None):
 
 
 def test_shipped_rule_is_a_13h_verdict_on_the_embargo():
-    for toml in ("chain.toml", "chain.testnet.toml"):
-        mc = load_chain_config(toml).marketcast
-        assert mc.wait_blocks == VERDICT_WAIT_MAX_BLOCKS == 3900          # 13 h of 12 s blocks
-        assert (mc.embargo_eval_days, mc.backtest_windows_per_cell) == (28, 48)
-        assert mc.embargo_eval_days < mc.embargo_days
-        assert mc.forward_horizons == ("1mx60", "5mx36")
+    mc = load_chain_config("chain.toml").marketcast
+    assert mc.wait_blocks == VERDICT_WAIT_MAX_BLOCKS == 3900          # 13 h of 12 s blocks
+    assert (mc.embargo_eval_days, mc.backtest_windows_per_cell) == (28, 48)
+    assert mc.embargo_eval_days < mc.embargo_days
+    assert mc.forward_horizons == ("1mx60", "5mx36")
+    # TESTNET-FAST (owner 2026-11-24): a ~1 h verdict on the embargo draw only
+    # (a 1 h wait leaves no forward span), the shortest span the 7-day paths
+    # allow, few windows per cell; same rule, draw_problems still empty
+    mc = load_chain_config("chain.testnet.toml").marketcast
+    assert mc.wait_blocks == 300 < VERDICT_WAIT_MAX_BLOCKS
+    assert (mc.embargo_eval_days, mc.backtest_windows_per_cell) == (14, 4)
+    assert mc.embargo_eval_days < mc.embargo_days == 15
+    assert mc.forward_horizons == ()
+    assert draw_problems(mc) == []
     from cascade.shared import netconfig as N
 
     # the eval-draw knobs are overlay-settable (code-bounded by the loader)

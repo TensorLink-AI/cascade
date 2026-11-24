@@ -807,8 +807,8 @@ open_rule                = "cogate"
 sentinel_target_rule     = "defer"
 sentinel_max_defer_eras  = 4
 funded_pod_skus          = ["RTX4090", "RTX3090", "L40S", "L40", "A6000"]   # = [round] funded_pod_skus
-max_leg_hours            = 6.0
-max_leg_seconds          = 27000
+max_leg_hours            = 1.0     # TESTNET-FAST (2026-11-24): 6.0 (on the 0.5 h grid)
+max_leg_seconds          = 4500    # TESTNET-FAST (2026-11-24): 27000 (1 h x 1.25, as mainnet's 6 h x 1.25)
 guard_factor             = 1.25
 tau_anchor_public        = 0.0
 tau_anchor_domain        = 0.0
@@ -849,8 +849,8 @@ targets = ["mkt:market"]
 # A confirmed win takes the slot only with a STRICTLY higher gain LCB than a
 # holder on the same king (else the slot and its clock stay); a holder
 # trained on an older king is replaced.
-full_pay_min_days = 5.0            # owner 2026-11-24: at the 1 % gain margin
-full_pay_max_days = 20.0           # owner 2026-11-24: at >= full_pay_max_gain
+full_pay_min_days = 0.25           # TESTNET-FAST (2026-11-24): 5.0 (days -> ~hours: 6 h = 3 testnet eras)
+full_pay_max_days = 1.0            # TESTNET-FAST (2026-11-24): 20.0 (days -> ~hours: 24 h = 12 testnet eras)
 full_pay_max_gain = 0.05
 # Verdict: an mkt: entry is judged by MarketCast ([marketcast] alpha /
 # gain_margin / min_windows ...), paired vs the pinned base on forward-only
@@ -859,9 +859,9 @@ full_pay_max_gain = 0.05
 alpha              = 0.05
 bootstrap_B        = 10000
 gain_margin        = 0.01          # owner-tunable
-min_target_windows = 100
+min_target_windows = 30           # TESTNET-FAST (2026-11-24): 100
 min_target_clusters = 5
-n_windows          = 1000          # windows drawn per target per settlement
+n_windows          = 100           # TESTNET-FAST (2026-11-24): 1000 (W-OV floor 100)
 tau_public         = 0.01
 min_public_items   = 10
 # guard_public: none — public bench guards are refused on mkt: targets.
@@ -969,6 +969,18 @@ queue_poll_seconds = 60                               # ready-queue poll interva
 # Activation is a SIGNED OVERLAY setting from_block (an era boundary; D10/D45),
 # never an edit here and never a DEC-CA-0045 vote. Kill switch: an overlay
 # until_block or share = 0. Every key but remainder is overlay-settable.
+#
+# TESTNET-FAST PROFILE (2026-11-24, owner: lanes B, C and D end-to-end on
+# testnet in hours). Every wait measured in hours/days is scaled to the 30-min
+# settlement / 2 h era grid (epoch_blocks = 150, era_settlements = 4); the rule
+# logic is unchanged. Each changed key carries `# TESTNET-FAST (2026-11-24):
+# <mainnet value>`. Mainnet (chain.toml) is untouched and carries no B/C/D
+# activation block. Lane D is NOT typed on here: it arms by the signed testnet
+# launch overlay (deploy/overlays/launch-20261125{.pre,}.testnet.toml, W-LAUNCH
+# #870: from_block 8524200, D 50 % from lane_a). A typed from_block here would
+# make that overlay move from_block off a passed block (refused). To run lane D
+# sooner, sign both steps with an earlier era start (a multiple of 600 at
+# least one era ahead of the head; head 8514127 at 2026-11-24 09:17 UTC).
 [lane_d]
 from_block      = 0              # 0 = off; arm by signed overlay at an era boundary
 until_block     = 0              # 0 = no end; an era boundary after from_block closes the lane
@@ -979,18 +991,18 @@ contexts        = [4096, 8192, 16384, 32768, 65536, 131072]  # D2 rev6.6: declar
 horizon         = 64             # points; <= 512 (§1.1)
 dtypes          = ["BF16"]       # D14: BF16 only
 forward_margin_hours = 0.0       # D5; rev6.14 (a): the eligibility / fresh boundary b = T + this (6 -> 0)
-eval_delay_hours = 6.0           # rev6.14 (a): judging start j = T + this ("delay eval by 6 hours"); >= forward_margin_hours
-min_windows     = 1000           # D5
-min_clusters    = 20             # D5: sources
-min_long_series = 300
+eval_delay_hours = 0.5           # TESTNET-FAST (2026-11-24): 6.0 (judging start j = T + this; one testnet settlement)
+min_windows     = 200            # TESTNET-FAST (2026-11-24): 1000 (W-OV floor 100)
+min_clusters    = 5              # TESTNET-FAST (2026-11-24): 20 (sources)
+min_long_series = 30             # TESTNET-FAST (2026-11-24): 300
 max_source_share = 0.25          # B14
 d_margin        = 0.01           # D5; rev6.23: the crown bar's END (floor)
 d_margin_start  = 0.03           # rev6.23 (owner 2026-11-24): the bar at KING_D's tenure 0; >= d_margin
-d_margin_warmup_settlements = 32 # rev6.23: settlements (32 x 3 h ~ 4 days) the bar falls linearly start -> d_margin
+d_margin_warmup_settlements = 4  # TESTNET-FAST (2026-11-24): 32 (4 x 30 min = 2 h: the bar falls start -> d_margin)
 alpha           = 0.05
 bootstrap_B     = 10000
-embargo_hours   = 48.0           # W2e rev6.10 (a)/rev6.12 (a): per-series embargo top-up, every cadence (0 = the rev3 rule)
-max_windows_per_settlement = 5000  # W2e rev6.11 (a): per-bin draw cap; >= min_windows
+embargo_hours   = 1.0            # TESTNET-FAST (2026-11-24): 48.0 (per-series embargo top-up)
+max_windows_per_settlement = 1000  # TESTNET-FAST (2026-11-24): 5000 (W-OV floor 1000; >= min_windows; one GPU in minutes)
 min_fresh_window_share = 0.5     # W2e rev6.12 (b): fresh share of a frozen set (1 = fresh only)
 backtest_weight_cap = 0.05       # W2e rev6.9: slow-cadence backtest weight cap (0 = off); owner 2026-11-23: ON at launch
 backtest_ratio_floor = 0.85      # W2e rev6.9 (a): cap > 0 needs 1 - floor**cap < d_margin
@@ -1004,11 +1016,11 @@ max_entries_per_settlement = 8   # D3
 max_open_per_coldkey = 2         # D3
 max_judged_per_coldkey_per_settlement = 2  # A8
 max_coldkey_unresolved_settlements = 4     # A8
-max_reveal_delay_days = 14       # A9
+max_reveal_delay_days = 14       # A9 (a ceiling, not a wait: kept)
 max_bench_holds = 4
 loser_ttl_eras  = 4              # D8
-max_mirror_lag_hours = 6.0       # A1
-ready_ttl_blocks = 7200          # B10: ~24 h at 12 s blocks
+max_mirror_lag_hours = 6.0       # A1 (a staleness ceiling, not a wait: kept)
+ready_ttl_blocks = 7200          # B10: ~24 h at 12 s blocks (a timeout, not a wait: kept)
 # Retired (rev6.18 B11): confirm_on_king_change and the DEC-CA-0062 keys
 # (targets ... win_ttl_eras). The loader ignores them (RETIRED_KEYS["lane_d"]),
 # so a deployed file that still carries them loads unchanged.
@@ -1036,22 +1048,25 @@ alpha              = 0.05
 gain_margin        = 0.01                       # never 0
 # An mkt: win's full-pay duration is [lane_c]'s gain-scaled rule, ramped
 # from gain_margin (DEC-CA-0073; full_pay_tiers is retired).
-min_windows        = 200                        # spread over >= min_time_blocks (review M10)
+min_windows        = 50                         # TESTNET-FAST (2026-11-24): 200 (W-OV floor 50)
 min_clusters       = 8                          # distinct (asset class, time block) clusters
 pool_prefix        = "pool_mkt"
 max_context_length = 32768
-embargo_days       = 30                         # recipe training data ends this long before submission
+embargo_days       = 15                         # TESTNET-FAST (2026-11-24): 30 (integer days; >= embargo_eval_days + 1)
 max_synthetic_fraction = 1.0                    # miner generator share of the training mix (1.0 = pure synthetic allowed)
-max_leg_hours      = 12.0                       # cap on a recipe's own leg_hours (miner-paid wall); no leg_hours = [lane_c] leg_hours
+max_leg_hours      = 1.0                        # TESTNET-FAST (2026-11-24): 12.0
 eval_context_length = 32768                     # owner 2026-11-21: UP TO 32k context steps the base and the fine-tune both see (shorter while the bank's history is shorter)
 # Owner 2026-11-24 (DEC-CA-0074): a verdict within 13 h of submission; every
 # horizon drawn from the embargo by the round block's hash (as chain.toml).
-embargo_eval_days  = 28                         # overlay-settable, 1 .. embargo_days - 1
-backtest_windows_per_cell = 48                  # overlay-settable, 1 .. 256: drawn per (asset, series, horizon)
-forward_horizons   = ["1mx60", "5mx36"]         # also scored on closed forward windows (never waited for)
-windows_per_cell   = 48                         # forward windows per (asset, horizon), spread evenly
+embargo_eval_days  = 14                         # TESTNET-FAST (2026-11-24): 28 (floor: the 7-day 4hx42 / 1dx7 paths need a span >= 2 x 7 d)
+backtest_windows_per_cell = 4                   # TESTNET-FAST (2026-11-24): 48
+# A 1 h wait leaves no forward span (300 x 12 s - start_margin < 2 x 1 h), so the
+# testnet verdict is embargo-draw only; forward scoring returns with a wait of
+# >= 600 blocks and start_margin_seconds = 0 (1mx60).
+forward_horizons   = []                         # TESTNET-FAST (2026-11-24): ["1mx60", "5mx36"]
+windows_per_cell   = 4                          # TESTNET-FAST (2026-11-24): 48
 start_margin_seconds = 3600                     # forward windows start >= 1 h after dispatch
-verdict_wait_blocks = 3900                      # overlay-settable, <= 3900: an inconclusive entry waits <= 13 h
+verdict_wait_blocks = 300                       # TESTNET-FAST (2026-11-24): 3900 (~1 h of 12 s blocks)
 snapshot_days      = 30                         # 1m bank: 32768-step 1m context (22.8 d) + the 28-day embargo draw (recorder fills it forward)
 coarse_history_days = 1372                      # hourly bank: 32768 h (1365 d) + the wait; HL serves ~208 d of 1h, the recorder the rest as it accrues
 report_timeout_settlements = 8                  # trainer records a missing report "absent" after this
