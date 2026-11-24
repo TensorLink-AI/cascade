@@ -30,10 +30,32 @@ code together.
 - GiftEvalPretrain and RMISC count together as one public half.
 - Public data is sampled from the whole dataset, not a fixed subset.
 - RMISC is scored as multivariate.
-- The slow-cadence backtest windows stay, at 5%.
+- ~~The slow-cadence backtest windows stay, at 5%.~~ **Superseded (owner 2026-11-24, DECIDED): the slow-cadence backtest windows (W5i) are DROPPED; the public half replaces them** (rev6.18 (D24) below).
 - The low-frequency check A10 is removed.
 - The coldkey caps stay as built. No entry fee at launch.
 - Disputes and wrong crowns: the owner decides; pay already sent stands.
+
+### rev6.18 (D24) Backtest windows dropped (owner 2026-11-24, DECIDED)
+
+The slow-cadence backtest windows (W5i) are dropped; the public half
+(GiftEvalPretrain + RMISC) replaces them. This supersedes the brief's
+"backtest stays at 5%" decision and its A7 keep line, rev6.9 (a) (the
+backtest part of it) and rev6.15 (b) (backtest ON at launch). Concretely:
+
+- **Live half = forward windows only** (fresh + 48 h embargo top-up, the W5j
+  forward cells and the W2e embargo rule, unchanged). No backtest cell is
+  built, drawn or scored; slow cadences enter the live half only as
+  forward windows that pass W5a.
+- **W5i is not built; it is retired** (row struck below).
+- **`[lane_d] backtest_weight_cap` and `backtest_ratio_floor`** (W2e, on main,
+  default 0.05 / 0.85) are **deleted in F4**: the loader drops their parse
+  and the `1 − floor**cap < d_margin` inequality check, and lists both in
+  `RETIRED_KEYS["lane_d"]` so a deployed file that still carries them
+  loads; their `chain.toml` lines go. The audit's two-part
+  `combined_log_ratio` (`cascade/audit/lane_d.py:841-850`) and the report's
+  forward/backtest sub-score split go with them.
+- **`public_weight` stays at 0.50** (overlay-settable, unchanged), so the
+  score is 50% live (forward) + 50% public.
 
 ### rev6.18 (V) Verification against main @ 78b1d45
 
@@ -67,7 +89,7 @@ block hash:
 
 | Source | Windows | Half |
 |---|---|---|
-| live (the existing W5j per-bin draw, unchanged; forward windows + W5i backtest cells) | ≤ 5000 (`max_windows_per_settlement`) | live |
+| live (the existing W5j per-bin draw; forward windows only — ~~+ W5i backtest cells~~, D24) | ≤ 5000 (`max_windows_per_settlement`) | live |
 | `Salesforce/GiftEvalPretrain` (Apache-2.0; 71 univariate + 17 multivariate datasets) | 5000 | public |
 | `nju-zhangsq/RMISC` (MIT card; allowed folders only, A5) | 5000 | public |
 
@@ -89,11 +111,12 @@ GiftEvalPretrain + RMISC are one **public half** of 10000 windows.
 
 **A3 Winning rule.**
 
-- `L_live` = the W5i combined log-ratio over forward + backtest windows
+- **(D24)** `L_live` = the mean per-window log-ratio over the forward
+  windows (fresh + embargo). ~~`L_live` = the W5i combined log-ratio over forward + backtest windows
   (`backtest_weight_cap = 0.05`, `backtest_ratio_floor`, unchanged; loader rule
-  `1 − floor**cap < d_margin` unchanged).
+  `1 − floor**cap < d_margin` unchanged).~~
 - `L_pub` = mean per-window log-ratio over the public windows.
-- **Per-window clamp:** every per-window ratio (live forward, backtest, public)
+- **Per-window clamp:** every per-window ratio (live forward, ~~backtest,~~ public)
   is clamped to `[window_ratio_floor, 1 / window_ratio_floor]` before it
   enters a half. New key `[lane_d] window_ratio_floor`, overlay-settable,
   default **0.5**: each window's ratio is clamped to **[0.5, 2]** (one window
@@ -102,7 +125,7 @@ GiftEvalPretrain + RMISC are one **public half** of 10000 windows.
 - `L = (1 − w) · L_live + w · L_pub`, `w = [lane_d] public_weight`.
 - **`public_weight`**: new `[lane_d]` key, **overlay-settable, default
   0.50**, range `[0, 1)`. It is **not** subject to the `backtest_weight_cap`
-  loader rule (that rule stays as is for the backtest cap). `w = 0` turns the
+  loader rule ~~(that rule stays as is for the backtest cap)~~ **(D24: that rule and key are deleted in F4)**. `w = 0` turns the
   public half off (not drawn; its point-gain condition not applied).
 - Crown iff **all** of: (1) the combined LCB on `L` (one max-T paired cluster
   bootstrap over the cohort, same `alpha`, `bootstrap_B`) ≥ `d_margin`;
@@ -110,8 +133,10 @@ GiftEvalPretrain + RMISC are one **public half** of 10000 windows.
   (when `w > 0`); then (4) the existing §1.3b benchmark gate, unchanged.
 - **Bootstrap clusters:** live = source (unchanged); public = dataset family
   (A2). Each bootstrap replicate resamples clusters within each half and
-  recombines with `w`, so both halves enter one max-T LCB (the W5i
-  machinery, extended from two parts to three).
+  recombines with `w`, so both halves enter one max-T LCB ~~(the W5i
+  machinery, extended from two parts to three)~~ **(D24: a two-part
+  live/public combination built in F4; W5i is retired, so there is no
+  backtest part)**.
 - No confirmation duel, no false-win test, no shadow stage: the rule is live
   at the lane D activation block.
 
@@ -152,7 +177,9 @@ channel count, file, row/offset). Each settlement draws from the index and
 reads only the drawn series. The signed report carries `public.index_sha256`,
 `public.files_sha256` (the file list) and `public.revisions`.
 
-**A7 Removals and keeps.** W5i backtest windows stay as built. **A10 / W3b5
+**A7 Removals and keeps.** ~~W5i backtest windows stay as built.~~ **(D24) W5i
+backtest windows are dropped (not built); `backtest_weight_cap` /
+`backtest_ratio_floor` are deleted in F4.** **A10 / W3b5
 is removed** from code (`cascade/validator/lane_d_lowfreq.py`, its call in
 `validator/lane_d.py`), the report schema (`lowfreq` verdict block,
 `lowfreq_regression` reason; a new schema minor, see F4), the audit
@@ -377,7 +404,7 @@ the rows each PR touches.
 | F1 | Burn scoping + one checker + refusal codes | B1, B2, B3 | W9 (`audit/lane_d.py` codes, `checks.py` `_lane_d_court`/`derive_weights`), W7d (deleted; satellite = audit), W8b (satellite path), W11 (alert patterns) | — (first: it removes the second checker before F2–F5 would change two) |
 | F2 | (C, L) multivariate lane D scoring | A4 | W5d (scorer `(B, C, L)`, channel pick, empty-column drop), W5e (per-window collapse), W7a (per-window `n_channels`, `channels_sha256`), W9 | F1 |
 | F3 | Public sources: allowed list, index, draw, mirror tooling | A1, A2, A5, A6 (code); data ops = owner | new W5k (public draw), new W6p (index builder + mirror script, read-only on HF until owner keys), W7a (`public.*` hashes), W9 (`ld_draw`, `ld_public_index`) | F2 |
-| F4 | Combined winning rule + per-half reporting + A10 removal | A3, A7, A8 | W2e (`public_weight`, `window_ratio_floor`), W5i (three-part max-T), W5e, W3b5 (removed), W7a (schema minor: per-half/source/domain fields; `lowfreq` dropped), W9, W12a, W17 | F3, F1 |
+| F4 | Combined winning rule (live forward + public) + per-half reporting + A10 removal + backtest removal (D24) | A3, A7, A8, D24 | W2e (add `public_weight`, `window_ratio_floor`; **delete** `backtest_weight_cap`, `backtest_ratio_floor` and the loader inequality, both keys to `RETIRED_KEYS["lane_d"]`, `chain.toml` lines out), W5i (retired, not built), W5j (forward cells only), W5e (two-part live/public max-T LCB), W3b5 (removed), W7a (schema minor: per-half/source/domain fields; `lowfreq` and the forward/backtest sub-score split dropped), W9 (`combined_log_ratio` removed; re-derives the new rule), W12a, W17 | F3, F1 |
 | F5 | GPU environments + handshake + cache key | B5, B6, B7 | W4 (handshake fields), W15 (cache key), W7a (`host.*`), W6-S8 / T7 (env list), D11 | — (parallel with F2) |
 | F6 | Config cleanup + init-gate removal | B9 (main-side typing incl. both owner keys), B11, B12, B13 | W2, `chain.toml`, R6x / #532, `koth.py`, `loop.py`, `scoring.py`/`loader.py` (B12 is lane A consensus: release + activation block) | — |
 | F7 | Miner status context | B15 | W17, W10, W12b | rev6.15 W7a/W8c landed |
@@ -443,7 +470,7 @@ case `(4096, (8192, 16384), 8192, 8192)`).
 | Item | Decision | Landed in |
 |---|---|---|
 | (a) | **Highest armed ≤ declared, else skip (owner 2026-11-23, DECIDED, verbatim choice: "Highest ≤ declared, else skip").** An entry is scored at its declared context when that variant is armed, else at the **highest armed variant below its declared context**. If no armed variant is ≤ the declared context, the entry is **not scored this settlement**: it stays `pending` with the new typed skip reason **`context_below_armed`**, and it is never run above its declared context. Spec below | §1.1 context bullet; rev6.6 (a); W5d, W7a, W7d, W8c, W9 rows; T7; D2 (§6); §11.2 `docs/LANE_D.md` row; §17.4 D2 |
-| (b) | **Backtest windows ON at launch (owner 2026-11-23, DECIDED).** `[lane_d] backtest_weight_cap` default **0.05** (was 0, "off by default", rev6.9). `backtest_ratio_floor` stays 0.85; the loader inequality `1 − 0.85^0.05 ≈ 0.0081 < d_margin` (0.01) holds at the defaults, so the default config loads. With the default, the slow-cadence backtest cells (W5i) are built and scored from launch. Setting the cap to 0 by overlay still turns them off (the rev6.9 "at 0" behaviour is kept as the off switch). The W2e default and its tests are changed by a separate builder; this rev changes plan text only | rev6.9 "Off by default" bullet; rev6.10 "What gets drawn" bullet; §1.7 horizon paragraph; W2 row; W5i row |
+| (b) | ~~**Backtest windows ON at launch (owner 2026-11-23, DECIDED).**~~ **Superseded (owner 2026-11-24, DECIDED) by rev6.18 D24 (backtest dropped).** `[lane_d] backtest_weight_cap` default **0.05** (was 0, "off by default", rev6.9). `backtest_ratio_floor` stays 0.85; the loader inequality `1 − 0.85^0.05 ≈ 0.0081 < d_margin` (0.01) holds at the defaults, so the default config loads. With the default, the slow-cadence backtest cells (W5i) are built and scored from launch. Setting the cap to 0 by overlay still turns them off (the rev6.9 "at 0" behaviour is kept as the off switch). The W2e default and its tests are changed by a separate builder; this rev changes plan text only | rev6.9 "Off by default" bullet; rev6.10 "What gets drawn" bullet; §1.7 horizon paragraph; W2 row; W5i row |
 | (c) | **Follow-ups** (WP list below) | this section |
 
 **(a) Spec: the scored context.**
@@ -1561,9 +1588,13 @@ rev6.9's per-window sha256 draw seed is struck in favour of rev6.10 (b) / W5j
 
 | Item | Decision | Landed in |
 |---|---|---|
-| (a) | **Slow-cadence backtest windows, owner horizon bins, 5% weight cap (owner 2026-11-23, DECIDED).** See the spec below | §1.1 Horizon; §1.3 Window identity; §1.6 Box row; W2 row (keys); **W5i** row (new, after W5g); §14 lane D tuning row |
+| (a) | ~~**Slow-cadence backtest windows, owner horizon bins, 5% weight cap (owner 2026-11-23, DECIDED).**~~ **Superseded (owner 2026-11-24, DECIDED) by rev6.18 D24: backtest windows dropped, W5i retired; the struck spec below is kept for history.** See the spec below | §1.1 Horizon; §1.3 Window identity; §1.6 Box row; W2 row (keys); **W5i** row (new, after W5g); §14 lane D tuning row |
 
-**(a) Spec.**
+**(a) Spec.** **(rev6.18 D24, owner 2026-11-24): the backtest parts of this
+spec ("Everything else is a backtest window", the weight cap, the
+combination rule and its loader check, the backtest draw and sub-scores) are
+superseded: no backtest window is built or scored, and
+`backtest_weight_cap` / `backtest_ratio_floor` are deleted (F4).**
 
 - **Horizon bins (points).** The forward pass appends `ceil(h/32)` masked
   patches and scores only the first h points (`lane_d_scorer.py:142, 156`).
@@ -1585,7 +1616,7 @@ rev6.9's per-window sha256 draw seed is struck in favour of rev6.10 (b) / W5j
   unchanged. A daily window whose draw lands in the short bin is a
   **forward** window with that drawn h ∈ [7, 30]. It must pass W5a on all h
   target points, and it counts toward the floors like any forward window.
-- **Everything else is a backtest window.** That's daily medium and long,
+- ~~**Everything else is a backtest window.**~~ **(rev6.18 D24) superseded.** That's daily medium and long,
   plus every weekly, monthly, quarterly and yearly bin. A backtest window is
   a hold-out of the last h points of the series in the boundary's pinned
   `pool_d` snapshot, with the history before it as context (truncated to the
@@ -1595,7 +1626,7 @@ rev6.9's per-window sha256 draw seed is struck in favour of rev6.10 (b) / W5j
   eval. **Rec:** a series with fewer than 32 points (one patch) of history
   before the hold-out is skipped with the typed reason
   `backtest_short_history`.
-- **Weight cap.** Together, backtest windows carry at most
+- ~~**Weight cap.**~~ **(rev6.18 D24) superseded.** Together, backtest windows carry at most
   `[lane_d] backtest_weight_cap` = 0.05 of the lane D score; forward-only
   windows carry ≥ 0.95. **Rec:** the effective weight is
   `c = min(backtest_weight_cap, n_bt / (n_bt + n_fwd))`, so a handful of
@@ -1613,7 +1644,7 @@ rev6.9's per-window sha256 draw seed is struck in favour of rev6.10 (b) / W5j
   gain = 1 − R. `r_floor` is the new key `[lane_d] backtest_ratio_floor`
   (**rec 0.85**). Perfect memorisation (with forward equal) gains at most
   `1 − r_floor^c`.
-  - **Loader check (W2/W5i):** whenever `backtest_weight_cap > 0`, refuse
+  - ~~**Loader check (W2/W5i):**~~ **(rev6.18 D24) deleted in F4.** Whenever `backtest_weight_cap > 0`, refuse
     the config (and any overlay) unless
     **`1 − backtest_ratio_floor ** backtest_weight_cap < d_margin`**,
     equivalently `backtest_weight_cap · ln(1 / backtest_ratio_floor) <
@@ -1652,7 +1683,7 @@ rev6.9's per-window sha256 draw seed is struck in favour of rev6.10 (b) / W5j
   its forward relative gain by more than an ops-side threshold (non-consensus;
   rec 0.15).
 - ~~**Off by default.** `backtest_weight_cap = 0` until the owner arms it by
-  overlay/config.~~ **(rev6.15, owner 2026-11-23) On at launch:**
+  overlay/config.~~ ~~**(rev6.15, owner 2026-11-23) On at launch:**~~ **(rev6.18 D24, owner 2026-11-24) superseded: dropped, key deleted.**
   `backtest_weight_cap` defaults to **0.05**. Setting it to 0 by overlay or
   config turns it off: at 0 no backtest window is built or scored, the
   per-window daily h draw is not applied (daily stays h = 64 forward), and
@@ -3418,7 +3449,7 @@ Accept command exits 0**, never on a builder's word. Conventions:
 | W5e | Verdict (paired cluster bootstrap, `d_margin`, max-T; ~~**(rev3)** mandatory confirmation duel on the next disjoint set, D20 king-change rule,~~ `rows_sha256` (A2, A9)). **(rev6.11)** **Crown at the first verdict** (owner 2026-11-23): first clear (max-t LCB vs KING_D on the W5j draw) ∧ A10 (W3b5) ∧ §1.3b gate ⇒ crowned. **Remove the `confirm` stage** (chosen over a `confirmation_duel` key; rev6.11 (b)): drop `confirm_pending` from `OPEN_STATUSES` (`lane_d.py`, `lane_d_queue.py:42`, `lane_d_status.py:51`), the `confirm` record, `_confirm_king_ts`, the D20 king-change sweep and `lost_confirmation`; `confirm_on_king_change` parse-only (legacy). **Includes the W5g follow-up** (the W5g row isn't edited, so it doesn't conflict with #745): `bench_hold` = a first-clear candidate the gate couldn't decide; the hold sweep keys on the first clear; the reason-enum assertions drop `confirm_pending`. **(rev6.14) Judging start:** an entry is not drawn, frozen or judged at a settlement whose boundary wall time is < `j = wall(max(T_E, T_K)) + eval_delay_hours` (skip reason `before_eval_delay`, distinct from `fresh_share_short` and the floor reasons) | W5c, W5d | ci | `scripts/laned/accept W5e` |
 | W5f | House entry and refresh | W5e | ci | `scripts/laned/accept W5f` |
 | W5g | Holds, `checkpoint_fault`, typed reason enums | W5e | ci | `scripts/laned/accept W5g` (asserts the exact reason enum per case) |
-| W5i | **(rev6.9, owner 2026-11-23)** Slow-cadence backtest windows and their scoring weight (rev6.9 spec). (1) **Windows builder:** the per-cadence horizon bins; bin and h drawn per window from the boundary block hash ~~(`sha256(block_hash ‖ series_id ‖ "lane_d_backtest")`)~~ **(on merge with rev6.10)** by the W5j seeded per-cell draw (W5i supplies the slow-cadence cells and the hold-out rule), the same for king and every cohort member; daily short ⇒ a forward window at the drawn h through W5a's both-clocks rule; every other slow bin ⇒ a backtest hold-out (the last h points of the pinned `pool_d` snapshot's series, history before it, no padding); `backtest_short_history` skip; floors, freeze and `max_source_share` count forward windows only. (2) **Scorer/verdict:** forward and backtest sub-scores, combined as `log R = (1 − c)·log R_fwd + c·log clamp(R_bt, r_floor, 1/r_floor)` with `c = min(backtest_weight_cap, n_bt/(n_bt + n_fwd))`, clamped inside every bootstrap replicate of the max-T cohort LCB. (3) **Config:** `backtest_weight_cap`, `backtest_ratio_floor`; the loader refuses `backtest_weight_cap > 0` unless `1 − backtest_ratio_floor ** backtest_weight_cap < d_margin` (re-checked on overlay adoption); ~~default 0 = nothing built or scored~~ **(rev6.15)** default 0.05 (on at launch); 0 = nothing built or scored. (4) **Report:** per window `kind`, `freq_class`, `bin`, `h`; per entry and bar `forward` and `backtest` sub-scores plus the combined score. (5) **Audit + replay:** re-derive the draws, the clamp and the combined verdict independently. Touched modules: `cascade/validator/lane_d.py` (`load_pool`, `window_id`, `judge_cohort`), `cascade/validator/lane_d_forward.py` (per-window h for daily short), `cascade/validator/lane_d_frozen.py` (forward-only floors), `cascade/eval/lane_d_scorer.py` (h ≤ 180 per window; already capped at 512), `cascade/eval/bootstrap.py` (the combined statistic for `cohort_maxt_lcbs`), `cascade/shared/config/lane_d.py` (keys + inequality), `cascade/validator/schemas/lane_d_report_1.json` and `cascade/validator/lane_d_report.py` (fields + cross-field checks), `cascade/audit/lane_d.py` (W9 re-derivation), `cascade/satellite/lane_d_replay.py` (W7d, independent implementation), `cascade/validator/lane_d_inputs.py` (W8c supplies backtest histories and targets). **Follow-up (W11):** the cascade-ops alert on backtest gain ≫ forward gain | W5a, W5b, W5d, W7a, W9, W7d, W5j | ci + testnet | `scripts/laned/accept W5i` |
+| W5i | **RETIRED (owner 2026-11-24, DECIDED), rev6.18 D24: not built; the public half replaces it.** ~~**(rev6.9, owner 2026-11-23)** Slow-cadence backtest windows and their scoring weight (rev6.9 spec). (1) **Windows builder:** the per-cadence horizon bins; bin and h drawn per window from the boundary block hash ~~(`sha256(block_hash ‖ series_id ‖ "lane_d_backtest")`)~~ **(on merge with rev6.10)** by the W5j seeded per-cell draw (W5i supplies the slow-cadence cells and the hold-out rule), the same for king and every cohort member; daily short ⇒ a forward window at the drawn h through W5a's both-clocks rule; every other slow bin ⇒ a backtest hold-out (the last h points of the pinned `pool_d` snapshot's series, history before it, no padding); `backtest_short_history` skip; floors, freeze and `max_source_share` count forward windows only. (2) **Scorer/verdict:** forward and backtest sub-scores, combined as `log R = (1 − c)·log R_fwd + c·log clamp(R_bt, r_floor, 1/r_floor)` with `c = min(backtest_weight_cap, n_bt/(n_bt + n_fwd))`, clamped inside every bootstrap replicate of the max-T cohort LCB. (3) **Config:** `backtest_weight_cap`, `backtest_ratio_floor`; the loader refuses `backtest_weight_cap > 0` unless `1 − backtest_ratio_floor ** backtest_weight_cap < d_margin` (re-checked on overlay adoption); ~~default 0 = nothing built or scored~~ **(rev6.15)** default 0.05 (on at launch); 0 = nothing built or scored. (4) **Report:** per window `kind`, `freq_class`, `bin`, `h`; per entry and bar `forward` and `backtest` sub-scores plus the combined score. (5) **Audit + replay:** re-derive the draws, the clamp and the combined verdict independently. Touched modules: `cascade/validator/lane_d.py` (`load_pool`, `window_id`, `judge_cohort`), `cascade/validator/lane_d_forward.py` (per-window h for daily short), `cascade/validator/lane_d_frozen.py` (forward-only floors), `cascade/eval/lane_d_scorer.py` (h ≤ 180 per window; already capped at 512), `cascade/eval/bootstrap.py` (the combined statistic for `cohort_maxt_lcbs`), `cascade/shared/config/lane_d.py` (keys + inequality), `cascade/validator/schemas/lane_d_report_1.json` and `cascade/validator/lane_d_report.py` (fields + cross-field checks), `cascade/audit/lane_d.py` (W9 re-derivation), `cascade/satellite/lane_d_replay.py` (W7d, independent implementation), `cascade/validator/lane_d_inputs.py` (W8c supplies backtest histories and targets). **Follow-up (W11):** the cascade-ops alert on backtest gain ≫ forward gain~~ | W5a, W5b, W5d, W7a, W9, W7d, W5j | ci + testnet | `scripts/laned/accept W5i` |
 | W6a | `pool_d` selection = `pool`'s selected series ids (joined, not re-selected). **(rev5) Join rule:** the emitted `series_id` isn't stable. Collision suffixes `-2`, `-3`… are assigned in sort order (`builder.py:361-370, 471-480`), and `content_hash` is the sha256 of the (truncated) values (`:295`), so it changes whenever the tail moves and differs between `pool` and `pool_d` histories. Join on **(source, the pre-suffix source series key, channel)**, both built in the **same builder run** from the same forge records, never by emitted id or content hash. A key collision inside one source refuses the series from `pool_d` (logged) | W1 | ci + builder | `scripts/laned/accept W6a` (`pool` bytes unchanged) |
 | W6fs | **(rev3, launch-blocking)** First-seen recording: an append-only ingest log in the forge mirror path recording, per partition or point, the first time our mirror saw it, plus a per-feed mirror-lag measurement (source publish stamp where available). **Scope:** a recorder + reader used only by the `pool_d` builder. **Invariant:** `pool` bytes and lane A windows byte-identical (the test diffs a `pool` build with and without the recorder). **Tests:** first-seen never later than any snapshot containing the point; rewrites and backfills keep the *first* time; lag computed per feed. Not implemented in this PR  **(rev5) Attestation (B12):** a ~~daily~~ **(rev6.11)** per-3-hourly-period digest (Merkle root) of the ingest log is committed **before** any snapshot uses that ~~day's~~ period's records: in the signed receipt, or on chain via the main validator's commitment. A snapshot whose first-seen records postdate their committed root is refused. **(rev6.10) Release-time record:** W6fs is **required** for the embargo rule (`release(p) = first_seen(p) + e`). The recorder doesn't store `release` (it's derived, so the catalog can't rewrite history). It stores first-seen per point under the B12 Merkle root, plus per feed the measured `max(data_ts − first_seen)`, which W6b uses to force `e = 0` on publish-ahead feeds (rec). Test: release is recomputable from the signed first-seen record and the pinned `e` alone | W1 | builder | `scripts/laned/accept W6fs --evidence evidence/w6fs.json` |
 | W6b | **(rev3)** Extended history **to 16384 + 64** + per-series (per-channel) `end_ts` / `first_target_ts`. **(rev6.1)** Also writes, for **every** series, `frontier` (a list, possibly empty: one record per earlier snapshot holding that series), and, for **every** feed in `pool_d`, a `feeds` entry (`mirror_lag_hours`, a number or `null`, and `forecast_product`). A `pool_d` in which any series lacks `frontier` (absent or `null`) or any feed lacks a `feeds` entry is **invalid**; the builder's tests assert that none does (RV3 BLOCKING 1: W5a's eligibility fails open on a missing key). **(rev6.10)** Each `feeds` entry also carries `embargo_hours`, the **effective** value: the TSBench-Forge catalog's per-feed `embargo_hours` (`sources.yaml`, read by the `pool_d` builder alongside the catalog fields `tsbench_forge.py:340` already reads), clamped to `[lane_d] embargo_hours`; the global value when the catalog has none; **0** for a feed W6fs shows as publish-ahead (rec). ~~**(rev6.11)** The sub-hourly zero is applied per series by W5a from `freq`, not written here.~~ **(rev6.12)** No sub-hourly zero: the pinned value applies to every series of the feed. A negative or non-numeric catalog value leaves the feed out of `feeds` (fail closed). `pool` bytes unchanged | W6a, W6fs, W2e | builder | `scripts/laned/accept W6b --evidence evidence/w6b.json` |
