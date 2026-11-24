@@ -3237,7 +3237,7 @@ LANE_B_STAGES = ("stale", "selection", "merge", "verdict", "targets")
 
 
 def _lane_b_slot_row_verdict(r: dict, lb, slots: tuple[str, ...]) -> str | None:
-    """Why one rev6.22 every-slot row (it carries ``bar``) contradicts
+    """Why one rev6.22 every-slot row (it carries ``gain_bar``) contradicts
     ``[lane_b]``, else None: the bar is ``gain_margin`` for a declared slot
     and ``undeclared_gain_margin`` otherwise; the family level is ``alpha``;
     an inconclusive row (floors, or a suite without items) never passes; a
@@ -3253,8 +3253,8 @@ def _lane_b_slot_row_verdict(r: dict, lb, slots: tuple[str, ...]) -> str | None:
     if r.get("family") != ("declared" if d in declared else "undeclared"):
         return f"{d}: test family {r.get('family')!r} does not match its declaration"
     want_bar = lb.gain_margin if d in declared else lb.undeclared_gain_margin
-    if not math.isclose(float(r.get("bar") or -1.0), want_bar, rel_tol=1e-12):
-        return f"{d}: bar {r.get('bar')} != {want_bar} ({'declared' if d in declared else 'undeclared'})"
+    if not math.isclose(float(r.get("gain_bar") or -1.0), want_bar, rel_tol=1e-12):
+        return f"{d}: bar {r.get('gain_bar')} != {want_bar} ({'declared' if d in declared else 'undeclared'})"
     if not math.isclose(float(r.get("alpha") or -1.0), lb.alpha, rel_tol=1e-12):
         return f"{d}: family level {r.get('alpha')} != alpha {lb.alpha} (each max-T family)"
     inc = str(r.get("inconclusive") or "")
@@ -3308,7 +3308,7 @@ def _lane_b_row_verdict(r: dict, lb, slots: tuple[str, ...]) -> str | None:
         return f"{d}: unknown stage {r.get('stage')!r}"
     if r.get("stage") != "verdict":
         return f"{d}: a {r.get('stage')}-stage row passed" if r.get("passed") else None
-    if "bar" in r:
+    if "gain_bar" in r:
         return _lane_b_slot_row_verdict(r, lb, slots)
     lcb = r.get("target_lcb")
     lcb_ok = lcb is not None and not math.isnan(float(lcb)) and float(lcb) >= lb.gain_margin
@@ -3392,10 +3392,10 @@ def check_lane_b(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
                 or any(t not in slots for t in declared) or len(set(declared)) != len(declared)):
             return _fail(name, f"{hk}: declared targets {declared} are not 1.."
                                f"{lb.max_domains_per_leg} configured slots")
-        if any("bar" in r for r in rs):
+        if any("gain_bar" in r for r in rs):
             # rev6.22: a judged leg is tested on EVERY slot, one row each
             if (sorted(str(r.get("domain")) for r in rs) != sorted(slots)
-                    or not all("bar" in r for r in rs)
+                    or not all("gain_bar" in r for r in rs)
                     or any(list(r.get("targets") or []) != declared for r in rs)):
                 return _fail(name, f"{hk}: rows {[r.get('domain') for r in rs]} do not cover "
                                    f"every slot {list(slots)} once each")

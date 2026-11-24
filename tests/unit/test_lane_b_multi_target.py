@@ -685,7 +685,7 @@ def test_audit_rederives_multi_target_verdicts_and_fails_tampering(cfg):
 
     cases = {
         "alpha": lambda t: t.lane_b[0].update(alpha=c.lane_b.alpha / 2),      # family level
-        "bar": lambda t: t.lane_b[2].update(bar=c.lane_b.gain_margin),        # undeclared bar
+        "gain_bar": lambda t: t.lane_b[2].update(gain_bar=c.lane_b.gain_margin),        # undeclared bar
         "flip": lambda t: t.lane_b[1].update(passed=False),                   # re-derived True
         "gain": lambda t: t.lane_b[0].update(metric_gains={"crps": -0.01, "mase": -0.01}),
         "guards-once": lambda t: t.lane_b[1].update(

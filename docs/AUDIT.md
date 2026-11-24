@@ -455,7 +455,7 @@ themselves at `gain_margin`, every other slot among themselves at
 `undeclared_gain_margin`); one row per tested slot.
 
 - `check_lane_b` — per slot row: `declared` / `family` match the leg's
-  declaration, the `bar` is the family's, the level is `alpha`, an
+  declaration, the `gain_bar` is the family's, the level is `alpha`, an
   inconclusive row never passes, and `passed` re-derives from the recorded
   CRPS/MASE family LCBs, point gains, the other metric's non-inferiority LCB
   and the guards; a judged leg has one row per slot and one critical value

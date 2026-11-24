@@ -169,7 +169,7 @@ def test_w9_judged_leg_has_one_row_per_slot_in_two_families(tmp_path):
     cfg = _cfg(tmp_path)
     tv, rows = _rows(cfg, ["energy"], {"energy": 0.9, "sales": 0.94})
     assert sorted(r["domain"] for r in rows) == sorted(cfg.lane_b.targets)
-    fam = {r["domain"]: (r["family"], r["bar"], r["passed"]) for r in rows}
+    fam = {r["domain"]: (r["family"], r["gain_bar"], r["passed"]) for r in rows}
     assert fam["energy"] == ("declared", cfg.lane_b.gain_margin, True)
     assert fam["sales"] == ("undeclared", cfg.lane_b.undeclared_gain_margin, True)
     assert not fam["nature"][2]
@@ -177,15 +177,15 @@ def test_w9_judged_leg_has_one_row_per_slot_in_two_families(tmp_path):
     assert res.status == "PASS", res
 
 
-@pytest.mark.parametrize("tamper", ["bar", "family", "passed", "crit", "missing_slot",
+@pytest.mark.parametrize("tamper", ["gain_bar", "family", "passed", "crit", "missing_slot",
                                     "declared_flag"])
 def test_w9_tampered_slot_rows_fail(tmp_path, tamper):
     cfg = _cfg(tmp_path)
     _tv, rows = _rows(cfg, ["energy", "web_cloudops"], {"energy": 0.9, "sales": 0.94})
     rows = copy.deepcopy(rows)
     by = {r["domain"]: r for r in rows}
-    if tamper == "bar":
-        by["sales"]["bar"] = cfg.lane_b.gain_margin            # an undeclared slot at 1%
+    if tamper == "gain_bar":
+        by["sales"]["gain_bar"] = cfg.lane_b.gain_margin            # an undeclared slot at 1%
     elif tamper == "family":
         by["sales"]["family"] = "declared"
     elif tamper == "passed":

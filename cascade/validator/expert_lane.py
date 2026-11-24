@@ -303,7 +303,7 @@ def judgements_record(judgements: list[ExpertJudgement]) -> list[dict]:
 
     A JUDGED entry (stage ``verdict``, rev6.22 every-slot judging) is one row
     PER TESTED SLOT: the leg's declared ``targets``, whether this slot is
-    ``declared``, the ``bar`` applied, per metric the max-T family LCB
+    ``declared``, the ``gain_bar`` applied, per metric the max-T family LCB
     (``metric_lcbs``), point gain and marginal non-inferiority LCB, the
     slot's test ``family`` (``declared`` / ``undeclared``, two separate
     max-T families) with its level ``alpha`` and critical value
@@ -352,7 +352,7 @@ def _slot_rows(j: ExpertJudgement, declared: tuple[str, ...]) -> list[dict]:
             "target_lcb": _num(v.target_lcb),
             "guard_lcbs": dict(v.guard_lcbs), "public_lcbs": dict(v.public_lcbs),
             "targets": list(declared), "leg": j.entry.rebased_pointer,
-            "declared": bool(v.declared), "bar": float(v.bar),
+            "declared": bool(v.declared), "gain_bar": float(v.bar),
             "family": "declared" if v.declared else "undeclared",
             "alpha": float(tv.alpha),
             "maxt_crit": _num(tv.maxt_crits.get("declared" if v.declared else "undeclared")),
