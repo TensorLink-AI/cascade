@@ -46,7 +46,10 @@ def test_shipped_grid_is_every_suite_on_every_timeframe():
     want = ["1mx60", "5mx36", "15mx96", "1hx48", "4hx42", "1dx7"]
     for toml in ("chain.toml", "chain.testnet.toml"):
         mc = load_chain_config(toml).marketcast
-        assert mc.forward_horizons == ("1mx60", "5mx36") and not hasattr(mc, "gap_horizons")
+        # TESTNET-FAST (owner 2026-11-24): testnet's ~1 h verdict wait leaves no
+        # forward span, so it scores the embargo draw only (same grid of paths)
+        want_fwd = () if toml == "chain.testnet.toml" else ("1mx60", "5mx36")
+        assert mc.forward_horizons == want_fwd and not hasattr(mc, "gap_horizons")
         for s in mc.suites:
             assert list(mc.horizons_map[s]) == want
             assert [window_geometry(mc.frequencies_map[s], h) for h in want] == [

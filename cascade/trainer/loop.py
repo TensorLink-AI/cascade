@@ -1293,6 +1293,8 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
             budget_denomination=getattr(contract, "budget_denomination", "points"),
             corpus_epochs=int(getattr(contract, "corpus_epochs", 0) or 0),
             **({"continuation_protocol": contract.continuation_protocol} if getattr(contract, "continuation_protocol", "") else {}),
+            # WB27: a lane B curriculum leg reads its stage corpora in order
+            **({"curriculum": tuple(contract.curriculum)} if getattr(contract, "curriculum", ()) else {}),
         ) as rs:
             result = self.base_trainer.train(
                 rs.series(),

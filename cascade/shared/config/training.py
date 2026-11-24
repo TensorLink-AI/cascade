@@ -303,6 +303,18 @@ class TrainingContractConfig:
     # taken from the live model. Never arm with ema_decay.
     power_ema_sigma_rels: tuple[float, ...] = ()
     power_ema_eval: int = -1
+    # Lane B leg levers (WB27, plan rev6.21): set only on a lane B expert leg
+    # contract by ``lane_b_levers.apply_levers`` (never read from TOML, never
+    # on a lane A contract; train_pyramid refuses them without an expert
+    # selection). Dropped from contract_digest at their defaults.
+    # lane_b_lr_scale multiplies every optimizer group's base LR; curriculum
+    # is ((stage name, hundredths), ...) read in order from the stage corpora.
+    lane_b_lr_scale: float = 1.0
+    curriculum: tuple = ()
+    # owner 2026-11-24 (rev6.21): a lane B limits leg (token limit and/or
+    # hour limit, any GPU) writes its actual steps, tokens and stop reason
+    # into the checkpoint's config.json (``lane_b_leg`` marker) for judges.
+    lane_b_stop_record: bool = False
     # What the power EMAs average over: "lineage" (t carried across warm
     # starts, so the window is σ_rel of the WHOLE lineage — the scored share of
     # the current leg shrinks as the lineage grows) or "leg" (restarted at

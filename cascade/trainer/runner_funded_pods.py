@@ -439,12 +439,14 @@ class _FundedPodMixin:
             return host
         from .remote import build_scp_argv, build_ssh_argv
 
+        src, profile = worker_config_for_pod(self, src, dest_name)
         dest = f"{host.workdir}/{dest_name}"
         runner = getattr(self, "_scp_runner", None) or (
             lambda argv: subprocess.run(argv, check=True, capture_output=True, timeout=120))
         runner(build_ssh_argv(host, f"mkdir -p {shlex.quote(host.workdir)}"))
         runner(build_scp_argv(host, str(src), dest))
-        log.info("pushed deployed chain.toml → %s:%s", host.name, dest)
+        log.info("pushed deployed chain.toml → %s:%s%s", host.name, dest,
+                 f" (worker config for {profile})" if profile else "")
         return dc_replace(host, chain_toml=dest)
 
     def _funded_pod_profile(self):
@@ -2354,6 +2356,38 @@ class _FundedPodMixin:
                 log.error("funded pod %s is gone but its ledger row could not be "
                           "removed (%s) — the startup sweep settles it",
                           pod.instance_id, e)
+
+
+def worker_config_for_pod(runner, src, dest_name: str):
+    """``(path, profile name)`` of the config a pod of the CURRENT leg's
+    image loads: the deployed file cut to what that release parses
+    (:mod:`cascade.shared.worker_config`), or ``src`` itself (profile "") for
+    a release without a legacy profile. The image is the one the leg rents /
+    is code-checked on (:func:`cascade.trainer.leg_pins.leg_round`: ``[round]
+    funded_pod_image``, a MarketCast leg's ``[marketcast] pod_image``, a
+    post-switch leg's after pin). A failed derivation raises — the push (and
+    so the leg) fails as an operator fault, never a silent run on a config
+    its worker cannot load."""
+    from pathlib import Path
+
+    from ..shared.atomic import write_text_atomic
+    from ..shared.worker_config import worker_toml_for_image
+    from .leg_pins import leg_round
+
+    try:
+        image = str(getattr(leg_round(runner), "funded_pod_image", "") or "")
+    except Exception as e:  # noqa: BLE001 — unknown image: the deployed file as before
+        log.warning("worker config: leg image unresolved (%s); pushing the deployed "
+                    "chain.toml unchanged", e)
+        return src, ""
+    text, profile = worker_toml_for_image(Path(src).read_text(encoding="utf-8"), image)
+    if not profile:
+        return src, ""
+    local = (Path(getattr(runner, "work_root", ".")) / "_deployed" / "worker_config"
+             / profile / dest_name)
+    local.parent.mkdir(parents=True, exist_ok=True)
+    write_text_atomic(local, text)
+    return local, profile
 
 
 def funded_pod_comm_failure(runner, result, profile) -> str:

@@ -20,6 +20,7 @@ from .helpers import (
     UNAVAILABLE,
     WITH_FALLBACK,
     base_contract,
+    caps_in_force,
     lane_b_cfg,
     leg,
     step_rate,
@@ -47,11 +48,13 @@ def test_module_is_torch_free():
 
 
 def test_shipped_keys_are_the_d42_values():
-    """WB10's keys as D42 decided them: 6 h, 6 h x 1.25 s, 1.25."""
+    """WB10's keys: owner 2026-11-24 (rev6.21; tests-correction) 12 h, 12 h x
+    1.25 s, 1.25 (no activation block: they bind as shipped)."""
     lb = lane_b_cfg()
-    assert float(lb.max_leg_hours) == 6.0
-    assert int(lb.max_leg_seconds) == 27_000
+    assert float(lb.max_leg_hours) == 12.0
+    assert int(lb.max_leg_seconds) == 54_000
     assert float(lb.guard_factor) == 1.25
+    assert caps_in_force(lb) == (12.0, 54_000)
 
 
 @pytest.mark.parametrize("raw,want", [("0.5", 0.5), ("1", 1.0), ("3.0", 3.0), (" 6.0 ", 6.0),
@@ -114,11 +117,11 @@ def test_leg_steps_clamped_and_never_zero():
 def test_leg_guard_seconds():
     m = leg()
     lb = lane_b_cfg()
-    kw = dict(guard_factor=float(lb.guard_factor), max_leg_seconds=int(lb.max_leg_seconds))
+    kw = dict(guard_factor=float(lb.guard_factor), max_leg_seconds=caps_in_force(lb)[1])
     assert m.leg_guard_seconds(0.5, overhead_seconds=OVERHEAD, **kw) == want_guard(0.5, lb)
     assert m.leg_guard_seconds(3.0, overhead_seconds=OVERHEAD, **kw) == want_guard(3.0, lb)
-    # 6 h x 1.25 + overhead > 27,000 s: capped at max_leg_seconds
-    assert m.leg_guard_seconds(6.0, overhead_seconds=OVERHEAD, **kw) == int(lb.max_leg_seconds)
+    # 12 h x 1.25 + overhead > 54,000 s: capped at max_leg_seconds (rev6.21)
+    assert m.leg_guard_seconds(12.0, overhead_seconds=OVERHEAD, **kw) == caps_in_force(lb)[1]
 
 
 def test_tb25_six_hours_admitted_with_guard_under_cap():
@@ -176,7 +179,8 @@ def test_check_leg_record_armed_nonempty_lane_d_effect():
                   guard_seconds=good.guard_seconds) == "steps_out_of_range"
 
 
-@pytest.mark.parametrize("hours", [0.25, 0.75, 6.5, 0.0, -1.0, float("nan")])
+# rev6.21 (owner 2026-11-24; tests-correction): the cap is 12 h
+@pytest.mark.parametrize("hours", [0.25, 0.75, 12.5, 0.0, -1.0, float("nan")])
 def test_check_leg_record_refuses_hours_off_grid(hours):
     assert _check(train_hours=hours, steps=10, guard_seconds=3000) == "train_hours_out_of_range"
 
@@ -192,7 +196,7 @@ def test_check_leg_record_steps_bounds():
 
 def test_tb27_guard_over_the_cap_is_refused():
     lb = lane_b_cfg()
-    mls = int(lb.max_leg_seconds)
+    mls = caps_in_force(lb)[1]      # rev6.21: 54000 shipped
     assert _check(train_hours=6.0, steps=100, guard_seconds=mls) is None
     assert _check(train_hours=6.0, steps=100, guard_seconds=mls + 1) == "guard_out_of_range"
     floor = want_guard_floor(1.0, lb)

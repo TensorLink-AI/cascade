@@ -436,6 +436,11 @@ On main these tests fail on the `settle_mv` / `max_channels` assertions or
 `cannot import name` (`channel_pick` from `cascade.audit.lane_d`,
 `_lane_d_max_channels` from `cascade.audit.checks`, both in PATHS).
 
+## rev6.20 (owner 2026-11-24): lane B stage `scored_weights`
+
+`checks.LANE_B_STAGES` gains `scored_weights` (a refusal stage; a passed
+row at it is flagged). `test_w9_lane_b_scored_weights.py`.
+
 ## Public sources (rev6.18 F3): `test_w9_public.py`
 
 - `lane_d_findings` / `check_lane_d(..., public_indexes=)`:

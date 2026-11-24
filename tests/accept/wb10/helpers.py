@@ -55,8 +55,10 @@ WB10_DEFAULTS: dict[str, object] = {
     "sentinel_target_rule": "defer",                       # D35 (a)
     "sentinel_max_defer_eras": 4,                          # §12b.5 recommended
     "funded_pod_skus": None,                               # = [round] funded_pod_skus
-    "max_leg_hours": 6.0,                                  # D42
-    "max_leg_seconds": 27_000,                             # §12b.6: 6 h x 1.25
+    # owner 2026-11-24 (plan rev6.21; tests-correction): 12 h legs (no
+    # activation block: lane B is not rolled out)
+    "max_leg_hours": 12.0,                                 # D42, rev6.21
+    "max_leg_seconds": 54_000,                             # §12b.6: 12 h x 1.25
     "guard_factor": 1.25,                                  # §12b.6 recommended
 }
 WB10_KEYS = tuple(WB10_DEFAULTS)
@@ -149,9 +151,32 @@ def _raw_text(name: str) -> str:
     return (REPO / name).read_text(encoding="utf-8")
 
 
-def shipped_raw(name: str) -> dict:
-    """A fresh copy of a shipped config's tomllib table."""
+# TESTNET-FAST profile (owner 2026-11-24: lanes B/C/D end-to-end on testnet in
+# hours): chain.testnet.toml caps a lane B leg at 1 h, each line commented
+# `# TESTNET-FAST (2026-11-24): <mainnet>`. key -> (release default,
+# testnet-fast value). The default tests run on the testnet file with these
+# restored (shipped_raw); test_wb10_testnet_fast.py pins the profile itself.
+TESTNET = "chain.testnet.toml"
+TESTNET_FAST_LANE_B: dict[str, tuple[object, object]] = {
+    "max_leg_hours": (12.0, 1.0),
+    "max_leg_seconds": (54_000, 4500),
+}
+
+
+def file_raw(name: str) -> dict:
+    """The shipped file exactly as written (testnet-fast profile included)."""
     return tomllib.loads(_raw_text(name))
+
+
+def shipped_raw(name: str) -> dict:
+    """A fresh copy of a shipped config's tomllib table; on the testnet file
+    the TESTNET-FAST [lane_b] keys are restored to their release default."""
+    raw = file_raw(name)
+    if name == TESTNET:
+        lb = raw.setdefault("lane_b", {})
+        for k, (default, _fast) in TESTNET_FAST_LANE_B.items():
+            lb[k] = default
+    return raw
 
 
 def round_skus(name: str) -> tuple[str, ...]:

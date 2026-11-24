@@ -96,13 +96,22 @@ def want_steps(hours: float, rate: float, cap: int) -> int:
     return min(math.floor(hours * 3600 * rate), cap)
 
 
+# owner 2026-11-24 (plan rev6.21; tests-correction): max_leg_hours / max_leg_seconds
+# ship at 12 h / 54000 s and bind as configured (lane B is not rolled out: no
+# activation block).
+
+
+def caps_in_force(lb) -> tuple[float, int]:
+    return float(lb.max_leg_hours), int(lb.max_leg_seconds)
+
+
 def want_guard(hours: float, lb, overhead: float = OVERHEAD) -> int:
     return min(math.ceil(hours * 3600 * float(lb.guard_factor) + overhead),
-               int(lb.max_leg_seconds))
+               caps_in_force(lb)[1])
 
 
 def want_guard_floor(hours: float, lb) -> int:
-    return min(math.ceil(hours * 3600 * float(lb.guard_factor)), int(lb.max_leg_seconds))
+    return min(math.ceil(hours * 3600 * float(lb.guard_factor)), caps_in_force(lb)[1])
 
 
 def step_rate(sku: str = SKU, rate: float = RATE, overhead: float = OVERHEAD):

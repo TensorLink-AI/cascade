@@ -83,6 +83,14 @@ def _capture(seen):
     return run
 
 
+def _lane_b_ema(c):
+    """rev6.20 (#845, no key) + WB27 (owner 2026-11-24; tests-correction):
+    every lane B leg contract is the EMA / no-cooldown one with its ONE EMA
+    width (0.10 by default); the WB23 length terms are unchanged."""
+    return dataclasses.replace(c, lr_schedule="warmup_constant_ema",
+                               power_ema_sigma_rels=(0.10,), power_ema_eval=0)
+
+
 def test_dispatch_contract_unchanged_when_unarmed(tmp_path, monkeypatch):
     """No train_hours on the funding record: today's for_hours(leg_hours)."""
     seen = {}
@@ -93,7 +101,7 @@ def test_dispatch_contract_unchanged_when_unarmed(tmp_path, monkeypatch):
     want = base_contract(cfg).for_hours(cfg.lane_b.leg_hours,
                                         guard_factor=cfg.round.heat_guard_factor,
                                         guard_floor_seconds=cfg.round.heat_guard_floor_seconds)
-    assert seen["contract"] == want
+    assert seen["contract"] == _lane_b_ema(want)
 
 
 def test_dispatch_contract_armed_nonempty_lane_d_effect(tmp_path, monkeypatch):
@@ -109,7 +117,7 @@ def test_dispatch_contract_armed_nonempty_lane_d_effect(tmp_path, monkeypatch):
     c = seen["contract"]
     assert c.training_steps == length.steps
     assert c.max_train_seconds == length.guard_seconds <= int(lb.max_leg_seconds)
-    assert c == m.leg_contract(base_contract(r.cfg), length)
+    assert c == _lane_b_ema(m.leg_contract(base_contract(r.cfg), length))
 
 
 def test_mark_funded_carries_the_leg_length():

@@ -158,3 +158,28 @@ is pinned under its own name).
   `test_king_and_challenger_of_a_warm_start_epoch_are_both_ema`, the
   warm-start scored-leg tests) and must be updated to the new rule in the
   implementation PR.
+
+## rev6.20 (owner 2026-11-24): lane B legs train with EMA, no cooldown
+
+Lane B only. Lane A keeps everything above (every test above is unchanged).
+With no activation key (owner 2026-11-24: lanes B/C/D are not rolled out),
+the trainer and the worker derive every lane B leg contract with
+`lr_schedule = "warmup_constant_ema"` (`lane_b_leg_contract`, WB10).
+`train_pyramid` then:
+
+- recognises the schedule with the pure `lane_b_ema_leg(lr_schedule,
+  expert_selection)`: `False` for `"wsd"`, `True` for the EMA schedule on an
+  expert leg, `ValueError` on a lane A leg or any other schedule;
+- steps the LR with `lane_b_schedule_factor`: WSD's warmup, then 1.0 to the
+  last step (no cooldown);
+- scores `POWER_EMA_SIGMA_RELS[POWER_EMA_EVAL]` = sigma_rel 0.10 (the owner's
+  standing scored width) as `weights.safetensors`, frozen rows at the king's
+  bytes; `weights_raw` + `weights_ema005` ride along unscored; the
+  `config.json` marker gains `"schedule": "warmup_constant_ema"`.
+
+`power_ema_active` is untouched (still `False` for every input).
+
+| file | pins |
+|---|---|
+| `test_w_ema_lane_b_no_cooldown.py` (box) | the two pure defs from source, the schedule shape, `train_pyramid` wiring, sigma 0.10, the worker's call |
+| `test_w_ema_lane_b_no_cooldown_torch.py` (CI) | no WSD call and LR 1.0 at the end; scored = an EMA (not raw), marker, merge byte-check; `settle_leg` rebases the scored file; a lane A leg refuses the schedule |
