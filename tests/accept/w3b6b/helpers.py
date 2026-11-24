@@ -86,7 +86,7 @@ def independent_lcb(ref_vals, cand_vals, *, alpha: float, B: int, seed: str) -> 
 def replay_mod():
     import importlib
 
-    return importlib.import_module("cascade.satellite.lane_d_replay")
+    return importlib.import_module("cascade.audit.lane_d_chain")
 
 
 def check_rows_fn():
