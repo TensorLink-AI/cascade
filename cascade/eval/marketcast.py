@@ -648,7 +648,7 @@ def cut_windows(series, *, cls: str, asset: str, suite: str, horizon: str,
     (:func:`spread_select`). ``t0`` is the series' block-0 start (a multiple
     of ``freq_minutes`` minutes).
 
-    DEC-CA-0073 draw: ``keep(wid)`` drops a candidate before anything else
+    DEC-CA-0074 draw: ``keep(wid)`` drops a candidate before anything else
     (the judge / confirm half partition) and ``rank(wid)`` turns ``limit``
     into "the first ``limit`` eligible candidates in rank order" (the block
     hash draw), evaluated lazily so an unpicked candidate is never cut;

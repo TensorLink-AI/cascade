@@ -363,7 +363,7 @@ class LaneCDriver:
             if callable(td):
                 leg["tree_digest"] = str(td(leg["ref"]) or "")
             if getattr(recipe, "embargo_scan", ()):
-                # DEC-CA-0073: the pre-rent embargo receipt rides the signed record
+                # DEC-CA-0074: the pre-rent embargo receipt rides the signed record
                 leg["embargo_scan"] = dict(recipe.embargo_scan)
             comp = trainer_competition(leg["target"])
             hours = comp.leg_hours(self.cfg, recipe) if comp is not None else None
@@ -896,7 +896,7 @@ class RunnerLaneCOps:
             shutil.rmtree(d, ignore_errors=True)
 
     def mkt_embargo_scan(self, tree, *, train_time: float) -> dict:  # pragma: no cover — bucket glue
-        """DEC-CA-0073 guard (b): the embargo receipt of ``tree`` (None = no
+        """DEC-CA-0074 guard (b): the embargo receipt of ``tree`` (None = no
         generator) against the signed ``pool_mkt`` snapshot active now."""
         from ..pool.marketcast import MktSnapshotSource
         from ..shared.hippius import pool_s3_store
