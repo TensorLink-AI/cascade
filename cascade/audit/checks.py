@@ -3372,6 +3372,15 @@ def _lane_b_slot_row_verdict(r: dict, lb, slots: tuple[str, ...]) -> str | None:
     if bool(r.get("guard_reason")) == guards_ok:
         return f"{d}: guard_reason {r.get('guard_reason')!r} contradicts the guard LCBs"
     want = bool(cleared) and guards_ok
+    sgd = r.get("suite_guards")
+    if suite and want:
+        # WB26 (DEC-CA-0071 §3 guards 4-5): a suite slot that clears is
+        # claimable only if guard 4 and the anchor guard hold
+        if not isinstance(sgd, dict) or "pool_gain" not in sgd:
+            return f"{d}: a cleared suite slot carries no suite_guards (guard 4 / anchor guard)"
+        want = _lane_b_suite_guards_ok(sgd, lb, guards, pubs)
+    elif sgd:
+        return f"{d}: suite_guards on a row that is not a cleared, guarded suite slot"
     if bool(r.get("passed")) != want:
         return (f"{d}: passed={r.get('passed')} but the re-derived slot verdict is {want} "
                 f"(LCBs {lcbs} vs bar {want_bar}, guards ok {guards_ok})")
@@ -3379,6 +3388,22 @@ def _lane_b_slot_row_verdict(r: dict, lb, slots: tuple[str, ...]) -> str | None:
                  or float(r.get("target_lcb")) != float(lcbs[r.get("gain_metric")])):
         return f"{d}: gain_metric {r.get('gain_metric')!r} / target_lcb do not match {cleared}"
     return None
+
+
+def _lane_b_suite_guards_ok(sgd: dict, lb, guards: dict, pubs: dict) -> bool:
+    """WB26 (DEC-CA-0071 §3 guards 4-5) from a suite slot's ``suite_guards``:
+    the whole-pool point gain ``>= 0``, and the anchor record covers every
+    guard of the leg with each ``>= -tau_anchor_*``. An anchor record that
+    does not cover the guards (``anchor_missing``) is not ok."""
+    def _f(x) -> float:
+        return float("nan") if x is None else float(x)
+
+    a_dom = sgd.get("anchor_guard_lcbs") or {}
+    a_pub = sgd.get("anchor_public_lcbs") or {}
+    return (_f(sgd.get("pool_gain")) >= 0.0 and bool(sgd.get("anchor_pointer"))
+            and set(a_dom) == set(guards) and set(a_pub) == set(pubs)
+            and all(_f(x) >= -lb.tau_anchor_domain for x in a_dom.values())
+            and all(_f(x) >= -lb.tau_anchor_public for x in a_pub.values()))
 
 
 def _lane_b_row_verdict(r: dict, lb, slots: tuple[str, ...]) -> str | None:
@@ -3508,6 +3533,11 @@ def check_lane_b(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
                                "(guards must run once per leg)")
         if any(r.get("guard_reason") for r in conc) and any(r.get("passed") for r in rs):
             return _fail(name, f"{hk}: a guard failed but a target of the leg passed")
+        # WB26: guard 4 + the anchor guard also run once per leg
+        if len({json.dumps(r["suite_guards"], sort_keys=True) for r in conc
+                if r.get("suite_guards")}) > 1:
+            return _fail(name, f"{hk}: the leg's suite guards differ between its suite slots "
+                               "(guard 4 / the anchor guard run once per leg)")
     best: dict[str, float] = {}
     for r in rows:
         if r.get("passed"):

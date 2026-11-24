@@ -116,9 +116,12 @@ class LaneBOps(Protocol):
     def publish_expert_manifest(self, manifest) -> None:
         """Sign and publish the expert manifest."""
 
-    def judge(self, manifest, round_id: str, block: int, sentinel: str | None = None) -> list:
+    def judge(self, manifest, round_id: str, block: int, sentinel: str | None = None,
+              anchor_pointer: str | None = None) -> list:
         """The manifest's ExpertJudgement list; ``sentinel`` (W-S2) is the
-        settlement era's §16 suite, passed only while armed."""
+        settlement era's §16 suite, passed only while armed; ``anchor_pointer``
+        (WB26) the era's anchor king, passed only when the settling legs
+        carry anchor rows (suite slots configured)."""
 
     def merge_scores(self, pointer: str, block: int) -> list:
         """The held-out acceptance scores of ``pointer``."""
@@ -271,6 +274,8 @@ class LaneBDriver:
         self.ops = ops
         self.path = Path(state_path)
         self._lock = threading.Lock()
+        # WB26: the anchor king's public bench rows, swept once per anchor
+        self._anchor_rows: dict[str, dict] = {}
         self.st = self._load()
         self.queue = LaneBQueue.from_json(self.st.queue)
         # Routing probes (one king forward over one domain's affinity slice:
@@ -1168,6 +1173,23 @@ class LaneBDriver:
                             " — entry ended (miner fault)" if leg.funding else "")
             self.save()
 
+    def _anchor_bench_rows(self, anchor_pointer: str, require: tuple[str, ...]) -> dict:
+        """WB26: the anchor king's public bench rows, swept once per anchor.
+        Unavailable or incomplete rows raise OSError (the settlement retries,
+        as for the king's and the candidates' rows)."""
+        from ..eval.public_guards import MissingPublicGuard, pair_public_rows
+
+        rows = self._anchor_rows.get(anchor_pointer)
+        if rows is None:
+            rows = self.ops.bench_rows(self.ops.fetch(anchor_pointer)) or {}
+            try:
+                pair_public_rows(rows, rows, require=require,
+                                 min_items=self.cfg.lane_b.min_public_items)
+            except MissingPublicGuard as e:
+                raise OSError(f"lane-B anchor public benchmarks unavailable: {e}") from e
+            self._anchor_rows = {anchor_pointer: rows}     # one anchor at a time
+        return rows
+
     def _funded_outcome(self, sub: LaneBSubmission, outcome: str, detail) -> None:
         self.st.outcomes.append({"round_id": "", "hotkey": sub.hotkey, "uid": int(sub.uid),
                                  "domain": sub.domain, "gen_ref": sub.gen_ref,
@@ -1179,7 +1201,7 @@ class LaneBDriver:
     # ── settlement ───────────────────────────────────────────────────────────
 
     def settle(self, *, round_id: str, block: int, era_index: int, king_pointer: str,
-               work_dir: Path) -> list:
+               work_dir: Path, anchor_pointer: str | None = None) -> list:
         """Rebase every finished leg onto this settlement's king, publish the
         expert manifest, self-judge it, and queue the winners for merge.
 
@@ -1188,7 +1210,15 @@ class LaneBDriver:
         settlement without its expert legs. Finished legs leave the queue only
         once the whole settlement succeeded — an I/O failure anywhere keeps
         them for the next settlement (and binds nothing this round).
-        Idempotent per ``round_id``."""
+        Idempotent per ``round_id``.
+
+        ``anchor_pointer`` (WB26, DEC-CA-0071 §3 guard 5): the era's anchor
+        king — the promotion member the validator derives from the signed
+        training manifest; the caller passes it only while suite slots are
+        configured. Every leg is tested on every suite slot (rev6.22), so
+        every settling leg carries the anchor's public rows as
+        ``public_rows["anchor"]`` (benched once per anchor), and the
+        self-judge is guarded against the same anchor."""
         from ..shared.expert_manifest import ExpertEntry, ExpertManifest, leg_label
         from .moe_model import MergeError
 
@@ -1269,6 +1299,8 @@ class LaneBDriver:
                                      min_items=lb.min_public_items)
                 except MissingPublicGuard as e:
                     raise OSError(f"lane-B candidate public benchmarks unavailable: {e}") from e
+                if anchor_pointer:
+                    rows["anchor"] = self._anchor_bench_rows(anchor_pointer, require)
             entries.append(ExpertEntry(
                 miner_hotkey=sub["hotkey"], miner_uid=int(sub["uid"]), gen_ref=sub["gen_ref"],
                 domain=sub["domain"], selection=sel,
@@ -1296,8 +1328,10 @@ class LaneBDriver:
                                       lineage_tokens=self.st.lineage_tokens,
                                       entries=tuple(entries))
             self.ops.publish_expert_manifest(manifest)
-            judgements = (self.ops.judge(manifest, rid, int(block)) if sentinel is None
-                          else self.ops.judge(manifest, rid, int(block), sentinel=sentinel))
+            judge_kw = {} if sentinel is None else {"sentinel": sentinel}
+            if anchor_pointer and any("anchor" in (e.public_rows or {}) for e in entries):
+                judge_kw["anchor_pointer"] = anchor_pointer     # WB26
+            judgements = self.ops.judge(manifest, rid, int(block), **judge_kw)
             digest = manifest.digest()
         # DEC-CA-0059: a leg that took at least one slot merges ONCE, however
         # many of its targets won (keyed by its judged checkpoint)
@@ -1996,7 +2030,8 @@ class RunnerLaneBOps:
         self.r.manifest_store().put_text(expert_manifest_key(manifest.round_id),
                                          manifest.to_json(), content_type="application/json")
 
-    def judge(self, manifest, round_id: str, block: int, sentinel: str | None = None) -> list:
+    def judge(self, manifest, round_id: str, block: int, sentinel: str | None = None,
+              anchor_pointer: str | None = None) -> list:
         from ..validator.evaluator import evaluate_checkpoint
         from ..validator.expert_lane import judge_manifest, verdict_windows
 
@@ -2026,7 +2061,8 @@ class RunnerLaneBOps:
                               king_scores=_eval(manifest.king_pointer), evaluate=_eval,
                               fetch_dir=self.fetch, cfg=cfg.lane_b, seed=str(round_id),
                               strict=cfg.lane_b.merge_guard_at_settlement(int(block)),
-                              sentinel=sentinel)
+                              sentinel=sentinel,
+                              **({"anchor_pointer": anchor_pointer} if anchor_pointer else {}))
 
     def merge_scores(self, pointer: str, block: int) -> list:
         from ..validator.evaluator import evaluate_checkpoint
