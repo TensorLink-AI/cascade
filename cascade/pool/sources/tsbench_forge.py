@@ -138,6 +138,17 @@ def resolve_frequency(freq: str) -> tuple[str, int] | None:
 # larger than this multiple of the median sampling interval (mirrors the
 # forge serving layer's contiguity rule).
 GAP_FACTOR = 8.0
+# ...except a SHORT scrape gap on a regular grid, which is bridged with NaN
+# slots instead of splitting (see ``_bridged_segment``): at most this long in
+# wall-clock seconds, and missing at most this fraction of the bridged
+# segment's expected (gridded) length. Date-templated fast feeds miss 6-25 min
+# every UTC midnight; splitting there cut 10 s feeds to their last day.
+BRIDGE_MAX_SECONDS = 3600.0
+BRIDGE_MAX_FRAC = 0.02
+# "Regular grid": at least this share of positive spacings within
+# ±BRIDGE_GRID_TOL of the median. Irregular feeds are never bridged.
+BRIDGE_GRID_SHARE = 0.9
+BRIDGE_GRID_TOL = 0.25
 # Preferred minimum segment length: horizon + the builder's default min_context.
 MIN_CONTEXT = 256
 
@@ -635,7 +646,10 @@ class TsbenchForgeSource:
         (DEC-CA-0041) it takes exactly those, aligned on the shared segment:
         one column → 1-D, several → ``(C, L)``; a missing/non-numeric named
         column drops the whole group (a tagged channel must be present).
-        NaN gaps are left in place; the builder interpolates or drops.
+        NaN gaps are left in place; the builder interpolates or drops. Short
+        scrape gaps on a regular grid are bridged with NaN slots rather than
+        split at (:meth:`_bridged_segment`); the rollup path
+        (:meth:`_rollup_values`) keeps the plain :meth:`_freshest_segment`.
         """
         df, ts = self._sorted_frame(pd, df, ctx)
         if len(df) < 2:
@@ -653,21 +667,22 @@ class TsbenchForgeSource:
             width = min(len(v) for v in chans)
             if width < 2:
                 return None
-            lo, hi = self._freshest_segment(
+            lo, hi, slots = self._bridged_segment(
                 ts_arr[:width] if ts_arr is not None else None, width,
                 min_len=ctx.horizon + MIN_CONTEXT,
             )
-            packed = np.stack([v[:width][lo:hi] for v in chans], axis=0)   # (C, L)
+            packed = np.stack([_on_grid(v[:width][lo:hi], slots) for v in chans],
+                              axis=0)   # (C, L)
             return packed[0] if packed.shape[0] == 1 else packed
 
         best_finite, best = self._densest_column(df, excluded)
         if best is None or best_finite < 2:
             return None
 
-        lo, hi = self._freshest_segment(
+        lo, hi, slots = self._bridged_segment(
             ts_arr, len(best), min_len=ctx.horizon + MIN_CONTEXT,
         )
-        return best[lo:hi]
+        return _on_grid(best[lo:hi], slots)
 
     def _rollup_values(self, pd, df, panel_cols: list[str], ctx: HarvestContext, *,
                        columns, agg: str, raw_sec: float, bucket_sec: int):
@@ -742,6 +757,98 @@ class TsbenchForgeSource:
             if hi - lo >= min_len:
                 return lo, hi
         return max(segments, key=lambda p: p[1] - p[0])
+
+    @staticmethod
+    def _bridged_segment(
+        ts_arr: np.ndarray | None, n: int, *, min_len: int
+    ) -> tuple[int, int, np.ndarray | None]:
+        """:meth:`_freshest_segment` that BRIDGES short scrape gaps instead of
+        splitting at them. Returns ``(lo, hi, slots)``: rows ``lo:hi`` are the
+        chosen segment and ``slots`` (``None`` = no bridge inside it, output is
+        exactly ``values[lo:hi]``) gives each row's position on the series'
+        regular grid; :func:`_on_grid` puts NaN in the positions between.
+
+        A gap (> ``GAP_FACTOR`` x median spacing) is bridged only when the
+        series has a regular grid (``BRIDGE_GRID_SHARE`` of spacings within
+        ``BRIDGE_GRID_TOL`` of the median), the gap is <= ``BRIDGE_MAX_SECONDS``,
+        and its missing-slot count (``round(gap / median) - 1``) is <=
+        ``BRIDGE_MAX_FRAC`` of the bridged segment's expected length (its rows
+        plus every bridged slot in it). Anything else is a cut, exactly as
+        before; demoting a gap to a cut shrinks its segment, so the rule is
+        re-applied to a fixed point (monotone: cuts only get added).
+        Irregular series, and series with no bridgeable gap, return exactly
+        what :meth:`_freshest_segment` returns. Pure numpy, deterministic.
+
+        Why this still doesn't fabricate a level shift: the hazard the split
+        guards against is a window whose history and target sit on either side
+        of a long silent stretch, so the series appears to jump between two
+        adjacent points. Bridging never joins observations as neighbours — it
+        inserts NaN (never values) on the real time grid, so positions keep
+        their wall-clock meaning (the seasonal period stays aligned) and the
+        missing span stays visible as missing. Windows are cut by the builder,
+        not the reader; the builder fills NaN by linear interpolation across at
+        most ``BRIDGE_MAX_SECONDS`` and drops the whole series if more than its
+        ``max_missing_frac`` is missing, so a bridged span is at worst a short
+        straight line, never a step. Gaps longer than an hour (or > 2% of the
+        segment) still split.
+        """
+        if ts_arr is None or n < 3:
+            return 0, n, None
+        d = np.diff(ts_arr).astype("timedelta64[s]").astype(float)
+        pos = d[d > 0]
+        if not pos.size:
+            return 0, n, None
+        med = float(np.median(pos))
+        big = d > GAP_FACTOR * med
+        bridge = big & (d <= BRIDGE_MAX_SECONDS)
+        regular = float(np.mean(np.abs(pos - med) <= BRIDGE_GRID_TOL * med)) >= BRIDGE_GRID_SHARE
+        if not regular or not bridge.any():
+            lo, hi = TsbenchForgeSource._freshest_segment(ts_arr, n, min_len=min_len)
+            return lo, hi, None
+        missing = np.where(big, np.rint(d / med).astype(np.int64) - 1, 0)
+
+        def _segments():
+            bounds = [0, *(np.flatnonzero(big & ~bridge) + 1).tolist(), n]
+            return list(zip(bounds[:-1], bounds[1:], strict=False))
+
+        changed = True
+        while changed:
+            changed = False
+            for lo, hi in _segments():
+                g = np.flatnonzero(bridge[lo:hi - 1]) + lo     # gap index i: rows i, i+1
+                if not g.size:
+                    continue
+                expected = (hi - lo) + int(missing[g].sum())
+                bad = g[missing[g] > BRIDGE_MAX_FRAC * expected]
+                if bad.size:
+                    bridge[bad] = False
+                    changed = True
+
+        step = np.where(bridge, missing + 1, 1)
+        segments = _segments()
+        out_len = [1 + int(step[lo:hi - 1].sum()) for lo, hi in segments]
+        chosen = None
+        for k in range(len(segments) - 1, -1, -1):       # newest first
+            if out_len[k] >= min_len:
+                chosen = k
+                break
+        if chosen is None:
+            chosen = max(range(len(segments)), key=lambda k: out_len[k])
+        lo, hi = segments[chosen]
+        if not bridge[lo:hi - 1].any():
+            return lo, hi, None
+        slots = np.concatenate([[0], np.cumsum(step[lo:hi - 1])])
+        return lo, hi, slots
+
+
+def _on_grid(values: np.ndarray, slots: np.ndarray | None) -> np.ndarray:
+    """Place a segment's values at their grid ``slots`` with NaN between
+    (bridged scrape gaps); ``slots=None`` returns ``values`` unchanged."""
+    if slots is None:
+        return values
+    out = np.full(int(slots[-1]) + 1, np.nan, dtype=np.float64)
+    out[slots] = values
+    return out
 
 
 def _stem_date(p: Path) -> dt.date | None:

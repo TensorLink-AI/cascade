@@ -44,5 +44,5 @@ def test_predecision_main_is_the_exact_inverse():
         "scoring.era_king_from_block": 9136800, "scoring.tenure_blocks_from_block": 9136800,
         "v2.commit_from_block": 9395601, "v2.from_block": 9399600,
         "v2.prelaunch_burn_from_block": 9486900,
-        "lane_c.from_block": 9579600, "marketcast.from_block": 9579600,
+        "lane_c.from_block": 9586800, "marketcast.from_block": 9586800,
     }
