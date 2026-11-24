@@ -34,6 +34,8 @@ W2E_DEFAULTS: dict[str, object] = {
     # Owner 2026-11-23: ON at launch (1 - 0.85 ** 0.05 ~ 0.0081 < d_margin 0.01).
     "backtest_weight_cap": 0.05,
     "backtest_ratio_floor": 0.85,
+    # rev6.14 (a): the judging start j = T + eval_delay_hours.
+    "eval_delay_hours": 6.0,
 }
 W2E_KEYS = tuple(W2E_DEFAULTS)
 
@@ -45,6 +47,7 @@ MUTATIONS: dict[str, tuple[object, object, dict]] = {
     # 1 - 0.85 ** 0.02 ~ 0.0032 and 1 - 0.85 ** 0.04 ~ 0.0065, both < 0.01.
     "backtest_weight_cap": (0.02, 0.04, {}),
     "backtest_ratio_floor": (0.9, 0.95, {}),
+    "eval_delay_hours": (3.0, 12.0, {}),
 }
 
 REFUSED: dict[str, list[object]] = {
@@ -53,6 +56,7 @@ REFUSED: dict[str, list[object]] = {
     "min_fresh_window_share": [-0.1, 1.5, True, "0.5"],
     "backtest_weight_cap": [-0.01, 1.0, 1.5, True, "0.05"],
     "backtest_ratio_floor": [0.0, -0.1, 1.5, True, "0.85"],
+    "eval_delay_hours": [-1.0, -0.5, True, "6"],
 }
 ACCEPTED: dict[str, list[object]] = {
     "embargo_hours": [0.0, 6.0, 48.0, 72.0],
@@ -60,6 +64,7 @@ ACCEPTED: dict[str, list[object]] = {
     "min_fresh_window_share": [0.0, 0.5, 1.0],
     "backtest_weight_cap": [0.0, 0.05],
     "backtest_ratio_floor": [0.85, 0.95],
+    "eval_delay_hours": [0.0, 6.0, 24.0],
 }
 
 # Overlay values that differ from the default and from ARM.
@@ -69,6 +74,7 @@ OVERLAY_VALUE: dict[str, object] = {
     "min_fresh_window_share": 0.75,
     "backtest_weight_cap": 0.03,           # 1 - 0.9 ** 0.03 ~ 0.0032 < 0.01
     "backtest_ratio_floor": 0.9,
+    "eval_delay_hours": 12.0,
 }
 
 
