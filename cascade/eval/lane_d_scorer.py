@@ -16,7 +16,11 @@
   training). Both are refused before anything is loaded or torch imported.
 * **No padding.** Each history is truncated to the largest patch multiple it
   really has, capped at the declared ``context``; histories of equal length
-  are batched together (:func:`batch_plan`, one forward per length). The
+  are batched together (:func:`batch_plan`, one batch per length). A batch
+  runs as deterministic micro-batches of at most :func:`forward_batch_size`
+  windows (#785: ``windows x patches`` past ~65k overflows the CUDA grid in
+  the pyramid's attention, and memory goes first), a pure function of the
+  input length, horizon, patch size and :data:`MAX_FORWARD_TOKENS`. The
   pinned wrapper's edge-pad is never used, so a 4k model and a declared-128k
   copy of it score identically on windows with ≤ 4096 history (T7).
 * **Context is scorer-side.** The model is built from the checkpoint's own
@@ -57,6 +61,14 @@ SCORING_METHOD = "quantile_head"
 SCORER_CONTEXTS: tuple[int, ...] = (4096, 8192, 16384, 32768, 65536, 131072)
 # CPM masks contiguous spans of at most cpm_c_max = 16 patches of 32 points.
 MAX_HORIZON = 16 * 32
+# #785: patch tokens (windows x channels x patches, horizon patches included)
+# one model forward may carry. The pyramid reshapes to (B * P, C, -1) before
+# scaled_dot_product_attention; at ~65,536 rows the CUDA launch fails
+# ("invalid configuration argument") and larger batches OOM first. Measured
+# on the launch 4090 class: 62,400 / 33,000 tokens ran (<= 4.02 GiB peak),
+# 66,000 failed. Half the 65,535 grid limit; a release constant, never a
+# runtime memory probe, so every validator cuts the same micro-batches.
+MAX_FORWARD_TOKENS = 32768
 
 
 def _as_int(value, what: str) -> int:
@@ -281,6 +293,24 @@ def batch_plan(history_lengths, *, context: int, patch_size: int) -> dict[int, l
     return {length: plan[length] for length in sorted(plan)}
 
 
+def forward_batch_size(input_len: int, horizon: int, patch_size: int, *, channels: int = 1,
+                       max_tokens: int = MAX_FORWARD_TOKENS) -> int:
+    """Windows per model forward (#785): ``max_tokens // (channels *
+    patches)``, at least 1, where ``patches`` counts the history patches
+    plus the ``ceil(horizon / patch_size)`` masked horizon patches.
+    Deterministic in its arguments; ``ValueError`` on a non-positive input."""
+    length = _as_int(input_len, "input length")
+    h = _as_int(horizon, "horizon")
+    ps = _as_int(patch_size, "patch_size")
+    c = _as_int(channels, "channels")
+    cap = _as_int(max_tokens, "max_tokens")
+    if min(length, h, ps, c, cap) < 1:
+        raise ValueError(f"forward_batch_size: non-positive input "
+                         f"(len {length}, h {h}, patch {ps}, channels {c}, max_tokens {cap})")
+    patches = -(-length // ps) + -(-h // ps)
+    return max(1, cap // (c * patches))
+
+
 def _load_model(checkpoint_dir: Path, context: int, device: str):
     import torch
     from safetensors.torch import load_file
@@ -324,8 +354,27 @@ def _forward(pm, cfg, model, rows: np.ndarray, horizon: int, device: str) -> np.
     return out.cpu().numpy().astype(np.float64)
 
 
+def _forward_chunked(pm, cfg, model, rows: np.ndarray, horizon: int, device: str,
+                     max_tokens: int) -> np.ndarray:
+    """:func:`_forward` over ``rows`` (``(B, ..., L)``, one input length) in
+    contiguous micro-batches of :func:`forward_batch_size` windows, in order,
+    concatenated along the window axis. Each window's forward is independent
+    of the others in its batch (per-row standardization, per-series
+    attention, per-token routing with no capacity drop), so the cut only
+    bounds the launch size and memory."""
+    rows = np.asarray(rows)
+    channels = int(np.prod(rows.shape[1:-1], dtype=np.int64)) if rows.ndim > 2 else 1
+    step = forward_batch_size(rows.shape[-1], horizon, int(cfg.patch_size), channels=channels,
+                              max_tokens=max_tokens)
+    if rows.shape[0] <= step:
+        return _forward(pm, cfg, model, rows, horizon, device)
+    return np.concatenate([_forward(pm, cfg, model, rows[i:i + step], horizon, device)
+                           for i in range(0, rows.shape[0], step)], axis=0)
+
+
 def forecast_quantiles(checkpoint_dir: str | os.PathLike, histories, *, context: int,
-                       horizon: int, contexts=None, device: str = "cpu") -> np.ndarray:
+                       horizon: int, contexts=None, device: str = "cpu",
+                       max_tokens: int = MAX_FORWARD_TOKENS) -> np.ndarray:
     """``(n, horizon, 9)`` quantile forecasts of ``histories`` at
     :data:`SCORING_LEVELS`.
 
@@ -336,11 +385,16 @@ def forecast_quantiles(checkpoint_dir: str | os.PathLike, histories, *, context:
     :data:`SCORER_CONTEXTS`. ``horizon`` must be in ``[1, MAX_HORIZON]``.
     Both checks run before anything is loaded or torch is imported. Each
     window's model input is its last :func:`batch_plan` length points plus
-    ``ceil(h/32)`` masked horizon patches, one forward per length. Raises
+    ``ceil(h/32)`` masked horizon patches, one batch per length, run in
+    micro-batches of :func:`forward_batch_size` windows (``max_tokens``
+    patch tokens per forward; #785). Raises
     ``ValueError`` on a history shorter than one patch, a non-finite history
     or a non-finite forecast."""
     ctx = declared_context(context, SCORER_CONTEXTS if contexts is None else contexts)
     h = _checked_horizon(horizon)
+    tokens = _as_int(max_tokens, "max_tokens")
+    if tokens < 1:
+        raise ValueError(f"max_tokens must be positive, got {tokens}")
     d = Path(checkpoint_dir)
     rows = []
     for i, hist in enumerate(histories):
@@ -362,7 +416,8 @@ def forecast_quantiles(checkpoint_dir: str | os.PathLike, histories, *, context:
     out = np.empty((len(rows), h, len(picks)), dtype=np.float64)
     with torch.no_grad():
         for length, idx in plan.items():
-            q = _forward(pm, cfg, model, np.stack([rows[i][-length:] for i in idx]), h, device)
+            q = _forward_chunked(pm, cfg, model, np.stack([rows[i][-length:] for i in idx]), h,
+                                 device, tokens)
             out[idx] = q[:, :, picks]
     if not np.isfinite(out).all():
         raise ValueError("non-finite lane D quantiles")
@@ -388,6 +443,7 @@ def score_window(q: np.ndarray, target: np.ndarray, history: np.ndarray,
     return crps, m
 
 
-__all__ = ["MAX_HORIZON", "MEDIAN_INDEX", "SCORER_CONTEXTS", "SCORING_LEVELS", "SCORING_METHOD",
-           "batch_plan", "declared_context", "forecast_quantiles", "level_indices",
+__all__ = ["MAX_FORWARD_TOKENS", "MAX_HORIZON", "MEDIAN_INDEX", "SCORER_CONTEXTS", "SCORING_LEVELS", "SCORING_METHOD",
+           "batch_plan", "declared_context", "forecast_quantiles", "forward_batch_size",
+           "level_indices",
            "score_window", "usable_length"]

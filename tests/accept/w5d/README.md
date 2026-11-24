@@ -20,6 +20,7 @@ Accept: `scripts/laned/accept W5d` (CI, tiny model) and, for T7,
 | each `[lane_d] contexts` value is a declared scorer context; others are refused | `test_scorer_contexts_cover_every_lane_d_context`, `test_each_lane_d_context_is_a_declared_scorer_context`, `test_undeclared_context_is_refused`, `test_forecast_refuses_undeclared_context_before_loading` |
 | horizons ≤ 512 (16 CPM patches × 32) | `test_forecast_refuses_horizon_over_512_before_loading` |
 | no padding: model input length = available history (largest patch multiple), capped at context | `test_batch_plan_*`, `test_no_pad_model_input_is_real_history_capped_at_context` (torch, a forward pre-hook records the patch tensor), `test_no_pad_truncates_to_the_largest_patch_multiple` (torch) |
+| (#785) settlement-size micro-batching: deterministic window chunks under the CUDA grid limit, byte-identical forecasts | `test_forward_batch_size_is_tokens_over_patches`, `test_forward_batch_stays_under_the_grid_limit_at_every_context`, `test_forecast_refuses_a_non_positive_max_tokens_before_loading`, `test_micro_batched_forecast_is_byte_identical_to_one_forward_per_length` (torch) |
 | T7 CI half: a 4k checkpoint and its declared-128k copy score identically on ≤ 4096-history windows | `test_t7_4k_checkpoint_and_declared_128k_copy_identical_on_short_windows` (torch; also 8k and 16k) |
 | T7 pod half: wall time + memory per variant, armed only if it fits | `test_evidence_*` (read `$LANED_EVIDENCE`), `test_builder_*`, `test_verifier_*`, `test_measure_variant_and_short_window_check_on_a_tiny_model` (torch) |
 | (RV3) a variant row is only certified on inputs that exercise it: `input_len == variant`, every history ≥ variant, memory = the variant's own CUDA peak | `test_builder_row_records_the_input_that_ran`, `test_builder_row_refuses_*`, `test_builder_pod_evidence_refuses_process_peak_rss`, `test_builder_refuses_a_hand_edited_row`, `test_measure_variant_refuses_short_history_before_loading`, `test_verifier_rejects_*_that_did_not_exercise_its_variant`, the tiny-model test (torch; a forward pre-hook checks the model input really is 8192 points) |
@@ -49,9 +50,21 @@ Everything W1.5 pins stays (`SCORING_LEVELS`, `MEDIAN_INDEX`,
     `torch` is imported (the tests make `import torch` fail and pass a
     checkpoint dir that does not exist).
   - The model input of each window is its **last** `batch_plan` length
-    points, batched by `batch_plan` (one forward per length), plus
+    points, batched by `batch_plan` (one batch per length), plus
     `ceil(h/32)` masked horizon patches. No edge pad. So with history 330 the
     forecast equals that of its last 320 points.
+  - **(#785) Micro-batching.** Each length's batch runs as contiguous
+    micro-batches of `forward_batch_size(length, horizon, patch_size,
+    channels=1, max_tokens=MAX_FORWARD_TOKENS)` windows, in window order:
+    `max(1, max_tokens // (channels * (ceil(length/patch) +
+    ceil(h/patch))))`. `MAX_FORWARD_TOKENS == 32768`, a release constant
+    (half the ~65,536-row CUDA grid limit the pyramid's SDPA hit at
+    settlement size; never a runtime memory probe, so every validator cuts
+    the same micro-batches). `forecast_quantiles(..., max_tokens=)`
+    (keyword, default `MAX_FORWARD_TOKENS`) overrides it; a non-positive or
+    non-int value is a `ValueError` before anything loads. Chunking does not
+    change a forecast: byte-identical to one forward per length (CPU, tiny
+    model).
   - Returns `(n, horizon, 9)` finite float64 at `SCORING_LEVELS`.
 
 Lane A equality (torch): the house (F32, median bias +3) on 12 windows with
