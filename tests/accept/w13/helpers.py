@@ -198,7 +198,7 @@ def king_record(hotkey: str, digest: str, *, crown_block: int = 9_000_900,
                  "suites": {"gift_eval": {"crps": 0.512, "mase": 0.861},
                             "boom": {"crps": 0.377, "mase": 0.902}}},
         "sentinel": {"suite": "time", "crps": 0.433, "mase": 0.915},
-        "license": "Apache-2.0",
+        "license": "MIT",
     }
 
 

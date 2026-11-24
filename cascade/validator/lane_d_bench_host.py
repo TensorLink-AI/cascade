@@ -26,6 +26,25 @@ from pathlib import Path
 REQUEST_SCHEMA = "lane-d-bench-request/1"
 REPLY_SCHEMA = "lane-d-bench-reply/1"
 DEFAULT_TIMEOUT_S = 6 * 3600
+SETTINGS_KEYS = ("num_samples", "max_series", "batch_size", "workers", "data_dir")
+# The sidecar's batch size; lane A's DEC-CA-0063 sweep never overrides it
+# (``eval_offload.run_bench_via_host_many`` / ``benchmarks.run_bench_reports``).
+LANE_A_BATCH_SIZE = 512
+
+
+def bench_settings(cfg) -> dict:
+    """The sidecar settings lane A's DEC-CA-0063 sweep runs with
+    (``validator_bench.ValidatorBenchMixin._vbench_run_sidecar_many``), read
+    from ``cfg.eval`` so a lane D and a lane A bench of one checkpoint
+    match, plus lane A's per-checkpoint allowance (box-side only)."""
+    ec = cfg.eval
+    return {"num_samples": int(ec.benchmark_num_samples or ec.num_samples),
+            "max_series": int(ec.cascade_bench_max_series),
+            "batch_size": LANE_A_BATCH_SIZE,
+            "workers": str(getattr(ec, "bench_workers", "1")),
+            "data_dir": ec.gift_gate_data_dir or None,
+            "timeout_s_per_checkpoint": (int(ec.bench_hold_max_hours * 3600)
+                                         if ec.cascade_bench_max_series == 0 else 1800)}
 
 
 class LaneDBenchHostError(RuntimeError):
@@ -37,14 +56,19 @@ class SSHBenchHost:
     docstring). ``grants(digest)`` gives a presigned GET grant or ``None``;
     ``run`` is the ``subprocess.run``-shaped runner."""
 
-    def __init__(self, hosts_path, *, cache_dir: str, budget_bytes: int,
+    def __init__(self, hosts_path, *, cache_dir: str, budget_bytes: int, settings: Mapping,
                  grants: Callable[[str], Mapping | None] | None = None,
-                 timeout_s: float = DEFAULT_TIMEOUT_S, run: Callable | None = None):
+                 run: Callable | None = None):
         self.hosts_path = Path(hosts_path)
         self.cache_dir = str(cache_dir)
         self.budget_bytes = int(budget_bytes)
+        self.settings = dict(settings)
+        missing = [k for k in SETTINGS_KEYS if k not in self.settings]
+        if missing:
+            raise ValueError(f"SSHBenchHost settings lack {missing}")
+        self.timeout_per_checkpoint_s = float(
+            self.settings.get("timeout_s_per_checkpoint", DEFAULT_TIMEOUT_S))
         self._grants = grants
-        self.timeout_s = float(timeout_s)
         self._run = run or subprocess.run
         self._contexts: dict[str, int] = {}
 
@@ -71,7 +95,8 @@ class SSHBenchHost:
             g = None if self._grants is None else self._grants(d)
             grants[d] = None if g is None else dict(g)
         return {"schema": REQUEST_SCHEMA, "digests": digests, "suites": suites,
-                "contexts": {d: self._contexts[d] for d in digests}, "grants": grants}
+                "contexts": {d: self._contexts[d] for d in digests}, "grants": grants,
+                "settings": {k: self.settings[k] for k in SETTINGS_KEYS}}
 
     @staticmethod
     def _checked(reply, digests: list[str]) -> dict:
@@ -106,7 +131,7 @@ class SSHBenchHost:
         cmd = f"cd {shlex.quote(host.workdir)} && {env}" + " ".join(shlex.quote(a) for a in args)
         payload = json.dumps(request, sort_keys=True).encode("utf-8")
         proc = self._run(build_ssh_argv(host, cmd), input=payload, capture_output=True,
-                         timeout=self.timeout_s, check=False)
+                         timeout=self.timeout_per_checkpoint_s * len(ds), check=False)
         err = (proc.stderr or b"").decode("utf-8", "replace")[-600:]
         if proc.returncode != 0:
             raise LaneDBenchHostError(f"{host.name}: lane D bench sweep exited "
@@ -122,4 +147,5 @@ class SSHBenchHost:
         return self._checked(reply, ds)
 
 
-__all__ = ["REPLY_SCHEMA", "REQUEST_SCHEMA", "LaneDBenchHostError", "SSHBenchHost"]
+__all__ = ["REPLY_SCHEMA", "REQUEST_SCHEMA", "SETTINGS_KEYS", "LaneDBenchHostError", "SSHBenchHost",
+           "bench_settings"]

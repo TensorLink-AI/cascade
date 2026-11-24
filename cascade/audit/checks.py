@@ -2854,7 +2854,7 @@ def _lane_vector_want(receipt: RoundReceipt, cfg: ChainConfig, got_pol,
             scale = (pool_a - share_d) / pool_a
             a = [x * scale for x in a]
         d = _lane_d_part(n_uids, share=share_d, court=d_court,
-                         king_decay=float(cfg.lane_d.king_decay), burn_uid=burn)
+                         court_weights=cfg.lane_d.court_weights, burn_uid=burn)
         b = [x + y for x, y in zip(b, d, strict=True)]
     kept_apart = pay is not None or c_pay is not None or d_court is not None
     want = emission_vector(a, b if kept_apart else None, got_pol,
@@ -2904,21 +2904,26 @@ def _lane_d_carve(cfg: ChainConfig, b_cfg, c_cfg) -> tuple[float, str | None]:
                  f"not re-derived by the audit")
 
 
-def _lane_d_part(n_uids: int, *, share: float, court: list, king_decay: float,
+def _lane_d_part(n_uids: int, *, share: float, court: list, court_weights,
                  burn_uid: int) -> list[float]:
     """Lane D's part, summing to ``share``: slot ``i`` of ``court`` (uids,
-    king first) is worth ``king_decay ** i`` normalised over the slots; a
-    null, non-integer, out-of-range or repeated uid burns to ``burn_uid``;
-    an empty court burns the whole share."""
+    king first) is worth ``court_weights[i]`` (rev6.23: ``[lane_d]
+    court_weights``, 0.80 / 0.15 / 0.05) normalised over the slots the court
+    has; a null, non-integer, out-of-range or repeated uid burns to
+    ``burn_uid``; an empty court (or one whose slots weigh 0) burns the
+    whole share; a slot past ``court_weights`` weighs 0."""
     out = [0.0] * n_uids
     s = float(share)
     if s == 0.0:
         return out
-    if not court:
+    weights = [float(w) for w in court_weights]
+    # A slot past court_weights (a court longer than 1 + reward_prior_kings,
+    # refused by check_lane_d's ld_court) weighs 0: it is never paid.
+    raw = [weights[i] if i < len(weights) else 0.0 for i in range(len(court))]
+    total = sum(raw)
+    if not court or total <= 0.0:
         out[burn_uid] += s
         return out
-    raw = [float(king_decay) ** i for i in range(len(court))]
-    total = sum(raw)
     seen: set[int] = set()
     for uid, w in zip(court, raw, strict=True):
         amt = s * w / total
@@ -2929,6 +2934,13 @@ def _lane_d_part(n_uids: int, *, share: float, court: list, king_decay: float,
             seen.add(uid)
             out[uid] += amt
     return out
+
+
+def _lane_d_max_channels(cfg) -> int | None:
+    """``[generator] max_channels`` (rev6.18 A4, F2): the cap the lane D
+    audit re-derives each multichannel window's channel pick with."""
+    v = getattr(getattr(cfg, "generator", None), "max_channels", None)
+    return None if v is None else int(v)
 
 
 @dataclass(frozen=True)
@@ -3020,7 +3032,8 @@ def lane_d_pay(receipt: RoundReceipt, cfg: ChainConfig, lane_d) -> LaneDPay:
                                f"the report body is {body[:12]}")
     court = _signed_court(report)
     f = lane_d_findings(report, cfg.lane_d, signer_hotkey=cfg.manifest.validator_hotkey,
-                        prior_reports=None if prior is None else list(prior))
+                        prior_reports=None if prior is None else list(prior),
+                        max_channels=_lane_d_max_channels(cfg))
     alerts = tuple(f"{c}: {d}" for c, d in f.alerts)
     burn = f.burn
     if burn is not None:

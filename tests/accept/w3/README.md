@@ -192,7 +192,7 @@ The body is `{"licence": <id>, "attestation": <text>}`; unparseable is
 `400 bad_body`. The steps, in order:
 
 1. **B13 licence attestation.** The licence must be one of
-   `service.LICENCES == ("Apache-2.0", "OpenMDW-1.1")` (D13), else
+   `service.LICENCES == ("MIT",)` (D13), else
    `400 licence_not_open`. The attestation must be exactly
    `service.LICENCE_ATTESTATION`, else `400 licence_attestation_missing`.
    That's one statement of at least 80 characters naming both licences,
@@ -277,6 +277,17 @@ entry. A failed `reveal_block` read never expires an entry; the answer is
   `context`, `coldkey_at_ready`, `ready_block`, `ready_expires_block`,
   `weights_sha256`, `licence` and `licence_attestation_sha256`. Ready-time
   fields are `null` before ready.
+- Background refresh (#842, testnet 2026-11-24): the validator reads the
+  file directly, so `ready → revealed` / `ready → ready_expired` must land
+  without traffic. `LaneDIntake.tick()` runs the request-path refresh under
+  the request lock (same atomic write; a failed chain read or write is
+  logged and returns `None`, nothing changes).
+  `LaneDIntake.refresh_timer(interval_s=None, *, wait=None)` returns a
+  `service.RefreshTimer` ticking every `[lane_d_ops] queue_poll_seconds`
+  (`run()` ticks first, then `wait(interval)`; `True` ends the loop;
+  `start()` / `stop()` run it on a daemon thread; a tick never kills the
+  loop). `main()` ticks once at startup, then starts the timer.
+  Tests: `test_w3_refresh_timer.py`.
 
 ## Secrets
 

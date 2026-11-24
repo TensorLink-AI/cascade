@@ -91,6 +91,10 @@ PRIOR_STATE_EXTENSION = "prior_state_sha256"
 # KING_D (absent otherwise, so a state with no house challenger keeps its
 # pre-W5f bytes).
 HOUSE_ENTRY_KEY = "house_entry"
+# rev6.23: the state key of KING_D's tenure, the lane D settlements it has held
+# the crown before the next one (the crown bar's input). Written by every
+# settlement; absent at genesis (so the genesis bytes are unchanged) = 0.
+KING_TENURE_KEY = "king_tenure"
 # A persisted report's file name under ``report_path``'s directory.
 _REPORT_NAME = re.compile(r"lane_d_report_([0-9]+)\.json")
 RECEIPT_ERROR_CODES = ("not_object", "unknown_schema", "missing_field", "unknown_field",
@@ -672,7 +676,7 @@ def verify_receipt_chain(receipts) -> None:
 
 __all__ = ["ABSENT_FIELDS", "ABSENT_REASONS", "ABSENT_STATUS",
            "CONFIRM_MIGRATION_EXTENSION", "CONFIRM_MIGRATION_TAG", "ENTRY_REASONS", "ENTRY_STATUSES",
-           "HOUSE_ENTRY_KEY", "LEGACY_CONFIRM_STATUS", "PRIOR_STATE_EXTENSION",
+           "HOUSE_ENTRY_KEY", "KING_TENURE_KEY", "LEGACY_CONFIRM_STATUS", "PRIOR_STATE_EXTENSION",
            "RECEIPT_ERROR_CODES",
            "RECEIPT_FIELDS", "RECEIPT_SCHEMA", "STATE_ERROR_CODES", "STATE_ONLY_REASONS",
            "STATE_SCHEMA", "LaneDReceiptError", "LaneDStateError", "bound_prior_state",

@@ -145,7 +145,9 @@ def test_inv1_weights_armed_nonempty_lane_d_effect():
 # ── armed goldens: court decay, house burn, B8, unregistered king ───────────
 
 S = 0.25
-K, P1, P2 = S * 4 / 7, S * 2 / 7, S * 1 / 7      # decay 0.5 over 3 slots
+# rev6.23 (owner 2026-11-24): court_weights 0.80 / 0.15 / 0.05 over 3 slots
+# (was the geometric decay 0.5: 4/7, 2/7, 1/7).
+K, P1, P2 = S * 0.80, S * 0.15, S * 0.05
 
 ARMED_NO_BC = {
     # name: (d_court, expected vector)       lane A: 0.75 x [2/3, 1/3] on [3, 4]
@@ -158,7 +160,7 @@ ARMED_NO_BC = {
     "deregistered_prior": ((KING_D_UID, None, PRIOR_2_UID),           # B8
                            [P1, 0.0, 0.0, 0.5, 0.25, 0.0, K, P2]),
     "deregistered_king": ((None, PRIOR_1_UID),                        # B8
-                          [S * 2 / 3, 0.0, 0.0, 0.5, 0.25, S / 3, 0.0, 0.0]),
+                          [S * 0.80 / 0.95, 0.0, 0.0, 0.5, 0.25, S * 0.15 / 0.95, 0.0, 0.0]),
     "unregistered_king_uid": ((99, PRIOR_1_UID, PRIOR_2_UID),         # no such uid
                               [K, 0.0, 0.0, 0.5, 0.25, P1, 0.0, P2]),
     "empty_court": ((), [S, 0.0, 0.0, 0.5, 0.25, 0.0, 0.0, 0.0]),
@@ -218,7 +220,8 @@ def test_house_and_dead_slots_burn_to_burn_uid_only():
     _, b_house = parts(d_cfg=lane_d_cfg(), d_court=(None, PRIOR_1_UID))
     _, b_paid = parts(d_cfg=lane_d_cfg(), d_court=(KING_D_UID, PRIOR_1_UID))
     diff = [x - y for x, y in zip(b_house, b_paid, strict=True)]
-    _close(diff, [S * 2 / 3, 0.0, 0.0, 0.0, 0.0, 0.0, -S * 2 / 3, 0.0])
+    # rev6.23: a two-slot court renormalises court_weights[:2] (0.80 / 0.95).
+    _close(diff, [S * 0.80 / 0.95, 0.0, 0.0, 0.0, 0.0, 0.0, -S * 0.80 / 0.95, 0.0])
 
 
 # ── D48: lane D's budget never varies with the lane A ladder ────────────────

@@ -190,12 +190,15 @@ def test_d_margin_is_an_inclusive_bar_on_the_lcb(tmp_path):
     _, _, x, _, _, s1 = _first_verdict(tmp_path / "probe")
     lcb = verdict_of(s1.report, x["digest"])["lcb"]
     assert 0.0 < lcb < 1.0, f"fixture: X's LCB {lcb} is not inside (0, 1)"
-    at = lane_d_cfg(d_margin=lcb)
+    # rev6.23: the bar decays from d_margin_start to d_margin; both at the
+    # LCB pin the bar there at every tenure.
+    at = lane_d_cfg(d_margin=lcb, d_margin_start=lcb)
     _, _, x, path, _, s = _first_verdict(tmp_path / "at", at)
     v = verdict_of(s.report, x["digest"])
     assert v["lcb"] == lcb, "the LCB must not depend on d_margin"
     assert v["cleared"] is True, "LCB == d_margin must clear (LCB_α ≥ d_margin)"
-    above = lane_d_cfg(d_margin=math.nextafter(lcb, 1.0))
+    above = lane_d_cfg(d_margin=math.nextafter(lcb, 1.0),
+                       d_margin_start=math.nextafter(lcb, 1.0))
     _, _, x, path, _, s = _first_verdict(tmp_path / "above", above)
     v = verdict_of(s.report, x["digest"])
     assert v["cleared"] is False and v["outcome"] == "lost"
@@ -246,8 +249,13 @@ def test_max_t_crowns_the_best_of_a_clearing_cohort_at_the_first_verdict(tmp_pat
 def test_every_verdict_clears_iff_lcb_reaches_d_margin_and_gain_is_positive(tmp_path):
     cfg, _, _, _, _, s1 = _two_entry_first(tmp_path)
     assert s1.report["verdicts"]
+    # rev6.23: the bar in force at the settlement (tenure 0: d_margin_start).
+    cb = s1.report.get("crown_bar")
+    assert isinstance(cb, dict), "the report records no crown_bar (rev6.23)"
+    bar = cb["margin"]
+    assert bar == cfg.crown_bar(s1.report["crown_bar"]["tenure"]) >= cfg.d_margin
     for v in s1.report["verdicts"]:
-        assert v["cleared"] == (v["lcb"] >= cfg.d_margin and v["gain"] > 0.0), v
+        assert v["cleared"] == (v["lcb"] >= bar and v["gain"] > 0.0), v
 
 
 def test_confirm_on_king_change_is_parsed_and_ignored(tmp_path):

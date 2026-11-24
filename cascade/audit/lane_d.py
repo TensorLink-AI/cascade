@@ -124,7 +124,12 @@ def _expected_params(cfg) -> dict:
             "forward_margin_hours": float(cfg.forward_margin_hours),
             "min_windows": int(cfg.min_windows), "min_clusters": int(cfg.min_clusters),
             "d_margin": float(cfg.d_margin), "alpha": float(cfg.alpha),
-            "bootstrap_B": int(cfg.bootstrap_B), "king_decay": float(cfg.king_decay),
+            "bootstrap_B": int(cfg.bootstrap_B),
+            # rev6.23: the tenure-decaying crown bar (d_margin is its end) and
+            # the explicit court weights (they replace king_decay).
+            "d_margin_start": float(cfg.d_margin_start),
+            "d_margin_warmup_settlements": int(cfg.d_margin_warmup_settlements),
+            "court_weights": [float(w) for w in cfg.court_weights],
             "reward_prior_kings": int(cfg.reward_prior_kings),
             "max_entries_per_settlement": int(cfg.max_entries_per_settlement),
             "max_judged_per_coldkey_per_settlement":
@@ -197,8 +202,55 @@ def _judge(report: dict, cfg, scores: dict, bar: str, members: list[str],
     out = []
     for m, lcb in zip(members, lcbs, strict=True):
         gain = (bg - _geo(*scores[m])) / (bg if abs(bg) >= 1e-9 else 1e-9)
-        out.append((float(lcb), float(gain), bool(lcb >= float(cfg.d_margin) and gain > 0.0)))
+        out.append((float(lcb), float(gain), bool(lcb >= _report_bar(report, cfg)
+                                                  and gain > 0.0)))
     return out
+
+
+def crown_bar_of(cfg, tenure: int) -> float:
+    """rev6.23, re-derived from the parsed ``[lane_d]`` keys (never the
+    producer's): ``d_margin_start`` at tenure 0, falling linearly to
+    ``d_margin`` at ``d_margin_warmup_settlements`` and flat after."""
+    w = int(cfg.d_margin_warmup_settlements)
+    t = max(0, int(tenure))
+    start, end = float(cfg.d_margin_start), float(cfg.d_margin)
+    if t >= w:
+        return end
+    return start - (start - end) * t / w
+
+
+def _crown_bar_problem(report: dict, cfg) -> str | None:
+    """rev6.23: ``crown_bar`` is ``{tenure, margin}`` with ``margin`` the bar
+    re-derived from the config at ``tenure`` (the tenure itself is a chain
+    rule: :func:`_continuity_problem`)."""
+    cb = report.get("crown_bar")
+    if not isinstance(cb, dict) or set(cb) != {"tenure", "margin"}:
+        return f"crown_bar {cb!r} is not {{tenure, margin}}"
+    t = cb["tenure"]
+    if not _int_value(t) or t < 0:
+        return f"crown_bar.tenure {t!r} is not an int >= 0"
+    want = crown_bar_of(cfg, t)
+    if not _close(cb["margin"], want):
+        return f"crown_bar.margin {cb['margin']!r} != {want!r} re-derived at tenure {t}"
+    return None
+
+
+def _report_bar(report: dict, cfg) -> float:
+    """The bar a verdict clears against: re-derived at the report's stated
+    tenure (checked by :func:`_crown_bar_problem` before any cohort)."""
+    return crown_bar_of(cfg, int(report["crown_bar"]["tenure"]))
+
+
+def next_tenure(prior: dict) -> int | None:
+    """rev6.23: the tenure the settlement after ``prior`` must state: 1
+    after a crown (a miner crowned, or the house retaking from a miner), else
+    the prior tenure + 1; ``None`` when ``prior`` carries no ``crown_bar``."""
+    cb = prior.get("crown_bar")
+    if not isinstance(cb, dict) or not _int_value(cb.get("tenure")):
+        return None
+    kb, ka = prior.get("king_before") or {}, prior.get("king_after") or {}
+    retake = bool(ka.get("house")) and not bool(kb.get("house"))
+    return 1 if (prior.get("crowned") is not None or retake) else int(cb["tenure"]) + 1
 
 
 def _bars(kd: str, hd: str, members) -> list[str]:
@@ -1030,6 +1082,12 @@ def _continuity_problem(report: dict, priors, entries: dict) -> str | None:
             continue
         return (f"king_before {str(kb.get('digest'))[:12]} is not where the report at {b} "
                 f"left KING_D ({str((ka or {}).get('digest'))[:12]})")
+    # rev6.23: KING_D's tenure continues from the latest earlier report.
+    want_t = next_tenure(next(p for b, p in earlier if b == latest))
+    got_t = (report.get("crown_bar") or {}).get("tenure")
+    if want_t is not None and got_t != want_t:
+        return (f"crown_bar.tenure {got_t!r} does not continue the report at {latest} "
+                f"(want {want_t})")
     for b, p in sorted(earlier, key=lambda x: x[0]):
         ph = p.get("house")
         if isinstance(ph, dict) and ph.get("digest") == house["digest"] and ph != house:
@@ -1122,6 +1180,103 @@ def window_refusal(series: dict, feeds: dict, bound: float, cfg) -> str | None:
     return None
 
 
+# rev6.18 A4 (F2): the multichannel window's channel pick, re-stated from the
+# spec (plan rev6.18 A4; tests/accept/w9/README.md "Multichannel windows"),
+# never imported from the producer (invariant 12).
+CHANNEL_SEED_TAG = "lane_d_channels"
+CHANNEL_FIELDS = ("series_id", "n_channels_raw", "empty_channels", "n_channels", "channels",
+                  "channels_sha256")
+
+
+def channel_pick(block_hash, series_id: str, candidates, max_channels: int) -> list[int]:
+    """The scored channels: every candidate when at most ``max_channels``;
+    else the ``max_channels`` with the smallest ``sha256(seed ‖ ":" ‖ c)``,
+    ``seed = sha256(block_hash ‖ series_id ‖ "lane_d_channels")``, ascending;
+    ``[]`` for an over-cap set without a block hash."""
+    cand = sorted({int(c) for c in candidates})
+    if len(cand) <= int(max_channels):
+        return cand
+    if block_hash is None:
+        return []
+    seed = hashlib.sha256(f"{block_hash}{series_id}{CHANNEL_SEED_TAG}".encode()).hexdigest()
+    ranked = sorted(cand, key=lambda c: hashlib.sha256(f"{seed}:{c}".encode()).hexdigest())
+    return sorted(ranked[:int(max_channels)])
+
+
+def _channel_problems(report: dict, windows: dict, max_channels) -> list[str]:
+    """F2: every judged multichannel window's recorded pick is the one the
+    rule gives for its raw channel count, its dropped channels, the
+    settlement's block hash (the draw's) and ``[generator] max_channels``."""
+    draw = report.get("draw")
+    bh = draw.get("boundary_block_hash") if isinstance(draw, dict) else None
+    out = []
+    for c in report.get("cohorts") or []:
+        for wid in c["window_ids"]:
+            w = windows.get(wid)
+            if w is None or not any(k in w for k in CHANNEL_FIELDS):
+                continue
+            if any(k not in w for k in CHANNEL_FIELDS):
+                out.append(f"window {wid}: a multichannel window lacks a channel field")
+                continue
+            if max_channels is None:
+                out.append(f"window {wid}: multichannel, but no [generator] max_channels to "
+                           f"re-derive its pick")
+                continue
+            raw, empty = int(w["n_channels_raw"]), {int(x) for x in w["empty_channels"]}
+            want = channel_pick(bh, str(w["series_id"]),
+                                [i for i in range(raw) if i not in empty], int(max_channels))
+            if not want:
+                out.append(f"window {wid}: no channel can be scored, yet it was judged")
+                continue
+            body = json.dumps(want, separators=(",", ":")).encode()
+            if ([int(x) for x in w["channels"]] != want or int(w["n_channels"]) != len(want)
+                    or w["channels_sha256"] != hashlib.sha256(body).hexdigest()):
+                out.append(f"window {wid}: channels {w['channels']!r} are not the re-derived "
+                           f"pick {want!r}")
+    return out
+
+
+def _snapshot_channels_problem(z, s: dict, w: dict) -> str | None:
+    """F2 with the snapshot (z its open hist.npz): the window's
+    multichannel record matches the stored series (its id and channel
+    count), every scored channel holds a finite value, and a window recorded
+    univariate is not a C ≥ 2 series."""
+    sid = str(s["series_id"])
+    try:
+        hist = np.asarray(z[sid], dtype=np.float64)
+    except (OSError, KeyError, ValueError) as e:
+        return f"window {w['window_id']}: history unreadable ({type(e).__name__})"
+    multi = hist.ndim == 2 and hist.shape[0] > 1
+    if not any(k in w for k in CHANNEL_FIELDS):
+        return (f"window {w['window_id']}: a {hist.shape[0]}-channel series recorded as "
+                f"univariate") if multi else None
+    if not multi or w.get("series_id") != sid or int(w["n_channels_raw"]) != hist.shape[0]:
+        return (f"window {w['window_id']}: channel record (series {w.get('series_id')!r}, "
+                f"{w.get('n_channels_raw')!r} channels) is not the snapshot's {sid!r} "
+                f"{tuple(hist.shape)}")
+    chans = [int(x) for x in w.get("channels") or []]
+    if any(not 0 <= x < hist.shape[0] or not np.isfinite(hist[x]).any() for x in chans):
+        return f"window {w['window_id']}: a scored channel is empty in the snapshot"
+    return None
+
+
+def _snapshot_windows_channels(d: Path, judged: list, by_id: dict) -> str | None:
+    """:func:`_snapshot_channels_problem` over one snapshot's judged windows
+    (its ``hist.npz`` opened once)."""
+    try:
+        with np.load(d / "hist.npz") as z:
+            for w, _bound in judged:
+                s = by_id.get(w["window_id"])
+                if s is None:
+                    continue
+                why = _snapshot_channels_problem(z, s, w)
+                if why is not None:
+                    return why
+    except (OSError, ValueError) as e:
+        return f"snapshot {d.name}: hist.npz unreadable ({type(e).__name__})"
+    return None
+
+
 def _snapshot_digest(d: Path) -> str:
     parts = "".join(hashlib.sha256((d / n).read_bytes()).hexdigest() for n in _SNAPSHOT_FILES)
     return hashlib.sha256(parts.encode()).hexdigest()
@@ -1130,6 +1285,7 @@ def _snapshot_digest(d: Path) -> str:
 def _snapshot_problem(report: dict, cfg, pool_dirs, windows: dict) -> str | None:
     """README rules 12-14 against the provided snapshot directories."""
     metas: dict[str, object] = {}
+    dirs: dict[str, Path] = {}
     for d in pool_dirs:
         p = Path(d)
         try:
@@ -1138,6 +1294,7 @@ def _snapshot_problem(report: dict, cfg, pool_dirs, windows: dict) -> str | None
         except (OSError, ValueError):
             continue
         metas.setdefault(dg, meta)
+        dirs.setdefault(dg, p)
     judged: dict[str, list] = {}
     margin = 3600.0 * float(cfg.forward_margin_hours)
     for c in report.get("cohorts") or []:
@@ -1169,6 +1326,9 @@ def _snapshot_problem(report: dict, cfg, pool_dirs, windows: dict) -> str | None
             ts = s.get("target_ts")
             if isinstance(sid, str) and isinstance(ts, list) and ts and _finite(ts[0]):
                 by_id[f"{sid}:{int(ts[0])}:h{h}"] = s
+        why = _snapshot_windows_channels(dirs[sha], judged[sha], by_id)
+        if why is not None:
+            return why
         for w, bound in judged[sha]:
             wid = w["window_id"]
             s = by_id.get(wid)
@@ -1299,7 +1459,7 @@ class LaneDFindings:
 
 def lane_d_findings(report: dict, cfg, *, signer_hotkey: str, prior_reports=None,
                     era_sentinel=_UNSET, pool_dirs=None, bench_rows=None, uid_of=None,
-                    chain=None) -> LaneDFindings:
+                    chain=None, max_channels=None) -> LaneDFindings:
     """Run every check of :func:`check_lane_d` and return its findings
     (rev6.18 B3). Same arguments as :func:`check_lane_d`.
 
@@ -1401,6 +1561,10 @@ def lane_d_findings(report: dict, cfg, *, signer_hotkey: str, prior_reports=None
         if expected_rows != len(rows):
             f.add("ld_rows_count", f"{len(rows)} rows; the cohorts account for {expected_rows}")
             return f
+        # rev6.23: the crown bar applied is the config's at the stated
+        # tenure; every verdict below clears against it.
+        if one("ld_params", _crown_bar_problem(report, cfg)):
+            return f
         problems, confirms = [], {}
         for c in cohorts:
             problems += _cohort_problems(report, cfg, c, rows_by, windows, entries, confirms)
@@ -1410,6 +1574,9 @@ def lane_d_findings(report: dict, cfg, *, signer_hotkey: str, prior_reports=None
         alert("ld_clock", lambda: _clock_problems(report, cfg, windows))
         alert("ld_embargo", lambda: _embargo_problems(report, cfg, windows, rows_by))
         alert("ld_draw", lambda: _draw_problems(report, cfg, windows))
+        # rev6.18 A4 (F2): each multichannel window's channel pick is part of
+        # the seeded draw (the boundary block hash): re-derived, alert class.
+        alert("ld_draw", lambda: _channel_problems(report, windows, max_channels))
         # The §1.3b gate decides every crowning candidate; the crowning and
         # the paid court follow from it.
         crown, problems = _crown_problems(report, cfg, boundary, confirms, entries)
@@ -1592,7 +1759,7 @@ def _chain_findings(report: dict, cfg, signer_hotkey: str, prior_reports, chain)
 
 def check_lane_d(report: dict, cfg, *, signer_hotkey: str, prior_reports=None,
                  era_sentinel=_UNSET, pool_dirs=None, bench_rows=None, uid_of=None,
-                 chain=None) -> CheckResult:
+                 chain=None, max_channels=None) -> CheckResult:
     """PASS on a genuine report; FAIL when the signature, ``rows_sha256``,
     a stated parameter or the verdict re-derived from the rows disagrees,
     or the crown's provenance does not hold (RV7 B2). rev6.18 B3: the FAIL
@@ -1610,10 +1777,14 @@ def check_lane_d(report: dict, cfg, *, signer_hotkey: str, prior_reports=None,
     directories the auditor holds; every snapshot a judged window names must
     be among them, valid, and give that window's record and eligibility
     (README rules 12-14); ``None`` skips those rules. ``bench_rows``: the
-    W3b6b bound bench records (:func:`check_gate_rows`)."""
+    W3b6b bound bench records (:func:`check_gate_rows`). ``max_channels``
+    (rev6.18 A4, F2): ``[generator] max_channels`` at the boundary; every
+    judged multichannel window's channel pick is re-derived with it
+    (``ld_draw``; with ``pool_dirs`` also checked against the stored series,
+    ``ld_snapshot``); ``None`` fails any multichannel window."""
     f = lane_d_findings(report, cfg, signer_hotkey=signer_hotkey, prior_reports=prior_reports,
                         era_sentinel=era_sentinel, pool_dirs=pool_dirs, bench_rows=bench_rows,
-                        uid_of=uid_of, chain=chain)
+                        uid_of=uid_of, chain=chain, max_channels=max_channels)
     if f.findings:
         code, detail = f.findings[0]
         return _fail(NAME, f"{code}: {detail}")

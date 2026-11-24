@@ -29,7 +29,17 @@ a valid registry is refused rather than overwritten.
 
     python -P -m cascade.lane_d.published_weights --out <state-dir>/published_weights.json \\
         [--lane-d-index index.json --index-signer SS58 --mirror-dir DIR] \\
-        [--checkpoint-dir DIR ...] [--replace]
+        [--checkpoint-dir DIR ...] [--shas-file FILE ...] [--replace] [--dry-run]
+
+The sources are fetched by :mod:`cascade.lane_d.published_sources`:
+``mirror-index`` writes the ``--lane-d-index`` / ``--mirror-dir`` pair
+(box-safe) and ``checkpoint-shas`` (pod side) the ``--shas-file`` of lane A
+checkpoints with their D47 BF16-cast shas.
+
+Recurring (``deploy/laned/systemd/cascade-laned-published-weights.*``): an
+unchanged registry is not rewritten (``current``); ``--dry-run`` reads and
+verifies every source and writes nothing. Exit 0 written / current /
+dry-run, 1 a source failed (nothing written), 2 usage.
 
 Torch-free: stdlib plus the lane D intake/publish helpers.
 """
@@ -188,8 +198,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--checkpoint-dir", type=Path, action="append", default=[],
                    help="a published lane A leg/king or house checkpoint, fetched from its "
                         "ref (repeatable)")
+    p.add_argument("--shas-file", type=Path, action="append", default=[],
+                   help="a laned_published_shas/1 file (published_sources checkpoint-shas): "
+                        "lane A checkpoint shas and their BF16 casts (repeatable)")
     p.add_argument("--replace", action="store_true",
                    help="drop the shas already in --out (default: keep them)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="read and verify every source, print the counts, write nothing")
     return p
 
 
@@ -212,12 +227,36 @@ def main(argv: Sequence[str] | None = None) -> int:
             shas.update(lane_d_king_weights(index, a.index_signer, DirMirror(a.mirror_dir)))
         for d in a.checkpoint_dir:
             shas.add(checkpoint_weights(d))
+        for f in a.shas_file:
+            from .published_sources import SourceFetchError, read_shas_file
+
+            try:
+                shas.update(read_shas_file(f))
+            except SourceFetchError as e:
+                raise PublishedWeightsSourceError(str(e)) from None
+        doc = registry_doc(shas)
+        previous = None
+        if a.out.exists():
+            try:
+                previous = read_registry(a.out)
+            except PublishedWeightsSourceError:
+                if not a.replace:      # --replace may overwrite an invalid file, as before
+                    raise
+        if previous is not None and set(doc["weights_sha256"]) == previous:
+            # Idempotent: an unchanged registry is not rewritten.
+            print(f"published_weights: current, {len(previous)} sha256 in {a.out}")
+            return 0
+        added = len(set(doc["weights_sha256"]) - (previous or set()))
+        if a.dry_run:
+            print(f"published_weights: dry-run, would write {len(doc['weights_sha256'])} sha256 "
+                  f"to {a.out} ({added} new, {kept} kept); nothing written")
+            return 0
         doc = write_registry(a.out, shas)
     except PublishedWeightsSourceError as e:
         print(f"published_weights: {e}; nothing written", file=sys.stderr)
         return 1
     print(f"published_weights: wrote {len(doc['weights_sha256'])} sha256 to {a.out} "
-          f"({kept} kept from the previous file)")
+          f"({added} new, {kept} kept from the previous file)")
     return 0
 
 

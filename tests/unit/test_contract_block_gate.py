@@ -13,6 +13,7 @@ Pinned:
 """
 from __future__ import annotations
 
+import re
 from dataclasses import replace
 from pathlib import Path
 
@@ -27,6 +28,16 @@ GATE = 9_165_600
 
 def _sched(cfg, after="points+mv20", gate=GATE):
     return replace(cfg.training, budget_denomination_after=after, budget_denomination_after_block=gate)
+
+
+def _unscheduled(cfg):
+    """The shipped [training] without its schedule (the release types the
+    live DEC-CA-0047 switch since S0a B9)."""
+    return replace(cfg.training, budget_denomination_after="", budget_denomination_after_block=0)
+
+
+_SHIPPED_SCHEDULE = re.compile(r"(?m)^budget_denomination_after(_block)? *=.*\n")
+_SHIPPED_PACKED = re.compile(r"(?m)^packed_sources(_from_block)? *=.*\n")
 
 
 def test_schedule_moves_no_current_digest(cfg):
@@ -50,7 +61,7 @@ def test_at_block_switches_exactly_at_the_gate(cfg):
 
 
 def test_no_schedule_is_identity(cfg):
-    t = cfg.training
+    t = _unscheduled(cfg)
     assert t.at_block(0) is t and t.at_block(10**9) is t
     assert replace(t, budget_denomination_after="points+mv20").at_block(10**9) is not None
     # an "after" without a gate never fires
@@ -66,7 +77,7 @@ def test_throne_contracts_at_follows_the_schedule(cfg):
 
 def test_loader_parses_and_validates_the_schedule(tmp_path):
     root = Path(__file__).resolve().parents[2]
-    text = (root / "chain.toml").read_text()
+    text = _SHIPPED_SCHEDULE.sub("", (root / "chain.toml").read_text())
     anchor = 'budget_denomination         = "series_points"\n'
     assert anchor in text
     good = tmp_path / "chain.toml"
@@ -78,7 +89,9 @@ def test_loader_parses_and_validates_the_schedule(tmp_path):
     bad.write_text(text.replace(anchor, anchor + 'budget_denomination_after = "tokens"\nbudget_denomination_after_block = 1\n'))
     with pytest.raises(ValueError, match="budget_denomination"):
         load_chain_config(bad)
-    assert load_chain_config(root / "chain.toml").training.budget_denomination_after == ""
+    shipped = load_chain_config(root / "chain.toml").training
+    assert (shipped.budget_denomination_after,
+            shipped.budget_denomination_after_block) == ("points+mv20", GATE)
 
 
 def test_worker_argv_carries_the_contract_block():
@@ -122,13 +135,13 @@ def test_packed_sources_at():
 
 def test_loader_parses_packed_sources_from_block(tmp_path):
     root = Path(__file__).resolve().parents[2]
-    text = (root / "chain.toml").read_text()
+    text = _SHIPPED_PACKED.sub("", (root / "chain.toml").read_text())
     armed = text.replace("[static_guard]\n", f'[static_guard]\npacked_sources = "reject"\npacked_sources_from_block = {GATE}\n', 1)
     p = tmp_path / "chain.toml"
     p.write_text(armed)
     sg = load_chain_config(p).static_guard
     assert (sg.packed_sources, sg.packed_sources_from_block) == ("reject", GATE)
-    assert load_chain_config(root / "chain.toml").static_guard.packed_sources_from_block == 0
+    assert load_chain_config(root / "chain.toml").static_guard.packed_sources_from_block == 9_169_200
 
 
 def test_rolling_legs_carry_the_flag_only_when_a_switch_is_scheduled(cfg):
@@ -141,9 +154,9 @@ def test_rolling_legs_carry_the_flag_only_when_a_switch_is_scheduled(cfg):
     from cascade.trainer.loop import TrainerRunner
 
     era = SimpleNamespace(start_block=GATE)
-    plain = SimpleNamespace(cfg=cfg)
+    plain = SimpleNamespace(cfg=replace(cfg, training=_unscheduled(cfg)))
     assert TrainerRunner._era_contract_block(plain, era) is None
     scheduled = SimpleNamespace(cfg=replace(cfg, training=_sched(cfg)))
     assert TrainerRunner._era_contract_block(scheduled, era) == GATE
-    half = SimpleNamespace(cfg=replace(cfg, training=replace(cfg.training, budget_denomination_after="points+mv20")))
+    half = SimpleNamespace(cfg=replace(cfg, training=replace(_unscheduled(cfg), budget_denomination_after="points+mv20")))
     assert TrainerRunner._era_contract_block(half, era) is None      # no block ⇒ no schedule ⇒ no flag

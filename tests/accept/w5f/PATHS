@@ -20,3 +20,10 @@ cascade/audit/lane_d.py
 # the gate wiring, only if the house challenger's gate needs a change there.
 cascade/validator/lane_d_gate.py
 cascade/validator/lane_d_bench.py
+# Lane D recurring jobs (ops tooling PR): the module of the w5f job these
+# tests pin (python -P -m cascade.lane_d.ops_jobs).
+cascade/lane_d/ops_jobs.py
+# Lane D ops gaps PR: the house source producer (D47 BF16 cast of KING_A as a
+# lane D entry, D46 reveal_ts from the lineage; pod side) whose documents the
+# w5f house-source job installs.
+cascade/lane_d/house_source.py
