@@ -657,3 +657,20 @@ signed as the top-level `host` (schema `$defs.host`: exactly `env`,
 `gpu_model`, `driver`, `torch_build`, `fingerprint`, `identity`).
 `validate_report` re-checks the identity (`bad_value` at `host`).
 `LaneDInputs.host` (W8b) carries it to `settle_lane_d`. Absent without a host.
+
+## Multichannel windows (rev6.18 F2): `test_w7a_multivariate.py`, `mv.py`
+
+`mv.py` is the multichannel chain fixture the F2 tests of W5d/W5e/W7a/W9
+share: W7a's synthetic chain with chosen sources stored `(C, L)`, the
+channel pick re-stated from the plan, and `settle_mv` (asserts
+`settle_lane_d` takes `max_channels`).
+
+- `$defs.window` has six optional properties, present exactly on a
+  multichannel window (C >= 2 stored channels): `series_id`,
+  `n_channels_raw` (>= 2), `empty_channels` (ascending, distinct, below
+  `n_channels_raw`), `n_channels` (>= 1, at most the non-empty count),
+  `channels` (the scored indices, ascending, none empty) and
+  `channels_sha256` (sha256 of the compact JSON list `channels`). The
+  window's `if {required: [n_channels]} then {required: all six}` and the
+  cross-field check enforce all-or-none. A univariate window carries none
+  of them, so a univariate report is unchanged.

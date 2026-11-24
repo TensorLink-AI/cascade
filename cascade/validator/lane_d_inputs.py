@@ -140,6 +140,37 @@ def _well_formed(arr, n: int, horizon: int) -> bool:
             and bool(np.isfinite(arr).all()))
 
 
+def _rows_of(history) -> int:
+    """Forecast rows of one window: C for a ``(C, L)`` history (C ≥ 2), else
+    1 (the scorer's ``forecast_rows`` rule, rev6.18 A4)."""
+    shape = np.shape(history)
+    return int(shape[0]) if len(shape) == 2 and int(shape[0]) > 1 else 1
+
+
+def _row_keys(windows: list[dict], rows: list[int]) -> list[str]:
+    """B6 score-cache keys, one per forecast row: ``<window_id>:<history
+    sha256[:16]>`` (``#<channel>`` appended for a k-channel window)."""
+    import hashlib
+
+    out = []
+    for w, k in zip(windows, rows, strict=True):
+        h = np.ascontiguousarray(np.asarray(w["history"], dtype=np.float64))
+        d = hashlib.sha256(repr(h.shape).encode() + h.tobytes()).hexdigest()[:16]
+        base = f"{w['window_id']}:{d}"
+        out += [base] if k == 1 else [f"{base}#{j}" for j in range(k)]
+    return out
+
+
+def _per_window(arr: np.ndarray, ids: list[str], rows: list[int]) -> dict:
+    """The eval host's ``(Σ rows, h, 9)`` reply split per window: ``(h, 9)``
+    for a one-row window, ``(k, h, 9)`` for a k-channel one."""
+    out, off = {}, 0
+    for wid, k in zip(ids, rows, strict=True):
+        out[wid] = arr[off] if k == 1 else arr[off:off + k]
+        off += k
+    return out
+
+
 class LaneDInputsSource:
     """``source(boundary) -> LaneDInputs`` (W8b's ``inputs``) and
     ``source.bench(boundary)`` (W8b's ``bench``); see the module docstring."""
@@ -402,17 +433,49 @@ class LaneDInputsSource:
                                        "(no declared context)")
         return ctx, frozenset(bars)
 
-    @staticmethod
-    def _windows(pools: list[tuple[Path, dict]]) -> list[dict]:
+    def _windows(self, pools: list[tuple[Path, dict]], boundary: int | None = None
+                 ) -> list[dict]:
         """Every pinned window with an id, unique by id (the oldest pin's),
-        sorted by id, as exactly ``{"window_id", "history"}``."""
+        sorted by id, as exactly ``{"window_id", "history"}``.
+
+        rev6.18 A4 (F2): a multichannel ``(C, L)`` window carries only the
+        channels it is scored on (:func:`~cascade.eval.lane_d_channels.
+        channel_plan` under ``[generator] max_channels``; the settlement
+        re-derives the same pick); one left is a 1-D history, none drops the
+        window. Only a series wider than the cap reads the boundary's block
+        hash (:attr:`channel_block_hash`), so a univariate pool reads
+        nothing new."""
+        from ..eval.lane_d_channels import apply_pick, channel_plan, empty_channels
+
+        self.channel_block_hash = None
         first: dict[str, Any] = {}
         for _, pool in pools:
             for w in pool["windows"]:
                 wid = w["window_id"]
                 if wid and wid not in first:
-                    first[wid] = w["history"]
-        return [{"window_id": wid, "history": first[wid]} for wid in sorted(first)]
+                    first[wid] = w
+        cap = int(getattr(getattr(self.cfg, "generator", None), "max_channels", 1) or 1)
+        multi = [w for w in first.values() if np.ndim(w["history"]) == 2
+                 and np.shape(w["history"])[0] > 1]
+        block_hash = None
+        if boundary is not None and any(
+                np.shape(w["history"])[0] - len(empty_channels(w["history"])) > cap
+                for w in multi):
+            try:
+                block_hash = str(self._reader().block_hash(int(boundary)))
+            except LaneDInputsError:
+                raise
+            except Exception as e:  # noqa: BLE001 — the boundary hash is the channel pick's input
+                raise LaneDInputsError("chain_unavailable",
+                                       f"boundary {boundary} block hash unreadable ({e})") from e
+            self.channel_block_hash = block_hash
+        picks = channel_plan([first[k] for k in sorted(first)], block_hash, cap) if multi else {}
+        out = []
+        for wid in sorted(first):
+            w = apply_pick(first[wid], picks.get(wid))
+            if w is not None:
+                out.append({"window_id": wid, "history": w["history"]})
+        return out
 
     def _hello(self, boundary: int):
         """The verified eval host: ``(code identity, host record | None)``."""
@@ -454,17 +517,25 @@ class LaneDInputsSource:
         if callable(arm):
             arm([int(c) for c in armed])
         horizon = int(self.cfg.lane_d.horizon)
-        n = len(windows)
         ids = [w["window_id"] for w in windows]
+        # rev6.18 A4 (F2): one forecast row per univariate window, k per
+        # k-channel window (window-major).
+        per = [_rows_of(w["history"]) for w in windows]
+        n = sum(per)
+        # B6: cache rows are keyed by the window id AND its history bytes (a
+        # recurring id with another history, or another channel pick, is
+        # another key), one key per forecast row.
+        row_keys = [] if ns is None else _row_keys(windows, per)
         out: dict[str, dict] = {}
         used = []
         for dg in sorted(need):
             bar = dg in bars
             if ns is not None:
                 used.append((dg, int(need[dg]), horizon))
-                hit = cache.get(ns, dg, context=need[dg], horizon=horizon, window_ids=ids)
+                hit = cache.get(ns, dg, context=need[dg], horizon=horizon,
+                                window_ids=row_keys)
                 if hit is not None:
-                    out[dg] = {wid: hit[i] for i, wid in enumerate(ids)}
+                    out[dg] = _per_window(hit, ids, per)
                     continue
             try:
                 got = self._eval_host.forecast(dg, context=need[dg], horizon=horizon,
@@ -475,7 +546,7 @@ class LaneDInputsSource:
                                            f"{dg[:16]}: {e}") from e
                 log.warning("lane D entry %s: checkpoint fault on the eval host (%s); the "
                             "settlement closes it", dg[:16], e.code)
-                out[dg] = self._fault(ids, horizon)
+                out[dg] = self._fault(ids, horizon, per)
                 continue
             except Exception as e:  # noqa: BLE001 — the host, never the miner
                 raise LaneDInputsError("forecasts_unavailable",
@@ -491,22 +562,24 @@ class LaneDInputsSource:
                                            f"({n}, {horizon}, {N_LEVELS}) array")
                 log.warning("lane D entry %s: malformed forecasts; the settlement closes it",
                             dg[:16])
-                out[dg] = self._fault(ids, horizon)
+                out[dg] = self._fault(ids, horizon, per)
                 continue
             if ns is not None:
-                cache.put(ns, dg, context=need[dg], horizon=horizon, window_ids=ids,
+                cache.put(ns, dg, context=need[dg], horizon=horizon, window_ids=row_keys,
                           quantiles=arr)
-            out[dg] = {wid: arr[i] for i, wid in enumerate(ids)}
+            out[dg] = _per_window(arr, ids, per)
         if ns is not None:
             cache.retain(ns, used)
         return out, host
 
     @staticmethod
-    def _fault(ids: list[str], horizon: int) -> dict:
+    def _fault(ids: list[str], horizon: int, per: list[int] | None = None) -> dict:
         """A faulted entry's record: malformed (non-finite) on every window, so
         ``forecast_ok`` is ``False`` and the settlement closes it as
         ``checkpoint_fault``."""
-        return {wid: np.full((horizon, N_LEVELS), np.nan) for wid in ids}
+        per = per or [1] * len(ids)
+        return {wid: np.full((horizon, N_LEVELS) if k == 1 else (k, horizon, N_LEVELS), np.nan)
+                for wid, k in zip(ids, per, strict=True)}
 
     # ── one settlement's inputs ─────────────────────────────────────────────
 
@@ -522,7 +595,7 @@ class LaneDInputsSource:
         pools = self._pools(b)
         armed = self._armed()
         ctxs = tuple(armed["armed_contexts"])
-        windows = self._windows(pools)
+        windows = self._windows(pools, b)
         need, bars = self._needed(entries, state, house, ctxs)
         forecasts, host = self._forecasts(need, bars, windows, state, house, ctxs, b)
         # W3b6a: the bench host sweeps each digest at the context it is
@@ -533,7 +606,8 @@ class LaneDInputsSource:
         dirs = [d for d, _ in pools]
         return LaneDInputs(pool_dir=dirs[-1], entries=entries, forecasts=forecasts,
                            uid_of=uid_of, house=house, prior_pool_dirs=tuple(dirs[:-1]),
-                           armed=armed, host=host)
+                           armed=armed, channel_block_hash=self.channel_block_hash,
+                           host=host)
 
 
 def build_lane_d_inputs(cfg: Any, *, state_dir, intake_state_dir,
@@ -726,8 +800,11 @@ class SSHEvalHost:
 
     @staticmethod
     def _cut(history, context: int) -> np.ndarray:
-        h = np.asarray(history, dtype=np.float64).reshape(-1)
-        return h[-context:] if h.size > context and np.isfinite(h).all() else h
+        h = np.asarray(history, dtype=np.float64)
+        if not (h.ndim == 2 and h.shape[0] > 1):
+            h = h.reshape(-1)
+        # rev6.18 A4 (F2): a (C, L) history is cut along time, every channel alike.
+        return h[..., -context:] if h.shape[-1] > context and np.isfinite(h).all() else h
 
     def forecast(self, digest: str, *, context: int, horizon: int, windows) -> np.ndarray:
         host = self._host

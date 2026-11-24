@@ -6,3 +6,9 @@ cascade/eval/lane_d_scorer.py
 # The T7 measurement helpers the pod run calls; they build evidence/t7.json
 # (schema laned_t7/1) that tests/accept/w5d/test_w5d_t7_evidence.py verifies.
 cascade/eval/lane_d_t7.py
+# rev6.18 A4 (F2): the multichannel (C, L) window: the channel pick (empty
+# columns, the [generator] max_channels cap by the boundary block hash) and
+# the eval-host transport of (C, L) histories and per-channel forecast rows.
+cascade/eval/lane_d_channels.py
+cascade/eval/lane_d_forecasts.py
+cascade/validator/lane_d_inputs.py

@@ -185,3 +185,18 @@ def test_an_unqualified_host_scores_nothing(tmp_path):
     with pytest.raises(Exception) as e:
         rig.source(w8c.B1)
     w8c.assert_inputs_error(e.value, "env_unqualified")
+
+
+def test_cache_rows_are_keyed_by_history_and_channel():
+    """A recurring window id with another history (or another channel pick,
+    rev6.18 A4) is another key; a k-channel window has k row keys."""
+    from cascade.validator.lane_d_inputs import _row_keys
+
+    a = {"window_id": "w1", "history": np.arange(8.0)}
+    b = {"window_id": "w1", "history": np.arange(8.0) + 1}
+    mv = {"window_id": "w2", "history": np.arange(16.0).reshape(2, 8)}
+    ka, kb = _row_keys([a], [1]), _row_keys([b], [1])
+    assert len(ka) == 1 and ka != kb, "same id, other history: never a cache hit"
+    assert _row_keys([a], [1]) == ka, "deterministic"
+    kmv = _row_keys([a, mv], [1, 2])
+    assert len(kmv) == 3 and len(set(kmv)) == 3 and kmv[0] == ka[0]

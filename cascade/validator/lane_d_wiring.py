@@ -111,7 +111,10 @@ class LaneDInputs:
     ``entries``, the eval host's ``forecasts``, the metagraph ``uid_of``
     (``{hotkey: uid}``) and the ``house`` pointer record. ``armed`` (rev6.6)
     is the settlement's W5d armed record, passed to ``settle_lane_d(armed=)``
-    (``None``: the legacy call, no armed fields in the report). ``host``
+    (``None``: the legacy call, no armed fields in the report).
+    ``channel_block_hash`` (rev6.18 A4, F2) is the block hash the source
+    picked the channels of an over-cap multichannel window with (``None``
+    when no window needed one); it must be the settlement's own. ``host``
     (rev6.18 B7) is the verified eval host's record, passed to
     ``settle_lane_d(host=)`` (``None``: no ``host`` in the report)."""
 
@@ -122,6 +125,7 @@ class LaneDInputs:
     house: Mapping
     prior_pool_dirs: tuple = ()
     armed: Mapping | None = None
+    channel_block_hash: str | None = None
     host: Mapping | None = None
 
 
@@ -135,6 +139,15 @@ def _armed_of(inp: Any) -> dict | None:
     """``inp.armed`` as a plain dict (``None`` when absent: the legacy call)."""
     armed = getattr(inp, "armed", None)
     return None if armed is None else dict(armed)
+
+
+def _max_channels(cfg: Any) -> int | None:
+    """``[generator] max_channels`` (rev6.18 A4, F2): the channel cap of a
+    multichannel lane D window; ``None`` when the config has no
+    ``[generator]`` (then no multichannel window is scored)."""
+    g = getattr(cfg, "generator", None)
+    v = getattr(g, "max_channels", None)
+    return None if v is None else int(v)
 
 
 def report_key(boundary: int) -> str:
@@ -289,6 +302,7 @@ class LaneDStep:
                               signer=self.signer, prior_pool_dirs=tuple(inp.prior_pool_dirs),
                               expect_prior_sha256=expect, boundary_block_hash=block_hash,
                               sentinel=sentinel, bench=bench, armed=_armed_of(inp),
+                              max_channels=_max_channels(self.cfg),
                               **({} if _host_of(inp) is None else {"host": _host_of(inp)}))
         except Exception as e:  # noqa: BLE001 — LaneDStateError, schema, pool or crash
             raise LaneDWiringError("settle_refused",
@@ -422,6 +436,13 @@ class LaneDStep:
                                        f"era {era}: no sentinel draw ({e})") from e
         latest = self._latest_receipt()
         inp = self._read_inputs(b)
+        picked_with = getattr(inp, "channel_block_hash", None)
+        if picked_with is not None and str(picked_with) != str(block_hash):
+            # F2: the eval host was sent channels picked by another hash; the
+            # settlement would pair forecasts with the wrong channels.
+            raise LaneDWiringError("inputs_unavailable",
+                                   f"settlement {b}: the inputs picked channels by block hash "
+                                   f"{str(picked_with)[:18]}, not the boundary's")
         state = self._local_state(inp.house)
         settled = int(state["boundary"])
         latest_b = None if latest is None else int(latest["boundary"])
