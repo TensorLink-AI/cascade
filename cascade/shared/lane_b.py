@@ -2,26 +2,21 @@
 combined lane-A + lane-B weight vector.
 
 Pure and deterministic — every validator derives the same state from the
-same receipts, and ``cascade-audit`` replays it. Payout age is counted in
-ERAS (``era_blocks`` = the grid in force × ``era_settlements``), from the
-settlement that merged the win (age 0 = the first era-length after it), so a
-win pays in full for its RECORDED ``full_eras`` eras, then decays, and stops
-paying at ``win_ttl_eras`` (its slot burns; the merged weights stay in the
-king).
+same receipts, and ``cascade-audit`` replays it.
 
-Gain-tiered full-pay period (owner 2026-10-20): ``full_eras`` is chosen AT
-THE WIN from the win's target gain LCB (``target_lcb``) by ``[lane_b]
-full_pay_tiers`` (:func:`cascade.eval.expert_lane.full_pay`) and recorded on
-the :class:`DomainWin` (``tier`` / ``full_eras`` / ``below_floor``) — never
-re-evaluated, so a later change to the tiers touches only later wins. A
-multi-target leg's wins are tiered per target, each by its own target LCB.
+Pay (LANE_D_PLAN rev6.22, owner 2026-11-24: "make the pay indefinite"): a
+held slot pays its FULL slot share every settlement — no decay, no TTL —
+until a newer merged (under acceptance: accepted) win on that slot takes it.
+An empty slot, or a deregistered holder's, burns. The old gain-tiered decay
+and payout TTL are retired; a ``tier`` / ``full_eras`` a state file still
+carries is never read. Each payout row records the holder's ``age`` (whole
+ERAS since its merging settlement) and ``since_era``.
 
 Slots (DEC-CA-0059) are the ``[lane_b]`` TARGETS — the domains, then one
 ``horizon:<h>`` per scored horizon (none on a chain without a scored ladder,
 where the slot list is exactly ``domains``). ``DomainWin.domain`` names the
 target. A multi-target leg that won several targets holds several wins, each
-on its own slot and decay clock, all naming one judged checkpoint (one
-merge).
+on its own slot, all naming one judged checkpoint (one merge).
 """
 
 from __future__ import annotations
@@ -29,7 +24,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass, field
 
-from ..eval.expert_lane import FullPay, LaneBWin, reward_multiplier, split_emissions
+from ..eval.expert_lane import LaneBWin, split_emissions
 from .chain import decayed_share_vector
 
 
@@ -48,54 +43,17 @@ class DomainWin:
     rebased_pointer: str = ""
     king_pointer: str = ""
     selection: dict = field(default_factory=dict)
-    # gain-tiered full-pay period, fixed at the win from ``target_lcb``
-    # (:func:`cascade.eval.expert_lane.full_pay`); None = untiered (refused
-    # by the payout — every recorded win carries its tier)
+    # retired gain-tiered full-pay period (rev6.22): kept so an older state
+    # file still loads; never set or read
     tier: float | None = None
     full_eras: int | None = None
     below_floor: bool = False
     commit_block: int = 0
     targets: tuple[str, ...] = ()
     qualified_block: int = 0
-    # DEC-CA-0075: the pay curve the win was recorded under ("" = lane B's
-    # legacy tiered_decay; a later overlay never changes a recorded one)
-    curve: str = ""
 
     def __post_init__(self):
         object.__setattr__(self, "targets", tuple(self.targets))
-
-    def with_full_pay(self, fp: FullPay) -> DomainWin:
-        from dataclasses import replace
-
-        return replace(self, tier=float(fp.tier), full_eras=int(fp.full_eras),
-                       below_floor=bool(fp.below_floor))
-
-    def full_pay_record(self) -> dict:
-        """``{gain_lcb, tier, full_eras, below_floor}`` (+ ``curve`` when not
-        the legacy one) — what the payout record and the settlement state
-        stamp."""
-        return {"gain_lcb": float(self.target_lcb), "tier": self.tier,
-                "full_eras": self.full_eras, "below_floor": bool(self.below_floor),
-                **({"curve": self.curve} if self.curve else {})}
-
-
-def _win_dict(w: DomainWin) -> dict:
-    """A win as the state file stores it (``curve`` only when recorded: a
-    legacy win's bytes are unchanged)."""
-    d = asdict(w)
-    if not d.get("curve"):
-        d.pop("curve", None)
-    return d
-
-
-def win_full_eras(win) -> int:
-    """A recorded win's full-pay period; a win without one is refused (the
-    payout is computed only from recorded fields)."""
-    n = getattr(win, "full_eras", None)
-    if n is None:
-        raise ValueError(f"win {getattr(win, 'hotkey', '?')!r} carries no full-pay tier "
-                         "(full_eras)")
-    return int(n)
 
 
 def merge_identity(m) -> tuple:
@@ -200,12 +158,12 @@ class LaneBState:
         return max(0, (int(block) - int(win.merge_block)) // int(era_blocks))
 
     def to_json(self) -> str:
-        return json.dumps({"wins": {d: _win_dict(w) for d, w in sorted(self.wins.items())},
-                           "history": [_win_dict(w) for w in self.history],
+        return json.dumps({"wins": {d: asdict(w) for d, w in sorted(self.wins.items())},
+                           "history": [asdict(w) for w in self.history],
                            "applied": dict(sorted(self.applied.items())),
                            "settled_block": self.settled_block,
                            "last_round": self.last_round,
-                           "qualifications": [_win_dict(w) for w in self.qualifications],
+                           "qualifications": [asdict(w) for w in self.qualifications],
                            "accepted": dict(sorted(self.accepted.items()))}, sort_keys=True)
 
     @classmethod
@@ -251,27 +209,32 @@ def save_state_atomic(state: LaneBState, path) -> None:
         os.close(fd)
 
 
-def win_expired(age_eras: int, cfg) -> bool:
-    """A win at ``age_eras`` has reached ``[lane_b] win_ttl_eras`` (0 = never)."""
-    ttl = int(getattr(cfg, "win_ttl_eras", 0) or 0)
-    return ttl > 0 and int(age_eras) >= ttl
-
-
 def lane_b_slots(cfg) -> tuple[str, ...]:
     """The lane-B emission slots (DEC-CA-0059): ``cfg.targets`` (domains +
     horizon targets), or ``cfg.domains`` for a config without targets."""
     return tuple(getattr(cfg, "targets", None) or cfg.domains)
 
 
+def since_era(merge_block: int, *, era_blocks: int, round_cfg=None) -> int:
+    """The era index a slot holder has held its slot since: the era of its
+    merging settlement on the grid in force there (``round_cfg``), else
+    ``merge_block // era_blocks``."""
+    if round_cfg is not None:
+        from .era import era_index_of
+
+        return int(era_index_of(round_cfg, int(merge_block)))
+    return int(merge_block) // max(1, int(era_blocks))
+
+
 def lane_b_payouts(state: LaneBState, *, block: int, era_blocks: int, cfg, n_uids: int,
-                   uid_of: dict[str, int] | None = None) -> list[dict]:
+                   uid_of: dict[str, int] | None = None, round_cfg=None) -> list[dict]:
     """The PAID live wins at ``block`` — what :func:`combined_weights` pays and
     the receipt's ``lane_b_pay`` records: ``{domain, hotkey, uid,
-    merge_block, age, multiplier, gain_lcb, tier, full_eras, below_floor}``
-    per configured domain (``age`` in eras; the full-pay fields as RECORDED
-    on the win),
-    deregistered or out-of-range winners and EXPIRED wins (``age >=
-    win_ttl_eras``) dropped — an unpaid slot burns."""
+    merge_block, age, since_era, multiplier, gain_lcb}`` per held slot
+    (``age`` in whole eras since the merging settlement; ``since_era`` per
+    :func:`since_era`; ``multiplier`` always 1.0 — the full slot, no decay,
+    no TTL, rev6.22). A deregistered or out-of-range holder is dropped and
+    its slot burns, as does an empty slot."""
     out = []
     for d in lane_b_slots(cfg):
         w = state.wins.get(d)
@@ -282,24 +245,12 @@ def lane_b_payouts(state: LaneBState, *, block: int, era_blocks: int, cfg, n_uid
         uid = w.uid if uid_of is None else uid_of.get(w.hotkey)
         if uid is None or not 0 <= int(uid) < n_uids:
             continue
-        age = state.eras_since(w, block, era_blocks)
-        # DEC-CA-0075: on the win's recorded curve (legacy = tiered_decay,
-        # exactly the rule before: TTL, then reward_multiplier)
-        from .rules_menu import curve_expired, curve_multiplier, recorded_curve
-
-        curve = recorded_curve(w, "lane_b")
-        if curve == "tiered_decay":
-            if win_expired(age, cfg):
-                continue
-            m = reward_multiplier(age, full_eras=win_full_eras(w),
-                                  half_life_rounds=cfg.half_life_rounds, floor=cfg.floor)
-        else:
-            if curve_expired(curve, age, full_eras=win_full_eras(w)):
-                continue
-            m = curve_multiplier(curve, age, full_eras=win_full_eras(w))
         out.append({"domain": d, "hotkey": w.hotkey, "uid": int(uid),
-                    "merge_block": int(w.merge_block), "age": int(age), "multiplier": m,
-                    **w.full_pay_record()})
+                    "merge_block": int(w.merge_block),
+                    "age": int(state.eras_since(w, block, era_blocks)),
+                    "since_era": since_era(w.merge_block, era_blocks=era_blocks,
+                                           round_cfg=round_cfg),
+                    "multiplier": 1.0, "gain_lcb": float(w.target_lcb)})
     return out
 
 
@@ -307,8 +258,8 @@ def combined_weights(lane_a_uids: list[int], n_uids: int, *, king_decay: float, 
                      state: LaneBState, block: int, era_blocks: int, cfg,
                      uid_of: dict[str, int] | None = None) -> list[float]:
     """The weight vector a validator sets once lane B is active: lane A's
-    court vector (unchanged rule) scaled to ``1 − share``, each live target
-    win paid ``share / n_targets × multiplier``, the unpaid lane-B remainder
+    court vector (unchanged rule) scaled to ``1 − share``, each held target
+    slot paid ``share / n_targets`` in full, the unpaid lane-B remainder
     burned (or returned to lane A). Before ``cfg.from_block`` this is exactly
     ``decayed_share_vector`` — callers may rely on that."""
     lane_a_vec = decayed_share_vector(lane_a_uids, n_uids, decay=king_decay, burn_uid=burn_uid)

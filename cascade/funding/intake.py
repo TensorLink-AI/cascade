@@ -182,6 +182,7 @@ from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from ..shared.lane_b_leg import TRAIN_HOURS_HEADER
 from .gpu_choice import GpuCatalog, GpuChoice, parse_gpu_headers, wall_warning
 from .queue import LIVE_LEG_PHASES, FundedQueue
 from .vault import PayerKeyVault
@@ -245,7 +246,7 @@ def lane_b_targets(header_value: str) -> tuple[str, ...]:
     return tuple(t.strip() for t in str(header_value or "").split(",") if t.strip())
 
 
-def lane_b_signed_ref(targets, ref: str, declared_rows=None) -> str:
+def lane_b_signed_ref(targets, ref: str, declared_rows=None, *, train_hours: str = "") -> str:
     """The ``ref`` field a lane-B request signs: ``"<t1>,<t2>|<ref>"`` with
     the targets EXACTLY as the request lists them — the signature binds the
     declared targets and the ref (and, through the canonical message, the key
@@ -255,15 +256,21 @@ def lane_b_signed_ref(targets, ref: str, declared_rows=None) -> str:
     is ``"<targets>|<ref>|rows=<sha256 of the canonical rows JSON>"``
     (:func:`cascade.trainer.declared_rows.declared_rows_digest`), so the
     signature binds the rows too; without them it is today's field byte for
-    byte. A ref never contains ``|``, so the two forms cannot collide."""
+    byte. A ref never contains ``|``, so the two forms cannot collide.
+
+    With ``train_hours`` (WB23, the ``X-Lane-B-Train-Hours`` value as sent)
+    ``"|hours=<value>"`` is appended after everything else, so the signature
+    binds the leg length; without it the field is unchanged."""
+    from ..shared.lane_b_leg import train_hours_tag
     from .queue import lane_b_entry_ref
 
     signed = lane_b_entry_ref(targets, ref)
-    if declared_rows is None:
-        return signed
-    from ..trainer.declared_rows import declared_rows_digest
+    if declared_rows is not None:
+        from ..trainer.declared_rows import declared_rows_digest
 
-    return f"{signed}|{_DECLARED_ROWS_SIGNED_TAG}{declared_rows_digest(declared_rows)}"
+        signed = f"{signed}|{_DECLARED_ROWS_SIGNED_TAG}{declared_rows_digest(declared_rows)}"
+    tag = train_hours_tag(train_hours)
+    return f"{signed}|{tag}" if tag else signed
 
 
 def lane_c_signed_ref(target: str, ref: str) -> str:
@@ -455,6 +462,8 @@ class FundingIntake:
         lane_c_closed: Callable[[str], str | None] | None = None,
         gpu_catalog: GpuCatalog | None = None,
         lane_b_gpus: object | None = None,        # WB22 LaneBGpus; None = lane A's catalog
+        lane_b_landing: Callable[[int], dict | None] | None = None,  # WB23 landing estimate
+        lane_b_contract: object | None = None,    # WB23 base contract (steps cap); None = no cap
         lane_b_queue: object | None = None,       # funding LaneBQueue; None = lane B off
         resolve_lane_b_reveal: Callable[[str, tuple, str], int | None] | None = None,
         lane_b_targets: tuple[str, ...] | None = None,
@@ -539,6 +548,12 @@ class FundingIntake:
         # funds read ``gpu_catalog`` with no rate gate (unit construction only;
         # the production intake always wires it, main.gpu_catalogs).
         self.lane_b_gpus = lane_b_gpus
+        # WB23: ``lane_b_landing(guard_seconds) -> {target_boundary, era_index,
+        # cross_era} | None`` (the miner sees where a leg of that wall lands;
+        # it never fails a fund) and the contract a lane B leg derives from
+        # (its reference steps cap the steps fixed at the fund)
+        self.lane_b_landing = lane_b_landing
+        self.lane_b_contract = lane_b_contract
         # DEC-CA-0056 lane C: the fine-tune queue + its reveal oracle
         # ``(hotkey, target, ref) -> reveal block | None`` (the hotkey's
         # revealed ``metro-v1:ft:`` commitment must name exactly them), and
@@ -1227,8 +1242,12 @@ class FundingIntake:
             if status is not None:
                 return status, parsed
             declared_rows = parsed.get("rows")
+        # WB23: the fund's train_hours header, as sent, is bound by the signature
+        hours_raw = ((headers.get(TRAIN_HOURS_HEADER) or "").strip()
+                     if action == "lane-b-fund" else "")
         try:
-            signed = lane_b_signed_ref(sent, ref, declared_rows) if ref else None
+            signed = (lane_b_signed_ref(sent, ref, declared_rows, train_hours=hours_raw)
+                      if ref else None)
         except ValueError as e:
             return 400, {"code": "bad_ref", "message": str(e)}
         status, ctx = self._auth(action, headers, signed_ref=signed, gpu_segment=gpu_segment)
@@ -1292,6 +1311,11 @@ class FundingIntake:
                 gpu_err = lb_gpus.refusal(choice)
         if gpu_err is not None:
             return 400, gpu_err
+        # WB23 (D42, D42b): the miner-chosen leg length, refused before
+        # anything is queued or vaulted (nothing charged, TB25)
+        length, length_err = self._lane_b_leg_length(headers, choice)
+        if length_err is not None:
+            return 400, length_err
         status, ctx = self._lane_b_request("lane-b-fund", headers, gpu_segment=segment)
         if status is not None:
             return status, ctx
@@ -1328,7 +1352,7 @@ class FundingIntake:
             receipt_kw = {"contamination": checked}
         outcome = self.lane_b_queue.add_lane_b(  # type: ignore[union-attr]
             hotkey, targets, ref, int(reveal_block), label=label, gpu_choice=choice,
-            declared_rows=ctx["declared_rows"], **receipt_kw)
+            declared_rows=ctx["declared_rows"], leg_length=length, **receipt_kw)
         self.vault.insert(hotkey, api_key)
         rows = ctx["declared_rows"]
         log.info("lane-B fund %s: %s targets=%s (reveal_block=%d%s%s)", hotkey, outcome,
@@ -1344,10 +1368,71 @@ class FundingIntake:
                 rate = lb_gpus.rate(choice.gpu)
                 if rate is not None:
                     body["steps_per_s"] = float(rate.steps_per_s)
+            if length is not None:
+                body.update(length.as_dict())
+                landing = self._lane_b_landing_estimate(length.guard_seconds)
+                if landing is not None:
+                    body["landing"] = landing
             return (200 if outcome == "already-queued" else 202), body
         if outcome == "already-queued":
             return 200, self._gpu_reply(body, choice)
         return 202, self._gpu_reply(body, choice)
+
+    def _lane_b_leg_length(self, headers, choice) -> tuple[object | None, dict | None]:
+        """WB23: ``(LegLength | None, None)`` or ``(None, refusal)``. No
+        ``X-Lane-B-Train-Hours`` header is ``(None, None)``: today's leg."""
+        from ..shared import lane_b_leg as lbl
+
+        raw = (headers.get(lbl.TRAIN_HOURS_HEADER) or "").strip()
+        if not raw:
+            return None, None
+        lb_gpus, cfg = self.lane_b_gpus, self.lane_b_cfg
+        if lb_gpus is None or cfg is None:
+            return None, {"code": lbl.UNAVAILABLE,
+                          "message": f"this intake has no lane B GPU list wired — fund "
+                                     f"without {lbl.TRAIN_HOURS_HEADER}"}
+        try:
+            hours = lbl.parse_train_hours(raw, max_leg_hours=float(cfg.max_leg_hours))
+        except lbl.LegLengthError as e:
+            return None, {"code": e.code, "message": e.message}
+        if not getattr(choice, "chosen", False):
+            return None, {"code": lbl.NEEDS_GPU,
+                          "message": f"{lbl.TRAIN_HOURS_HEADER} is wall hours on the GPU you "
+                                     "choose (D42b): send X-Gpu-Type with a measured type"}
+        if bool(getattr(choice, "allow_fallback", False)):
+            return None, {"code": lbl.WITH_FALLBACK,
+                          "message": f"{lbl.TRAIN_HOURS_HEADER} fixes the steps on the chosen "
+                                     "GPU; a fallback type would train them at another rate — "
+                                     "drop X-Gpu-Allow-Fallback"}
+        rate = lb_gpus.rate(choice.gpu)
+        try:
+            if self.lane_b_contract is not None:
+                length = lbl.admit_leg_length(cfg, rate, hours, contract=self.lane_b_contract)
+            else:
+                length = lbl.LegLength(
+                    train_hours=hours,
+                    steps=lbl.leg_steps(hours, rate.steps_per_s, cap=10 ** 12),
+                    guard_seconds=lbl.leg_guard_seconds(
+                        hours, guard_factor=float(cfg.guard_factor),
+                        overhead_seconds=float(rate.overhead_seconds),
+                        max_leg_seconds=int(cfg.max_leg_seconds)))
+        except (AttributeError, TypeError, ValueError) as e:
+            return None, {"code": lbl.BAD_TRAIN_HOURS,
+                          "message": f"{raw} h on {choice.gpu} is not a trainable leg ({e})"}
+        return length, None
+
+    def _lane_b_landing_estimate(self, guard_seconds: int) -> dict | None:
+        """WB23 (TB26): where a leg of that wall is expected to land; never
+        fails the fund."""
+        fn = self.lane_b_landing
+        if fn is None:
+            return None
+        try:
+            got = fn(int(guard_seconds))
+        except Exception as e:  # noqa: BLE001 — an estimate never fails a fund
+            log.warning("lane-B landing estimate failed: %s", e)
+            return None
+        return dict(got) if isinstance(got, dict) else None
 
     def _lane_b_pin(self) -> str:
         """The ``[lane_b] contamination_hashset`` pin ("" = unpinned: the

@@ -45,7 +45,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ..eval.expert_lane import ExpertVerdict, TargetsVerdict, judge_expert_targets
+from ..eval.expert_lane import ExpertVerdict, TargetsVerdict, judge_expert_slots
 from ..shared.expert_manifest import ExpertEntry, ExpertManifest
 from ..shared.lane_b import DomainWin, LaneBState
 
@@ -160,14 +160,29 @@ def _arrays(scores) -> dict:
 def judge_entry(entry: ExpertEntry, *, manifest: ExpertManifest, king_pointer: str,
                 king_scores, evaluate: Callable[[str], list], fetch_dir: Callable[[str], Path],
                 cfg, seed: str, recompute_selection: Callable | None = None,
-                strict: bool = False, sentinel: str | None = None) -> ExpertJudgement:
+                strict: bool = False, sentinel: str | None = None,
+                contract=None) -> ExpertJudgement:
     """``sentinel`` is the settlement era's LANE_D_PLAN §16 suite (W-S2, D35):
     its ``<suite>_crps`` / ``<suite>_mase`` public guards are not built and
     ``require_public`` minus it is what must pair; every other guard is judged
-    exactly as unarmed. ``None`` (unarmed) is today's judgement."""
+    exactly as unarmed. ``None`` (unarmed) is today's judgement.
+
+    ``contract`` (WB23, TB27) is the contract a lane B leg derives from: an
+    entry whose recorded leg length (``train_hours`` / ``leg_steps`` /
+    ``leg_guard_seconds``) breaks the ``[lane_b]`` consensus caps is refused
+    at stage ``leg_length`` before any fetch. An entry without one is judged
+    as before; ``contract`` None skips the check."""
     if manifest.king_pointer != king_pointer:
         return ExpertJudgement(entry, False, "stale",
                                f"rebased onto {manifest.king_pointer}, king is {king_pointer}")
+    if contract is not None:
+        from ..shared.lane_b_leg import check_leg_record
+
+        why = check_leg_record(train_hours=entry.train_hours, steps=entry.leg_steps,
+                               guard_seconds=entry.leg_guard_seconds, lb_cfg=cfg,
+                               contract=contract)
+        if why is not None:
+            return ExpertJudgement(entry, False, "leg_length", why)
     declared = entry.declared
     if (any(t not in _targets(cfg) for t in declared)
             or len(declared) > int(getattr(cfg, "max_domains_per_leg", 1) or 1)):
@@ -225,8 +240,11 @@ def judge_entry(entry: ExpertEntry, *, manifest: ExpertManifest, king_pointer: s
         except MissingPublicGuard as e:
             return ExpertJudgement(entry, False, "verdict", f"public guard missing: {e}")
     hts = tuple(getattr(cfg, "horizon_target_names", ()) or ())
-    tv = judge_expert_targets(
-        targets=declared, domains=k["domains"],
+    # rev6.22 (owner 2026-11-24): the leg is tested on EVERY slot, one max-T
+    # family; declared slots clear at gain_margin, the rest at
+    # undeclared_gain_margin; every cleared slot is claimable
+    tv = judge_expert_slots(
+        slots=_targets(cfg), declared=declared, domains=k["domains"],
         king_qloss=k["qloss"], king_abs_target=k["abs"], king_mase=k["mase"],
         chal_qloss=c["qloss"], chal_abs_target=c["abs"], chal_mase=c["mase"],
         clusters=k["clusters"], public=public, params=cfg.verdict_params(),
@@ -235,10 +253,13 @@ def judge_entry(entry: ExpertEntry, *, manifest: ExpertManifest, king_pointer: s
         horizon_targets=hts,
     )
     v = tv.verdicts[declared[0]]
-    if len(declared) == 1:
-        return ExpertJudgement(entry, v.passed, "verdict", v.reason, v, king_pointer=king_pointer)
     won = tv.won
-    reason = (f"won {won}" if won else (tv.guard_reason or "no target won"))
+    if len(declared) == 1 and won == [declared[0]]:
+        reason = v.reason                    # a single target won alone: "merge", as before
+    elif len(declared) == 1 and not won:
+        reason = v.reason                    # the single target's own refusal
+    else:
+        reason = f"won {won}" if won else (tv.guard_reason or "no target won")
     return ExpertJudgement(entry, bool(won), "verdict", reason, v, king_pointer=king_pointer,
                            targets=tv)
 
@@ -261,17 +282,12 @@ def judge_manifest(manifest: ExpertManifest, **kw) -> list[ExpertJudgement]:
 
 
 def apply_judgements(state: LaneBState, judgements: list[ExpertJudgement], *, round_id: str,
-                     settle_block: int, tiers=None, qualify_only: bool = False,
-                     curve: str = "") -> list[DomainWin]:
+                     settle_block: int, qualify_only: bool = False) -> list[DomainWin]:
     """Record one win per domain (best target LCB, ties to the earliest commit
-    block, then hotkey). Returns the wins recorded. Each win is tiered by its
-    OWN target LCB (DEC-CA-0059: per target of a multi-target leg) under
-    ``tiers`` — ``[lane_b] full_pay_tiers`` in force at the settlement (None =
-    the shipped defaults) — and the tier is recorded on it."""
-    from ..eval.expert_lane import full_pay
-    from ..shared.config.v2 import FULL_PAY_TIERS
-
-    tiers = FULL_PAY_TIERS if tiers is None else tiers
+    block, then hotkey); every target of a multi-target leg that passed
+    competes for its own slot (DEC-CA-0059), so one leg may win several.
+    Returns the wins recorded. Pay is untiered (rev6.22): a held slot pays
+    in full until replaced."""
     best: dict[str, tuple] = {}
     for j in judgements:
         if not j.passed:
@@ -293,9 +309,7 @@ def apply_judgements(state: LaneBState, judgements: list[ExpertJudgement], *, ro
                       rebased_pointer=j.entry.rebased_pointer, king_pointer=j.king_pointer,
                       selection={str(k): list(v) for k, v in j.entry.selection.items()},
                       **({"commit_block": j.entry.commit_block, "targets": j.entry.declared,
-                          "qualified_block": int(settle_block)} if qualify_only else {}),
-                      **({"curve": str(curve)} if curve else {}),
-                      ).with_full_pay(full_pay(float(v.target_lcb), tiers))
+                          "qualified_block": int(settle_block)} if qualify_only else {}))
         if qualify_only:
             state.qualify(w)
         else:
@@ -306,25 +320,36 @@ def apply_judgements(state: LaneBState, judgements: list[ExpertJudgement], *, ro
 
 def judgements_record(judgements: list[ExpertJudgement]) -> list[dict]:
     """The receipt's ``lane_b`` verdict rows (drop-when-empty at the caller).
-    A single-target entry is one row, exactly as before; a multi-target entry
-    (DEC-CA-0059) is one row PER declared target, each carrying the leg's
-    ``targets``, the per-target gain level ``alpha`` (= alpha / k), its
-    ``target_gain`` / ``inconclusive`` and the leg's ``guard_reason`` — what
-    ``cascade-audit`` needs to re-derive every per-target verdict."""
+
+    A JUDGED entry (stage ``verdict``, rev6.22 every-slot judging) is one row
+    PER TESTED SLOT: the leg's declared ``targets``, whether this slot is
+    ``declared``, the ``gain_bar`` applied, per metric the max-T family LCB
+    (``metric_lcbs``), point gain and marginal non-inferiority LCB, the
+    slot's test ``family`` (``declared`` / ``undeclared``, two separate
+    max-T families) with its level ``alpha`` and critical value
+    ``maxt_crit``, the metric that
+    cleared (``gain_metric``), ``passed`` (= claimed if best on its slot)
+    and the leg's guards — what ``cascade-audit`` re-derives. An entry
+    refused before judging (stale / targets / selection / merge) is one row
+    for the entry (its first declared target), as before."""
     out = []
     for j in judgements:
-        declared = j.entry.declared
-        if len(declared) > 1:
-            out.extend(_multi_rows(j, declared))
+        declared = tuple(j.entry.declared)
+        if j.targets is not None and j.targets.declared:
+            out.extend(_slot_rows(j, declared))
             continue
         v = j.verdict
-        out.append({
-            "hotkey": j.entry.miner_hotkey, "domain": j.entry.domain, "stage": j.stage,
-            "passed": j.passed, "reason": j.reason,
-            "target_lcb": None if v is None else v.target_lcb,
-            "guard_lcbs": {} if v is None else v.guard_lcbs,
-            "public_lcbs": {} if v is None else v.public_lcbs,
-        })
+        if len(declared) > 1:              # a multi-target entry refused before judging
+            out.extend({"hotkey": j.entry.miner_hotkey, "domain": t, "stage": j.stage,
+                        "passed": False, "reason": j.reason, "target_lcb": None,
+                        "guard_lcbs": {}, "public_lcbs": {}, "targets": list(declared),
+                        "leg": j.entry.rebased_pointer} for t in declared)
+            continue
+        out.append({"hotkey": j.entry.miner_hotkey, "domain": j.entry.domain,
+                    "stage": j.stage, "passed": j.passed, "reason": j.reason,
+                    "target_lcb": None if v is None else v.target_lcb,
+                    "guard_lcbs": {} if v is None else v.guard_lcbs,
+                    "public_lcbs": {} if v is None else v.public_lcbs})
     return out
 
 
@@ -332,24 +357,29 @@ def _num(x):
     return None if x is None or (isinstance(x, float) and x != x) else float(x)
 
 
-def _multi_rows(j: ExpertJudgement, declared: tuple[str, ...]) -> list[dict]:
+def _nums(d: dict) -> dict:
+    return {str(k): _num(v) for k, v in sorted(d.items())}
+
+
+def _slot_rows(j: ExpertJudgement, declared: tuple[str, ...]) -> list[dict]:
     tv = j.targets
     rows = []
-    for t in declared:
-        v = None if tv is None else tv.verdicts.get(t)
+    for t in tv.targets:
+        v = tv.verdicts[t]
         rows.append({
             "hotkey": j.entry.miner_hotkey, "domain": t, "stage": j.stage,
-            "passed": bool(v is not None and v.passed),
-            "reason": j.reason if v is None else v.reason,
-            "target_lcb": None if v is None else v.target_lcb,
-            "guard_lcbs": {} if v is None else v.guard_lcbs,
-            "public_lcbs": {} if v is None else v.public_lcbs,
+            "passed": bool(v.passed), "reason": v.reason,
+            "target_lcb": _num(v.target_lcb),
+            "guard_lcbs": dict(v.guard_lcbs), "public_lcbs": dict(v.public_lcbs),
             "targets": list(declared), "leg": j.entry.rebased_pointer,
-            "alpha": None if tv is None else float(tv.alpha),
-            "target_gain": None if v is None else _num(v.target_gain),
-            "target_n": None if v is None else int(v.target_n),
-            "target_clusters": None if v is None else int(v.target_clusters),
-            "inconclusive": "" if v is None else v.inconclusive,
-            "guard_reason": "" if tv is None else tv.guard_reason,
+            "declared": bool(v.declared), "gain_bar": float(v.bar),
+            "family": "declared" if v.declared else "undeclared",
+            "alpha": float(tv.alpha),
+            "maxt_crit": _num(tv.maxt_crits.get("declared" if v.declared else "undeclared")),
+            "metric_lcbs": _nums(v.metric_lcbs), "metric_gains": _nums(v.metric_gains),
+            "metric_ni_lcbs": _nums(v.metric_ni_lcbs), "gain_metric": v.gain_metric,
+            "target_gain": _num(v.target_gain),
+            "target_n": int(v.target_n), "target_clusters": int(v.target_clusters),
+            "inconclusive": v.inconclusive, "guard_reason": tv.guard_reason,
         })
     return rows

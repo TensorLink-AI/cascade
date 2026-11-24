@@ -24,7 +24,7 @@ never changes a promise already made):
 
 * ``tiered_decay`` — full pay for the win's recorded ``full_eras``, then
   exponential decay (``half_life_rounds``) to ``floor`` until the TTL
-  (:func:`cascade.eval.expert_lane.reward_multiplier`; lane B legacy);
+  (:func:`cascade.eval.expert_lane.reward_multiplier`; lane B before rev6.22);
 * ``fixed_term`` — full pay for the win's recorded ``full_eras`` (lane C:
   the DEC-CA-0073 5–20 day gain-scaled duration), then the slot ends;
 * ``indefinite_until_beaten`` — full pay until a better entry replaces the
@@ -42,14 +42,16 @@ PAY_CURVES: tuple[str, ...] = ("tiered_decay", "fixed_term", "indefinite_until_b
 
 # Today's rules, per lane — the defaults; every default is byte-identical.
 LANE_DEFAULTS: dict[str, tuple[str, str]] = {
-    "lane_b": ("bonferroni", "tiered_decay"),
+    # rev6.22 (#854): every lane B slot is tested in two max-T families and
+    # pays in full until replaced
+    "lane_b": ("maxt", "indefinite_until_beaten"),
     "lane_c": ("bonferroni", "fixed_term"),
     "lane_d": ("maxt", "indefinite_until_beaten"),
 }
 
 # What each lane's code runs in this release (family set, curve set).
 LANE_SUPPORT: dict[str, tuple[frozenset[str], frozenset[str]]] = {
-    "lane_b": (frozenset({"plain_lcb", "bonferroni"}), frozenset(PAY_CURVES)),
+    "lane_b": (frozenset({"maxt"}), frozenset({"indefinite_until_beaten"})),
     "lane_c": (frozenset({"plain_lcb", "bonferroni"}), frozenset(PAY_CURVES)),
     "lane_d": (frozenset({"maxt"}), frozenset({"indefinite_until_beaten"})),
 }

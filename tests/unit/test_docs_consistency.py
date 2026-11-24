@@ -97,9 +97,12 @@ def test_reward_examples_include_all_pools_decay_expiry_and_burn():
     assert "| A | 100% | 0% | 0% |" in tables["allocation"]
     assert "| A + B | 75% | 25% | 0% |" in tables["allocation"]
     assert "| A + B + C | 50% | 25% | 25% |" in tables["allocation"]
-    for row in ("| 0–4 | 100% | 2.5% |", "| 5 | 50% | 1.25% |",
-                "| 8–27 | 10% | 0.25% |", "| 28+ | 0% | 0% |"):
-        assert row in tables["slot-decay"]
+    # rev6.22: B pays a held slot in full until replaced; DEC-CA-0073: C has no
+    # decay either (its slot ends with its full-pay duration)
+    assert "B: a held slot pays 100% of its slot (2.5% of total emissions)" in tables["slot-decay"]
+    assert "C has no decay" in tables["slot-decay"]
+    assert "| C: confirmed MarketCast gain | ≥ 0.05 | 40 |" in tables["slot-tiers"]
+    assert "B: accepted" not in tables["slot-tiers"]
     example = tables["worked-example"]
     assert "| A king | 30% |" in example
     assert "| Eligible immediate former king | 2.5% |" in example

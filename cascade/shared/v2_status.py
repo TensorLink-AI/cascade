@@ -302,6 +302,15 @@ def payout_terms(lb) -> dict:
     (``[[lcb_threshold, full_eras], ...]``; a win's own tier is on its
     payout record)."""
     out: dict = {"full_pay_tiers": full_pay_tiers_view(lb)}
+    if not hasattr(lb, "win_ttl_eras") and hasattr(lb, "undeclared_gain_margin"):
+        # LANE_D_PLAN rev6.22: lane B pays a held slot in full until replaced
+        out.update({"rule": "indefinite", "unit": "eras", "half_life": None,
+                    "floor": None, "ttl": None,
+                    "share": _finite(getattr(lb, "share", None)),
+                    "slots": len(_lb_targets(lb)),
+                    "remainder": str(getattr(lb, "remainder", "burn") or "burn"),
+                    "undeclared_gain_margin": _finite(lb.undeclared_gain_margin)})
+        return out
     # DEC-CA-0050 go-live: the decay is counted in ERAS (``half_life_rounds``
     # keeps its name) once the config carries the win TTL; the original build
     # counted settlements

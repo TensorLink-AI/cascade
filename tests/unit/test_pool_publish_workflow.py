@@ -37,3 +37,47 @@ def test_scheduled_publish_uses_the_reviewed_cli_capacity(command):
 def test_no_retired_lane_c_forge_command_is_scheduled():
     commands = [step.get('run', '') for step in WORKFLOW['jobs']['publish']['steps']]
     assert not any(re.search(r'cascade-pool\s+publish\s+--lane\s+c\b', command) for command in commands)
+
+
+def _flag(command: str, name: str) -> str:
+    match = re.search(rf'{name}\s+(\S+)', command)
+    assert match, f'{name} missing'
+    return match[1]
+
+
+def test_hourly_publish_keeps_the_pending_block_an_epoch_past_the_build():
+    on = WORKFLOW.get('on', WORKFLOW.get(True))
+    assert [c['cron'] for c in on['schedule']] == ['0 * * * *']
+    (command,) = COMMANDS
+    # Buffer 2: a ~55 min build can never land on an epoch that began during it.
+    assert int(_flag(command, '--round-buffer')) >= 2
+
+
+def test_reveal_runs_once_a_day_and_never_reveals_the_active_snapshot():
+    (step,) = [s for s in WORKFLOW['jobs']['publish']['steps']
+               if s.get('name', '').startswith('Reveal retired snapshots')]
+    run = step['run']
+    # scheduled runs skip the reveal outside one UTC hour, before any reveal
+    assert 'github.event_name }}" = "schedule"' in run and 'date -u +%H' in run
+    assert run.index('date -u +%H') < run.index('cascade-pool reveal')
+    (command,) = COMMANDS
+    buffer = int(_flag(command, '--round-buffer'))
+    primary = re.search(r'cascade-pool reveal --chain-toml.*?(?=\n\s*#|\n\s*if |\Z)', run, re.S)[0]
+    # buffer pending entries sit above the active one: withhold all of them + it
+    assert int(_flag(primary, '--keep-newest')) >= buffer + 1
+    # owner 2026-11-24 option (b): ONE snapshot per day — the newest retiree;
+    # the rest stay in the pool bucket (no backfill)
+    assert '--newest-only' in primary.split()
+    assert int(_flag(primary, '--max-reveal')) == 1
+
+
+def test_reveal_cli_parses_the_scheduled_flags():
+    from cascade.pool.cli import _add_reveal
+
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers()
+    _add_reveal(sub)
+    args = parser.parse_args(['reveal', '--hf-repo', 'o/r', '--keep-newest', '3',
+                              '--newest-only', '--max-reveal', '1'])
+    assert (args.keep_newest, args.newest_only, args.max_reveal) == (3, True, 1)
+    assert parser.parse_args(['reveal', '--hf-repo', 'o/r']).newest_only is False

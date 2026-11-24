@@ -258,9 +258,11 @@ def check_overrides(overrides: object) -> dict:
             if (table, key) in (("scoring", "burn_uid"), ("lane_b", "remainder"),
                                 ("lane_c", "remainder"), ("lane_d", "remainder")):
                 bad.append(f"[{table}] {key} (burn destination is release-only)")
-            elif table in ("lane_c", "marketcast") and key in RETIRED_KEYS.get(table, ()):
+            elif (table in ("lane_b", "lane_c", "marketcast")
+                  and key in RETIRED_KEYS.get(table, ())):
                 # the loader ignores a retired key, so an overlay naming one
-                # would silently change nothing (DEC-CA-0073: lane C pay)
+                # would silently change nothing (DEC-CA-0073: lane C pay;
+                # LANE_D_PLAN rev6.22: lane B pay)
                 bad.append(f"[{table}] {key} (retired)")
             elif isinstance(value, dict) and table in ("v2",):
                 bad.append(f"[{table}.{key}] (nested tables are release-only)")
