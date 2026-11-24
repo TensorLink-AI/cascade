@@ -51,13 +51,17 @@ W2_DEFAULTS: dict[str, object] = {
     "min_clusters": 20,
     "min_long_series": 300,
     "d_margin": 0.01,
+    # rev6.23 (owner 2026-11-24): the tenure-decaying crown bar (d_margin is its end).
+    "d_margin_start": 0.03,
+    "d_margin_warmup_settlements": 32,
     "alpha": 0.05,
     "bootstrap_B": 10_000,
     "gate_suites": ("gift", "boom", "time", "fev"),
     "gate_weights": None,              # equal over gate_suites (checked separately)
     "tau_public": 0.01,
     "reward_prior_kings": 2,
-    "king_decay": 0.5,
+    # rev6.23 (owner 2026-11-24): explicit court weights replace king_decay.
+    "court_weights": (0.80, 0.15, 0.05),
     "max_entries_per_settlement": 8,
     "max_open_per_coldkey": 2,
     "max_bench_holds": 4,
@@ -79,6 +83,8 @@ W2_KEYS = tuple(W2_DEFAULTS)
 # the shipped files carry none of them.
 RETIRED_VALUES: dict[str, object] = {
     "confirm_on_king_change": "original",
+    # rev6.23 (owner 2026-11-24): court_weights replaces it.
+    "king_decay": 0.25,
     "targets": ("energy",),
     "teacher_ref": "ephemeris:panel@1",
     "teacher_api": "ephemeris",
@@ -116,6 +122,8 @@ MUTATIONS: dict[str, tuple[object, object, dict]] = {
     "min_clusters": (10, 30, {}),
     "min_long_series": (150, 600, {}),
     "d_margin": (0.02, 0.03, {}),
+    "d_margin_start": (0.04, 0.05, {}),
+    "d_margin_warmup_settlements": (16, 64, {}),
     "alpha": (0.1, 0.01, {}),
     "bootstrap_B": (2000, 20_000, {}),
     "gate_suites": (["gift", "boom"], ["gift", "boom", "time"], {"gate_weights": None}),
@@ -123,8 +131,9 @@ MUTATIONS: dict[str, tuple[object, object, dict]] = {
                      {"gift": 1.0, "boom": 1.0, "time": 1.0, "fev": 3.0},
                      {"gate_suites": ["gift", "boom", "time", "fev"]}),
     "tau_public": (0.02, 0.005, {}),
+    # rev6.23: court_weights moves with it (co_for: one weight per slot).
     "reward_prior_kings": (3, 1, {}),
-    "king_decay": (0.25, 0.75, {}),
+    "court_weights": ([0.7, 0.2, 0.1], [0.6, 0.3, 0.1], {}),
     "max_entries_per_settlement": (4, 16, {}),
     "max_open_per_coldkey": (3, 1, {}),
     "max_bench_holds": (6, 2, {}),
@@ -154,7 +163,9 @@ REFUSED: dict[str, list[object]] = {
     "min_windows": [0, -1, True, 1.5],
     "min_clusters": [0, -1, True, 2.5],
     "min_long_series": [-1, True, 1.5],
-    "d_margin": [0.0, -0.01, 1.0, True],
+    "d_margin": [0.0, -0.01, 1.0, True, 0.05],     # 0.05 > d_margin_start (rev6.23)
+    "d_margin_start": [0.0, -0.03, 1.0, True, 0.005],  # 0.005 < d_margin
+    "d_margin_warmup_settlements": [0, -1, True, 1.5, "32"],
     "alpha": [0.0, 1.0, -0.05, True],
     "bootstrap_B": [0, -1, True, 1000.5],
     "gate_suites": [[], [""], ["gift", "gift"], "gift", [1]],
@@ -164,7 +175,10 @@ REFUSED: dict[str, list[object]] = {
                      {"gift": "1"}],
     "tau_public": [-0.01, 1.0, True],
     "reward_prior_kings": [-1, True, 1.5],
-    "king_decay": [0.0, -0.5, 1.5, True],
+    "court_weights": [[0.8, 0.2], [0.8, 0.15, 0.05, 0.0], [0.9, 0.15, -0.05],
+                      [0.8, 0.15, 0.1], [0.8, 0.15, 0.05 + 1e-8], [True, False, False],
+                      ["0.8", 0.15, 0.05], 0.8, [float("nan"), 0.5, 0.5],
+                      [float("inf"), 0.0, 0.0], []],
     "max_entries_per_settlement": [0, -1, True, 2.5],
     "max_open_per_coldkey": [0, -1, True],
     "max_bench_holds": [-1, True, 1.5],
@@ -186,7 +200,20 @@ ACCEPTED: dict[str, list[object]] = {
     "takes_from": ["lane_a", "lane_b", "lane_c"],
     "dtypes": [["BF16"]],
     "max_source_share": [1.0, 0.25],
+    "court_weights": [[1.0, 0.0, 0.0], [1 / 3, 1 / 3, 1 / 3], [0.80, 0.15, 0.05 + 1e-10]],
+    "d_margin_start": [0.01, 0.5],        # = d_margin (no decay) and wide
+    "d_margin_warmup_settlements": [1, 1000],
 }
+
+
+def co_for(key: str, value) -> dict:
+    """The co-keys ``key = value`` needs to load: MUTATIONS' co-keys, and
+    (rev6.23) for ``reward_prior_kings = n`` a ``court_weights`` of
+    ``1 + n`` slots (the loader refuses a length mismatch)."""
+    co = dict(MUTATIONS[key][2]) if key in MUTATIONS else {}
+    if key == "reward_prior_kings" and type(value) is int and value >= 0:
+        co["court_weights"] = [1.0] + [0.0] * value
+    return co
 
 
 # ── loading ──────────────────────────────────────────────────────────────────

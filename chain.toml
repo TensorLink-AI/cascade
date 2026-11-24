@@ -1671,7 +1671,9 @@ min_windows     = 1000           # D5
 min_clusters    = 20             # D5: sources
 min_long_series = 300
 max_source_share = 0.25          # B14
-d_margin        = 0.01           # D5
+d_margin        = 0.01           # D5; rev6.23: the crown bar's END (floor)
+d_margin_start  = 0.03           # rev6.23 (owner 2026-11-24): the bar at KING_D's tenure 0; >= d_margin
+d_margin_warmup_settlements = 32 # rev6.23: settlements (32 x 3 h ~ 4 days) the bar falls linearly start -> d_margin
 alpha           = 0.05
 bootstrap_B     = 10000
 embargo_hours   = 48.0           # W2e rev6.10 (a)/rev6.12 (a): per-series embargo top-up, every cadence (0 = the rev3 rule)
@@ -1684,7 +1686,7 @@ gate_weights    = { gift = 1.0, boom = 1.0, time = 1.0, fev = 1.0 }  # D2b: equa
 tau_public      = 0.01
 lowfreq_freqs   = ["D", "W", "M", "ME", "MS", "Q", "QE", "QS", "A", "Y", "YE"]  # A10: daily and slower
 reward_prior_kings = 2           # D7
-king_decay      = 0.5            # D7
+court_weights   = [0.80, 0.15, 0.05]  # D7 rev6.23 (owner 2026-11-24): KING_D, prior 1, prior 2; length 1 + reward_prior_kings, sum 1 (replaces the retired king_decay)
 max_entries_per_settlement = 8   # D3
 max_open_per_coldkey = 2         # D3
 max_judged_per_coldkey_per_settlement = 2  # A8
