@@ -1,12 +1,293 @@
 # Plan: lane D "open weights" (anything goes on our architecture), with lane E and lane A flexibility — v3
 
-Status: **PLAN v3, ~~rev6.12~~ ~~rev6.14~~ ~~rev6.15~~ ~~rev6.16~~ ~~rev6.17~~ ~~rev6.18~~ rev6.20 (proposed 2026-11-22; ~~rev6.12~~ ~~rev6.14~~ ~~rev6.15~~ ~~rev6.16~~ ~~rev6.17~~ rev6.18 2026-11-23; rev6.20 2026-11-24)**: v2's design, made buildable by an
+Status: **PLAN v3, ~~rev6.12~~ ~~rev6.14~~ ~~rev6.15~~ ~~rev6.16~~ ~~rev6.17~~ ~~rev6.18~~ ~~rev6.20~~ rev6.21, rev6.23 (proposed 2026-11-22; ~~rev6.12~~ ~~rev6.14~~ ~~rev6.15~~ ~~rev6.16~~ ~~rev6.17~~ rev6.18 2026-11-23; rev6.20, rev6.21, rev6.23 2026-11-24)**: v2's design, made buildable by an
 autonomous loop. A work package is done **only when its Accept command exits
 0**; **(rev6)** its level is only what `scripts/laned/status` computes (§17),
 never a claim. Owner decisions are marked **[DECIDE]**. Nothing is armed. **No calendar
 dates**: stages are gated (§5).
 
+## rev6.21 (owner 2026-11-24; main @ b65f25d): four miner-chosen levers on lane B expert legs
+
+One owner decision (owner 2026-11-24, DECIDED: "open four new miner-chosen
+levers for lane B expert legs"). It builds on rev6.20 (lane B EMA, no
+cooldown; plan PR #840, feature PR #845) and on WB23 (miner-chosen
+`train_hours`, PR #816), and lands as **one feature PR** (rev6.17 rule),
+tests and code together, new WP **WB27** (`tests/accept/wb27/`). Plan text
+only here. Changed text elsewhere is marked **(rev6.21)**.
+
+**Where the levers live.** On the lane B funding request, next to WB23's
+`train_hours`: one header **`X-Lane-B-Levers`** carrying a JSON object (keys
+below; an absent key is its default; no header = every lever at its default
+= today's leg). The signature binds it: the lane B signed ref gains
+`|levers=<sha256 of the header value as sent>` after WB23's `|hours=` tag
+(no header ⇒ the signed field is today's, byte for byte). The intake parses
+and range-checks it before anything is queued or vaulted (nothing charged),
+the funded entry keeps the canonical value, and the trainer derives the leg
+contract from it.
+
+| Lever | Key | Range | Default (today) | Typed refusal |
+|---|---|---|---|---|
+| (1) LR scale | `lr_scale` | `[lane_b] lr_scale_min` … `lr_scale_max` (shipped 0.5 … 2.0; loader: `0 < min ≤ 1.0 ≤ max ≤ 4.0`), at most 3 decimals | 1.0 | `lr_scale_out_of_range` |
+| (2) Curriculum | `curriculum` | 1–3 ordered stages `[[name, fraction], …]`; names `[a-z][a-z0-9_-]{0,23}`, unique; fractions > 0 with at most 2 decimals, summing to exactly 1 | one stage (today) | `bad_curriculum` |
+| (3) Context length | `context_length` | 4096 … 32768, powers of two, ≤ the context ceiling, must fit the chosen GPU's measured memory | 4096 | `context_length_out_of_range`, `context_length_unfit`, **`context_length_unsupported` (see below)** |
+| (4) Scored EMA | `ema` | ~~{0.05, 0.10}~~ `[lane_b] ema_sigma_rels` (addition 6) | 0.10 | `ema_out_of_range`, `ema_unarmed` (a non-default width needs `[lane_b] ema_no_cooldown_from_block` typed) |
+
+Any other key, a non-object, or malformed JSON is `bad_levers`; any
+~~non-default lever while the activation key is unset is `levers_unarmed`.~~ (no activation key, addition 5)
+
+1. **`lr_scale`** multiplies the leg's base LR (every optimizer group,
+   NorMuon and AdamW, the router's own scale on top as today). Carried as a
+   new leg-contract term `lane_b_lr_scale` (dropped from `contract_digest`
+   at 1.0, `_DIGEST_DROP_WHEN_DEFAULT`), so the worker's receipt binds it;
+   `train_pyramid` refuses `lane_b_lr_scale ≠ 1.0` on a lane A leg.
+2. **Curriculum.** The miner declares up to 3 ordered stages (e.g.
+   `[["easy", 0.3], ["hard", 0.7]]`); fractions are step fractions of the
+   leg (= point-budget fractions: every step consumes the same batch).
+   Stage *i* has its own corpus, generated on the CPU tier exactly like
+   today's leg corpus, at the derived seed `curriculum_stage_seed(seed, i)`
+   (sha256, stdlib) and with the generator constructed with the opt-in
+   keyword **`curriculum_stage=<name>`** (passed only when the leg has > 1
+   stage and the constructor declares it, the DEC-CA-0028 `real_corpus_dir`
+   pattern; a multi-stage leg whose generator does not declare it is the
+   miner's fault, `generator_curriculum_unsupported`; `cascade lane-b
+   verify-repo` checks the signature statically). The trainer sends the pod
+   one merged index whose children are tagged with their stage; the pod
+   reads stage 0 to its budget (`budget × h_0 / 100`, `h` the hundredths),
+   then stage 1, …, the last stage to the remainder: deterministic, a pure
+   function of the contract. The leg-contract term `curriculum` (tuple of
+   `(name, hundredths)`, dropped from the digest at `()`) binds it; the pod
+   refuses an index whose stages disagree with the contract. A one-stage
+   curriculum is the default and changes nothing (the lane A corpus key is
+   reused exactly as today).
+3. **`context_length`.** **Not buildable on main without a contract change
+   — flagged for the owner, [DECIDE].** Two facts the brief did not have:
+   (a) there is no `[training] max_context_length`; the deployed `chain.toml`
+   has `max_context_length = 32768` only under `[lane_d]` (and
+   `[marketcast]`); (b) the locked architecture refuses any other context:
+   `CascadeMoEConfig.from_contract` (`cascade/trainer/pyramid_model.py`, folded
+   into `base_arch_digest`) raises unless `context_length == 4096`, and the
+   model's decode window `max_patches = 136` is sized for 4096 + 64. Opening
+   the lever means editing `pyramid_model.py`, which moves `base_arch_digest`
+   and therefore **lane A's `contract_digest`** — forbidden by this decision
+   ("no contract_digest change for lane A"). Also, every judge scores the
+   leg through the king's `config.json` (context 4096), so a longer training
+   context would not be what is judged. So the feature PR ships the wire
+   format and refusals only: `context_length` 4096 is accepted (a no-op);
+   anything else on the grid is refused **`context_length_unsupported`**
+   (off the grid: `context_length_out_of_range`). The memory-fit admission
+   check (`context_length_unfit`: projected peak = WB19
+   `peak_memory_bytes × context / 4096` must be ≤ 0.90 ×
+   `memory_total_bytes` of the chosen type) and the ceiling (a new `[lane_b]
+   max_context_length`, default 32768, never `[training]`) are specified for
+   when the owner opens it. Owner options: (i) keep it closed; (ii) an
+   arch-generation change (D15: a new board) that makes the context a
+   contract term of `pyramid_model.py` for every lane.
+4. **EMA choice.** From `[lane_b] ema_no_cooldown_from_block` (rev6.20) a
+   lane B leg scores a power EMA; the miner picks the width: 0.10 (default,
+   rev6.20's) or 0.05. Carried as the existing contract term
+   `power_ema_eval` (index into the image's `POWER_EMA_SIGMA_RELS = (0.05,
+   0.10)`: 0 for 0.05; −1 = the image default 0.10, dropped from the digest
+   as today). `train_pyramid` honours it only on a lane B EMA leg and refuses
+   it elsewhere. The checkpoint marker records `scored_sigma_rel`; the expert
+   entry's `scored_weights` gains `"ema005"`; the rebased (judged and merged)
+   checkpoint is built from that scored file, as rev6.20.
+
+~~**Activation: ONE typed key `[lane_b] miner_levers_from_block`** (integer ≥
+0; default **0 = never**, today's behaviour for every lever). When typed,
+an era boundary at or after `[v2] from_block` (loader-checked like
+`ema_no_cooldown_from_block`). A lane B leg whose dispatch block
+(`train_block`) is ≥ the key trains its funded levers; before it (or unset)
+it trains every lever at its default and records none.~~ **(rev6.21 owner
+addition 5) No activation block**: lanes B, C and D are not rolled out, so
+the levers are the default lane B behaviour. Keys `lr_scale_min` /
+`lr_scale_max` ship at 0.5 / 2.0, overlay-settable like every `[lane_b]`
+key; `levers_unarmed` is gone.
+
+**Owner additions (2026-11-24, same day; they supersede the text above
+where they differ):**
+
+1. **Legs up to 12 h.** `[lane_b] max_leg_hours = 12.0`, `max_leg_seconds =
+   54000` (12 h × 1.25) in the code defaults and both shipped files. Checked
+   for ≤ 6 h assumptions: pod TTLs derive from the leg contract's
+   `max_train_seconds` (`provider_ttl_seconds`) and scale; the key/queue TTL
+   `funded_entry_ttl_hours = 36` still covers a 15 h guard plus waiting;
+   `max_base_age_eras = 2` covers a leg that spans up to two 12 h eras;
+   the WB23 cross-era hold (`_leg_length_holds`) would hold a leg whose
+   guard + margin exceeds one era **forever**, so such a leg is no longer
+   held: it starts and settles at the boundary after its wall, rebased onto
+   that king. Validators never window-check a lane B `train_block`. The
+   `funded_sku_wall_seconds` table is lane A's (not used for lane B walls).
+2. **Token and/or hour limits, whichever comes first.** `X-Lane-B-Train-
+   Tokens` (signed `|tokens=`) and/or `X-Lane-B-Train-Hours`. Tokens only ⇒
+   the hour limit is `max_leg_hours`. Steps = `tokens // tokens_per_step`
+   (`batch_size × (context_length // patch_size) × patch_size` of the leg
+   contract, never a constant), capped at WB23's steps cap for the hour
+   limit; the training wall is the hour limit and hitting it is a normal
+   stop. Hours only on a measured GPU is WB23's leg unchanged. Codes
+   `bad_train_tokens`, `train_tokens_out_of_range`.
+3. **Any GPU type at the miner's own risk.** With a limit, a type with no
+   WB19 rate (or not listed) may be chosen on a Lium key; the record says
+   `gpu_measured: false`; it rents exactly that type. OOM / no boot / crash
+   fail the leg as the miner's (`own_risk_gpu_failed`, no requeue, no
+   refund). Image pinning and the sandbox are unchanged.
+4. **Recording.** A limits leg's contract carries `lane_b_stop_record`; the
+   checkpoint `config.json` records `lane_b_leg = {steps, tokens, stop}`
+   (`stop` ∈ steps / tokens / hours / corpus); the expert entry records the
+   requested limits, the derived steps and `train_tokens`, `gpu_measured`,
+   `trained_steps`, `trained_tokens`, `stop` (each dropped at its default),
+   and `check_leg_record` re-derives from what the leg trained.
+5. **No activation block** (above).
+6. **EMA choice is a set.** `[lane_b] ema_sigma_rels = [0.03, 0.05, 0.10,
+   0.15, 0.20]` (overlay-settable; code bounds 0.01–0.30, must contain
+   0.10), default 0.10. On a rev6.20 EMA leg the leg contract carries
+   `power_ema_sigma_rels = (σ,)`, `power_ema_eval = 0`: **only that EMA is
+   computed**, scored and merged; `scored_weights = "ema<σ×100:03d>"`
+   (e.g. `ema015`) and judges check it. Replaces the {0.05, 0.10} choice.
+
+**Signed record; judges re-derive.** The expert manifest entry gains
+**`levers`** (the canonical non-default levers; `{}` dropped from the
+canonical body, so an entry without levers keeps its bytes). `judge_entry`
+(validator, trainer self-judge and cascade-audit) refuses at a new stage
+**`levers`** (added to the audit's `LANE_B_STAGES`) an entry whose levers do
+not re-validate against `[lane_b]` or are non-default at a `train_block`
+before the key; the `scored_weights` stage re-derives `"ema005"` /
+`"ema010"` / `""` from `train_block`, `ema_no_cooldown_from_block` and the
+entry's `ema`. The trainer and the worker derive the leg contract with ONE
+shared helper (`lane_b_leg_contract`, stdlib); the trainer sends the pod the
+leg spec (WB23 length + levers) as `--recipe-json` on the expert role and
+checks the receipt's contract digest as today (`receipt_contract_ok`). This
+also closes a WB23 gap: on #816 the worker re-derived `for_hours(leg_hours)`
+while the trainer expected the `train_hours` contract.
+
+**Steps.** WB23's cap still applies unchanged (the steps of a lane A leg of
+the same hours); a lever never raises a leg's steps, guard or wall.
+
+**Anti-gaming (unchanged guards).** The levers change only how the selected
+expert rows are trained. Judging is untouched: every guard still runs once
+per leg against the same windows — the other suites' public metrics, every
+undeclared pool domain (with `_rest` pooling), every undeclared horizon
+target, guard 4 (whole-pool point gain ≥ 0) and the anchor-king guards
+(rev6.19, WB26). A lever that buys a target gain by hurting anything else
+fails exactly as today. Frozen rows stay the king's bytes (merge byte-check
+unchanged), the router stays frozen (D40 a), and no lever reaches lane A.
+
+**Lane A is byte-identical.** No `[training]` / `[v2.training]` key, no
+pinned dependency, no `base_arch_digest` and no lane A `contract_digest`
+moves: the two new contract terms are dropped at their defaults, and lane A
+legs never take them (`train_pyramid` refuses them without an expert
+selection). The existing byte-identity tests (WB25 `main_snapshot` oracle,
+W-EMA EMA-off comparisons, the multi-target manifest bytes test) prove it
+in CI. The generator keyword is passed only on a multi-stage lane B leg.
+
+**Miner CLI (WB24) and docs (WB20).** `cascade lane-b fund` gains
+`--lr-scale`, `--curriculum name:frac,…`, `--context-length`, `--ema`
+(builds, signs and pre-checks the header with the intake's codes);
+`cascade lane-b verify-repo` reports whether `Generator.__init__` declares
+`curriculum_stage`. `docs/MINER.md` lane B section documents the four
+levers, ranges, defaults, refusals and the activation key.
+
+**Activation (owner steps).** On-pod parts (`pyramid_trainer.py`,
+`stream.py`, the generator loader) ship in a shared-image repin (5 pins +
+wall gate, never mid seed epoch); the CPU-tier generation CLI ships with
+the release. Release-then-activate on netuid 91 (six external validators):
+release, ≥ 2/3 observed stake ~~, then type `miner_levers_from_block` at a
+future era boundary~~ (no key to type: lane B itself is not rolled out).
+Testnet (netuid 259) first.
+
+| Item | Change | Where |
+|---|---|---|
+| (a) | Four miner levers on lane B legs (no activation block); 12 h legs; token/hour limits; own-risk GPUs; EMA set; `context_length` refused (`context_length_unsupported`) pending an owner decision | rev6.21 (this section), §12b.6, WB27 row |
+| (b) | Feature PR WPs: WB27 (new), WB23 (intake, leg record), WB10 (keys), WB22 (manifest, driver), W-EMA (`pyramid_trainer.py`), W9 (`LANE_B_STAGES`), WB24 (CLI), WB20 (docs) | §3 |
+
+## rev6.23 (owner 2026-11-24; main @ b65f25d): lane D court pays 80 / 15 / 5
+
+One owner decision, for **lane D only** (owner 2026-11-24, DECIDED): lane
+D's paid court shares become **explicit weights**: current KING_D
+**80%**, prior king 1 **15%**, prior king 2 **5%** of lane D's share. This
+replaces the geometric `king_decay = 0.5` (which gave 57 / 29 / 14). Plan
+text only; the code lands as one feature PR (rev6.17 rule), tests and code
+together. Changed text elsewhere is marked **(rev6.23)**; superseded text
+is struck, not deleted.
+
+**Config (W2 / W2e).**
+
+- New key `[lane_d] court_weights = [0.80, 0.15, 0.05]`: a list of
+  numbers, one per court slot (KING_D first, then prior miner kings by
+  recency). The loader refuses it unless its length is
+  `1 + reward_prior_kings`, every entry is a finite number `>= 0` (bools
+  refused), and the entries sum to 1 within `1e-9`. Overlay-settable like
+  every other lane D tuning key (`ALLOWED["lane_d"] = None`; the overlay
+  merge is re-parsed through the same loader, so a bad overlay is refused).
+- `reward_prior_kings` stays 2. Changing it alone (file or overlay) is a
+  length mismatch and is refused; the two keys move together.
+- `[lane_d] king_decay` is **retired**: it joins `RETIRED_KEYS["lane_d"]`,
+  so older files that still set it load and the value is ignored. It is no
+  longer a `LaneDConfig` field. **Lane A's `[scoring] king_decay` is a
+  different key and is untouched.**
+
+**Pay (unchanged otherwise).** Slot `i` of the paid court is worth
+`court_weights[i]`, normalised over the slots the court has, times lane D's
+share. Every other court rule is exactly today's:
+
+- the court shifts on a new crown (the new KING_D in slot 0, the old one
+  becomes prior king 1, prior king 2 drops off);
+- the house is never paid: when the house holds KING_D its slot pays
+  nobody and burns (`house_king`), exactly as today;
+- a deregistered member's slot burns (`deregistered`);
+- a court with fewer than `1 + reward_prior_kings` slots (no prior kings
+  yet) renormalises over the slots it has, as today's geometric split
+  did: KING_D alone takes the whole share; KING_D plus one prior king
+  take `0.80 / 0.95` and `0.15 / 0.95`;
+- a failed lane D check burns only lane D (rev6.18 F1/B1).
+
+**Not an activation change.** Lane D is not armed on mainnet
+(`from_block = 0`). This changes a default in the shipped files and the
+parser; no activation block, no `cfg-` vote, no overlay is needed. The
+change reaches a validator with the release; the arming overlay (D10/D45)
+carries whatever `court_weights` the owner sets then.
+
+**Report and audit (W7a, W8b, W9).** The signed `lane-d-report/1`
+`params` echo carries `court_weights` (a JSON list, as parsed) in place of
+`king_decay`; the audit's expected params match it. Every re-derivation of
+the paid court uses the parsed `court_weights`, never the producer's
+emission: `cascade.audit.lane_d_chain.court_shares` (W8b) and the audit's
+lane D part in `cascade.audit.checks` (`lane_d_pay`, W9: the "weights match
+the paid court" burn check). The validator's builder
+(`cascade.shared.emission.lane_d_vector`) takes `court_weights` too.
+
+**Text struck elsewhere:** §1.4 (court decay), the W2 key list, D7 (§6 and
+§17.4), D25's 57 / 29 / 14.
+
+## rev6.20b (owner 2026-11-24): no activation block for lane B EMA
+
+Owner 2026-11-24: "lanes B, C and D are NOT rolled out yet, so **no
+activation blocks**." This amends rev6.20 below. Plan text only.
+
+- **EMA, no cooldown is simply lane B.** Every lane B leg contract carries
+  `lr_schedule = "warmup_constant_ema"` (`lane_b_leg_contract`, the one
+  helper the trainer and the worker share). Every lane B leg scores and
+  merges its σ_rel 0.10 power EMA. No key, flag or block arms it.
+- **~~`[lane_b] ema_no_cooldown_from_block`~~ is not built** (struck in
+  rev6.20 below). It never reached main, so there is nothing to retire.
+- **Kept:** the signed record and the judge check. Every expert manifest
+  entry carries `scored_weights = "ema010"`, always in the signed body. A
+  manifest without the field loads as `""`, and `judge_entry` refuses any
+  entry whose value is not `"ema010"` at stage `scored_weights` (in the
+  audit's `LANE_B_STAGES`).
+- **Dropped:** the trainer's per-leg marker check (`scored_weights_mismatch`).
+  The receipt check (`receipt_contract_ok`) already binds the pod to the
+  EMA leg contract.
+- **Unchanged:** lane A (W-EMA, cooldown, `contract_digest`, `[training]`,
+  pinned deps). The on-pod part still ships in a shared-image repin, never
+  mid seed epoch. Lane B goes live only with its own rollout
+  (`[lane_b] from_block`).
+- **WPs (#845):** W-EMA, WB10 (`lane_b_leg_contract`, no key), WB22, W-S2,
+  W9, WB20 (MINER.md).
+
 ## rev6.20 (owner 2026-11-24; main @ 052eabe): lane B legs train with EMA, no cooldown
+
+**(rev6.20b) The activation key below is superseded: no key; the rule is
+lane B itself (rev6.20b above).**
 
 One owner decision, for **lane B only** (owner 2026-11-24, DECIDED: "let's
 just do EMA, no cooldown"). Plan text only; the code lands as one feature
@@ -46,15 +327,15 @@ for every input. Lane A training, the lane A `contract_digest`, every
 byte-identical; the existing byte-identity tests (WB25 `main_snapshot`
 oracle, W-EMA EMA-off comparisons) prove it in CI.
 
-**Consensus surface (validators judge lane B legs).** One typed activation
-key, the repo's `*_from_block` pattern:
+**Consensus surface (validators judge lane B legs).** ~~One typed activation
+key, the repo's `*_from_block` pattern:~~ **(rev6.20b) no key.**
 
-- **`[lane_b] ema_no_cooldown_from_block`** (integer ≥ 0; default **0 =
+- ~~**`[lane_b] ema_no_cooldown_from_block`** (integer ≥ 0; default **0 =
   never**, today's behaviour). When typed, an era boundary at or after
   `[v2] from_block` (loader-checked, like `acceptance_from_block`).
   Overlay-settable like every `[lane_b]` key except the release-only hash
   set. A lane B leg whose dispatch block (`--block`, recorded as the expert
-  manifest entry's `train_block`) is ≥ the key trains under the new rule.
+  manifest entry's `train_block`) is ≥ the key trains under the new rule.~~
 - **Lane B leg contract.** From that block the trainer and the worker derive
   the leg contract as today (`for_hours`) and then set `lr_schedule =
   "warmup_constant_ema"`, one shared helper on both sides. The worker's
@@ -86,12 +367,13 @@ key, the repo's `*_from_block` pattern:
 repin + wall gate, never mid seed epoch (memory: "Image repin: 5 pins + wall
 gate"), release-then-activate on netuid 91 (six external validators): ship
 the validator release, wait for ≥ 2/3 observed stake, then type
-`ema_no_cooldown_from_block` at a future era boundary. Testnet (netuid 259)
-first. Until the key is typed nothing changes, on any image.
+~~`ema_no_cooldown_from_block` at a future era boundary. Testnet (netuid 259)
+first. Until the key is typed nothing changes, on any image.~~ **(rev6.20b)**
+no key to type: lane B gets the rule when lane B rolls out.
 
 | Item | Change | Where |
 |---|---|---|
-| (a) | Lane B legs: no cooldown, scored = σ 0.10 power EMA, behind `[lane_b] ema_no_cooldown_from_block` | §8 W-EMA (lane B struck), W-EMA row, §3.2 lane B bullet, §12b.0, D44 note |
+| (a) | Lane B legs: no cooldown, scored = σ 0.10 power EMA, ~~behind `[lane_b] ema_no_cooldown_from_block`~~ **(rev6.20b) for every lane B leg** | §8 W-EMA (lane B struck), W-EMA row, §3.2 lane B bullet, §12b.0, D44 note |
 | (b) | Feature PR WPs: W-EMA (`pyramid_trainer.py`, `worker.py` ride-along), WB10 (key), WB22 (`expert_manifest.py`, `lane_b_driver.py`), WB23 (`validator/expert_lane.py`), W9 (`LANE_B_STAGES`) | §3 |
 
 ## rev6.18 (owner 2026-11-23; main @ 78b1d45): eval v2 (live 50% + public 50%), multivariate, one checker, burn scoping, GPU environments
@@ -3089,7 +3371,9 @@ every challenger shares one window draw and the king's scores
 
 - There's one KING_D at a time.
 - The court is KING_D plus `reward_prior_kings` (2) prior **miner** kings,
-  decayed by `king_decay` (0.5) inside lane D's share.
+  ~~decayed by `king_decay` (0.5) inside lane D's share~~ **(rev6.23)** paid
+  by the explicit `court_weights` `[0.80, 0.15, 0.05]` inside lane D's share
+  (owner 2026-11-24).
 - The house is never in the court.
 
 **The house (our lane A king)**
@@ -3521,7 +3805,7 @@ Accept command exits 0**, never on a builder's word. Conventions:
 | WP | What | Depends | Runs in | Accept |
 |---|---|---|---|---|
 | W1 | **(rev3)** Measurement (= S1 B2, `scripts/laned_w1_measure.py`): first-seen existence check; snapshot-diff **upper bound** on forward-eligible counts at both clocks; pool_mkt at 6 h; (§1.3, §1.7): forward-eligible counts and latency per frequency; long-history inventory per context variant; `pool_d` size. **(rev6.14)** The script's single `--margin-hours` (default 6) is split to match rev6.14 (a): `--fresh-from` semantics (fresh / eligibility counted from `T + forward_margin_hours`, default 0) and counts taken at the first snapshot / settlement ≥ `T + eval_delay_hours` (default 6); fresh and embargo windows reported separately per frequency (10 s / 1-min / 5-min sources counted) | — | builder (needs `TSFORGE_S3`) | `scripts/laned/accept W1 --evidence evidence/w1.json` |
-| W2 | `[lane_d]` config: the keys `from_block`, `until_block`, `share`, `takes_from`, `remainder`, `contexts`, `horizon`, `forward_margin_hours`, `min_windows`, `min_clusters`, `min_long_series`, `d_margin`, `alpha`, `bootstrap_B`, `gate_suites`, `gate_weights`, ~~`unselected_suite`~~ **(rev5) dropped:** the held-out suite is the §16 sentinel, drawn from `[v2] sentinel_suites` (W-S1); a lane D key would duplicate it, `tau_public`, `reward_prior_kings`, `king_decay`, `max_entries_per_settlement`, `max_open_per_coldkey`, `max_bench_holds`, `loser_ttl_eras`, `dtypes`, **(rev3)** `max_mirror_lag_hours` (A1), `confirm_on_king_change` (D20), `max_judged_per_coldkey_per_settlement` (A8), `max_coldkey_unresolved_settlements` (A8), `max_reveal_delay_days` (A9), `lowfreq_freqs` (A10); **(rev5)** `ready_ttl_blocks` (B10), `max_source_share` (B14); **(rev6.9)** `backtest_weight_cap` (default ~~0~~ **(rev6.15)** 0.05) and `backtest_ratio_floor` (rec 0.85), parsed and range-checked here, with the inequality check in W5i; `contexts` default ~~`[4096, 8192, 16384]` (A5)~~ **(rev6.6)** `[4096, 8192, 16384, 32768, 65536, 131072]` (every variant declarable from launch; arming per variant is computed, not configured, §1.1); `dtypes` default `["BF16"]` (A6). **(rev3) Size M, not S:** `lane_d.py` hardcodes `active() = False` (`:65-68`), refuses `from_block > 0` (**(rev5)** `:78-79`) and carries DEC-CA-0062 placeholder keys that must keep parsing (`until_block` and `share` overlay-settable; activation by signed-overlay `from_block`, never a DEC-CA-0045 vote), plus legacy keys still parsed (the deployed file carries `targets`, `teacher_*`, `gain_margin`, …); `ALLOWED["lane_d"]` with `remainder` refused via the `(table, key)` special case (**(rev5)** `netconfig.py:210`); loader parse, round-trip and **mutation** test per key; the 131072 cap; `LaneDConfig.active()` real | W0c | ci | `scripts/laned/accept W2` (includes `unread_keys.py`) |
+| W2 | `[lane_d]` config: the keys `from_block`, `until_block`, `share`, `takes_from`, `remainder`, `contexts`, `horizon`, `forward_margin_hours`, `min_windows`, `min_clusters`, `min_long_series`, `d_margin`, `alpha`, `bootstrap_B`, `gate_suites`, `gate_weights`, ~~`unselected_suite`~~ **(rev5) dropped:** the held-out suite is the §16 sentinel, drawn from `[v2] sentinel_suites` (W-S1); a lane D key would duplicate it, `tau_public`, `reward_prior_kings`, ~~`king_decay`~~ **(rev6.23)** `court_weights` (`[0.80, 0.15, 0.05]`; length `1 + reward_prior_kings`, each ≥ 0, sum 1 within 1e-9; `king_decay` → `RETIRED_KEYS["lane_d"]`), `max_entries_per_settlement`, `max_open_per_coldkey`, `max_bench_holds`, `loser_ttl_eras`, `dtypes`, **(rev3)** `max_mirror_lag_hours` (A1), `confirm_on_king_change` (D20), `max_judged_per_coldkey_per_settlement` (A8), `max_coldkey_unresolved_settlements` (A8), `max_reveal_delay_days` (A9), `lowfreq_freqs` (A10); **(rev5)** `ready_ttl_blocks` (B10), `max_source_share` (B14); **(rev6.9)** `backtest_weight_cap` (default ~~0~~ **(rev6.15)** 0.05) and `backtest_ratio_floor` (rec 0.85), parsed and range-checked here, with the inequality check in W5i; `contexts` default ~~`[4096, 8192, 16384]` (A5)~~ **(rev6.6)** `[4096, 8192, 16384, 32768, 65536, 131072]` (every variant declarable from launch; arming per variant is computed, not configured, §1.1); `dtypes` default `["BF16"]` (A6). **(rev3) Size M, not S:** `lane_d.py` hardcodes `active() = False` (`:65-68`), refuses `from_block > 0` (**(rev5)** `:78-79`) and carries DEC-CA-0062 placeholder keys that must keep parsing (`until_block` and `share` overlay-settable; activation by signed-overlay `from_block`, never a DEC-CA-0045 vote), plus legacy keys still parsed (the deployed file carries `targets`, `teacher_*`, `gain_margin`, …); `ALLOWED["lane_d"]` with `remainder` refused via the `(table, key)` special case (**(rev5)** `netconfig.py:210`); loader parse, round-trip and **mutation** test per key; the 131072 cap; `LaneDConfig.active()` real | W0c | ci | `scripts/laned/accept W2` (includes `unread_keys.py`) |
 | W2b | `[lane_d_ops]` non-consensus table (vault bucket, `pool_d` location, eval host, queue policy), read only by the main validator and the intake; never in receipts | W2 | ci | `scripts/laned/accept W2b` (satellite code path imports nothing from it) |
 | W2e | **(rev6.10, owner 2026-11-23)** `[lane_d]` keys added to W2's set (a separate row so W2's text stays untouched while #745 edits it): `embargo_hours` (default **48**, decided: lane A's ~48 h reveal delay; ≥ 0; 0 = the rev3 rule), `max_windows_per_settlement` (~~rec 2000~~ **(rev6.11)** **5000**, owner 2026-11-23; refused below `min_windows`); ~~**(rev6.11)** `embargo_window_share_cap` (rec **0.25**, in [0, 1]; 0 = no embargo windows)~~ **(rev6.12)** renamed and redefined: `min_fresh_window_share` (**0.5**, owner 2026-11-23, in [0, 1]; 1 = fresh windows only; the minimum fresh share of a frozen set, rev6.12 (b)). ~~Also confirms `forward_margin_hours` = **6** (already the default, `cascade/shared/config/lane_d.py:59`, `:244`).~~ **(rev6.14)** Adds `eval_delay_hours` (default **6**, float, ≥ 0; the judging start `j`) and changes the `forward_margin_hours` default **6 → 0** (`cascade/shared/config/lane_d.py:59`, loader `:244`); refuses `forward_margin_hours > eval_delay_hours`. A config default is consensus-relevant (every validator must derive the same `b`, `j`); lane D is unarmed, so no live effect; before arming, diff the deployed chain.toml for an explicit `forward_margin_hours = 6` override. Loader parse, round-trip and mutation test per key (a dataclass field without a loader parse is a silent no-op); both are overlay-settable lane D tuning (§14.2) | W2 | ci | `scripts/laned/accept W2e` (includes `unread_keys.py`) |
 | W1.5 | **Walking skeleton** `make laned-e2e` (CI): fixture `pool_d` (with `end_ts`) → tiny checkpoint → intake (filesystem adapter behind the real storage interface) → ingest guards → scorer → signed report → `lane_d_state.json` → emission → `check_lane_d` | W2 | ci | `make laned-e2e` asserts: non-zero lane D weight for the challenger; audit passes; one tampered row fails; unarmed byte-identical; `share = 0` leaves weights unchanged and still yields a valid report; `LaneDConfig.active()` is not a constant. **Every later WP keeps it green and adds ≥ 1 assertion** |
@@ -3599,9 +3883,10 @@ Every new `[lane_b]` key below ships with:
 | WB23 | **(rev5)** Miner-chosen leg length (D42, D42b): `train_hours` on the funding request (0.5–`max_leg_hours`, 0.5 h steps); steps fixed at admission and signed in the leg record; guard = `train_hours × guard_factor` + overhead, capped at `[lane_b] max_leg_seconds` (lane B contract derivation; `[training] max_train_seconds` untouched); expected landing boundary returned to the miner; validator check of recorded steps and guard | keys `max_leg_hours`, `max_leg_seconds`, `guard_factor`; `status/lane_b.json` shows steps, GPU and landing boundary | WB10, WB22 | ci | `scripts/laned/accept WB23` (TB25–TB27) |
 | WB24 | **(rev6.3, proposed)** Lane B miner CLI. Today `cascade lane-b fund` / `lane-b status` (`cascade/miner/lane_b.py`) do not send the declared-rows header, so the WB20 docs have miners hand-build that request. `cascade lane-b fund` gains `--declared-rows <file>` (builds and signs the WB14 `X-Lane-B-Declared-Rows` header and its signed `rows=` tag; refuses locally with the same `DECLARED_ROWS_CODES` the intake uses), `--target suite:<s>` (suite targets, WB18) and `--train-hours` (WB23, once built). `cascade lane-b status` shows the new deferral and refusal reasons (`rows_held`, `sentinel_target`, the `gate_closed_reason` values, the WB13 contamination codes incl. `contamination_budget_exceeded`) from `status/lane_b.json` and the intake replies. New `cascade lane-b verify-repo <dir>` runs the WB13 scan (`scan_repo`) locally against the pinned hash set (no upload; never executes the repo) so a miner can check before funding. Never prints keys; unarmed defaults unchanged | CLI flags `--declared-rows`, `--target suite:<s>`, `--train-hours`; subcommand `verify-repo` | WB13, WB14, WB15, WB17, WB18 (WB23 for `--train-hours`) | ci | `scripts/laned/accept WB24` |
 | WB25 | **(rev6.8, owner 2026-11-23)** Multi-GPU lane B expert legs. Today `train_pyramid` (`cascade/trainer/pyramid_trainer.py`) forces `world = 1` for an expert-slice leg (`gang_size(trainer.device) if slices is None else 1`), so a lane B leg trains on GPU0 of an 8× pod (WB19 on 8×H200: 0.055 steps/s, the same as an RTX 4090). WB25 trains lane B expert legs on every GPU of the rented layout through the existing `pyramid_dp` `Gang` (micro-batches dealt round-robin, sums all-reduced, rank 0 owns the corpus and the optimizer), extended for `ExpertSlices`: the helper ranks hold the same compact selected-row leaves; the optimizer sharding and the gradient all-reduce cover only the trainable (selected) expert rows; the router and the routing bias stay frozen (WB16, D40 option a). The leg is identical to the 1-GPU leg up to floating-point summation order, and frozen tensors and unselected rows are exactly the king's. The leg record keeps the GPU count (`gpu_n`; WB22's audit re-derivation is pinned to the recorded `gpu_n`); `CASCADE_TRAIN_GPUS` may lower it. Lane A legs (no slices) are byte-for-byte unchanged and keep the same Gang path. No dependency, `[training]` or contract-digest change | leg metric `gpu_n` | WB16, WB19 | ci + pod | `scripts/laned/accept WB25` |
-| W-EMA | **(rev5)** Score the raw cooled endpoint on every leg (lanes A and B **(rev6.20: lane B only until `[lane_b] ema_no_cooldown_from_block`; from it lane B legs train with no cooldown and score the σ 0.10 power EMA, recorded as the expert entry's `scored_weights`)**): `power_ema_active` → raw for warm-start legs; keep writing `weights_ema005`/`weights_ema010` unscored; main-validator EMA telemetry off the critical path (§8). Blocks every repin ≥ rc16 and D40(b) | worker image (`pyramid_trainer.py`) | — | ci + testnet | `scripts/laned/accept W-EMA` |
+| W-EMA | **(rev5)** Score the raw cooled endpoint on every leg (lanes A and B **(rev6.20b: lane A only; every lane B leg trains with no cooldown and scores the σ 0.10 power EMA, recorded as the expert entry's `scored_weights`, no activation key)**): `power_ema_active` → raw for warm-start legs; keep writing `weights_ema005`/`weights_ema010` unscored; main-validator EMA telemetry off the critical path (§8). Blocks every repin ≥ rc16 and D40(b) | worker image (`pyramid_trainer.py`) | — | ci + testnet | `scripts/laned/accept W-EMA` |
 | WB20 | Lane B docs (MINER, INTERFACE, AGENT_MINING, VALIDATOR) | — | WB13–WB18 | ci | `scripts/laned/accept WB20` |
 | WB21 | DEC-CA-0071 amendment (this PR drafts it; owner accepts) | — | — | ci + owner | `scripts/laned/accept WB21` |
+| WB27 | **(rev6.21, owner 2026-11-24)** Miner-chosen lane B leg levers on the funding request (`X-Lane-B-Levers`, signed `|levers=` tag): `lr_scale` (`[lane_b] lr_scale_min`…`lr_scale_max`, 0.5…2.0), curriculum (≤ 3 ordered stages, fractions sum to 1, stage corpora in order, generator keyword `curriculum_stage`), `context_length` (wire format + `context_length_unsupported` until the owner opens it: the locked `pyramid_model.py` pins 4096), EMA choice from `[lane_b] ema_sigma_rels` (only the chosen EMA computed; needs `ema_no_cooldown_from_block`); legs up to 12 h; token and/or hour limits (whichever first); any GPU at own risk (`gpu_measured`); no activation block; intake typed refusals; leg contract terms `lane_b_lr_scale` / `curriculum` / `lane_b_stop_record` / `power_ema_sigma_rels` + `power_ema_eval` (dropped at defaults); expert entry `levers`, `train_tokens`, `gpu_measured`, `trained_steps`, `trained_tokens`, `stop`; judge stage `levers`; `scored_weights` `ema<σ>`; WB23 steps cap unchanged; lane A byte-identical | headers `X-Lane-B-Levers`, `X-Lane-B-Train-Tokens`; keys `lr_scale_min`, `lr_scale_max`, `ema_sigma_rels`, `max_leg_hours` 12, `max_leg_seconds` 54000; entry fields above; stage `levers` | WB10, WB22, WB23, W-EMA (rev6.20) | ci + testnet | `scripts/laned/accept WB27` |
 | W-S1 | **(rev4: now in §3)** §16 sentinel draw + lane A gate rule behind `sentinel_from_block` + receipt field + `[v2]` overlay keys (**(rev5)** no shadow logging, D45). **(rev5) Changed consensus code:** the bench gate (`cascade/eval/bench_gate.py`) **and `king_check_gate` (`cascade/validator/king_check.py:93`)**, both of which must drop the sentinel suite from the rule; block-gated by `sentinel_from_block` | `[v2] sentinel_from_block`, `sentinel_suites`, `sentinel_ratchet`, `sentinel_tau` | W0c | ci | `scripts/laned/accept W-S1` (TS1–TS3, TS5) |
 | W-S2 | **(rev4: now in §3)** lane B guard/target exclusion for the sentinel. **(rev6.2, owner 2026-11-22) Follow-up:** a warm-start acceptance made at an era-init block is governed by the sentinel of the era that init block opens; applies to the acceptance callers (trainer `accept_candidates`, validator `verify_acceptance`) (§16) | — | W-S1 | ci | `scripts/laned/accept W-S2` (TS4) |
 | W-S3 | **(rev4: now in §3)** sentinel numbers on the status boards | — | W-S1 | ci | `scripts/laned/accept W-S3` |
@@ -3764,7 +4049,8 @@ These are pinned by tests in the WPs named.
     raw cooled endpoint on every leg.
   - **(rev6.20)** Lane B EMA / no cooldown is on-pod code too
     (`pyramid_trainer.py`, `worker.py`), so it ships in a shared-image repin;
-    it changes nothing until `[lane_b] ema_no_cooldown_from_block` is typed
+    **(rev6.20b: no key; it applies to every lane B leg once lane B rolls
+    out)** ~~it changes nothing until `[lane_b] ema_no_cooldown_from_block` is typed~~
     (release-then-activate, after the repin).
 
 ---
@@ -3992,7 +4278,7 @@ is **accepted** unless a row says otherwise. The explicit answers:
 | D4 | Eval fee | None at launch |
 | D5 | Margins and floors | `d_margin` 0.01 (level units, re-checked by T14); `forward_margin` ~~6 h~~ **(rev6.14)** 0 h (fresh = data after submission T) and `eval_delay_hours` 6 h (judging start; owner 2026-11-23); 1000 windows / 20 sources. **(rev6.10, owner 2026-11-23)** `embargo_hours` 48 h (lane A's ~48 h reveal delay; per-feed catalog override can only shorten); `max_windows_per_settlement` ~~rec 2000~~ **(rev6.11)** 5000 (owner 2026-11-23); **(rev6.11)** ~~embargo only for hourly-and-slower series,~~ **(rev6.12)** embargo for every cadence (owner 2026-11-23), ~~`embargo_window_share_cap` rec 0.25~~ **(rev6.12)** fresh-first draw, `min_fresh_window_share` 0.5 (owner 2026-11-23; below it at the floors ⇒ not frozen, pending); floors unchanged |
 | D6 | Bench capacity | Queue behind lane A; second pod if crownings slip > 1 settlement |
-| D7 | Court | 2 prior miner kings, decay 0.5; house never in the court |
+| D7 | Court | 2 prior miner kings, ~~decay 0.5~~ **(rev6.23)** `court_weights` 80 / 15 / 5 (owner 2026-11-24); house never in the court |
 | D8 | Losers | Private; vault TTL 4 eras; owner-only archive 14 days; then delete |
 | D9 | House paid? | No: the slot burns; prior miner tails keep paying |
 | D10 | Activation | **(rev5, D45)** One overlay: `from_block` with **`share = 0.25`** (D1) and `takes_from = "lane_a"` together (no `share = 0` shadow), published with an `effective_block` far enough ahead that observed `cfg-` stake reaches ≥ 2/3 before it; kill switch by a staged revert overlay (latency up to about one era); ~~**(rev3)** the S8 long-context arming is also an overlay (`contexts`), live at its block, no shadow~~ **(rev6.6)** long-context arming needs no overlay: every variant is in `contexts` from launch and arms automatically on its gates (§1.1, D2) |
@@ -4030,7 +4316,7 @@ is **accepted** unless a row says otherwise. The explicit answers:
 | D42 | **(rev5) DECIDED (owner 2026-11-21):** expert-leg cost (LB6) | **Cheaper GPUs allowed** via a lane B-only `[lane_b] funded_pod_skus` (each type image-qualified and measured first), and **miner-chosen leg length** `train_hours` 0.5–6.0 h (`[lane_b] max_leg_hours = 6.0`), guard capped by a new `[lane_b] max_leg_seconds`, never by editing `[training] max_train_seconds`. Operator funding not adopted. §12b.6 |
 | D42b | **(rev5)** What `train_hours` means (§12b.6) | (a) wall hours on the chosen GPU, steps fixed at admission from the measured per-GPU rate (**recommended**); (b) reference hours, steps = 23,841 × h / 3 on any GPU **(rev5) DECIDED: (a) real hours on the chosen GPU** (owner). |
 | D43 | **(rev5) DECIDED (owner 2026-11-21):** lane D reveal timing | **Immediate reveal** (`min_blocks`), not lane A's boundary − 25 blocks; T = the observed reveal block. Starts the forward clock up to ≈ 3 h earlier. §1.2 step 4, W10. (The commit-inclusion-block alternative is not adopted) |
-| D44 | **(rev5) WITHDRAWN (owner 2026-11-21)** | Power EMA instead of cooldown was drafted and then dropped by the owner. ~~Lanes A and B keep today's cooldown.~~ Lane A keeps today's cooldown. Not planned **for lane A**. **(rev6.20, owner 2026-11-24)** Lane B only: EMA, no cooldown, decided separately (rev6.20 section, behind `[lane_b] ema_no_cooldown_from_block`); D44 itself stays withdrawn |
+| D44 | **(rev5) WITHDRAWN (owner 2026-11-21)** | Power EMA instead of cooldown was drafted and then dropped by the owner. ~~Lanes A and B keep today's cooldown.~~ Lane A keeps today's cooldown. Not planned **for lane A**. **(rev6.20, owner 2026-11-24)** Lane B only: EMA, no cooldown, decided separately (rev6.20 / rev6.20b: every lane B leg, no activation key); D44 itself stays withdrawn |
 | D45 | **(rev5) DECIDED (owner 2026-11-21):** go-live rule | No shadow modes: every feature goes live at one activation block on every node at full effect. Testnet + S1 replace shadow evidence; release-then-activate (observed stake ≥ 2/3 **before** the block) and the kill switch stay. §5 |
 | D46 | **(rev5, C1)** House T, which fixes starvation (§1.3, §1.4; interacts with D20) | Today the house's T resets on every KING_A change (a dethrone or a promotion; the king leg trains once per seed epoch, `shared/era.py:440-457`), so pending entries restart. If lane A changes king faster than lane D's commit-to-crown latency (~~about 2–8 days with confirmation~~ **(rev6.11)** ≈ T+6–9 h (10 s data) to ≈ 1 day (15-min, hourly) with 3-hourly pool_d, no confirmation duel), no challenger can crown. (a) **T_house = the latest commit (reveal) block of any generator in its lineage (recommended)**; (b) an entry keeps the T_K it froze against; (c) unchanged. B2 measures house refresh frequency **(rev5) DECIDED: (a)** (owner). |
 | D47 | **(rev5, C2)** House precision under BF16-only | (a) **score the house as a BF16 cast of KING_A, and dedup entries against BF16 casts of every published checkpoint (recommended)**, so the house plays by the entry rules and a cast copy can't dodge dedup; (b) the house stays F32 |
@@ -4064,11 +4350,10 @@ is **accepted** unless a row says otherwise. The explicit answers:
 - **(rev5) WP W-EMA (blocks every repin to an image ≥ rc16, including any
   image #477's NCCL pin ships in if it's built from main):**
   - The next image **scores the raw cooled endpoint on every leg**, in lanes
-    A ~~and B~~. **(rev6.20, owner 2026-11-24) Lane B is superseded:** from
-    `[lane_b] ema_no_cooldown_from_block` a lane B leg trains with no
-    cooldown and scores its σ_rel 0.10 power EMA (rev6.20 above); before it
-    (and with the key unset) lane B keeps this rule. Lane A keeps it
-    unconditionally. `power_ema_active` is changed so warm-start legs behave like
+    A ~~and B~~. **(rev6.20/rev6.20b, owner 2026-11-24) Lane B is
+    superseded:** every lane B leg trains with no cooldown and scores its
+    σ_rel 0.10 power EMA (rev6.20 above), with no activation key. Lane A
+    keeps this rule unconditionally. `power_ema_active` is changed so warm-start legs behave like
     random-init legs do today: `weights.safetensors` is the raw endpoint, and
     `weights_ema005` / `weights_ema010` are written alongside, **unscored**.
   - The main validator scores the EMA files **off the critical path** and
@@ -4079,9 +4364,9 @@ is **accepted** unless a row says otherwise. The explicit answers:
     switch the scored file, as one activation for every leg (D45).
   - Tests: a warm-start leg's scored file is byte-identical to the raw
     endpoint; both EMA files are present; a lane B leg from an EMA-marked king
-    still scores raw **(rev6.20: under the default `wsd` leg contract, i.e.
-    before `ema_no_cooldown_from_block`; after it the lane B leg scores its
-    own σ 0.10 EMA whatever its king)**.
+    still scores raw **(rev6.20b: only when trained directly on the `wsd`
+    era contract; the dispatched lane B leg contract is the EMA schedule, so
+    a dispatched lane B leg scores its own σ 0.10 EMA whatever its king)**.
 - **Reproducibility:** options are folded into each leg's effective contract
   and replayed by the trainer, validators and audit.
 - **Cost:** it's a lane A contract change (image, repin and seed-epoch rules;
@@ -4443,15 +4728,19 @@ The rules below are recorded in the DEC-CA-0071 amendment
   reused as-is (`:49-51`).
 - **(rev6.20, owner 2026-11-24) Schedule and scored weights.** ~~A lane B
   leg uses lane A's WSD schedule (cooldown over the last 1/11 of its steps)
-  and scores the raw cooled endpoint (W-EMA).~~ From `[lane_b]
-  ema_no_cooldown_from_block` a lane B leg has **no cooldown** (warmup, then
-  constant LR to the end) and its scored and merged weights are its
-  **σ_rel 0.10 power EMA**; the expert entry records `scored_weights =
-  "ema010"` and judges re-derive it from `train_block`. Before the key (and
-  while it is unset) today's rule holds. Lane A is unchanged (rev6.20).
+  and scores the raw cooled endpoint (W-EMA).~~ **(rev6.20b: no key)** Every
+  lane B leg has **no cooldown** (warmup, then constant LR to the end) and
+  its scored and merged weights are its **σ_rel 0.10 power EMA**; every
+  expert entry records `scored_weights = "ema010"` and judges refuse any
+  other value. Lane A is unchanged (rev6.20).
 - **Legs:** `[lane_b] leg_hours = 3.0`, `leg_funding = "miner"` (deployed).
   **(rev5)** Replaced by miner-chosen `train_hours` (0.5–6 h) on a lane B GPU
   list (D42, §12b.6); `leg_hours` stays the default when a miner sets none.
+  **(rev6.21, owner 2026-11-24)** By default (no activation block) legs run
+  up to 12 h, stop at a token and/or hour limit, may use any GPU at the
+  miner's own risk, and the miner also chooses `lr_scale`, a ≤ 3-stage curriculum and the scored
+  EMA width (`ema_sigma_rels`) on the same request (`X-Lane-B-Levers`, WB27);
+  `context_length` is refused until the owner opens it (rev6.21 section).
 
 ### 12b.1 LB1: contamination check — a precondition for arming
 
@@ -4890,7 +5179,7 @@ at `ready`) was found sound against target leakage. The weak part is pay.
 
 | # | Issue | Option A (keep v2) | Option B (proposed) |
 |---|---|---|---|
-| **D25** | **Court pays rent indefinitely; salami-slicing.** The court is rank-decayed (57/29/14% of D's share at `king_decay` 0.5, 2 priors) with no TTL, and the bar is a fixed 0.01. A 3% gain released as three 1% crowns fills the whole court | Simple; matches lane A's court shape | Pay D wins on lanes B and C's `full_pay_tiers` + `half_life_rounds` + `win_ttl_eras` shape, keyed to the crowning LCB over max(KING_D, house). Or a tenure-decaying bar (e.g. 0.03 → 0.01). Or time-bound prior-king tails, like lane A's `court_bp` / `court_blocks` |
+| **D25** | **Court pays rent indefinitely; salami-slicing.** The court is rank-decayed (~~57/29/14% of D's share at `king_decay` 0.5~~ **(rev6.23)** 80/15/5% of D's share by `court_weights`, 2 priors) with no TTL, and the bar is a fixed 0.01. A 3% gain released as three 1% crowns fills the whole court | Simple; matches lane A's court shape | Pay D wins on lanes B and C's `full_pay_tiers` + `half_life_rounds` + `win_ttl_eras` shape, keyed to the crowning LCB over max(KING_D, house). Or a tenure-decaying bar (e.g. 0.03 → 0.01). Or time-bound prior-king tails, like lane A's `court_bp` / `court_blocks` |
 | **D26** | **Lane A is a free input to D, and D's 20% comes out of A.** **(rev6:** D's share is now 25% of the total, D1/D48**)** The cheapest winning D entry is "fine-tune the published house". Generators and recipe are published (**(rev5)** `[generation] king_publish = "recipe"`, `chain.toml:1555` on main `07117e1`; not `[v2]`) | Lane A is paid by its own ladder; D pays only for beating the house | A **lineage royalty**: a fixed ρ ≈ 15–20% of each D win's pay goes to the lane A king hotkey that was the house at the winner's T_E. Calibrate ρ in shadow with a weight-space nearest-ancestor measurement. Never self-declared lineage |
 | **D27** | **Withholding from A.** A strong generator may earn more used privately in D than published in A | Accept; monitor how many D kings are far from every published A checkpoint | The D26 royalty, plus keep A's share ≥ D's |
 | **D28** | **Split.** v2 has A 30 / B 25 / C 25 / D 20 when all are armed | v2 split | Reviewer: **A 40 / D 25 / B 20 / C 15**, with D ramping 15 → 25% after ≥ 3 miner crowns pass the gate with the unselected suite not falling. Now (B, C off): A80/D20 is acceptable. Interacts with **D21**: the reviewer prefers returning the unpaid house slot to lane A over burning it **(rev5) DECIDED (owner): A 25 / B 25 / C 25 / D 25** (§6 D1, D28). |
@@ -5123,7 +5412,7 @@ script parses this table on main; it changes only by an owner-merged plan PR.
 | D4 | decided | No eval fee at launch | S | owner (default), 2026-11-21 |
 | D5 | decided | `d_margin` 0.01 (re-checked by T14), `forward_margin` ~~6 h~~ **(rev6.14)** 0 h + `eval_delay_hours` 6 h (owner 2026-11-23), 1000 windows / 20 sources; **(rev6.10)** `embargo_hours` 48 h (owner 2026-11-23), `max_windows_per_settlement` ~~rec 2000 (open)~~ **(rev6.11)** 5000 (owner 2026-11-23); ~~embargo hourly-and-slower only~~ **(rev6.12)** embargo for every cadence, ~~`embargo_window_share_cap` rec 0.25~~ **(rev6.12)** fresh-first draw, `min_fresh_window_share` 0.5, not frozen below it (owner 2026-11-23) | O | owner (default), 2026-11-21; owner, 2026-11-23 |
 | D6 | decided | Queue behind lane A; second pod if crownings slip > 1 settlement | O (ops) | owner (default), 2026-11-21 |
-| D7 | decided | 2 prior miner kings, decay 0.5; house never in the court | O | owner (default), 2026-11-21 |
+| D7 | decided | 2 prior miner kings, ~~decay 0.5~~ **(rev6.23)** `court_weights` 80 / 15 / 5; house never in the court | O | owner (default), 2026-11-21; owner, 2026-11-24 (rev6.23) |
 | D8 | decided | Losers private; vault TTL 4 eras; archive 14 days; delete | O | owner (default), 2026-11-21 |
 | D9 | decided | House unpaid: the slot burns | S | owner (default), 2026-11-21 |
 | D10 | decided | One activation overlay (D45) | S | owner, 2026-11-21 |
