@@ -38,11 +38,11 @@ from cascade.shared.netconfig import NetConfigError, check_overrides
 
 @pytest.mark.parametrize("toml", ["chain.toml", "chain.testnet.toml"])
 def test_shipped_tables_parse_inert(toml):
-    """Testnet ships MarketCast off; mainnet arms it at 9579600 (owner
-    2026-11-20) and is inert before that block."""
+    """Testnet ships MarketCast off; mainnet arms it at 9586800 (owner
+    2026-11-24) and is inert before that block."""
     cfg = load_chain_config(toml)
     mc = cfg.marketcast
-    fb = 9579600 if toml == "chain.toml" else 0
+    fb = 9586800 if toml == "chain.toml" else 0
     assert mc.from_block == fb and mc.active(10**9) == bool(fb)
     assert not mc.active(fb - 1)
     assert mc.target_suites == (("market",) if fb else ())
@@ -110,8 +110,8 @@ def test_loader_refuses_arming_without_lane_c(tmp_path):
     from pathlib import Path
 
     text = (Path(__file__).resolve().parents[2] / "chain.toml").read_text(encoding="utf-8")
-    old = ("from_block         = 9579600                    # owner 2026-11-20: era boundary "
-           "~ Tue 24 Nov 22:23 UTC (Wed 09:23 AEDT)")
+    old = ("from_block         = 9586800                    # owner 2026-11-24: launch moved to era boundary "
+           "~ Wed 25 Nov 22:28 UTC (Thu 09:28 AEDT); was 9579600")
     assert old in text
     p = tmp_path / "chain.toml"
     p.write_text(text.replace(old, "from_block = 7200000"), encoding="utf-8")
@@ -213,7 +213,7 @@ def test_mkt_targets_only_with_config():
 def test_shipped_marketcast_cannot_admit_mkt_targets():
     """Off (testnet) ⇒ the intake / commit / recipe surfaces admit no mkt:
     target, while the shipped [lane_c] targets still load (they are inactive).
-    Armed (mainnet, 9579600) ⇒ only the composite mkt:market is admitted."""
+    Armed (mainnet, 9586800) ⇒ only the composite mkt:market is admitted."""
     cfg = load_chain_config("chain.testnet.toml")
     for t in ("mkt:returns", "mkt:market"):
         with pytest.raises(ValueError):

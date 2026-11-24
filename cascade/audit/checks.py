@@ -2457,7 +2457,7 @@ def check_king_check(receipt: RoundReceipt, cfg: ChainConfig,
 
 
 def _paid_full_pay_why(w: dict, tiers, *, at_win: bool, ttl: int,
-                       state_entry: list | None) -> str | None:
+                       state_entry: list | None, mismatch=None) -> str | None:
     """Why a payout record's win carries a forged / inconsistent gain-tiered
     full-pay period (owner 2026-10-20), else None. Every paid win carries
     ``gain_lcb`` / ``tier`` / ``full_eras`` / ``below_floor``; ``full_eras``
@@ -2480,7 +2480,9 @@ def _paid_full_pay_why(w: dict, tiers, *, at_win: bool, ttl: int,
     if lcb is None or not math.isfinite(float(lcb)):
         return f"gain_lcb {lcb!r} is not finite"
     if at_win:
-        why = full_pay_mismatch(w, tiers)
+        # ``mismatch`` (DEC-CA-0073, lane C): the gain-scaled duration's
+        # re-derivation, in place of the gain-tiered one
+        why = mismatch(w) if mismatch is not None else full_pay_mismatch(w, tiers)
         if why:
             return f"full-pay tier forged: {why}"
     elif bool(w.get("below_floor")) != (float(lcb) < float(w.get("tier") or 0.0)):
@@ -2566,7 +2568,7 @@ def _lane_c_paid_wins(receipt: RoundReceipt, cfg: ChainConfig,
     inconsistency (lane C not active, payout clock, era length, share / slot
     count, unknown / duplicate target, uid range, age, expiry, multiplier)."""
     from ..shared.era import era_length_blocks
-    from ..shared.lane_c import LaneCWin, full_pay_tiers_for, target_multiplier, win_expired
+    from ..shared.lane_c import LaneCWin, full_pay_record_mismatch
 
     lc = cfg.lane_c
     pay = receipt.lane_c_pay or {}
@@ -2616,14 +2618,19 @@ def _lane_c_paid_wins(receipt: RoundReceipt, cfg: ChainConfig,
         if int(w.get("age", -1)) != age:
             return [], (f"target {t}: recorded age {w.get('age')} != {age} eras since block "
                         f"{w.get('win_block')}")
-        if win_expired(age, lc):
-            return [], f"target {t}: win paid at age {age} eras, past win_ttl_eras={lc.win_ttl_eras}"
+        # DEC-CA-0073: full pay for the win's recorded gain-scaled duration
+        # (re-derived at the win), then the slot ends — no decay, no TTL
+        mc_ = getattr(cfg, "marketcast", None)
         why = _paid_full_pay_why(
-            w, full_pay_tiers_for(t, lc, getattr(cfg, "marketcast", None)),
-            at_win=int(w.get("win_block", -1)) == block, ttl=int(lc.win_ttl_eras),
-            state_entry=None if post is None else (post or {}).get(t))
+            w, None, at_win=int(w.get("win_block", -1)) == block, ttl=0,
+            state_entry=None if post is None else (post or {}).get(t),
+            mismatch=lambda r, t=t, mc_=mc_: full_pay_record_mismatch(r, t, lc, mc_,
+                                                                       era_blocks=eb))
         if why:
             return [], f"target {t}: {why}"
+        if age >= int(w["full_eras"]):
+            return [], (f"target {t}: win paid at age {age} eras, past its full-pay duration "
+                        f"({w['full_eras']} eras) — the slot has ended")
         if bool(w.get("wind_down", False)) != (t in winding):
             return [], (f"target {t}: wind_down flag {w.get('wind_down')} but its competition "
                         f"is {'' if t in winding else 'not '}winding down at {block}")
@@ -2637,7 +2644,7 @@ def _lane_c_paid_wins(receipt: RoundReceipt, cfg: ChainConfig,
                             f"period ({w.get('full_eras')} eras) or the wind-down window")
             mult = 1.0
         else:
-            mult = target_multiplier(age, lc, int(w["full_eras"]))
+            mult = 1.0
         if not math.isclose(float(w.get("multiplier", -1.0)), mult, rel_tol=1e-12,
                             abs_tol=1e-15):
             return [], f"target {t}: multiplier {w.get('multiplier')} != {mult} at age {age}"
@@ -3720,14 +3727,17 @@ def check_lane_c(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
             return _fail(name, f"{who} passed without the public guard "
                                f"{missing} configured for {t}")
         if phase == "confirm":
-            # gain-tiered full-pay (owner 2026-10-20): the tier a confirmed
-            # win records, re-derived from this row's gain LCB
-            from ..eval.expert_lane import full_pay_mismatch
-            from ..shared.lane_c import full_pay_tiers_for
+            # the gain-scaled full-pay duration a confirmed win records
+            # (DEC-CA-0073), re-derived from this row's gain LCB on the era
+            # grid in force at this settlement
+            from ..shared.era import era_length_blocks
+            from ..shared.lane_c import full_pay_record_mismatch
 
             fp = dict(r.get("full_pay") or {})
             fp["gain_lcb"] = lcb
-            why = full_pay_mismatch(fp, full_pay_tiers_for(t, lc, cfg.marketcast))
+            why = full_pay_record_mismatch(
+                fp, t, lc, cfg.marketcast,
+                era_blocks=int(era_length_blocks(cfg.round, boundary)))
             if why:
                 return _fail(name, f"{who}: full-pay tier forged: {why}")
         if phase == "judge":
@@ -4237,10 +4247,18 @@ def _mkt_init_lineage(init: str, train_time: float, cfg: ChainConfig, manifests:
                                   f"manifest the auditor holds")
 
 
+class _AuditEntry:
+    """The one field :func:`~cascade.validator.marketcast.entry_draw` reads
+    (the trainer-signed ``train_time``), for the audit's draw re-derivation."""
+
+    def __init__(self, train_time: float | None) -> None:
+        self.marketcast = {} if train_time is None else {"train_time": float(train_time)}
+
+
 def check_marketcast(receipt: RoundReceipt, cfg: ChainConfig,
                      reports: dict | None = None, *, lane_c_manifests: dict | None = None,
-                     quantiles: dict | None = None, snapshots: dict | None = None
-                     ) -> CheckResult:
+                     quantiles: dict | None = None, snapshots: dict | None = None,
+                     block_hashes: dict | None = None) -> CheckResult:
     """DEC-CA-0064 MarketCast replay (joins :func:`run_tier0` ONLY at a
     settlement where ``[marketcast]`` is active, so earlier audit output is
     byte-identical). Nothing here trusts the main validator's arithmetic.
@@ -4254,11 +4272,17 @@ def check_marketcast(receipt: RoundReceipt, cfg: ChainConfig,
       (``train_time`` from the trainer-signed lane-C manifest that carried
       the entry, ``lane_c_manifests``: ``{round: text}``; and on a confirm,
       ≥ the recorded ``fresh_after``) — never the snapshot anchor;
+    * DEC-CA-0073: the entry's signed draw is the rule's (re-derived from
+      ``train_time``, the round block, the phase and ``fresh_after``), its
+      block hash the chain's (``block_hashes``: ``{block: hash}``; WARN
+      without); every backtest window lies wholly in the draw's embargo
+      span and the phase's half, every forward window after the dispatch
+      + margin on a ``forward_horizons`` horizon; no cell holds more than
+      ``n`` backtests / ``windows_per_cell`` forwards;
     * with the published snapshot (``snapshots``: ``{digest: MktSnapshot}``)
-      the report's window set must EQUAL the forward-only set
-      :func:`~cascade.pool.marketcast.snapshot_windows` re-cuts (nothing
-      omitted, nothing added); without it, every window must be forward-only
-      and no (asset, horizon) cell hold more than ``windows_per_cell``;
+      the report's window set must EQUAL the set the draw re-cuts
+      (:func:`~cascade.pool.marketcast.snapshot_windows`: nothing omitted,
+      nothing added);
     * with the quantile sidecar (``quantiles``: ``{key: bytes}``, sha256
       bound in the signed report) AND the snapshot, every per-window loss
       and coverage tally is recomputed on CPU from the snapshot targets and
@@ -4293,7 +4317,7 @@ def check_marketcast(receipt: RoundReceipt, cfg: ChainConfig,
     if not mkt:
         return _ok(name, "no MarketCast rows at this settlement")
     from ..eval.marketcast import COVERAGE_GATE_SUITES
-    from ..pool.marketcast import gap_span, target_windows
+    from ..pool.marketcast import target_windows, window_half, window_kind
     from ..shared.config.marketcast import base_suite
     from ..shared.marketcast_report import (
         GUARD_FIELDS,
@@ -4403,11 +4427,21 @@ def check_marketcast(receipt: RoundReceipt, cfg: ChainConfig,
         if want_after is None or not usable:
             return _fail(name, f"{who}: windows start after {ent.after}, the trainer's dispatch "
                                f"time gives {want_after}")
-        want_gap = (float(tt) if str(r.get("phase", ent.phase)) == "judge"
-                    and tuple(getattr(mc, "gap_horizons", ())) else 0.0)
-        if float(ent.gap_end) != want_gap:
-            return _fail(name, f"{who}: gap windows end by {ent.gap_end}, the trainer's dispatch "
-                               f"time gives {want_gap}")
+        from ..validator.marketcast import _draw_mismatch
+
+        draw = dict(ent.draw or {})
+        if m.get("round_block") is None:
+            return _fail(name, f"{who}: the row records no round_block to re-derive its draw")
+        rb = int(m["round_block"])
+        why_d = _draw_mismatch(_AuditEntry(tt), ent, mc, phase=str(r.get("phase", ent.phase)),
+                               block=rb, fresh_after=float(m.get("fresh_after", 0.0) or 0.0))
+        if why_d:
+            return _fail(name, f"{who}: the report's window draw: {why_d}")
+        if block_hashes is None or rb not in block_hashes:
+            _miss("block hash (chain)")
+        elif str(block_hashes[rb]).lower() != str(draw.get("block_hash", "")).lower():
+            return _fail(name, f"{who}: the draw's block hash {draw.get('block_hash')} is not "
+                               f"block {rb}'s on chain ({block_hashes[rb]})")
         # red-team F4: the near-duplicate record and the stage it implies
         from ..validator.marketcast import near_duplicate_of
 
@@ -4431,37 +4465,40 @@ def check_marketcast(receipt: RoundReceipt, cfg: ChainConfig,
             return _fail(name, f"{who}: fine-tune loss non-finite on {nonfinite[:2]} — that "
                                f"entry is a fault, not a verdict")
         cells: dict[tuple, int] = {}
-        gaps = tuple(getattr(mc, "gap_horizons", ()))
         for w in ent.windows:
-            if w.horizon in gaps:
-                # owner 2026-11-18: a gap window sits inside the embargo gap
-                lo, hi = gap_span(mc, float(ent.gap_end)) if ent.gap_end else (0.0, -1.0)
-                if not (w.start > lo and w.end <= hi):
-                    return _fail(name, f"{who}: gap window {w.wid} is outside the embargo "
-                                       f"gap before {ent.gap_end}")
-            elif not (w.start > float(ent.after) and w.end <= int(snap_rec.get("end", 0))):
-                return _fail(name, f"{who}: window {w.wid} is not forward-only "
-                                   f"(after {ent.after}, snapshot end {snap_rec.get('end')})")
-            c = (w.suite_label, w.cluster, w.horizon)
+            kind = window_kind(draw, w.start)
+            if kind == "backtest":
+                # DEC-CA-0073: wholly inside the embargo span, in the phase's half
+                if not (w.start > float(draw["lo"]) and w.end <= float(draw["hi"])
+                        and window_half(w.wid) == int(draw["half"])):
+                    return _fail(name, f"{who}: backtest window {w.wid} is outside the draw's "
+                                       f"embargo span / half")
+            elif not (w.horizon in tuple(draw.get("forward_horizons", ()))
+                      and w.start > float(draw["forward_after"])
+                      and w.end <= min(float(draw["forward_hi"]), int(snap_rec.get("end", 0)))):
+                return _fail(name, f"{who}: window {w.wid} is not a forward window of the draw "
+                                   f"(after {draw['forward_after']}, snapshot end "
+                                   f"{snap_rec.get('end')})")
+            c = (kind, w.suite_label, w.cluster, w.horizon)
             cells[c] = cells.get(c, 0) + 1
-        over = [c for c, n in cells.items() if n > int(mc.windows_per_cell)]
+        over = [c for c, n in cells.items()
+                if n > int(draw["n"] if c[0] == "backtest" else draw["forward_n"])]
         if over:
-            return _fail(name, f"{who}: {over[:2]} hold more than windows_per_cell="
-                               f"{mc.windows_per_cell} windows")
+            return _fail(name, f"{who}: {over[:2]} hold more windows than the draw allows "
+                               f"(n={draw['n']}, forward_n={draw['forward_n']})")
         suite = str(r["target"]).split(":", 1)[1]
         snap = (snapshots or {}).get(str(snap_rec.get("digest", "")))
         if snap is None:
             _miss("snapshot")
         else:
-            want = target_windows(snap, mc, suite, after=float(ent.after),
-                                  gap_end=float(ent.gap_end))
+            want = target_windows(snap, mc, suite, after=float(ent.after), draw=draw)
             got_ids = [w.wid for w in ent.windows]
             want_ids = [w.wid for w in want]
             if got_ids != want_ids:
                 gone = sorted(set(want_ids) - set(got_ids))
                 extra = sorted(set(got_ids) - set(want_ids))
                 return _fail(name, f"{who}: the report's windows are not the snapshot's "
-                                   f"forward-only set (omitted {gone[:2]}{'…' if len(gone) > 2 else ''}"
+                                   f"drawn set (omitted {gone[:2]}{'…' if len(gone) > 2 else ''}"
                                    f" {len(gone)}, added {extra[:2]} {len(extra)})")
             data = (quantiles or {}).get(ent.quantiles_key) if ent.quantiles_key else None
             if data is None:

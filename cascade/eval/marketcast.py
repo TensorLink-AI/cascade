@@ -630,7 +630,8 @@ def cut_windows(series, *, cls: str, asset: str, suite: str, horizon: str,
                 freq_minutes: int, steps: int, t0: float, context_length: int,
                 after: float, now: float, min_context: int = MIN_CONTEXT,
                 limit: int | None = None, eligible=None,
-                stale_context: bool = False, crps_scale: str = "seasonal_naive") -> list[MktWindow]:
+                stale_context: bool = False, crps_scale: str = "seasonal_naive",
+                rank=None, keep=None) -> list[MktWindow]:
     """Every forward-only window of one series: origins on the ABSOLUTE
     UTC grid (block index ``k`` with ``(t0/60/f + k) % steps == 0``, so a
     window id is stable across snapshots), start strictly after ``after``,
@@ -645,7 +646,13 @@ def cut_windows(series, *, cls: str, asset: str, suite: str, horizon: str,
     zero-scale cell is masked in the verdict instead, :func:`clustered_gain`).
     ``limit`` keeps that many windows spread EVENLY over the eligible span
     (:func:`spread_select`). ``t0`` is the series' block-0 start (a multiple
-    of ``freq_minutes`` minutes)."""
+    of ``freq_minutes`` minutes).
+
+    DEC-CA-0073 draw: ``keep(wid)`` drops a candidate before anything else
+    (the judge / confirm half partition) and ``rank(wid)`` turns ``limit``
+    into "the first ``limit`` eligible candidates in rank order" (the block
+    hash draw), evaluated lazily so an unpicked candidate is never cut;
+    the result is in series order either way."""
     s = np.asarray(series, dtype=np.float64)
     f = _step(freq_minutes, "freq_minutes")
     h = _step(steps, "steps")
@@ -654,11 +661,23 @@ def cut_windows(series, *, cls: str, asset: str, suite: str, horizon: str,
     base = int(t0) // (60 * f)
     out: list[MktWindow] = []
     first = (-base) % h
+    ks = []
     for k in range(first, s.size - h + 1, h):
         start = float(t0) + 60.0 * f * k
         end = start + 60.0 * f * h
         if not (start > float(after) and end <= float(now)):
             continue
+        if keep is not None and not keep(window_id(cls, asset, suite, horizon, start)):
+            continue
+        ks.append(k)
+    if rank is not None:
+        ks.sort(key=lambda k: rank(window_id(cls, asset, suite, horizon,
+                                             float(t0) + 60.0 * f * k)))
+    for k in ks:
+        if rank is not None and limit is not None and len(out) >= int(limit):
+            break
+        start = float(t0) + 60.0 * f * k
+        end = start + 60.0 * f * h
         ctx = s[max(0, k - int(context_length)):k]
         # owner 2026-11-21: the banks are sized for a 32k context the
         # recording only fills over time — the unrecorded NaN run before the
@@ -683,6 +702,8 @@ def cut_windows(series, *, cls: str, asset: str, suite: str, horizon: str,
             continue
         out.append(MktWindow(window_id(cls, asset, suite, horizon, start), cls, asset, suite,
                              horizon, f, h, start, end, k, ctx, tgt, sc))
+    if rank is not None:
+        return sorted(out, key=lambda w: w.index)
     if limit is not None:
         out = [out[i] for i in spread_select(len(out), int(limit))]
     return out
