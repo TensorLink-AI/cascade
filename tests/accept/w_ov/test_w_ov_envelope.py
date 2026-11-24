@@ -22,6 +22,8 @@ DANGEROUS = [
     ({"scoring": {"bootstrap_alpha": 0.45}}, "scoring] bootstrap_alpha"),
     ({"scoring": {"bootstrap_B": 5_000_000}}, "scoring] bootstrap_B"),
     ({"lane_b": {"share": 0.8}, "lane_c": {"share": 0.1}}, "lane_b] share"),
+    ({"lane_d": {"court_weights": [0.2, 0.4, 0.4]}}, "lane_d] court_weights"),  # KING_D < half
+    ({"lane_c": {"full_pay_max_days": 1000.0}}, "lane_c] full_pay_max_days"),
 ]
 
 
@@ -42,7 +44,7 @@ def test_w_ov_envelope_contains_every_shipped_value(name):
 
     raw = shipped_raw(name)
     restated = {}
-    for (table, key) in nb.BOUNDS:
+    for (table, key) in [*nb.BOUNDS, *nb.SEQ_BOUNDS]:
         if key in (raw.get(table) or {}):
             restated.setdefault(table, {})[key] = raw[table][key]
     assert restated
@@ -59,7 +61,7 @@ def test_w_ov_every_bound_names_a_parser_key():
     cfg = shipped_cfg()
     raws = [shipped_raw(n) for n in SHIPPED]
     bad = []
-    for (table, key) in nb.BOUNDS:
+    for (table, key) in [*nb.BOUNDS, *nb.SEQ_BOUNDS]:
         typed = any(key in (r.get(table) or {}) for r in raws)
         section = getattr(cfg, table, None)
         parsed = section is not None and key in {f.name for f in fields(section)}

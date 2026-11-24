@@ -168,6 +168,10 @@ BOUNDS: dict[tuple[str, str], Bound] = {
     ("lane_c", "tau_public"): _tau(),
     ("lane_c", "leg_hours"): _hours(48.0),
     ("lane_c", "legs_per_target"): _count(1, 16),
+    # DEC-CA-0073 duration-scaled full pay of an mkt: win
+    ("lane_c", "full_pay_min_days"): Bound(0.0, 365.0, lo_open=True, why=_MONEY),
+    ("lane_c", "full_pay_max_days"): Bound(0.0, 365.0, lo_open=True, why=_MONEY),
+    ("lane_c", "full_pay_max_gain"): Bound(0.0, 0.5, lo_open=True, why=_MONEY),
     # ── lane C's judge: the listed [marketcast] controls ──────────────────
     ("marketcast", "alpha"): _alpha(),
     ("marketcast", "bootstrap_B"): _boot(),
@@ -185,19 +189,23 @@ BOUNDS: dict[tuple[str, str], Bound] = {
     # DEC-CA-0075: the embargo (recorded per leg at dispatch; the loader also
     # keeps embargo_eval_days < embargo_days)
     ("marketcast", "embargo_days"): _count(2, 120, why="the eval draw lies inside it"),
-    ("marketcast", "embargo_eval_days"): _count(1, 119, why="the eval draw lies inside it"),
+    # DEC-CA-0074 (the loader bounds them too: 1 .. embargo_days - 1, 1 .. 256, <= 3900)
+    ("marketcast", "embargo_eval_days"): _count(1, 365),
+    ("marketcast", "backtest_windows_per_cell"): _count(1, 256),
+    ("marketcast", "verdict_wait_blocks"): _count(0, 3900, why=_STALL),
     # ── lane D ────────────────────────────────────────────────────────────
     ("lane_d", "share"): Bound(0.0, 0.5, why=_MONEY),
     ("lane_d", "alpha"): _alpha(),
     ("lane_d", "bootstrap_B"): _boot(),
     ("lane_d", "d_margin"): _margin(),
-    ("lane_d", "gain_margin"): _margin(),
+    # rev6.23 decaying crown bar: d_margin_start -> d_margin over the warmup
+    ("lane_d", "d_margin_start"): _margin(),
+    ("lane_d", "d_margin_warmup_settlements"): _count(0, 1000, why=_STALL),
     ("lane_d", "min_windows"): _windows(100),
     ("lane_d", "min_clusters"): _clusters(),
     ("lane_d", "max_windows_per_settlement"): _windows(1000),
     ("lane_d", "max_entries_per_settlement"): _count(1, 64),
     ("lane_d", "tau_public"): _tau(),
-    ("lane_d", "king_decay"): _DECAY,
     ("lane_d", "reward_prior_kings"): _PRIOR_KINGS,
     ("lane_d", "embargo_hours"): Bound(0.0, 168.0, why="the reveal delay caps it"),
     ("lane_d", "forward_margin_hours"): Bound(0.0, 48.0, why="forward-only gap"),
@@ -269,14 +277,44 @@ def key_refusals(overrides: dict) -> list[str]:
     return out
 
 
+# (table, key) -> (per-element envelope, max length, min first element):
+# list-valued tunables. The loader checks the sum and the length rule.
+SEQ_BOUNDS: dict[tuple[str, str], tuple[Bound, int, float]] = {
+    # rev6.23 lane D court split (KING_D first): KING_D keeps at least half,
+    # at most 1 + 8 slots (reward_prior_kings <= 8)
+    ("lane_d", "court_weights"): (Bound(0.0, 1.0, why=_MONEY), 9, 0.5),
+}
+
+
+def _seq_refusal(spec: tuple[Bound, int, float], value: object) -> str | None:
+    elem, max_len, first_min = spec
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)) or not value:
+        return f"must be a non-empty list; got {value!r}"
+    if len(value) > max_len:
+        return f"has {len(value)} entries, above the overlay envelope's {max_len}"
+    for i, v in enumerate(value):
+        why = elem.refusal(v)
+        if why:
+            return f"[{i}] {why}"
+    if float(value[0]) < first_min:
+        return f"first entry {value[0]!r} is below the overlay envelope's {first_min}"
+    return None
+
+
 def value_refusals(overrides: dict) -> list[str]:
     """``[table] key: why`` for every override outside its :data:`BOUNDS`
-    envelope."""
+    (or :data:`SEQ_BOUNDS`) envelope."""
     out = []
     for table, kv in overrides.items():
         if not isinstance(kv, dict):
             continue
         for key, value in kv.items():
+            seq = SEQ_BOUNDS.get((table, key))
+            if seq is not None:
+                why = _seq_refusal(seq, value)
+                if why:
+                    out.append(f"[{table}] {key} {why} ({seq[0].why})")
+                continue
             b = BOUNDS.get((table, key))
             if b is None:
                 continue
@@ -313,6 +351,9 @@ def policy() -> dict:
     return {
         "bounds": {f"{t}.{k}": {"span": b.span(), "integer": b.integer, "why": b.why}
                    for (t, k), b in sorted(BOUNDS.items())},
+        "list_bounds": {f"{t}.{k}": {"each": e.span(), "max_len": n, "first_min": f,
+                                     "why": e.why}
+                        for (t, k), (e, n, f) in sorted(SEQ_BOUNDS.items())},
         "release_only_keys": {f"{t}.{k}": why for (t, k), why in sorted(RELEASE_ONLY_KEYS.items())},
         "pinned_refs": sorted(f"{t}.{k}" for t, k in PINNED_REF_KEYS),
         "never_overlay": ["the bounds themselves", "signature / trust rules",
@@ -320,5 +361,5 @@ def policy() -> dict:
     }
 
 
-__all__ = ["BOUNDS", "PINNED_REF_KEYS", "RELEASE_ONLY_KEYS", "Bound", "key_refusals",
+__all__ = ["BOUNDS", "PINNED_REF_KEYS", "RELEASE_ONLY_KEYS", "SEQ_BOUNDS", "Bound", "key_refusals",
            "pin_refusals", "policy", "share_refusals", "value_refusals"]
