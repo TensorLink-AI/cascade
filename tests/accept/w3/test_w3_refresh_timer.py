@@ -16,6 +16,11 @@ import threading
 from .helpers import BLOCK, TTL, Env, Miner, checkpoint, digest_of, manifest, ops_cfg
 
 
+def _require():
+    """Fail on main at the missing name (the timer is the new contract)."""
+    from cascade.lane_d.service import RefreshTimer  # noqa: F401
+
+
 def _file_state(env: Env, hotkey: str) -> dict:
     doc = json.loads((env.state_dir / "lane_d_intake_queue.json").read_text(encoding="utf-8"))
     (rec,) = [r for r in doc["entries"] if r["hotkey"] == hotkey]
@@ -39,6 +44,7 @@ def _one_tick_wait(calls: list):
 
 
 def test_reveal_lands_in_the_file_after_one_tick_without_requests(tmp_path):
+    _require()
     env = Env(tmp_path, ops=ops_cfg(queue_poll_seconds=17))
     m, dig = _ready_entry(env, "tick-a")
     assert _file_state(env, m.hotkey)["state"] == "ready"
@@ -57,6 +63,7 @@ def test_reveal_lands_in_the_file_after_one_tick_without_requests(tmp_path):
 
 
 def test_ttl_expiry_lands_in_the_file_after_one_tick(tmp_path):
+    _require()
     env = Env(tmp_path)
     m, _dig = _ready_entry(env, "tick-b")
     env.reads.block = BLOCK + TTL + 1
@@ -65,6 +72,7 @@ def test_ttl_expiry_lands_in_the_file_after_one_tick(tmp_path):
 
 
 def test_startup_refresh_on_restart(tmp_path):
+    _require()
     env = Env(tmp_path)
     m, dig = _ready_entry(env, "tick-c")
     env.reads.reveals[(m.hotkey, dig)] = BLOCK + 2
@@ -75,6 +83,7 @@ def test_startup_refresh_on_restart(tmp_path):
 
 
 def test_failed_chain_read_skips_the_tick_and_keeps_the_entry(tmp_path):
+    _require()
     env = Env(tmp_path)
     m, dig = _ready_entry(env, "tick-d")
     env.reads.reveals[(m.hotkey, dig)] = BLOCK + 1
@@ -92,6 +101,7 @@ def test_failed_chain_read_skips_the_tick_and_keeps_the_entry(tmp_path):
 
 
 def test_timer_survives_an_unexpected_error_and_keeps_ticking(tmp_path):
+    _require()
     env = Env(tmp_path)
     m, dig = _ready_entry(env, "tick-e")
     boom = {"n": 0}
@@ -118,6 +128,7 @@ def test_timer_survives_an_unexpected_error_and_keeps_ticking(tmp_path):
 
 
 def test_timer_shares_the_request_lock(tmp_path):
+    _require()
     env = Env(tmp_path)
     _ready_entry(env, "tick-f")
     entered = threading.Event()
@@ -132,6 +143,7 @@ def test_timer_shares_the_request_lock(tmp_path):
 
 
 def test_timer_start_stop_thread(tmp_path):
+    _require()
     env = Env(tmp_path)
     timer = env.app.refresh_timer(3600).start()
     timer.stop(timeout=5)

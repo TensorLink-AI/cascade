@@ -72,6 +72,14 @@ def _event_frame(seed: int, *, conflict: bool) -> dict:
     return {"timestamp": rows_ts, "m": np.asarray(rows_v)}
 
 
+def _require():
+    """Fail on main at the missing names (the #841 selection rules)."""
+    from cascade.pool.pool_d_build import (  # noqa: F401
+        _dedupe_repeated_ts,
+        _series_invariant_refusal,
+    )
+
+
 def _world(base, *, with_events: bool):
     b, sel, fs = mods()
     catalog = CATALOG + (EVENT_CATALOG if with_events else [])
@@ -94,6 +102,7 @@ def _build(b, root, selection, out):
 
 
 def test_repeated_timestamps_refuse_per_series_not_the_snapshot(tmp_path):
+    _require()
     b, root, selection = _world(tmp_path / "ev", with_events=True)
     picked = {s.pool_d_series_id for s in selection.series}
     assert {EMSC_SID, USGS_SID} <= picked, picked   # lane A selected both feeds
@@ -119,6 +128,7 @@ def test_repeated_timestamps_refuse_per_series_not_the_snapshot(tmp_path):
 
 
 def test_event_feed_build_is_deterministic(tmp_path):
+    _require()
     b, root, selection = _world(tmp_path / "ev", with_events=True)
     s1 = _build(b, root, selection, tmp_path / "d1")
     s2 = _build(b, root, selection, tmp_path / "d2")
@@ -129,6 +139,7 @@ def test_event_feed_build_is_deterministic(tmp_path):
 
 
 def test_series_without_repeats_unchanged(tmp_path):
+    _require()
     b, root_e, sel_e = _world(tmp_path / "ev", with_events=True)
     _b, root_p, sel_p = _world(tmp_path / "plain", with_events=False)
     _build(b, root_e, sel_e, tmp_path / "de")
@@ -142,6 +153,7 @@ def test_series_without_repeats_unchanged(tmp_path):
 
 
 def test_dedupe_helper_rules():
+    _require()
     b, _sel, _fs = mods()
     ts = np.array([1, 2, 2, 3, 3, 3, 4], dtype=np.int64)
     seen = np.array([9, 9, 9, 9, 9, 9, 9], dtype=np.int64)
@@ -159,6 +171,7 @@ def test_dedupe_helper_rules():
 
 
 def test_per_series_invariant_refusals():
+    _require()
     b, _sel, _fs = mods()
     assert b._series_invariant_refusal([1, 2, 3], [0, 0, 0], 10) is None
     assert b._series_invariant_refusal([1, 2, 2], [0, 0, 0], 10) == "target_ts_not_increasing"
