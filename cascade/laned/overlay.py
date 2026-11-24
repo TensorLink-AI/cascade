@@ -49,8 +49,8 @@ from typing import Any
 
 from cascade.laned import blocks
 from cascade.shared import netconfig as nc
-from cascade.shared.era import era_length_blocks
 from cascade.shared.config import ChainConfig, effective_epoch_blocks, load_chain_config
+from cascade.shared.era import era_length_blocks
 
 EXIT_OK = 0
 EXIT_REFUSED = 1
