@@ -159,9 +159,10 @@ class MktEntryRows:
     # "pointer", "quantiles_key", "quantiles_sha256"} ({} = none measured);
     # the per-window losses are the rows' ``hold``
     holder: dict = field(default_factory=dict)
-    # owner 2026-11-18: the submission instant the ``gap_horizons`` windows are
-    # cut before (the trainer's dispatch time on a judge; 0 = none, a confirm)
-    gap_end: float = 0.0
+    # DEC-CA-0074: the window draw (cascade.pool.marketcast.embargo_draw: rule,
+    # round block + hash, spans, counts; {} = none, the plain forward cut) —
+    # the windows are re-derived from it and the snapshot
+    draw: dict = field(default_factory=dict)
 
     @property
     def deferred(self) -> bool:
@@ -184,7 +185,7 @@ class MktReport:
         d.pop("signature")
         for e in d["entries"]:
             for k in ("status", "infra_reason", "quantiles_key", "quantiles_sha256", "near_dup",
-                      "gap_end", "holder"):
+                      "holder", "draw"):
                 if not e.get(k):
                     e.pop(k, None)
             for w in e["windows"]:
@@ -231,8 +232,8 @@ def load_mkt_report(text: str) -> MktReport:
         status=str(e.get("status", "") or ""), infra_reason=str(e.get("infra_reason", "") or ""),
         quantiles_key=str(e.get("quantiles_key", "") or ""),
         quantiles_sha256=str(e.get("quantiles_sha256", "") or ""),
-        near_dup=dict(e.get("near_dup") or {}), gap_end=float(e.get("gap_end", 0.0) or 0.0),
-        holder=dict(e.get("holder") or {}))
+        near_dup=dict(e.get("near_dup") or {}),
+        holder=dict(e.get("holder") or {}), draw=dict(e.get("draw") or {}))
         for e in o["entries"])
     return MktReport(round_id=str(o["round_id"]), created_block=int(o["created_block"]),
                      snapshot=dict(o.get("snapshot") or {}), entries=ents,
@@ -557,6 +558,29 @@ def composite_from_rows(rows: MktEntryRows, mc, *, k: int, seed: str, levels,
         baseline_gate=bool(getattr(mc, "baseline_gate", False)), name=COMPOSITE_TARGET)
 
 
+def kind_scores(rows: MktEntryRows, mc, *, suite: str, k: int, seed: str) -> dict:
+    """DEC-CA-0074 (c): the verdict's numbers on the FORWARD and the BACKTEST
+    windows of a draw separately — reported, never gating (the verdict
+    is the combined set's). ``{}`` without a draw."""
+    from ..pool.marketcast import window_kind
+
+    if not rows.draw:
+        return {}
+    out = {}
+    for kind in ("backtest", "forward"):
+        sub = tuple(w for w in rows.windows if window_kind(rows.draw, w.start) == kind)
+        if not sub:
+            out[kind] = {"n": 0}
+            continue
+        v = verdict_from_rows(replace(rows, windows=sub), mc, suite=suite, k=k,
+                              seed=f"{seed}|{kind}")
+        out[kind] = {"n": len(sub),
+                     "gain": float(v.gain) if math.isfinite(v.gain) else None,
+                     "gain_lcb": float(v.gain_lcb) if math.isfinite(v.gain_lcb) else None,
+                     "passed": bool(v.passed), "reason": str(v.reason)[:200]}
+    return out
+
+
 def holder_gain(rows: MktEntryRows, mc, *, k: int, seed: str) -> dict | None:
     """Owner 2026-11-18: the PAIRED challenger-vs-holder test — the composite
     statistic (:func:`cascade.eval.marketcast.composite_gain_detail`, the same
@@ -645,6 +669,7 @@ class MktReportState:
 
 
 __all__ = [
+    "kind_scores",
     "GUARD_FIELDS", "baseline_scores", "holder_gain", "mkt_holder_quantiles_key", "INFRA_DEFERRED", "MKT_REPORT_VERSION", "guard_scores", "MktEntryRows", "MktReport", "MktReportState",
     "MktWindowRow", "REPORT_ABSENT", "base_cov_gain", "behaviour_distance", "calibration_gate",
     "composite_from_rows", "decode_quantiles", "encode_quantiles", "load_mkt_report", "mkt_ref_quantiles_key",

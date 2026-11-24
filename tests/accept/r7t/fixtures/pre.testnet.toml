@@ -1,0 +1,11 @@
+# Mirror of deploy/overlays/launch-20261125.pre.testnet.toml (PR #870, step 1
+# of the Wed 2026-11-25 testnet rehearsal). The test reads the deploy file when
+# it exists and this copy otherwise; when both exist they must be identical in
+# their overrides (test_fixture_matches_deploy_overlay).
+
+[lane_b]
+share = 0.35
+
+[lane_c]
+share      = 0.15
+takes_from = "lane_a"

@@ -461,10 +461,14 @@ def test_every_default_horizon_yields_windows_per_asset(tmp_path):
     for mc in (parse_marketcast({"assets": assets, **liq}),               # the shipped suites
                parse_marketcast({"assets": assets, "suites": list(SUITES), **liq})):
         snap = _full_snapshot(tmp_path / "-".join(mc.suites), mc)
-        # the worst case: dispatched a whole verdict wait before the snapshot's end
-        after = snap.end - mc.verdict_wait_blocks * BLOCK_SECONDS + mc.start_margin_seconds
+        # DEC-CA-0074: the worst case is a leg finishing right at the snapshot's
+        # end — every window then comes from the embargo draw before it
+        tt = float(snap.end)
+        d = P.embargo_draw(mc, train_time=tt, phase="judge", block=1,
+                           block_hash="0x" + "11" * 32, after=tt + mc.start_margin_seconds)
+        assert d["forward_hi"] == tt + mc.wait_blocks * BLOCK_SECONDS
         for suite in mc.suites:
-            ws = P.snapshot_windows(snap, mc, suite, after=after)
+            ws = P.snapshot_windows(snap, mc, suite, after=0.0, draw=d)
             for h in mc.horizons_map[suite]:
                 for cls, a in mc.suite_assets(suite):
                     n = sum(1 for w in ws if w.horizon == h and w.asset == a)
@@ -531,14 +535,17 @@ def test_build_snapshot_fetches_the_coarse_bank_as_hourly_candles(tmp_path):
 
 
 def test_load_check_refuses_an_unscorable_horizon():
-    from cascade.shared.config.marketcast import scorability_problems
+    from cascade.shared.config.marketcast import draw_problems, scorability_problems
 
-    with pytest.raises(ValueError, match="unscorable.*returns/5d"):
-        parse_marketcast({"horizons": {"returns": ["1h", "1d", "5d"], "vol": ["5m"]}})
+    # DEC-CA-0074: whether the embargo draw holds a horizon is an ARMING check
+    assert any("returns/1d" in p and "embargo eval span" in p
+               for p in draw_problems(parse_marketcast({"embargo_eval_days": 1})))
     with pytest.raises(ValueError, match="unscorable.*returns/1d.*history"):
         parse_marketcast({"coarse_history_days": 21})
-    with pytest.raises(ValueError, match="unscorable.*aligned"):
-        parse_marketcast({"verdict_wait_blocks": 3600})              # 12 h wait vs 1d windows
+    from cascade.shared.config.marketcast import arming_problems
+
+    assert any("embargo eval span" in p
+               for p in arming_problems(parse_marketcast({"embargo_eval_days": 1})))
     with pytest.raises(ValueError, match="coarse_history_days >= snapshot_days"):
         parse_marketcast({"coarse_history_days": 7})
     with pytest.raises(ValueError, match="report_timeout_settlements"):

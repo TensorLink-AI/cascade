@@ -9,9 +9,9 @@ import pytest
 from .helpers import (
     ACCEPTED,
     ARM_BLOCK,
-    MUTATIONS,
     REFUSED,
     SHIPPED,
+    co_for,
     field,
     load_ok,
     norm,
@@ -23,21 +23,22 @@ CASES = [(k, v) for k, vals in REFUSED.items() for v in vals]
 OK_CASES = [(k, v) for k, vals in ACCEPTED.items() for v in vals]
 
 
-def _co(key: str) -> dict:
-    return dict(MUTATIONS[key][2]) if key in MUTATIONS else {}
+def _co(key: str, value=None) -> dict:
+    return co_for(key, value)
 
 
 @pytest.mark.parametrize("name", SHIPPED)
 @pytest.mark.parametrize(("key", "value"), CASES, ids=[f"{k}={v!r}" for k, v in CASES])
 def test_w2_invalid_value_is_refused_at_load(name, key, value):
-    raw = raw_with(name, {**_co(key), key: value})
+    raw = raw_with(name, {**_co(key, value), key: value})
     assert refused(raw), f"[lane_d] {key} = {value!r} loaded; it must be refused"
 
 
 @pytest.mark.parametrize("name", SHIPPED)
 @pytest.mark.parametrize(("key", "value"), OK_CASES, ids=[f"{k}={v!r}" for k, v in OK_CASES])
 def test_w2_valid_value_loads(name, key, value):
-    ld = load_ok(raw_with(name, {**_co(key), key: value}), f" with {key}={value!r}").lane_d
+    ld = load_ok(raw_with(name, {**_co(key, value), key: value}),
+                 f" with {key}={value!r}").lane_d
     assert norm(field(ld, key)) == norm(value)
 
 

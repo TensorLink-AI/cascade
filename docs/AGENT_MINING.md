@@ -445,8 +445,8 @@ Percentages are shares of the competition reward vector. A lane's pool is its bu
 - **Former king:** only the immediate former king can receive 5% of A for 36,000 blocks, while eligible. A qualifying compute-key lapse reduces the current king's payout to 1% of A, without reducing separately earned B/C rewards.
 - **B winner:** with merge acceptance enabled, qualification is unpaid. Acceptance into a scheduled shared starting checkpoint starts payment. The 10 targets each reserve 2.5% of total emissions at full pay.
 - **C winner:** an initial test pass is unpaid. A later confirmation must win the target slot. C's pool is divided by competition weight, then target count. The current sole competition, MarketCast, has 1 target: each full-pay slot is 25% of total emissions.
-- **Full-pay duration:** B: LCB ≥ 0.05 → 10 eras, LCB ≥ 0.02 → 5 eras, LCB ≥ 0.01 → 2 eras; MarketCast C: LCB ≥ 0.05 → 10 eras, LCB ≥ 0.02 → 5 eras, LCB ≥ 0.01 → 2 eras. B uses accepted marginal gain; C uses confirmed gain. Each win keeps its recorded tier.
-- **B/C progression:** after full pay, B's per-era slot multipliers are 50% → 25% → 12.5%, then a 10% floor. Payment ends at age 28 eras, including the full-pay period. C has its own policy (currently a 10% floor and age 28 expiry). Age starts at B acceptance or C confirmation. A new holder stops the old holder's pay.
+- **Full-pay duration:** B: LCB ≥ 0.05 → 10 eras, LCB ≥ 0.02 → 5 eras, LCB ≥ 0.01 → 2 eras; MarketCast C: 5 days (10 eras) at LCB 0.01, rising linearly to 20 days (40 eras) at LCB ≥ 0.05. B uses accepted marginal gain; C uses confirmed gain. Each win keeps its recorded tier.
+- **B/C progression:** after full pay, B's per-era slot multipliers are 50% → 25% → 12.5%, then a 10% floor. Payment ends at age 28 eras, including the full-pay period. C has no decay: its slot ends when the full-pay duration ends. Age starts at B acceptance or C confirmation. A new holder stops the old holder's pay.
 - **Burn:** unpaid A, empty/decayed/expired slots in launched lanes and inactive competition allocations go to `burn_uid`; they are not shared among other miners. An unlaunched lane has no reserved pool.
 - **Check payment:** read signed reward records and on-chain weights. Queue completion, qualification and pending confirmation are not paid wins. Public status reports `reward_status=not_verified` because it does not verify payment.
 <!-- cascade:rewards:summary:end -->
@@ -482,7 +482,7 @@ deployment or qualification succeeded:
 <!-- cascade:config-reference:start -->
 | Template | V2 block | Loaded B gate | C / MarketCast blocks | Random-init eras | B pool | CPU generation |
 |---|---:|---:|---|---:|---|---|
-| `chain.toml` | 9399600 | 0 | 9579600 / 9579600 | 14 | 25% | enabled for shards; 90 min configured |
+| `chain.toml` | 9399600 | 0 | 9586800 / 9586800 | 14 | 25% | enabled for shards; 90 min configured |
 | `chain.testnet.toml` | 8190000 | 8190001 | 0 / 0 | 0 | 50% | off; 90 min configured |
 <!-- cascade:config-reference:end -->
 
