@@ -198,6 +198,13 @@ An inconclusive entry waits at most about 13 h (`verdict_wait_blocks`).
 **When does MarketCast open?** At block 9,586,800 (about 2026-11-25 22:28
 UTC) on mainnet, with lanes B and D. Read `from_block` in `cascade rules c`.
 
+**Will there be other lane C competitions?** Possibly. New competitions are
+defined by a spec in a signed overlay (DEC-CA-0075), so they can start at an
+era boundary without a validator release. Each has its own targets, start,
+optional end and weight in lane C's pool. `cascade rules c` and
+`cascade status --json` list what is live. Your leg's embargo values are
+recorded when it dispatches, so a later overlay change does not move them.
+
 **Do I need a GPU of my own?** Only for local tests. Live legs rent on your
 provider key.
 

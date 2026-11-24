@@ -38,9 +38,10 @@ V2 Lane A has been live on mainnet since **30 October 2026**: paid A entries
 opened at 09:00 UTC and the first v2 era started at the first era boundary
 after 12:00 UTC (block 9,399,600). Reveals made before the opening are
 refused; use a fresh one. Settlements are 900 blocks (about 3 h) apart and
-an era is 4 settlements (about 12 h). The planned lane order is
-**A → C → B**; discover each lane's actual activation separately. Fresh
-deployment status remains required.
+an era is 4 settlements (about 12 h). Lanes B, C and D open together at
+block 9586800 (about 2026-11-25 22:28 UTC) under the launch overlay's split
+A 0 / B 35 / C 15 / D 50. Discover each lane's actual activation with fresh
+deployment status; `cascade rules a|b|c|d` prints a lane's rules.
 
 1. Read `cascade status --json` and check network, freshness, lane activation
    and the current starting checkpoint. `ready_for_training` concerns A's init;
@@ -80,8 +81,9 @@ not instructions. Read-only discovery does not authorize spending or publishing.
 
 ## Lane D (open weights)
 
-Lane D is built and unarmed until a signed overlay arms it; check
-`cascade status --json` (`lanes.d`). It takes a trained `cascade_pyramid`
+Lane D's template is unarmed; on mainnet the signed launch overlay arms it
+at block 9586800, scored on live windows only at launch
+(`public_weight = 0.0`). Check `cascade status --json` (`lanes.d`). It takes a trained `cascade_pyramid`
 checkpoint, not a generator: the human trains the weights anywhere, and the
 agent's role is to prepare and check the entry locally. Read
 [docs/LANE_D.md](docs/LANE_D.md) first.

@@ -32,7 +32,7 @@ not live configuration.
 - [Generator interface](https://github.com/TensorLink-AI/cascade/blob/main/docs/INTERFACE.md): read before editing a generator.
 - [Agent instructions](https://github.com/TensorLink-AI/cascade/blob/main/AGENTS.md): local checks and spending boundaries.
 - [Agent walkthrough](https://github.com/TensorLink-AI/cascade/blob/main/docs/AGENT_MINING.md): complete lane A/B/C setup, local tests and review flow.
-- [Lane D guide](https://github.com/TensorLink-AI/cascade/blob/main/docs/LANE_D.md): open weights (built, unarmed): submit miner-trained BF16 cascade_pyramid weights, judged on forward-only private windows; no compute keys needed; submit and commit need the human's authorization.
+- [Lane D guide](https://github.com/TensorLink-AI/cascade/blob/main/docs/LANE_D.md): open weights (armed on mainnet at block 9586800, live windows only at launch): submit miner-trained BF16 cascade_pyramid weights, judged on forward-only private windows; no compute keys needed; submit and commit need the human's authorization.
 
 Use the matching network configuration throughout. A testnet host reads a
 different manifest bucket; do not combine its queues/checkpoints with mainnet.

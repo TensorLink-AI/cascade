@@ -102,6 +102,12 @@ slot:
   `tau_domain` (1%). No public suite in `require_public` (GIFT-Eval, BOOM,
   TIME, FEV) may regress by more than `tau_public` (1%). One failed guard
   blocks every slot in the leg.
+- **Extra guards for a suite slot** (only while suite targets are on). A
+  cleared `suite:` slot is claimable only if the leg's whole-pool point gain
+  is ≥ 0, and every domain, horizon and public guard also holds against the
+  era's anchor king at `tau_anchor_domain` / `tau_anchor_public` (0). These
+  catch a leg that games one suite. Domain and horizon slots are not
+  affected.
 - **Acceptance.** A cleared leg earns nothing until its merge is accepted at
   a warm start. A suite target that is the era's sentinel waits
   (`sentinel_target`) for up to `sentinel_max_defer_eras` (4) eras.
@@ -144,8 +150,9 @@ with suite targets not armed at launch.
   contested rows.
 - **Short wide-EMA legs vs long narrow-EMA legs.** A short leg with a wide
   EMA (σ_rel 0.15–0.20) averages more of a brief run. A long leg with a
-  narrow EMA (0.03–0.05) tracks late, better weights. Test both locally with
-  `cascade lane-b test` before you pay.
+  narrow EMA (0.03–0.05) tracks late, better weights. `cascade lane-b test`
+  does not apply the levers, so compare them on short token-capped legs
+  before you pay for a long one.
 - **Use the curriculum for focus.** For example, use broad data first and
   then target-heavy data in a final stage, so the experts specialise without
   forgetting.
@@ -218,7 +225,7 @@ There is no decay and no time limit.
 
 **Can I run a longer leg to get a bigger gain?** Yes, up to 12 h, at your
 cost (5 h while the image is unmeasured). Gains per token usually fall with
-length, so test locally first.
+length, so try a short leg first.
 
 **Can I use a cheaper GPU?** Any Lium type, at your own risk, once you set a
 token or hour limit. An unmeasured type that fails is not requeued or
