@@ -172,7 +172,10 @@ def test_base_ref_pinning_and_durations():
 
 def test_overlay_allows_marketcast_thresholds_but_keeps_the_model_and_data_pinned():
     assert check_overrides({"marketcast": {"gain_margin": 0.02}})
-    for key, val in (("base_ref", "other@pin"), ("from_block", 7200),
+    # containment (owner 2026-11-24): from_block is overlay-settable, later
+    # only (tests/accept/w_ov/test_w_ov_containment.py)
+    assert check_overrides({"marketcast": {"from_block": 7200}})
+    for key, val in (("base_ref", "other@pin"),
                      ("data_sources", {"crypto": "other"}), ("suites", ["returns"]),
                      ("pool_prefix", "other"), ("eval_context_length", 512)):
         with pytest.raises(NetConfigError, match="release-only"):

@@ -386,10 +386,18 @@ def test_lane_payout_tamper_burns(scfg, tmp_path):
     doc = runner.poll(client)
     assert doc["last_failing_check"] == "", doc
     assert client.pushed[-1][2] > 0                       # the lane-B slot is paid
-    make_settlement(lb_cfg, store, 1, prev=l0, tamper=with_lane_b(0.5))
+    r1, _ = make_settlement(lb_cfg, store, 1, prev=l0, tamper=with_lane_b(0.5))
     client.block = BOUNDARIES[1] + 300
     doc = runner.poll(client)
-    assert doc["last_failing_check"] == "weights" and client.pushed[-1] == _burn(lb_cfg)
+    # containment (owner 2026-11-24, laned:tests-correction): the mismatch
+    # lies wholly inside lane B's share, so ONLY lane B's share burns — lane
+    # A is set as the satellite derives it (was: the whole vector burned)
+    from cascade.audit.checks import derive_weights
+
+    want, _ = derive_weights(r1, lb_cfg, burn_lanes=frozenset({"b"}))
+    assert doc["last_failing_check"] == "", doc
+    assert client.pushed[-1] == want and client.pushed[-1] != _burn(lb_cfg)
+    assert client.pushed[-1][2] == 0.0                    # the lane-B slot is not paid
 
 
 def test_broken_chain_link_fails_continuity(scfg, tmp_path):

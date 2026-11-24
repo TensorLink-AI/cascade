@@ -381,6 +381,20 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
         if _lb_from % _lb_era:
             raise ValueError(f"[lane_b] from_block={_lb_from} must be an era boundary "
                              f"(a multiple of {_lb_era})")
+    _lb_until = lb_raw.get("until_block", 0)
+    if type(_lb_until) is not int or _lb_until < 0:
+        raise ValueError("[lane_b] until_block must be an integer >= 0 (0 = no end)")
+    if _lb_until:
+        # containment kill switch (owner 2026-11-24): an era boundary after
+        # the launch; the settlement AT it is lane B's last paid one
+        if _lb_until <= _lb_from:
+            raise ValueError(f"[lane_b] until_block={_lb_until} must follow from_block="
+                             f"{_lb_from}")
+        _lbu_grid = _ebp if (_eab and _ebp and _lb_until < _eab) else _eb
+        _lbu_era = max(1, _lbu_grid) * max(1, _era_settlements)
+        if _lb_until % _lbu_era:
+            raise ValueError(f"[lane_b] until_block={_lb_until} must be an era boundary "
+                             f"(a multiple of {_lbu_era})")
     # Public launch blocks name era STARTS; the settlement AT that boundary
     # belongs to the preceding era. Keep LaneBConfig.active's inclusive API.
     lane_b = parse_lane_b(lb_raw, from_block=(_lb_from + 1 if _lb_from else 0),
@@ -525,6 +539,13 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
         era_blocks_at=lambda b: max(1, _ebp if (_eab and _ebp and 0 < b < _eab) else _eb)
         * max(1, _era_settlements),
         specs=(_specs_ok, _specs_bad), instances=tuple(_instances))
+    if int(lane_c.until_block):
+        # containment (owner 2026-11-24): a closed lane C closes MarketCast
+        # and every spec instance with it (derived; no [marketcast] key)
+        _ub_lc = int(lane_c.until_block)
+        marketcast = replace(marketcast, until_block=_ub_lc)
+        lane_c = replace(lane_c, instances=tuple(
+            (_k, replace(_mi, until_block=_ub_lc), _t) for _k, _mi, _t in lane_c.instances))
     for _k, _mi, _t in lane_c.instances:
         if not float(_mi.gain_margin) < float(lane_c.full_pay_max_gain):
             raise ValueError(f"[lane_c.specs.{_k}] gain_margin={_mi.gain_margin} must be < "

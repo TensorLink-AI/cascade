@@ -181,8 +181,11 @@ class LaneDInputsSource:
                  eval_host: Any, house_pointer, house_signer_ss58: str,
                  readiness: Callable[[], bytes], t7: Callable[[], bytes],
                  bench_host: Callable | None = None, expected_identity=None,
-                 scoring_envs=None, score_cache=None):
+                 scoring_envs=None, score_cache=None,
+                 cfg_at: Callable[[int], Any] | None = None):
         self.cfg = cfg
+        # containment (owner 2026-11-24): the config in force at a boundary
+        self._cfg_at = cfg_at
         self._scoring_envs = None if scoring_envs is None else tuple(scoring_envs)
         self._score_cache = score_cache
         self._readiness = readiness
@@ -589,6 +592,11 @@ class LaneDInputsSource:
 
     def __call__(self, boundary: int) -> LaneDInputs:
         b = int(boundary)
+        if self._cfg_at is not None:
+            try:
+                self.cfg = self._cfg_at(b)
+            except Exception as e:  # noqa: BLE001 — no config: no inputs (fail closed)
+                raise LaneDInputsError("not_active", f"config at {b} unavailable ({e})") from e
         if not self.cfg.lane_d.active(b):
             raise LaneDInputsError("not_active", f"lane D does not settle at {b}")
         reader = self._reader()
@@ -629,7 +637,8 @@ def build_lane_d_inputs(cfg: Any, *, state_dir, intake_state_dir,
                         house_signer_ss58: str, readiness: Callable[[], bytes],
                         t7: Callable[[], bytes], bench_host: Callable | None = None,
                         expected_identity=None, scoring_envs=None,
-                        score_cache=None) -> LaneDInputsSource | None:
+                        score_cache=None, cfg_at: Callable[[int], Any] | None = None,
+                        always: bool = False) -> LaneDInputsSource | None:
     """The lane D inputs source for ``cfg`` (the full ``ChainConfig``), or
     ``None`` while ``[lane_d] from_block = 0`` (nothing is called, read or
     created). Building an armed source reads nothing. ``readiness`` / ``t7``
@@ -638,15 +647,18 @@ def build_lane_d_inputs(cfg: Any, *, state_dir, intake_state_dir,
     ``scoring_envs`` (rev6.18 B5) is the qualified scoring environment list
     and ``score_cache`` the B6
     :class:`~cascade.validator.lane_d_score_cache.ScoreCache` (production
-    passes both, :func:`load_inputs_services`)."""
-    if int(getattr(getattr(cfg, "lane_d", None), "from_block", 0) or 0) <= 0:
+    passes both, :func:`load_inputs_services`). ``always`` / ``cfg_at``
+    (containment, owner 2026-11-24): built unarmed too, inert until the
+    config in force at a boundary arms lane D."""
+    if not always and int(getattr(getattr(cfg, "lane_d", None), "from_block", 0) or 0) <= 0:
         return None
     return LaneDInputsSource(cfg, state_dir=state_dir, intake_state_dir=intake_state_dir,
                              chain_factory=chain_factory, pool=pool, eval_host=eval_host,
                              house_pointer=house_pointer, house_signer_ss58=house_signer_ss58,
                              readiness=readiness, t7=t7, bench_host=bench_host,
                              expected_identity=expected_identity,
-                             scoring_envs=scoring_envs, score_cache=score_cache)
+                             scoring_envs=scoring_envs, score_cache=score_cache,
+                             cfg_at=cfg_at)
 
 
 # ── the production collaborators ─────────────────────────────────────────────

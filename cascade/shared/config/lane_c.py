@@ -278,6 +278,11 @@ class LaneCConfig:
     """
 
     from_block: int = 0
+    # containment kill switch (owner 2026-11-24, overlay-settable): 0 = no
+    # end; else the era boundary lane C closes at — the settlement AT it is
+    # lane C's last, every later one is as if lane C were off (its share
+    # returns to its source, MarketCast judges nothing)
+    until_block: int = 0
     share: float = 0.25
     takes_from: str = "lane_b"
     remainder: str = "burn"
@@ -386,13 +391,16 @@ class LaneCConfig:
     def active(self, block: int | None) -> bool:
         """Whether the SETTLEMENT at boundary ``block`` judges lane C (its era
         starts at or after ``from_block``)."""
-        return self.from_block > 0 and block is not None and int(block) > self.from_block
+        return (self.from_block > 0 and block is not None and int(block) > self.from_block
+                and (self.until_block <= 0 or int(block) <= self.until_block))
 
     def era_active(self, era_start: int | None) -> bool:
         """Whether the era STARTING at ``era_start`` is a lane-C era (the
-        trainer's leg-scheduling test)."""
+        trainer's leg-scheduling test); the era starting AT ``until_block`` is
+        not (it would settle after the end)."""
         return (self.from_block > 0 and era_start is not None
-                and int(era_start) >= self.from_block)
+                and int(era_start) >= self.from_block
+                and (self.until_block <= 0 or int(era_start) < self.until_block))
 
     @property
     def guard_public_map(self) -> dict[str, tuple[str, ...]]:
@@ -562,6 +570,11 @@ def parse_lane_c(lc: dict, *, v2_from_block: int = 0, era_blocks: int = 0,
     fb = _num(lc.get("from_block", 0), "from_block", integer=True)
     if fb < 0:
         raise ValueError(f"[lane_c] from_block must be >= 0; got {fb}")
+    ub = _num(lc.get("until_block", 0), "until_block", integer=True)
+    if ub < 0:
+        raise ValueError(f"[lane_c] until_block must be >= 0 (0 = no end); got {ub}")
+    if ub and ub <= fb:
+        raise ValueError(f"[lane_c] until_block={ub} must follow from_block={fb}")
     fp_days = {k: _num(lc.get(k, d), k) for k, d in (
         ("full_pay_min_days", 5.0), ("full_pay_max_days", 20.0), ("full_pay_max_gain", 0.05))}
     # a rebuilt validator's catch-up must hold every still-paying win: the
@@ -615,6 +628,7 @@ def parse_lane_c(lc: dict, *, v2_from_block: int = 0, era_blocks: int = 0,
         decay_floor=_num(lc.get("decay_floor", 0.1), "decay_floor"),
         decay_ttl_eras=_num(lc.get("decay_ttl_eras", 56), "decay_ttl_eras", integer=True),
         from_block=fb,
+        until_block=ub,
         share=_num(lc.get("share", 0.25), "share"),
         takes_from=str(lc.get("takes_from", "lane_b")),
         remainder=str(lc.get("remainder", "burn")),
@@ -702,6 +716,12 @@ def parse_lane_c(lc: dict, *, v2_from_block: int = 0, era_blocks: int = 0,
         if int(era_blocks) > 0 and fb % int(era_blocks):
             raise ValueError(f"[lane_c] from_block={fb} must be an era boundary (a multiple "
                              f"of the era length {era_blocks} in force at it)")
+    if ub:
+        _ue = int((era_blocks_at or (lambda _b: int(era_blocks)))(ub)) if (
+            era_blocks_at is not None or int(era_blocks) > 0) else 0
+        if _ue > 0 and ub % _ue:
+            raise ValueError(f"[lane_c] until_block={ub} must be an era boundary (a multiple "
+                             f"of the era length {_ue} in force at it)")
     # Checked armed or not, so an overlay (DEC-CA-0057) can never stage a
     # composition that would only fail at the block that arms it.
     if lane_b_share is not None:

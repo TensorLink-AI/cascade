@@ -325,6 +325,10 @@ class MarketCastConfig:
     continuation_protocol: str = ""
 
     from_block: int = 0
+    # Containment kill switch (owner 2026-11-24): DERIVED, never a
+    # [marketcast] key — the loader copies ``[lane_c] until_block`` here so a
+    # closed lane C also stops MarketCast judging (0 = no end).
+    until_block: int = 0
     # The pinned base (release-only: a new architecture).
     base_ref: str = TIMESTRAL_PINNED_REF
     base_sha256: str = TIMESTRAL_SHA256
@@ -497,6 +501,7 @@ class MarketCastConfig:
         """Whether MarketCast judges a settlement at ``block`` (never while
         its competition spec is refused, DEC-CA-0075)."""
         return bool(self.from_block > 0 and block is not None and int(block) >= self.from_block
+                    and (self.until_block <= 0 or int(block) <= self.until_block)
                     and not self.refused)
 
     @property

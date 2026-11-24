@@ -140,6 +140,10 @@ ALLOWED: dict[str, frozenset[str] | None] = {
         # DEC-CA-0074: the embargo eval-draw length, backtest windows per cell
         # and the <= 13 h inconclusive wait (code-bounded by the loader)
         "embargo_eval_days", "backtest_windows_per_cell", "verdict_wait_blocks",
+        # containment (owner 2026-11-24): MarketCast's start is movable LATER
+        # than the typed block, forward-only (:func:`start_refusals`,
+        # :func:`retroactive_changes`) — lane C's launch is overlay-gated
+        "from_block",
     }),
 }
 # Recovery controls are trainer-only policy; satellites can ignore their values.
@@ -164,6 +168,16 @@ OPERATOR_ONLY_TABLES: dict[str, str] = {
 }
 # Block-valued switch keys checked for retroactivity (§4).
 _BLOCK_KEY = re.compile(r"(?:^|_)from_block(?:_v2)?$|activation_block2?$")
+# Containment (owner 2026-11-24): lane C's / MarketCast's typed launch may be
+# moved LATER by overlay, never earlier than the typed value, never once it
+# has started (:func:`start_refusals`, :func:`retroactive_changes`). An overlay
+# that moves ``[lane_c] from_block`` alone carries MarketCast's start along
+# (:func:`_carry_lane_c_start`).
+_LATER_ONLY_STARTS = (("lane_c", "from_block"), ("marketcast", "from_block"))
+# The containment kill switches: never moved to, or away from, a block before
+# the apply block (a closed lane is never re-opened retroactively).
+_UNTIL_KEYS = (("lane_b", "until_block"), ("lane_c", "until_block"),
+               ("lane_d", "until_block"))
 # The DEC-CA-0045 typed blocks: an overlay that SETS one of these makes that
 # feature typed in the config it builds (the resolved flag is not carried),
 # which also drops its note segment (§7).
@@ -401,6 +415,43 @@ def _comparable(cfg: ChainConfig) -> ChainConfig:
     return replace(cfg, raw={})
 
 
+def _typed_start(base: ChainConfig, table: str) -> int:
+    return int(getattr(getattr(base, table), "from_block", 0) or 0)
+
+
+def start_refusals(base: ChainConfig, overrides: dict) -> list[str]:
+    """Containment (owner 2026-11-24): an overlay may move lane C's /
+    MarketCast's start LATER than the typed (``chain.toml``) value or to 0
+    (off), never earlier. Empty = allowed. A typed 0 (off) may be armed —
+    the retroactivity guard then keeps it at or after the apply block."""
+    out = []
+    for table, key in _LATER_ONLY_STARTS:
+        if not _sets(overrides, table, key):
+            continue
+        v = overrides[table][key]
+        typed = _typed_start(base, table)
+        if type(v) is int and 0 < v < typed:
+            out.append(f"[{table}] {key} = {v} is earlier than the typed launch {typed} "
+                       "(an overlay only postpones it)")
+    return out
+
+
+def _carry_lane_c_start(base: ChainConfig, overrides: dict, raw: dict) -> dict:
+    """An overlay that postpones ``[lane_c] from_block`` without naming
+    ``[marketcast] from_block`` postpones MarketCast with it (MarketCast
+    never starts before lane C), so the one-key postpone loads. Pure."""
+    if not _sets(overrides, "lane_c", "from_block") or _sets(overrides, "marketcast",
+                                                             "from_block"):
+        return raw
+    v = overrides["lane_c"]["from_block"]
+    mc = int(base.marketcast.from_block or 0)
+    if type(v) is not int or v <= 0 or not 0 < mc < v:
+        return raw
+    out = copy.deepcopy(raw)
+    out.setdefault("marketcast", {})["from_block"] = int(v)
+    return out
+
+
 def build_config(base: ChainConfig, body: dict, *, applied_block: int = 0) -> ChainConfig:
     """The config ``body`` puts in force on top of ``base`` (the node's live
     config, resolved activation blocks included), through the SAME parser and
@@ -409,7 +460,10 @@ def build_config(base: ChainConfig, body: dict, *, applied_block: int = 0) -> Ch
     if body.get("network") != network_identity(base):
         raise NetConfigError("overlay network mismatch (chain identity or netuid)")
     ov = check_overrides(body["overrides"])
-    raw = merge_raw(effective_raw(base), ov)
+    early = start_refusals(base, ov)
+    if early:
+        raise NetConfigError("overlay refused — " + "; ".join(early))
+    raw = _carry_lane_c_start(base, ov, merge_raw(effective_raw(base), ov))
     try:
         cfg = parse_chain_config(raw)
     except (ValueError, KeyError, TypeError) as e:
@@ -552,6 +606,22 @@ def retroactive_changes(prev: ChainConfig, new: ChainConfig, apply_block: int) -
         if was != now and (0 < now < apply_block or 0 < was < apply_block):
             out.append(f"[lane_c.competitions.{c.kind}] until_block {was} -> {now} crosses a "
                        f"block before the one the overlay applies at ({apply_block})")
+    # containment (owner 2026-11-24): a lane C / MarketCast start that has
+    # already passed is never moved to another nonzero block (that would
+    # un-start a running lane; use until_block), and a kill switch is never
+    # moved to, or away from, a block before the apply block
+    for table, key in _LATER_ONLY_STARTS:
+        was = int(getattr(getattr(prev, table), key, 0) or 0)
+        now = int(getattr(getattr(new, table), key, 0) or 0)
+        if was != now and now > 0 and 0 < was < apply_block:
+            out.append(f"[{table}] {key} {was} -> {now}: it started before the block the "
+                       f"overlay applies at ({apply_block}); end it with until_block instead")
+    for table, key in _UNTIL_KEYS:
+        was = int(getattr(getattr(prev, table), key, 0) or 0)
+        now = int(getattr(getattr(new, table), key, 0) or 0)
+        if was != now and (0 < now < apply_block or 0 < was < apply_block):
+            out.append(f"[{table}] {key} {was} -> {now} crosses a block before the one the "
+                       f"overlay applies at ({apply_block})")
     # W-CMP2: a spec instance's start never lies before the apply block when
     # it is added or moved (no retroactive competition)
     old_f = {c.kind: int(c.from_block) for c in prev.lane_c.competition_list}
@@ -870,8 +940,11 @@ class NetConfigResolver:
 
     def refresh(self, cfg: ChainConfig, *, force: bool = False) -> bool:
         """Re-read ``latest.json`` (every ``poll_seconds``); verify the chain
-        and validate the newest body against ``cfg``. True when the candidate
-        changed."""
+        and adopt as the candidate the NEWEST body that validates against
+        ``cfg`` (containment, owner 2026-11-24): the new bodies newest first,
+        then the candidate already held. A refused newer body never drops an
+        older valid one that is still being signalled (a publishing-order
+        mistake cannot strand a step). True when the state changed."""
         if not self.enabled:
             return False
         if self._persistence_error:
@@ -895,20 +968,39 @@ class NetConfigResolver:
             return False
         if not envs:
             return False
-        newest = envs[-1]
-        body = newest["body"]
-        d = body_digest(body)
-        self.state.last = body
-        try:
-            validate_overlay(cfg, body)
-            self.state.candidate = newest
+        self.state.last = envs[-1]["body"]
+        held = self.state.candidate
+        chosen = None
+        for env in reversed(envs):
+            body = env["body"]
+            d = body_digest(body)
+            if d in self.state.refused:
+                continue
+            try:
+                validate_overlay(cfg, body)
+            except NetConfigError as e:
+                self.state.refused.append(d)
+                log.error("netconfig: overlay seq %d (%s) REFUSED: %s", body["seq"], d[:12], e)
+                continue
+            chosen = env
             log.warning("netconfig: overlay seq %d (%s, effective %d) verified — signalling %s",
                         body["seq"], d[:12], body["effective_block"], cfg_feature_name(d))
-        except NetConfigError as e:
-            self.state.candidate = None
-            if d not in self.state.refused:
-                self.state.refused.append(d)
-            log.error("netconfig: overlay seq %d (%s) REFUSED: %s", body["seq"], d[:12], e)
+            break
+        if chosen is None and held is not None:
+            hb = held["body"]
+            hd = body_digest(hb)
+            try:
+                if hd in self.state.refused:
+                    raise NetConfigError("refused earlier")
+                validate_overlay(cfg, hb)
+            except NetConfigError as e:
+                log.error("netconfig: held overlay seq %d (%s) no longer validates (%s)",
+                          hb["seq"], hd[:12], e)
+            else:
+                chosen = held
+                log.warning("netconfig: no newer overlay validates; still signalling seq %d "
+                            "(%s)", hb["seq"], hd[:12])
+        self.state.candidate = chosen
         self._persist()
         return True
 
@@ -1069,6 +1161,13 @@ def plan_overlay(cfg: ChainConfig, overrides: dict, effective_block: int,
         errors.append(str(e))
     if head_block is not None:
         era = int(era_length_blocks(cfg.round, int(head_block)))
+        # containment: a postponed lane C / MarketCast start lies at least one
+        # era past the head (the lock-in needs that long)
+        for table, key in _LATER_ONLY_STARTS:
+            v = (overrides.get(table) or {}).get(key)
+            if type(v) is int and 0 < v < int(head_block) + era:
+                errors.append(f"[{table}] {key} = {v} is less than one era ({era} blocks) "
+                              f"after the head ({head_block})")
         if int(effective_block) - int(head_block) < era:
             warnings.append(f"effective_block is less than one era ({era} blocks) after the "
                             f"head ({head_block}): if the 51 % lock-in lands after it, the "
