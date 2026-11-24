@@ -341,15 +341,32 @@ def test_native_banks_snapshot_and_composite_windows(tmp_path):
     # every suite on every timeframe, each horizon a multi-step path (owner 2026-11-18)
     assert {(w.horizon, w.freq_minutes, w.steps) for w in ws if w.suite == "returns"} >= {
         ("1mx60", 1, 60), ("5mx36", 5, 36), ("15mx96", 15, 96), ("1hx48", 60, 48)}
-    # no gap_end ⇒ no gap-horizon windows; with one they sit inside the embargo gap
-    assert not any(w.horizon in mc.gap_horizons for w in ws)
-    sub = end - 6 * 86400
-    gw = [w for w in P.target_windows(snap, mc, "market", after=after, gap_end=sub)
-          if w.horizon in mc.gap_horizons]
-    lo, hi = P.gap_span(mc, sub)
-    assert gw and {w.horizon for w in gw} == {"4hx42", "1dx7"}
-    assert all(lo < w.start and w.end <= hi for w in gw)
-    assert lo + 1 == sub // 86400 * 86400 - (mc.embargo_days - 1) * 86400
+    # DEC-CA-0073: the drawn windows — every timeframe from the embargo before
+    # the dispatch, in the phase's half, plus the short paths' closed forwards
+    tt = float(end - 10 * 3600)
+    h = "0x" + "ab" * 32
+    d = P.embargo_draw(mc, train_time=tt, phase="judge", block=7200, block_hash=h,
+                       after=tt + mc.start_margin_seconds)
+    assert d["lo"] == tt - mc.embargo_eval_days * 86400 and d["hi"] == tt
+    gw = P.target_windows(snap, mc, "market", after=after, draw=d)
+    back = [w for w in gw if P.window_kind(d, w.start) == "backtest"]
+    fwd = [w for w in gw if P.window_kind(d, w.start) == "forward"]
+    assert {w.horizon for w in back} == {"1mx60", "5mx36", "15mx96", "1hx48", "4hx42", "1dx7"}
+    assert all(d["lo"] < w.start and w.end <= d["hi"] and P.window_half(w.wid) == 0
+               for w in back)
+    assert fwd and {w.horizon for w in fwd} <= {"1mx60", "5mx36"}
+    assert all(w.start > tt + mc.start_margin_seconds and w.end <= snap.end for w in fwd)
+    # the same draw re-cuts the same windows; another block hash draws others
+    assert [w.wid for w in P.target_windows(snap, mc, "market", after=after, draw=d)] == [
+        w.wid for w in gw]
+    d2 = {**d, "block_hash": "0x" + "cd" * 32}
+    assert {w.wid for w in P.target_windows(snap, mc, "market", after=after, draw=d2)} != {
+        w.wid for w in gw}
+    # the confirm half never shares a window with the judge half
+    dc = P.embargo_draw(mc, train_time=tt, phase="confirm", block=7200, block_hash=h,
+                        after=tt + mc.start_margin_seconds)
+    cw = P.target_windows(snap, mc, "market", after=after, draw=dc)
+    assert cw and not {w.wid for w in back} & {w.wid for w in cw}
     # one suite target is that suite's windows alone
     only = P.target_windows(snap, mc, "vol", after=after)
     assert {w.suite for w in only} == {"vol"}

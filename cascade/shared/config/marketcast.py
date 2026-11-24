@@ -46,11 +46,14 @@ The asset lists are the universe Hyperliquid listed on 2026-10-19
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime
 
 from .v2 import FULL_PAY_TIERS, parse_full_pay_tiers
+
+_log = logging.getLogger("cascade.config.marketcast")
 
 # The suites (DEC-CA-0064 §Suites; ``ohlcv`` / ``high`` / ``low`` added
 # 2026-11-10, owner). With ``composite = false`` a suite is its own lane-C
@@ -131,10 +134,17 @@ TIMESTRAL_KNOTS: tuple[float, ...] = (
     0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 0.99,
 )
 TIMESTRAL_MAX_CONTEXT = 32768
-# a recipe's leg_hours ceiling: a week (verdict_wait_blocks is 6 days of windows
-# that start at dispatch; a longer leg only scores a finished model on fewer)
+# a recipe's leg_hours ceiling: a week (the cap a recipe may ask for is
+# [marketcast] max_leg_hours; the verdict never waits on the leg's length)
 MAX_LEG_HOURS_CEILING = 168.0
 CRPS_SCALES = ("level", "seasonal_naive")
+# Owner 2026-11-24 (DEC-CA-0073): a verdict within 13 hours of submission,
+# judged on windows drawn from the embargo. Code bounds of its overlay knobs.
+VERDICT_MAX_HOURS = 13
+VERDICT_WAIT_MAX_BLOCKS = 3900            # 13 h of 12 s blocks
+BACKTEST_WINDOWS_PER_CELL_MAX = 256
+EMBARGO_RULE = "embargo-v1"               # the signed draw rule name (rows + receipts)
+DEFAULT_FORWARD_HORIZONS = ("1mx60", "5mx36")
 TIMESTRAL_MAX_HORIZON = 1024      # per forward pass; longer autoregresses on the median
 TIMESTRAL_PATCH = 32
 
@@ -371,9 +381,9 @@ class MarketCastConfig:
     max_lora_rank: int = 64
     # Window cutting / verdict timing (validator + audit).
     eval_context_length: int = 4096       # context steps both base and fine-tune see
-    windows_per_cell: int = 48            # windows per (asset, horizon), spread evenly
-    start_margin_seconds: int = 3600      # windows start this long after the train block
-    verdict_wait_blocks: int = 43_200     # an entry waits for windows this long (6 days)
+    windows_per_cell: int = 48            # FORWARD windows per (asset, horizon), spread evenly
+    start_margin_seconds: int = 3600      # forward windows start this long after dispatch
+    verdict_wait_blocks: int = 3900       # an inconclusive entry waits this long (<= 13 h)
     snapshot_days: int = 21               # realized bars an eval snapshot carries
     # Review fixes 2026-10-19 (DEC-CA-0064 §Review fixes):
     coarse_history_days: int = 180        # hourly bars kept for >= 1h series (HL serves ~208 d)
@@ -445,13 +455,6 @@ class MarketCastConfig:
         sorted(COMPOSITE_SUITE_WEIGHTS.items()))
     guards: tuple[str, ...] = GUARD_METRICS
     guard_floor: float = 0.0
-    # Owner 2026-11-18: horizons judged on the EMBARGO GAP — windows inside the
-    # ``embargo_days`` before the submission (data the training leg never
-    # gets: a recipe's data.end is >= embargo_days before it) instead of
-    # forward-only, so a week-long path verdicts with the 6-day wait. Judge
-    # phase only (a confirm has no fresh gap); the forward-only horizons stay
-    # the check against data nobody has seen.
-    gap_horizons: tuple[str, ...] = ()
     # Owner 2026-11-18: the composite must also beat the strong simple
     # baselines (cascade.eval.marketcast_baselines: random walk + EWMA / FHS,
     # seasonal AR(1)) — composite LCB >= 0, no suite confidently worse
@@ -465,10 +468,29 @@ class MarketCastConfig:
     # the 1-minute + hourly banks only (the pre-2026-11-10 layout).
     native_intervals: tuple[str, ...] = ()
     native_history_days: tuple[tuple[str, int], ...] = (("15m", 50), ("5m", 21))
+    # Owner 2026-11-24 (DEC-CA-0073): every horizon is judged on windows
+    # DRAWN from the embargo — the ``embargo_eval_days`` before the leg's
+    # dispatch, which no training leg reads (a recipe's data ends >=
+    # ``embargo_days`` before its commit) — ``backtest_windows_per_cell`` per
+    # (asset, series, horizon), ranked by the round block's hash (unknown
+    # while the leg trains); judge and confirm draw from the two halves of a
+    # fixed public window partition. The ``forward_horizons`` also take up to
+    # ``windows_per_cell`` forward windows already closed in the snapshot
+    # (start > dispatch + start_margin_seconds, end <= dispatch +
+    # verdict_wait_blocks), never waited for.
+    embargo_eval_days: int = 28
+    backtest_windows_per_cell: int = 48
+    forward_horizons: tuple[str, ...] = ()   # parse default: DEFAULT_FORWARD_HORIZONS enabled
 
     def active(self, block: int | None) -> bool:
         """Whether MarketCast judges a settlement at ``block``."""
         return bool(self.from_block > 0 and block is not None and int(block) >= self.from_block)
+
+    @property
+    def wait_blocks(self) -> int:
+        """The inconclusive wait in force: ``verdict_wait_blocks`` capped at
+        :data:`VERDICT_WAIT_MAX_BLOCKS` (owner 2026-11-24: <= 13 h)."""
+        return min(int(self.verdict_wait_blocks), VERDICT_WAIT_MAX_BLOCKS)
 
     @property
     def base_pointer(self) -> str:
@@ -612,7 +634,7 @@ def arming_problems(mc: MarketCastConfig) -> list[str]:
         unbuilt = [x for x in srcs if x not in IMPLEMENTED_SOURCES]
         if unbuilt:
             out.append(f"data_sources.{cls} names {unbuilt}: no adapter in this release")
-    return out
+    return out + draw_problems(mc)
 
 
 def scorability_problems(mc: MarketCastConfig) -> list[str]:
@@ -622,19 +644,13 @@ def scorability_problems(mc: MarketCastConfig) -> list[str]:
 
     * the history of the bank the series is cut from
       (:meth:`MarketCastConfig.bank_days`) holds at least ``MIN_CONTEXT +
-      steps`` blocks;
-    * the span its windows are cut from holds at least ONE window at the
-      worst grid alignment (window origins sit on the absolute UTC grid, so
-      the first may start up to one horizon after the span opens: ``span ≥ 2
-      × horizon``) — the forward wait ``verdict_wait_blocks × BLOCK_SECONDS −
-      start_margin_seconds``, or for a ``gap_horizons`` horizon the
-      ``embargo_days`` gap before the submission (owner 2026-11-18: the
-      multi-step paths hold 1–2 aligned windows per asset in a 6-day wait;
-      the evidence is their steps)."""
+      steps`` blocks.
+
+    Whether the DEC-CA-0073 embargo draw can hold the windows is an arming
+    check (:func:`draw_problems`)."""
     from ...eval.marketcast import window_geometry
 
     out: list[str] = []
-    wait_s = int(mc.verdict_wait_blocks) * BLOCK_SECONDS - int(mc.start_margin_seconds)
     fm, hm = mc.frequencies_map, mc.horizons_map
     for s in mc.suites:
         for h in hm.get(s, ()):
@@ -648,19 +664,38 @@ def scorability_problems(mc: MarketCastConfig) -> list[str]:
             if blocks < MIN_CONTEXT + steps:
                 out.append(f"{s}/{h} at {f}m: {days} days of history hold {blocks} blocks < "
                            f"{MIN_CONTEXT} context + {steps} target")
+    return out
+
+
+def draw_problems(mc: MarketCastConfig) -> list[str]:
+    """DEC-CA-0073: why the embargo draw could never judge (empty = it can;
+    an ARMING check, :func:`arming_problems`): an embargo of >= 2 days (the
+    draw reads only days no leg reads); per enabled (suite, horizon) the
+    ``embargo_eval_days`` span holds an aligned window (window origins sit
+    on the absolute UTC grid, so the first may start up to one horizon after
+    the span opens: ``span >= 2 x horizon``) and a ``forward_horizons``
+    horizon one in the forward span (``verdict_wait_blocks`` (capped) x
+    BLOCK_SECONDS - start_margin_seconds); the span holds ``min_time_blocks``
+    distinct cluster blocks."""
+    out: list[str] = []
+    if int(mc.embargo_days) < 2:
+        out.append(f"embargo_days={mc.embargo_days}: the embargo draw needs >= 2 days no leg "
+                   f"reads")
+    span = int(mc.embargo_eval_days) * 86400
+    fwd = int(mc.wait_blocks) * BLOCK_SECONDS - int(mc.start_margin_seconds)
+    for s in mc.suites:
+        for h in mc.horizons_map.get(s, ()):
             hs = 60 * duration_minutes(h)
-            if h in tuple(getattr(mc, "gap_horizons", ())):
-                gap_s = int(mc.embargo_days) * 86400
-                if gap_s < 2 * hs:
-                    out.append(f"{s}/{h}: the {mc.embargo_days}-day embargo gap holds no aligned "
-                               f"window (needs >= {2 * hs}s)")
-            elif wait_s < 2 * hs:
-                out.append(f"{s}/{h}: the forward wait ({wait_s:.0f}s = verdict_wait_blocks × "
-                           f"{BLOCK_SECONDS:g} − start_margin_seconds) holds no aligned window "
-                           f"(needs >= {2 * hs}s)")
+            if span < 2 * hs:
+                out.append(f"{s}/{h}: the {mc.embargo_eval_days}-day embargo eval span holds "
+                           f"no aligned window (needs >= {2 * hs}s)")
+            if h in tuple(mc.forward_horizons) and fwd < 2 * hs:
+                out.append(f"{s}/{h}: a forward horizon must fit the forward span ({fwd:.0f}s "
+                           f"= verdict_wait_blocks × {BLOCK_SECONDS:g} − start_margin_seconds; "
+                           f"needs >= {2 * hs}s)")
     tb_s = int(mc.min_time_blocks) * int(mc.cluster_block_hours) * 3600
-    if wait_s < tb_s:
-        out.append(f"the forward wait ({wait_s:.0f}s) is shorter than min_time_blocks × "
+    if span < tb_s:
+        out.append(f"the embargo eval span ({span}s) is shorter than min_time_blocks × "
                    f"cluster_block_hours ({tb_s}s): no verdict could ever conclude")
     return out
 
@@ -845,11 +880,16 @@ def parse_marketcast(raw: object) -> MarketCastConfig:
                          f"max_context_length]; got {ectx}")
     wpc = _num(mc.get("windows_per_cell", 48), "windows_per_cell", integer=True)
     marg = _num(mc.get("start_margin_seconds", 3600), "start_margin_seconds", integer=True)
-    wait = _num(mc.get("verdict_wait_blocks", 43_200), "verdict_wait_blocks", integer=True)
+    wait = _num(mc.get("verdict_wait_blocks", 3900), "verdict_wait_blocks", integer=True)
     sdays = _num(mc.get("snapshot_days", 21), "snapshot_days", integer=True)
     if wpc < 1 or marg < 0 or wait < 0 or sdays < 1:
         raise ValueError("[marketcast] need windows_per_cell >= 1, start_margin_seconds >= 0, "
                          "verdict_wait_blocks >= 0 and snapshot_days >= 1")
+    if wait > VERDICT_WAIT_MAX_BLOCKS:
+        # owner 2026-11-24 (DEC-CA-0073): a verdict within 13 h — a larger
+        # value (an older deployed file, an overlay) is capped in code
+        _log.warning("[marketcast] verdict_wait_blocks=%d is capped at %d (a verdict within "
+                     "%d h, DEC-CA-0073)", wait, VERDICT_WAIT_MAX_BLOCKS, VERDICT_MAX_HOURS)
     cdays = _num(mc.get("coarse_history_days", 180), "coarse_history_days", integer=True)
     rto = _num(mc.get("report_timeout_settlements", 8), "report_timeout_settlements",
                integer=True)
@@ -946,12 +986,32 @@ def parse_marketcast(raw: object) -> MarketCastConfig:
     if len(set(gd)) != len(gd) or not set(gd) <= set(GUARD_METRICS):
         raise ValueError(f"[marketcast] guards must be unique members of {GUARD_METRICS}; "
                          f"got {list(gd)}")
-    gap = _str_list(mc.get("gap_horizons", ()), "gap_horizons")
-    if len(set(gap)) != len(gap):
-        raise ValueError(f"[marketcast] gap_horizons must be unique; got {list(gap)}")
-    for h_ in gap:
+    if mc.get("gap_horizons"):
+        # retired (owner 2026-11-24, DEC-CA-0073): every horizon is drawn from
+        # the embargo; an older file still naming it loads, the key does nothing
+        _log.warning("[marketcast] gap_horizons is retired (DEC-CA-0073): every horizon is "
+                     "drawn from the embargo; the key is ignored")
+    fed = _num(mc.get("embargo_eval_days", min(28, max(1, emb - 1))), "embargo_eval_days",
+               integer=True)
+    bwpc = _num(mc.get("backtest_windows_per_cell", 48), "backtest_windows_per_cell",
+                integer=True)
+    if not 1 <= fed <= max(1, emb - 1):
+        raise ValueError(f"[marketcast] embargo_eval_days must be in [1, embargo_days - 1] "
+                         f"(the draw stays inside the embargo no leg reads); got {fed}")
+    if not 1 <= bwpc <= BACKTEST_WINDOWS_PER_CELL_MAX:
+        raise ValueError(f"[marketcast] backtest_windows_per_cell must be in "
+                         f"[1, {BACKTEST_WINDOWS_PER_CELL_MAX}]; got {bwpc}")
+    # absent = the default short paths this config enables (owner 2026-11-24:
+    # 1m and 5m fit the 13 h without a wait); listed = exactly those
+    fh = (_str_list(mc["forward_horizons"], "forward_horizons") if "forward_horizons" in mc
+          else tuple(h_ for h_ in DEFAULT_FORWARD_HORIZONS
+                     if any(h_ in hzs.get(s_, ()) for s_ in suites)))
+    if len(set(fh)) != len(fh):
+        raise ValueError(f"[marketcast] forward_horizons must be unique; got {list(fh)}")
+    for h_ in fh:
         if not any(h_ in hzs.get(s_, ()) for s_ in suites):
-            raise ValueError(f"[marketcast] gap_horizons {h_!r} is no enabled suite's horizon")
+            raise ValueError(f"[marketcast] forward_horizons {h_!r} is no enabled suite's "
+                             f"horizon")
     ev_raw = mc.get("event_times", ())
     if not isinstance(ev_raw, (list, tuple)):
         raise ValueError(f"[marketcast] event_times must be a list of ISO UTC instants; got "
@@ -1019,8 +1079,9 @@ def parse_marketcast(raw: object) -> MarketCastConfig:
         max_open_legs_per_coldkey=molc,
         composite=comp, composite_suite_floor=floor, ohlcv_open_weight=ow,
         composite_suite_weights=tuple(sorted(sw.items())), guards=gd, guard_floor=gfl,
-        gap_horizons=gap, baseline_gate=bgate, event_times=tuple(sorted(evs)),
+        baseline_gate=bgate, event_times=tuple(sorted(evs)),
         native_intervals=nat, native_history_days=tuple(sorted(nhd.items())),
+        embargo_eval_days=fed, backtest_windows_per_cell=bwpc, forward_horizons=fh,
     )
     unscorable = scorability_problems(cfg_out)
     if unscorable:
@@ -1074,4 +1135,5 @@ __all__ = [
     "mkt_base_pointer", "scorability_problems", "COMPOSITE_LAUNCH_SUITES", "COMPOSITE_TARGET",
     "NATIVE_INTERVALS", "OHLCV_FIELDS", "OHLCV_FIELD_NAMES", "base_suite",
     "horizon_path", "COMPOSITE_SUITE_WEIGHTS", "GUARD_METRICS", "GUARD_SUITES", "TAIL_SCORE_LEVELS",
+    "BACKTEST_WINDOWS_PER_CELL_MAX", "draw_problems", "EMBARGO_RULE", "VERDICT_MAX_HOURS", "VERDICT_WAIT_MAX_BLOCKS",
 ]
