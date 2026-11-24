@@ -159,11 +159,12 @@ def test_notes_edits_turn_a_stale_deployed_file_green(tmp_path):
 def test_notes_edits_on_the_deployed_file(tmp_path):
     """On the box (LANED_S0A_DEPLOYED=<deployed chain.toml>): the deployed
     file plus the notes' lines passes `decided`."""
+    edits = _edits()
     path = os.environ.get("LANED_S0A_DEPLOYED")
     if not path:
         pytest.skip("LANED_S0A_DEPLOYED not set (the deployed file lives on the box)")
     text = Path(path).read_text(encoding="utf-8")
-    for t, k, v in _edits():
+    for t, k, v in edits:
         text = _set_in_table(text, t, k, v)
     cfg = _load(text, tmp_path, "deployed.toml")
     assert not _decided_fails(cfg), _decided_fails(cfg)

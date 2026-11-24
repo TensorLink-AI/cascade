@@ -9,7 +9,8 @@ import pytest
 from .helpers import SHIPPED, W2_KEYS, run_unread_keys
 
 
-def test_w2_unread_keys_every_w2_key_is_read(tmp_path):
+def test_w2_unread_keys_every_w2_and_legacy_key_is_read(tmp_path):
+    # rev6.18 B11: the legacy keys are retired (read by nothing); the name stays
     cfg = tmp_path / "lane_d_keys.toml"
     cfg.write_text("[lane_d]\n" + "".join(f"{k} = 0\n" for k in W2_KEYS),
                    encoding="utf-8")
