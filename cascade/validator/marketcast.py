@@ -879,7 +879,7 @@ class MarketCastMixin:
 
     def _mkt_cfg(self):
         """The MarketCast-shaped table of the instance being judged."""
-        return current_ctx(self.cfg).mc
+        return current_ctx(getattr(self, "cfg", None)).mc
 
     def _mkt_main_hotkey(self) -> str:
         return str(getattr(getattr(self.cfg, "netconfig", None), "owner_hotkey", "") or "")
@@ -909,8 +909,8 @@ class MarketCastMixin:
         key = (mc.pool_prefix, signer, mc.pool_schema, tuple(mc.pool_select),
                tuple(getattr(mc, "pool_channels", ())))
         srcs = self.__dict__.setdefault("_mkt_sources", {})
-        src = srcs.get(current_ctx(self.cfg).kind)
-        if src is None or srcs.get(("key", current_ctx(self.cfg).kind)) != key:
+        src = srcs.get(current_ctx(getattr(self, "cfg", None)).kind)
+        if src is None or srcs.get(("key", current_ctx(getattr(self, "cfg", None)).kind)) != key:
             from ..pool.marketcast import MktSnapshotSource
             from ..shared.hippius import pool_s3_store
 
@@ -921,8 +921,8 @@ class MarketCastMixin:
                 verify_signature=bool(self.verify_signatures),
                 schema=mc.pool_schema, select=dict(mc.pool_select),
                 channels=dict(getattr(mc, "pool_channels", ())))
-            srcs[current_ctx(self.cfg).kind] = src
-            srcs[("key", current_ctx(self.cfg).kind)] = key
+            srcs[current_ctx(getattr(self, "cfg", None)).kind] = src
+            srcs[("key", current_ctx(getattr(self, "cfg", None)).kind)] = key
         return src.snapshot_for(block)
 
     def _mkt_block_hash(self, block: int) -> str:
@@ -1016,7 +1016,7 @@ class MarketCastMixin:
 
         if arbiter == REPORT_ABSENT:
             return None, "", "the main validator's report never appeared (recorded absent)"
-        key = current_ctx(self.cfg).report_key(rid)
+        key = current_ctx(getattr(self, "cfg", None)).report_key(rid)
         try:
             text = self._mkt_store().get_text(key)
         except Exception as e:  # noqa: BLE001 — the recorded bytes exist: retried
@@ -1051,7 +1051,7 @@ class MarketCastMixin:
         from ..shared.lane_c import LaneCState
         from .lane_c import LaneCJudgement
 
-        ctx = current_ctx(self.cfg)
+        ctx = current_ctx(getattr(self, "cfg", None))
         mc = ctx.mc
         new = [e for e in (cm.entries if cm is not None else ()) if ctx.is_target(e.target)]
         legacy = [p for p in st.pending if ctx.is_target(p.target)]
@@ -1274,7 +1274,7 @@ class MarketCastMixin:
             _row(e, None, "judge")
         for p in sorted(legacy, key=PendingEntry.sort_key):
             _row(LaneCEntry(**p.entry), p, "confirm" if p.kind == "confirm" else "judge")
-        ctx = current_ctx(self.cfg)
+        ctx = current_ctx(getattr(self, "cfg", None))
         for item in ctx.backlog(st):
             for c in item.get("candidates") or ():
                 e, phase, p = _unpack(c)
@@ -1306,7 +1306,7 @@ class MarketCastMixin:
         from ..shared.rules_menu import family_size
 
         ks = {key: family_size(mc.test_family, v) for key, v in ks.items()}
-        info = {"report_key": current_ctx(self.cfg).report_key(R), "report_sha256": sha,
+        info = {"report_key": current_ctx(getattr(self, "cfg", None)).report_key(R), "report_sha256": sha,
                 "round": R,
                 "round_block": B}
         if item.get("expired"):
@@ -1452,7 +1452,7 @@ class MarketCastMixin:
             return False
         import threading
 
-        ctx = ctx if ctx is not None else current_ctx(self.cfg)
+        ctx = ctx if ctx is not None else current_ctx(getattr(self, "cfg", None))
 
         def _run():
             # the instance travels with the run (W-CMP2)
@@ -1475,7 +1475,7 @@ class MarketCastMixin:
         need = []
         for item in todo:
             try:
-                store.get_text(current_ctx(self.cfg).report_key(str(item["round_id"])))
+                store.get_text(current_ctx(getattr(self, "cfg", None)).report_key(str(item["round_id"])))
             except ObjectNotFound:
                 need.append(item)
             except Exception as e:  # noqa: BLE001 — unknown: retried next settlement
@@ -1526,7 +1526,7 @@ class MarketCastMixin:
         from ..shared.hippius import ObjectNotFound, StorageError
 
         rid = str(item["round_id"])
-        key = current_ctx(self.cfg).report_key(rid)
+        key = current_ctx(getattr(self, "cfg", None)).report_key(rid)
         store = self._mkt_store()
         try:
             store.get_text(key)
