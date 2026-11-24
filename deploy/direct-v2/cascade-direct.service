@@ -11,7 +11,7 @@ Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=CUBLAS_WORKSPACE_CONFIG=:4096:8
 # Hippius S3 credentials and CASCADE_VAULT_KEY_FILE (the intake's vault seal key).
 EnvironmentFile=/etc/cascade/direct.env
-ExecStart=/opt/cascade/.venv/bin/python -m cascade.direct --config /etc/cascade/direct.json --serve
+ExecStart=/opt/cascade/.venv/bin/python -P -m cascade.direct --config /etc/cascade/direct.json --serve
 Restart=on-failure
 RestartSec=15
 TimeoutStopSec=30

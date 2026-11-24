@@ -52,6 +52,7 @@ sku          = "NVIDIA GeForce RTX 3090"
 market_sku   = "RTX3090"
 gpus_per_pod = 1
 max_pods     = 1
+# incident-ok: IR006 KNOWN VIOLATION pending owner: template predates the 2026-11-24 Lium-only GPU rule; the deployed provision.toml governs
 providers    = ["lium", "shadeform"]
 max_price_hr = 0.45
 

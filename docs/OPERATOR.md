@@ -1948,7 +1948,8 @@ Before you flip it:
 **Relay host setup.** Use a small operator VM with disk at least the largest
 checkpoint (about 20 GB for the 1.23B preset) plus headroom, and good
 bandwidth to R2 and Hippius. Install the cascade checkout at the released
-commit (`uv sync --frozen`), so its `checkpoint_guard` matches the trainer's.
+commit (`uv sync --frozen` with the extras the relay uses, repeated on every
+upgrade), so its `checkpoint_guard` matches the trainer's.
 Add it to the hosts file:
 
 ```toml
@@ -3567,7 +3568,7 @@ publishes is Approve-tier.
 Any GPU may score lane D when its environment is a `qualified` entry of
 `deploy/laned/scoring_envs.toml` at the settlement boundary: the GPU model is
 listed, the driver is in range and the torch build matches. Launch list:
-`cu124-torch241` (the release's `uv sync --frozen` venv, torch 2.4.1+cu124;
+`cu124-torch241` (the release's `uv sync --frozen --extra train` venv, torch 2.4.1+cu124;
 e.g. valpriv-4090, at least 24 GB) and `sm120-torch212` (RTX PRO 6000
 Blackwell, e.g. valeval-blackwell4; **candidate** until its qualification
 evidence is committed, so it is refused until then). Lane A's pinned training
@@ -3662,7 +3663,7 @@ configured by `deploy/laned/elastic.toml` (operator-only, never consensus).
 **Costs.** Builder: the cheapest available type meeting the spec, at the
 2026-11-24 snapshot `massedcompute cpu_small` $0.22/h (40 GB / 800 GB) or
 `cpu_medium` $0.44/h (80 GB / 1600 GB), times the build hours (boot +
-`uv sync --frozen` + mirror delta + build). Eight builds a day at 1 h each and
+`uv sync --frozen --all-extras` + mirror delta + build). Eight builds a day at 1 h each and
 $0.44/h is about $106 a month; a build that runs the full 3 h makes it the
 same as keeping one VM warm (about $317 a month). Eval hosts: Lium price per
 host times the settlement's scoring hours, times the number of hosts (for
