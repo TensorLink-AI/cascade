@@ -850,8 +850,12 @@ class SatelliteRunner(ActivationMixin):
     # ── status ──
 
     def status(self, now_block: int | None = None) -> dict:
+        from ..shared.netconfig import out_of_bounds_report
+
         st = self.state
+        oob = out_of_bounds_report()      # #891: in-force keys at the release value
         return {
+            **({"netconfig_out_of_bounds": oob} if oob else {}),
             "hotkey": self.hotkey, "main_validator": self.owner, "mode": self._mode,
             "block": now_block, "last_verified_round": st.verified_round,
             "last_verified_boundary": st.verified_boundary,

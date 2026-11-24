@@ -249,8 +249,13 @@ def seq_key(seq: int) -> str:
     return f"{PREFIX}/seq-{int(seq)}.json"
 
 
-def check_overrides(overrides: object) -> dict:
-    """Refuse anything outside :data:`ALLOWED`; returns ``overrides`` unchanged."""
+def check_overrides(overrides: object, *, in_force: bool = False) -> dict:
+    """Refuse anything outside :data:`ALLOWED`; returns ``overrides`` unchanged.
+
+    ``in_force`` (#891): the body is an overlay already adopted (or a
+    receipt's stamp), so the W-OV per-key envelope (release-only keys,
+    content-addressed pins) is not a refusal here — :func:`build_config`
+    resolves those keys to the release value instead."""
     if not isinstance(overrides, dict):
         raise NetConfigError("overrides must be a table of tables")
     bad: list[str] = []
@@ -284,14 +289,16 @@ def check_overrides(overrides: object) -> dict:
                 bad.append(f"[{table}] {key} (not an overlay key)")
     from .netconfig_bounds import key_refusals, pin_refusals
 
-    bad += key_refusals(overrides) + pin_refusals(overrides)
+    if not in_force:
+        bad += key_refusals(overrides) + pin_refusals(overrides)
     if bad:
         raise NetConfigError("overlay refused — release-only keys: " + "; ".join(bad))
     return overrides
 
 
-def check_body(body: object) -> dict:
-    """Shape of an overlay body; returns it unchanged."""
+def check_body(body: object, *, in_force: bool = False) -> dict:
+    """Shape of an overlay body; returns it unchanged (``in_force``: see
+    :func:`check_overrides`)."""
     if not isinstance(body, dict):
         raise NetConfigError("overlay body must be an object")
     keys = set(body)
@@ -315,7 +322,7 @@ def check_body(body: object) -> dict:
         raise NetConfigError("overlay effective_block must be a positive integer")
     if "comment" in body and not isinstance(body["comment"], str):
         raise NetConfigError("overlay comment must be a string")
-    check_overrides(body["overrides"])
+    check_overrides(body["overrides"], in_force=in_force)
     canonical(body)                     # strict JSON (no NaN) or raise
     return body
 
@@ -342,8 +349,9 @@ def sign_overlay(body: dict, keypair: Any) -> dict:
     return sign(check_body(body), keypair, scope=SCOPE)
 
 
-def verify_overlay(envelope: object, *, owner: str) -> dict:
-    """The verified body of ``envelope`` signed by ``owner``, else raise."""
+def verify_overlay(envelope: object, *, owner: str, in_force: bool = False) -> dict:
+    """The verified body of ``envelope`` signed by ``owner``, else raise
+    (``in_force``: see :func:`check_overrides`)."""
     from ..direct.signing import verify
 
     if not owner:
@@ -356,7 +364,7 @@ def verify_overlay(envelope: object, *, owner: str) -> dict:
         raise NetConfigError(f"malformed overlay envelope ({e})") from e
     except ValueError as e:
         raise NetConfigError(str(e)) from e
-    return check_body(body)
+    return check_body(body, in_force=in_force)
 
 
 # ── merging and validation ───────────────────────────────────────────────────
@@ -452,14 +460,30 @@ def _carry_lane_c_start(base: ChainConfig, overrides: dict, raw: dict) -> dict:
     return out
 
 
-def build_config(base: ChainConfig, body: dict, *, applied_block: int = 0) -> ChainConfig:
+def build_config(base: ChainConfig, body: dict, *, applied_block: int = 0,
+                 in_force: bool = False) -> ChainConfig:
     """The config ``body`` puts in force on top of ``base`` (the node's live
     config, resolved activation blocks included), through the SAME parser and
     load checks as ``chain.toml``. Raises :class:`NetConfigError` on a refused
-    key, a key no parser reads, or a merged table the loader refuses."""
+    key, a key no parser reads, or a merged table the loader refuses.
+
+    ``in_force`` (#891): ``body`` is ALREADY in force (adopted, locked in, or
+    stamped on a receipt), possibly under an older release whose W-OV
+    envelope (:mod:`cascade.shared.netconfig_bounds`) was looser. Every key
+    this release's envelope refuses is resolved to the RELEASE value (the
+    override is dropped; the rest of the overlay stands), logged once per
+    key and listed by :func:`out_of_bounds_report`, instead of raising —
+    so an upgrade never stalls rounds on an overlay nobody can un-adopt.
+    The rule is a pure function of (release, base, body): every node, the
+    satellites and the audit replay resolve the same config. With no key out
+    of bounds the result is identical to ``in_force=False``. A NEW overlay
+    being validated for adoption is never built with it (still refused)."""
     if body.get("network") != network_identity(base):
         raise NetConfigError("overlay network mismatch (chain identity or netuid)")
-    ov = check_overrides(body["overrides"])
+    if in_force:
+        ov = check_overrides(_resolve_in_force(base, body), in_force=False)
+    else:
+        ov = check_overrides(body["overrides"])
     early = start_refusals(base, ov)
     if early:
         raise NetConfigError("overlay refused — " + "; ".join(early))
@@ -540,6 +564,97 @@ def build_config(base: ChainConfig, body: dict, *, applied_block: int = 0) -> Ch
         validator=base.validator,
         netconfig=replace(cfg.netconfig, seq=int(body["seq"]), digest=body_digest(body),
                           applied_block=int(applied_block)))
+
+
+# #891: ``digest -> ("[table] key ... using release value ...", ...)`` for each
+# in-force overlay this process resolved with keys out of the current
+# envelope; the logged set keeps the loud line to once per (overlay, key).
+_OOB_REPORT: dict[str, tuple[str, ...]] = {}
+_OOB_LOGGED: set[tuple[str, str, str]] = set()
+_CARVE_KEYS = tuple((t, k) for t in ("lane_b", "lane_c", "lane_d")
+                    for k in ("share", "takes_from"))
+
+
+def _release_value(base: ChainConfig, table: str, key: str) -> object:
+    return (effective_raw(base).get(table) or {}).get(key, "<release default>")
+
+
+def _without(overrides: dict, drop: list[tuple[str, str, str]]) -> dict:
+    gone = {(t, k) for t, k, _ in drop}
+    out: dict = {}
+    for table, kv in overrides.items():
+        if not isinstance(kv, dict):
+            out[table] = kv
+            continue
+        keep = {k: v for k, v in kv.items() if (table, k) not in gone}
+        if keep:
+            out[table] = keep
+    return out
+
+
+def in_force_out_of_bounds(base: ChainConfig, overrides: dict) -> list[tuple[str, str, str]]:
+    """#891: ``(table, key, why)`` for every override of an IN-FORCE overlay
+    that this release's W-OV envelope refuses, in a fixed order: the per-key
+    envelope (:func:`~cascade.shared.netconfig_bounds.out_of_bounds_keys`),
+    then — on the remainder — lane shares the carve would clamp (every
+    ``share`` / ``takes_from`` override of lanes B/C/D) and ``[lane_c]
+    specs`` with a spec out of its code bounds (the whole specs table). A
+    merged table the loader refuses is left to :func:`build_config` (not an
+    envelope matter). Pure."""
+    from .netconfig_bounds import out_of_bounds_keys, share_refusals
+
+    drop = out_of_bounds_keys(overrides)
+    rest = _without(overrides, drop)
+    carve = [(t, k) for t, k in _CARVE_KEYS if _sets(rest, t, k)]
+    specs = _sets(rest, "lane_c", "specs")
+    if carve or specs:
+        try:
+            cfg = parse_chain_config(_carry_lane_c_start(base, rest,
+                                                         merge_raw(effective_raw(base), rest)))
+        except (ValueError, KeyError, TypeError):
+            return drop                 # the loader's refusal stands (build_config)
+        why = share_refusals(cfg) if carve else []
+        if why:
+            drop += [(t, k, "; ".join(why)) for t, k in carve]
+        if specs:
+            from .competition_spec import bound_refusals
+
+            sw = bound_refusals(rest["lane_c"]["specs"])
+            if sw:
+                drop.append(("lane_c", "specs", "; ".join(sw)))
+    return drop
+
+
+def _resolve_in_force(base: ChainConfig, body: dict) -> dict:
+    """The overrides :func:`build_config` applies for an in-force ``body``
+    (#891): :func:`in_force_out_of_bounds` keys dropped (release value),
+    recorded for :func:`out_of_bounds_report` and logged once per key."""
+    ov = body["overrides"]
+    if not isinstance(ov, dict):
+        return ov
+    drop = in_force_out_of_bounds(base, ov)
+    if not drop:
+        return ov
+    d = body_digest(body)
+    lines = []
+    for table, key, why in drop:
+        line = (f"[{table}] {key} = {ov[table][key]!r} ({why}) — using release value "
+                f"{_release_value(base, table, key)!r}")
+        lines.append(line)
+        if (d, table, key) not in _OOB_LOGGED:
+            _OOB_LOGGED.add((d, table, key))
+            log.error("netconfig: overlay key out of current bounds: %s; overlay seq %s (%s) "
+                      "stays in force for its other keys — publish a compliant overlay",
+                      line, body.get("seq"), d[:12])
+    _OOB_REPORT[d] = tuple(lines)
+    return _without(ov, drop)
+
+
+def out_of_bounds_report() -> dict[str, list[str]]:
+    """#891, presentational: ``{overlay digest: [resolved key lines]}`` for
+    every in-force overlay this process resolved with keys outside the
+    current envelope (empty = none). Status / readiness surfaces read it."""
+    return {d: list(v) for d, v in sorted(_OOB_REPORT.items())}
 
 
 def lane_c_competition_changes(base: ChainConfig, new: ChainConfig) -> list[str]:
@@ -755,7 +870,9 @@ def fetch_overlay_by_digest(store: Any, *, seq: int, digest_hex: str,
     env = _read_envelope(store, seq_key(seq))
     if env is None:
         raise NetConfigError(f"{seq_key(seq)} not found")
-    body = verify_overlay(env, owner=owner) if owner else check_body(env.get("body"))
+    # the receipt stamps an overlay that WAS in force (#891: in_force)
+    body = (verify_overlay(env, owner=owner, in_force=True) if owner
+            else check_body(env.get("body"), in_force=True))
     if body_digest(body) != str(digest_hex):
         raise NetConfigError(f"{seq_key(seq)} digest {body_digest(body)[:12]} != receipt "
                              f"{str(digest_hex)[:12]}")
@@ -839,7 +956,9 @@ def config_from_history(base: ChainConfig, history: list[Adopted], block: int | 
         hit = cache.get(key)
         if hit is not None and hit[0] is base:
             return hit[1]
-    cfg = build_config(base, h.body, applied_block=h.apply_block)
+    # #891: an adopted overlay is in force — keys this release's envelope
+    # refuses resolve to the release value instead of failing every round
+    cfg = build_config(base, h.body, applied_block=h.apply_block, in_force=True)
     if cache is not None:
         if len(cache) > 16:
             cache.clear()
@@ -1041,7 +1160,8 @@ class NetConfigResolver:
         d = body_digest(body)
         apply = apply_block_for(body, rec, cfg.round)
         try:
-            new = build_config(cfg, body, applied_block=apply)
+            # locked in by the fleet: in force from ``apply`` (#891)
+            new = build_config(cfg, body, applied_block=apply, in_force=True)
             prev = self.config_at(cfg, apply - 1)
             why = retroactive_changes(prev, new, apply)
             if not (is_era_start(prev, apply) and is_era_start(new, apply)):
@@ -1084,6 +1204,9 @@ class NetConfigResolver:
             "history": [{"apply_block": h.apply_block, "seq": h.seq, "digest": h.digest}
                         for h in self.state.history],
             "refused": list(self.state.refused),
+            # #891: in-force overlay keys resolved to the release value
+            "out_of_bounds": {d: v for d, v in out_of_bounds_report().items()
+                              if any(h.digest == d for h in self.state.history)},
         }
 
 
@@ -1098,7 +1221,7 @@ def apply_receipt_netconfig(cfg: ChainConfig, receipt: Any, *, store: Any) -> Ch
         return cfg
     body = fetch_overlay_by_digest(store, seq=seq, digest_hex=d,
                                    owner=str(cfg.netconfig.owner_hotkey or ""))
-    return build_config(cfg, body)
+    return build_config(cfg, body, in_force=True)
 
 
 # ── the owner's publish tool ─────────────────────────────────────────────────
@@ -1156,6 +1279,12 @@ def plan_overlay(cfg: ChainConfig, overrides: dict, effective_block: int,
                 prev_cfg = build_config(cfg, previous)
             except NetConfigError as e:
                 warnings.append(f"the previous overlay no longer builds on this chain.toml ({e})")
+                # #891: nodes on this release run it with the out-of-bounds
+                # keys at the release value; judge retroactivity against that
+                try:
+                    prev_cfg = build_config(cfg, previous, in_force=True)
+                except NetConfigError:
+                    prev_cfg = cfg
         errors += retroactive_changes(prev_cfg, new, int(effective_block))
     except NetConfigError as e:
         errors.append(str(e))

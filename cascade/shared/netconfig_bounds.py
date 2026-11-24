@@ -345,6 +345,25 @@ def value_refusals(overrides: dict) -> list[str]:
     return out
 
 
+def out_of_bounds_keys(overrides: dict) -> list[tuple[str, str, str]]:
+    """``(table, key, why)`` for every override the per-key envelope refuses
+    (:func:`key_refusals`, :func:`pin_refusals`, :func:`value_refusals`), in
+    the overrides' own order. #891: an IN-FORCE overlay (adopted under an
+    older release) that fails this release's envelope keeps the release
+    value for these keys instead of failing every round
+    (:func:`cascade.shared.netconfig.build_config` ``in_force=True``)."""
+    out = []
+    for table, kv in overrides.items():
+        if not isinstance(kv, dict):
+            continue
+        for key, value in kv.items():
+            one = {table: {key: value}}
+            why = key_refusals(one) + pin_refusals(one) + value_refusals(one)
+            if why:
+                out.append((table, key, "; ".join(why)))
+    return out
+
+
 def share_refusals(cfg) -> list[str]:
     """Lane shares that the carve would clamp (``lane_pool_shares`` caps a
     lane at what its source holds, silently): lane C's share must fit its
@@ -383,4 +402,4 @@ def policy() -> dict:
 
 
 __all__ = ["BOUNDS", "PINNED_REF_KEYS", "RELEASE_ONLY_KEYS", "SEQ_BOUNDS", "Bound", "key_refusals",
-           "pin_refusals", "policy", "share_refusals", "value_refusals"]
+           "out_of_bounds_keys", "pin_refusals", "policy", "share_refusals", "value_refusals"]
