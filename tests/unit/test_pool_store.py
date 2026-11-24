@@ -314,6 +314,7 @@ def test_publish_cli_end_to_end(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(cli, "load_chain_config", lambda *_a, **_k: cfg)
     monkeypatch.setattr(hippius, "pool_s3_store", lambda *_a, **_k: store)
+    monkeypatch.setattr(cli, "estimate_chain_head", lambda cfg: None)  # no network
 
     rc = cli.main(
         ["publish", "--sources", "synthetic", "--out", str(tmp_path / "stage"),
@@ -328,6 +329,29 @@ def test_publish_cli_end_to_end(tmp_path, monkeypatch):
     assert len(src.windows_for_round(9, 50, block=8000)) > 0
 
 
+def test_publish_cli_refuses_an_entry_inside_the_freeze_horizon(tmp_path, monkeypatch):
+    # hourly republish: once the chain head is within one epoch of the entry's
+    # activation, the published bytes are final (warning + exit 0, nothing written)
+    from cascade.pool import cli
+
+    store = _FakeS3Store()
+    cfg = dataclasses.replace(
+        _cfg_small(),
+        storage=dataclasses.replace(load_chain_config().storage, pool_bucket="cascade-eval-pool"),
+    )
+    monkeypatch.setattr(cli, "load_chain_config", lambda *_a, **_k: cfg)
+    monkeypatch.setattr(hippius, "pool_s3_store", lambda *_a, **_k: store)
+    argv = ["publish", "--sources", "synthetic", "--out", str(tmp_path / "stage"),
+            "--effective-block", "7200", "--context-length", "128", "--horizon", "16",
+            "--min-context", "32"]
+    monkeypatch.setattr(cli, "estimate_chain_head", lambda cfg: 7200 - 1)
+    assert cli.main(argv) == 0
+    assert store.objects == {}  # 7200 < head + one epoch: refused, nothing written
+    monkeypatch.setattr(cli, "estimate_chain_head", lambda cfg: 0)
+    assert cli.main(argv) == 0
+    assert [m.effective_block for m in read_pool_index(store)] == [7200]
+
+
 def test_publish_cli_deprecated_effective_round_alias(tmp_path, monkeypatch):
     # --effective-round still works (maps to --effective-block) so existing
     # cron invocations don't break; the value is a BLOCK now.
@@ -340,6 +364,7 @@ def test_publish_cli_deprecated_effective_round_alias(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(cli, "load_chain_config", lambda *_a, **_k: cfg)
     monkeypatch.setattr(hippius, "pool_s3_store", lambda *_a, **_k: store)
+    monkeypatch.setattr(cli, "estimate_chain_head", lambda cfg: None)  # no network
     rc = cli.main(
         ["publish", "--sources", "synthetic", "--out", str(tmp_path / "stage"),
          "--effective-round", "14400", "--context-length", "128", "--horizon", "16",
@@ -527,6 +552,7 @@ def _publish_capturing_build(tmp_path, monkeypatch, cfg, argv_extra):
     store = _FakeS3Store()
     monkeypatch.setattr(cli, "load_chain_config", lambda *_a, **_k: cfg)
     monkeypatch.setattr(hippius, "pool_s3_store", lambda *_a, **_k: store)
+    monkeypatch.setattr(cli, "estimate_chain_head", lambda cfg: None)  # no network
     seen = {}
     real_build = cli._build
 

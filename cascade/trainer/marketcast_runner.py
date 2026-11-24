@@ -48,6 +48,10 @@ class MktLegRecipe:
     # recipe's ``init`` against its lineage (:func:`resolve_mkt_init`)
     init_pointer: str = ""
     init_sha256: str = ""
+    # DEC-CA-0074 guard (b): the trainer's pre-rent embargo contamination
+    # receipt (cascade.shared.marketcast_embargo.scan_receipt); it rides the
+    # leg's trainer-signed marketcast record, never the pod's recipe
+    embargo_scan: tuple[tuple[str, object], ...] = ()
 
     @property
     def leg_hours(self) -> float:
@@ -127,15 +131,44 @@ def resolve_mkt_init(init: str, lineage: dict, *, submission_time: float | None)
     return str(init), str(rec.get("checkpoint_sha256", ""))
 
 
+def embargo_scan_or_refuse(d: Path, has_generator: bool, scan, *, train_time: float | None
+                           ) -> tuple[tuple[str, object], ...]:
+    """DEC-CA-0074 guard (b), before anything is rented: the receipt of
+    ``scan(tree | None, train_time=...)`` (a tree is scanned only when it
+    ships a generator). ``embedded`` / ``budget_exceeded`` is
+    :class:`~cascade.trainer.finetune.RecipeError` ``embargo_series_embedded``
+    (miner fault); no scanner wired or a scan that raises is the operator's
+    side (the caller requeues uncharged): an unscanned leg could never be
+    judged (the trainer's :class:`~cascade.trainer.lane_c_competitions.
+    MarketCastTrainer` refuses without one)."""
+    from .finetune import RecipeError
+
+    if not train_time:
+        raise RuntimeError("no dispatch train_time to scan the embargo against")
+    rec = dict(scan(Path(d) if has_generator else None, train_time=float(train_time)))
+    if rec.get("result") in ("embedded", "budget_exceeded"):
+        what = ("embeds embargoed market bars" if rec["result"] == "embedded"
+                else "carries more numeric data than the embargo scan reads")
+        raise RecipeError(f"embargo_series_embedded: the generator tree {what} "
+                          f"({rec.get('window_id') or rec['result']}); generators may not ship "
+                          f"the embargoed history MarketCast is judged on")
+    if rec.get("result") not in ("clean", "no_generator"):
+        raise RuntimeError(f"embargo scan gave {rec.get('result')!r}")
+    return tuple(sorted(rec.items()))
+
+
 def read_mkt_recipe(d: Path, cfg, *, target: str, submission_time: float | None = None,
-                    train_time: float | None = None, lineage: dict | None = None
-                    ) -> MktLegRecipe:
+                    train_time: float | None = None, lineage: dict | None = None,
+                    embargo_scan=None) -> MktLegRecipe:
     """``marketcast.json`` at the root of the fetched tree, validated with
     the shared rule; :class:`~cascade.trainer.finetune.RecipeError` (miner
     fault) on anything wrong. ``submission_time`` (the commitment's time on
     the dispatch clock) enforces ``data.end <= submission − embargo_days``
     HERE, on the trainer, before anything is rented (review M12) — the miner
-    CLI's check is advisory."""
+    CLI's check is advisory. ``embargo_scan`` (DEC-CA-0074,
+    :func:`embargo_scan_or_refuse`) scans the generator against the embargo
+    (None = no scan: the miner CLI's local check; the trainer always passes
+    one, :class:`~cascade.trainer.lane_c_competitions.MarketCastTrainer`)."""
     from ..shared.marketcast_recipe import MARKETCAST_RECIPE_FILE, parse_marketcast_recipe
     from .finetune import RecipeError
 
@@ -150,9 +183,12 @@ def read_mkt_recipe(d: Path, cfg, *, target: str, submission_time: float | None 
     except (ValueError, OSError) as e:
         raise RecipeError(f"{MARKETCAST_RECIPE_FILE}: {e}") from e
     ip, isha = resolve_mkt_init(rc.init, lineage or {}, submission_time=submission_time)
+    scan = (embargo_scan_or_refuse(d, gen, embargo_scan, train_time=train_time)
+            if embargo_scan is not None else ())
     return MktLegRecipe(target=str(target), has_generator=gen,
                         payload=json.dumps(obj, sort_keys=True, separators=(",", ":")),
-                        train_time=float(train_time or 0.0), init_pointer=ip, init_sha256=isha)
+                        train_time=float(train_time or 0.0), init_pointer=ip, init_sha256=isha,
+                        embargo_scan=scan)
 
 
 def base_weights_path(runner) -> Path:  # pragma: no cover — Hub download

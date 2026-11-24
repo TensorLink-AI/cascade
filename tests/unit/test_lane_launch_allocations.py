@@ -136,8 +136,14 @@ def test_c_holder_gets_paid_before_b_and_audit_rejects_a_premature_b_pool(tmp_pa
     r = _runner(cfg, ChampionState(king_hotkey=KING, king_uid=3,
                                    king_since_block=start + 1, king_share_bp=5000))
     r._lane_b_block = r._lane_c_block = boundary
+    # DEC-CA-0073: the win records the gain-scaled full-pay duration
+    from cascade.shared.era import era_length_blocks
+    from cascade.shared.lane_c import target_full_pay_record
+
+    fp = target_full_pay_record("mkt:market", .05, cfg.lane_c, cfg.marketcast,
+                                era_blocks=era_length_blocks(cfg.round, boundary))
     r._lane_c().record(TargetWin("mkt:market", "specialist", 5, "confirmed", boundary,
-                                 gain_lcb=.05, tier=.05, full_eras=10))
+                                 gain_lcb=.05, tier=fp["tier"], full_eras=fp["full_eras"]))
     m = _manifest(boundary)
     r._v2_settlement_economics(m, [], 1, None, KING)
     vector = r._apply_weights(_Client(boundary, {KING: 3, "specialist": 5}),

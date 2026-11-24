@@ -192,3 +192,7 @@ There is no `confirm` stage, no `confirm_pending` status or reason and no
 crowning chains move to that rule with nothing weakened. The Flow lists X from boundary 2, where its first clear is gated with `mode2`. A held clear is `hold` / `bench_hold` (the only held status). A re-queued entry's fresh first verdict is decided at once (crowned on a passing gate, else held with a new count). The `confirm_pending` and `lost_confirmation` cases are gone with their reasons, and `test_no_confirm_stage_reason_or_status_exists` pins that. On main the
 old code still runs the confirmation stage, so the changed tests fail on an
 assertion until the W5e implementation lands.
+
+## rev6.14 (a): judging start vs eligibility boundary (owner 2026-11-23)
+
+Two typed skip reasons get cases: `before_eval_delay` (the boundary's on-chain timestamp is before max(T_E, T_K) + `eval_delay_hours`: nothing drawn, frozen or judged, `pending`) and `boundary_ts_missing` (a settlement without `boundary_ts`, the legacy call: fail closed, `pending`). `helpers.settle` passes the fixture clock (`fixture_boundary_ts`) unless a test overrides it.

@@ -56,3 +56,14 @@ def test_scheduled_runs_are_gated_on_marketcast_being_armed():
 def test_dispatch_defaults_to_the_inert_sentinel_block():
     on = WORKFLOW.get('on', WORKFLOW.get(True))
     assert on['workflow_dispatch']['inputs']['effective_block']['default'] == '999999999999'
+
+
+def test_a_slow_mirror_cannot_cancel_a_completed_publish():
+    # run 45315434742: a 47 min build left the mirror 6 min before a 60 min job cap
+    job_cap = WORKFLOW['jobs']['publish']['timeout-minutes']
+    mirror = _step('Mirror the recording into the pool bucket')
+    assert job_cap >= 150
+    assert 0 < mirror['timeout-minutes'] < job_cap
+    names = [s.get('name', '') for s in STEPS]
+    assert names.index(mirror['name']) > names.index(_step('Build + sign + publish')['name'])
+    assert 'aws s3 sync ./mkt/bars' in mirror['run']    # a delta, so a cut-off mirror resumes

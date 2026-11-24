@@ -311,6 +311,14 @@ def _audit_inputs(f):
                                    if k.startswith("lane_c/")},
               "quantiles": {k: v for k, v in f.store.objs.items() if k.endswith(".npy")},
               "snapshots": {f.s1.digest: f.s1}}
+    from cascade.shared.marketcast_report import load_mkt_report
+
+    from .test_marketcast_validator import _bhash
+
+    # DEC-CA-0074: the chain's hash of every block a signed draw names
+    inputs["block_hashes"] = {e.draw["block"]: _bhash(e.draw["block"])
+                              for t in reps.values() for e in load_mkt_report(t).entries
+                              if e.draw}
     return reps, inputs
 
 

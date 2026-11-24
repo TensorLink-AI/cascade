@@ -69,7 +69,8 @@ SKIP_REASONS = ("pending_floor", "coldkey_cap_settlement", "coldkey_unresolved",
                 "coldkey_changed", "king_unscored", "bench_hold", "deregistered",
                 "ready_expired", "reveal_delay_exceeded", "duplicate_digest",
                 "hotkey_has_open_entry", "context_not_armed", "checkpoint_fault",
-                "mirror_lag_exceeded", "lane_closed", "context_below_armed")
+                "mirror_lag_exceeded", "lane_closed", "context_below_armed",
+                "before_eval_delay", "boundary_ts_missing")
 # `context_below_armed` (plan rev6.15, owner 2026-11-23): with the settlement's
 # armed record, a chosen entry whose declared context is below every armed
 # variant is not judged and stays `pending` (never run above its declaration).
@@ -122,8 +123,9 @@ TOP_LEVEL_REQUIRED = ("schema", "boundary", "signer", "signature", "scoring_meth
 # rev6.6: `armed_contexts` + `armed_evidence`, present together iff the
 # settlement was handed the W5d armed record (README "Armed contexts").
 # rev6.18 B7: `host`, present iff the settlement was handed the eval host's
-# verified record (README "Scoring host").
-TOP_LEVEL_OPTIONAL = ("extensions", "gate", "armed_contexts", "armed_evidence", "draw", "host")
+# verified record (README "Scoring host"). rev6.14 (a): `boundary_ts`.
+TOP_LEVEL_OPTIONAL = ("extensions", "gate", "armed_contexts", "armed_evidence", "draw",
+                      "boundary_ts", "host")
 PARAMS_FIELDS = ("share", "takes_from", "remainder", "horizon", "horizons", "contexts",
                  "forward_margin_hours", "max_mirror_lag_hours", "min_windows", "min_clusters",
                  "d_margin", "alpha", "bootstrap_B", "reward_prior_kings",
@@ -397,7 +399,7 @@ def settle(chain: dict, cfg, state_path: Path, signer, *, boundary: int, snap: i
     `gate_inputs`): `two_settlements` crowns at BOUNDARY_2."""
     from cascade.validator.lane_d import settle_lane_d
 
-    return settle_lane_d(cfg=cfg, boundary=boundary, pool_dir=chain["pools"][snap],
+    return settle_lane_d(**_rev614_ts(settle_lane_d, boundary), cfg=cfg, boundary=boundary, pool_dir=chain["pools"][snap],
                          entries=[dict(e) for e in entries], house=dict(chain["house"]),
                          forecasts=chain["forecasts"][snap], uid_of=dict(uid_of),
                          state_path=state_path, signer=signer,
@@ -658,3 +660,14 @@ def with_embargo_fields(report: dict, *, embargo_windows: int = 0) -> dict:
                              "\n".join(sorted(c["window_ids"])).encode()).hexdigest()}
                         for c in out["cohorts"]]}
     return out
+
+
+def _rev614_ts(settle, boundary) -> dict:
+    """rev6.14 (a): the fixture's on-chain boundary timestamp (far after every
+    fixture T + eval_delay_hours, 12 s per block), passed only where
+    ``settle_lane_d`` takes it."""
+    import inspect
+
+    if "boundary_ts" not in inspect.signature(settle).parameters:
+        return {}
+    return {"boundary_ts": 2_000_000_000 + 12 * int(boundary)}

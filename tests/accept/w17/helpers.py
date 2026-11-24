@@ -254,7 +254,7 @@ class Fixture:
         kw = {}
         if snapshot > 1:
             kw["prior_pool_dirs"] = list(self.pools[:snapshot - 1])
-        return settle_lane_d(cfg=cfg.lane_d, boundary=boundary, pool_dir=self.pools[snapshot - 1],
+        return settle_lane_d(**_rev614_ts(settle_lane_d, boundary), cfg=cfg.lane_d, boundary=boundary, pool_dir=self.pools[snapshot - 1],
                              entries=[dict(e) for e in entries], house=dict(self.house),
                              forecasts=self.forecasts, uid_of=dict(self.uid_of),
                              state_path=state_path, signer=self.signer,
@@ -372,3 +372,14 @@ def all_keys(obj) -> set[str]:
         for v in obj:
             out |= all_keys(v)
     return out
+
+
+def _rev614_ts(settle, boundary) -> dict:
+    """rev6.14 (a): the fixture's on-chain boundary timestamp (far after every
+    fixture T + eval_delay_hours, 12 s per block), passed only where
+    ``settle_lane_d`` takes it."""
+    import inspect
+
+    if "boundary_ts" not in inspect.signature(settle).parameters:
+        return {}
+    return {"boundary_ts": 2_000_000_000 + 12 * int(boundary)}

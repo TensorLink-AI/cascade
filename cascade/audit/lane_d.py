@@ -149,7 +149,9 @@ def _expected_params(cfg) -> dict:
             # settlement budget and the minimum fresh share.
             "embargo_hours": float(cfg.embargo_hours),
             "max_windows_per_settlement": int(cfg.max_windows_per_settlement),
-            "min_fresh_window_share": float(cfg.min_fresh_window_share)}
+            "min_fresh_window_share": float(cfg.min_fresh_window_share),
+            # rev6.14 (a): the judging start j = T + eval_delay_hours.
+            "eval_delay_hours": float(cfg.eval_delay_hours)}
 
 
 def _body_digest(report: dict) -> str:
@@ -1045,6 +1047,36 @@ def _draw_problems(report: dict, cfg, windows: dict) -> list[str]:
     return out
 
 
+def _judging_start_problems(report: dict, cfg) -> list[str]:
+    """rev6.14 (a), re-derived: every cohort was frozen at a boundary stamped
+    at or after its judging start t_max + 3600 * eval_delay_hours (the signed
+    ``boundary_ts``); a ``before_eval_delay`` skip names an entry whose
+    start max(T_E, T_K) + delay is after it; ``boundary_ts_missing`` only
+    without it."""
+    out = []
+    delay = 3600.0 * float(cfg.eval_delay_hours)
+    bts = report.get("boundary_ts")
+    if "boundary_ts" in report and (isinstance(bts, bool) or not isinstance(bts, int)):
+        return [f"boundary_ts {bts!r} is not a timestamp"]
+    for c in report.get("cohorts") or []:
+        if bts is None:
+            out.append(f"cohort {c['index']}: frozen without the boundary timestamp")
+        elif bts < int(c["t_max"]) + delay:
+            out.append(f"cohort {c['index']}: frozen_before_eval_delay: boundary_ts {bts} < "
+                       f"t_max {c['t_max']} + {cfg.eval_delay_hours} h")
+    reveal = {e["digest"]: int(e["reveal_ts"]) for e in report.get("entries") or []}
+    kt = int(report["king_before"]["reveal_ts"])
+    for sk in report.get("skipped") or []:
+        if sk.get("reason") == "boundary_ts_missing" and bts is not None:
+            out.append(f"{str(sk.get('digest'))[:12]}: boundary_ts_missing with a boundary_ts")
+        elif sk.get("reason") == "before_eval_delay":
+            t = reveal.get(sk.get("digest"))
+            if bts is None or t is None or bts >= max(t, kt) + delay:
+                out.append(f"{str(sk.get('digest'))[:12]}: before_eval_delay after its judging "
+                           f"start")
+    return out
+
+
 def _row_order_problem(report: dict, rows: list) -> str | None:
     """README rule 8: the rows in the canonical order (cohorts by index, each
     cohort's ``window_ids`` in order, per window ``[king, house?, *members]``)."""
@@ -1574,6 +1606,10 @@ def lane_d_findings(report: dict, cfg, *, signer_hotkey: str, prior_reports=None
         for c in cohorts:
             problems += _cohort_problems(report, cfg, c, rows_by, windows, entries, confirms)
         if many("ld_cohort", problems):
+            return f
+        # rev6.14 (a): no cohort frozen before its judging start (signed
+        # boundary_ts), and the two judging-start skips are honest.
+        if many("ld_cohort", _judging_start_problems(report, cfg)):
             return f
         alert("ld_row_order", lambda: _row_order_problem(report, rows))
         alert("ld_clock", lambda: _clock_problems(report, cfg, windows))

@@ -674,3 +674,6 @@ channel pick re-stated from the plan, and `settle_mv` (asserts
   window's `if {required: [n_channels]} then {required: all six}` and the
   cross-field check enforce all-or-none. A univariate window carries none
   of them, so a univariate report is unchanged.
+## rev6.14 (a): judging start vs eligibility boundary (owner 2026-11-23)
+
+The report signs the optional top-level `boundary_ts` (the boundary block's on-chain `Timestamp.Now`; absent, never null, on the legacy call) and echoes `params.eval_delay_hours`; `SKIP_REASONS` gains `before_eval_delay` and `boundary_ts_missing`. `validate_report` refuses a cohort with `boundary_ts < t_max + 3600 * eval_delay_hours` (`bad_value` at `cohorts[i]`), a judged cohort without `boundary_ts` (`missing_field`), a `boundary_ts_missing` skip on a stamped settlement, a `before_eval_delay` skip whose start has passed, and `forward_margin_hours > eval_delay_hours`. `test_w7a_rev614.py`.
