@@ -51,7 +51,7 @@ def test_repeated_target_matches_targets_list(tmp_path, cli_env, intake, capsys)
 
 @pytest.mark.parametrize("flags", [
     ("--target", "energy", "--target", "web_cloudops", "--target", "sales",
-     "--target", "nature"),                         # 4 > max_domains_per_leg = 3
+     "--target", "nature", "--target", "transport"),  # 5 > max_domains_per_leg = 4
     ("--target", "energy", "--target", "energy"),   # repeated
     ("--target", "energy,web_cloudops"),            # one target per flag
     ("--target", "nope"),                           # not configured

@@ -162,16 +162,21 @@ No `tests/unit` file pins behaviour WB10 changes:
 
 None is listed in `PATHS`.
 
-## rev6.22: indefinite lane B pay (`test_wb10_indefinite_pay.py`)
+## rev6.22: the lane B slot rule (`test_wb10_lane_b_slots.py`)
 
-Owner 2026-11-24: "make the pay indefinite". `[lane_b] indefinite_pay_from_block`
-(integer, default 0 = never) ships at 0 in both files. A typed value must be an
-era boundary at or after `[v2] from_block`, and `acceptance_from_block` must be
-typed at or before it (a newer leg takes a held slot only through merge
-acceptance, judged on top of the base that carries the holder). From the era
-starting at it, `lane_b_payouts` pays every held slot multiplier 1 with no TTL
-and stamps `since_era`; before it the rows are byte-identical to the decay +
-TTL rule. One hotkey may hold several slots; empty slots burn; a qualified but
-not yet accepted newer leg never moves the slot; an older accepted merge never
-displaces a newer holder. PATHS gain `cascade/shared/lane_b.py` and
-`cascade/validator/lane_b.py`.
+Owner 2026-11-24 (final): lane B is not rolled out, so there is no
+activation key. **Pay:** a held slot pays its full share every settlement,
+no decay, no TTL, until a newer merge takes it; empty slots burn. The four
+decay / TTL keys are in `RETIRED_KEYS["lane_b"]`: the shipped files drop
+them, and an older file carrying them loads to the same `LaneBConfig`.
+**Testing** (`judge_expert_slots`): every judged leg is tested on every
+slot; declared targets (`max_domains_per_leg` = 4) form one max-T family at
+`gain_margin`, every other slot a second max-T family at
+`undeclared_gain_margin` (0.02, validated `>= gain_margin`, overlay-settable).
+A slot clears on CRPS or MASE with the other metric non-inferior and every
+guard holding; each cleared slot is claimable, so one miner may hold every
+slot. The declared family's LCBs do not depend on the undeclared slots.
+Payouts, the take-all case, the replacement rule (only a newer accepted
+merge moves a slot) and inconclusive suites are pinned. PATHS gain the judge,
+validator rows, acceptance, the trainer call site, `v2_status.py` and the
+unit tests that pinned the retired rule.

@@ -166,6 +166,6 @@ pass on main.
 
 `lane-b fund --target T` may be repeated (one target per flag, any configured
 target, suites mixed with domains/horizons); it sends the same slot-ordered
-`X-Lane-B-Targets` as `--targets T1,T2`. More than `max_domains_per_leg`, a
-repeat, a comma inside one flag, or an unknown target is refused locally as
+`X-Lane-B-Targets` as `--targets T1,T2`. More than `max_domains_per_leg` (4),
+a repeat, a comma inside one flag, or an unknown target is refused locally as
 `bad_targets` with nothing sent. `--target` and `--targets` stay exclusive.

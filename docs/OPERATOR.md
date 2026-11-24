@@ -146,9 +146,11 @@ edited `chain.toml` before shipping it.
    - `[v2] ladder_start_tiers`: seed replicas on the private pool (the 0.50
      tier must be rare under noise); keep the lowest threshold at `[v2]
      win_margin_end`.
-   - `[lane_b]` / `[lane_c] full_pay_tiers` and `[marketcast]
-     full_pay_tiers` (overlay-settable): from real win LCBs (testnet receipts'
-     `target_lcb` / `gain_lcb`); lowest threshold at `gain_margin`.
+   - `[lane_c] full_pay_tiers` and `[marketcast] full_pay_tiers`
+     (overlay-settable): from real win LCBs (testnet receipts' `gain_lcb`);
+     lowest threshold at `gain_margin`. `[lane_b]` has no tiers (rev6.22);
+     calibrate `[lane_b] undeclared_gain_margin` (0.02) from testnet slot
+     rows instead.
    - `[marketcast] near_dup_tol` (0.02, overlay-settable) and the liquidity
      floor `min_dollar_volume_24h` (release-only): once the recorder shows
      real volumes.

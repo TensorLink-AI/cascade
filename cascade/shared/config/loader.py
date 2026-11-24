@@ -101,6 +101,10 @@ RETIRED_KEYS: dict[str, frozenset[str]] = {
     # Parsed by older releases (hf_cache_seconds was REQUIRED there), read by none.
     "eval": frozenset({"eval_source"}),
     "validator": frozenset({"hf_cache_seconds"}),
+    # LANE_D_PLAN rev6.22 (owner 2026-11-24): lane B slots pay in full until
+    # replaced, so the gain-tiered decay and the payout TTL are gone. Lane C
+    # keeps its own keys of the same names.
+    "lane_b": frozenset({"full_pay_tiers", "half_life_rounds", "floor", "win_ttl_eras"}),
 }
 
 
@@ -374,15 +378,6 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
         if not _v2_from or _ab < _v2_from or _ab % _ab_era:
             raise ValueError("[lane_b] acceptance_from_block must be an era boundary "
                              "at or after [v2] from_block")
-    _ip = int(lane_b.indefinite_pay_from_block)
-    if _ip:
-        # rev6.22 indefinite lane B pay: a typed era boundary at/after v2
-        _ip_grid = _ebp if (_eab and _ebp and 0 < _ip < _eab) else _eb
-        _ip_era = max(1, _ip_grid) * max(1, _era_settlements)
-        if not _v2_from or _ip < _v2_from or _ip % _ip_era:
-            raise ValueError(f"[lane_b] indefinite_pay_from_block={_ip} must be an era "
-                             f"boundary (a multiple of {_ip_era}) at or after [v2] "
-                             f"from_block={_v2_from}")
     # DEC-CA-0056: lane C's typed block must be an era boundary on the grid
     # in force at it, at or after the v2 go-live (checked inside parse_lane_c).
     # DEC-CA-0064: [marketcast] suites admit the mkt:<suite> lane-C targets

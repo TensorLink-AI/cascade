@@ -412,6 +412,7 @@ def test_retired_keys_load_and_are_ignored(tmp_path):
         DEFAULT_CHAIN_TOML,
         RETIRED_KEYS,
         EvalConfig,
+        LaneBConfig,
         RoundConfig,
         TelemetryConfig,
         ValidatorConfig,
@@ -421,7 +422,8 @@ def test_retired_keys_load_and_are_ignored(tmp_path):
     live = {"round": {f.name for f in dataclasses.fields(RoundConfig)},
             "telemetry": {f.name for f in dataclasses.fields(TelemetryConfig)},
             "eval": {f.name for f in dataclasses.fields(EvalConfig)},
-            "validator": {f.name for f in dataclasses.fields(ValidatorConfig)}}
+            "validator": {f.name for f in dataclasses.fields(ValidatorConfig)},
+            "lane_b": {f.name for f in dataclasses.fields(LaneBConfig)}}
     for section, keys in RETIRED_KEYS.items():
         assert not keys & live[section], f"[{section}] retired key is a live field"
 
@@ -432,7 +434,10 @@ def test_retired_keys_load_and_are_ignored(tmp_path):
     extra = {"round": "\n".join(f"{k} = 1" for k in sorted(RETIRED_KEYS["round"])
                                 if f"\n{k} " not in text and f"\n{k}=" not in text),
              "telemetry": "\n".join(f"{k} = 1" for k in sorted(RETIRED_KEYS["telemetry"])
-                                    if f"\n{k} " not in text)}
+                                    if f"\n{k} " not in text),
+             # rev6.22: an older file's lane B decay / TTL keys load, ignored
+             "lane_b": "full_pay_tiers = [[0.05, 10], [0.02, 5], [0.01, 2]]\n"
+                       "half_life_rounds = 1.0\nfloor = 0.1\nwin_ttl_eras = 28"}
     for section, lines in extra.items():
         if lines:
             text = text.replace(f"\n[{section}]\n", f"\n[{section}]\n{lines}\n", 1)
@@ -440,3 +445,4 @@ def test_retired_keys_load_and_are_ignored(tmp_path):
     p.write_text(text)
     assert load_chain_config(p).round.epoch_blocks == load_chain_config(
         DEFAULT_CHAIN_TOML).round.epoch_blocks
+    assert load_chain_config(p).lane_b == load_chain_config(DEFAULT_CHAIN_TOML).lane_b

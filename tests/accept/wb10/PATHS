@@ -13,3 +13,21 @@ cascade/validator/lane_b.py
 # [lane_b] defaults only; nothing armed (from_block and share unchanged).
 chain.toml
 chain.testnet.toml
+# rev6.22 lane B slot rule: every-slot judging in two max-T families
+# (judge_expert_slots), its verdict rows, merge acceptance on the same rule,
+# the trainer self-judge call, the status payout terms and the unit tests
+# that pinned the retired decay / TTL rule.
+cascade/eval/expert_lane.py
+cascade/validator/expert_lane.py
+cascade/validator/merge_acceptance.py
+cascade/trainer/lane_b_driver.py
+cascade/shared/v2_status.py
+tests/unit/test_lane_b_state.py
+tests/unit/test_validator_lane_b_weights.py
+tests/unit/test_validator_lane_b_convergence.py
+tests/unit/test_full_pay_tiers.py
+tests/unit/test_audit_lane_b_config.py
+tests/unit/test_v2_status.py
+tests/unit/test_config.py
+tests/unit/test_lane_b_multi_target.py
+tests/unit/test_v2_golive.py
