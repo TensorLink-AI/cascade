@@ -1386,6 +1386,22 @@ class _FundedPodMixin:
             raise _FundedLegSkip(gen.hotkey)
         api_key = vault.get(gen.hotkey)
         local = self.__dict__.get('_leg_local_obj')
+        if api_key and getattr(local, "mkt_rent_skus", None) is not None:
+            # owner 2026-11-24: a MarketCast leg's GPU rents on Lium only —
+            # never Shadeform (or another provider) from a multi-provider bundle
+            from ..funding.mkt_gpus import lium_only_key
+
+            try:
+                lium_key = lium_only_key(api_key)
+            except ValueError:
+                lium_key = ""
+            if not lium_key:
+                self._record_funded_failure(
+                    gen.hotkey, "a MarketCast leg rents its GPU on Lium only and the vaulted "
+                    "payer credentials carry no Lium key — re-fund with your Lium key",
+                    miner_fault=True, error_class="auth", burn=False)
+                raise _FundedLegSkip(gen.hotkey)
+            api_key = lium_key
         if local is not None and getattr(local, 'funded_is_king', False):
             import hashlib
             local.funded_key_digest = hashlib.sha256(api_key.encode()).hexdigest() if api_key else ''

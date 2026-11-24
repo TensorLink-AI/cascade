@@ -836,6 +836,11 @@ export HIPPIUS_S3_ACCESS_KEY=...       # READ access on the manifest bucket
 export HIPPIUS_S3_SECRET_KEY=...       # (manifests/, receipts/, benchmarks/, bench_v/, marketcast/, config/network/)
 ```
 
+**Upgrade:** `git pull`, then `pip install -e '.[satellite]'` again (or
+`uv sync --frozen --extra hippius --extra chain`, with the extras: a bare
+`uv sync --frozen` uninstalls bittensor). Then restart `cascade-satellite`.
+Keep the state dir.
+
 **Run:**
 
 ```bash

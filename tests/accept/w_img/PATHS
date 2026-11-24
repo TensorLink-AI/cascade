@@ -18,6 +18,7 @@ cascade/validator/era_gate.py
 # and the mainnet receipt replay.
 cascade/audit/checks.py
 scripts/replay_mainnet_receipts.py
+tests/unit/test_replay_known_unstamped.py
 # Trainer: the per-seed-epoch binding (tick, persistence) and the pins that
 # follow it.
 cascade/trainer/image_epoch.py

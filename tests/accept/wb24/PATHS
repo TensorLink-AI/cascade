@@ -11,3 +11,7 @@ cascade/miner/submission_status.py
 # The shared signing and pre-send checks (build_intake_headers,
 # prepare_funding_request), if the rows header or the key redaction lands there.
 cascade/miner/funding.py
+# `cascade lane-b test` (owner 2026-11-24 miner CLI refresh): the local preview
+# calls the validators' judge_expert_slots (+ WB26 anchor guard via --anchor)
+# and prints every slot in plain English (judge_slots_preview / describe_slots).
+cascade/miner/lane_tests.py
