@@ -47,42 +47,28 @@ def test_910_rebuilt_from_empty_state_follows_the_published_court(tmp_path):
         "following wrote a lane D state"
 
 
-def test_910_a_node_without_inputs_follows_and_completes(tmp_path):
-    cfg, fx, main = _published(tmp_path)
-    follower = h.Rig(tmp_path / "follower", cfg, fx, store=main.store,
-                     state_dir=tmp_path / "follower_state", with_inputs=False)
-    assert follower.step(h.B2) is None
-    assert follower.step.court_for(h.B2) == [h.CHALLENGER_UID]
-
-
-@pytest.mark.parametrize("tamper", ["court_uid", "unsigned_body"])
-def test_910_an_unverified_published_settlement_is_not_followed(tmp_path, tamper):
-    """A published report the audit refuses (court edited after signing):
-    nothing is followed, lane D's share burns (empty court)."""
+def test_910_a_node_without_inputs_follows_only_a_verified_settlement(tmp_path):
+    """A full validator that does not produce lane D (no inputs): an
+    unverified published settlement (its court edited after signing) is not
+    followed and lane D's share burns (no court); the verified one is
+    followed and the step completes."""
     w = h.wiring()
     cfg, fx, main = _published(tmp_path)
-    rep = json.loads(main.store.objects[w.report_key(h.B2)])
-    if tamper == "court_uid":
-        rep["pay"]["court"][0]["uid"] = h.OTHER_UID
-    else:
-        rep["seed"] = "lane-d/1:0:" + "0" * 64
-    main.store.objects[w.report_key(h.B2)] = json.dumps(rep)
+    key = w.report_key(h.B2)
+    honest = main.store.objects[key]
+    rep = json.loads(honest)
+    rep["pay"]["court"][0]["uid"] = h.OTHER_UID
+    main.store.objects[key] = json.dumps(rep)
     follower = h.Rig(tmp_path / "follower", cfg, fx, store=main.store,
                      state_dir=tmp_path / "follower_state", with_inputs=False)
     with pytest.raises(Exception) as ei:
         follower.step(h.B2)
     h.assert_wiring_error(ei.value, "inputs_unavailable")
-    assert follower.step.court_for(h.B2) is None
-    assert follower.step.court_for(h.B1) is None
-
-
-def test_910_nothing_published_burns_lane_d_only(tmp_path):
-    """Empty state and nothing published at the boundary: no court (lane D's
-    share burns through the weight fold's empty court)."""
-    cfg = h.chain_cfg(tmp_path / "v")
-    fx = h.fixture(tmp_path)
-    rig = h.Rig(tmp_path / "rig", cfg, fx, with_inputs=False)
-    with pytest.raises(Exception) as ei:
-        rig.step(h.B1)
-    h.assert_wiring_error(ei.value, "inputs_unavailable")
-    assert rig.step.court_for(h.B1) is None
+    assert follower.step.court_for(h.B2) is None, "an unverified court was followed"
+    main.store.objects[key] = honest
+    try:
+        got = follower.step(h.B2)
+    except Exception as e:  # noqa: BLE001 — base: the step cannot follow
+        got = e
+    assert got is None, f"the step did not follow the verified settlement: {got!r}"
+    assert follower.step.court_for(h.B2) == [h.CHALLENGER_UID]

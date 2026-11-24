@@ -294,6 +294,16 @@ def test_913_a_lane_d_court_paying_king_d_and_a_prior_king_is_followed(tmp_path,
     client2 = FakeClient(BOUNDARIES[0] + 400)
     again.push(client2, now_block=client2.block)
     assert client2.pushed[-1] == recorded
+    # scoping covers lane D's payees only: a lane A payee registered
+    # elsewhere still burns the whole vector (unchanged)
+    burn = int(cfg.scoring.burn_uid)
+    lane_a = [u for u in receipt.reward_uids if u != burn]
+    assert lane_a, "fixture: lane A pays a uid other than burn_uid"
+    hotkeys = list(client.hotkeys)
+    hotkeys[lane_a[0]] = "mallory_hk"
+    vec, mode, why = again.desired(now_block=client2.block, hotkeys=hotkeys)
+    assert mode == "burning" and why.startswith("reward-uid"), why
+    assert vec[burn] == pytest.approx(1.0)
 
 
 @pytest.mark.parametrize("bad_uid", [LANE_D_UID, PRIOR_UID])
@@ -332,30 +342,3 @@ def test_913_a_lane_d_payee_registered_elsewhere_burns_only_lane_d_share(tmp_pat
             assert pushed[u] == recorded[u], f"uid {u}: lane A/B/C moved"
     assert sum(pushed) == pytest.approx(1.0)
     assert "lane_d_check_burn" in caplog.text and "reward-uid" in caplog.text
-
-
-def test_913_a_lane_a_payee_registered_elsewhere_still_burns_the_whole_vector(tmp_path,
-                                                                              offline):
-    """Scoping covers lane D's payees only: a lane A payee mismatch at the
-    same settlement still burns the whole vector (unchanged)."""
-    from tests.unit.test_satellite_replay import (
-        BOUNDARIES,
-        HOTKEYS,
-        DictStore,
-        FakeClient,
-        _runner,
-    )
-
-    store = DictStore()
-    cfg, receipt = _court_settlement(tmp_path, store)
-    burn = int(cfg.scoring.burn_uid)
-    lane_a = [u for u in receipt.reward_uids if u != burn]
-    assert lane_a, "fixture: lane A pays a uid other than burn_uid"
-    hotkeys = list(HOTKEYS)
-    hotkeys[lane_a[0]] = "mallory_hk"
-    runner = _runner(cfg, store, tmp_path / "sat")
-    client = FakeClient(BOUNDARIES[0] + 300, hotkeys=hotkeys)
-    doc = runner.poll(client)
-    assert doc["last_failing_check"] == "reward-uid", doc
-    pushed = client.pushed[-1]
-    assert pushed[burn] == pytest.approx(1.0)
