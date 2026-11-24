@@ -210,6 +210,28 @@ in `--expect-fail`:
 Then the full Accept must pass on HEAD. It prints `TESTS-TREE <sha>`,
 `LEDGER-MODE combined` and `PASS <WP> combined`.
 
+### `accept --freshness --base REF --head REF --main REF [--warn-only] [--root R]`
+
+The stale-base check (FRESHNESS rule in `accept --help`). Without
+`--warn-only` a stale base prints `STALE BASE: update-branch and re-run` and
+exits non-zero. With `--warn-only` (the `pull_request` job since the merge
+queue, owner 2026-11-24) the same analysis prints `WARNING STALE BASE ...`
+and exits 0; a fresh base prints `FRESH ...` either way.
+
+### `accept --merge-group --base REF --head REF --group-labels FILE [--root R]`
+
+The merge queue's gate (MERGE-GROUP rule in `accept --help`). `--root` is the
+combined ref checked out; `--base` is `merge_group.base_sha`; `FILE` is JSON
+`{"<PR>": ["laned:W3", ...]}`. Each first-parent commit of BASE..HEAD must
+name its PR (`... (#N)` or `Merge pull request #N ...`) and appear in the
+file. For each `laned:<WP>` of that PR, check-pr on the commit (`C^1...C`)
+names the mode, and the WP's own run follows on the combined tree:
+implementation / combined → full Accept, tests-only → `--verification`,
+tests-correction → `--tests-correction`, evidence → full Accept with each
+evidence file, review → nothing. It prints `GROUP-OWN <WPs|none>`, `GROUP
+<WP> <mode> PASS|FAIL (#N)` per run and `GROUP PASS` / `GROUP FAIL`, exiting
+non-zero on any FAIL, a commit naming no PR, or a PR missing from the file.
+
 ### `accept --gate <STAGE> [--root R]` (§17.2)
 
 It verifies `evidence/gates/<stage lowercased>.json` in the working tree. The
@@ -352,6 +374,15 @@ carries `--pr`; both jobs write the merged PRs' labels to
 `$LANED_PR_LABELS` (`gh pr list`, fails closed). The tooling still comes
 from the base branch, so a PR that changes the rules runs under the old ones.
 
+Merge queue (owner 2026-11-24): the `pull_request` freshness step runs
+`--freshness --warn-only`, reports a stale base as a `::warning::` plus a
+job-summary section and always exits 0. On `merge_group` the merge-group
+step writes the queued PRs' labels to a file, runs `accept --merge-group`
+(each queued PR's own WPs on the combined ref) and then `accept <GROUP-OWN
+WPs> --cross` over the group; it fails when either fails. Trade-off: PR CI no
+longer chases main, merge-group CI gets longer (own Accepts + CROSS; the
+`pr` job's timeout is 120 min on `merge_group`).
+
 ## Loop brief (orchestrator-facing, rev6.17)
 
 - One PR per feature: put every WP the feature touches on one PR, one
@@ -366,5 +397,15 @@ from the base branch, so a PR that changes the rules runs under the old ones.
 - Every WP whose code a PR changes must carry its label: an unlabelled WP
   gets no L2 from the merge, however broad its `PATHS`.
 - Tests-only and tests-correction PRs still work; they are optional.
+- A stale base is a warning on the PR, not a reason to update-branch and
+  re-run: enqueue green PRs; the merge queue re-accepts them on latest main.
 - Plan text changes: one plan PR per batch of decisions (no `laned:` label;
   `docs/plans/` is PROTECTED from every WP PR).
+- Retired WPs (owner decision D24, plan rev6.18; `test_w0c_retired.py`):
+  `scripts/laned/retired_wps` lists `<WP> <owner decision reference>` (W5i).
+  Read at the base, never from the PR. A retired WP's PATHS never count for
+  scope, so a PR touching e.g. `cascade/validator/lane_d.py` needs no
+  `laned:W5i`; a leftover label of it is inert (`MODE retired`, nothing
+  runs, no ledger row). Its tests dir may only be deleted, under its label
+  plus `laned:tests-correction`. Never a CROSS or merge-group run; the board
+  keeps it at L0, side state `retired`, Level RETIRED.

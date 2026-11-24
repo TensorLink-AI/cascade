@@ -1,0 +1,41 @@
+# Wed 2026-11-25 launch, STEP 1 of 2 (seq N): every NON-lane-D change of the
+# launch, effective at the launch era start 9586800 (= 2663 x 3600, the first
+# mainnet era boundary after Wed 18:00 UTC; ~22:28 UTC at 12 s/block).
+# MAINNET (netuid 91). Owner decision 2026-11-24: lane B expert legs, lane C
+# MarketCast and lane D all start together at 9586800 ([lane_c] /
+# [marketcast] from_block are typed in chain.toml by the release; lane B and
+# lane D arm here, by signed overlay).
+#
+# Why two steps: the R3 overlay lint (cascade/laned/overlay_lint.py, rule
+# `non-lane-d`) refuses a [lane_d] overlay whose non-lane_d keys are not a
+# byte-identical restatement of seq N-1 — a node whose release lacks lane D
+# refuses such an overlay WHOLE and would split the fleet on the lane B / C
+# keys. So this body (no [lane_d] table) goes first; step 2
+# (launch-20261125.mainnet.toml) restates it byte-identically and adds
+# [lane_d].
+#
+# Dry run against the DEPLOYED chain.toml (after the launch release is on it),
+# then the owner signs (Approve-tier; six external validators adopt it by the
+# 51 % cfg- tally — publish >= 1 era (3600 blocks, 12 h) before 9586800):
+#
+#   cascade-validator --chain-toml chain.toml \
+#     --netconfig-overlay deploy/overlays/launch-20261125.pre.mainnet.toml \
+#     --netconfig-effective-block 9586800
+#
+# Folds in #859's split-a0-b35-c15-d50.mainnet.toml (owner 2026-11-24:
+# A 0 / B 35 / C 15 / D 50). Lane D's 50 % stays with lane A until step 2
+# arms [lane_d] from_block, so between the two steps the split is
+# A 50 / B 35 / C 15. Overlays are SNAPSHOTS: every later overlay must
+# restate these keys or they fall back to chain.toml.
+#
+# Lane B suite targets ([lane_b] suite_targets) are NOT armed here: the loader
+# refuses suite_targets = true without [lane_b] contamination_hashset pinned,
+# and that pin is release-only (an overlay cannot set it).
+
+[lane_b]
+from_block = 9586800
+share      = 0.35
+
+[lane_c]
+share      = 0.15
+takes_from = "lane_a"

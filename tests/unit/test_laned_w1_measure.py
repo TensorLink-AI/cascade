@@ -338,6 +338,47 @@ def test_forge_cli_report(tmp_path):
     assert json.loads(out2.read_text())["forge_mirror"] == fm
 
 
+def test_window_counts_keep_each_feeds_own_bucket(tmp_path):
+    """Regression (run 45296831349): every window landed in ONE bucket, the
+    last catalog feed's in sort order, because the sweep took the bucket from
+    a variable left over from the inventory loop. Here a 5-min feed ``z5``
+    sorts last; the 1-min feed's windows must stay under "1min"."""
+    import os
+
+    import pandas as pd
+
+    forge = _mirror(tmp_path / "f")
+    with open(forge / "sources.yaml", "a", encoding="utf-8") as fh:
+        fh.write("- {id: z5, frequency: PT5M, domain: energy}\n")
+    rng = np.random.default_rng(1)
+    for k in range(4):
+        t = DAY0 + k * 86400 + 300 * np.arange(288)
+        d = forge / "data" / "z5"
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / f"{w1.iso(DAY0 + k * 86400)[:10]}.parquet"
+        pd.DataFrame({"timestamp": pd.to_datetime(t, unit="s", utc=True),
+                      "value": rng.normal(size=t.size)}).to_parquet(p, index=False)
+        os.utime(p, (DAY0 + k * 86400 + 23.5 * 3600,) * 2)
+    out = tmp_path / "w1.json"
+    assert w1.main(["--forge-dir", str(forge), "--out", str(out)]) == 0
+    fm = json.loads(out.read_text())["forge_mirror"]
+    inv = fm["per_freq"]
+    seen = set()
+    for row in fm["windows"]["sweep"]:
+        for c in row["clocks"].values():
+            if isinstance(c, str):
+                continue
+            for name, cell in c["per_freq"].items():
+                seen.add(name)
+                assert cell["sources"] <= inv[name]["sources"], (name, cell)
+                assert inv[name]["reader_emits"] is True
+            for k in ("fresh", "embargo"):
+                assert sum(x[k] for x in c["per_freq"].values()) == c["total"][k]
+    assert {"1min", "5min"} <= seen and "slower" not in seen
+    summ = fm["windows"]["summary"]["T+24h"]["per_freq"]
+    assert summ["1min"]["fresh"]["median"] > 0 and summ["5min"]["embargo"]["median"] > 0
+
+
 def test_forward_margin_and_eval_delay(tmp_path):
     """Plan rev6.14: b = T + forward_margin (default 0, fresh counted from T);
     judging starts at T + eval_delay (default 6 h), earlier clocks not run."""
