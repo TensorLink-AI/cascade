@@ -15,7 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from .helpers import REPO, base_cfg, v2_setup
+from .helpers import REPO, base_cfg, require_w_img, v2_setup
 
 MEASURED = "sha256:" + "5" * 64
 OTHER = "sha256:" + "6" * 64
@@ -29,6 +29,7 @@ def _round(cfg, *, pod_image, cap=18000):
 
 
 def test_measured_image_is_unchanged(tmp_path):
+    require_w_img()
     from cascade.trainer.cost_guards import (
         measured_wall_refusal,
         unmeasured_wall_cap,
@@ -44,6 +45,7 @@ def test_measured_image_is_unchanged(tmp_path):
 
 
 def test_unmeasured_image_rents_under_the_cap_instead_of_refusing(tmp_path):
+    require_w_img()
     from cascade.trainer.cost_guards import (
         measured_wall_refusal,
         unmeasured_wall_cap,
@@ -59,6 +61,7 @@ def test_unmeasured_image_rents_under_the_cap_instead_of_refusing(tmp_path):
 
 
 def test_cap_zero_keeps_the_old_refusal(tmp_path):
+    require_w_img()
     from cascade.trainer.cost_guards import measured_wall_refusal, unmeasured_wall_cap
 
     rnd = _round(base_cfg(tmp_path), pod_image=OTHER, cap=0)
@@ -77,6 +80,7 @@ def _runner(cfg, contract, **loc):
 
 
 def test_leg_wall_is_the_cap_on_an_unmeasured_image_only(tmp_path):
+    require_w_img()
     from cascade.trainer.runner_capacity import _FundedCapacityMixin
 
     cfg = base_cfg(tmp_path)
@@ -91,6 +95,7 @@ def test_leg_wall_is_the_cap_on_an_unmeasured_image_only(tmp_path):
 
 
 def test_watchdog_holds_an_unmeasured_leg_to_the_cap(tmp_path):
+    require_w_img()
     from cascade.trainer.cost_guards import leg_watchdog, note_unmeasured_wall
 
     cfg = base_cfg(tmp_path)
@@ -109,6 +114,7 @@ def test_watchdog_holds_an_unmeasured_leg_to_the_cap(tmp_path):
 
 
 def test_completed_leg_record_carries_walls_measured_false(tmp_path):
+    require_w_img()
     import json
 
     from cascade.trainer.cost_guards import note_unmeasured_wall
@@ -131,6 +137,7 @@ def test_completed_leg_record_carries_walls_measured_false(tmp_path):
 
 
 def test_config_key_defaults_to_five_hours_and_round_trips(tmp_path):
+    require_w_img()
     from cascade.shared.config import load_chain_config
 
     cfg = load_chain_config(REPO / "chain.toml")

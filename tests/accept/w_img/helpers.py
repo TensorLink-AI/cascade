@@ -29,6 +29,13 @@ IMG_Y = "sha256:" + "b" * 64
 FP_Y = "c" * 64
 
 
+def require_w_img():
+    """Fail first (on a build without W-IMG) on the missing W-IMG names
+    themselves, never on a later stand-in mismatch."""
+    from cascade.shared.era import image_epoch_from, image_record_at  # noqa: F401
+    from cascade.trainer.cost_guards import unmeasured_wall_cap  # noqa: F401
+
+
 def base_cfg(tmp_path):
     """The mainnet template with its enforcing pins neutralised — the same
     neutralisation as ``tests/conftest.py``'s ``cfg`` fixture (repeated here
@@ -36,6 +43,7 @@ def base_cfg(tmp_path):
     from cascade.shared.config import load_chain_config
     from tests.unit.predecision_main import predecision_path
 
+    require_w_img()
     Path(tmp_path).mkdir(parents=True, exist_ok=True)
     c = load_chain_config(predecision_path(tmp_path))
     return replace(
@@ -114,6 +122,7 @@ def receipt(m, block):
 
 def with_keys(tmp_path, **kv):
     """The shipped chain.toml with ``[v2]`` keys set (or appended)."""
+    require_w_img()
     text = (REPO / "chain.toml").read_text()
     extra = []
     for k, v in kv.items():

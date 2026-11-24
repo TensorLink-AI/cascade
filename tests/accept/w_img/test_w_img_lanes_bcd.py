@@ -8,13 +8,14 @@ import json
 from dataclasses import replace
 from types import SimpleNamespace
 
-from .helpers import IMG_Y, base_cfg
+from .helpers import IMG_Y, base_cfg, require_w_img
 
 PTR = "metro-v1:trained:hippius:cascade/ckpt@sha256:" + "c" * 64
 REF = "alice/recipe@sha256:" + "a" * 64
 
 
 def test_image_records_start_at_the_activation_block(tmp_path):
+    require_w_img()
     from cascade.shared.era import image_record_at
 
     cfg = base_cfg(tmp_path)
@@ -34,6 +35,7 @@ def _expert(**kw):
 
 
 def test_lane_b_expert_entry_records_its_image_drop_when_default():
+    require_w_img()
     from cascade.shared.expert_manifest import ExpertManifest, load_expert_manifest
 
     plain = _expert()
@@ -48,6 +50,7 @@ def test_lane_b_expert_entry_records_its_image_drop_when_default():
 
 
 def test_lane_c_entry_records_its_image_drop_when_default():
+    require_w_img()
     from cascade.shared.lane_c_manifest import LaneCEntry, LaneCManifest, load_lane_c_manifest
 
     ptr = PTR
@@ -65,6 +68,7 @@ def test_lane_c_entry_records_its_image_drop_when_default():
 
 
 def test_lane_d_report_records_the_eval_image_only_from_activation(tmp_path):
+    require_w_img()
     from cascade.validator.lane_d import EVAL_IMAGE_EXTENSION
     from cascade.validator.lane_d_wiring import LaneDInputs, _eval_identity_of
 
@@ -82,6 +86,7 @@ def test_lane_d_report_records_the_eval_image_only_from_activation(tmp_path):
 def test_lane_d_settlement_threads_the_identity_into_extensions():
     """The report writer puts the identity under ``extensions`` (open, never
     consensus) and only when given one."""
+    require_w_img()
     import inspect
 
     from cascade.validator import lane_d
