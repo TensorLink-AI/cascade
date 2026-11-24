@@ -63,6 +63,10 @@ fine-tuned models with a decision-based measure, not only CRPS.
    forecast API is open-ended, and each scenario has a second, *novel-use*
    slot for a qualifier that wins in a different way from the main holder.
    See **Rewarding creative use of forecasts**.
+9. **One primitive set for every vertical (owner, 2026-11-24).** Harnesses
+   and scenarios are built from a shared, versioned kit (`cascade.harness`).
+   A vertical we fine-tune for gets an app by writing a data adapter and a
+   scenario spec, not a new competition. See **Primitive set**.
 
 ## Vertical pairing
 
@@ -222,6 +226,138 @@ It is a risk-management score, not a profit claim, and the docs must say so.
 
 Later candidates: `app:hedge` (fuel / power hedging ratio), `app:capacity`
 (cloud autoscaling on `domain:web_cloudops` series), `app:staffing`.
+
+## Primitive set: one kit for every vertical
+
+We fine-tune a model per vertical, and every fine-tune should get an app
+without new competition code. Under the surface, the three scenarios above
+are the same few problems:
+
+- the battery is a **store** (level, charge and discharge, capacity, losses);
+- inventory is a **store** whose outflow is the forecast series (demand);
+- the trading mandate is a **position** held against a risk budget.
+
+So the kit is split by layer. Each layer is pure numpy / scipy,
+deterministic and versioned (`api = 1`, additive-only; a breaking change
+bumps `api`, and older harnesses keep running on a shim, like
+`[generator] interface_version`). It ships as one package used by three
+groups: miners write harnesses on it, the owner writes scenarios on it, and
+the validator and auditor run both on it.
+
+### Layer 1 — data (`cascade.harness.data`)
+
+| primitive | what |
+|---|---|
+| `Series` | values, timestamps, frequency, mask, channels, metadata (`vertical`, `unit`, `source`) — the existing carrier fields |
+| `Observation` | a past-only view of every series in the episode, plus state; cannot be indexed past "now" |
+| `Spec` | the episode's constants and variant draws, delivered at `reset` |
+| transforms | `returns`, `log`, `resample`, `deseasonalise`, `basket(weights)`, `spread(a, b)`, `aggregate(window)`, `align` |
+
+### Layer 2 — forecasts (`cascade.harness.forecast`)
+
+| primitive | what |
+|---|---|
+| `Forecaster` | the handle: `forecast(contexts, horizon, levels, covariates, model)`, `models`, `levels`, `max_horizon`, `budget_left()` |
+| `QuantileForecast` | the reply: `quantile(p)`, `interval(a)`, `cdf(x)` / `ppf(p)` interpolated, `median`, `spread`, `pit(y)` for checking past forecasts |
+| `Scenarios` | the harness builds sample paths from marginals with a copula it chooses (`independent`, `comonotone`, `gaussian(rho)`), labelled as its own construction, never as model paths |
+| `RiskFromQuantiles` | VaR / ES, upside / downside, and probabilities of crossing a threshold, all read off the marginals for one horizon step |
+| `Calibrator` | online recalibration of the model's quantiles from the harness's own past PIT values: a sanctioned, deterministic place for "the model is a bit wide here" |
+
+### Layer 3 — decisions (`cascade.harness.decide`)
+
+Vertical-agnostic decision kernels that miners compose, replace or beat:
+
+| primitive | what |
+|---|---|
+| `newsvendor(q, under, over)` | the critical-fractile quantity |
+| `base_stock` / `s_S` | inventory-style replenishment policies on lead-time demand |
+| `store_dispatch(scenarios, store, prices)` | a stochastic or rolling LP for any store (battery, warehouse, reservoir, capacity pool, cash) |
+| `size_to_risk(target, risk)` | scale a position to a vol, VaR or ES target |
+| `hedge(book, instruments, risk)` | the minimum-variance or tail hedge ratio |
+| `band(target, current, cost)` | a no-trade or no-order band, to limit churn |
+| `mpc(model, horizon, solver)` | receding-horizon control around any of the above |
+| `commit_then_adjust` | a two-stage decision (day-ahead commitment plus real-time adjustment) |
+
+The reference harness for every scenario is just a composition of these
+kernels. Miners see exactly what they have to beat.
+
+### Layer 4 — environments (`cascade.harness.env`, owner-side)
+
+| primitive | what |
+|---|---|
+| templates | `Store` (level, in / out controls, capacity, efficiency, leakage), `Position` (exposure, hedges, mandate), `Commit` (a two-stage commitment with imbalance settlement). A scenario is one template or a few composed |
+| `ActionSpace` | box, integer, simplex; the simulator clips and logs every action |
+| `CostModel` | linear, fixed, slippage from spread / volume, holding, shortage, degradation, imbalance |
+| `Constraint` | limits, ramp rates, capacity shared across items, utilisation floors |
+| `Oracle` | perfect-foresight LP / MIP for any `Store` or `Commit` scenario; none for `Position` |
+| `ScoreTerm` | a loss, how it aggregates (sum ratio against the reference), its weight and its `tau` guard; the library has tracking, tail, FZ0, cost, regret ratio and capture ratio |
+| `VariantSampler` | seeded ranges for every spec constant (the creativity variants) |
+| `Tier` | an episode selector (events, stress, spikes, cold start) with a share |
+
+### A new vertical = a data adapter + a scenario spec
+
+```toml
+# cascade/harness/scenarios/hydro.toml   (example: a hydro reservoir)
+scenario  = "hydro"
+model     = "dmd:inflow"            # the paired fine-tune target
+template  = "Store"
+data      = "adapters.river_flow"   # forward recorder + adapter (code, reviewed)
+step      = "1d"
+episode   = "28d"
+
+[store]       # with variant ranges
+capacity   = [500, 2000]
+efficiency = [0.85, 0.95]
+inflow     = "series:inflow"        # the forecast series drives the store
+price      = "series:power_price"
+
+[score]
+terms     = ["capture_ratio", "spill", "cost"]
+reference = "mpc(store_dispatch, horizon=14)"
+
+[[tier]]
+name = "drought"
+share = 0.2
+select = "inflow_pct < 10"
+```
+
+- **What is code.** Each data adapter, plus any genuinely new template, cost
+  or score term. These are reviewed and shipped in a release (consensus).
+- **What is spec.** Everything else. Load-checked: the model target exists,
+  every series is forward-recorded, the terms and reference resolve, and the
+  variant ranges are bounded.
+- **What it unlocks.** The same competition kind (`app`) serves every
+  vertical. Arming a vertical's app is a release with its spec, then a
+  `from_block`, as for any lane-C competition. Candidate next verticals on
+  the existing templates:
+  * cloud capacity (`Store` on `domain:web_cloudops`);
+  * staffing (newsvendor `Position` on call or footfall counts);
+  * fleet and bike rebalancing (a multi-site `Store`);
+  * fuel and power hedging (`Position`);
+  * day-ahead bidding (`Commit`).
+
+### Harnesses that carry across verticals
+
+Because harnesses see templates, not verticals, a harness written for
+`Store` runs on any `Store` scenario. `harness.json` may declare
+`"scenarios": ["bess", "inventory", "hydro"]` and enter each one. Each entry
+is still judged and paid per scenario, by the rules above.
+
+Optional (Q9): a **generalist slot** `app:store` (and `app:position`),
+scored on the geometric mean of the gains across every armed scenario of
+that template. It would include one scenario added after the harness was
+committed, so the harness cannot have been tuned to it. This pays for
+software that works on the next vertical we fine-tune, not only the ones
+it was tuned on.
+
+### Growing the kit
+
+The kit starts as the owner's set. Ideas that keep winning (a calibrator, a
+scenario builder, a dispatch heuristic) can be promoted into the kit in a
+later release, crediting the commitment that introduced them. That makes it
+the shared base for the next round of harnesses. Promotion is an owner call,
+not a consensus rule. The same kit can also sit on top of our hosted
+forecasting API, so apps that win here can be used outside the subnet.
 
 ## Rewarding creative use of forecasts
 
@@ -387,7 +523,8 @@ means the call is refused, not that the episode fails.
 | piece | where | what |
 |---|---|---|
 | kind | `cascade/shared/config/lane_c.py` | `register_competition_kind("app", eval="paired episode decision score", forward_only=True, parse_value=check_scenario)` |
-| scenarios | `cascade/eval/harness/` (new) | one module per scenario: data adapter, simulator, oracle, reference harness, score. Pure numpy / scipy, deterministic |
+| kit | `cascade/harness/` (new: `data`, `forecast`, `decide`, `env`) | the primitive set, with golden-vector tests per primitive; published as a standalone package for miners |
+| scenarios | `cascade/harness/scenarios/<name>.toml` + `adapters/` | one spec per scenario, plus its data adapter and forward recorder |
 | sandbox runner | `cascade/eval/harness/runner.py` | runs `Harness` in the sandbox, proxies `fc.forecast`, writes the transcript |
 | trainer half | `cascade/trainer/lane_c_competitions.py` | `HarnessTrainer`: `read_recipe` checks the tree. `train_leg` is a short CPU leg (DEC-CA-0053 CPU tier, on the miner's key): static guard, a smoke run, and a **historical qualifier** (it must beat the reference on public backtest episodes, so junk is filtered before it costs validator GPU). It then freezes the pointer. `leg_hours` ≈ 0.25 |
 | validator half | `cascade/validator/lane_c_competitions.py` | `HarnessValidator.judge`: on the main validator, for entries whose forward window has closed, it runs N episodes × {miner, reference, naive-model miner} through `MktSession.forecaster(...)` (reusing the pod via `MktLease(owner="app")`), scores them and emits `LaneCJudgement` rows. Uses `generic_fold = True` unless the forecaster-change rule needs state |
@@ -458,8 +595,15 @@ episode_h  = 24
   small blocks new ideas; too large makes the main validator's GPU cost
   unpredictable.
 
+- **Q9. Generalist slots.** Should there be `app:store` / `app:position`
+  slots scored across every scenario of a template, including one added after
+  commit? And what weight should they get against the per-scenario slots?
+
 ## Rollout
 
+0. Build the kit first (layers 1–4, golden vectors), and write the three
+   first scenarios as specs on it. If a scenario needs a one-off module, the
+   kit is missing a primitive.
 1. Build `app:perp` plumbing on `mkt:market` first: it is the only vertical
    whose fine-tune exists, so the forecaster pairing can be tested end to
    end. In parallel, build the `nrg:` fine-tune and `app:bess` together, since
