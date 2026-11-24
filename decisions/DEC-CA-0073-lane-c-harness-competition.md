@@ -59,6 +59,10 @@ fine-tuned models with a decision-based measure, not only CRPS.
    with the existing gain-tiered slot schedule and TTL.
 7. **Separate product.** Winning harnesses are published (open source, with
    their recorded episodes) as reference apps for the models.
+8. **Creative use of forecasts is paid for (owner, 2026-11-24).** The
+   forecast API is open-ended, and each scenario has a second, *novel-use*
+   slot for a qualifier that wins in a different way from the main holder.
+   See **Rewarding creative use of forecasts**.
 
 ## Vertical pairing
 
@@ -219,13 +223,120 @@ It is a risk-management score, not a profit claim, and the docs must say so.
 Later candidates: `app:hedge` (fuel / power hedging ratio), `app:capacity`
 (cloud autoscaling on `domain:web_cloudops` series), `app:staffing`.
 
+## Rewarding creative use of forecasts
+
+The aim is to find new ways to turn our models' forecasts into decisions, not
+small tweaks of one winning harness. Nothing here judges creativity directly.
+A human or LLM judge would be subjective, non-deterministic and gameable.
+Instead, the rules pay for outcomes that only new uses of the forecasts can
+reach, and give harnesses room to find them.
+
+### 1. An open forecast API, with a budget instead of a fixed call pattern
+
+What a harness may ask the model is wide open. The limit is a per-episode
+budget of forecast series (for example 2,000 series × horizon steps), not a
+fixed number of calls per step. Spending it well is part of the game.
+
+- **Any context it builds.** The harness may forecast any series it derives
+  from the past: returns, spreads, the mandate book's value, a synthetic
+  basket, resampled bars, residuals from its own model, a detrended or
+  deseasonalised series.
+- **Any of the 21 quantile levels, any horizon** up to the model's maximum,
+  and **covariates it constructs**: its own calendar features, or another
+  series as a cross channel.
+- **What-if queries.** A harness may edit a context to ask "what if?"
+  (append a shock, roll a P50 or P90 forward as a scenario path, change a
+  covariate). These are ordinary calls against the budget. The docs must say
+  that marginal quantiles are not paths, and that rolled scenarios are the
+  harness's own construction.
+- **Event-driven spending.** A harness can save budget in quiet hours and
+  spend it in stress hours, or re-forecast only when its own trigger fires.
+- **Cross-vertical models.** `harness.json` may list other verticals'
+  fine-tunes it also calls, for example `app:bess` asking `mkt:market` for
+  gas or power-adjacent markets. The main model must still be used (the
+  model-lift gate). Other models are extra inputs and count against the same
+  budget.
+- **Batching.** One call can forecast many contexts. The budget counts series,
+  not calls, so batching is free.
+
+Every request and reply still goes in the transcript, so audit replay is
+unchanged.
+
+### 2. A novel-use slot per scenario
+
+Each `app:<scenario>` has two slots:
+
+| slot | who takes it | share of the scenario's payout |
+|---|---|---|
+| main | best confirmed qualifier (the current rule) | 1 − `novel_share` |
+| novel-use | best confirmed qualifier that wins *differently* from the main holder | `novel_share` (for example 0.3) |
+
+**"Differently"** is measured, not judged. Take the per-episode gains (over
+the reference) of the candidate and of the main holder, on the same
+episodes. Their correlation must be at most `novel_max_corr` (for example
+0.5). The candidate must also pass the full gate on its own: gain LCB,
+model lift, and no term confidently worse.
+
+This is the DEC-CA-0015 idea (pay for decorrelated errors), applied to
+decisions. A harness that does what the leader does a bit better still
+fights for the main slot. A harness that wins on different episodes (in
+stress, around events, on other assets or regions) can earn without beating
+the leader head to head. When the main slot changes hands, the novel-use
+holder is re-checked against the new main holder at its next confirm. If it
+is now too similar, it loses the novel slot but can contest the main one.
+
+### 3. Forecast value as a scored term
+
+The model-lift gate already makes a harness beat its own naive-forecast run.
+On top of that, each verdict records the harness's **forecast value**: its
+score with the real model minus its score with the naive forecaster. That
+lift is compared with the reference harness's own lift.
+
+- **Novel-use slot:** forecast value is a tie-break and a gate (it must be at
+  least the reference's). This means "different" cannot come from ignoring
+  the model.
+- **Main slot:** forecast value is published but not scored at first. Q8
+  covers adding it to the composite.
+
+### 4. Variants that stop hard-coding
+
+Each round's seed draws scenario variants that the harness only learns at
+`reset(spec)`: cost levels, limits, battery size and efficiency, lead times,
+asset baskets, σ* and drawdown limits, which regions or SKUs. A harness tuned
+to one setting loses across the draw. One that reads the spec and the
+forecasts carries over.
+
+### 5. Hard tiers where simple use is not enough
+
+Part of every verdict's episodes come from tiers where reading the median is
+not enough:
+
+- **perp:** scheduled events (FOMC, CPI), mandate changes mid-episode, and
+  stress windows sampled more often;
+- **bess:** price-spike days, and a day-ahead commitment plus real-time
+  dispatch, which needs both short and long horizons;
+- **inventory:** long lead times, shared capacity, and new SKUs with short
+  history.
+
+The reference harness is weak on these tiers on purpose, so that is where
+the room for new ideas is.
+
+### 6. Open source, without paying copies
+
+Winning harnesses are published with their transcripts, so the field learns
+from each other. Copies are not paid: the exact-digest rule, the
+behavioural near-duplicate rule (action correlation ≥ 0.98) and the novel-use
+correlation rule all go to the earlier commitment. Building on a published
+idea is fine. Winning still needs a confident gain over the current holder,
+or a different way of winning.
+
 ## Submission
 
 The miner commits `metro-v1:ft:app:<scenario>:hippius:<repo>@sha256:<digest>`
 (the existing lane-C form, parsed generically). The tree:
 
 ```
-harness.json      # {"scenario": "bess", "api": 1, "calls_per_step": 4, ...}
+harness.json      # {"scenario": "bess", "api": 1, "models": ["nrg:aemo", "mkt:market"], ...}
 policy.py         # class Harness(HarnessBase): reset(spec) / step(obs, fc) -> action
 lib/…             # optional pure-Python helpers, size-capped
 ```
@@ -236,12 +347,18 @@ class Harness(HarnessBase):
         ...
     def step(self, obs, fc):          # obs: history to now (past only)
         q = fc.forecast(obs.prices, horizon=288, levels=(0.1, 0.5, 0.9))
+        if self.spike_risk(q):        # spend budget only when it matters
+            shocked = self.what_if(obs.prices, shock=+3.0)
+            q2 = fc.forecast([obs.prices, shocked], horizon=288, levels=fc.LEVELS)
         return self.plan(q, obs.soc)  # action, validated and clipped by the sim
 ```
 
-`fc.forecast(context, horizon, levels, covariates=…)` is the only way to reach
-the model. It returns quantiles from the vertical's fine-tuned model. Each
-step has a call budget (`calls_per_step`, cap 8) and a context-length cap.
+`fc.forecast(contexts, horizon, levels, covariates=…, model=…)` is the only
+way to reach a model. It returns quantiles from the vertical's fine-tuned
+model, or from another model listed in `harness.json`. Calls are batched, and
+they draw on a per-episode budget of forecast series × horizon steps, with a
+context-length cap. `fc.budget_left()` reports what remains. Over budget
+means the call is refused, not that the episode fails.
 
 ## Rules
 
@@ -294,7 +411,10 @@ episodes_per_verdict = 400
 verdict_wait_blocks  = 21600    # ~3 days of forward data
 gain_margin          = 0.01
 model_lift_margin    = 0.0
-calls_per_step_max   = 8
+forecast_budget      = 2000      # series x horizon/100 per episode (unit to fix)
+novel_share          = 0.3
+novel_max_corr       = 0.5
+hard_tier_fraction   = 0.3
 step_cpu_ms          = 200
 tree_max_bytes       = 2_000_000
 
@@ -331,6 +451,12 @@ episode_h  = 24
   forecasts?
 - **Q7. Weight.** Should the app competition take part of lane C's 25 %, and
   how much (0.5 in the sketch above, against MarketCast's 1.0)?
+
+- **Q8. Creativity terms.** Agree the novel-use slot (`novel_share`,
+  `novel_max_corr`). Should forecast value also count in the main composite,
+  or stay a novel-use gate? And how large should the forecast budget be? Too
+  small blocks new ideas; too large makes the main validator's GPU cost
+  unpredictable.
 
 ## Rollout
 
