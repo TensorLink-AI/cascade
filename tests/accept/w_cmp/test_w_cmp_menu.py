@@ -55,9 +55,9 @@ def test_w_cmp_family_math():
 
 
 def test_w_cmp_lane_b_plain_lcb_drops_the_per_leg_correction():
-    import cascade.shared.competition_spec  # noqa: F401  (W-CMP)
     import numpy as np
 
+    import cascade.shared.competition_spec  # noqa: F401  (W-CMP)
     from cascade.eval.expert_lane import ExpertLaneParams, judge_expert_targets
 
     rng = np.random.default_rng(0)
@@ -93,7 +93,6 @@ def test_w_cmp_lane_c_win_records_its_curve_and_pays_on_it():
     from dataclasses import replace
 
     import cascade.shared.competition_spec  # noqa: F401  (W-CMP)
-
     from cascade.shared.lane_c import (
         LaneCState,
         TargetWin,
@@ -131,7 +130,6 @@ def test_w_cmp_lane_b_win_records_its_curve_and_pays_on_it():
     from dataclasses import replace
 
     import cascade.shared.competition_spec  # noqa: F401  (W-CMP)
-
     from cascade.shared.lane_b import DomainWin, LaneBState, lane_b_payouts
 
     cfg = parse(shipped_raw())

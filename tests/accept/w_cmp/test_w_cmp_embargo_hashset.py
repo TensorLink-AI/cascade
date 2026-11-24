@@ -41,9 +41,8 @@ def test_w_cmp_draw_uses_the_recorded_dispatch_embargo():
 
 def test_w_cmp_embargo_is_overlay_settable_within_bounds():
     import cascade.shared.competition_spec  # noqa: F401  (W-CMP)
-    from cascade.shared.netconfig_bounds import value_refusals
-
     from cascade.shared.config import load_chain_config
+    from cascade.shared.netconfig_bounds import value_refusals
 
     base = load_chain_config(ROOT / "chain.toml")
     out, why = overlay(base, {"marketcast": {"embargo_days": 35}})
