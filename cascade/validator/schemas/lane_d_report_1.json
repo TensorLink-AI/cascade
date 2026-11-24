@@ -6,7 +6,8 @@
   "type": "object",
   "required": ["schema", "boundary", "signer", "signature", "scoring_method", "params", "seed",
                "pool", "house", "king_before", "king_after", "crowned", "prior_kings", "entries",
-               "judged", "skipped", "cohorts", "windows", "verdicts", "rows", "rows_sha256", "pay"],
+               "judged", "skipped", "cohorts", "windows", "verdicts", "rows", "rows_sha256", "pay",
+               "crown_bar"],
   "additionalProperties": false,
   "properties": {
     "schema": {"type": "string", "const": "lane-d-report/1"},
@@ -32,6 +33,16 @@
     "rows": {"type": "array", "items": {"$ref": "#/$defs/row"}},
     "rows_sha256": {"$ref": "#/$defs/digest"},
     "pay": {"$ref": "#/$defs/pay"},
+    "crown_bar": {
+      "type": "object",
+      "description": "rev6.23: KING_D's tenure (lane D settlements it has held the crown, the house included) and the crown bar applied: d_margin_start falling linearly to d_margin over d_margin_warmup_settlements.",
+      "required": ["tenure", "margin"],
+      "additionalProperties": false,
+      "properties": {
+        "tenure": {"type": "integer", "minimum": 0},
+        "margin": {"type": "number", "exclusiveMinimum": 0}
+      }
+    },
     "gate": {"$ref": "#/$defs/gate"},
     "draw": {"$ref": "#/$defs/draw"},
     "public": {"$ref": "#/$defs/public"},
@@ -129,7 +140,8 @@
       "description": "§14.3 item 2: every [lane_d] value a satellite needs, as parsed.",
       "required": ["share", "takes_from", "remainder", "horizon", "horizons", "contexts",
                    "forward_margin_hours", "max_mirror_lag_hours", "min_windows", "min_clusters",
-                   "d_margin", "alpha", "bootstrap_B", "king_decay", "reward_prior_kings",
+                   "d_margin", "d_margin_start", "d_margin_warmup_settlements", "alpha",
+                   "bootstrap_B", "court_weights", "reward_prior_kings",
                    "max_entries_per_settlement",
                    "max_judged_per_coldkey_per_settlement", "scoring_levels", "gate_suites",
                    "tau_public", "lowfreq_freqs", "gate_weights", "max_source_share",
@@ -150,7 +162,10 @@
         "d_margin": {"type": "number"},
         "alpha": {"type": "number", "minimum": 0},
         "bootstrap_B": {"type": "integer", "minimum": 1},
-        "king_decay": {"type": "number", "minimum": 0},
+        "d_margin_start": {"type": "number"},
+        "d_margin_warmup_settlements": {"type": "integer", "minimum": 1},
+        "court_weights": {"type": "array", "minItems": 1,
+                          "items": {"type": "number", "minimum": 0}},
         "reward_prior_kings": {"type": "integer", "minimum": 0},
         "max_entries_per_settlement": {"type": "integer", "minimum": 0},
         "max_judged_per_coldkey_per_settlement": {"type": "integer", "minimum": 0},

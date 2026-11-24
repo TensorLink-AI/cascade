@@ -1223,7 +1223,9 @@ class _PackedRegistry:
 @pytest.mark.parametrize("mode", ["scan", "reject"])
 def test_packed_source_is_refused_at_admission_only_when_armed(cfg, tmp_path, mode):
     armed = _armed(cfg)
-    armed = replace(armed, static_guard=replace(armed.static_guard, packed_sources=mode))
+    # from_block 0: armed immediately (the shipped file gates it at 9169200, S0a B9)
+    armed = replace(armed, static_guard=replace(armed.static_guard, packed_sources=mode,
+                                                packed_sources_from_block=0))
     clock = Clock()
     sched, ops = _sched(armed, tmp_path, clock)
     reg = _PackedRegistry({REF["ALFA"]})

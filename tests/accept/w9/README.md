@@ -306,8 +306,8 @@ code. The checks run in this order:
   pool `1 - b - c - d`, where `d = min(share, max(0, 1 - b - c))` for
   `takes_from = "lane_a"`. Lane D's part is added from the signed
   `pay.court` alone:
-  - slot `i` is worth `cfg.lane_d.king_decay ** i`, normalised over the
-    slots, times `pay.share`;
+  - slot `i` is worth `cfg.lane_d.court_weights[i]` (rev6.23: 0.80 /
+    0.15 / 0.05), normalised over the slots, times `pay.share`;
   - a slot whose `uid` is null, out of range or repeated burns to
     `cfg.scoring.burn_uid`;
   - an empty court burns the whole share.
