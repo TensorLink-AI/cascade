@@ -512,6 +512,62 @@ def validator_bench_rows(report, store) -> dict | None:
     return out
 
 
+_FETCH = object()
+
+# The lane D publish layout (W7c / W8b), restated: the audit must not import
+# the producer's wiring (invariant 12).
+LANE_D_REPORT_KEY = "lane-d/reports/lane_d_report_{boundary}.json"
+LANE_D_RECEIPT_KEY = "lane-d/receipts/lane_d_receipt_{boundary}.json"
+
+
+def _strict_json(text: str):
+    """JSON with no repeated key and no NaN / Infinity (the signed formats)."""
+    def pairs(items):
+        out = {}
+        for k, v in items:
+            if k in out:
+                raise ValueError(f"repeated key {k!r}")
+            out[k] = v
+        return out
+
+    def constant(name):
+        raise ValueError(f"non-finite number {name}")
+
+    return json.loads(text, object_pairs_hook=pairs, parse_constant=constant)
+
+
+def fetch_lane_d_record(receipt: RoundReceipt, store) -> dict | None:
+    """rev6.18 B1: the lane D record of the settlement ``receipt`` closes —
+    ``{"report", "receipt"}`` — read from the published layout, the receipt
+    record preferring the one the signed round receipt embeds (W14).
+    ``None``: nothing is published (lane D's share burns). An unparseable
+    object yields ``report`` / ``receipt`` ``None`` (malformed: lane D's
+    share burns). Any other read failure raises (the caller retries)."""
+    from ..shared.hippius import ObjectNotFound
+
+    b = int(receipt.epoch_start_block)
+    rec = getattr(receipt, "lane_d", None)
+    if not isinstance(rec, dict):
+        try:
+            rec = _strict_json(store.get_text(LANE_D_RECEIPT_KEY.format(boundary=b)))
+        except ObjectNotFound:
+            rec = None
+        except ValueError:
+            rec = "unreadable"
+    if isinstance(rec, dict) and rec.get("status") == "absent":
+        return {"report": None, "receipt": rec}
+    try:
+        report = _strict_json(store.get_text(LANE_D_REPORT_KEY.format(boundary=b)))
+    except ObjectNotFound:
+        report = None
+        if rec is None:
+            return None
+    except ValueError:
+        report = "unreadable"
+    return {"report": report if isinstance(report, dict) else None,
+            "receipt": rec if isinstance(rec, dict) else None}
+
+
 def fetch_marketcast_reports(receipt: RoundReceipt, store) -> dict:
     """DEC-CA-0064: ``{key: text}`` of every MarketCast report the receipt's
     ``mkt:`` lane-C rows bind (absent / unreadable ones are left out — the
@@ -574,10 +630,14 @@ def audit_receipt(
     receipt: RoundReceipt, cfg, *, tier: int, client=None,
     workdir: Path = Path("./_audit_work"), full_stream: bool = False,
     device: str = "cuda", netconfig_store=None, bench_store=None,
-    mkt_snapshot_dir: Path | None = None,
+    mkt_snapshot_dir: Path | None = None, lane_d=_FETCH,
 ) -> list[CheckResult]:
     """Run every check up to ``tier``. Pure orchestration; each check is a small
-    function in :mod:`cascade.audit.checks` / :mod:`cascade.audit.rederive`."""
+    function in :mod:`cascade.audit.checks` / :mod:`cascade.audit.rederive`.
+
+    ``lane_d`` (rev6.18 B1): the settlement's lane D record for the
+    ``lane_d`` row; left unset it is fetched (:func:`fetch_lane_d_record`)
+    when lane D pays at the settlement."""
     from ..shared.activation import apply_receipt_activation
 
     # DEC-CA-0045: a receipt judged under a rollover the validators decided
@@ -638,7 +698,11 @@ def audit_receipt(
     mkt_inputs = (fetch_marketcast_inputs(receipt, mkt_reports, reader,
                                           snapshot_dir=mkt_snapshot_dir)
                   if mkt_reports else None)
+    pays_d = cfg.lane_d.active(int(receipt.epoch_start_block))
+    if lane_d is _FETCH:
+        lane_d = fetch_lane_d_record(receipt, reader) if pays_d else None
     results = run_tier0(receipt, cfg, client, funded_roster=roster,
+                        **({"lane_d": lane_d} if pays_d else {}),
                         **({"marketcast_reports": mkt_reports} if mkt_reports else {}),
                         **({"marketcast_inputs": mkt_inputs} if mkt_inputs else {}),
                         **({"bench": bench} if bench is not None else {}),

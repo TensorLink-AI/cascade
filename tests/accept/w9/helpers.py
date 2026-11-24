@@ -55,9 +55,13 @@ FORBIDDEN_PACKAGES = ("cascade.validator.lane_d", "cascade.lane_d", "cascade.lan
 FORBIDDEN_STEMS = ("cascade.validator.lane_d_", "cascade.eval.lane_d_", "cascade.lane_d_")
 # What `cascade/audit/lane_d.py` itself may import (besides the stdlib and
 # numpy): the generic statistic, the sr25519 verifier, the parsed [lane_d]
-# config type and the audit's own result helpers.
+# config type and the audit's own result helpers. rev6.18 B2: plus the
+# audit's own chain rules (`cascade.audit.lane_d_chain`, the former W7d
+# satellite replay, moved into the audit; its own imports are pinned by
+# tests/accept/w7d/test_w7d_import_graph.py).
 LANE_D_AUDIT_ALLOWED = ("cascade.eval.bootstrap", "cascade.shared.sr25519",
-                        "cascade.shared.config.lane_d", "cascade.audit.checks")
+                        "cascade.shared.config.lane_d", "cascade.audit.checks",
+                        "cascade.audit.lane_d_chain")
 
 
 def forbidden(name: str) -> bool:

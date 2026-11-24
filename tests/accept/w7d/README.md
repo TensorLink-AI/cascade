@@ -1,5 +1,21 @@
 # W7d acceptance tests: the independent satellite replay
 
+> **rev6.18 B2 (owner 2026-11-23, "One lane D checker for outside
+> validators ... delete the other").** The satellite replay is no longer a
+> second checker. `cascade/satellite/` is deleted; the module moved into the
+> audit as `cascade/audit/lane_d_chain.py` (the chain rules of
+> `check_lane_d`) and reaches outside validators only through
+> `check_lane_d(..., chain=...)` / `lane_d_findings` (the satellite: through
+> `audit_receipt` -> the `lane_d` row). Its mismatch paths become rev6.18 B3
+> alert codes (`ld_chain`, `ld_draw`, `ld_judged_set`, `ld_bench`,
+> `ld_snapshot`); the replay-only per-report rules on the paid court and
+> `king_after` were ported into `check_lane_d` as burn codes (`ld_court`,
+> `ld_crown`). The tests below keep testing the rules at the new path
+> (`helpers.MODULE`); invariant 12 now forbids the module from importing the
+> rest of the audit (`cascade.audit.lane_d`, `checks`, `main`, `rederive`)
+> instead of the whole `cascade.audit` package. `test_w7d_audit_chain.py`
+> covers the `check_lane_d` mapping.
+
 W7d (plan rev6 §3.0 W7d row, depends on W7c) is the satellite half of
 §14.3: "Satellites verify the signature, check that the parameters stated in
 the report equal `config_at(boundary)` from the adopted overlay, check

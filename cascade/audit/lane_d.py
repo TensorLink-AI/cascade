@@ -66,6 +66,19 @@ W9 re-derives what main took on trust (tests/accept/w9/README.md):
   ``feeds`` completeness and each judged window's record and §1.3
   eligibility (:func:`window_refusal`, re-implemented here from the spec).
 
+rev6.18 B3 (owner 2026-11-23): every check has a refusal code
+(:data:`REFUSAL_CODES`, the plan's table), ``burn`` or ``alert``. Only the
+report signature, the config echo, the scores reproducing the named winner
+and the weights matching the paid court burn (lane D's share only, B1:
+``cascade.audit.checks.lane_d_pay``); every other failure is an alert that
+is logged (cascade-ops tag ``lane_d_check_alert``) while the signed court
+stays paid. :func:`lane_d_findings` returns every finding, never stopping
+at an alert; :func:`check_lane_d` keeps its one-result form, ``<code>:
+<detail>`` of the first. rev6.18 B2: this is the ONE lane D checker for
+outside validators; the former satellite replay's rules run inside it
+(per report: the court and ``king_after`` records; chain mode, ``chain=``:
+:mod:`cascade.audit.lane_d_chain`; ``bench_rows=``: W3b6b).
+
 W14 (the lane D-only fast kill): :func:`check_lane_d_absent` re-derives a
 settlement with no lane D report from its absent receipt record (the
 structure rules re-implemented here, never imported from the producer). A
@@ -437,8 +450,8 @@ def _result_problem(i: int, res, tau: float) -> str | None:
         keys = sorted(res) if isinstance(res, dict) else type(res).__name__
         return f"gate result {i}: keys {keys}"
     if "rows" in res:
-        # W3b6b: the bound bench records, three sha256 (verified by W7d's
-        # replay against the published bytes).
+        # W3b6b: the bound bench records, three sha256 (verified against the published
+        # bytes by check_gate_rows when bench_rows is given).
         rows = res["rows"]
         if not isinstance(rows, dict) or set(rows) != _ROWS_ROLES or not all(
                 isinstance(v, str) and len(v) == 64 and set(v) <= _HEX for v in rows.values()):
@@ -877,7 +890,7 @@ def _embargo_problems(report: dict, cfg, windows: dict, rows_by: dict) -> list[s
     """rev6.10 (a) / rev6.12 (a)/(b) / W5j, re-derived: each judged window's
     embargo record and class at its cohort's bound, each cohort's fresh /
     embargo split and the minimum fresh share, each verdict's sub-scores
-    from the rows, the settlement budget and the draw record."""
+    from the rows, the settlement budget (the draw record: :func:`_draw_problems`)."""
     out: list[str] = []
     cap, h = float(cfg.embargo_hours), int(cfg.horizon)
     margin = 3600.0 * float(cfg.forward_margin_hours)
@@ -936,7 +949,6 @@ def _embargo_problems(report: dict, cfg, windows: dict, rows_by: dict) -> list[s
     if len(judged) > int(cfg.max_windows_per_settlement):
         out.append(f"{len(judged)} judged windows > max_windows_per_settlement "
                    f"{cfg.max_windows_per_settlement}")
-    out += _draw_problems(report, cfg, windows)
     return out
 
 
@@ -1201,12 +1213,393 @@ def _snapshot_problem(report: dict, cfg, pool_dirs, windows: dict) -> str | None
 
 _UNSET = object()
 
+# ── rev6.18 B3: per-check refusal codes (LANE_D_PLAN rev6.18 B3 table) ──────
+#
+# Only four checks stop pay: the report signature, the config echo
+# (= ``config_at(boundary)``), the scores reproducing the named winner
+# (``rows_sha256`` and the bootstrap) and the weights matching the paid
+# court. Their codes are ``burn``: lane D's share, and only lane D's, goes to
+# ``burn_uid`` (B1). Every other failed check is ``alert``: it is logged and
+# alerted (cascade-ops tag ``lane_d_check_alert``) and the signed court keeps
+# being paid. A verifier that cannot run is neither (``TRANSIENT_CODE``: the
+# receipt is retried).
+BURN = "burn"
+ALERT = "alert"
+REFUSAL_CODES: dict[str, str] = {
+    "lane_d_record_missing": BURN,
+    "lane_d_record_malformed": BURN,
+    "lane_d_boundary_mismatch": BURN,
+    "lane_d_report_mismatch": BURN,
+    "ld_schema": BURN,
+    "ld_signature": BURN,
+    "ld_not_armed": BURN,
+    "lane_d_not_armed": BURN,
+    "ld_params": BURN,
+    "ld_pay_share": BURN,
+    "ld_seed": BURN,
+    "ld_rows_sha256": BURN,
+    "ld_rows_count": BURN,
+    "ld_rows_duplicate": BURN,
+    "ld_cohort": BURN,
+    "ld_crown": BURN,
+    "ld_court": BURN,
+    "lane_d_carve_unsupported": BURN,
+    "ld_malformed": BURN,
+    "ld_scoring_method": ALERT,
+    "ld_sentinel": ALERT,
+    "ld_row_order": ALERT,
+    "ld_clock": ALERT,
+    "ld_embargo": ALERT,
+    "ld_draw": ALERT,
+    "ld_judged_set": ALERT,
+    "ld_chain": ALERT,
+    "ld_snapshot": ALERT,
+    "ld_public_index": ALERT,
+    "ld_bench": ALERT,
+}
+TRANSIENT_CODE = "ld_verifier_unavailable"
+# The cascade-ops follower tag of an alert-class finding (W11).
+ALERT_TAG = "lane_d_check_alert"
+
+
+def refusal_class(code: str) -> str:
+    """``burn`` / ``alert`` for a :data:`REFUSAL_CODES` code; an unknown code
+    is ``burn`` (fail closed)."""
+    return REFUSAL_CODES.get(str(code), BURN)
+
+
+class LaneDFindings:
+    """Every failed check of one report, in check order, as ``(code,
+    detail)``. ``transient``: a verifier could not run (retry; neither burn
+    nor pay). Checks stop at the first ``burn`` finding; ``alert`` findings
+    never stop them, so a burn check behind an alert still runs."""
+
+    def __init__(self) -> None:
+        self.findings: list[tuple[str, str]] = []
+        self.transient = ""
+        self.boundary: int | None = None
+        self.n_cohorts = 0
+        self.n_rows = 0
+
+    @property
+    def burn(self) -> tuple[str, str] | None:
+        return next((f for f in self.findings if refusal_class(f[0]) == BURN), None)
+
+    @property
+    def alerts(self) -> list[tuple[str, str]]:
+        return [f for f in self.findings if refusal_class(f[0]) == ALERT]
+
+    def add(self, code: str, detail: str) -> bool:
+        """Record a finding; True when it is a burn (the checks stop)."""
+        if code not in REFUSAL_CODES:
+            raise ValueError(f"lane D refusal code {code!r} is not in REFUSAL_CODES")
+        self.findings.append((code, str(detail)))
+        return refusal_class(code) == BURN
+
+
+def lane_d_findings(report: dict, cfg, *, signer_hotkey: str, prior_reports=None,
+                    era_sentinel=_UNSET, pool_dirs=None, bench_rows=None, uid_of=None,
+                    chain=None) -> LaneDFindings:
+    """Run every check of :func:`check_lane_d` and return its findings
+    (rev6.18 B3). Same arguments as :func:`check_lane_d`.
+
+    rev6.18 B2 (the W7d satellite replay's rules, ported so no verification
+    is lost): ``bench_rows`` (W3b6b): the bound bench records, a
+    ``{sha256: bytes}`` mapping or a directory of ``<sha256>.json`` files;
+    ``None`` skips :func:`~cascade.audit.lane_d_chain.check_gate_rows`.
+    ``uid_of``: the metagraph ``{hotkey: uid}`` at the boundary, pinning each
+    court slot's uid (``None``: the stated uid, taken as signed). ``chain``:
+    ``{"receipts": [...], "states"?: {...}, "uid_of"?: {...},
+    "bench_rows"?: ...}`` runs the chain rules of
+    :mod:`cascade.audit.lane_d_chain` over ``prior_reports`` + this report
+    (receipt links, ``king_before``, ``prior_kings``, holds, used windows,
+    the house challenger, entry progress, state snapshots); their mismatch
+    paths become alert-class codes. Every check that can stop pay is
+    re-derived from this report alone."""
+    from ..shared.sr25519 import SignatureVerifierUnavailable
+    from .lane_d_chain import check_gate_rows
+
+    f = LaneDFindings()
+    if not isinstance(report, dict) or report.get("schema") != SCHEMA:
+        got = report.get("schema") if isinstance(report, dict) else type(report).__name__
+        f.add("ld_schema", f"unknown report schema {got!r}")
+        return f
+
+    def many(code: str, problems) -> bool:
+        return bool(problems) and f.add(code, "; ".join(list(problems)[:5]))
+
+    def one(code: str, why) -> bool:
+        return bool(why) and f.add(code, why)
+
+    def alert(code: str, fn) -> None:
+        """An alert-class check: a malformed field fails that check only."""
+        try:
+            got = fn()
+        except (KeyError, TypeError, ValueError) as e:
+            f.add(code, f"malformed report: {type(e).__name__}: {e}")
+            return
+        if isinstance(got, list):
+            many(code, got)
+        else:
+            one(code, got)
+
+    try:
+        boundary = int(report["boundary"])
+        f.boundary = boundary
+        if not cfg.active(boundary):
+            f.add("ld_not_armed", f"lane D does not judge the settlement at {boundary}")
+            return f
+        try:
+            why = _signature(report, signer_hotkey)
+        except SignatureVerifierUnavailable as e:
+            f.transient = f"cannot verify the signature: {e}"
+            return f
+        if one("ld_signature", why):
+            return f
+        if one("ld_cohort", _confirmation_problem(report)):
+            return f
+        alert("ld_scoring_method",
+              lambda: None if report.get("scoring_method") == "quantile_head"
+              else f"scoring_method {report.get('scoring_method')!r}")
+        want = _expected_params(cfg)
+        if report.get("params") != want:
+            diff = sorted(k for k in set(want) | set(report.get("params") or {})
+                          if (report.get("params") or {}).get(k) != want.get(k))
+            f.add("ld_params", f"stated params differ from config on {diff}")
+            return f
+        # RV7 B2 (c): the bootstrap seed is the boundary's and the pool's,
+        # never a free choice the producer could grind.
+        want_seed = f"lane-d/1:{boundary}:{report['pool']['sha256']}"
+        if report.get("seed") != want_seed:
+            f.add("ld_seed", f"seed {report.get('seed')!r} != {want_seed!r}")
+            return f
+        if era_sentinel is not _UNSET:
+            alert("ld_sentinel", lambda: _sentinel_problem(report, era_sentinel))
+        rows = list(report.get("rows") or [])
+        f.n_rows = len(rows)
+        if hashlib.sha256(_canon(rows)).hexdigest() != report.get("rows_sha256"):
+            f.add("ld_rows_sha256", "rows_sha256 does not match the rows")
+            return f
+        rows_by = {}
+        for r in rows:
+            key = (int(r["cohort"]), str(r["window_id"]), str(r["digest"]))
+            if key in rows_by:
+                f.add("ld_rows_duplicate", f"duplicate row {key}")
+                return f
+            rows_by[key] = r
+        windows = {w["window_id"]: w for w in report.get("windows") or []}
+        entries = {e["digest"]: e for e in report.get("entries") or []}
+        cohorts = list(report.get("cohorts") or [])
+        f.n_cohorts = len(cohorts)
+        # One row per (window, model): KING_D, the house when it is a second
+        # bar (a miner holds KING_D), and every member.
+        house = report["house"]["digest"]
+        expected_rows = sum(len(c["window_ids"])
+                            * (len(_bars(c["king_digest"], house, c["members"]))
+                               + len(c["members"]))
+                            for c in cohorts)
+        if expected_rows != len(rows):
+            f.add("ld_rows_count", f"{len(rows)} rows; the cohorts account for {expected_rows}")
+            return f
+        problems, confirms = [], {}
+        for c in cohorts:
+            problems += _cohort_problems(report, cfg, c, rows_by, windows, entries, confirms)
+        if many("ld_cohort", problems):
+            return f
+        alert("ld_row_order", lambda: _row_order_problem(report, rows))
+        alert("ld_clock", lambda: _clock_problems(report, cfg, windows))
+        alert("ld_embargo", lambda: _embargo_problems(report, cfg, windows, rows_by))
+        alert("ld_draw", lambda: _draw_problems(report, cfg, windows))
+        # The §1.3b gate decides every crowning candidate; the crowning and
+        # the paid court follow from it.
+        crown, problems = _crown_problems(report, cfg, boundary, confirms, entries)
+        if many("ld_crown", problems):
+            return f
+        alert("ld_judged_set", lambda: _judged_set_problems(report, cfg, entries))
+        before, after = report["king_before"], report["king_after"]
+        if crown is not None and crown == report["house"]["digest"]:
+            # W5f (§2 item 2, T10): the house retakes KING_D from a miner.
+            if (report.get("crowned") is not None or after["digest"] != crown
+                    or not after["house"] or after.get("hotkey") is not None
+                    or before["house"]):
+                f.add("ld_crown", f"house retake {crown[:12]}: crowned "
+                                  f"{report.get('crowned')!r}, king_after "
+                                  f"{str(after['digest'])[:12]} (house={after['house']}), "
+                                  f"king_before house={before['house']}")
+                return f
+        elif crown is not None:
+            if report.get("crowned") != crown or after["digest"] != crown or after["house"]:
+                f.add("ld_crown", f"crowned {report.get('crowned')!r}; re-derived {crown!r}")
+                return f
+        elif report.get("crowned") is not None or after["digest"] != before["digest"]:
+            why = ("no gate record (the gate did not run)" if "gate" not in report
+                   else "no gate result passes")
+            f.add("ld_crown", f"crowned {report.get('crowned')!r} / king changed, but {why}: "
+                              f"nothing may crown")
+            return f
+        if prior_reports is not None:
+            try:
+                alert("ld_chain", lambda: (lambda w: f"chain: {w}" if w else None)(
+                    _chain_problems(report, prior_reports, signer_hotkey, entries)))
+            except SignatureVerifierUnavailable as e:
+                f.transient = f"cannot verify the prior reports' signatures: {e}"
+                return f
+        if pool_dirs is not None:
+            alert("ld_snapshot", lambda: (lambda w: f"snapshot: {w}" if w else None)(
+                _snapshot_problem(report, cfg, list(pool_dirs), windows)))
+        if bench_rows is not None:
+            alert("ld_bench", lambda: [f"mismatch at {p}" for p in
+                                       check_gate_rows(report, bench_rows, cfg)])
+        if one("ld_crown", _king_after_problem(report, entries, crown)):
+            return f
+        pay = report.get("pay")
+        court = (pay or {}).get("court") or []
+        if float((pay or {}).get("share", -1.0)) != float(cfg.share):
+            f.add("ld_pay_share", "pay share differs from config")
+            return f
+        if not court or court[0]["digest"] != after["digest"] \
+                or (court[0]["hotkey"] is None) != bool(after["house"]):
+            f.add("ld_court", "the paid court does not start with KING_D (house slot unpaid)")
+            return f
+        if len(court) > 1 + int(cfg.reward_prior_kings):
+            f.add("ld_court", f"court has {len(court)} slots; at most "
+                              f"{1 + int(cfg.reward_prior_kings)}")
+            return f
+        if any(s["digest"] == report["house"]["digest"] for s in court[1:]):
+            f.add("ld_court", "the house sits in the court as a prior king")
+            return f
+        if one("ld_court", _court_problem(report, cfg, uid_of)):
+            return f
+        if chain is not None:
+            r = _chain_findings(report, cfg, signer_hotkey, prior_reports, chain)
+            if r == "transient":
+                f.transient = "cannot verify a chain report's signature"
+                return f
+            for code, detail in r:
+                f.add(code, detail)
+    except (KeyError, TypeError, ValueError) as e:
+        f.add("ld_malformed", f"malformed report: {type(e).__name__}: {e}")
+    return f
+
+
+def _king_after_problem(report: dict, entries: dict, crown) -> str | None:
+    """Ported from the W7d replay (G8): the whole ``king_after`` record. A
+    miner crown is ``{digest, hotkey, house: False, reveal_ts}`` of the
+    crowned entry; a house retake the house record; no crown leaves
+    ``king_before``."""
+    before, after, house = report["king_before"], report["king_after"], report["house"]
+    if crown is not None and crown == house["digest"]:
+        want = {"digest": house["digest"], "hotkey": None, "house": True,
+                "reveal_ts": house["reveal_ts"]}
+    elif crown is not None:
+        e = entries[crown]
+        want = {"digest": crown, "hotkey": e["hotkey"], "house": False,
+                "reveal_ts": e["reveal_ts"]}
+    else:
+        want = dict(before)
+    if after != want:
+        diff = sorted(k for k in set(want) | set(after) if after.get(k) != want.get(k))
+        return f"king_after differs from the re-derived record on {diff}"
+    return None
+
+
+def _court_problem(report: dict, cfg, uid_of) -> str | None:
+    """Ported from the W7d replay (C5, G5): ``pay`` is exactly ``{share,
+    court}`` and the court is KING_D then ``prior_kings`` by recency, each
+    slot ``{digest, hotkey, uid, burn_reason}``: a house slot has no hotkey
+    and no uid (``house_king``), a slot without a uid burns
+    (``deregistered``). ``uid_of`` (``{hotkey: uid}``, the metagraph at the
+    boundary) pins each uid; without it the stated uid is taken as signed."""
+    pay = report["pay"]
+    if not isinstance(pay, dict) or set(pay) != {"share", "court"}:
+        return f"pay keys {sorted(pay) if isinstance(pay, dict) else pay!r} are not [court, share]"
+    stated = pay["court"]
+    rpk = max(0, int(cfg.reward_prior_kings))
+    kings = [report["king_after"], *list(report.get("prior_kings") or [])[:rpk]]
+    want = []
+    for i, k in enumerate(kings):
+        hk = None if k["house"] else k["hotkey"]
+        if hk is None:
+            uid = None
+        elif uid_of is not None:
+            got = uid_of.get(hk)
+            uid = got if isinstance(got, int) and not isinstance(got, bool) else None
+        else:
+            slot = stated[i] if i < len(stated) and isinstance(stated[i], dict) else {}
+            got = slot.get("uid")
+            uid = got if isinstance(got, int) and not isinstance(got, bool) else None
+        burn = None if uid is not None else ("house_king" if hk is None else "deregistered")
+        want.append({"digest": k["digest"], "hotkey": hk, "uid": uid, "burn_reason": burn})
+    if stated != want:
+        at = next((i for i, (g, w) in enumerate(zip(stated, want, strict=False)) if g != w),
+                  min(len(stated), len(want)))
+        return f"pay.court[{at}] is not the re-derived slot (KING_D, then prior_kings)"
+    return None
+
+
+# Chain mode (rev6.18 B2): the ported W7d chain rules' mismatch paths, by
+# leading field, to their B3 code. All are alert-class: the four burn checks
+# are re-derived per report above.
+_CHAIN_PATH_CODES = (
+    ("gate.results", "ld_bench"), ("windows", "ld_draw"), ("draw", "ld_draw"),
+    ("entries", "ld_judged_set"), ("armed_", "ld_judged_set"), ("pool", "ld_snapshot"),
+    ("scoring_method", "ld_scoring_method"),
+)
+
+
+def _chain_code(path: str) -> str:
+    return next((c for p, c in _CHAIN_PATH_CODES if path.startswith(p)), "ld_chain")
+
+
+def _chain_findings(report: dict, cfg, signer_hotkey: str, prior_reports, chain):
+    """``chain`` = ``{"receipts": [lane-d-receipt/1 records, settlement order,
+    ending with this report's], "states"?: {boundary: state bytes},
+    "uid_of"?: {boundary: {hotkey: uid}}, "bench_rows"?: ...}``. The W7d
+    rules (:mod:`cascade.audit.lane_d_chain`) over the reports
+    ``prior_reports`` + this one: a list of ``(code, detail)`` for this
+    report's boundary, or ``"transient"``."""
+    from .lane_d_chain import MISMATCH, UNVERIFIABLE, replay_chain
+
+    if not isinstance(chain, dict) or not isinstance(chain.get("receipts"), (list, tuple)):
+        return [("ld_chain", "chain: no receipt records given")]
+    b = int(report["boundary"])
+    reports = {}
+    for p in list(prior_reports or []):
+        if isinstance(p, dict) and isinstance(p.get("boundary"), int):
+            reports[p["boundary"]] = p
+    reports[b] = report
+    receipts = [r for r in chain["receipts"]
+                if isinstance(r, dict) and isinstance(r.get("boundary"), int)
+                and r["boundary"] <= b]
+    if not receipts or receipts[-1]["boundary"] != b:
+        return [("ld_chain", f"chain: the receipt records do not end at boundary {b}")]
+    res = replay_chain(reports, receipts, cfg, signer_ss58=signer_hotkey,
+                       uid_of=chain.get("uid_of"), states=chain.get("states"),
+                       bench_rows=chain.get("bench_rows"))
+    mine = res[-1]
+    if mine.status == UNVERIFIABLE:
+        if mine.reason == "signature_unverifiable":
+            return "transient"
+        return [("ld_chain", f"chain: unverifiable ({mine.reason})")]
+    if mine.status != MISMATCH:
+        return []
+    by_code: dict[str, list[str]] = {}
+    for p in mine.mismatches:
+        by_code.setdefault(_chain_code(p), []).append(p)
+    return [(code, "chain: mismatch at " + ", ".join(paths[:8]))
+            for code, paths in by_code.items()]
+
 
 def check_lane_d(report: dict, cfg, *, signer_hotkey: str, prior_reports=None,
-                 era_sentinel=_UNSET, pool_dirs=None) -> CheckResult:
+                 era_sentinel=_UNSET, pool_dirs=None, bench_rows=None, uid_of=None,
+                 chain=None) -> CheckResult:
     """PASS on a genuine report; FAIL when the signature, ``rows_sha256``,
     a stated parameter or the verdict re-derived from the rows disagrees,
-    or the crown's provenance does not hold (RV7 B2).
+    or the crown's provenance does not hold (RV7 B2). rev6.18 B3: the FAIL
+    detail is ``<code>: <detail>`` for the first failed check (codes in
+    :data:`REFUSAL_CODES`; :func:`lane_d_findings` has every finding and its
+    burn / alert class); a verifier that cannot run is a WARN
+    ``ld_verifier_unavailable: ...``.
 
     ``prior_reports`` (chain mode, what W9 runs): the earlier signed reports
     the auditor holds, in any order; each
@@ -1216,128 +1609,20 @@ def check_lane_d(report: dict, cfg, *, signer_hotkey: str, prior_reports=None,
     left unset, ``gate.sentinel`` is not pinned. ``pool_dirs``: snapshot
     directories the auditor holds; every snapshot a judged window names must
     be among them, valid, and give that window's record and eligibility
-    (README rules 12-14); ``None`` skips those rules."""
-    from ..shared.sr25519 import SignatureVerifierUnavailable
+    (README rules 12-14); ``None`` skips those rules. ``bench_rows``: the
+    W3b6b bound bench records (:func:`check_gate_rows`)."""
+    f = lane_d_findings(report, cfg, signer_hotkey=signer_hotkey, prior_reports=prior_reports,
+                        era_sentinel=era_sentinel, pool_dirs=pool_dirs, bench_rows=bench_rows,
+                        uid_of=uid_of, chain=chain)
+    if f.findings:
+        code, detail = f.findings[0]
+        return _fail(NAME, f"{code}: {detail}")
+    if f.transient:
+        return _warn(NAME, f"{TRANSIENT_CODE}: {f.transient}")
+    return _ok(NAME, f"boundary {f.boundary}: {f.n_cohorts} cohort(s), {f.n_rows} rows "
+                     f"re-derived")
 
-    if not isinstance(report, dict) or report.get("schema") != SCHEMA:
-        got = report.get("schema") if isinstance(report, dict) else type(report).__name__
-        return _fail(NAME, f"unknown report schema {got!r}")
-    try:
-        boundary = int(report["boundary"])
-        if not cfg.active(boundary):
-            return _fail(NAME, f"lane D does not judge the settlement at {boundary}")
-        try:
-            why = _signature(report, signer_hotkey)
-        except SignatureVerifierUnavailable as e:
-            return _warn(NAME, f"cannot verify the signature: {e}")
-        if why:
-            return _fail(NAME, why)
-        why = _confirmation_problem(report)
-        if why:
-            return _fail(NAME, why)
-        if report.get("scoring_method") != "quantile_head":
-            return _fail(NAME, f"scoring_method {report.get('scoring_method')!r}")
-        want = _expected_params(cfg)
-        if report.get("params") != want:
-            diff = sorted(k for k in set(want) | set(report.get("params") or {})
-                          if (report.get("params") or {}).get(k) != want.get(k))
-            return _fail(NAME, f"stated params differ from config on {diff}")
-        # RV7 B2 (c): the bootstrap seed is the boundary's and the pool's,
-        # never a free choice the producer could grind.
-        want_seed = f"lane-d/1:{boundary}:{report['pool']['sha256']}"
-        if report.get("seed") != want_seed:
-            return _fail(NAME, f"seed {report.get('seed')!r} != {want_seed!r}")
-        if era_sentinel is not _UNSET:
-            why = _sentinel_problem(report, era_sentinel)
-            if why:
-                return _fail(NAME, why)
-        rows = list(report.get("rows") or [])
-        if hashlib.sha256(_canon(rows)).hexdigest() != report.get("rows_sha256"):
-            return _fail(NAME, "rows_sha256 does not match the rows")
-        rows_by = {}
-        for r in rows:
-            key = (int(r["cohort"]), str(r["window_id"]), str(r["digest"]))
-            if key in rows_by:
-                return _fail(NAME, f"duplicate row {key}")
-            rows_by[key] = r
-        windows = {w["window_id"]: w for w in report.get("windows") or []}
-        entries = {e["digest"]: e for e in report.get("entries") or []}
-        cohorts = list(report.get("cohorts") or [])
-        # One row per (window, model): KING_D, the house when it is a second
-        # bar (a miner holds KING_D), and every member.
-        house = report["house"]["digest"]
-        expected_rows = sum(len(c["window_ids"])
-                            * (len(_bars(c["king_digest"], house, c["members"]))
-                               + len(c["members"]))
-                            for c in cohorts)
-        if expected_rows != len(rows):
-            return _fail(NAME, f"{len(rows)} rows; the cohorts account for {expected_rows}")
-        problems, confirms = [], {}
-        for c in cohorts:
-            problems += _cohort_problems(report, cfg, c, rows_by, windows, entries, confirms)
-        if problems:
-            return _fail(NAME, "; ".join(problems[:5]))
-        why = _row_order_problem(report, rows)
-        if why:
-            return _fail(NAME, why)
-        problems = _clock_problems(report, cfg, windows)
-        if problems:
-            return _fail(NAME, "; ".join(problems[:5]))
-        problems = _embargo_problems(report, cfg, windows, rows_by)
-        if problems:
-            return _fail(NAME, "; ".join(problems[:5]))
-        # The §1.3b gate decides every crowning candidate; the crowning and
-        # the paid court follow from it.
-        crown, problems = _crown_problems(report, cfg, boundary, confirms, entries)
-        if problems:
-            return _fail(NAME, "; ".join(problems[:5]))
-        problems = _judged_set_problems(report, cfg, entries)
-        if problems:
-            return _fail(NAME, "; ".join(problems[:5]))
-        before, after = report["king_before"], report["king_after"]
-        if crown is not None and crown == report["house"]["digest"]:
-            # W5f (§2 item 2, T10): the house retakes KING_D from a miner.
-            if (report.get("crowned") is not None or after["digest"] != crown
-                    or not after["house"] or after.get("hotkey") is not None
-                    or before["house"]):
-                return _fail(NAME, f"house retake {crown[:12]}: crowned "
-                                   f"{report.get('crowned')!r}, king_after "
-                                   f"{str(after['digest'])[:12]} (house={after['house']}), "
-                                   f"king_before house={before['house']}")
-        elif crown is not None:
-            if report.get("crowned") != crown or after["digest"] != crown or after["house"]:
-                return _fail(NAME, f"crowned {report.get('crowned')!r}; re-derived {crown!r}")
-        elif report.get("crowned") is not None or after["digest"] != before["digest"]:
-            why = ("no gate record (the gate did not run)" if "gate" not in report
-                   else "no gate result passes")
-            return _fail(NAME, f"crowned {report.get('crowned')!r} / king changed, but {why}: "
-                               f"nothing may crown")
-        if prior_reports is not None:
-            try:
-                why = _chain_problems(report, prior_reports, signer_hotkey, entries)
-            except SignatureVerifierUnavailable as e:
-                return _warn(NAME, f"cannot verify the prior reports' signatures: {e}")
-            if why:
-                return _fail(NAME, f"chain: {why}")
-        if pool_dirs is not None:
-            why = _snapshot_problem(report, cfg, list(pool_dirs), windows)
-            if why:
-                return _fail(NAME, f"snapshot: {why}")
-        court = (report.get("pay") or {}).get("court") or []
-        if float((report.get("pay") or {}).get("share", -1.0)) != float(cfg.share):
-            return _fail(NAME, "pay share differs from config")
-        if not court or court[0]["digest"] != after["digest"] \
-                or (court[0]["hotkey"] is None) != bool(after["house"]):
-            return _fail(NAME, "the paid court does not start with KING_D (house slot unpaid)")
-        if len(court) > 1 + int(cfg.reward_prior_kings):
-            return _fail(NAME, f"court has {len(court)} slots; at most "
-                               f"{1 + int(cfg.reward_prior_kings)}")
-        if any(s["digest"] == report["house"]["digest"] for s in court[1:]):
-            return _fail(NAME, "the house sits in the court as a prior king")
-    except (KeyError, TypeError, ValueError) as e:
-        return _fail(NAME, f"malformed report: {type(e).__name__}: {e}")
-    n_rows = len(report.get("rows") or [])
-    return _ok(NAME, f"boundary {boundary}: {len(cohorts)} cohort(s), {n_rows} rows re-derived")
+
 
 
 def _absent_problem(record) -> str | None:
@@ -1395,5 +1680,6 @@ def check_lane_d_absent(record, cfg, *, boundary: int, previous_posterior_sha256
                             "lane D's share burns")
 
 
-__all__ = ["CONFIRMATION_STAGE_PRESENT", "check_lane_d", "check_lane_d_absent", "combined_log_ratio",
-           "window_refusal"]
+__all__ = ["ALERT", "ALERT_TAG", "BURN", "CONFIRMATION_STAGE_PRESENT", "REFUSAL_CODES",
+           "TRANSIENT_CODE", "LaneDFindings", "check_lane_d", "check_lane_d_absent",
+           "combined_log_ratio", "lane_d_findings", "refusal_class", "window_refusal"]
