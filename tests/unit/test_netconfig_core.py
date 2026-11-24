@@ -104,11 +104,10 @@ def test_parse_chain_config_is_the_loader_and_does_not_mutate_its_input():
 def test_netconfig_table_defaults_inert_and_refuses_typos():
     for path in ("chain.toml", "chain.testnet.toml"):
         c = load_chain_config(REPO / path)
-        if path == "chain.toml":
-            assert c.netconfig.owner_hotkey == c.manifest.validator_hotkey
-            assert c.netconfig.enabled
-        else:
-            assert c.netconfig.owner_hotkey == "" and not c.netconfig.enabled
+        # both releases name their main validator (testnet: owner 2026-11-24, R7t)
+        assert c.netconfig.owner_hotkey == c.manifest.validator_hotkey
+        assert c.netconfig.owner_hotkey != ""
+        assert c.netconfig.enabled
     # the shipped release (v2 launch typed, validator bench source armed)
     # needs its [netconfig] owner: dropping the table is refused
     raw = copy.deepcopy(SHIPPED_RAW)
@@ -299,7 +298,7 @@ def test_bench_policy_switch_checks_identity_alignment_and_retroactivity():
     {"marketcast": {"gain_margin": 0.0}},
     {"marketcast": {"alpha": 2.0}},
     {"marketcast": {"bootstrap_B": 50}},
-    {"marketcast": {"full_pay_tiers": [[0.01, 100000]]}},
+    {"lane_c": {"full_pay_max_days": 1.0}},        # DEC-CA-0073: below full_pay_min_days
 ])
 def test_new_runtime_controls_still_pass_the_loader(overrides):
     with pytest.raises(nc.NetConfigError, match="loader"):

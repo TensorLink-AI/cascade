@@ -271,6 +271,14 @@ jobs:
               table+=("$wp | review | PASS")
               echo "::endgroup::"; continue
             fi
+            if [ "$mode" = "retired" ]; then
+              # RETIRED rule (accept --help; scripts/laned/retired_wps at the
+              # base): an owner decision dropped the WP, its label is inert.
+              # check-pr allowed only deleting its tests dir; nothing runs and
+              # no ledger row is written (a row would read as progress).
+              table+=("$wp | retired | SKIP")
+              echo "::endgroup::"; continue
+            fi
             if [ "$mode" = "evidence" ]; then
               # evidence PR: the diff is exactly evidence file(s) named in the
               # WP's Accept cell (check-pr prints `EVIDENCE <file>` per file);

@@ -12,7 +12,8 @@ later (backfills), so the ~03:00 build that got pinned saw a partial day while
 the next-morning rebuild saw the closed day (observed live: block-8740800.tar =
 3,356 series vs its HF rebuild = 3,442). This module replaces the rebuild with
 a mirror of the pinned tar itself: download, verify sha256 against the index,
-unpack, and push both the files and the tar to the public HF dataset.
+and push the tar (plus its ``POOL_SHA256`` and small sidecars) to the public
+HF dataset in one commit.
 
 Safety guard — never reveal an active pool: entries are sorted by
 ``effective_block`` and the newest ``keep_newest`` (default 2) are withheld:
@@ -30,11 +31,11 @@ import logging
 from pathlib import Path
 
 from ..shared.hippius import (
+    POOL_SENTINEL_MIN_BLOCK,
     PoolSnapshotMeta,
     StorageError,
     read_pool_index,
     tar_cid_digest,
-    unpack_tar_to_dir,
 )
 
 log = logging.getLogger("cascade.pool")
@@ -42,7 +43,15 @@ log = logging.getLogger("cascade.pool")
 # Anything at or above this is a workflow_dispatch smoke-test sentinel
 # (999_999_999_999 in publish-pool.yml), never selectable by a validator:
 # skip them so a sentinel can't consume a keep_newest slot or be revealed.
-SENTINEL_MIN_BLOCK = 10**11
+SENTINEL_MIN_BLOCK = POOL_SENTINEL_MIN_BLOCK
+
+# Small top-level members of the tar copied next to it for browsing. The
+# per-series .npy files are NOT uploaded individually any more: thousands of
+# small LFS uploads in one commit outlived HF's 900 s presigned URLs
+# (AccessDenied: Request has expired, daily from 2026-11-20). The tar is the
+# exact artifact; consumers extract it (cascade.miner.hf_pool does).
+SIDECAR_MEMBERS = ("metadata.json", "provenance.json")
+UPLOAD_ATTEMPTS = 3
 
 # Marker file inside each revealed dir; its presence makes re-runs idempotent
 # and its content (the tar sha256) is the receipt-matching handle.
@@ -90,6 +99,7 @@ def reveal_snapshots(
     max_reveal: int = 6,
     work_dir: Path | str = "./_reveal_stage",
     prefix: str = "pool",
+    newest_only: bool = False,
 ) -> int:
     """Mirror retired snapshot tars from the pool bucket to the public HF repo.
 
@@ -98,6 +108,16 @@ def reveal_snapshots(
     first, so a backlog backfills over a few runs). Returns the number revealed.
     Raises :class:`StorageError` if any downloaded tar fails its index sha256 —
     an integrity failure must be loud, never published.
+
+    ``newest_only`` (owner 2026-11-24, one reveal per day): consider ONLY the
+    newest retired snapshot; older retirees stay in the pool bucket and are
+    never backfilled. Already revealed => nothing to do.
+
+    Each snapshot is ONE commit of the exact tar, its ``POOL_SHA256`` and the
+    small sidecars (``SIDECAR_MEMBERS``) — a handful of files, so the commit
+    finishes inside HF's presigned-URL lifetime. ``POOL_SHA256`` lands in the
+    same commit as the tar, so a failed commit leaves no marker and the next
+    run retries it (resumable); a commit is retried ``UPLOAD_ATTEMPTS`` times.
     """
     import os
 
@@ -110,6 +130,8 @@ def reveal_snapshots(
 
     index = read_pool_index(store) if prefix == "pool" else read_pool_index(store, prefix)
     candidates = select_reveals(index, keep_newest=keep_newest)
+    if newest_only:
+        candidates = candidates[-1:]
     if not candidates:
         log.info("reveal: no retired snapshots to reveal (index has %d entries)", len(index))
         return 0
@@ -142,12 +164,9 @@ def reveal_snapshots(
 
         stage = Path(work_dir) / (f"block-{meta.effective_block}" if prefix == "pool"
                                   else f"{prefix}-block-{meta.effective_block}")
-        unpack_tar_to_dir(data, stage)
-        tar_name = f"block-{meta.effective_block}.tar"
-        (stage / tar_name).write_bytes(data)
-        (stage / SHA_MARKER).write_text(meta.sha256 + "\n", encoding="utf-8")
-
-        api.upload_folder(
+        _stage_snapshot(data, meta, stage)
+        _upload_with_retry(
+            api,
             folder_path=str(stage),
             path_in_repo=dir_name,
             repo_id=hf_repo,
@@ -175,6 +194,41 @@ def reveal_snapshots(
             commit_message=f"refresh card (through block-{newest_done.effective_block})",
         )
     return revealed
+
+
+def _stage_snapshot(data: bytes, meta: PoolSnapshotMeta, stage: Path) -> None:
+    """Stage the exact tar, its ``POOL_SHA256`` and the small sidecars."""
+    import io
+    import shutil
+    import tarfile
+
+    shutil.rmtree(stage, ignore_errors=True)
+    stage.mkdir(parents=True)
+    (stage / f"block-{meta.effective_block}.tar").write_bytes(data)
+    (stage / SHA_MARKER).write_text(meta.sha256 + "\n", encoding="utf-8")
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as tar:
+        for member in tar.getmembers():
+            name = member.name.removeprefix("./")
+            if member.isreg() and name in SIDECAR_MEMBERS:
+                src = tar.extractfile(member)
+                if src is not None:
+                    (stage / name).write_bytes(src.read())
+
+
+def _upload_with_retry(api, **kw) -> None:
+    """``upload_folder`` with a bounded retry; the last error propagates."""
+    import time
+
+    for attempt in range(1, UPLOAD_ATTEMPTS + 1):
+        try:
+            api.upload_folder(**kw)
+            return
+        except Exception as e:  # noqa: BLE001 — HF raises RuntimeError/HTTP errors
+            if attempt == UPLOAD_ATTEMPTS:
+                raise
+            log.warning("reveal: upload of %s failed (attempt %d/%d: %s); retrying",
+                        kw.get("path_in_repo"), attempt, UPLOAD_ATTEMPTS, e)
+            time.sleep(30 * attempt)
 
 
 def _card(latest: PoolSnapshotMeta) -> str:
@@ -212,10 +266,15 @@ current or future round.
 snapshots/<as_of>-block-<N>/     one folder per revealed snapshot
   block-<N>.tar                  the EXACT tar validators scored
   POOL_SHA256                    its sha256 (matches receipts + publisher index)
-  <series_id>.npy                the same files, unpacked for convenience
   metadata.json                  {{series_id: {{freq, seasonal_period, domain, source}}}}
   provenance.json                build config recorded at publish time
 ```
+
+The series themselves are inside the tar (`tar -xf block-<N>.tar`, or
+`cascade iterate --pool-hf <folder>`, which verifies the sha256 and extracts).
+Folders revealed before 2026-11-24 also carry the unpacked `<series_id>.npy`.
+One snapshot is revealed per day (the newest retired one); the other retired
+snapshots are not published.
 
 Legacy `snapshots/<YYYY-MM-DD>/` folders (through 2026-08-03) predate this
 scheme: they were **rebuilds**, not byte mirrors, and are known to differ from

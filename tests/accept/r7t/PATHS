@@ -1,0 +1,9 @@
+# R7t S0c testnet drill (plan §3.0 R7t): the drill needs the testnet
+# [netconfig] owner_hotkey typed (owner 2026-11-24: the testnet main
+# validator hotkey = [manifest] validator_hotkey). R7t is an owner WP; its
+# drill Accept is `scripts/laned/accept R7t --evidence evidence/s0c_testnet.json`.
+chain.testnet.toml
+# The unit test that pinned the empty testnet key (now: = validator_hotkey).
+tests/unit/test_netconfig_core.py
+# docs/OPERATOR.md: ONLY item 6's testnet sentence (testnet identity now typed).
+docs/OPERATOR.md

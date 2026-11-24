@@ -1493,6 +1493,17 @@ class PoolSnapshotMeta:
         )
 
 
+# Anything at or above this is a workflow_dispatch smoke-test sentinel
+# (999_999_999_999 in publish-pool.yml), never selectable by a validator.
+POOL_SENTINEL_MIN_BLOCK = 10**11
+
+
+class PoolEntryFrozen(StorageError):
+    """A publish would change (or retroactively add) an index entry that is
+    within the freeze horizon of the chain head: some validator or the trainer
+    may already have resolved it, so the published bytes stay final."""
+
+
 class SnapshotPruned(StorageError):
     """The round's epoch block precedes every snapshot left in a PRUNED index:
     the snapshot that served it was trimmed out (``pool/index.json`` keeps the
@@ -1574,6 +1585,8 @@ def publish_pool_snapshot(
     horizon: int,
     max_keep: int = 60,
     prefix: str = POOL_PREFIX,
+    frozen_before_block: int | None = None,
+    allow_replace: bool = True,
 ) -> PoolSnapshotMeta:
     """Upload a pool snapshot tar and register it in ``pool/index.json``.
 
@@ -1583,9 +1596,36 @@ def publish_pool_snapshot(
     and records the greatest trimmed ``effective_block`` as ``pruned_through``,
     so :func:`select_snapshot` refuses a round older than the index instead of
     silently pinning the oldest survivor.
+
+    Freeze (consensus guard for repeated publishes): every real entry with
+    ``effective_block < frozen_before_block`` is FINAL. Replacing it with other
+    bytes, or adding a new entry below that block, raises
+    :class:`PoolEntryFrozen` BEFORE anything is written (the tar key is shared
+    per block, so even the tar must not be overwritten). Republishing identical
+    bytes is a no-op. ``allow_replace=False`` freezes every existing real entry
+    (the caller could not establish the chain head). Test sentinels
+    (``effective_block >= POOL_SENTINEL_MIN_BLOCK``) are never frozen.
     """
     sha = tar_cid_digest(tar_bytes)
     key = pool_snapshot_key(effective_block, prefix)
+    current = read_pool_index(store, prefix)
+    existing = next((s for s in current if s.effective_block == int(effective_block)), None)
+    if int(effective_block) < POOL_SENTINEL_MIN_BLOCK:
+        if existing is not None and existing.sha256 == sha and (
+                not allow_replace or (frozen_before_block is not None
+                                      and int(effective_block) < int(frozen_before_block))):
+            return existing  # identical bytes on a frozen entry: nothing to write
+        if frozen_before_block is not None and int(effective_block) < int(frozen_before_block):
+            raise PoolEntryFrozen(
+                f"pool_entry_frozen: block {effective_block} is within the freeze horizon "
+                f"(< {frozen_before_block}); "
+                + (f"keeping published sha256 {existing.sha256[:16]}…" if existing is not None
+                   else "refusing a new entry that could already be selected"))
+        if existing is not None and existing.sha256 != sha and not allow_replace:
+            raise PoolEntryFrozen(
+                f"pool_entry_frozen: block {effective_block} already published "
+                f"(sha256 {existing.sha256[:16]}…) and the chain head is unknown; "
+                "not replacing it")
     store.put_bytes(key, tar_bytes, content_type="application/x-tar")
 
     meta = PoolSnapshotMeta(
@@ -1598,7 +1638,6 @@ def publish_pool_snapshot(
         context_length=context_length,
         horizon=horizon,
     )
-    current = read_pool_index(store, prefix)
     pruned_through = int(getattr(current, "pruned_through", 0) or 0)
     index = [s for s in current if s.effective_block != meta.effective_block]
     index.append(meta)

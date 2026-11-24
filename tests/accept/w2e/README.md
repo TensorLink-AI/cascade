@@ -61,3 +61,7 @@ floor 0.85 and `d_margin` 0.01 the rev6.9 (a) check admits it
 carry 0.05; `test_w2e_backtest_cap_default_is_on_and_meets_the_inequality`
 pins it; the overlay value moves to 0.03 so it still differs from the
 default. Every other assertion is unchanged.
+
+## rev6.14 (a): judging start vs eligibility boundary (owner 2026-11-23)
+
+New key `eval_delay_hours` (default 6.0, >= 0, parsed, mutation- and round-trip-tested, shipped in both tables); `forward_margin_hours` defaults to 0.0 (6 -> 0) and the shipped tables state 0.0; the loader refuses `forward_margin_hours > eval_delay_hours` (b <= j). Tests: `test_w2e_forward_margin_hours_defaults_to_0`, `test_w2e_forward_margin_above_eval_delay_is_refused` and the table rows.

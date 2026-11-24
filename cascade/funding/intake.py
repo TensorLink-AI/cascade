@@ -465,7 +465,15 @@ class FundingIntake:
         lane_a_admission: Callable[[int | None], tuple[int, dict] | None] | None = None,
         pod_live: Callable[[str], bool] | None = None,
         on_withdrawn: Callable[[str], None] | None = None,
+        lane_refresh: Callable[[FundingIntake], None] | None = None,
     ) -> None:
+        # ``lane_refresh(intake)``: called at every lane-B / lane-C entry point
+        # before the lane's on/off check. The production intake (main.py) passes
+        # an ``EffectiveLanes`` that re-points the lane attributes below at the
+        # config in force at the current block (the adopted DEC-CA-0057
+        # overlay, read-only) so ``--lane-b/--lane-c auto`` open and close with
+        # no restart. None = the lanes are fixed at construction.
+        self.lane_refresh = lane_refresh
         # ``on_withdrawn(hotkey)``: the entry left the queue by the miner's
         # hand — any operator make-good request still parked for it is moot
         # (2026-11-04: a withdrawn 5GhPUmHV kept a pending $89 request alive).
@@ -1050,6 +1058,16 @@ class FundingIntake:
             log.warning("withdraw %s: funded ledger unreadable (%s) — key retained", hotkey, e)
             return True
 
+    def _refresh_lanes(self) -> None:
+        """Run the ``lane_refresh`` hook; it never fails a request."""
+        hook = self.lane_refresh
+        if hook is None:
+            return
+        try:
+            hook(self)
+        except Exception:  # noqa: BLE001 — a config view read never fails a request
+            log.exception("lane config refresh failed; keeping the lanes as they are")
+
     # ── lane C (DEC-CA-0056) ─────────────────────────────────────────────────
 
     def _lane_c_request(self, action: str, headers, gpu_segment: str = "",
@@ -1104,8 +1122,10 @@ class FundingIntake:
         queue) and vaults the key in the shared payer vault — the same key a
         hotkey's other legs rent on (one key per hotkey, rotated by
         ``/v1/credentials``). Consumes NO lane-A lifetime submission."""
+        self._refresh_lanes()
         try:
-            self.lane_c_queue.expire_stale()      # type: ignore[union-attr]
+            if self.lane_c_queue is not None:     # off: the gate below answers 503
+                self.lane_c_queue.expire_stale()
         except Exception:  # noqa: BLE001 — housekeeping never fails a request
             log.exception("lane-C queue TTL sweep failed")
         choice, segment, gpu_err = self._gpu_choice(headers)
@@ -1153,6 +1173,7 @@ class FundingIntake:
         """Withdraw a still-queued lane-C entry (``POST /v1/lane-c/withdraw``).
         The vaulted key is NOT forgotten here: it is shared with the hotkey's
         other legs (use ``/v1/withdraw`` to forget it)."""
+        self._refresh_lanes()
         status, ctx = self._lane_c_request("lane-c-withdraw", headers)
         if status is not None:
             return status, ctx
@@ -1249,8 +1270,10 @@ class FundingIntake:
         this ref. Queues into the lane-B queue (never the challenger queue)
         and vaults the key in the shared payer vault — the same key a
         hotkey's other legs rent on. Consumes NO lane-A lifetime submission."""
+        self._refresh_lanes()
         try:
-            self.lane_b_queue.expire_stale()      # type: ignore[union-attr]
+            if self.lane_b_queue is not None:     # off: the gate below answers 503
+                self.lane_b_queue.expire_stale()
         except Exception:  # noqa: BLE001 — housekeeping never fails a request
             log.exception("lane-B queue TTL sweep failed")
         lb_gpus = self.lane_b_gpus
@@ -1417,6 +1440,7 @@ class FundingIntake:
         """Withdraw a still-queued lane-B entry (``POST /v1/lane-b/withdraw``).
         The vaulted key is NOT forgotten here: it is shared with the hotkey's
         other legs (use ``/v1/withdraw`` to forget it)."""
+        self._refresh_lanes()
         status, ctx = self._lane_b_request("lane-b-withdraw", headers)
         if status is not None:
             return status, ctx
@@ -1428,11 +1452,13 @@ class FundingIntake:
                                 "runs to its end)"}
 
     def lane_b_queue_view(self) -> tuple[int, dict]:
+        self._refresh_lanes()
         if self.lane_b_queue is None:
             return 503, {"code": "lane_b_disabled"}
         return 200, self.lane_b_queue.public_view()  # type: ignore[union-attr]
 
     def lane_c_queue_view(self) -> tuple[int, dict]:
+        self._refresh_lanes()
         if self.lane_c_queue is None:
             return 503, {"code": "lane_c_disabled"}
         return 200, self.lane_c_queue.public_view()  # type: ignore[union-attr]

@@ -1,10 +1,309 @@
 # Plan: lane D "open weights" (anything goes on our architecture), with lane E and lane A flexibility — v3
 
-Status: **PLAN v3, ~~rev6.12~~ ~~rev6.14~~ ~~rev6.15~~ ~~rev6.16~~ ~~rev6.17~~ ~~rev6.18~~ ~~rev6.20~~ rev6.21, rev6.22, rev6.23 (proposed 2026-11-22; ~~rev6.12~~ ~~rev6.14~~ ~~rev6.15~~ ~~rev6.16~~ ~~rev6.17~~ rev6.18 2026-11-23; rev6.20, rev6.21, rev6.22, rev6.23 2026-11-24)**: v2's design, made buildable by an
+Status: **PLAN v3, ~~rev6.12~~ ~~rev6.14~~ ~~rev6.15~~ ~~rev6.16~~ ~~rev6.17~~ ~~rev6.18~~ ~~rev6.20~~ rev6.21, rev6.22, rev6.23, rev6.24, rev6.25 (proposed 2026-11-22; ~~rev6.12~~ ~~rev6.14~~ ~~rev6.15~~ ~~rev6.16~~ ~~rev6.17~~ rev6.18 2026-11-23; rev6.20, rev6.21, rev6.22, rev6.23, rev6.24, rev6.25 2026-11-24)**: v2's design, made buildable by an
 autonomous loop. A work package is done **only when its Accept command exits
 0**; **(rev6)** its level is only what `scripts/laned/status` computes (§17),
 never a claim. Owner decisions are marked **[DECIDE]**. Nothing is armed. **No calendar
 dates**: stages are gated (§5).
+
+## rev6.25 (owner 2026-11-24): lane C competitions, tests, pay and embargo by overlay (W-CMP)
+
+Owner (firm): "new test or formula and embargo days etc. should be up to our
+choice, and we should bring new lane C competitions without validators
+updating." Clarified the same day: lane C is the umbrella; MarketCast is ONE
+lane C competition; a new domain must not need a validator release, not even
+for its data source. Validators never execute owner-supplied code, so the
+owner's choice is a choice among BLOCKS every validator runs, selected by a
+signed overlay. Record: DEC-CA-0075. Builds on W-OV (#859; merge order #859 →
+this plan → the W-CMP feature PR).
+
+**(a) Declarative competitions.** `[lane_c.specs.<id>]` = runner, pool
+(prefix + signer + schema version), series selection (pool tags), universe /
+timeframes / horizons, metrics, score, guards, metric weights, `gain_margin`,
+`alpha`, `test_family`, `pay_curve`, weight in lane C, `until_block`,
+`embargo_days` / `embargo_eval_days`. Registry (`competition_spec.py`,
+published in `overlay_policy()["competition_registry"]`): runner `marketcast`;
+series metrics `returns vol range high low liquidity ohlcv funding alpha`;
+score `crps`; guards `mase qlike tail`; pool schema `cascade-std-pool/1`;
+the menu in (d). A spec compiles onto its runner's tables and goes through the
+same parser. MarketCast (`mkt:market`) is one such spec, byte-identical
+(pinned). Unknown block / key / runner / schema → typed refusal: the
+competition judges nothing, its weight stays in the split (its share burns),
+logged and recorded; out-of-bounds known keys are refused on the overlay path
+(W-OV style); unknown NAMES are adopted as a refusal so a node one release
+behind burns that share only, never forks on the whole overlay.
+
+**(b) One data format.** Every lane C competition reads a signed,
+content-addressed STANDARD POOL (`cascade-std-pool/1`: per series grid or
+timestamps, channels (C, L), freq, tags, first_seen / embargo_until; sha256
+manifest; signer) through ONE reader. Source code (market APIs, relays,
+energy feeds, scrapers) lives ONLY in pool builders (owner infra). A new
+domain = a new builder job + an overlay spec; **no validator release for a
+new data source**. The MarketCast snapshot is the special case (series
+`<bank>/<class>/<asset>`, fields as channels); its builder re-emits a
+standard pool and the judge reads either form with byte-identical windows.
+Today no other lane C competition exists in code (the DEC-CA-0056
+`domain:`/`freq:`/`horizon:` kinds are retired as not forward-only; "energy"
+is a lane B domain). An energy lane C competition is a builder job emitting a
+standard pool + a spec — once the generic runner (W-CMP2) can host a second
+competition. Domain metrics (liquidity / range ...) stay registry blocks over
+the channels the spec's pool carries.
+
+**(c) Embargo.** The trainer records `embargo_days` / `embargo_eval_days` at
+DISPATCH in the signed leg record; draw / scan / verdict / audit use the
+recorded values. `[marketcast] embargo_days` becomes overlay-settable in
+[2, 120] (amends rev6.24 (b): the training-data overlap reason is gone).
+
+**(d) Rule menu.** Test families {`plain_lcb`, `maxt`, `bonferroni`}; pay
+curves {`tiered_decay`, `fixed_term` (DEC-CA-0073 5–20 d), `indefinite_until_beaten`}.
+Lane defaults = today: B `bonferroni`/`tiered_decay`; C `bonferroni`/`fixed_term`;
+D `maxt`/`indefinite_until_beaten`. Runs in this release: B and C families
+`plain_lcb`/`bonferroni`, all three curves; D its defaults only. A
+non-default curve is recorded on the win; the audit re-derives it.
+
+**(e) Contamination hash set.** `[lane_b] contamination_hashset` (sha256 pin) +
+`contamination_hashset_key` are overlay-settable; readers fetch, verify the
+sha256 against the pin before parsing, fail closed (`HashsetMismatch`, 503).
+Amends rev5's release-only pin (WB10 tests corrected).
+
+**Consensus.** One release to all validators, satellites and the trainer;
+nothing changes until an overlay selects something. After it, specs, menu
+choices, embargo and hash-set pins are overlay data. A new block is a release.
+
+| WP | What | Keys / fields | Depends | Runs in | Accept |
+|---|---|---|---|---|---|
+| W-CMP | **(rev6.25)** `std_pool` (schema, writer, reader, MarketCast projection + builder); `competition_spec` (registry, parse with typed refusals, bounds, compile onto MarketCast, `marketcast_spec`); `rules_menu` wired into lanes B / C / D and the audit; per-leg embargo record; hash set by content hash + key with fetch-verify and intake reload | (a)–(e) | W-OV | ci | `scripts/laned/accept W-CMP` |
+| W-CMP2 | **(rev6.25, plan only)** generic runner: a second concurrent lane C competition on a standard pool (per-instance judge / legs / reports / audit), `maxt` for lanes B and C, the pool_d / lane A pool projections | (a), (b), (d) | W-CMP | ci + testnet | `scripts/laned/accept W-CMP2` |
+
+## rev6.24 (owner 2026-11-24; main @ ce27dfb): competition tweaks by signed overlay, with a code envelope
+
+Owner requests (2026-11-24, verbatim intent): "for lanes A, B, C and D, if we
+need to make tweaks to the competition, we want it so satellite validators do
+not need to update — we need the flexibility"; "for lane C make it 10k
+series"; "validators update ONLY for major upgrades, never for a
+training-image change or competition-rule tweaks"; "we just log what image
+pin was used — it's auditable"; "WHAT DATA is in each lane's eval must also
+be overlay-changeable; only rule LOGIC needs a release"; "emission split
+lane A 0 % / B 35 % / C 15 % / D 50 %". This section is the whole change:
+§14.2's rule stands, with the envelope below added to it.
+
+**Where main already is (verified at ce27dfb).** `ALLOWED` in
+`cascade/shared/netconfig.py` already admits every key of `[scoring]`,
+`[eval]`, `[lane_b]`, `[lane_c]`, `[lane_d]` (wildcards), the listed `[v2]`
+and `[marketcast]` keys and the `[round]` schedule. Satellites already adopt
+new VALUES without code: a receipt stamps `netconfig_seq` / `netconfig_digest`,
+`apply_receipt_overlay` fetches that overlay and rebuilds the config, and
+`derive_weights` runs on it; lane D's signed report also echoes `params`
+(checked against `config_at(boundary)`, burn code `ld_params`). What was
+missing: (1) nothing stops an overlay from setting a value the loader
+accepts but that is dangerous (lane B `gain_margin` 0.0005, lane D
+`bootstrap_B` 10^7, `alpha` 0.4, a lane share the carve silently clamps);
+(2) a few security-root-class keys sit inside the wildcard tables; (3) lane
+C's eval data (`[marketcast]` universe, grid) is release-only.
+
+### (a) The envelope (WP W-OV, one feature PR)
+
+New module `cascade/shared/netconfig_bounds.py`, called by
+`check_overrides` (key presence) and `build_config` (values, after the
+loader so a loader-refused value keeps its loader message):
+
+1. `BOUNDS`: a per-key numeric envelope, overlay-only (it never loosens a
+   loader check). Every shipped value in `chain.toml`, `chain.testnet.toml`
+   and the deployed file (checked 2026-11-24) is inside it, so a restating
+   S0c overlay passes.
+2. `RELEASE_ONLY_KEYS` inside allowed tables, refused by presence.
+3. `PINNED_REF_KEYS`: a data reference an overlay sets must be
+   `<repo>@<revision>` (content-addressed); a bucket prefix is
+   content-addressed by its signed, sha256-verified snapshot index.
+4. Shares: when an overlay touches a lane `share` / `takes_from`, a share
+   the carve would clamp (`lane_pool_shares` clamps silently) is refused.
+
+`overlay_policy()["envelope"]` publishes it. **Never overlay-settable**
+(code): the envelope itself, signature / trust rules, `[netconfig]
+owner_hotkey`, burn destinations, `[training]` / `[v2.training]`, storage
+endpoints, the SDK pin.
+
+**Fork note (stated up front).** An older node lacks the envelope and
+accepts a superset of what a new node accepts. The owner's publish path
+(`plan_overlay`, R7) runs the envelope, so any published overlay is one
+every node accepts. No overlay has been published on mainnet (S0c pending),
+so no adopted history can fall outside it.
+
+### (b) Key table
+
+Class **(a)** = overlay-settable inside the envelope; **(b)** = release-only.
+
+| Lane | Key | Class | Envelope / reason |
+|---|---|---|---|
+| A | `[scoring] bootstrap_B` | a | [200, 50000] |
+| A | `[scoring] bootstrap_alpha` | a | (0, 0.20] |
+| A | `[scoring] king_decay` / `reward_prior_kings` | a | (0, 1] / [0, 8] |
+| A | `[scoring] min_windows` / `min_clusters` | a | [1, 20000] / [0, 1000] |
+| A | `[scoring] win_margin_*` (start, end, start_prev, *_v2), `margin_increment_floor` | a | [0, 0.5] |
+| A | `[scoring] bench_gate_tolerance`, `gift_gate_tolerance` / `bench_gate_min_win_rate` / `bench_gate_min_items` | a | [0, 0.5] / [0, 1] / [1, 10000] |
+| A | `[scoring] cascade_top_k` | a | [1, 16] |
+| A | `[eval] n_windows` / `shared_ladder_windows` / `mix_target_windows` / `num_samples` | a | [100, 20000] / [500, 20000] / [0, 20000] / [8, 1000] |
+| A | `[v2] win_margin_start` / `win_margin_end` / `king_check_margin` / `sentinel_tau` | a | [0, 0.5] / [0, 0.5] / [0, 1] / [0, 0.10] |
+| A | other `[scoring]` / `[eval]` / listed `[v2]` keys (switch blocks, modes, forfeit) | a | loader checks + retroactivity guard (unchanged) |
+| A | `[scoring] prior_contract_digest` | **b** | a contract digest |
+| A | `[eval] shared_ladder_feature` | **b** | a fork-guard feature name |
+| A | `[eval] benchmark_project_dir`, `gift_gate_data_dir` | **b** | operator-local paths |
+| A | `[v2] *_after` image pins, `[training]`, `[v2.training]` | **b** | contract / numerics (see (e)) |
+| B | `share` | a | [0, 0.75] + no clamp |
+| B | `alpha` / `bootstrap_B` / `gain_margin` | a | (0, 0.10] / [200, 50000] / [0.002, 0.25] |
+| B | `min_target_windows`, `min_guard_windows` / `affinity_windows` / `min_target_clusters` | a | [10, 20000] / [16, 20000] / [2, 1000] |
+| B | `tau_domain`, `tau_public` / `traffic_steal_bound` | a | [0, 0.10] / [0, 0.25] |
+| B | `leg_hours`, `max_leg_hours` / `max_leg_seconds` / `guard_factor` | a | (0, 48] / [60, 345600] / [1, 4] |
+| B | `sentinel_max_defer_eras` | a | [0, 100] |
+| B | `full_pay_tiers`, `half_life_rounds`, `floor`, `win_ttl_eras`, `domains`, `suite_targets`, `open_rule`, experts fracs, `funded_pod_skus` | a | loader checks |
+| B | `remainder`, `contamination_hashset` | **b** | burn destination / data pin (unchanged) |
+| C | `share` | a | [0, 0.5] + no clamp |
+| C | `alpha` / `bootstrap_B` / `gain_margin` | a | (0, 0.10] / [200, 50000] / [0.002, 0.25] |
+| C | `n_windows` / `min_target_windows` / `min_target_clusters` | a | [100, 20000] / [10, 20000] / [2, 1000] |
+| C | `tau_public` / `leg_hours` / `legs_per_target` | a | [0, 0.10] / (0, 48] / [1, 16] |
+| C | `targets`, `full_pay_tiers`, payout schedule, competition `weight` / `until_block` | a | loader + competition rule (unchanged) |
+| C | `[marketcast] alpha` / `bootstrap_B` / `gain_margin` / `min_windows` / `min_clusters` / `min_time_blocks` | a | (0, 0.10] / [200, 50000] / [0.002, 0.25] / [50, 20000] / [2, 1000] / [1, 100] |
+| C | `[marketcast] calibration_z` / `cell_ratio_cap` / `near_dup_tol` / `report_timeout_settlements` / `max_infra_deferrals` | a | [1, 10] / (1, 100] / [0, 0.5] / [1, 100] / [0, 100] |
+| C | **(new)** `[marketcast] assets`, `frequencies`, `horizons`, `composite_suite_weights` | a | loader checks (geometry, classes) |
+| C | **(new)** `[marketcast] windows_per_cell` | a | [1, 512] |
+| C | `remainder` | **b** | burn destination (unchanged) |
+| C | `[marketcast] base_ref`, `base_sha256`, `base_arch`, `from_block`, `suites`, `data_sources`, `pool_prefix`, context lengths, `pod_image`, fingerprint | **b** | model / data-source code / arming / image |
+| C | `[marketcast] embargo_days` | **b** | a recipe is accepted under one embargo but its gap windows are cut under the verdict's value: a raise would score on training data. Overlay-settable only once each entry pins its embargo (follow-up) |
+| D | `share` | a | [0, 0.5] + no clamp |
+| D | `alpha` / `bootstrap_B` / `d_margin`, `gain_margin` | a | (0, 0.10] / [200, 50000] / [0.002, 0.25] |
+| D | `min_windows` / `max_windows_per_settlement` / `min_clusters` / `max_entries_per_settlement` | a | [100, 20000] / [1000, 20000] / [2, 1000] / [1, 64] |
+| D | `king_decay` / `reward_prior_kings` / `tau_public` | a | (0, 1] / [0, 8] / [0, 0.10] |
+| D | `embargo_hours` / `forward_margin_hours` / `max_mirror_lag_hours` | a | [0, 168] / [0, 48] / (0, 168] |
+| D | `backtest_weight_cap` / `backtest_ratio_floor` / `max_source_share` | a | [0, 0.25] / [0.5, 1) / (0, 1] |
+| D | rate limits, TTLs (`max_open_per_coldkey`, `max_judged_*`, `max_coldkey_unresolved_settlements`, `max_reveal_delay_days`, `max_bench_holds`, `loser_ttl_eras`, `ready_ttl_blocks`) | a | [1, 64] / [1, 64] / [1, 1000] / [1, 365] / [0, 64] / [0, 1000] / [1, 10^6] |
+| D | `from_block`, `until_block`, `takes_from`, `contexts`, `horizon`, `gate_suites`, `gate_weights`, `lowfreq_freqs`, `confirm_on_king_change` | a | loader checks |
+| D | `pool_prefix`, `real_corpus_ref` | a | data: `real_corpus_ref` must be `<repo>@<rev>` |
+| D | `remainder` / `teacher_ref` / `teacher_api` | **b** | burn destination / model pin / external endpoint |
+| all | the envelope, signature rules, `[netconfig]`, `[storage]`, `[manifest]`, `[chain]`, `[activation]` | **b** | security roots (unchanged) |
+
+Keys other builders are adding (`[lane_d] court_weights`, the decaying
+`d_margin_*`, `eval_delay_hours`, `public_weight`; lane B levers and
+`indefinite_pay_from_block`; MarketCast pay-days) are not on main at
+ce27dfb. They are overlay-settable by the wildcard the day they land; each
+lands with its `BOUNDS` row in the same PR (§14.3 rule 5).
+
+### (c) Eval data by overlay (owner: "only rule LOGIC needs a release")
+
+| Lane | Data key | Today | rev6.24 |
+|---|---|---|---|
+| A | `[eval] window_pool`, `eval_dataset`, `eval_source`, `n_windows`, `shared_ladder_windows` | overlay (wildcard) | overlay; `window_pool` must be `<repo>@<rev>` |
+| A | pool caps per domain | pool publisher (not validator config) | unchanged: the snapshot is signed + sha256 indexed |
+| B | `domains`, `suite_targets`, `require_public`, horizons | overlay (wildcard) | overlay, loader checks |
+| C | `[marketcast] assets`, `frequencies`, `horizons`, `composite_suite_weights`, `windows_per_cell` | release-only | **overlay** (W-OV) |
+| C | `embargo_days`, `data_sources`, `suites` | release-only | release-only (see (b)) |
+| D | `pool_prefix`, `real_corpus_ref`, `min_fresh_window_share`, `max_windows_per_settlement` | overlay (wildcard) | overlay, `real_corpus_ref` content-addressed |
+| D | public sources (GiftEvalPretrain / RMISC revisions, `index_sha256`, `files_sha256`, allowed-list digest, per-source windows, weight split) | not on main (F3, #851) | **(F3 follow-up)** add as `[lane_d]` keys with `PINNED_REF_KEYS` / `BOUNDS` rows when F3 lands; the signed report already carries index hash + revision (rev6.18 A6) |
+| D | live feed catalog / per-feed embargo, per-bin quotas | forge catalog pinned per snapshot (W6b) | unchanged: data in the signed snapshot |
+
+The rule for every data reference: content-addressed (revision + hash), in
+force only from the overlay's apply block (an era start). **Lane A only at
+a seed-epoch boundary** is NOT enforced by an era-start overlay (a seed epoch
+spans eras and is derived from the king history, `era.v2_seed_epoch_start`),
+so a lane A data change by overlay must be published at a seed-epoch start
+by the owner until W-IMG (e) adds the check.
+
+### (d) Lane C "10k series" — not built, owner decision needed
+
+`[lane_c] n_windows` (1000) is **read by nothing**: lane C's only
+competition is MarketCast, and `chain.toml` says "MarketCast does not read
+them" (the `[lane_c]` verdict keys are kept for a future competition).
+Setting it to 10000 changes nothing. MarketCast scores EVERY grid window:
+`[marketcast] windows_per_cell` (48) per (suite label, asset, horizon), so
+`mkt:market` holds up to 7 suites (ohlcv = 4 labels) x 58 assets x 6 horizons
+x 48 = **167,040** windows before the liquidity filter (≈ 16,700 per
+single-label suite; the gap horizons only at dispatch). **[DECIDE]** which
+of: (1) a cap of 10,000 windows per entry drawn by the settlement block hash
+(new consensus code + audit replay; lowers compute), (2) about 10k per
+suite via `windows_per_cell` ≈ 29 (an overlay after W-OV, no code), or (3)
+nothing (already ≥ 10k). W-OV bounds `[lane_c] n_windows` to [100, 20000]
+and its satellite test adopts 10000 by overlay, but no default changes, so
+nothing forks at tonight's lane C arming (9579600).
+
+### (e) Worker images (WP W-IMG, plan only; NOT built in W-OV)
+
+Owner rule as simplified 2026-11-24: lanes B, C, D record the worker image
+digest each leg / eval ran in its signed record and the audit reports it
+(no allowlist). Lane A: every leg compared in one duel / seed epoch (king and
+challengers) runs the SAME image digest, recorded in the contract /
+receipt; validators check equality within the epoch, not a fixed pin; the
+trainer picks the image at a seed-epoch boundary (enforced); the
+measured-wall gate stays per image (no measured wall on the recorded image
+⇒ the 5 h cap).
+
+Why it is a separate WP: it rewrites the reproducibility contract
+(`train_image_digest` is a `[v2.training]` contract term, folded into
+`contract_digest`; the builder safety rule and CLAUDE.md forbid contract
+changes without an explicit owner sign-off), and the seed-epoch boundary is
+state-derived (`era.v2_seed_epoch_start`, warm eras), not a config fact
+`build_config` can check. The 2026-11-01 incident (a repin inside a v2 seed
+epoch made every validator reject king pointers / entry contracts) is the
+failure W-IMG must prevent. Places that compare against a fixed pin today
+(the W-IMG inventory): `trainer/leg_pins.py`, `shared/manifest.py`,
+`trainer/launch_preflight.py`, `trainer/contract.py`,
+`shared/image_qualification.py`, `provision/main.py`,
+`trainer/runner_funded_pods.py`, `audit/rederive.py`, `shared/decided.py`,
+`shared/config/{training,loader,rounds,chain_config,marketcast}.py`,
+`trainer/{runner_operator_pods,rolling,cost_guards,runner_funded_legs,main}.py`,
+`shared/era.py`, `provision/{health,codeprint,core}.py`, `validator/era_gate.py`,
+`funding/{step_rates,lane_b_gpus}.py`, `audit/checks.py`. W-IMG's test: an
+epoch whose king and challenger ran image X passes; mixed images in one
+epoch are refused; a new image at the next seed-epoch boundary passes with
+no validator code or config change. **DECIDED (owner 2026-11-24, the
+deliberate reproducibility-contract decision; verbatim):** "can we relax
+need for image to be pinned"; "we need a system so that we roll all these
+lanes out, validators only need to update for major upgrades, not if we
+tweak training image or comp rules"; "we just log what image pin was used,
+it's auditable". Lane A keeps the image inside each leg's `contract_digest`
+(duel reproducibility intact); only the fixed config pin goes, replaced by
+the one-image-per-seed-epoch rule, released then activated by a typed
+seed-epoch-boundary block.
+
+### (f) Emission split A 0 / B 35 / C 15 / D 50 (owner 2026-11-24), by overlay
+
+The four shares are overlay keys (`[lane_b] share`, `[lane_c] share` /
+`takes_from`, `[lane_d] share` / `takes_from`; lane A gets the rest). Lane A
+is live with six external validators, so the repo defaults do NOT change
+(A 50 / B 25 / C 25 / D 0); W-OV ships ready-to-sign overrides,
+`deploy/overlays/split-a0-b35-c15-d50.{testnet,mainnet}.toml`: B 0.35,
+C 0.15 from lane A, D 0.50 from lane A ⇒ A = 1 − 0.35 − 0.15 − 0.50 = 0
+exactly (in float too). It applies at an era start (the overlay rule).
+Inside the envelope (B ≤ 0.75, C ≤ 0.5, D ≤ 0.5, no clamp: D's 0.50 is
+exactly A's pool after B and C). The code handles A = 0: `lane_parts`
+scales lane A's court by a 0 pool (no division); the ladder, carry-over cap
+and key slash re-shape that empty pool only; W-OV tests the exact vector.
+
+**Caveat (stated up front):** lane D is carved only while it PAYS
+(`lane_pool_shares` takes C and D only when active). Until `[lane_d]
+from_block` arms, lane D's 50 % stays with lane A: the live split is then
+A 50 / B 35 / C 15. Lane B pays only while it is armed (`[lane_b]
+from_block`, 0 on main): its unpaid slots burn. To reach A 0 the lane D
+arming overlay must restate these keys (overlays are snapshots).
+
+| Row | Value | How |
+|---|---|---|
+| `[lane_b] share` | 0.35 | overlay |
+| `[lane_c] share` / `takes_from` | 0.15 / `lane_a` | overlay |
+| `[lane_d] share` / `takes_from` | 0.50 / `lane_a` | overlay |
+| lane A | 0 (the rest) | derived |
+
+Owner steps: (1) dry run `cascade-validator --chain-toml chain.testnet.toml
+--netconfig-overlay deploy/overlays/split-a0-b35-c15-d50.testnet.toml
+--netconfig-effective-block <next era start ≥ 1 era ahead>` (testnet
+`[netconfig] owner_hotkey` must be set first — R7t); (2) sign + publish
+with `--netconfig-publish`; (3) observe ≥ 51 % `cfg-` lock, adoption at the
+block, receipts stamping `netconfig_seq`, satellite vectors equal; (4) the
+same against the DEPLOYED mainnet chain.toml with the mainnet file
+(after S0c's no-op overlay, §5 row 4).
+
+| WP | What | Keys / fields | Depends | Runs in | Accept |
+|---|---|---|---|---|---|
+| W-OV | **(rev6.24)** Signed-overlay envelope: `netconfig_bounds` (`BOUNDS`, `RELEASE_ONLY_KEYS`, `PINNED_REF_KEYS`, no-clamp shares), called by `check_overrides` / `build_config`, published by `overlay_policy()`; lane C eval data in `ALLOWED["marketcast"]`; DEC-CA-0057 amendment; the (f) split overrides in `deploy/overlays/` with the lane A = 0 vector test | table (b), (f) | W2 | ci | `scripts/laned/accept W-OV` |
+| W-IMG | **(rev6.24, DECIDED owner 2026-11-24, see (e))** Image recorded per leg (lanes B–D, audit reports it); lane A same-image-within-seed-epoch rule replacing fixed-pin comparisons; image changes only at a seed-epoch boundary; measured-wall gate per recorded image, else the 5 h cap | (e) | W-OV | ci + testnet | `scripts/laned/accept W-IMG` |
 
 ## rev6.22 (owner 2026-11-24; main @ bd07cb5): lane B slots pay until replaced; every slot tested in two max-T families
 
@@ -301,15 +600,16 @@ Testnet (netuid 259) first.
 | (a) | Four miner levers on lane B legs (no activation block); 12 h legs; token/hour limits; own-risk GPUs; EMA set; `context_length` refused (`context_length_unsupported`) pending an owner decision | rev6.21 (this section), §12b.6, WB27 row |
 | (b) | Feature PR WPs: WB27 (new), WB23 (intake, leg record), WB10 (keys), WB22 (manifest, driver), W-EMA (`pyramid_trainer.py`), W9 (`LANE_B_STAGES`), WB24 (CLI), WB20 (docs) | §3 |
 
-## rev6.23 (owner 2026-11-24; main @ b65f25d): lane D court pays 80 / 15 / 5
+## rev6.23 (owner 2026-11-24; main @ b65f25d): lane D court pays 80 / 15 / 5; the crown bar decays with tenure
 
-One owner decision, for **lane D only** (owner 2026-11-24, DECIDED): lane
-D's paid court shares become **explicit weights**: current KING_D
-**80%**, prior king 1 **15%**, prior king 2 **5%** of lane D's share. This
-replaces the geometric `king_decay = 0.5` (which gave 57 / 29 / 14). Plan
-text only; the code lands as one feature PR (rev6.17 rule), tests and code
-together. Changed text elsewhere is marked **(rev6.23)**; superseded text
-is struck, not deleted.
+Two owner decisions, for **lane D only** (owner 2026-11-24, DECIDED):
+(1) lane D's paid court shares become **explicit weights**: current KING_D
+**80%**, prior king 1 **15%**, prior king 2 **5%** of lane D's share,
+replacing the geometric `king_decay = 0.5` (which gave 57 / 29 / 14);
+(2) the lane D **crown bar decays with the king's tenure**, like lane A's
+(below). Plan text only; the code lands as one feature PR (rev6.17 rule),
+tests and code together. Changed text elsewhere is marked **(rev6.23)**;
+superseded text is struck, not deleted.
 
 **Config (W2 / W2e).**
 
@@ -342,6 +642,47 @@ share. Every other court rule is exactly today's:
   take `0.80 / 0.95` and `0.15 / 0.95`;
 - a failed lane D check burns only lane D (rev6.18 F1/B1).
 
+**The crown bar (decision 2).**
+
+- New keys `[lane_d] d_margin_start = 0.03` and
+  `d_margin_warmup_settlements = 32` (32 × 3 h ≈ 4 days). **`d_margin`
+  (0.01) is kept as the bar's end** (the floor) rather than retired for a
+  new `d_margin_end`: it already is the floor everywhere it is read (the
+  W5i `1 - floor ** cap < d_margin` inequality, the T14 / `null_fpr`
+  calibration, the held-clear provenance check), so keeping the name keeps
+  those bindings exact and changes no echo field; a second name for the
+  same value would be two keys to keep equal. Lane A's margin keys are
+  untouched.
+- **The bar at a settlement** is `d_margin_start - (d_margin_start -
+  d_margin) * t / d_margin_warmup_settlements` for tenure `t <
+  warmup`, and exactly `d_margin` from `t = warmup` on (exactly
+  `d_margin_start` at `t = 0`).
+- **Tenure** `t` = the lane D settlements the current KING_D has held the
+  crown before this one. The house holding the crown counts: genesis (the
+  house) is tenure 0 at the first armed settlement, and a house refresh in
+  place does not reset it. A crown (a miner crowned, or the house retaking
+  from a miner) makes the next settlement tenure 1; otherwise each
+  settlement adds 1. It is counted over **settled** lane D settlements (the
+  state's `king_tenure`): an absent settlement (W14 `report_absent` /
+  `infra_deferred`, nothing judged) writes no state and does not age the
+  king, so the bar never falls while lane D is not judging.
+- **The crown test** uses the bar in force: a first verdict clears iff its
+  combined LCB ≥ the bar (and the gain is positive), against KING_D and,
+  with a miner king, the house bar alike.
+- **Loader checks:** `d_margin` in (0, 1) (so `end ≤ 0` is refused),
+  `d_margin_start` in (0, 1), `d_margin ≤ d_margin_start` (`end >
+  start` refused), `d_margin_warmup_settlements` an int ≥ 1.
+- **Recording and checks:** the signed report's `params` echo the three
+  keys; a new required report field `crown_bar = {tenure, margin}` records
+  the tenure and the bar applied. The audit re-derives the bar from the
+  config at the stated tenure (`check_lane_d`, code `ld_params`: a burn
+  check), judges every verdict against it, and in chain mode requires the
+  tenure to continue from the previous signed report; the chain replay
+  (`lane_d_chain`, W7d/W8b) carries the tenure itself from genesis and
+  checks each state snapshot's `king_tenure`.
+- **Prior-king pay keeps no time limit** for now (not decided; D25's
+  time-bound tails stay open).
+
 **Not an activation change.** Lane D is not armed on mainnet
 (`from_block = 0`). This changes a default in the shipped files and the
 parser; no activation block, no `cfg-` vote, no overlay is needed. The
@@ -358,7 +699,7 @@ the paid court" burn check). The validator's builder
 (`cascade.shared.emission.lane_d_vector`) takes `court_weights` too.
 
 **Text struck elsewhere:** §1.4 (court decay), the W2 key list, D7 (§6 and
-§17.4), D25's 57 / 29 / 14.
+§17.4), D25's 57 / 29 / 14 and its fixed 0.01 bar, D5 (§6, the bar).
 
 ## rev6.20b (owner 2026-11-24): no activation block for lane B EMA
 
@@ -3907,7 +4248,7 @@ Accept command exits 0**, never on a builder's word. Conventions:
 | WP | What | Depends | Runs in | Accept |
 |---|---|---|---|---|
 | W1 | **(rev3)** Measurement (= S1 B2, `scripts/laned_w1_measure.py`): first-seen existence check; snapshot-diff **upper bound** on forward-eligible counts at both clocks; pool_mkt at 6 h; (§1.3, §1.7): forward-eligible counts and latency per frequency; long-history inventory per context variant; `pool_d` size. **(rev6.14)** The script's single `--margin-hours` (default 6) is split to match rev6.14 (a): `--fresh-from` semantics (fresh / eligibility counted from `T + forward_margin_hours`, default 0) and counts taken at the first snapshot / settlement ≥ `T + eval_delay_hours` (default 6); fresh and embargo windows reported separately per frequency (10 s / 1-min / 5-min sources counted) | — | builder (needs `TSFORGE_S3`) | `scripts/laned/accept W1 --evidence evidence/w1.json` |
-| W2 | `[lane_d]` config: the keys `from_block`, `until_block`, `share`, `takes_from`, `remainder`, `contexts`, `horizon`, `forward_margin_hours`, `min_windows`, `min_clusters`, `min_long_series`, `d_margin`, `alpha`, `bootstrap_B`, `gate_suites`, `gate_weights`, ~~`unselected_suite`~~ **(rev5) dropped:** the held-out suite is the §16 sentinel, drawn from `[v2] sentinel_suites` (W-S1); a lane D key would duplicate it, `tau_public`, `reward_prior_kings`, ~~`king_decay`~~ **(rev6.23)** `court_weights` (`[0.80, 0.15, 0.05]`; length `1 + reward_prior_kings`, each ≥ 0, sum 1 within 1e-9; `king_decay` → `RETIRED_KEYS["lane_d"]`), `max_entries_per_settlement`, `max_open_per_coldkey`, `max_bench_holds`, `loser_ttl_eras`, `dtypes`, **(rev3)** `max_mirror_lag_hours` (A1), `confirm_on_king_change` (D20), `max_judged_per_coldkey_per_settlement` (A8), `max_coldkey_unresolved_settlements` (A8), `max_reveal_delay_days` (A9), `lowfreq_freqs` (A10); **(rev5)** `ready_ttl_blocks` (B10), `max_source_share` (B14); **(rev6.9)** `backtest_weight_cap` (default ~~0~~ **(rev6.15)** 0.05) and `backtest_ratio_floor` (rec 0.85), parsed and range-checked here, with the inequality check in W5i; `contexts` default ~~`[4096, 8192, 16384]` (A5)~~ **(rev6.6)** `[4096, 8192, 16384, 32768, 65536, 131072]` (every variant declarable from launch; arming per variant is computed, not configured, §1.1); `dtypes` default `["BF16"]` (A6). **(rev3) Size M, not S:** `lane_d.py` hardcodes `active() = False` (`:65-68`), refuses `from_block > 0` (**(rev5)** `:78-79`) and carries DEC-CA-0062 placeholder keys that must keep parsing (`until_block` and `share` overlay-settable; activation by signed-overlay `from_block`, never a DEC-CA-0045 vote), plus legacy keys still parsed (the deployed file carries `targets`, `teacher_*`, `gain_margin`, …); `ALLOWED["lane_d"]` with `remainder` refused via the `(table, key)` special case (**(rev5)** `netconfig.py:210`); loader parse, round-trip and **mutation** test per key; the 131072 cap; `LaneDConfig.active()` real | W0c | ci | `scripts/laned/accept W2` (includes `unread_keys.py`) |
+| W2 | `[lane_d]` config: the keys `from_block`, `until_block`, `share`, `takes_from`, `remainder`, `contexts`, `horizon`, `forward_margin_hours`, `min_windows`, `min_clusters`, `min_long_series`, `d_margin`, `alpha`, `bootstrap_B`, `gate_suites`, `gate_weights`, ~~`unselected_suite`~~ **(rev5) dropped:** the held-out suite is the §16 sentinel, drawn from `[v2] sentinel_suites` (W-S1); a lane D key would duplicate it, `tau_public`, `reward_prior_kings`, ~~`king_decay`~~ **(rev6.23)** `court_weights` (`[0.80, 0.15, 0.05]`; length `1 + reward_prior_kings`, each ≥ 0, sum 1 within 1e-9; `king_decay` → `RETIRED_KEYS["lane_d"]`), **(rev6.23)** `d_margin_start` (0.03, ≥ `d_margin`) and `d_margin_warmup_settlements` (32, ≥ 1), `max_entries_per_settlement`, `max_open_per_coldkey`, `max_bench_holds`, `loser_ttl_eras`, `dtypes`, **(rev3)** `max_mirror_lag_hours` (A1), `confirm_on_king_change` (D20), `max_judged_per_coldkey_per_settlement` (A8), `max_coldkey_unresolved_settlements` (A8), `max_reveal_delay_days` (A9), `lowfreq_freqs` (A10); **(rev5)** `ready_ttl_blocks` (B10), `max_source_share` (B14); **(rev6.9)** `backtest_weight_cap` (default ~~0~~ **(rev6.15)** 0.05) and `backtest_ratio_floor` (rec 0.85), parsed and range-checked here, with the inequality check in W5i; `contexts` default ~~`[4096, 8192, 16384]` (A5)~~ **(rev6.6)** `[4096, 8192, 16384, 32768, 65536, 131072]` (every variant declarable from launch; arming per variant is computed, not configured, §1.1); `dtypes` default `["BF16"]` (A6). **(rev3) Size M, not S:** `lane_d.py` hardcodes `active() = False` (`:65-68`), refuses `from_block > 0` (**(rev5)** `:78-79`) and carries DEC-CA-0062 placeholder keys that must keep parsing (`until_block` and `share` overlay-settable; activation by signed-overlay `from_block`, never a DEC-CA-0045 vote), plus legacy keys still parsed (the deployed file carries `targets`, `teacher_*`, `gain_margin`, …); `ALLOWED["lane_d"]` with `remainder` refused via the `(table, key)` special case (**(rev5)** `netconfig.py:210`); loader parse, round-trip and **mutation** test per key; the 131072 cap; `LaneDConfig.active()` real | W0c | ci | `scripts/laned/accept W2` (includes `unread_keys.py`) |
 | W2b | `[lane_d_ops]` non-consensus table (vault bucket, `pool_d` location, eval host, queue policy), read only by the main validator and the intake; never in receipts | W2 | ci | `scripts/laned/accept W2b` (satellite code path imports nothing from it) |
 | W2e | **(rev6.10, owner 2026-11-23)** `[lane_d]` keys added to W2's set (a separate row so W2's text stays untouched while #745 edits it): `embargo_hours` (default **48**, decided: lane A's ~48 h reveal delay; ≥ 0; 0 = the rev3 rule), `max_windows_per_settlement` (~~rec 2000~~ **(rev6.11)** **5000**, owner 2026-11-23; refused below `min_windows`); ~~**(rev6.11)** `embargo_window_share_cap` (rec **0.25**, in [0, 1]; 0 = no embargo windows)~~ **(rev6.12)** renamed and redefined: `min_fresh_window_share` (**0.5**, owner 2026-11-23, in [0, 1]; 1 = fresh windows only; the minimum fresh share of a frozen set, rev6.12 (b)). ~~Also confirms `forward_margin_hours` = **6** (already the default, `cascade/shared/config/lane_d.py:59`, `:244`).~~ **(rev6.14)** Adds `eval_delay_hours` (default **6**, float, ≥ 0; the judging start `j`) and changes the `forward_margin_hours` default **6 → 0** (`cascade/shared/config/lane_d.py:59`, loader `:244`); refuses `forward_margin_hours > eval_delay_hours`. A config default is consensus-relevant (every validator must derive the same `b`, `j`); lane D is unarmed, so no live effect; before arming, diff the deployed chain.toml for an explicit `forward_margin_hours = 6` override. Loader parse, round-trip and mutation test per key (a dataclass field without a loader parse is a silent no-op); both are overlay-settable lane D tuning (§14.2) | W2 | ci | `scripts/laned/accept W2e` (includes `unread_keys.py`) |
 | W1.5 | **Walking skeleton** `make laned-e2e` (CI): fixture `pool_d` (with `end_ts`) → tiny checkpoint → intake (filesystem adapter behind the real storage interface) → ingest guards → scorer → signed report → `lane_d_state.json` → emission → `check_lane_d` | W2 | ci | `make laned-e2e` asserts: non-zero lane D weight for the challenger; audit passes; one tampered row fails; unarmed byte-identical; `share = 0` leaves weights unchanged and still yields a valid report; `LaneDConfig.active()` is not a constant. **Every later WP keeps it green and adds ≥ 1 assertion** |
@@ -4378,7 +4719,7 @@ is **accepted** unless a row says otherwise. The explicit answers:
 | D2b | Gate | **(rev3)** One gate suite drawn per crowning from the suites **not** held out this era; the held-out suite is the §16 cross-lane sentinel (replaces fixed "TIME unselected"); `tau_public` 0.01; anchors = KING_D and house |
 | D3 | Rate limits | 1 open per hotkey; 2 open per coldkey; 8 judged per settlement |
 | D4 | Eval fee | None at launch |
-| D5 | Margins and floors | `d_margin` 0.01 (level units, re-checked by T14); `forward_margin` ~~6 h~~ **(rev6.14)** 0 h (fresh = data after submission T) and `eval_delay_hours` 6 h (judging start; owner 2026-11-23); 1000 windows / 20 sources. **(rev6.10, owner 2026-11-23)** `embargo_hours` 48 h (lane A's ~48 h reveal delay; per-feed catalog override can only shorten); `max_windows_per_settlement` ~~rec 2000~~ **(rev6.11)** 5000 (owner 2026-11-23); **(rev6.11)** ~~embargo only for hourly-and-slower series,~~ **(rev6.12)** embargo for every cadence (owner 2026-11-23), ~~`embargo_window_share_cap` rec 0.25~~ **(rev6.12)** fresh-first draw, `min_fresh_window_share` 0.5 (owner 2026-11-23; below it at the floors ⇒ not frozen, pending); floors unchanged |
+| D5 | Margins and floors | `d_margin` 0.01 (level units, re-checked by T14; **(rev6.23)** the floor of a tenure-decaying crown bar: `d_margin_start` 0.03 → `d_margin` over `d_margin_warmup_settlements` 32, owner 2026-11-24); `forward_margin` ~~6 h~~ **(rev6.14)** 0 h (fresh = data after submission T) and `eval_delay_hours` 6 h (judging start; owner 2026-11-23); 1000 windows / 20 sources. **(rev6.10, owner 2026-11-23)** `embargo_hours` 48 h (lane A's ~48 h reveal delay; per-feed catalog override can only shorten); `max_windows_per_settlement` ~~rec 2000~~ **(rev6.11)** 5000 (owner 2026-11-23); **(rev6.11)** ~~embargo only for hourly-and-slower series,~~ **(rev6.12)** embargo for every cadence (owner 2026-11-23), ~~`embargo_window_share_cap` rec 0.25~~ **(rev6.12)** fresh-first draw, `min_fresh_window_share` 0.5 (owner 2026-11-23; below it at the floors ⇒ not frozen, pending); floors unchanged |
 | D6 | Bench capacity | Queue behind lane A; second pod if crownings slip > 1 settlement |
 | D7 | Court | 2 prior miner kings, ~~decay 0.5~~ **(rev6.23)** `court_weights` 80 / 15 / 5 (owner 2026-11-24); house never in the court |
 | D8 | Losers | Private; vault TTL 4 eras; owner-only archive 14 days; then delete |
@@ -5290,7 +5631,7 @@ at `ready`) was found sound against target leakage. The weak part is pay.
 
 | # | Issue | Option A (keep v2) | Option B (proposed) |
 |---|---|---|---|
-| **D25** | **Court pays rent indefinitely; salami-slicing.** The court is rank-decayed (~~57/29/14% of D's share at `king_decay` 0.5~~ **(rev6.23)** 80/15/5% of D's share by `court_weights`, 2 priors) with no TTL, and the bar is a fixed 0.01. A 3% gain released as three 1% crowns fills the whole court | Simple; matches lane A's court shape | Pay D wins on lanes B and C's `full_pay_tiers` + `half_life_rounds` + `win_ttl_eras` shape, keyed to the crowning LCB over max(KING_D, house). Or a tenure-decaying bar (e.g. 0.03 → 0.01). Or time-bound prior-king tails, like lane A's `court_bp` / `court_blocks` |
+| **D25** | **Court pays rent indefinitely; salami-slicing.** The court is rank-decayed (~~57/29/14% of D's share at `king_decay` 0.5~~ **(rev6.23)** 80/15/5% of D's share by `court_weights`, 2 priors) with no TTL, and the bar is ~~a fixed 0.01~~ **(rev6.23)** a tenure-decaying 0.03 → 0.01 over 32 settlements (owner 2026-11-24; prior-king tails still have no TTL). A 3% gain released as three 1% crowns fills the whole court | Simple; matches lane A's court shape | Pay D wins on lanes B and C's `full_pay_tiers` + `half_life_rounds` + `win_ttl_eras` shape, keyed to the crowning LCB over max(KING_D, house). Or a tenure-decaying bar (e.g. 0.03 → 0.01). Or time-bound prior-king tails, like lane A's `court_bp` / `court_blocks` |
 | **D26** | **Lane A is a free input to D, and D's 20% comes out of A.** **(rev6:** D's share is now 25% of the total, D1/D48**)** The cheapest winning D entry is "fine-tune the published house". Generators and recipe are published (**(rev5)** `[generation] king_publish = "recipe"`, `chain.toml:1555` on main `07117e1`; not `[v2]`) | Lane A is paid by its own ladder; D pays only for beating the house | A **lineage royalty**: a fixed ρ ≈ 15–20% of each D win's pay goes to the lane A king hotkey that was the house at the winner's T_E. Calibrate ρ in shadow with a weight-space nearest-ancestor measurement. Never self-declared lineage |
 | **D27** | **Withholding from A.** A strong generator may earn more used privately in D than published in A | Accept; monitor how many D kings are far from every published A checkpoint | The D26 royalty, plus keep A's share ≥ D's |
 | **D28** | **Split.** v2 has A 30 / B 25 / C 25 / D 20 when all are armed | v2 split | Reviewer: **A 40 / D 25 / B 20 / C 15**, with D ramping 15 → 25% after ≥ 3 miner crowns pass the gate with the unselected suite not falling. Now (B, C off): A80/D20 is acceptable. Interacts with **D21**: the reviewer prefers returning the unpaid house slot to lane A over burning it **(rev5) DECIDED (owner): A 25 / B 25 / C 25 / D 25** (§6 D1, D28). |

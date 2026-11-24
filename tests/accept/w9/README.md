@@ -425,3 +425,6 @@ Run locally with `-m "not torch"`. Nothing here imports torch.
 On main these tests fail on the `settle_mv` / `max_channels` assertions or
 `cannot import name` (`channel_pick` from `cascade.audit.lane_d`,
 `_lane_d_max_channels` from `cascade.audit.checks`, both in PATHS).
+## rev6.14 (a): judging start vs eligibility boundary (owner 2026-11-23)
+
+The audit re-derives the judging start (`frozen_before_eval_delay` FAILs, a judged cohort without `boundary_ts` FAILs) and judges eligibility at `b = T + forward_margin_hours` (default 0). `test_w9_rev614.py`.

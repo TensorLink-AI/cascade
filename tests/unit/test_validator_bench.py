@@ -230,8 +230,8 @@ def test_loader_refuses_v2_go_live_without_a_main_validator(tmp_path):
     # loader's "precedes [v2] from_block" check does not fire before the one under test
     text = re.sub(r"(?m)^image_decoupled_from_block\s*=\s*\d+", "image_decoupled_from_block = 0", text)
     text = text.replace(f'owner_hotkey = "{cfg.netconfig.owner_hotkey}"', 'owner_hotkey = ""', 1)
-    # the shipped lane C / MarketCast block (9579600) would precede this v2 gate
-    text = re.sub(r"(?m)^from_block(\s*)=\s*9579600", r"from_block\g<1>= 0", text)
+    # the shipped lane C / MarketCast block (9586800) would precede this v2 gate
+    text = re.sub(r"(?m)^from_block(\s*)=\s*9586800", r"from_block\g<1>= 0", text)
     p = tmp_path / "chain.toml"
     p.write_text(text, encoding="utf-8")
     with pytest.raises(ValueError, match="owner_hotkey"):
