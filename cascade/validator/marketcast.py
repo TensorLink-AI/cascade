@@ -73,7 +73,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from ..shared.config.lane_c import MKT_KIND, is_mkt_target
+from ..shared.config.lane_c import MKT_KIND, is_mkt_target, kind_of
 from ..shared.lane_c import PendingEntry, competition_past_end
 from ..shared.lane_c_manifest import LaneCEntry, commit_block_as_of, finetune_commit_as_of
 from ..shared.marketcast_report import (
@@ -101,6 +101,92 @@ from ..shared.marketcast_report import (
 )
 
 log = logging.getLogger("cascade.validator")
+
+
+# ── W-CMP2 (DEC-CA-0075): the competition this runner is judging ────────────
+#
+# The MarketCast runner is MULTI-INSTANCE: ``mkt`` (its legacy instance —
+# ``[marketcast]``, ``mkt_reports``, ``mkt_backlog`` / ``mkt_seen``, report key
+# ``marketcast/round-<R>.json``, all byte-identical) and every spec instance
+# ``<id>`` (its compiled table, ``reports[<id>]``, ``comp[<id>]`` state, report
+# key ``marketcast/<id>/round-<R>.json``). Every mixin method reads the
+# instance from :func:`current_ctx` (thread-local; default ``mkt``).
+
+import threading as _threading  # noqa: E402
+
+_CTX = _threading.local()
+
+
+@dataclass(frozen=True)
+class MktCtx:
+    """One instance of the MarketCast runner."""
+    kind: str
+    mc: object
+
+    @property
+    def legacy(self) -> bool:
+        return self.kind == MKT_KIND
+
+    def is_target(self, target: object) -> bool:
+        return kind_of(str(target or "")) == self.kind
+
+    def report_key(self, rid: str) -> str:
+        from ..shared.marketcast_report import instance_report_key
+
+        return mkt_report_key(rid) if self.legacy else instance_report_key(self.kind, rid)
+
+    def arbiters(self, cm) -> dict:
+        if cm is None:
+            return {}
+        if self.legacy:
+            return dict(getattr(cm, "mkt_reports", None) or {})
+        return dict((getattr(cm, "reports", None) or {}).get(self.kind) or {})
+
+    def backlog(self, st) -> list:
+        if self.legacy:
+            return list(st.mkt_backlog)
+        return list(dict(getattr(st, "comp", {}) or {}).get(self.kind, {}).get("backlog", []))
+
+    def seen(self, st) -> dict:
+        if self.legacy:
+            return dict(st.mkt_seen)
+        return dict(dict(getattr(st, "comp", {}) or {}).get(self.kind, {}).get("seen", {}))
+
+    def store(self, st, backlog: list, seen: dict) -> None:
+        if self.legacy:
+            st.mkt_backlog, st.mkt_seen = list(backlog), dict(seen)
+            return
+        comp = dict(st.comp or {})
+        sec = {k: v for k, v in (("backlog", list(backlog)), ("seen", dict(seen))) if v}
+        if sec:
+            comp[self.kind] = sec
+        else:
+            comp.pop(self.kind, None)
+        st.comp = comp
+
+
+def current_ctx(cfg=None) -> MktCtx:
+    """The instance being judged on this thread (default: ``mkt`` on
+    ``cfg``'s ``[marketcast]``)."""
+    c = getattr(_CTX, "ctx", None)
+    if c is not None:
+        return c
+    return MktCtx(MKT_KIND, getattr(cfg, "marketcast", None))
+
+
+class mkt_context:  # noqa: N801 — a context manager used like a function
+    """``with mkt_context(ctx):`` — judge / publish as instance ``ctx``."""
+
+    def __init__(self, ctx: MktCtx) -> None:
+        self.ctx = ctx
+
+    def __enter__(self) -> MktCtx:
+        self.saved = getattr(_CTX, "ctx", None)
+        _CTX.ctx = self.ctx
+        return self.ctx
+
+    def __exit__(self, *exc) -> None:
+        _CTX.ctx = self.saved
 
 # base quantiles kept in memory per (snapshot, window) before the cache resets
 MKT_BASE_CACHE_MAX = 200_000
@@ -212,14 +298,35 @@ def entry_after(entry: LaneCEntry, mc, *, fresh_after: float = 0.0) -> float:
     return max(t + float(mc.start_margin_seconds), float(fresh_after or 0.0))
 
 
+# DEC-CA-0075 (item 2): the embargo in force at the leg's DISPATCH, stamped
+# by the trainer into the signed ``marketcast`` record; the draw / scan /
+# verdict read these, never the verdict-time config, so an overlay that
+# changes ``[marketcast] embargo_days`` / ``embargo_eval_days`` never scores
+# a leg on windows inside its own training data.
+EMBARGO_RECORD_KEYS = ("embargo_days", "embargo_eval_days")
+
+
+def entry_embargo_mc(entry, mc):
+    """``mc`` with the entry's RECORDED dispatch-time embargo (legacy entry
+    without the record: ``mc`` unchanged — the value then was the config's)."""
+    from dataclasses import replace
+
+    rec = dict(getattr(entry, "marketcast", None) or {})
+    got = {k: int(rec[k]) for k in EMBARGO_RECORD_KEYS
+           if type(rec.get(k)) is int and int(rec[k]) > 0}
+    return replace(mc, **got) if got else mc
+
+
 def entry_draw(entry: LaneCEntry, mc, *, phase: str, block: int, block_hash: str,
                fresh_after: float = 0.0) -> dict:
     """DEC-CA-0074: the entry's signed draw record at round ``block``
     (:func:`cascade.pool.marketcast.embargo_draw`): backtests from the
     embargo before its trainer-stamped dispatch, forwards after
-    :func:`entry_after`."""
+    :func:`entry_after`. DEC-CA-0075: on the embargo RECORDED at the leg's
+    dispatch (:func:`entry_embargo_mc`)."""
     from ..pool.marketcast import embargo_draw
 
+    mc = entry_embargo_mc(entry, mc)
     t = mkt_train_time(entry)
     if t is None:
         raise ValueError("no train_time on the entry's marketcast record")
@@ -729,14 +836,15 @@ def _superseded(seen: dict, e: LaneCEntry) -> dict | None:
     return h
 
 
-def _slot_holders(work) -> dict[str, tuple[str, str, int]]:
+def _slot_holders(work, ctx: MktCtx | None = None) -> dict[str, tuple[str, str, int]]:
     """Red-team F4: ``{mkt target: (hotkey, pointer, commit block)}`` of the
     current slot holders — references for the near-duplicate test (a
     holder whose commit block the identity registry lacks is senior: -1)."""
     cbs = {(v.get("hotkey"), v.get("pointer")): int(v.get("commit_block", -1))
            for v in work.mkt_seen.values()}
     return {t: (w.hotkey, w.trained_pointer, cbs.get((w.hotkey, w.trained_pointer), -1))
-            for t, w in work.slots.items() if is_mkt_target(t)}
+            for t, w in work.slots.items()
+            if (ctx.is_target(t) if ctx is not None else is_mkt_target(t))}
 
 
 def _dup_reason(h: dict) -> str:
@@ -769,6 +877,10 @@ class MarketCastMixin:
     mkt_lease_fn: Callable | None = None
     mkt_session_fn: Callable | None = None
 
+    def _mkt_cfg(self):
+        """The MarketCast-shaped table of the instance being judged."""
+        return current_ctx(getattr(self, "cfg", None)).mc
+
     def _mkt_main_hotkey(self) -> str:
         return str(getattr(getattr(self.cfg, "netconfig", None), "owner_hotkey", "") or "")
 
@@ -789,17 +901,28 @@ class MarketCastMixin:
         fn = self.mkt_snapshot_fn
         if fn is not None:
             return fn(block)
-        src = getattr(self, "_mkt_source_obj", None)
-        if src is None:
+        mc = self._mkt_cfg()
+        # DEC-CA-0075: the competition spec names the pool (prefix + signer +
+        # schema + series filter); a spec change takes a new source, and each
+        # instance keeps its own (W-CMP2)
+        signer = str(mc.pool_signer or "") or self._mkt_main_hotkey()
+        key = (mc.pool_prefix, signer, mc.pool_schema, tuple(mc.pool_select),
+               tuple(getattr(mc, "pool_channels", ())))
+        srcs = self.__dict__.setdefault("_mkt_sources", {})
+        src = srcs.get(current_ctx(getattr(self, "cfg", None)).kind)
+        if src is None or srcs.get(("key", current_ctx(getattr(self, "cfg", None)).kind)) != key:
             from ..pool.marketcast import MktSnapshotSource
             from ..shared.hippius import pool_s3_store
 
             src = MktSnapshotSource(
-                pool_s3_store(self.cfg.storage), prefix=self.cfg.marketcast.pool_prefix,
-                signer_hotkey=self._mkt_main_hotkey(),
+                pool_s3_store(self.cfg.storage), prefix=mc.pool_prefix,
+                signer_hotkey=signer,
                 cache_dir=Path(getattr(self, "cache_dir", None) or "./_eval_pool"),
-                verify_signature=bool(self.verify_signatures))
-            self._mkt_source_obj = src
+                verify_signature=bool(self.verify_signatures),
+                schema=mc.pool_schema, select=dict(mc.pool_select),
+                channels=dict(getattr(mc, "pool_channels", ())))
+            srcs[current_ctx(getattr(self, "cfg", None)).kind] = src
+            srcs[("key", current_ctx(getattr(self, "cfg", None)).kind)] = key
         return src.snapshot_for(block)
 
     def _mkt_block_hash(self, block: int) -> str:
@@ -824,7 +947,7 @@ class MarketCastMixin:
         if hit is None:  # pragma: no cover — GPU + the timestral extra
             from ..eval.timestral_adapter import load_pinned_base
 
-            mc = self.cfg.marketcast
+            mc = self._mkt_cfg()
             hit, _d = load_pinned_base(mc.base_ref, mc.base_sha256,
                                        cache_dir=getattr(self, "cache_dir", None),
                                        device=str(getattr(self, "device", "cpu")))
@@ -836,7 +959,7 @@ class MarketCastMixin:
         d = getattr(self, "_mkt_base_dir", None)
         if d is None:
             d = self._mkt_base_dir = resolve_pinned_base_dir(
-                self.cfg.marketcast, cache_dir=getattr(self, "cache_dir", None))
+                self._mkt_cfg(), cache_dir=getattr(self, "cache_dir", None))
         return Path(d)
 
     def _mkt_load_ft(self, pointer: str):
@@ -867,7 +990,7 @@ class MarketCastMixin:
                 raise MktFault("fine-tune weights are not finite")
             raw = (dest / META_FILE).read_bytes()
             meta = json.loads(raw)
-            why = meta_problem(meta, self.cfg.marketcast, size=len(raw))
+            why = meta_problem(meta, self._mkt_cfg(), size=len(raw))
             if why:
                 raise MktFault(why)
             sess = self.__dict__.get("_mkt_sess")
@@ -893,7 +1016,7 @@ class MarketCastMixin:
 
         if arbiter == REPORT_ABSENT:
             return None, "", "the main validator's report never appeared (recorded absent)"
-        key = mkt_report_key(rid)
+        key = current_ctx(getattr(self, "cfg", None)).report_key(rid)
         try:
             text = self._mkt_store().get_text(key)
         except Exception as e:  # noqa: BLE001 — the recorded bytes exist: retried
@@ -928,17 +1051,18 @@ class MarketCastMixin:
         from ..shared.lane_c import LaneCState
         from .lane_c import LaneCJudgement
 
-        mc = getattr(self.cfg, "marketcast", None)
-        new = [e for e in (cm.entries if cm is not None else ()) if is_mkt_target(e.target)]
-        legacy = [p for p in st.pending if is_mkt_target(p.target)]
+        ctx = current_ctx(getattr(self, "cfg", None))
+        mc = ctx.mc
+        new = [e for e in (cm.entries if cm is not None else ()) if ctx.is_target(e.target)]
+        legacy = [p for p in st.pending if ctx.is_target(p.target)]
         if mc is None or not mc.active(block):
             js = [LaneCJudgement(e, False, "target", "MarketCast is not active at this "
                                  "settlement", phase="judge", k=1,
                                  alpha=float(getattr(mc, "alpha", 0.05)),
                                  mkt={"inconclusive": ""}) for e in new]
             return None, js
-        quiet = not (new or legacy or st.mkt_backlog)
-        comp = self.cfg.lane_c.competition(MKT_KIND)
+        quiet = not (new or legacy or ctx.backlog(st))
+        comp = self.cfg.lane_c.competition(ctx.kind)
         if comp is not None and competition_past_end(comp, block):
             if quiet:
                 return None, []
@@ -956,11 +1080,11 @@ class MarketCastMixin:
             return None, []
         bp = mc.base_pointer
         work = LaneCState(slots=dict(st.slots), mkt_seen={k: dict(v) for k, v in
-                                                          st.mkt_seen.items()})
+                                                          ctx.seen(st).items()})
         import copy
 
-        backlog = copy.deepcopy(list(st.mkt_backlog))
-        arbiters = dict(getattr(cm, "mkt_reports", None) or {}) if cm is not None else {}
+        backlog = copy.deepcopy(ctx.backlog(st))
+        arbiters = ctx.arbiters(cm)
         expiry = 2 * int(mc.report_timeout_settlements)
         for item in backlog:
             if not item.get("arbiter") and str(item["round_id"]) in arbiters:
@@ -973,10 +1097,12 @@ class MarketCastMixin:
         from ..shared.lane_c import win_expired
 
         for target, holder in list(work.slots.items()):
+            if not ctx.is_target(target):
+                continue                   # another competition's slot (W-CMP2)
             # DEC-CA-0073: the holder's full-pay duration ran out — the slot ends
             expired = win_expired(work.eras_since(holder, block,
                                                  era_length_blocks(self.cfg.round, block)),
-                                  holder)
+                                  holder, self.cfg.lane_c)
             unregistered = registration is not None and self._mkt_registration(
                 registration, holder.hotkey, max(0, block - 1), rid=rid) is None
             if expired or unregistered:
@@ -1080,12 +1206,12 @@ class MarketCastMixin:
             work.mkt_seen = dict(keep)
         plan.backlog, plan.seen = backlog, work.mkt_seen
         if self._mkt_is_main():
-            holders = _slot_holders(work)
+            holders = _slot_holders(work, ctx)
             todo = [item for item in backlog if not item.get("arbiter")]
             if self.mkt_eval_hosts is not None:
                 # offloaded: off the settlement thread (the pod may take
                 # minutes to come up; the trainer's arbiter waits for it)
-                self._mkt_publish_async(copy.deepcopy(todo), dict(holders))
+                self._mkt_publish_async(copy.deepcopy(todo), dict(holders), ctx=ctx)
             else:
                 for item in todo:
                     self._mkt_publish_round(item, holders=holders)
@@ -1148,11 +1274,12 @@ class MarketCastMixin:
             _row(e, None, "judge")
         for p in sorted(legacy, key=PendingEntry.sort_key):
             _row(LaneCEntry(**p.entry), p, "confirm" if p.kind == "confirm" else "judge")
-        for item in st.mkt_backlog:
+        ctx = current_ctx(getattr(self, "cfg", None))
+        for item in ctx.backlog(st):
             for c in item.get("candidates") or ():
                 e, phase, p = _unpack(c)
                 _row(e, p, phase)
-        return MktPlan(backlog=[], seen=dict(st.mkt_seen)), js
+        return MktPlan(backlog=[], seen=ctx.seen(st)), js
 
     def _mkt_apply_item(self, item: dict, work, *, settle_rid: str, settle_block: int,
                         era_index: int) -> tuple[list, list, list]:
@@ -1168,14 +1295,19 @@ class MarketCastMixin:
             resolve_outcomes,
         )
 
-        mc = self.cfg.marketcast
+        mc = self._mkt_cfg()
         R, B = str(item["round_id"]), int(item["block"])
         arbiter = str(item["arbiter"])
         rep, sha, why = self._mkt_read_recorded(R, arbiter)
         cands = [_unpack(c) for c in item["candidates"]]
         # red-team F6: the family counts OWNERS (coldkeys), weighted Bonferroni
         ks = mkt_family_sizes([e for e, ph, _p in cands if ph == "judge"])
-        info = {"report_key": mkt_report_key(R), "report_sha256": sha, "round": R,
+        # DEC-CA-0075: the competition spec's test family (bonferroni = today)
+        from ..shared.rules_menu import family_size
+
+        ks = {key: family_size(mc.test_family, v) for key, v in ks.items()}
+        info = {"report_key": current_ctx(getattr(self, "cfg", None)).report_key(R), "report_sha256": sha,
+                "round": R,
                 "round_block": B}
         if item.get("expired"):
             info["report_expired"] = True
@@ -1265,7 +1397,7 @@ class MarketCastMixin:
         and stage the reference sidecars in ``sidecars``."""
         from .mkt_offload import MktOffloadError
 
-        mc = self.cfg.marketcast
+        mc = self._mkt_cfg()
         out = []
         same_target: dict = {}
         for (hk, ptr, ph), v in datas.items():
@@ -1308,7 +1440,7 @@ class MarketCastMixin:
 
     # ── the main validator's rows ──
 
-    def _mkt_publish_async(self, todo: list, holders: dict) -> bool:
+    def _mkt_publish_async(self, todo: list, holders: dict, *, ctx: MktCtx | None = None) -> bool:
         """Offloaded publishing: one background run over ``todo`` (False =
         a run is still going; the next settlement retries what it leaves)."""
         t = self.__dict__.get("_mkt_pub_thread")
@@ -1320,8 +1452,14 @@ class MarketCastMixin:
             return False
         import threading
 
-        t = threading.Thread(target=self._mkt_publish_remote, args=(todo, holders),
-                             name="mkt-publish", daemon=True)
+        ctx = ctx if ctx is not None else current_ctx(getattr(self, "cfg", None))
+
+        def _run():
+            # the instance travels with the run (W-CMP2)
+            with mkt_context(ctx):
+                self._mkt_publish_remote(todo, holders)
+
+        t = threading.Thread(target=_run, name=f"mkt-publish-{ctx.kind}", daemon=True)
         self.__dict__["_mkt_pub_thread"] = t
         t.start()
         return True
@@ -1337,7 +1475,7 @@ class MarketCastMixin:
         need = []
         for item in todo:
             try:
-                store.get_text(mkt_report_key(str(item["round_id"])))
+                store.get_text(current_ctx(getattr(self, "cfg", None)).report_key(str(item["round_id"])))
             except ObjectNotFound:
                 need.append(item)
             except Exception as e:  # noqa: BLE001 — unknown: retried next settlement
@@ -1388,7 +1526,7 @@ class MarketCastMixin:
         from ..shared.hippius import ObjectNotFound, StorageError
 
         rid = str(item["round_id"])
-        key = mkt_report_key(rid)
+        key = current_ctx(getattr(self, "cfg", None)).report_key(rid)
         store = self._mkt_store()
         try:
             store.get_text(key)
@@ -1399,7 +1537,7 @@ class MarketCastMixin:
             log.warning("marketcast round=%s: report existence unreadable (%s); retried at the "
                         "next settlement", rid, e)
             return False
-        mc = self.cfg.marketcast
+        mc = self._mkt_cfg()
         sess = self.__dict__.get("_mkt_sess")
         if self.mkt_eval_hosts is not None and sess is None:
             log.warning("marketcast round=%s: offload configured but no pod session; "
@@ -1556,7 +1694,7 @@ def _near_dup_refs(rows: MktEntryRows, sen: tuple, datas: dict, holders: dict) -
     return refs
 
 
-def fold_mkt_plan(st, plan: MktPlan | None) -> list:
+def fold_mkt_plan(st, plan: MktPlan | None, ctx: MktCtx | None = None) -> list:
     """Replay a :class:`MktPlan` onto the live state (the fold) in the exact
     order judge time applied it to its scratch copy (``_mkt_settle``): evict
     expired / deregistered holders, offer the wins in order, evict the
@@ -1577,14 +1715,15 @@ def fold_mkt_plan(st, plan: MktPlan | None) -> list:
         if st.record(w):
             took.append(w)
     _evict(getattr(plan, "evict_after", ()))
-    st.mkt_backlog = list(plan.backlog)
-    st.mkt_seen = dict(plan.seen)
-    st.pending = [p for p in st.pending if not is_mkt_target(p.target)]
+    ctx = ctx if ctx is not None else MktCtx(MKT_KIND, None)
+    ctx.store(st, list(plan.backlog), dict(plan.seen))
+    st.pending = [p for p in st.pending if not ctx.is_target(p.target)]
     return took
 
 
 __all__ = [
-    "MKT_COMPUTE_ATTEMPTS", "MarketCastMixin", "MktFault", "MktPlan", "anchor_time",
-    "compute_entry_rows", "holder_record", "entry_after", "entry_draw", "embargo_scan_problem", "fold_mkt_plan", "judge_marketcast_entry",
+    "MKT_COMPUTE_ATTEMPTS", "MarketCastMixin", "MktCtx", "current_ctx", "mkt_context", "MktFault", "MktPlan", "anchor_time",
+    "compute_entry_rows", "holder_record", "entry_after", "entry_draw", "entry_embargo_mc",
+    "EMBARGO_RECORD_KEYS", "embargo_scan_problem", "fold_mkt_plan", "judge_marketcast_entry",
     "mkt_prechecks", "mkt_train_time", "snapshot_record", "suite_of",
 ]

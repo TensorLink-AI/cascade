@@ -1013,6 +1013,7 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
                   bench=None, armed: dict | None = None,
                   boundary_ts: int | None = None,
                   max_channels: int | None = None,
+                  public_indexes: dict | None = None,
                   host: dict | None = None,
                   eval_identity: dict | None = None) -> LaneDSettlement:
     """Settle lane D at ``boundary`` (see the module docstring).
@@ -1024,6 +1025,14 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     skipped ``before_eval_delay``. Without it (the legacy call) nothing is
     frozen or judged: every open entry is skipped ``boundary_ts_missing``
     (fail closed).
+
+    ``public_indexes`` (rev6.18 A1/A2/A6, F3) is ``{source: index dir}`` of the
+    public sources (W6p indexes). With ``boundary_block_hash`` each source is
+    drawn (:func:`~cascade.validator.lane_d_public.draw_public`, 5000
+    windows, the same for KING_D, the house and every challenger) and the
+    report carries the ``public`` block (revision, index and file-list
+    hashes, window ids). The box reads only the indexes; scoring the public
+    windows and the combined rule are F4's. ``None`` records nothing.
 
     ``max_channels`` (rev6.18 A4, F2) is ``[generator] max_channels``: the
     channel cap of a multichannel ``(C, L)`` pool window, whose pick
@@ -1533,6 +1542,15 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     if gate is not None:
         # Present iff the gate ran (absent, never null, otherwise).
         report["gate"] = gate
+    if public_indexes and boundary_block_hash is not None:
+        # rev6.18 F3 (W5k): one public draw per source, from the indexes.
+        from .lane_d_public import draw_public, public_record
+
+        report["public"] = public_record([
+            draw_public(public_indexes[src], source=src,
+                        boundary_block_hash=str(boundary_block_hash), horizon=h)
+            for src in sorted(public_indexes)])
+
     if boundary_ts is not None:
         # rev6.14 (a): the boundary block's on-chain timestamp the judging
         # start was applied against (absent, never null, on the legacy call).

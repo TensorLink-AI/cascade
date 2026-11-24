@@ -1,0 +1,107 @@
+"""W-CMP (DEC-CA-0075): the rule menu — test families {plain_lcb, maxt,
+bonferroni} and pay curves {tiered_decay, fixed_term, indefinite_until_beaten}
+— selectable per lane / per competition; defaults are today's rules
+byte-for-byte; a curve other than a lane's legacy one is recorded on the win
+and the audit re-derives it."""
+
+from __future__ import annotations
+
+import pytest
+
+from .helpers import parse, shipped_raw
+
+
+def test_w_cmp_menu_defaults_are_todays_rules():
+    from cascade.shared import rules_menu as R
+
+    cfg = parse(shipped_raw())
+    assert (cfg.lane_b.test_family, cfg.lane_b.pay_curve) == R.LANE_DEFAULTS["lane_b"]
+    assert (cfg.lane_c.test_family, cfg.lane_c.pay_curve) == R.LANE_DEFAULTS["lane_c"]
+    assert (cfg.lane_d.test_family, cfg.lane_d.pay_curve) == R.LANE_DEFAULTS["lane_d"]
+    assert R.LANE_DEFAULTS["lane_b"] == ("maxt", "indefinite_until_beaten")  # rev6.22
+    assert cfg.lane_c.verdict_params(4).alpha == pytest.approx(cfg.lane_c.alpha / 4)
+
+
+def test_w_cmp_menu_choices_parse_and_unsupported_ones_are_refused():
+    import copy
+
+    import cascade.shared.competition_spec  # noqa: F401  (W-CMP)
+
+    raw = shipped_raw()
+    r = copy.deepcopy(raw)
+    r.setdefault("lane_c", {})["test_family"] = "plain_lcb"
+    cfg = parse(r)
+    assert cfg.lane_c.verdict_params(4).alpha == pytest.approx(cfg.lane_c.alpha)
+    # lane B (rev6.22, #854) runs its own max-T families and pays until
+    # replaced: the menu names that rule and refuses any other
+    for table, key, val in (("lane_b", "test_family", "holm"),
+                            ("lane_b", "test_family", "bonferroni"),
+                            ("lane_b", "pay_curve", "tiered_decay"),
+                            ("lane_d", "test_family", "plain_lcb"),
+                            ("lane_d", "pay_curve", "fixed_term"),
+                            ("lane_c", "pay_curve", "lottery")):
+        bad = copy.deepcopy(raw)
+        bad.setdefault(table, {})[key] = val
+        with pytest.raises(ValueError, match=key):
+            parse(bad)
+
+
+def test_w_cmp_family_math():
+    from cascade.shared import rules_menu as R
+
+    assert R.family_alpha("plain_lcb", 0.05, 5) == 0.05
+    assert R.family_alpha("bonferroni", 0.05, 5) == pytest.approx(0.01)
+    assert R.family_size("plain_lcb", 7) == 1 and R.family_size("bonferroni", 7) == 7
+    with pytest.raises(R.MenuError):
+        R.family_alpha("maxt", 0.05, 3)
+
+
+def test_w_cmp_pay_curves():
+    from cascade.shared import rules_menu as R
+
+    assert not R.curve_expired("indefinite_until_beaten", 10**6, full_eras=1)
+    assert R.curve_expired("fixed_term", 10, full_eras=10)
+    assert not R.curve_expired("fixed_term", 9, full_eras=10)
+    assert R.curve_expired("tiered_decay", 28, full_eras=5, ttl_eras=28)
+    assert R.curve_multiplier("tiered_decay", 5, full_eras=5) == 0.5
+    assert R.curve_multiplier("tiered_decay", 2, full_eras=5) == 1.0
+    assert R.curve_multiplier("indefinite_until_beaten", 99, full_eras=5) == 1.0
+    assert R.curve_record("fixed_term", "lane_c") == "" and R.curve_record(
+        "tiered_decay", "lane_c") == "tiered_decay"
+
+
+def test_w_cmp_lane_c_win_records_its_curve_and_pays_on_it():
+    from dataclasses import replace
+
+    import cascade.shared.competition_spec  # noqa: F401  (W-CMP)
+    from cascade.shared.lane_c import (
+        LaneCState,
+        TargetWin,
+        full_pay_record_mismatch,
+        lane_c_payouts,
+        target_full_pay_record,
+    )
+
+    cfg = parse(shipped_raw())
+    lc, mc = cfg.lane_c, cfg.marketcast
+    t = lc.targets[0]
+    legacy = target_full_pay_record(t, 0.03, lc, mc, era_blocks=3600)
+    assert "curve" not in legacy                         # byte-identical default
+    mc2 = replace(mc, pay_curve="indefinite_until_beaten")
+    rec = target_full_pay_record(t, 0.03, lc, mc2, era_blocks=3600)
+    assert rec["curve"] == "indefinite_until_beaten"
+    assert full_pay_record_mismatch(rec, t, lc, mc2, era_blocks=3600) is None
+    assert "curve" in (full_pay_record_mismatch(rec, t, lc, mc, era_blocks=3600) or "")
+    w = TargetWin(target=t, hotkey="hk", uid=3, round_id="r", win_block=3600, tier=0.03,
+                  full_eras=rec["full_eras"], gain_lcb=0.03)
+    late = 3600 * (rec["full_eras"] + 5)
+    st = LaneCState(slots={t: w})
+    assert lane_c_payouts(st, block=late, era_blocks=3600, cfg=lc, n_uids=10) == []
+    st = LaneCState(slots={t: replace(w, curve="indefinite_until_beaten")})
+    rows = lane_c_payouts(st, block=late, era_blocks=3600, cfg=lc, n_uids=10)
+    assert rows and rows[0]["multiplier"] == 1.0 and rows[0]["curve"] == "indefinite_until_beaten"
+    st = LaneCState(slots={t: replace(w, curve="tiered_decay")})
+    rows = lane_c_payouts(st, block=late, era_blocks=3600, cfg=lc, n_uids=10)
+    assert rows and 0.0 < rows[0]["multiplier"] < 1.0
+    js = LaneCState(slots={t: w}).to_json()
+    assert '"curve"' not in js                           # legacy state bytes unchanged

@@ -51,7 +51,7 @@ class TrainerCompetition:
     def live(self, cfg, block: int) -> bool:
         """Whether a leg of this kind may be DISPATCHED at ``block`` (the
         competition's own start/end is checked by the driver too)."""
-        raise NotImplementedError
+        raise TypeError(f"{type(self).__name__} does not define live() — a competition half must")
 
     def admitted_values(self, cfg) -> tuple[str, ...]:
         """The target values a commitment may name now (() = whatever the
@@ -64,13 +64,13 @@ class TrainerCompetition:
 
     def read_recipe(self, ops, tree: Path, *, target: str, submission_time: float | None,
                     train_time: float | None):
-        raise NotImplementedError
+        raise TypeError(f"{type(self).__name__} does not define read_recipe() — a competition half must")
 
     def leg_hours(self, cfg, recipe) -> float | None:
         return None
 
     def train_leg(self, ops, leg: dict, recipe) -> dict:
-        raise NotImplementedError
+        raise TypeError(f"{type(self).__name__} does not define train_leg() — a competition half must")
 
     # ── the optional arbiter report ──
 
@@ -141,7 +141,122 @@ class MarketCastTrainer(TrainerCompetition):
     # ``mkt_await``, byte-identical): :meth:`LaneCDriver._mkt_arbiters`.
 
 
+class SpecInstanceTrainer(TrainerCompetition):
+    """W-CMP2 (DEC-CA-0075): a lane-C spec INSTANCE of the multi-instance
+    MarketCast runner — Timestral fine-tunes on the miner's key, exactly
+    MarketCast's legs, on the instance's compiled table (its pool, its
+    metrics, its bounds); the arbiter report is the generic
+    ``reports[<id>]`` one (key ``marketcast/<id>/round-<R>.json``)."""
+
+    def __init__(self, kind: str) -> None:
+        self.kind = str(kind)
+
+    def _mc(self, cfg):
+        from ..shared.config.lane_c import mc_for
+
+        return mc_for(cfg, self.kind)
+
+    def _view(self, cfg):
+        from dataclasses import replace
+
+        mc = self._mc(cfg)
+        if mc is None:
+            raise RuntimeError(f"lane-C competition {self.kind!r} is not configured")
+        return replace(cfg, marketcast=mc) if hasattr(cfg, "__dataclass_fields__") else \
+            _NsView(cfg, mc)
+
+    def live(self, cfg, block: int) -> bool:
+        mc = self._mc(cfg)
+        return mc is not None and bool(mc.active(block))
+
+    def admitted_values(self, cfg) -> tuple[str, ...]:
+        mc = self._mc(cfg)
+        return tuple(getattr(mc, "target_suites", ()) or ()) if mc is not None else ()
+
+    def coldkey_cap(self, cfg) -> int:
+        mc = self._mc(cfg)
+        return int(getattr(mc, "max_open_legs_per_coldkey", 1)) if mc is not None else 1
+
+    def read_recipe(self, ops, tree: Path, *, target: str, submission_time: float | None,
+                    train_time: float | None):
+        import functools
+
+        from .marketcast_runner import load_mkt_lineage, read_mkt_recipe
+
+        scan = getattr(ops, "mkt_embargo_scan", None)
+        if scan is None:
+            raise RuntimeError("no embargo scanner wired: refusing to dispatch an unjudgeable "
+                               f"{self.kind} leg")
+        import json
+
+        view = self._view(ops.r.cfg)
+        table = ops.r.cfg.lane_c.instance_table(self.kind)
+        inst = json.dumps({"kind": self.kind, "table": json.loads(table)}, sort_keys=True,
+                          separators=(",", ":"))
+        return read_mkt_recipe(tree, view, target=target, submission_time=submission_time,
+                               train_time=train_time, lineage=load_mkt_lineage(ops.r.work_root),
+                               embargo_scan=functools.partial(scan, mc=view.marketcast),
+                               instance=inst)
+
+    def leg_hours(self, cfg, recipe) -> float | None:
+        if not getattr(recipe, "leg_hours", 0.0):
+            return None
+        from .marketcast_runner import mkt_leg_hours
+
+        return mkt_leg_hours(self._view(cfg), float(recipe.leg_hours))
+
+    def train_leg(self, ops, leg: dict, recipe) -> dict:
+        from .marketcast_runner import train_mkt_leg
+
+        return train_mkt_leg(ops, leg, recipe, mc=self._view(ops.r.cfg).marketcast,
+                             kind=self.kind)
+
+    def report_key(self, round_id: str) -> str | None:
+        from ..shared.marketcast_report import instance_report_key
+
+        return instance_report_key(self.kind, str(round_id))
+
+    def report_timeout(self, cfg) -> int:
+        mc = self._mc(cfg)
+        return int(getattr(mc, "report_timeout_settlements", 8)) if mc is not None else 8
+
+    def on_report(self, driver, text: str) -> None:
+        driver._mkt_infra_requeue(text)
+
+
+class _NsView:
+    """A config stand-in (tests' SimpleNamespace configs) whose
+    ``marketcast`` is an instance's table."""
+
+    def __init__(self, cfg, mc) -> None:
+        self.__dict__.update(vars(cfg))
+        self.marketcast = mc
+
+
 TRAINER_COMPETITIONS: dict[str, TrainerCompetition] = {}
+_SPEC_TRAINERS: dict[str, SpecInstanceTrainer] = {}
+
+
+def _spec_trainer(kind: str) -> SpecInstanceTrainer | None:
+    from ..shared.config.lane_c import SPEC_KINDS
+
+    if kind not in SPEC_KINDS:
+        return None
+    hit = _SPEC_TRAINERS.get(kind)
+    if hit is None:
+        hit = _SPEC_TRAINERS[kind] = SpecInstanceTrainer(kind)
+    return hit
+
+
+def all_trainer_competitions() -> dict[str, TrainerCompetition]:
+    """Every trainer half: the registered ones and (W-CMP2) every spec
+    instance kind of this process."""
+    from ..shared.config.lane_c import SPEC_KINDS
+
+    out = dict(TRAINER_COMPETITIONS)
+    for k in sorted(SPEC_KINDS):
+        out.setdefault(k, _spec_trainer(k))
+    return out
 
 
 def register_trainer_competition(comp: TrainerCompetition) -> TrainerCompetition:
@@ -160,10 +275,12 @@ def trainer_competition(target_or_kind: str) -> TrainerCompetition | None:
     """The trainer half of ``target``'s (or ``kind``'s) competition (None =
     no trainer support: the target is refused)."""
     s = str(target_or_kind or "")
-    return TRAINER_COMPETITIONS.get(kind_of(s) if ":" in s else s)
+    k = kind_of(s) if ":" in s else s
+    return TRAINER_COMPETITIONS.get(k) or _spec_trainer(k)
 
 
 register_trainer_competition(MarketCastTrainer())
 
-__all__ = ["TRAINER_COMPETITIONS", "MarketCastTrainer", "TrainerCompetition",
+__all__ = ["SpecInstanceTrainer", "all_trainer_competitions", "TRAINER_COMPETITIONS",
+           "MarketCastTrainer", "TrainerCompetition",
            "register_trainer_competition", "trainer_competition"]

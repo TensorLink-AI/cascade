@@ -1,0 +1,39 @@
+# W-CMP (plan rev6.25, DEC-CA-0075): declarative lane C competitions on a
+# standard pool, the rule menu, the per-leg embargo record and the
+# content-addressed contamination hash set.
+# New modules: the standard pool, the competition spec registry, the menu.
+cascade/shared/std_pool.py
+cascade/shared/competition_spec.py
+cascade/shared/rules_menu.py
+# Config: specs compiled onto [marketcast] / [lane_c.competitions]; menu keys
+# per lane; the hash-set storage key; overlay allow-list + bounds.
+cascade/shared/config/loader.py
+cascade/shared/config/lane_b.py
+cascade/shared/config/lane_c.py
+cascade/shared/config/lane_d.py
+cascade/shared/config/marketcast.py
+cascade/shared/config/v2.py
+cascade/shared/netconfig.py
+cascade/shared/netconfig_bounds.py
+# The generic reader on the MarketCast path; the spec's pool reaches it.
+cascade/pool/marketcast.py
+cascade/validator/marketcast.py
+cascade/trainer/lane_c_driver.py
+# The menu in the verdicts / payouts and their audit replays.
+cascade/eval/expert_lane.py
+cascade/shared/lane_b.py
+cascade/shared/lane_c.py
+cascade/validator/expert_lane.py
+cascade/validator/lane_b.py
+cascade/validator/lane_c.py
+cascade/audit/checks.py
+cascade/audit/main.py
+# The hash set fetched by content hash + key, verified before use.
+cascade/interface/contamination_scan.py
+cascade/funding/intake.py
+cascade/funding/main.py
+# Unit pins of the superseded release-only embargo and the eviction call
+# (owner 2026-11-24 decision; the plan and DEC-CA-0075 land in PR #878 first).
+tests/unit/test_marketcast_embargo.py
+tests/unit/test_marketcast_pay_duration.py
+tests/unit/test_marketcast_trainer.py

@@ -1,0 +1,9 @@
+# W5k public-source draw (plan rev6.18 A1, A2, A4; F3; README.md has the contract).
+# The per-settlement draw from each public source's index and the block hash,
+# reading only the drawn series (F2's channel rule) and the per-source
+# per-window scores through F2's score_window.
+cascade/validator/lane_d_public.py
+# settle_lane_d(..., public_indexes=) draws both sources and records the
+# report's `public` block (the same windows for KING_D, the house and every
+# challenger).
+cascade/validator/lane_d.py

@@ -88,7 +88,9 @@ MAX_CHAIN_WALK = 1000
 ALLOWED: dict[str, frozenset[str] | None] = {
     "scoring": None,
     "eval": None,
-    # remainder and the WB10 contamination_hashset pin stay release-only below
+    # remainder stays release-only below; DEC-CA-0075: the WB10
+    # contamination_hashset pin is overlay-settable as a content hash (+ its
+    # storage key): every reader verifies the bytes' sha256 against the pin
     "lane_b": None,
     "lane_c": None,
     # LANE_D_PLAN §14.2: every lane D tuning key (activation, kill switch,
@@ -128,10 +130,13 @@ ALLOWED: dict[str, frozenset[str] | None] = {
         # universe, the timeframes, the composite's suite weights and the
         # grid density. Still release-only: the model pins, from_block, the
         # suite list (it is lane C's slot list), data_sources (each is
-        # code), pool_prefix, context lengths and embargo_days (a recipe is
-        # accepted under one embargo and its gap windows are cut under the
-        # value at the verdict, so a raise would score on training data).
+        # code), pool_prefix and context lengths.
         "assets", "frequencies", "horizons", "composite_suite_weights", "windows_per_cell",
+        # DEC-CA-0075 (W-CMP): the embargo is overlay-settable — the trainer
+        # records the value in force at each leg's DISPATCH in the signed
+        # leg record and the draw / scan / verdict use THAT, so a change
+        # never scores a leg on its own training data (code-bounded).
+        "embargo_days", "test_family", "pay_curve",
         # DEC-CA-0074: the embargo eval-draw length, backtest windows per cell
         # and the <= 13 h inconclusive wait (code-bounded by the loader)
         "embargo_eval_days", "backtest_windows_per_cell", "verdict_wait_blocks",
@@ -193,12 +198,20 @@ def overlay_policy() -> dict:
         "release_only_tables": dict(sorted(REFUSED_TABLES.items())),
         "default_policy": "Keys not listed are release-only.",
         "wildcard_policy": "Existing parser-supported keys only; loader checks still apply.",
-        "lane_c_competitions": "Existing competitions: weight and until_block only.",
+        "lane_c_competitions": "Existing competitions: weight and until_block only; "
+                               "[lane_c] specs compose registry blocks (DEC-CA-0075).",
+        "competition_registry": _competition_registry(),
         "adoption": "Owner signature, permit-stake lock-in, then an era boundary.",
         "operator_only": sorted(OPERATOR_ONLY_TABLES),
         "training": "Trainer-declared recipe/budget changes need no fleet update; "
                     "locked training terms and new model code require a release.",
     }
+
+
+def _competition_registry() -> dict:
+    from .competition_spec import registry
+
+    return registry()
 
 
 def body_digest(body: dict) -> str:
@@ -251,9 +264,6 @@ def check_overrides(overrides: object) -> dict:
                 # would silently change nothing (DEC-CA-0073: lane C pay;
                 # LANE_D_PLAN rev6.22: lane B pay)
                 bad.append(f"[{table}] {key} (retired)")
-            elif (table, key) in (("lane_b", "contamination_hashset"),):
-                # LANE_D_PLAN §14.2 (rev5): an overlay never replaces a data pin
-                bad.append(f"[{table}] {key} (data pin is release-only)")
             elif isinstance(value, dict) and table in ("v2",):
                 bad.append(f"[{table}.{key}] (nested tables are release-only)")
             elif allowed is not None and key not in allowed:
@@ -425,7 +435,13 @@ def build_config(base: ChainConfig, body: dict, *, applied_block: int = 0) -> Ch
 
     carve = any(_sets(ov, t, k) for t in ("lane_b", "lane_c", "lane_d")
                 for k in ("share", "takes_from"))
+    from .competition_spec import bound_refusals
+
     out_of_bounds = value_refusals(ov) + (share_refusals(cfg) if carve else [])
+    if _sets(ov, "lane_c", "specs"):
+        # DEC-CA-0075: a spec's KNOWN keys out of their code bounds are
+        # refused here (unknown block names stay a typed refusal at load)
+        out_of_bounds += bound_refusals(ov["lane_c"]["specs"])
     if out_of_bounds:
         raise NetConfigError("overlay refused — out of bounds: " + "; ".join(out_of_bounds))
     # A key the base table does not carry must change SOMETHING, or it is a
@@ -484,8 +500,11 @@ def lane_c_competition_changes(base: ChainConfig, new: ChainConfig) -> list[str]
 
     from .config.lane_c import COMPETITION_OVERLAY_KEYS, LaneCCompetition
 
-    a = {c.kind: c for c in base.lane_c.competition_list}
-    b = {c.kind: c for c in new.lane_c.competition_list}
+    # W-CMP2 (DEC-CA-0075): a SPEC INSTANCE is added, changed or removed by
+    # its spec (its start is guarded by retroactive_changes)
+    inst = {t[0] for t in tuple(base.lane_c.instances) + tuple(new.lane_c.instances)}
+    a = {c.kind: c for c in base.lane_c.competition_list if c.kind not in inst}
+    b = {c.kind: c for c in new.lane_c.competition_list if c.kind not in inst}
     if set(a) != set(b):
         return [f"[lane_c] competitions {sorted(a)} -> {sorted(b)}: adding or removing a "
                 "competition is release-only (a new competition kind is code)"]
@@ -533,6 +552,15 @@ def retroactive_changes(prev: ChainConfig, new: ChainConfig, apply_block: int) -
         if was != now and (0 < now < apply_block or 0 < was < apply_block):
             out.append(f"[lane_c.competitions.{c.kind}] until_block {was} -> {now} crosses a "
                        f"block before the one the overlay applies at ({apply_block})")
+    # W-CMP2: a spec instance's start never lies before the apply block when
+    # it is added or moved (no retroactive competition)
+    old_f = {c.kind: int(c.from_block) for c in prev.lane_c.competition_list}
+    inst = {t[0] for t in new.lane_c.instances}
+    for c in new.lane_c.competition_list:
+        if c.kind in inst and old_f.get(c.kind) != int(c.from_block) and \
+                0 < int(c.from_block) < apply_block:
+            out.append(f"[lane_c.specs.{c.kind}] from_block {c.from_block} lies before the "
+                       f"block the overlay applies at ({apply_block})")
     probes = {0, max(0, apply_block - 1)}
     for c in (prev, new):
         act = int(c.round.epoch_activation_block or 0)

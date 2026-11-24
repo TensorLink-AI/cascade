@@ -40,6 +40,12 @@ def mkt_report_key(round_id: str) -> str:
     return f"marketcast/round-{round_id}.json"
 
 
+def instance_report_key(kind: str, round_id: str) -> str:
+    """W-CMP2 (DEC-CA-0075): a spec instance's report of a round (the
+    legacy ``mkt`` keeps :func:`mkt_report_key`)."""
+    return f"marketcast/{kind}/round-{round_id}.json"
+
+
 def mkt_quantiles_key(round_id: str, hotkey: str, pointer: str, phase: str) -> str:
     """The sidecar of one entry's per-window quantiles (``.npy``)."""
     tag = hashlib.sha256(f"{hotkey}|{pointer}|{phase}".encode()).hexdigest()[:24]
@@ -669,7 +675,7 @@ class MktReportState:
 
 
 __all__ = [
-    "kind_scores",
+    "kind_scores", "instance_report_key",
     "GUARD_FIELDS", "baseline_scores", "holder_gain", "mkt_holder_quantiles_key", "INFRA_DEFERRED", "MKT_REPORT_VERSION", "guard_scores", "MktEntryRows", "MktReport", "MktReportState",
     "MktWindowRow", "REPORT_ABSENT", "base_cov_gain", "behaviour_distance", "calibration_gate",
     "composite_from_rows", "decode_quantiles", "encode_quantiles", "load_mkt_report", "mkt_ref_quantiles_key",

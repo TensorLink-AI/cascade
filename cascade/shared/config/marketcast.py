@@ -472,10 +472,32 @@ class MarketCastConfig:
     embargo_eval_days: int = 28
     backtest_windows_per_cell: int = 48
     forward_horizons: tuple[str, ...] = ()   # parse default: DEFAULT_FORWARD_HORIZONS enabled
+    # DEC-CA-0075 (W-CMP): MarketCast as a declarative lane-C competition
+    # spec (``[lane_c.specs.mkt]``, :mod:`cascade.shared.competition_spec`).
+    # The pool's signer ("" / "owner" = the main validator's hotkey, today's
+    # rule), its schema ("" = legacy snapshot OR standard pool, today; a
+    # standard-pool version = that version only), the standard-pool tags a
+    # series must carry ({} = every series), the rule menu picks, and the
+    # typed refusal of the spec ("" = accepted; set ⇒ MarketCast is inert at
+    # every block and its share burns).
+    pool_signer: str = ""
+    pool_schema: str = ""
+    pool_select: tuple[tuple[str, str], ...] = ()
+    # W-CMP2: metric channel name -> the pool's channel name ({} = same names)
+    pool_channels: tuple[tuple[str, str], ...] = ()
+    test_family: str = "bonferroni"
+    pay_curve: str = "fixed_term"
+    refused: str = ""
+    # DEC-CA-0075 (W-CMP2): a lane-C spec INSTANCE on the marketcast runner —
+    # its classes are its standard pool's ``class`` tags and every enabled
+    # suite reads every class (no market feed, no SUITE_CLASSES table)
+    open_classes: bool = False
 
     def active(self, block: int | None) -> bool:
-        """Whether MarketCast judges a settlement at ``block``."""
-        return bool(self.from_block > 0 and block is not None and int(block) >= self.from_block)
+        """Whether MarketCast judges a settlement at ``block`` (never while
+        its competition spec is refused, DEC-CA-0075)."""
+        return bool(self.from_block > 0 and block is not None and int(block) >= self.from_block
+                    and not self.refused)
 
     @property
     def wait_blocks(self) -> int:
@@ -585,16 +607,23 @@ class MarketCastConfig:
         """The class's source ids, primary first ("" ⇒ ``()``)."""
         return split_sources(self.data_sources_map.get(cls, ""))
 
+    def suite_classes(self, suite: str) -> tuple[str, ...]:
+        """The asset classes ``suite`` reads (:data:`SUITE_CLASSES`; a spec
+        instance, ``open_classes``: every configured class)."""
+        if self.open_classes:
+            return tuple(c for c, _a in self.assets)
+        return tuple(SUITE_CLASSES.get(suite, ()))
+
     def suite_assets(self, suite: str) -> list[tuple[str, str]]:
         """``[(class, symbol), ...]`` a suite is judged over (sorted)."""
         am = self.assets_map
-        return sorted((c, a) for c in SUITE_CLASSES.get(suite, ()) for a in am.get(c, ()))
+        return sorted((c, a) for c in self.suite_classes(suite) for a in am.get(c, ()))
 
     @property
     def armed_classes(self) -> tuple[str, ...]:
         """The classes an enabled suite reads that list at least one asset."""
         am = self.assets_map
-        return tuple(sorted({c for s in self.suites for c in SUITE_CLASSES.get(s, ())
+        return tuple(sorted({c for s in self.suites for c in self.suite_classes(s)
                              if am.get(c)}))
 
 
@@ -726,7 +755,43 @@ def _per_suite(raw, name: str, default: dict, suites: tuple[str, ...]):
     return out
 
 
-def parse_marketcast(raw: object) -> MarketCastConfig:
+def _parse_spec_fields(mc: dict) -> dict:
+    """DEC-CA-0075: the spec-compiled keys (``pool_signer``, ``pool_schema``,
+    ``pool_select``, ``test_family``, ``pay_curve``, ``refused``); absent =
+    today's rule."""
+    from ..competition_spec import POOL_SCHEMAS
+    from ..rules_menu import check_choice
+
+    out: dict = {}
+    for k in ("pool_signer", "pool_schema", "refused"):
+        v = mc.get(k, "")
+        if not isinstance(v, str):
+            raise ValueError(f"[marketcast] {k} must be a string; got {v!r}")
+        out[k] = "" if (k == "pool_signer" and v == "owner") else v
+    if out["pool_schema"] not in POOL_SCHEMAS:
+        raise ValueError(f"[marketcast] pool_schema must be one of {POOL_SCHEMAS}; "
+                         f"got {out['pool_schema']!r}")
+    sel = mc.get("pool_select", {})
+    if not isinstance(sel, dict) or not all(isinstance(a, str) and isinstance(b, str) and b
+                                            for a, b in sel.items()):
+        raise ValueError(f"[marketcast] pool_select must be a table tag -> value; got {sel!r}")
+    out["pool_select"] = tuple(sorted(sel.items()))
+    chn = mc.get("pool_channels", {})
+    if not isinstance(chn, dict) or not all(isinstance(a, str) and isinstance(b, str) and b
+                                            for a, b in chn.items()):
+        raise ValueError(f"[marketcast] pool_channels must be a table channel -> pool "
+                         f"channel; got {chn!r}")
+    out["pool_channels"] = tuple(sorted(chn.items()))
+    out["test_family"], out["pay_curve"] = check_choice(
+        "lane_c", test_family=mc.get("test_family", "bonferroni"),
+        pay_curve=mc.get("pay_curve", "fixed_term"))
+    return out
+
+
+_OPEN_CLASS_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+
+
+def parse_marketcast(raw: object, *, open_classes: bool = False) -> MarketCastConfig:
     """Parse + validate ``[marketcast]`` (absent ⇒ the inert defaults).
     Refuses arming (``from_block`` > 0) and malformed placeholders."""
     mc = dict(raw) if isinstance(raw, dict) else {}
@@ -760,7 +825,12 @@ def parse_marketcast(raw: object) -> MarketCastConfig:
                          f"got {assets_raw!r}")
     assets: dict[str, tuple[str, ...]] = {}
     for cls, syms in assets_raw.items():
-        if cls not in ASSET_CLASSES:
+        if open_classes:
+            # DEC-CA-0075 (W-CMP2): a spec instance's classes are the standard
+            # pool's ``class`` tags (any lower-case label); no feed reads them
+            if not isinstance(cls, str) or not _OPEN_CLASS_RE.match(cls):
+                raise ValueError(f"[marketcast] assets class {cls!r} must be [a-z][a-z0-9_]{{0,31}}")
+        elif cls not in ASSET_CLASSES:
             raise ValueError(f"[marketcast] assets names unknown class {cls!r}; classes are "
                              f"{ASSET_CLASSES}")
         ss = _str_list(syms, f"assets.{cls}")
@@ -786,7 +856,7 @@ def parse_marketcast(raw: object) -> MarketCastConfig:
         raise ValueError(f"[marketcast] data_sources must be a table class -> source; "
                          f"got {src_raw!r}")
     bad = [k for k in src_raw if k not in ASSET_CLASSES]
-    if bad:
+    if bad and not open_classes:
         raise ValueError(f"[marketcast] data_sources names unknown classes {bad}")
     sources = {**DEFAULT_DATA_SOURCES, **src_raw}
     for cls, spec in sources.items():
@@ -1070,6 +1140,7 @@ def parse_marketcast(raw: object) -> MarketCastConfig:
         baseline_gate=bgate, event_times=tuple(sorted(evs)),
         native_intervals=nat, native_history_days=tuple(sorted(nhd.items())),
         embargo_eval_days=fed, backtest_windows_per_cell=bwpc, forward_horizons=fh,
+        **_parse_spec_fields(mc), open_classes=bool(open_classes),
     )
     unscorable = scorability_problems(cfg_out)
     if unscorable:
