@@ -262,3 +262,34 @@ So W5e's PATHS add those two files (only those): W5e removes the stage from
 the producer, the audit and the replay together. The audit and replay
 rules W7a / W9 / W7d add on top (embargo, draw and fresh-share fields,
 `confirmation_stage_present`) stay those WPs' work. No test changed.
+
+## Multichannel windows (rev6.18 F2): `test_w5e_multivariate.py`
+
+Plan rev6.18 A4 (DEC-CA-0041). Fixture: `tests/accept/w7a/mv.py`.
+
+- `settle_lane_d(..., max_channels=)` takes `[generator] max_channels` (the
+  wiring passes `cfg.generator.max_channels`, `lane_d_wiring._max_channels`;
+  `None`, the legacy call, scores no multichannel window).
+- Each multichannel pool window is reduced to its pick before anything is
+  judged (`cascade.eval.lane_d_channels`; README w5d): empty channels drop,
+  a wider series keeps `max_channels` channels by the boundary block hash;
+  without a block hash an over-cap series leaves the pool. The pick of an id
+  is its first version's in pin order; a version that cannot carry it leaves
+  the pool.
+- A multichannel window is ONE row per model: `crps`/`mase` are the
+  channel means of the per-channel univariate scores (zero-target channels
+  masked from `crps` only); it is one resampling unit in its source's
+  cluster (evidence counts windows and sources, never channels).
+- A forecast's expected shape is `(k, horizon, 9)` for a k-channel window
+  (k >= 2), else `(horizon, 9)`; a mismatch is a malformed forecast.
+- Univariate results are unchanged: the same chain stored 1-D or as `(1, L)`
+  gives the same rows, point gains and crown; a univariate settlement's
+  report body is the same with or without `max_channels`.
+- The inputs source (`LaneDInputsSource._windows(pools, boundary)`) sends the
+  eval host only the picked channels, reading the boundary block hash only
+  when a series is wider than the cap (`channel_block_hash`); the wiring
+  refuses inputs picked by another hash (`inputs_unavailable`).
+
+On main these tests fail on the `max_channels` assertion of `mv.settle_mv`,
+`cannot import name '_max_channels'` (`lane_d_wiring`, in PATHS) or an
+assertion wrapping the old `_windows` signature.
