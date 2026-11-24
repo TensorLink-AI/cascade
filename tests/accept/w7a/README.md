@@ -708,3 +708,12 @@ rows digest is checked with `rows_sha256`). The house judgement keeps its
 four fields. `test_w7a_f4_fields.py` pins it; the A10 field tests are
 corrected (owner decisions A7 / D24), and `pub.py` gains the index-only
 public fixture (no pyarrow) and the eval host's public scores.
+
+## Correction (owner 2026-11-23): `min_fresh_window_share` default 0.5 -> 0.2
+
+Owner rule: "fresh data should always be in there, but trade off" and "first
+verdict ~6 h". The W1 forge measured ~250 fresh windows at T+6 h, so a 0.5
+share would hold verdicts ~24 h. The default (loader, both shipped files) is
+**0.2**; fresh windows are still drawn first and always included. The tests
+that pinned the 0.5 default now pin 0.2. Lane D is not rolled out, so there is
+no activation key.

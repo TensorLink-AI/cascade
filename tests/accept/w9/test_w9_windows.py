@@ -59,7 +59,8 @@ def _need(window: dict, *keys: str) -> None:
 def _honest_fields(rep: dict, cfg, block_hash: str) -> None:
     p = rep["params"]
     assert p.get("embargo_hours") == E, p.get("embargo_hours")
-    assert p.get("min_fresh_window_share") == 0.5, p.get("min_fresh_window_share")
+    # owner 2026-11-23: the default is 0.2 (was 0.5; "first verdict ~6 h")
+    assert p.get("min_fresh_window_share") == 0.2, p.get("min_fresh_window_share")
     assert p.get("max_windows_per_settlement") == int(cfg.max_windows_per_settlement)
     assert "embargo_window_share_cap" not in p, "rev6.12 (b) replaced the share cap"
     b = _b(rep, cfg)
@@ -167,14 +168,15 @@ def test_rev610_a_forged_embargo_or_draw_record_fails(run, forge):
 
 
 def test_rev612_a_frozen_set_below_the_fresh_share_fails(run):
-    """More than half the judged windows restated as embargo windows (data
+    """More than 80% of the judged windows restated as embargo windows (data
     time inside (b − e, b], flagged): F / (F + E) < `min_fresh_window_share`
-    = 0.5, which the producer would never freeze (`fresh_share_short`)."""
+    = 0.2 (owner 2026-11-23, was 0.5), which the producer would never freeze
+    (`fresh_share_short`)."""
     rep = _s1(run)
     cfg = run["cfg"]
     b = _b(rep, cfg)
     ws = _judged(rep)
-    for w in ws[: len(ws) // 2 + 2]:
+    for w in ws[: (4 * len(ws)) // 5 + 2]:
         _need(w, "embargo_window")
         w["min_target_ts"] = int(b - HOUR)
         w["embargo_window"] = True

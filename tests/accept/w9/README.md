@@ -458,3 +458,12 @@ binding the rows is `ld_rows_sha256`; a missing / extra public model is
 `sources` or `domains` does not re-derive, or a report without its public
 half at `public_weight > 0`, is `ld_cohort`. The W5i `combined_log_ratio`
 and the A10 rule are removed (`test_w9_rev611.py` correction).
+
+## Correction (owner 2026-11-23): `min_fresh_window_share` default 0.5 -> 0.2
+
+Owner rule: "fresh data should always be in there, but trade off" and "first
+verdict ~6 h". The W1 forge measured ~250 fresh windows at T+6 h, so a 0.5
+share would hold verdicts ~24 h. The default (loader, both shipped files) is
+**0.2**; fresh windows are still drawn first and always included. The tests
+that pinned the 0.5 default now pin 0.2. Lane D is not rolled out, so there is
+no activation key.

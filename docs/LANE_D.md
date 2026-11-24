@@ -201,7 +201,9 @@ confirmation duel (FAQ).
 
 **Verdict: 50% live, 50% public.** Two halves are scored with lane A's
 quantile head. The **live half** is the cohort's forward-only windows above
-(fresh plus the 48 h embargo top-up). The **public half** is 10000 windows
+(fresh plus the 48 h embargo top-up; fresh windows are always drawn first and
+included, and at least `[lane_d] min_fresh_window_share = 0.2` of the set is
+fresh, so a first verdict can land about 6 h after you commit). The **public half** is 10000 windows
 drawn each settlement from the block hash out of `Salesforce/GiftEvalPretrain`
 and the allowed `nju-zhangsq/RMISC` folders (5000 each, the same windows for
 the king, the house and every challenger). Per window the ratio of the king's

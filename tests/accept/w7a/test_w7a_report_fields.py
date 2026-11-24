@@ -77,7 +77,7 @@ def _expected_params(cfg) -> dict:
         # defaults, so the test never touches an attribute W2e hasn't added).
         "embargo_hours": float(getattr(cfg, "embargo_hours", 48.0)),
         "max_windows_per_settlement": int(getattr(cfg, "max_windows_per_settlement", 5000)),
-        "min_fresh_window_share": float(getattr(cfg, "min_fresh_window_share", 0.5)),
+        "min_fresh_window_share": float(getattr(cfg, "min_fresh_window_share", 0.2)),
     }
 
 

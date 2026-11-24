@@ -83,7 +83,10 @@ class LaneDConfig:
     # and the minimum fresh share of a frozen set (1 = fresh windows only).
     embargo_hours: float = 48.0
     max_windows_per_settlement: int = 5000
-    min_fresh_window_share: float = 0.5
+    # Owner 2026-11-23 ("fresh data should always be in there, but trade off";
+    # "first verdict ~6 h"): 0.2, was 0.5 (W1 forge: ~250 fresh windows at T+6 h).
+    # Fresh windows are still drawn first and always included.
+    min_fresh_window_share: float = 0.2
     # W2e (rev6.18 A3, F4): the public half's weight in the combined score
     # L = (1 - w) L_live + w L_pub (0 = the public half off: not drawn, its
     # point-gain condition not applied) and the per-window ratio clamp
@@ -264,7 +267,7 @@ def parse_lane_d(raw: object, *, era_blocks_at: Callable[[int], int] | None = No
     if max_windows < min_windows:
         raise ValueError(f"[lane_d] max_windows_per_settlement={max_windows} must be >= "
                          f"min_windows={min_windows}")
-    fresh = _float(ld.get("min_fresh_window_share", 0.5), "min_fresh_window_share")
+    fresh = _float(ld.get("min_fresh_window_share", 0.2), "min_fresh_window_share")
     if not 0.0 <= fresh <= 1.0:
         raise ValueError(f"[lane_d] min_fresh_window_share must be in [0, 1]; got {fresh!r}")
     # rev6.18 A3 (F4): the public half's weight, range [0, 1), and the

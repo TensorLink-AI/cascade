@@ -31,7 +31,8 @@ ARM = {"from_block": ARM_BLOCK, "share": 0.25, "takes_from": "lane_a"}
 W2E_DEFAULTS: dict[str, object] = {
     "embargo_hours": 48.0,
     "max_windows_per_settlement": 5000,
-    "min_fresh_window_share": 0.5,
+    # Owner 2026-11-23 ("first verdict ~6 h"): 0.2, was 0.5 (tests-correction).
+    "min_fresh_window_share": 0.2,
     # rev6.18 A3 (owner 2026-11-23): 50% live + 50% public; ratio clamp [0.5, 2].
     "public_weight": 0.5,
     "window_ratio_floor": 0.5,

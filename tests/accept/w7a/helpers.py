@@ -137,7 +137,7 @@ PARAMS_FIELDS = ("share", "takes_from", "remainder", "horizon", "horizons", "con
 # The W2e defaults (plan: 48 h, 5000 windows, 0.5); read from cfg with these
 # fall-backs, so a test never touches an attribute W2e has not added yet.
 W2E_DEFAULTS = {"embargo_hours": 48.0, "max_windows_per_settlement": 5000,
-                "min_fresh_window_share": 0.5}
+                "min_fresh_window_share": 0.2}  # owner 2026-11-23: 0.2 (was 0.5)
 GATE_FIELDS = ("suite", "block", "block_hash", "sentinel", "eligible", "results")
 GATE_RESULT_FIELDS = ("digest", "outcome", "lcb", "blocked_by", "session")
 # `snapshots` (RV4, W5b #581): every snapshot a judged window's version came

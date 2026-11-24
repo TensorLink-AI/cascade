@@ -459,3 +459,12 @@ expect that one convention (and the fixture test also checks the reason
 `bench_hold`); the C6 row and the `held` row above say the same. Nothing
 else changed. Both tests stay red on main (old confirmation stage) and pass
 with the W5e implementation (#802).
+
+## Correction (owner 2026-11-23): `min_fresh_window_share` default 0.5 -> 0.2
+
+Owner rule: "fresh data should always be in there, but trade off" and "first
+verdict ~6 h". The W1 forge measured ~250 fresh windows at T+6 h, so a 0.5
+share would hold verdicts ~24 h. The default (loader, both shipped files) is
+**0.2**; fresh windows are still drawn first and always included. The tests
+that pinned the 0.5 default now pin 0.2. Lane D is not rolled out, so there is
+no activation key.
