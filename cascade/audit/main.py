@@ -120,6 +120,9 @@ def _build_parser() -> argparse.ArgumentParser:
                        help="--reproduce forecast device (default cpu).")
     mkt_p.add_argument("--network", default="finney",
                        help="Bittensor network the window draws' block hashes are read from.")
+    mkt_p.add_argument("--history-network", default="archive",
+                       help="Endpoint for past-block reads the --network node pruned "
+                            "('none' disables).")
     mkt_p.add_argument("--no-chain", action="store_true",
                        help="Skip the block-hash check of the window draws (it WARNs).")
     mkt_p.add_argument("--workdir", type=Path, default=Path("./_audit_work/marketcast"))
@@ -158,6 +161,9 @@ def _build_parser() -> argparse.ArgumentParser:
                              "pointer, or index discovery for a round id.")
         sp.add_argument("--network", default="finney",
                         help="Bittensor network for the optional chain checks.")
+        sp.add_argument("--history-network", default="archive",
+                        help="Endpoint for past-block reads (block hashes, as-of stakes) "
+                             "the --network node pruned ('none' disables).")
         sp.add_argument("--no-chain", action="store_true",
                         help="Skip chain lookups (their checks WARN).")
         sp.add_argument("--workdir", type=Path, default=Path("./_audit_work"),
@@ -280,12 +286,15 @@ def fetch_receipt_text(cfg, round_id: str | None, validator_hotkey: str = "") ->
         ) from err
 
 
-def _chain_client(cfg, network: str):
-    """A read-only chain client, or None (checks then WARN) if unavailable."""
+def _chain_client(cfg, network: str, history_network: str = "archive"):
+    """A read-only chain client, or None (checks then WARN) if unavailable.
+    Past-block reads the ``network`` node pruned are retried once on
+    ``history_network`` (an archive endpoint by default)."""
     from ..shared.chain import ChainClient
 
     try:
-        client = ChainClient(netuid=cfg.netuid, network=network)
+        client = ChainClient(netuid=cfg.netuid, network=network,
+                             history_network=history_network)
         client.current_block()  # force the connection now, not mid-check
         return client
     except Exception as e:  # noqa: BLE001
@@ -813,7 +822,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"receipt round_id {receipt.round_id} != requested {round_id}", file=sys.stderr)
         return 2
 
-    client = None if args.no_chain else _chain_client(cfg, args.network)
+    client = None if args.no_chain else _chain_client(
+        cfg, args.network, getattr(args, "history_network", "archive"))
     results = audit_receipt(
         receipt, cfg, tier=args.tier, client=client,
         workdir=args.workdir, full_stream=args.full_stream, device=args.device,
@@ -979,7 +989,8 @@ def _marketcast(args) -> int:  # pragma: no cover — network / storage glue
     cfg = apply_receipt_activation(cfg, receipt)
     reader = _BucketReader(cfg)
     reports = fetch_marketcast_reports(receipt, reader)
-    client = None if args.no_chain else _chain_client(cfg, args.network)
+    client = None if args.no_chain else _chain_client(
+        cfg, args.network, getattr(args, "history_network", "archive"))
     inputs = fetch_marketcast_inputs(receipt, reports, reader, snapshot_dir=args.mkt_snapshots,
                                      client=client, select=dict(cfg.marketcast.pool_select),
                                      instances=tuple(getattr(cfg.lane_c, "instances", ())))

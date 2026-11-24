@@ -15,10 +15,20 @@ from pathlib import Path
 from .loop import build_runner
 
 
+def _history(args: argparse.Namespace) -> str:
+    """``--history-network`` (absent on a parser without it: the default)."""
+    return str(getattr(args, "history_network", "archive"))
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="cascade-validator", description="cascade validator loop.")
     p.add_argument("--chain-toml", type=Path, default=None, help="Override chain.toml path.")
     p.add_argument("--network", default="finney", help="Bittensor network (finney/test/local).")
+    p.add_argument("--history-network", default="archive",
+                   help="Chain endpoint for reads at a PAST block (registration / stake / "
+                        "commitment / block hash as of a boundary) that the --network node "
+                        "pruned: retried there once, never used for writes or head reads. "
+                        "Default: the SDK's archive network. 'none' disables.")
     p.add_argument("--wallet-name", default=None)
     p.add_argument("--wallet-hotkey", default=None)
     p.add_argument("--wallet-path", default=None)
@@ -157,6 +167,7 @@ def _netconfig_overlay(args) -> int:
         from ..shared.chain import ChainClient
 
         client = ChainClient.from_config(cfg, network=args.network,
+                                         history_network=_history(args),
                                          wallet_name=args.wallet_name,
                                          wallet_hotkey=args.wallet_hotkey,
                                          wallet_path=args.wallet_path)
@@ -205,7 +216,8 @@ def _publish_direct_config(args) -> int:
     cfg = load_chain_config(args.chain_toml)
     location = {"bucket": args.direct_config_bucket,
                 "endpoint": cfg.storage.s3_endpoint, "region": cfg.storage.s3_region}
-    client = ChainClient.from_config(cfg, network=args.network, wallet_name=args.wallet_name,
+    client = ChainClient.from_config(cfg, network=args.network, history_network=_history(args),
+                                     wallet_name=args.wallet_name,
                                      wallet_hotkey=args.wallet_hotkey, wallet_path=args.wallet_path)
     keypair = client.wallet().hotkey
     current = client.plain_commitment(keypair.ss58_address)
@@ -263,7 +275,7 @@ def _run_direct(args) -> int:
     cfg = load_chain_config(args.chain_toml)
     storage = {"endpoint": cfg.storage.s3_endpoint, "region": cfg.storage.s3_region}
     client = None if args.offline else ChainClient.from_config(
-        cfg, network=args.network, wallet_name=args.wallet_name,
+        cfg, network=args.network, history_network=_history(args), wallet_name=args.wallet_name,
         wallet_hotkey=args.wallet_hotkey, wallet_path=args.wallet_path)
     network, poll = None, args.direct_poll_seconds
     # The last accepted config survives restarts, so a panel the owner adds
@@ -463,7 +475,7 @@ def main(argv: list[str] | None = None) -> int:
     from ..shared.chain import ChainClient
 
     client = ChainClient.from_config(
-        runner.cfg, network=args.network,
+        runner.cfg, network=args.network, history_network=_history(args),
         wallet_name=args.wallet_name, wallet_hotkey=args.wallet_hotkey, wallet_path=args.wallet_path,
     )
     log = logging.getLogger("cascade.validator")
@@ -548,12 +560,14 @@ def main(argv: list[str] | None = None) -> int:
 
         lane_d_inputs = build_lane_d_inputs(
             runner.cfg, state_dir=lane_d_dir,
-            chain_factory=lambda: ChainClient.from_config(runner.cfg, network=args.network),
+            chain_factory=lambda: ChainClient.from_config(
+                runner.cfg, network=args.network, history_network=_history(args)),
             cfg_at=runner.cfg_at, always=True, **lane_d_services)
     runner.lane_d_step = build_lane_d_step(
         runner.cfg, state_dir=lane_d_dir,
         signer=runner.bench_signer,
-        chain_factory=lambda: ChainClient.from_config(runner.cfg, network=args.network),
+        chain_factory=lambda: ChainClient.from_config(
+            runner.cfg, network=args.network, history_network=_history(args)),
         store=lane_d_store, inputs=lane_d_inputs,
         bench=None if lane_d_inputs is None else lane_d_inputs.bench,
         cfg_at=runner.cfg_at, always=True)

@@ -1175,6 +1175,10 @@ class ValidatorRunner(
         # of the manifests, so a lock-in seen this poll governs the settlement
         # judged this poll.
         self._activation_tick(client)
+        # Lane C (owner 2026-11-24): snapshot the slot holders' registrations
+        # as of the boundary − 1 while that block is fresh (no-op unless lane
+        # C is active), so eviction never needs chain history.
+        self._lane_c_registration_tick(client)
         from ..shared.calendar_launch import resolve_calendar_launch
 
         base = self._base_cfg()
