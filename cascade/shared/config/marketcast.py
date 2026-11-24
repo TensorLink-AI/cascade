@@ -50,8 +50,6 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 
-from .v2 import FULL_PAY_TIERS, parse_full_pay_tiers
-
 # The suites (DEC-CA-0064 §Suites; ``ohlcv`` / ``high`` / ``low`` added
 # 2026-11-10, owner). With ``composite = false`` a suite is its own lane-C
 # target ``mkt:<suite>``; with ``composite = true`` the ONE target
@@ -339,15 +337,8 @@ class MarketCastConfig:
     alpha: float = 0.05
     bootstrap_B: int = 10_000
     gain_margin: float = 0.01
-    # Gain-tiered full-pay period of an ``mkt:`` win (owner 2026-10-20), on
-    # lane C's slot TTL and decay: the ``full_eras`` of the highest threshold
-    # its confirmed gain LCB meets. Its OWN tiers, not [lane_c]'s: the
-    # MarketCast LCB is a horizon-equal clustered geomean gain on one suite's
-    # loss (CRPS-bp / QLIKE / log range …) vs the pinned base, not lane C's
-    # cluster-bootstrapped sqrt(WQL · MASE) gain vs the king — the same number
-    # is not the same evidence. Release-only like the rest of [marketcast].
-    # Uncalibrated placeholders (lane B / C's defaults).
-    full_pay_tiers: tuple[tuple[float, int], ...] = FULL_PAY_TIERS
+    # (``full_pay_tiers`` is retired, DEC-CA-0073: an mkt: win's full-pay
+    # duration is lane C's gain-scaled rule, ramped from this gain_margin.)
     # review M10 (2026-10-19): clusters are asset class × time block, so the
     # floors count independent evidence, not windows of one regime
     min_windows: int = 200
@@ -800,9 +791,6 @@ def parse_marketcast(raw: object) -> MarketCastConfig:
     if not 0.0 < margin < 1.0:
         raise ValueError(f"[marketcast] gain_margin must be in (0, 1) — a zero bar lets an "
                          f"untouched base win ~alpha of the time; got {margin}")
-    # the TTL bound (lane C's win_ttl_eras) is checked by the loader
-    fpt = parse_full_pay_tiers(mc.get("full_pay_tiers", FULL_PAY_TIERS), section="marketcast",
-                               win_ttl_eras=0)
     mw = _num(mc.get("min_windows", 200), "min_windows", integer=True)
     mcl = _num(mc.get("min_clusters", 8), "min_clusters", integer=True)
     if mw < 1 or not 1 <= mcl <= mw:
@@ -1006,7 +994,7 @@ def parse_marketcast(raw: object) -> MarketCastConfig:
         horizons=tuple(sorted(hzs.items())),
         data_sources=tuple(sorted(sources.items())),
         coverage_levels=cov, coverage_tolerance=tol, alpha=alpha, bootstrap_B=B,
-        gain_margin=margin, full_pay_tiers=fpt, min_windows=mw, min_clusters=mcl, pool_prefix=pp,
+        gain_margin=margin, min_windows=mw, min_clusters=mcl, pool_prefix=pp,
         eval_context_length=ectx, windows_per_cell=wpc, start_margin_seconds=marg,
         verdict_wait_blocks=wait, snapshot_days=sdays, coarse_history_days=cdays,
         report_timeout_settlements=rto, max_infra_deferrals=mid,

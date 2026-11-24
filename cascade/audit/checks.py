@@ -2381,7 +2381,7 @@ def check_king_check(receipt: RoundReceipt, cfg: ChainConfig,
 
 
 def _paid_full_pay_why(w: dict, tiers, *, at_win: bool, ttl: int,
-                       state_entry: list | None) -> str | None:
+                       state_entry: list | None, mismatch=None) -> str | None:
     """Why a payout record's win carries a forged / inconsistent gain-tiered
     full-pay period (owner 2026-10-20), else None. Every paid win carries
     ``gain_lcb`` / ``tier`` / ``full_eras`` / ``below_floor``; ``full_eras``
@@ -2404,7 +2404,9 @@ def _paid_full_pay_why(w: dict, tiers, *, at_win: bool, ttl: int,
     if lcb is None or not math.isfinite(float(lcb)):
         return f"gain_lcb {lcb!r} is not finite"
     if at_win:
-        why = full_pay_mismatch(w, tiers)
+        # ``mismatch`` (DEC-CA-0073, lane C): the gain-scaled duration's
+        # re-derivation, in place of the gain-tiered one
+        why = mismatch(w) if mismatch is not None else full_pay_mismatch(w, tiers)
         if why:
             return f"full-pay tier forged: {why}"
     elif bool(w.get("below_floor")) != (float(lcb) < float(w.get("tier") or 0.0)):
@@ -2490,7 +2492,7 @@ def _lane_c_paid_wins(receipt: RoundReceipt, cfg: ChainConfig,
     inconsistency (lane C not active, payout clock, era length, share / slot
     count, unknown / duplicate target, uid range, age, expiry, multiplier)."""
     from ..shared.era import era_length_blocks
-    from ..shared.lane_c import LaneCWin, full_pay_tiers_for, target_multiplier, win_expired
+    from ..shared.lane_c import LaneCWin, full_pay_record_mismatch
 
     lc = cfg.lane_c
     pay = receipt.lane_c_pay or {}
@@ -2540,14 +2542,19 @@ def _lane_c_paid_wins(receipt: RoundReceipt, cfg: ChainConfig,
         if int(w.get("age", -1)) != age:
             return [], (f"target {t}: recorded age {w.get('age')} != {age} eras since block "
                         f"{w.get('win_block')}")
-        if win_expired(age, lc):
-            return [], f"target {t}: win paid at age {age} eras, past win_ttl_eras={lc.win_ttl_eras}"
+        # DEC-CA-0073: full pay for the win's recorded gain-scaled duration
+        # (re-derived at the win), then the slot ends — no decay, no TTL
+        mc_ = getattr(cfg, "marketcast", None)
         why = _paid_full_pay_why(
-            w, full_pay_tiers_for(t, lc, getattr(cfg, "marketcast", None)),
-            at_win=int(w.get("win_block", -1)) == block, ttl=int(lc.win_ttl_eras),
-            state_entry=None if post is None else (post or {}).get(t))
+            w, None, at_win=int(w.get("win_block", -1)) == block, ttl=0,
+            state_entry=None if post is None else (post or {}).get(t),
+            mismatch=lambda r, t=t, mc_=mc_: full_pay_record_mismatch(r, t, lc, mc_,
+                                                                       era_blocks=eb))
         if why:
             return [], f"target {t}: {why}"
+        if age >= int(w["full_eras"]):
+            return [], (f"target {t}: win paid at age {age} eras, past its full-pay duration "
+                        f"({w['full_eras']} eras) — the slot has ended")
         if bool(w.get("wind_down", False)) != (t in winding):
             return [], (f"target {t}: wind_down flag {w.get('wind_down')} but its competition "
                         f"is {'' if t in winding else 'not '}winding down at {block}")
@@ -2561,7 +2568,7 @@ def _lane_c_paid_wins(receipt: RoundReceipt, cfg: ChainConfig,
                             f"period ({w.get('full_eras')} eras) or the wind-down window")
             mult = 1.0
         else:
-            mult = target_multiplier(age, lc, int(w["full_eras"]))
+            mult = 1.0
         if not math.isclose(float(w.get("multiplier", -1.0)), mult, rel_tol=1e-12,
                             abs_tol=1e-15):
             return [], f"target {t}: multiplier {w.get('multiplier')} != {mult} at age {age}"
@@ -3639,14 +3646,17 @@ def check_lane_c(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
             return _fail(name, f"{who} passed without the public guard "
                                f"{missing} configured for {t}")
         if phase == "confirm":
-            # gain-tiered full-pay (owner 2026-10-20): the tier a confirmed
-            # win records, re-derived from this row's gain LCB
-            from ..eval.expert_lane import full_pay_mismatch
-            from ..shared.lane_c import full_pay_tiers_for
+            # the gain-scaled full-pay duration a confirmed win records
+            # (DEC-CA-0073), re-derived from this row's gain LCB on the era
+            # grid in force at this settlement
+            from ..shared.era import era_length_blocks
+            from ..shared.lane_c import full_pay_record_mismatch
 
             fp = dict(r.get("full_pay") or {})
             fp["gain_lcb"] = lcb
-            why = full_pay_mismatch(fp, full_pay_tiers_for(t, lc, cfg.marketcast))
+            why = full_pay_record_mismatch(
+                fp, t, lc, cfg.marketcast,
+                era_blocks=int(era_length_blocks(cfg.round, boundary)))
             if why:
                 return _fail(name, f"{who}: full-pay tier forged: {why}")
         if phase == "judge":

@@ -458,12 +458,14 @@ trusts the recorded tier:
   multi-target leg), and `tier` / `full_eras` / `below_floor` re-derive from
   it (`cascade.eval.expert_lane.full_pay_mismatch`).
 - `check_lane_c` — a passing confirm row's `full_pay` re-derives from its
-  `gain_lcb` under the target's tiers; the slot paid at this settlement
+  `gain_lcb` under the gain-scaled duration rule (DEC-CA-0073, on the era
+  length at that settlement); the slot paid at this settlement
   carries the confirmed row's `gain_lcb` and `full_pay`.
 - `_lane_b_paid_wins` / `_lane_c_paid_wins` (the payout replay behind
   `check_weights` and `derive_weights`, so satellites run it too) — every
-  paid win carries the four fields; `full_eras` is an integer in `[0,
-  win_ttl_eras]`; a win made at this settlement re-derives under this
+  paid win carries the four fields; lane B's `full_eras` is an integer in
+  `[0, win_ttl_eras]`; a lane-C win pays 1.0 and FAILs at or past its own
+  `full_eras` (DEC-CA-0073: the slot ends, no decay); a win made at this settlement re-derives under this
   receipt's tiers; an OLDER win is not re-derived under today's tiers (a
   signed overlay may have changed them since) but must be self-consistent
   (`below_floor` ⟺ `gain_lcb < tier`) and equal its slot in the receipt's

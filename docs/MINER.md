@@ -969,8 +969,10 @@ target (`mkt:market`), its full-pay slot reserves **all 25% of total emissions**
 That is a slot maximum, not a promise of paying an unfilled slot. Pending,
 unstarted or ended competitions do not donate their allocation to active ones.
 
-**B/C reward progression.** B records its tier from accepted marginal gain;
-MarketCast C records it from the confirmed gain. Current full-pay tiers are:
+**B/C reward progression.** B records its tier from accepted marginal gain.
+MarketCast C records a full-pay duration from the confirmed gain (DEC-CA-0073):
+5 days at the 0.01 gain margin, rising linearly to 20 days at a gain LCB of
+0.05 or more, rounded up to whole eras. Current full-pay periods are:
 
 <!-- cascade:rewards:slot-tiers:start -->
 | Lane | Target gain LCB | Full-pay eras |
@@ -978,9 +980,10 @@ MarketCast C records it from the confirmed gain. Current full-pay tiers are:
 | B: accepted marginal gain | ≥ 0.05 | 10 |
 | B: accepted marginal gain | ≥ 0.02 | 5 |
 | B: accepted marginal gain | ≥ 0.01 | 2 |
-| C: confirmed MarketCast gain | ≥ 0.05 | 10 |
-| C: confirmed MarketCast gain | ≥ 0.02 | 5 |
-| C: confirmed MarketCast gain | ≥ 0.01 | 2 |
+| C: confirmed MarketCast gain | 0.01 | 10 |
+| C: confirmed MarketCast gain | 0.02 | 18 |
+| C: confirmed MarketCast gain | 0.03 | 25 |
+| C: confirmed MarketCast gain | ≥ 0.05 | 40 |
 <!-- cascade:rewards:slot-tiers:end -->
 
 A threshold of 0.05 here is a 5% lower confidence bound on the target gain;
@@ -988,10 +991,11 @@ it is a different statistic from A's increment-unit crowning LCB. Full pay
 means **100% of that target's slot**, not 100% of the lane or subnet. The tier
 is fixed on the recorded win; a later tier retune does not restart that win.
 
-After the full-pay period, the configured one-era half-life gives multipliers
+After B's full-pay period, the configured one-era half-life gives multipliers
 50% → 25% → 12.5% → a **10% slot floor**. The win stops paying at **age 28
-eras**, measured from B acceptance or C confirmation, including its full-pay
-eras. It does not get another 28 eras after decay starts. Replacement by a new
+eras**, measured from B acceptance, including its full-pay eras. A C win has
+no decay: its slot ends (burns) when its full-pay duration ends, unless a
+newer win has already replaced it. It does not get another 28 eras after decay starts. Replacement by a new
 holder stops the old holder earlier. At approximately 12 hours per mainnet
 era, 28 eras is approximately 14 days; blocks, not wall-clock estimates, govern.
 
@@ -1729,9 +1733,9 @@ market. The shipped suites are `ohlcv` (the next bars' high / low / close
 price and volume), `returns`, `vol` (Garman–Klass), `high` / `low` (the
 bar's up / down excursion from its open), `range` and `liquidity` (log
 volume); `funding` and `alpha` exist but are off. `mkt:market` is one lane-C
-slot, with lane C's decay and TTL; its full-pay period is tiered by
-`[marketcast] full_pay_tiers` (same placeholder table as lane C's, kept
-separate because the MarketCast gain is a different statistic).
+slot. A confirmed win pays it in full for 5 days (at `[marketcast]
+gain_margin`) up to 20 days (at `[lane_c] full_pay_max_gain` or more), then
+the slot ends (DEC-CA-0073).
 
 Licence: the pinned weights use a
 [Modified MIT licence](https://huggingface.co/mistralai/Timestral-28M/blob/180698bbf5a50dda3516aa6419798437fb03a430/LICENSE).

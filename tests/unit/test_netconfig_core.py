@@ -299,7 +299,7 @@ def test_bench_policy_switch_checks_identity_alignment_and_retroactivity():
     {"marketcast": {"gain_margin": 0.0}},
     {"marketcast": {"alpha": 2.0}},
     {"marketcast": {"bootstrap_B": 50}},
-    {"marketcast": {"full_pay_tiers": [[0.01, 100000]]}},
+    {"lane_c": {"full_pay_max_days": 1.0}},        # DEC-CA-0073: below full_pay_min_days
 ])
 def test_new_runtime_controls_still_pass_the_loader(overrides):
     with pytest.raises(nc.NetConfigError, match="loader"):

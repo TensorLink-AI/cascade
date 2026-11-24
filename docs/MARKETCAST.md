@@ -289,10 +289,13 @@ cascade lane-c status https://<intake> --hotkey YOUR_SS58 --json   # the public 
 7. **Confirmed.** A later settlement must pass you again on windows that
    started after the first snapshot ended, and you must beat the current
    holder on *your* windows (paired `vs_holder` gain). Then you take the slot.
-8. **Payout.** 100 % of the slot for a gain-tiered period (`full_pay_tiers`:
-   LCB ≥ 0.05 → 10 eras, ≥ 0.02 → 5, ≥ 0.01 → 2), then halving every era to
-   a 10 % floor, stopping 28 eras (14 days) after the win. Unpaid decay and
-   empty slots burn.
+8. **Payout** (DEC-CA-0073). 100 % of the slot for `5 + 15 × clamp((LCB −
+   0.01) / 0.04, 0, 1)` days (`[lane_c] full_pay_min_days` /
+   `full_pay_max_days` / `full_pay_max_gain`, ramped from `[marketcast]
+   gain_margin`), rounded up to whole eras: 10 to 40 twelve-hour eras. Then
+   the slot ends and burns unless a newer win has replaced it. There is no
+   decay tail and no TTL. The win records its `full_eras`; `tier` is the
+   clamped gain the duration came from. Empty slots burn.
 
 ## Reading your verdict
 

@@ -837,20 +837,23 @@ remainder  = "burn"                # unpaid decay + empty target slots burn
 # "mkt:<suite>" are the composite = false shape). Listed but inactive while [marketcast]
 # from_block = 0: zero active slots, lane C's whole share burns.
 targets = ["mkt:market"]
-# Payout schedule in ERAS (lane B's rule): 100 % for a GAIN-TIERED full
-# period after the judging settlement, then halving every half_life_rounds
-# eras to floor; payout STOPS at win_ttl_eras. full_pay_tiers (owner
-# 2026-10-20, CONSENSUS, overlay-settable; same shape and checks as [lane_b]):
-# the confirmed win's gain LCB picks the full_eras of the highest threshold it
-# meets, fixed at the win. mkt: targets use [marketcast] full_pay_tiers.
-# UNCALIBRATED PLACEHOLDERS — set from real lane-C win LCBs before arming.
+# Payout (owner 2026-11-24, DEC-CA-0073; CONSENSUS, overlay-settable): a
+# confirmed win pays 100 % of its slot for
+#   days = full_pay_min_days + (full_pay_max_days - full_pay_min_days)
+#          * clamp((gain_lcb - gain_margin) / (full_pay_max_gain - gain_margin), 0, 1)
+# (gain_margin = [marketcast] gain_margin for an mkt: target), rounded UP to
+# whole eras on the grid in force at the win (12 h eras: 10 ... 40 eras),
+# fixed at the win; then the slot ENDS and burns unless a newer win replaced
+# it — no decay, no TTL. Loader-checked: 0 < full_pay_min_days <=
+# full_pay_max_days, gain_margin < full_pay_max_gain < 1. The gain-tiered
+# full_pay_tiers / half_life_rounds / floor / win_ttl_eras are RETIRED
+# (ignored at load, refused in overlays).
 # A confirmed win takes the slot only with a STRICTLY higher gain LCB than a
 # holder on the same king (else the slot and its clock stay); a holder
 # trained on an older king is replaced.
-full_pay_tiers   = [[0.05, 10], [0.02, 5], [0.01, 2]]   # owner-tunable
-half_life_rounds = 1.0             # owner-tunable
-floor            = 0.1             # owner-tunable
-win_ttl_eras     = 28              # owner-tunable: 14 days of 12 h eras
+full_pay_min_days = 5.0            # owner 2026-11-24: at the 1 % gain margin
+full_pay_max_days = 20.0           # owner 2026-11-24: at >= full_pay_max_gain
+full_pay_max_gain = 0.05
 # Verdict: an mkt: entry is judged by MarketCast ([marketcast] alpha /
 # gain_margin / min_windows ...), paired vs the pinned base on forward-only
 # windows. The keys below are lane C's own verdict defaults, kept for the
@@ -1037,14 +1040,8 @@ coverage_levels    = [0.5, 0.8, 0.98]           # calibration gate on mkt:return
 coverage_tolerance = 0.05                       # owner-tunable: fail if empirical < nominal - tolerance
 alpha              = 0.05
 gain_margin        = 0.01                       # never 0
-# Gain-tiered full-pay period of an mkt: win (owner 2026-10-20), on lane C's
-# slot TTL and decay: [[lcb_threshold, full_eras], ...] like [lane_c]'s, but
-# its OWN table — the MarketCast LCB is a horizon-equal clustered geomean gain
-# on one suite's loss vs the pinned base, not lane C's sqrt(WQL*MASE) gain vs
-# the king, so one threshold is not the same evidence in both. Overlay-settable;
-# full_eras <= [lane_c] win_ttl_eras
-# (load-checked). UNCALIBRATED PLACEHOLDERS.
-full_pay_tiers     = [[0.05, 10], [0.02, 5], [0.01, 2]]
+# An mkt: win's full-pay duration is [lane_c]'s gain-scaled rule, ramped
+# from gain_margin (DEC-CA-0073; full_pay_tiers is retired).
 min_windows        = 200                        # spread over >= min_time_blocks (review M10)
 min_clusters       = 8                          # distinct (asset class, time block) clusters
 pool_prefix        = "pool_mkt"

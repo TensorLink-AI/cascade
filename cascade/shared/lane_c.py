@@ -8,15 +8,16 @@ Pure and deterministic — every validator derives the same state from the same
 settlements, and ``cascade-audit`` replays the payouts. Mirrors
 :mod:`cascade.shared.lane_b`: payout age is counted in ERAS (``era_blocks``
 = the grid in force × ``era_settlements``) from the settlement that judged the
-win (age 0 = the first era-length after it); a win pays in full for its
-RECORDED ``full_eras`` eras, then decays to ``floor``, and stops paying at
-``win_ttl_eras`` (its slot burns). Gain-tiered full-pay period (owner
-2026-10-20): ``full_eras`` is chosen at the confirmed win from its gain LCB by
-``[lane_c] full_pay_tiers`` — ``[marketcast] full_pay_tiers`` for an ``mkt:``
-target (:func:`target_full_pay`) — and recorded on the :class:`TargetWin`
-(``tier`` / ``full_eras`` / ``below_floor``), never re-evaluated. A confirmed win takes a target's slot
+win (age 0 = the first era-length after it). Gain-scaled full-pay duration
+(owner 2026-11-24, DEC-CA-0073): a confirmed win pays its slot IN FULL for
+``full_eras`` eras — 5 days at the competition's gain margin up to 20 days at
+``[lane_c] full_pay_max_gain`` (:func:`duration_full_pay`), chosen at the win
+from its gain LCB and recorded on the :class:`TargetWin` (``tier`` /
+``full_eras`` / ``below_floor``), never re-evaluated — then its slot ENDS
+(burns): no decay tail, no TTL. A confirmed win takes a target's slot
 per :func:`win_beats` (a strictly higher gain LCB on the same king, or any
-win on a newer king). A winning fine-tune is published and paid but NEVER becomes the
+win on a newer king); a holder whose duration ran out is evicted first, so
+any confirmed win then takes the empty slot. A winning fine-tune is published and paid but NEVER becomes the
 pretraining init — lane A's lineage is untouched.
 
 A win is CONFIRMED, never immediate: a target's best passer at one
@@ -70,7 +71,6 @@ import math
 from dataclasses import asdict, dataclass, field
 from typing import Any, NamedTuple
 
-from ..eval.expert_lane import FullPay, full_pay, reward_multiplier
 from .config.lane_c import (
     COMPETITION_KINDS,
     COMPETITION_STATES,
@@ -161,9 +161,9 @@ class TargetWin:
     recipe_ref: str = ""
     base_pointer: str = ""
     gain_lcb: float = 0.0
-    # gain-tiered full-pay period, fixed at the confirmed win from
-    # ``gain_lcb`` (:func:`target_full_pay`); None = untiered (refused by the
-    # payout — every recorded win carries its tier)
+    # gain-scaled full-pay duration, fixed at the confirmed win from
+    # ``gain_lcb`` (:func:`target_full_pay_record`): ``tier`` = the clamped
+    # gain it was derived from; None = untiered (refused by the payout)
     tier: float | None = None
     full_eras: int | None = None
     below_floor: bool = False
@@ -179,22 +179,73 @@ class TargetWin:
                 "full_eras": self.full_eras, "below_floor": bool(self.below_floor)}
 
 
-def full_pay_tiers_for(target: str, cfg, mc=None) -> tuple:
-    """The full-pay tiers a win on ``target`` is tiered by: ``[marketcast]
-    full_pay_tiers`` (``mc``) for an ``mkt:`` target, else ``[lane_c]``'s
-    (``cfg``)."""
+def gain_margin_for(target: str, cfg, mc=None) -> float:
+    """The verdict margin a win on ``target`` cleared — the bottom of the
+    pay-duration ramp: ``[marketcast] gain_margin`` (``mc``) for an ``mkt:``
+    target, else ``[lane_c]``'s (``cfg``)."""
     if is_mkt_target(target):
         if mc is None:
-            raise ValueError(f"an {target!r} win needs [marketcast] for its full-pay tiers")
-        return tuple(mc.full_pay_tiers)
-    return tuple(cfg.full_pay_tiers)
+            raise ValueError(f"an {target!r} win needs [marketcast] for its gain margin")
+        return float(mc.gain_margin)
+    return float(cfg.gain_margin)
 
 
-def target_full_pay(target: str, gain_lcb: float | None, cfg, mc=None) -> FullPay:
-    """CONSENSUS: the full-pay period of a confirmed win on ``target`` with
-    gain LCB ``gain_lcb`` (:func:`cascade.eval.expert_lane.full_pay` over
-    :func:`full_pay_tiers_for`)."""
-    return full_pay(gain_lcb, full_pay_tiers_for(target, cfg, mc))
+def duration_full_pay(gain_lcb: float | None, *, margin: float, min_days: float,
+                      max_days: float, max_gain: float, era_blocks: int) -> dict:
+    """CONSENSUS (pure, exact rational arithmetic; owner 2026-11-24,
+    DEC-CA-0073): the full-pay record of a win with gain LCB ``gain_lcb``::
+
+        frac      = clamp((gain_lcb - margin) / (max_gain - margin), 0, 1)
+        days      = min_days + (max_days - min_days) * frac
+        full_eras = ceil(days * 86400 / (BLOCK_SECONDS * era_blocks))
+
+    ``ceil``: never shorter than the owner's duration (12 h eras: 10 … 40 eras
+    for 5 … 20 days). ``tier`` records the clamped gain the duration was
+    derived from; ``below_floor`` an LCB under ``margin`` or a non-finite one
+    (paid the minimum). After ``full_eras`` the slot ends."""
+    from fractions import Fraction
+
+    from .config import BLOCK_SECONDS
+
+    if int(era_blocks) <= 0:
+        raise ValueError("era_blocks must be > 0")
+    m, top = Fraction(float(margin)), Fraction(float(max_gain))
+    if not m < top:
+        raise ValueError(f"gain margin {margin} must be < max gain {max_gain}")
+    x = None if gain_lcb is None or not math.isfinite(float(gain_lcb)) else float(gain_lcb)
+    g = m if x is None else min(max(Fraction(x), m), top)
+    lo, hi = Fraction(float(min_days)), Fraction(float(max_days))
+    days = lo + (hi - lo) * (g - m) / (top - m)
+    n = math.ceil(days * 86400 / Fraction(BLOCK_SECONDS) / int(era_blocks))
+    return {"gain_lcb": x, "tier": float(g), "full_eras": int(max(1, n)),
+            "below_floor": bool(x is None or Fraction(x) < m)}
+
+
+def target_full_pay_record(target: str, gain_lcb: float | None, cfg, mc=None, *,
+                           era_blocks: int) -> dict:
+    """CONSENSUS: the full-pay record of a confirmed win on ``target``
+    (:func:`duration_full_pay` on ``[lane_c]``'s terms, ramped from
+    :func:`gain_margin_for`; ``era_blocks`` = the era length in force at the
+    confirming settlement)."""
+    return duration_full_pay(
+        gain_lcb, margin=gain_margin_for(target, cfg, mc), min_days=cfg.full_pay_min_days,
+        max_days=cfg.full_pay_max_days, max_gain=cfg.full_pay_max_gain, era_blocks=era_blocks)
+
+
+def full_pay_record_mismatch(rec: dict, target: str, cfg, mc=None, *,
+                             era_blocks: int) -> str | None:
+    """Why a recorded ``{gain_lcb, tier, full_eras, below_floor}`` is not
+    :func:`target_full_pay_record` of its own ``gain_lcb`` (None =
+    consistent) — the audit's forged-duration check."""
+    if not all(k in rec for k in ("gain_lcb", "tier", "full_eras")):
+        return "carries no gain_lcb / tier / full_eras"
+    want = target_full_pay_record(target, rec.get("gain_lcb"), cfg, mc, era_blocks=era_blocks)
+    for k in ("tier", "full_eras", "below_floor"):
+        got = rec.get(k, False if k == "below_floor" else None)
+        if got != want[k] or isinstance(got, bool) != isinstance(want[k], bool):
+            return (f"{k} {got!r} != {want[k]!r} re-derived from gain_lcb "
+                    f"{rec.get('gain_lcb')!r}")
+    return None
 
 
 PENDING_KINDS = ("confirm", "deferred")
@@ -407,18 +458,14 @@ class LaneCWin:
     multiplier: float
 
 
-def win_expired(age_eras: int, cfg) -> bool:
-    ttl = int(getattr(cfg, "win_ttl_eras", 0) or 0)
-    return ttl > 0 and int(age_eras) >= ttl
-
-
-def target_multiplier(age_eras: int, cfg, full_eras: int | None) -> float:
-    """A lane-C win's multiplier at ``age_eras`` from its RECORDED
-    ``full_eras`` (None = an untiered win: refused) on ``[lane_c]``'s decay."""
-    if full_eras is None:
-        raise ValueError("lane-C win carries no full-pay tier (full_eras)")
-    return reward_multiplier(int(age_eras), full_eras=int(full_eras),
-                             half_life_rounds=cfg.half_life_rounds, floor=cfg.floor)
+def win_expired(age_eras: int, win) -> bool:
+    """Whether a win of age ``age_eras`` has stopped paying (DEC-CA-0073):
+    its recorded full-pay duration ``full_eras`` has run out — the slot
+    burns and the holder is evicted. None ``full_eras`` = untiered: refused."""
+    n = getattr(win, "full_eras", None)
+    if n is None:
+        raise ValueError("lane-C win carries no full-pay duration (full_eras)")
+    return int(age_eras) >= int(n)
 
 
 # ── concurrent competitions (owner 2026-10-20) ───────────────────────────────
@@ -560,7 +607,7 @@ def lane_c_payouts(state: LaneCState, *, block: int, era_blocks: int, cfg, n_uid
         if uid is None or not 0 <= int(uid) < n_uids:
             continue
         age = state.eras_since(w, block, era_blocks)
-        if win_expired(age, cfg):
+        if win_expired(age, w):
             continue
         row = {"target": t, "hotkey": w.hotkey, "uid": int(uid),
                "win_block": int(w.win_block), "age": int(age)}
@@ -570,7 +617,7 @@ def lane_c_payouts(state: LaneCState, *, block: int, era_blocks: int, cfg, n_uid
             row["multiplier"] = 1.0
             row["wind_down"] = True
         else:
-            row["multiplier"] = target_multiplier(age, cfg, w.full_eras)
+            row["multiplier"] = 1.0          # full pay until the duration ends
         out.append({**row, **w.full_pay_record()})
     return out
 
@@ -679,22 +726,24 @@ def lane_c_pay_record(state: LaneCState, *, block: int, era_blocks: int, cfg, n_
     comps, slot = lane_c_split(cfg, int(block), int(era_blocks), mc)
     paying = tuple(t for t in cfg.targets if t in slot)
     winding = frozenset(t for c in comps if c["state"] == "winding_down" for t in c["targets"])
-    return {"block": int(block), "era_blocks": int(era_blocks),
-            "share": float(cfg.share), "slots": len(paying),
-            "slot_frac": {t: slot[t] for t in paying}, "competitions": comps,
-            "wins": lane_c_payouts(state, block=block, era_blocks=era_blocks, cfg=cfg,
-                                   n_uids=n_uids, uid_of=uid_of, targets=paying,
-                                   winding=winding)}
+    rec = {"block": int(block), "era_blocks": int(era_blocks),
+           "share": float(cfg.share), "slots": len(paying),
+           "slot_frac": {t: slot[t] for t in paying}, "competitions": comps,
+           "wins": lane_c_payouts(state, block=block, era_blocks=era_blocks, cfg=cfg,
+                                  n_uids=n_uids, uid_of=uid_of, targets=paying,
+                                  winding=winding)}
+    return rec
 
 
 __all__ = [
     "PENDING_KINDS", "LaneCState", "LaneCWin", "LanePoolShares", "MAX_WARMUP_FRACTION",
     "PendingEntry",
     "RECIPE_FILE", "RECIPE_KEYS", "Recipe",
-    "TargetWin", "active_targets", "competition_closed", "competition_from_block",
-    "competition_past_end", "competition_started", "competition_state", "full_pay_tiers_for",
+    "TargetWin", "active_targets", "duration_full_pay", "full_pay_record_mismatch",
+    "gain_margin_for", "competition_closed", "competition_from_block",
+    "competition_past_end", "competition_started", "competition_state",
     "lane_c_pay_record", "lane_c_payouts", "lane_c_shares", "lane_c_split", "lane_c_vector",
     "lane_pool_shares",
-    "load_state", "parse_recipe", "pay_wins", "save_state_atomic", "target_full_pay",
-    "target_multiplier", "wind_down_pays", "win_beats", "win_expired",
+    "load_state", "parse_recipe", "pay_wins", "save_state_atomic", "target_full_pay_record",
+    "wind_down_pays", "win_beats", "win_expired",
 ]
