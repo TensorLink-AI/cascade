@@ -51,8 +51,8 @@ training leg. Funding makes an entry eligible; it never guarantees a reward.
 | A MarketCast recipe author | [MarketCast reference](docs/MARKETCAST.md) |
 | A coding agent | [AGENTS.md](AGENTS.md) and [the agent walkthrough](docs/AGENT_MINING.md) |
 | A validator | [Validator guide](docs/VALIDATOR.md) |
-| The operator | [Operator runbook](docs/OPERATOR.md) |
 | Reviewing the design | [Architecture](docs/ARCHITECTURE.md), [model and recipe](docs/MODEL.md) and [decisions](decisions/) |
+| Looking for any other doc | [The docs map](docs/README.md) |
 
 The live model is **Cascade MoE Base - 1.23B** (a pyramid mixture of experts,
 112M active parameters per token). Smaller presets (17.58M, 69.02M, 273.84M)
@@ -130,7 +130,7 @@ git diff --check
 reference and the reward tables against the code. It does not prove that a
 deployment is live. Operator services (`cascade-trainer`, `cascade-validator`,
 `cascade-satellite`, `cascade-audit` and others) are covered in the
-[operator](docs/OPERATOR.md) and [validator](docs/VALIDATOR.md) guides; the
+[validator guide](docs/VALIDATOR.md); the
 code layout is in [ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## License

@@ -3095,6 +3095,27 @@ def _signed_court(report: dict) -> list | None:
     return [s["uid"] for s in court]
 
 
+def lane_d_court_payees(lane_d) -> dict[int, str]:
+    """#913: ``{uid: hotkey}`` of every PAID slot of the lane D record's
+    signed court (``pay.court``: an int uid and a hotkey; a house or
+    deregistered slot pays nobody). The court is the one
+    :func:`lane_d_pay` verifies — call this only when it pays (``paid``).
+    A uid named by two slots with different hotkeys keeps neither (it can
+    match at most one registration; the reward-uid check then refuses it)."""
+    report = lane_d.get("report") if isinstance(lane_d, dict) else None
+    court = (report.get("pay") or {}).get("court") if isinstance(report, dict) else None
+    out: dict[int, str] = {}
+    clash: set[int] = set()
+    for s in court if isinstance(court, list) else ():
+        uid, hk = (s.get("uid"), s.get("hotkey")) if isinstance(s, dict) else (None, None)
+        if not isinstance(uid, int) or isinstance(uid, bool) or not isinstance(hk, str) or not hk:
+            continue
+        if out.get(uid, hk) != hk:
+            clash.add(uid)
+        out[uid] = hk
+    return {u: h for u, h in out.items() if u not in clash}
+
+
 def lane_d_pay(receipt: RoundReceipt, cfg: ChainConfig, lane_d) -> LaneDPay:
     """rev6.18 B1/B3: lane D's pay at the settlement ``receipt`` closes, from
     the lane D record (the signed report and its W7c receipt record;

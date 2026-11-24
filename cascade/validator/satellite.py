@@ -31,7 +31,9 @@ d. re-derives everything else with the code ``cascade-audit`` runs
    recorded one (``weights-derive``);
 e. at every weight push, checks each paid UID against its OWN metagraph: the
    hotkey registered at that UID must be one the receipt pays
-   (``reward-uid``).
+   (``reward-uid``). Lane D's verified signed court (#913) is attributed
+   apart: a lane D court uid registered to another hotkey burns lane D's
+   share only (``lane_d_check_burn``), lanes A/B/C as derived.
 
 All checks pass ⇒ the satellite sets the vector it derived through the chain
 client's weight path (float32 → u16 quantisation, ``WEIGHT_RETRY_BLOCKS``
@@ -172,6 +174,10 @@ class Replay:
     burn_uid: int = 0
     attribution: dict = field(default_factory=dict)
     advance: bool = True
+    # #913: when ``vector`` pays lane D's signed court, the same derivation
+    # with lane D's share on ``burn_uid`` (lanes A/B/C identical); a lane D
+    # payee the satellite's metagraph does not register burns to it.
+    vector_d_burned: list[float] | None = None
 
 
 def _fail(check: str, detail: str, *, advance: bool = True) -> Replay:
@@ -203,10 +209,13 @@ def _anchor_of(receipt) -> dict:
     }
 
 
-def _attribution(receipt) -> dict:
+def _attribution(receipt, lane_d_court: dict | None = None) -> dict:
     """Who the receipt pays: every hotkey its posterior state pays (plus the
     verdict's king) and the ``uid -> hotkey`` pairs the lane payout records
-    pin explicitly."""
+    pin explicitly. ``lane_d_court`` (#913): the ``{uid: hotkey}`` slots of
+    lane D's verified signed court (KING_D, then prior kings) when the
+    derived vector pays it; kept apart under ``"lane_d"`` so a lane D payee
+    mismatch burns lane D's share only (:meth:`SatelliteRunner.desired`)."""
     from ..shared.settlement_state import paid_hotkeys
 
     paid = paid_hotkeys(getattr(receipt, "state_post", None))
@@ -219,7 +228,30 @@ def _attribution(receipt) -> dict:
             if w.get("hotkey") is not None and w.get("uid") is not None:
                 pinned[str(int(w["uid"]))] = str(w["hotkey"])
                 paid.add(str(w["hotkey"]))
-    return {"paid": sorted(paid), "pinned": pinned}
+    out = {"paid": sorted(paid), "pinned": pinned}
+    if lane_d_court:
+        out["lane_d"] = {str(int(u)): str(h) for u, h in sorted(lane_d_court.items())}
+    return out
+
+
+def lane_d_payee_problem(vector: list[float], burned: list[float], hotkeys: list[str],
+                         attribution: dict) -> str | None:
+    """#913: ``None`` when every uid lane D's part of ``vector`` pays (weight
+    above ``burned``, the same vector with lane D's share burned) is
+    registered on the satellite's own metagraph to the hotkey lane D's
+    signed court names for it; else why not."""
+    pins = {int(u): str(h) for u, h in (attribution.get("lane_d") or {}).items()}
+    for u, (w, b) in enumerate(zip(vector, burned, strict=False)):
+        if float(w) - float(b) <= 1e-12:
+            continue
+        if u not in pins:
+            return f"uid {u} carries lane D weight but lane D's signed court names no hotkey for it"
+        if u >= len(hotkeys):
+            return f"lane D uid {u} is past the metagraph's {len(hotkeys)} uids"
+        if str(hotkeys[u]) != pins[u]:
+            return (f"lane D uid {u} is registered to {str(hotkeys[u])[:12]}…, lane D's signed "
+                    f"court names {pins[u][:12]}…")
+    return None
 
 
 def check_reward_uids(vector: list[float], burn_uid: int, hotkeys: list[str],
@@ -230,6 +262,8 @@ def check_reward_uids(vector: list[float], burn_uid: int, hotkeys: list[str],
     record names); else why not."""
     paid = set(attribution.get("paid") or ())
     pinned = {int(u): str(h) for u, h in (attribution.get("pinned") or {}).items()}
+    # #913: lane D's court slots (checked first by lane_d_payee_problem)
+    lane_d = {int(u): str(h) for u, h in (attribution.get("lane_d") or {}).items()}
     for u, w in enumerate(vector):
         if w <= 0 or u == burn_uid:
             continue
@@ -238,7 +272,7 @@ def check_reward_uids(vector: list[float], burn_uid: int, hotkeys: list[str],
         hk = str(hotkeys[u])
         if u in pinned and pinned[u] != hk:
             return f"uid {u} is registered to {hk[:12]}…, the payout record names {pinned[u][:12]}…"
-        if hk not in paid:
+        if hk not in paid and lane_d.get(u) != hk:
             return f"uid {u} is registered to {hk[:12]}…, which the receipt does not pay"
     return None
 
@@ -295,6 +329,7 @@ def replay_receipt(receipt, cfg: ChainConfig, *, reader: Any, prev: dict | None,
         check_lane_c_chain,
         derive_weights,
         ladder_prior_mismatch,
+        lane_d_court_payees,
     )
     from ..audit.lane_d import TRANSIENT_CODE
     from ..audit.main import apply_receipt_overlay, audit_receipt, fetch_lane_d_record
@@ -506,6 +541,18 @@ def replay_receipt(receipt, cfg: ChainConfig, *, reader: Any, prev: dict | None,
                               burn_lanes=frozenset(scoped))
     if vec is None:
         return _fail("weights-derive", why)
+
+    def _paid(v: list[float]) -> Replay:
+        """``v`` set; when it pays lane D's verified court (#913) the court's
+        payees join the attribution and the lane-D-burned twin rides along."""
+        if not (pays_d and not lane_d_burn and not why):
+            return Replay(ok=True, vector=list(v), burn_uid=burn,
+                          attribution=_attribution(receipt))
+        twin, _ = derive_weights(receipt, cfg_r, lane_d=None, burn_lanes=frozenset(scoped))
+        return Replay(ok=True, vector=list(v), burn_uid=burn,
+                      attribution=_attribution(receipt, lane_d_court_payees(lane_d)),
+                      vector_d_burned=None if twin is None else list(twin))
+
     if scoped:
         # containment: the failed lane's share burns; lane A (and lane D,
         # as derived above) are set from the satellite's own derivation —
@@ -519,8 +566,7 @@ def replay_receipt(receipt, cfg: ChainConfig, *, reader: Any, prev: dict | None,
         if pays_d and why:
             log.warning("lane_d_check_burn round=%s lane D's share burns to uid %d: %s", rid,
                         burn, lane_d_burn or why)
-        return Replay(ok=True, vector=list(vec), burn_uid=burn,
-                      attribution=_attribution(receipt))
+        return _paid(vec)
     if pays_d and why:
         # lane D's share burns; lanes A/B/C were compared by the audit's
         # weights row, so the vector set is the derived one
@@ -534,7 +580,7 @@ def replay_receipt(receipt, cfg: ChainConfig, *, reader: Any, prev: dict | None,
     if bad:
         return _fail("weights-derive", f"uid {bad[0]}: derived {vec[bad[0]]} != recorded "
                      f"{got[bad[0]]}")
-    return Replay(ok=True, vector=list(vec), burn_uid=burn, attribution=_attribution(receipt))
+    return _paid(vec)
 
 
 # ── storage ──────────────────────────────────────────────────────────────────
@@ -571,6 +617,7 @@ class SatelliteState:
     vector: list[float] | None = None
     burn_uid: int = 0
     attribution: dict = field(default_factory=dict)
+    vector_d_burned: list[float] | None = None
     verified_round: str = ""
     verified_boundary: int = 0
     failing: str = ""
@@ -770,6 +817,7 @@ class SatelliteRunner(ActivationMixin):
             st.verified_round, st.verified_boundary = rid, int(receipt.epoch_start_block)
             if res.vector is not None:
                 st.vector, st.burn_uid, st.attribution = res.vector, res.burn_uid, res.attribution
+                st.vector_d_burned = res.vector_d_burned
             log.info("round=%s verified (%s)", rid,
                      "vector derived" if res.vector is not None else "no vector recorded; "
                      "the standing vector stays")
@@ -798,8 +846,19 @@ class SatelliteRunner(ActivationMixin):
             return burn_vec, BURNING, (f"main validator silent: {age} blocks since round "
                                        f"{st.verified_round} > stale_after_blocks="
                                        f"{self.sat.stale_after_blocks}")
-        vec = fit_vector(st.vector, n)
-        why = (check_reward_uids(st.vector, st.burn_uid, hotkeys, st.attribution)
+        src, attribution = st.vector, st.attribution
+        if st.vector_d_burned is not None and attribution.get("lane_d"):
+            # #913: lane D's court payees against this satellite's metagraph;
+            # a mismatch burns lane D's share ONLY (lanes A/B/C as derived)
+            why_d = lane_d_payee_problem(st.vector, st.vector_d_burned, hotkeys, attribution)
+            if why_d is not None:
+                log.warning("lane_d_check_burn round=%s lane D's share burns to uid %d, lanes "
+                            "A/B/C unchanged: reward-uid: %s", st.verified_round, st.burn_uid,
+                            why_d)
+                src = st.vector_d_burned
+                attribution = {k: v for k, v in attribution.items() if k != "lane_d"}
+        vec = fit_vector(src, n)
+        why = (check_reward_uids(src, st.burn_uid, hotkeys, attribution)
                if vec is not None else f"vector has weight past the metagraph's {n} uids")
         if why is not None:
             self._push_failing = "reward-uid"
