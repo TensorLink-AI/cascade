@@ -797,7 +797,7 @@ class _Settlement:
         # rev6.23: the tenure is the chain's, the bar the config's at it.
         self._guarded("crown_bar", lambda: _compare(
             self.d, "crown_bar", {"tenure": self.chain.tenure,
-                                  "bar": crown_bar_at(self.cfg, self.chain.tenure)},
+                                  "margin": crown_bar_at(self.cfg, self.chain.tenure)},
             self.r.get("crown_bar")))
         self._guarded("rows_sha256", self.check_rows_sha)
         self._guarded("armed_evidence", self.check_armed)

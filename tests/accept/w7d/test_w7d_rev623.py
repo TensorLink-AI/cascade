@@ -17,6 +17,16 @@ import pytest
 from .helpers import build_all, describe, doctored, has_path, replay, replay_module
 
 
+def _need_rev623() -> None:
+    """rev6.23 is built: ``LaneDConfig`` has ``court_weights`` and
+    ``crown_bar`` (on main both are absent: an assertion, the right failure)."""
+    from cascade.shared.config.lane_d import LaneDConfig
+
+    assert "court_weights" in LaneDConfig.__dataclass_fields__ and \
+        callable(getattr(LaneDConfig, "crown_bar", None)), \
+        "plan rev6.23 is not built: LaneDConfig has no court_weights / crown_bar"
+
+
 @pytest.fixture(scope="module")
 def chains(tmp_path_factory):
     return build_all(tmp_path_factory.mktemp("w7d-rev623"))
@@ -42,12 +52,13 @@ def _want_tenures(c) -> list[int]:
 
 @pytest.mark.parametrize("name", ["gated", "held", "house_bar", "refresh"])
 def test_every_honest_chain_states_the_chain_tenure_and_bar(chains, name):
+    _need_rev623()
     c = chains[name]
     assert _tenures(c) == _want_tenures(c)
     reps = c.pub.reports()
     for b in c.pub.boundaries:
         cb = reps[b]["crown_bar"]
-        assert cb["bar"] == c.cfg.crown_bar(cb["tenure"])
+        assert cb["margin"] == c.cfg.crown_bar(cb["tenure"])
     mod = replay_module()
     res = replay(c.pub)
     assert all(r.status == mod.MATCH for r in res), describe(res)
@@ -55,12 +66,13 @@ def test_every_honest_chain_states_the_chain_tenure_and_bar(chains, name):
 
 @pytest.mark.parametrize("name", ["gated", "house_bar"])
 def test_a_tenure_off_the_chain_is_a_mismatch(chains, name):
+    _need_rev623()
     c = chains[name]
     n = len(c.pub.boundaries)
 
     def bump(rep):
         t = int(rep["crown_bar"]["tenure"]) + 3
-        rep["crown_bar"] = {"tenure": t, "bar": c.cfg.crown_bar(t)}
+        rep["crown_bar"] = {"tenure": t, "margin": c.cfg.crown_bar(t)}
 
     reports, receipts = doctored(c.pub, n, bump)
     res = replay(c.pub, reports=reports, receipts=receipts)
@@ -69,10 +81,11 @@ def test_a_tenure_off_the_chain_is_a_mismatch(chains, name):
 
 
 def test_a_bar_off_the_config_is_a_mismatch(chains):
+    _need_rev623()
     c = chains["gated"]
 
     def lower(rep):
-        rep["crown_bar"]["bar"] = float(c.cfg.d_margin) / 2
+        rep["crown_bar"]["margin"] = float(c.cfg.d_margin) / 2
 
     reports, receipts = doctored(c.pub, 1, lower)
     res = replay(c.pub, reports=reports, receipts=receipts)
@@ -80,6 +93,7 @@ def test_a_bar_off_the_config_is_a_mismatch(chains):
 
 
 def test_the_state_snapshot_carries_the_next_tenure(chains):
+    _need_rev623()
     c = chains["house_bar"]
     want = _want_tenures(c)[1:]
     reps = c.pub.reports()
@@ -99,6 +113,7 @@ def test_the_state_snapshot_carries_the_next_tenure(chains):
 def test_the_replay_pays_court_weights():
     """`court_shares`: KING_D, prior 1, prior 2 at 0.80 / 0.15 / 0.05 of the
     share; a short court renormalises over its slots."""
+    _need_rev623()
     from cascade.audit.lane_d_chain import court_shares, crown_bar_at
 
     from .helpers import lane_d_cfg

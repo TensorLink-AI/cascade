@@ -250,7 +250,9 @@ def test_every_verdict_clears_iff_lcb_reaches_d_margin_and_gain_is_positive(tmp_
     cfg, _, _, _, _, s1 = _two_entry_first(tmp_path)
     assert s1.report["verdicts"]
     # rev6.23: the bar in force at the settlement (tenure 0: d_margin_start).
-    bar = s1.report["crown_bar"]["bar"]
+    cb = s1.report.get("crown_bar")
+    assert isinstance(cb, dict), "the report records no crown_bar (rev6.23)"
+    bar = cb["margin"]
     assert bar == cfg.crown_bar(s1.report["crown_bar"]["tenure"]) >= cfg.d_margin
     for v in s1.report["verdicts"]:
         assert v["cleared"] == (v["lcb"] >= bar and v["gain"] > 0.0), v

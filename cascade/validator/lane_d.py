@@ -1447,7 +1447,7 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
         "verdicts": verdicts, "rows": rows, "rows_sha256": rows_sha256(rows),
         "pay": {"share": pay["share"], "court": court},
         # rev6.23: the tenure the bar was taken at and the bar applied.
-        "crown_bar": {"tenure": tenure, "bar": crown_bar},
+        "crown_bar": {"tenure": tenure, "margin": crown_bar},
         # RV7 B1: the state this settlement ran from, under the signature, so
         # recovery can check a persisted report against the state as loaded.
         "extensions": {PRIOR_STATE_EXTENSION: prior_sha,

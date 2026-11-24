@@ -189,7 +189,7 @@ re-derives everything that follows from it.
 sum_{j < n} court_weights[j]` (rev6.23, owner 2026-11-24: 0.80 / 0.15 /
 0.05; `king_decay` retired). **(rev6.23) Crown bar.** The replay carries
 KING_D's tenure (0 at genesis, 1 after a crown or house retake, else + 1),
-requires each report's `crown_bar` to be `{tenure, bar}` at that tenure
+requires each report's `crown_bar` to be `{tenure, margin}` at that tenure
 with the config's bar, judges every verdict against it, and checks the
 state snapshot's `king_tenure` is the next one. A `None` uid burns. The shares sum to `share`. The
 tests check them against an independent computation and against the

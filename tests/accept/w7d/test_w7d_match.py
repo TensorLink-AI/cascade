@@ -153,6 +153,7 @@ def test_the_house_bar_court_pays_the_new_king_and_the_prior_king_by_court_weigh
     last = replay(c.pub, uid_of=dict(c.pub.uid_of))[-1]
     assert len(last.pay) == 2, f"fixture: Y crowned over X, two paid slots; got {last.pay}"
     # rev6.23: a two-slot court renormalises court_weights[:2] (80 / 15).
+    assert hasattr(c.cfg, "court_weights"), "[lane_d] court_weights is not parsed (rev6.23)"
     share, (w0, w1) = float(c.cfg.share), [float(w) for w in c.cfg.court_weights[:2]]
     (y_d, y_uid, y_s), (x_d, x_uid, x_s) = [tuple(s) for s in last.pay]
     assert (y_d, y_uid, x_d, x_uid) == (c.y["digest"], 12, c.x["digest"], 11)

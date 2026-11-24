@@ -25,7 +25,8 @@ def test_shipped_court_weights_are_80_15_5(name):
 def test_lane_d_king_decay_is_retired_and_ignored(name):
     from cascade.shared.config import RETIRED_KEYS
 
-    assert "king_decay" in RETIRED_KEYS["lane_d"]
+    assert "king_decay" in RETIRED_KEYS.get("lane_d", frozenset()), \
+        "[lane_d] king_decay is not in RETIRED_KEYS['lane_d']"
     old = load_ok(raw_with(name, {"king_decay": 0.25}), " with the retired king_decay")
     new = load_ok(raw_with(name))
     assert old.lane_d == new.lane_d
@@ -59,6 +60,9 @@ def test_court_weights_and_the_bar_keys_are_overlay_settable():
 @pytest.mark.parametrize("name", SHIPPED)
 def test_shipped_crown_bar_defaults(name):
     ld = load_ok(raw_with(name)).lane_d
-    assert (ld.d_margin_start, ld.d_margin, ld.d_margin_warmup_settlements) == (0.03, 0.01, 32)
+    got = tuple(getattr(ld, k, None)
+                for k in ("d_margin_start", "d_margin", "d_margin_warmup_settlements"))
+    assert got == (0.03, 0.01, 32), f"crown bar keys parsed as {got}"
+    assert callable(getattr(ld, "crown_bar", None)), "LaneDConfig has no crown_bar(tenure)"
     assert ld.crown_bar(0) == 0.03 and ld.crown_bar(32) == 0.01 and ld.crown_bar(99) == 0.01
     assert ld.crown_bar(16) == pytest.approx(0.02, abs=1e-15)

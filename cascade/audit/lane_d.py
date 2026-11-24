@@ -220,18 +220,18 @@ def crown_bar_of(cfg, tenure: int) -> float:
 
 
 def _crown_bar_problem(report: dict, cfg) -> str | None:
-    """rev6.23: ``crown_bar`` is ``{tenure, bar}`` with ``bar`` the one
+    """rev6.23: ``crown_bar`` is ``{tenure, margin}`` with ``margin`` the bar
     re-derived from the config at ``tenure`` (the tenure itself is a chain
     rule: :func:`_continuity_problem`)."""
     cb = report.get("crown_bar")
-    if not isinstance(cb, dict) or set(cb) != {"tenure", "bar"}:
-        return f"crown_bar {cb!r} is not {{tenure, bar}}"
+    if not isinstance(cb, dict) or set(cb) != {"tenure", "margin"}:
+        return f"crown_bar {cb!r} is not {{tenure, margin}}"
     t = cb["tenure"]
     if not _int_value(t) or t < 0:
         return f"crown_bar.tenure {t!r} is not an int >= 0"
     want = crown_bar_of(cfg, t)
-    if not _close(cb["bar"], want):
-        return f"crown_bar.bar {cb['bar']!r} != {want!r} re-derived at tenure {t}"
+    if not _close(cb["margin"], want):
+        return f"crown_bar.margin {cb['margin']!r} != {want!r} re-derived at tenure {t}"
     return None
 
 

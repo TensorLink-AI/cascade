@@ -36,11 +36,11 @@
     "crown_bar": {
       "type": "object",
       "description": "rev6.23: KING_D's tenure (lane D settlements it has held the crown, the house included) and the crown bar applied: d_margin_start falling linearly to d_margin over d_margin_warmup_settlements.",
-      "required": ["tenure", "bar"],
+      "required": ["tenure", "margin"],
       "additionalProperties": false,
       "properties": {
         "tenure": {"type": "integer", "minimum": 0},
-        "bar": {"type": "number", "exclusiveMinimum": 0}
+        "margin": {"type": "number", "exclusiveMinimum": 0}
       }
     },
     "gate": {"$ref": "#/$defs/gate"},

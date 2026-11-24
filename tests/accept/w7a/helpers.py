@@ -116,7 +116,7 @@ TOP_LEVEL_REQUIRED = ("schema", "boundary", "signer", "signature", "scoring_meth
                       "seed", "pool", "house", "king_before", "king_after", "crowned",
                       "prior_kings", "entries", "judged", "skipped", "cohorts", "windows",
                       "verdicts", "rows", "rows_sha256", "pay",
-                      # rev6.23: {tenure, bar}, the crown bar applied
+                      # rev6.23: {tenure, margin}, the crown bar applied
                       "crown_bar")
 # `gate` (RV4): the §1.3b gate record, present iff a candidate reached the gate.
 # rev6.6: `armed_contexts` + `armed_evidence`, present together iff the
