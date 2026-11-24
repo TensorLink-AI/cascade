@@ -329,28 +329,39 @@ def _load_model(checkpoint_dir: Path, context: int, device: str):
 
 
 def _forward(pm, cfg, model, rows: np.ndarray, horizon: int, device: str) -> np.ndarray:
-    """``(B, L)`` float64 histories (L a patch multiple) → ``(B, horizon, Q21)``,
-    the pyramid head's quantiles in data units (the wrapper's arithmetic,
-    without its pad)."""
+    """``(B, L)`` univariate or ``(B, C, L)`` multichannel float64 histories
+    (L a patch multiple) → ``(B, horizon, Q21)`` resp. ``(B, C, horizon,
+    Q21)``, the pyramid head's quantiles in data units (the wrapper's
+    ``_parameters`` arithmetic, without its pad). The C channels of a window
+    are one joint forecast (the model's variate axis); each channel is
+    standardized on its own, as in training. ``(B, L)`` is exactly the
+    ``C = 1`` case, so a univariate batch runs the same arithmetic as before
+    F2 (rev6.18 A4: bit-identical)."""
     import torch
 
     ps = int(cfg.patch_size)
-    b, length = rows.shape
+    rows = np.asarray(rows)
+    uni = rows.ndim == 2
+    b, c, length = (rows.shape[0], 1, rows.shape[1]) if uni else rows.shape
     count = (int(horizon) + ps - 1) // ps
-    context = torch.as_tensor(rows, dtype=torch.float64, device=device)[:, None]
-    x = torch.cat([context, context.new_zeros(b, 1, count * ps)], -1)
+    context = torch.as_tensor(rows, dtype=torch.float64, device=device)
+    context = context[:, None] if uni else context
+    x = torch.cat([context, context.new_zeros(b, c, count * ps)], -1)
     mask = torch.zeros_like(x, dtype=torch.bool)
     mask[..., length:] = True
-    flat = x.reshape(b, -1)
+    flat = x.reshape(b * c, -1)
     z, loc, scale = pm.causal_standardize(flat, mask.reshape_as(flat))
-    z = z.masked_fill(mask.reshape_as(flat), 0).float().reshape(b, 1, -1, ps)
-    params = model(z, mask=mask.reshape(b, 1, -1, ps), with_parameters=True)
+    z = z.masked_fill(mask.reshape_as(flat), 0).float().reshape(b, c, -1, ps)
+    params = model(z, mask=mask.reshape(b, c, -1, ps), with_parameters=True)
     start = length // ps - 1
     params = params[:, :, start:start + count]
-    loc = loc.reshape(b, 1, -1, ps)[:, :, start:start + count, -1].float()
-    scale = scale.reshape(b, 1, -1, ps)[:, :, start:start + count, -1].float()
+    loc = loc.reshape(b, c, -1, ps)[:, :, start:start + count, -1].float()
+    scale = scale.reshape(b, c, -1, ps)[:, :, start:start + count, -1].float()
     q = pm.quantiles(params) * scale[..., None, None] + loc[..., None, None]
-    out = q[:, 0].reshape(b, -1, q.shape[-1])[:, :int(horizon)]
+    if uni:
+        out = q[:, 0].reshape(b, -1, q.shape[-1])[:, :int(horizon)]
+    else:
+        out = q.reshape(b, c, -1, q.shape[-1])[:, :, :int(horizon)]
     return out.cpu().numpy().astype(np.float64)
 
 
@@ -376,11 +387,46 @@ def _forward_chunked(pm, cfg, model, rows: np.ndarray, horizon: int, device: str
                            for i in range(0, rows.shape[0], step)], axis=0)
 
 
+def _as_window(hist, i: int) -> np.ndarray:
+    """One history as a float64 array: 1-D ``(L,)`` (univariate; any 1-D
+    shape as before F2) or 2-D ``(C, L)`` (multichannel, C ≥ 2; a ``(1, L)``
+    history is the univariate ``(L,)``)."""
+    a = np.asarray(hist, dtype=np.float64)
+    if a.ndim == 2 and a.shape[0] > 1:
+        row = a
+    elif a.ndim <= 2:
+        row = a.reshape(-1)
+    else:
+        raise ValueError(f"window {i}: history shape {a.shape} is neither (L,) nor (C, L)")
+    if not np.isfinite(row).all():
+        raise ValueError(f"window {i}: non-finite history")
+    return row
+
+
+def forecast_rows(histories) -> list[int]:
+    """The forecast rows of each window in :func:`forecast_quantiles`'
+    output: 1 per univariate window, C per ``(C, L)`` window (C ≥ 2)."""
+    out = []
+    for h in histories:
+        shape = np.shape(h)
+        out.append(int(shape[0]) if len(shape) == 2 and int(shape[0]) > 1 else 1)
+    return out
+
+
 def forecast_quantiles(checkpoint_dir: str | os.PathLike, histories, *, context: int,
                        horizon: int, contexts=None, device: str = "cpu",
                        max_tokens: int = MAX_FORWARD_TOKENS) -> np.ndarray:
     """``(n, horizon, 9)`` quantile forecasts of ``histories`` at
     :data:`SCORING_LEVELS`.
+
+    rev6.18 A4 (F2): a history may be a ``(C, L)`` multichannel window
+    (C ≥ 2), forecast jointly by one model call. The output then has one row
+    per channel, window-major and channel-minor (:func:`forecast_rows`):
+    ``(Σ rows, horizon, 9)``. Windows batch by (channels, input length); the
+    univariate windows form exactly the pre-F2 per-length batches, so a
+    univariate forecast is bit-identical with or without multichannel windows
+    in the request. The channel pick (empty columns, the 32 cap) happens
+    box-side before the request (:mod:`cascade.eval.lane_d_channels`).
 
     ``context`` is the context to run at (an entry's
     :func:`effective_context`) and ``contexts`` the settlement's armed set:
@@ -400,29 +446,39 @@ def forecast_quantiles(checkpoint_dir: str | os.PathLike, histories, *, context:
     if tokens < 1:
         raise ValueError(f"max_tokens must be positive, got {tokens}")
     d = Path(checkpoint_dir)
-    rows = []
-    for i, hist in enumerate(histories):
-        row = np.asarray(hist, dtype=np.float64).reshape(-1)
-        if not np.isfinite(row).all():
-            raise ValueError(f"window {i}: non-finite history")
-        rows.append(row)
+    rows = [_as_window(hist, i) for i, hist in enumerate(histories)]
     if not rows:
         return np.empty((0, h, len(SCORING_LEVELS)), dtype=np.float64)
     # The patch size is read from the checkpoint's own config (json only), so
     # a too-short history is refused before torch or the weights load.
     meta = json.loads((d / "config.json").read_text(encoding="utf-8"))
-    plan = batch_plan([r.size for r in rows], context=ctx, patch_size=int(meta["moe"]["patch_size"]))
+    ps = int(meta["moe"]["patch_size"])
+    n_ch = [1 if r.ndim == 1 else int(r.shape[0]) for r in rows]
+    # One no-pad plan per channel count: C = 1 is the univariate plan, the
+    # same batches as before F2.
+    plans: dict[int, dict[int, list[int]]] = {}
+    for c in sorted(set(n_ch)):
+        members = [i for i, k in enumerate(n_ch) if k == c]
+        sub = batch_plan([rows[i].shape[-1] for i in members], context=ctx, patch_size=ps)
+        plans[c] = {length: [members[j] for j in idx] for length, idx in sub.items()}
+    offsets = np.concatenate([[0], np.cumsum(n_ch)]).astype(np.int64)
 
     import torch
 
     pm, cfg, model = _load_model(d, ctx, device)
     picks = np.asarray(level_indices(pm.QUANTILE_LEVELS), dtype=np.int64)
-    out = np.empty((len(rows), h, len(picks)), dtype=np.float64)
+    out = np.empty((int(offsets[-1]), h, len(picks)), dtype=np.float64)
     with torch.no_grad():
-        for length, idx in plan.items():
-            q = _forward_chunked(pm, cfg, model, np.stack([rows[i][-length:] for i in idx]), h,
-                                 device, tokens)
-            out[idx] = q[:, :, picks]
+        for c, plan in plans.items():
+            for length, idx in plan.items():
+                q = _forward_chunked(pm, cfg, model,
+                                     np.stack([rows[i][..., -length:] for i in idx]), h, device,
+                                     tokens)
+                if c == 1:
+                    out[offsets[idx]] = q[:, :, picks]
+                    continue
+                for j, i in enumerate(idx):
+                    out[offsets[i]:offsets[i + 1]] = q[j][:, :, picks]
     if not np.isfinite(out).all():
         raise ValueError("non-finite lane D quantiles")
     return out
@@ -433,8 +489,19 @@ def score_window(q: np.ndarray, target: np.ndarray, history: np.ndarray,
     """``(crps, mase)`` of one ``(horizon, 9)`` forecast: ``crps`` is the
     window's weighted quantile loss over the grid (``2·mean_q pinball /
     Σ|y|``), ``mase`` scores the 0.5 quantile. ``ValueError`` when the
-    forecast is malformed or the target has no scale (``Σ|y| = 0``)."""
+    forecast is malformed or the target has no scale (``Σ|y| = 0``).
+
+    rev6.18 A4 (F2, DEC-CA-0041): a ``(C, horizon, 9)`` forecast of a
+    ``(C, horizon)`` target with a ``(C, L)`` history (C ≥ 2) is ONE
+    per-window score: each channel's ``crps`` and ``mase`` as above, then
+    the arithmetic mean over channels; ``crps`` averages only the channels
+    with ``Σ|y_c| > 0`` (zero-target channels are masked from the quantile
+    half, as lane A's ``wql_per_window`` does), ``mase`` averages every
+    channel. ``ValueError`` when no channel has scale. A 2-D call never
+    touches the univariate path, which is unchanged."""
     q = np.asarray(q, dtype=np.float64)
+    if q.ndim == 3:
+        return _score_multichannel(q, target, history, seasonal_period)
     y = np.asarray(target, dtype=np.float64).reshape(-1)
     if q.shape != (y.size, len(SCORING_LEVELS)) or not np.isfinite(q).all():
         raise ValueError(f"forecast shape {q.shape} / finiteness invalid for horizon {y.size}")
@@ -447,7 +514,30 @@ def score_window(q: np.ndarray, target: np.ndarray, history: np.ndarray,
     return crps, m
 
 
-__all__ = ["MAX_FORWARD_TOKENS", "MAX_HORIZON", "MEDIAN_INDEX", "SCORER_CONTEXTS", "SCORING_LEVELS", "SCORING_METHOD",
-           "batch_plan", "declared_context", "forecast_quantiles", "forward_batch_size",
-           "level_indices",
+def _score_multichannel(q: np.ndarray, target, history, seasonal_period: int
+                        ) -> tuple[float, float]:
+    from .crps import wql_per_window
+
+    y = np.asarray(target, dtype=np.float64)
+    hist = np.asarray(history, dtype=np.float64)
+    c = q.shape[0]
+    if (c < 2 or y.ndim != 2 or y.shape[0] != c or hist.ndim != 2 or hist.shape[0] != c
+            or q.shape != (c, y.shape[1], len(SCORING_LEVELS)) or not np.isfinite(q).all()):
+        raise ValueError(f"multichannel forecast {q.shape} / target {y.shape} / history "
+                         f"{hist.shape} invalid")
+    # (num_q, C, H) quantiles against the (C, H) target: one row per channel.
+    qloss, abs_t = pinball_components(np.transpose(q, (2, 0, 1)), y, SCORING_LEVELS)
+    wql, valid = wql_per_window(qloss, abs_t)
+    if not bool(valid.any()):
+        raise ValueError("target has no scale")
+    crps = float(wql[valid].mean())
+    sp = max(1, int(seasonal_period))
+    m = float(np.mean([float(mase_one(q[k, :, MEDIAN_INDEX], y[k], hist[k], sp))
+                       for k in range(c)]))
+    return crps, m
+
+
+__all__ = ["MAX_FORWARD_TOKENS", "MAX_HORIZON", "MEDIAN_INDEX", "SCORER_CONTEXTS",
+           "SCORING_LEVELS", "SCORING_METHOD", "batch_plan", "declared_context",
+           "forecast_quantiles", "forecast_rows", "forward_batch_size", "level_indices",
            "score_window", "usable_length"]

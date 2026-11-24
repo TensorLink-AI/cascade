@@ -223,3 +223,40 @@ keys also satisfy `accept`'s generic evidence step.
 - Tests marked `torch` need torch (CI: `uv sync --all-extras`). The
   production box runs only `-m 'not torch'`. `torch` is not registered in
   pyproject, so pytest warns about an unknown mark.
+
+## Multichannel windows (rev6.18 F2): `test_w5d_multivariate.py`
+
+Plan rev6.18 A4 (DEC-CA-0041 applied to lane D). A lane D window is either
+univariate (1-D history and target, as before) or multichannel: a `(C, L)`
+history with a `(C, horizon)` target, C >= 2, forecast jointly by one model
+call. A `(1, L)` series is the univariate window.
+
+- `cascade/eval/lane_d_channels.py` (numpy + hashlib) picks the channels a
+  multichannel window is scored on: `empty_channels(history)` (channels with
+  no finite history value) drop first; `pick_channels(block_hash, series_id,
+  candidates, max_channels)` keeps all when they fit, else the
+  `max_channels` with the smallest `sha256(seed + ":" + index)`, `seed =
+  sha256(block_hash + series_id + "lane_d_channels")`, ascending (`()`
+  without a block hash). `max_channels` is `[generator] max_channels`
+  (32), read from the config. `window_pick`, `channel_plan` (first version of
+  an id in pin order decides), `apply_pick` (one channel left gives 1-D
+  arrays; `(1, L)` is flattened; a univariate window is returned unchanged),
+  `channel_record` (`series_id, n_channels_raw, empty_channels, n_channels,
+  channels, channels_sha256`).
+- `score_window(q, target, history, sp)` with `q` of shape `(C, horizon,
+  9)`: each channel scored as a univariate window, `crps` averaged
+  (arithmetic) over the channels with `sum|y_c| > 0` (zero-target channels
+  masked from the quantile half only), `mase` over every channel;
+  `ValueError` when no channel has scale or a shape disagrees. A 2-D `q`
+  runs the pre-F2 path unchanged.
+- `forecast_quantiles` takes `(C, L)` histories and returns one row per
+  channel, window-major: `(sum forecast_rows(histories), horizon, 9)`.
+  Windows batch by (channel count, input length); univariate rows of a mixed
+  request are bit-identical to a univariate-only request (torch test).
+- Transport: `encode_request` keeps a `(C, L)` history 2-D (univariate
+  stays flat); `forecast_entry` wants `(sum rows, horizon, 9)`;
+  `SSHEvalHost._cut` cuts every channel along time.
+
+On main these tests fail on `No module named 'cascade.eval.lane_d_channels'`
+or on an assertion (scorer and transport refusals are re-raised as
+`AssertionError`).

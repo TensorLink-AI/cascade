@@ -102,7 +102,7 @@ or upload URL; the hotkey signs and the coldkey is never opened.
 cascade lane-d export ./trained --out ./entry
 cascade lane-d verify ./entry
 cascade lane-d submit https://<intake> ./entry --context 4096 --wallet-name W --wallet-hotkey H
-cascade lane-d ready https://<intake> --digest <digest> --context 4096 --licence Apache-2.0 --attest --wallet-name W --wallet-hotkey H
+cascade lane-d ready https://<intake> --digest <digest> --context 4096 --licence MIT --attest --wallet-name W --wallet-hotkey H
 cascade lane-d status https://<intake> --hotkey <ss58>
 ```
 
@@ -143,11 +143,12 @@ from content addressing: the object path carries the manifest digest
 
 ## Licence and takedown
 
-At `ready` you attest, with `--licence Apache-2.0` or `--licence OpenMDW-1.1`
-and `--attest`, that the checkpoint's weights, code and config, and the
-training data used to produce them, are licensed for publication under
-Apache-2.0 or OpenMDW-1.1, and that the training data contains no outputs of
-any teacher model released under a restricted licence. Without `--attest`
+At `ready` you attest, with `--licence MIT` and `--attest`, that the
+checkpoint's weights, code and config, and the training data used to produce
+them, are licensed for publication under the MIT licence (exactly MIT: a
+modified MIT, such as one with a revenue restriction, is not), and that the
+training data contains no outputs of any teacher model released under a
+restricted licence. Without `--attest`
 the CLI shows the statement and sends nothing. Distillation is allowed, from
 Ephemeris or anything else, on your own account, as long as the teacher's
 licence permits it.
