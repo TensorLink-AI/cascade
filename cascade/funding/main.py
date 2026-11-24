@@ -20,7 +20,7 @@ import sys
 import threading
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from ..shared.env import load_env_files
@@ -323,6 +323,143 @@ class ChainRevealResolver(_DeadlineCachedPoll):
         return best
 
 
+def lane_b_armed(cfg) -> bool:
+    """``--lane-b auto``: lane B is miner-funded and its ``from_block`` typed."""
+    lb = getattr(cfg, "lane_b", None) if cfg is not None else None
+    return (lb is not None and int(getattr(lb, "from_block", 0) or 0) > 0
+            and str(getattr(lb, "leg_funding", "miner")) == "miner")
+
+
+def lane_c_armed(cfg) -> bool:
+    """``--lane-c auto``: lane C's ``from_block`` typed."""
+    lc = getattr(cfg, "lane_c", None) if cfg is not None else None
+    return int(getattr(lc, "from_block", 0) or 0) > 0
+
+
+INTAKE_NETCONFIG_STATE = "intake_netconfig_state.json"
+_LANE_VIEW_POLL_SECONDS = 12.0   # one block: a lane opens within a block of its apply block
+
+
+class EffectiveLanes:
+    """The lane-B / lane-C intake wiring under the config IN FORCE.
+
+    ``--lane-b/--lane-c auto`` used to read ``chain.toml`` once at start, so a
+    lane armed by an adopted owner-signed overlay (DEC-CA-0057 — the Wed
+    2026-11-25 launch arms ``[lane_b] from_block`` that way) stayed 503
+    ``*_disabled`` until a restart. This resolves the overlay read-only with
+    the same :class:`~cascade.shared.netconfig.NetConfigResolver` the trainer
+    and the validators use (fetch, verify, read the fleet's ``cfg-`` lock-in
+    from their notes, never signal) and, at most every ``poll_seconds`` while
+    lane requests arrive, re-points the intake's lane attributes at
+    ``config_at(base, current block)``: the queue opens exactly at the
+    overlay's apply block (and closes if a later overlay disarms it). Without
+    an owner key (or without an overlay in force) the view IS the base config
+    and nothing changes — byte-for-byte the static wiring. ``on`` / ``off``
+    keep their meaning; the targets, per-leg cap, ``[lane_b]`` table and lane
+    B GPU list follow the view either way.
+    """
+
+    def __init__(self, base, *, lane_b_mode: str, lane_c_mode: str,
+                 open_lane_b_queue: Callable[[], object],
+                 open_lane_c_queue: Callable[[], object],
+                 client=None, netconfig=None, gpus: Callable | None = None,
+                 poll_seconds: float = _LANE_VIEW_POLL_SECONDS,
+                 clock: Callable[[], float] = time.monotonic) -> None:
+        self.base = base
+        self.view = base
+        self.lane_b_mode = lane_b_mode
+        self.lane_c_mode = lane_c_mode
+        self._open_b, self._open_c = open_lane_b_queue, open_lane_c_queue
+        self._b_queue = self._c_queue = None
+        self.client = client
+        self.netconfig = netconfig
+        self.gpus = gpus
+        self.poll_seconds = float(poll_seconds)
+        self.clock = clock
+        self._polled = float("-inf")
+        self._lock = threading.Lock()
+
+    @property
+    def lane_b(self):
+        return getattr(self.view, "lane_b", None) if self.view is not None else None
+
+    @property
+    def lane_c(self):
+        return getattr(self.view, "lane_c", None) if self.view is not None else None
+
+    def _on(self, mode: str, armed: bool) -> bool:
+        return mode == "on" or (mode == "auto" and armed)
+
+    def apply(self, intake, view, block: int | None = None) -> None:
+        """Point ``intake``'s lane attributes at ``view``."""
+        prev = (intake.lane_b_queue is not None, intake.lane_c_queue is not None)
+        self.view = view
+        lb, lc = self.lane_b, self.lane_c
+        if self._on(self.lane_c_mode, lane_c_armed(view)):
+            if self._c_queue is None:
+                self._c_queue = self._open_c()
+            intake.lane_c_targets = tuple(lc.targets) if lc is not None else None
+            intake.lane_c_queue = self._c_queue
+        else:
+            intake.lane_c_queue = None
+        intake.lane_b_cfg = lb
+        if view is not None and self.gpus is not None:
+            intake.lane_b_gpus = self.gpus(view)[1]
+        if self._on(self.lane_b_mode, lane_b_armed(view)):
+            if self._b_queue is None:
+                self._b_queue = self._open_b()
+            intake.lane_b_targets = tuple(lb.targets) if lb is not None else None
+            intake.lane_b_max_targets = (int(lb.max_domains_per_leg) if lb is not None
+                                         else None)
+            intake.lane_b_queue = self._b_queue
+        else:
+            intake.lane_b_queue = None
+        now = (intake.lane_b_queue is not None, intake.lane_c_queue is not None)
+        nc = getattr(view, "netconfig", None)
+        why = (f"overlay seq {nc.seq} in force from block {nc.applied_block}"
+               if int(getattr(nc, "seq", 0) or 0) else "chain.toml")
+        for lane, q, was, is_on, targets in (
+                ("B", intake.lane_b_queue, prev[0], now[0], intake.lane_b_targets),
+                ("C", intake.lane_c_queue, prev[1], now[1], intake.lane_c_targets)):
+            if is_on and (not was or block is None):
+                log.info("lane-%s intake ON (%s%s): queue %s, targets %s", lane, why,
+                         "" if block is None else f", block {block}", q.path,
+                         ",".join(targets) if targets else "<any well-formed>")
+            elif was and not is_on:
+                log.warning("lane-%s intake CLOSED (%s, block %s): /v1/lane-%s/* answer 503",
+                            lane, why, block, lane.lower())
+
+    def __call__(self, intake) -> None:
+        """The intake's ``lane_refresh`` hook: re-resolve the view at most every
+        ``poll_seconds``; a no-op while the resolver is inert. Never raises."""
+        nc = self.netconfig
+        if nc is None or not getattr(nc, "enabled", False) or self.client is None:
+            return
+        now = self.clock()
+        if now - self._polled < self.poll_seconds:
+            return
+        if not self._lock.acquire(blocking=False):
+            return                       # another request is refreshing: use the view in place
+        try:
+            self._polled = now
+            try:
+                block = int(self.client.current_block())
+            except Exception as e:  # noqa: BLE001 — chain flake: keep the view in place
+                log.warning("lane view: chain block read failed (%s); keeping the lanes", e)
+                return
+            nc.tick(self.base, self.client, now_block=block)
+            try:
+                view = nc.config_at(self.base, block)
+            except Exception as e:  # noqa: BLE001 — persistence pending: keep the lanes
+                log.warning("lane view: config at block %d unavailable (%s); keeping the "
+                            "lanes", block, e)
+                return
+            if view is not self.view:
+                self.apply(intake, view, block)
+        finally:
+            self._lock.release()
+
+
 class ChainLaunchAdmission:
     """Retain finalized opening/activation pins as the running intake observes them."""
 
@@ -480,9 +617,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         resolver = ChainRevealResolver(client, deadline_seconds=args.chain_timeout)
         resolver.mkt_suites = tuple(cfg.marketcast.target_suites)
         lane_c_resolver = resolver.lane_c
-        _lb = cfg.lane_b
 
         def lane_b_resolver(hotkey, targets, ref):
+            _lb = lanes.lane_b           # the [lane_b] in force (EffectiveLanes below)
             return resolver.lane_b(hotkey, targets, ref, slots=tuple(_lb.targets),
                                    max_targets=int(_lb.max_domains_per_leg))
         registration = ChainRegistrationResolver(
@@ -535,44 +672,42 @@ def main(argv: Sequence[str] | None = None) -> int:
                 block = int(client.current_block())
             except Exception:  # noqa: BLE001
                 return None
-            return competition_closed(cfg.lane_c, target, block)
-    lane_c_queue, lane_c_targets = None, None
-    lane_c_cfg = getattr(cfg, "lane_c", None) if cfg is not None else None
-    lane_c_on = args.lane_c == "on" or (
-        args.lane_c == "auto" and int(getattr(lane_c_cfg, "from_block", 0) or 0) > 0)
-    if lane_c_on:
-        from .queue import LaneCQueue, lane_c_queue_path
+            return competition_closed(lanes.lane_c, target, block)
+    # --lane-b/--lane-c: the lanes the config IN FORCE arms — chain.toml plus
+    # the adopted owner-signed overlay at the current block (DEC-CA-0057,
+    # resolved read-only like the trainer; inert while [netconfig]
+    # owner_hotkey is empty), re-resolved per poll so an overlay-armed lane
+    # opens at its apply block with no restart.
+    from .queue import LaneBQueue, LaneCQueue, lane_b_queue_path, lane_c_queue_path
 
-        lane_c_queue = LaneCQueue(lane_c_queue_path(args.queue_path),
-                                  entry_ttl_seconds=args.ttl_hours * 3600.0)
-        if lane_c_cfg is not None:
-            lane_c_targets = tuple(lane_c_cfg.targets)
-        log.info("lane-C intake ON: queue %s, targets %s", lane_c_queue.path,
-                 ",".join(lane_c_targets) if lane_c_targets else "<any well-formed>")
-    lane_b_queue, lane_b_slots, lane_b_cap = None, None, None
-    lane_b_cfg = getattr(cfg, "lane_b", None) if cfg is not None else None
-    lane_b_on = args.lane_b == "on" or (
-        args.lane_b == "auto" and lane_b_cfg is not None
-        and int(getattr(lane_b_cfg, "from_block", 0) or 0) > 0
-        and str(getattr(lane_b_cfg, "leg_funding", "miner")) == "miner")
-    if lane_b_on:
-        from .queue import LaneBQueue, lane_b_queue_path
+    lane_netconfig = None
+    if cfg is not None and not args.trust_refs and cfg.netconfig.enabled:
+        from ..shared.hippius import open_manifest_store
+        from ..shared.netconfig import NetConfigResolver
 
-        lane_b_queue = LaneBQueue(lane_b_queue_path(args.queue_path),
-                                  entry_ttl_seconds=args.ttl_hours * 3600.0)
-        if lane_b_cfg is not None:
-            lane_b_slots = tuple(lane_b_cfg.targets)
-            lane_b_cap = int(lane_b_cfg.max_domains_per_leg)
-        log.info("lane-B intake ON: queue %s, targets %s", lane_b_queue.path,
-                 ",".join(lane_b_slots) if lane_b_slots else "<any well-formed>")
+        # its own state file: never the trainer's netconfig_state.json
+        lane_netconfig = NetConfigResolver(
+            cfg, state_path=Path(args.queue_path).parent / INTAKE_NETCONFIG_STATE,
+            store=lambda: open_manifest_store(cfg.storage), signal=False)
+    lanes = EffectiveLanes(
+        cfg, lane_b_mode=args.lane_b, lane_c_mode=args.lane_c,
+        open_lane_b_queue=lambda: LaneBQueue(lane_b_queue_path(args.queue_path),
+                                             entry_ttl_seconds=args.ttl_hours * 3600.0),
+        open_lane_c_queue=lambda: LaneCQueue(lane_c_queue_path(args.queue_path),
+                                             entry_ttl_seconds=args.ttl_hours * 3600.0),
+        client=client if lane_netconfig is not None else None, netconfig=lane_netconfig,
+        gpus=gpu_catalogs if cfg is not None else None)
+    lane_b_cfg = lanes.lane_b
     # WB13 / LB1: the intake contamination check, armed only by a [lane_b]
     # contamination_hashset pin. The artefact ships with the release
     # (benchmarks/contamination/hashset-v<n>.json); a pin no artefact matches
     # leaves it unloaded, and the intake then answers every lane-B fund 503
-    # (fail closed) while lanes A and C keep serving.
+    # (fail closed) while lanes A and C keep serving. The pin is release-only
+    # (an overlay cannot set it), so it is loaded whenever lane B may open —
+    # including a lane B an overlay arms later.
     lane_b_hashset, fetch_lane_b_repo = None, None
     lane_b_pin = str(getattr(lane_b_cfg, "contamination_hashset", "") or "")
-    if lane_b_queue is not None and lane_b_pin:
+    if args.lane_b != "off" and cfg is not None and lane_b_pin:
         from ..interface.contamination_scan import load_pinned_hashset
 
         try:
@@ -597,7 +732,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         gpu_catalog, lane_b_gpus = gpu_catalogs(cfg)
         log.info("GPU choice: %s", ",".join(gpu_catalog.skus or ()) or
                  "OFF (one locked type)")
-        if lane_b_queue is not None:
+        if args.lane_b != "off":
             log.info("lane-B GPU choice ([lane_b] funded_pod_skus): %s; measured (WB19): %s",
                      ",".join(lane_b_gpus.skus) or "none",
                      ",".join(lane_b_gpus.rent_skus()) or "NONE (every lane B fund refused "
@@ -617,27 +752,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         resolve_registered=registration,
         direct_intake=direct_intake,
         compute_vaults=compute_vaults,
-        lane_c_queue=lane_c_queue,
         resolve_lane_c_reveal=lane_c_resolver,
-        lane_c_targets=lane_c_targets,
         mkt_suites=(tuple(cfg.marketcast.target_suites) if cfg is not None else ()),
         lane_c_closed=lane_c_closed,
         gpu_catalog=gpu_catalog,
         lane_b_gpus=lane_b_gpus,
         # WB23: the reference steps of the lane B base contract cap the steps
-        # a train_hours fund fixes (the validator's consensus cap)
+        # a train_hours fund fixes (the validator's consensus cap). The lane B
+        # queue itself is wired by ``lanes.apply`` (EffectiveLanes, #874).
         lane_b_contract=_lane_b_base_contract(cfg),
-        lane_b_queue=lane_b_queue,
         resolve_lane_b_reveal=lane_b_resolver,
-        lane_b_targets=lane_b_slots,
-        lane_b_max_targets=lane_b_cap,
         lane_b_cfg=lane_b_cfg,
         lane_b_hashset=lane_b_hashset,
         fetch_lane_b_repo=fetch_lane_b_repo,
         lane_a_admission=lane_a_admission,
         pod_live=ledger_pod_live(Path(args.queue_path).parent / "funded_pods.json"),
         on_withdrawn=withdrawn_clears_approvals(Path(args.queue_path)),
+        lane_refresh=lanes,
     )
+    # the lanes chain.toml arms now (the static wiring); the hook re-points
+    # them per poll at the overlay in force
+    lanes.apply(intake, cfg)
     server = intake.make_server(args.host, args.port,
                                 max_connections=args.max_connections,
                                 request_timeout_s=args.request_timeout,

@@ -48,6 +48,18 @@ def test_w2e_max_windows_below_min_windows_is_refused(name):
     load_ok(raw_with(name, {"min_windows": 6000, "max_windows_per_settlement": 6000}))
 
 
+@pytest.mark.parametrize("name", SHIPPED)
+def test_w2e_forward_margin_above_eval_delay_is_refused(name):
+    """rev6.14 (a): b <= j, i.e. forward_margin_hours <= eval_delay_hours, else
+    judging could start before any fresh point can exist."""
+    ok = load_ok(raw_with(name, {"forward_margin_hours": 6.0, "eval_delay_hours": 6.0}))
+    assert float(ok.lane_d.forward_margin_hours) == 6.0
+    assert float(field(ok.lane_d, "eval_delay_hours")) == 6.0
+    assert refused(raw_with(name, {"forward_margin_hours": 6.5, "eval_delay_hours": 6.0}))
+    assert refused(raw_with(name, {"forward_margin_hours": 1.0, "eval_delay_hours": 0.0}))
+    load_ok(raw_with(name, {"forward_margin_hours": 0.0, "eval_delay_hours": 0.0}))
+
+
 # (backtest_weight_cap, backtest_ratio_floor, d_margin) -> loads?
 INEQUALITY = [
     (0.05, 0.85, 0.01),     # the rev6.9 defaults: 1 - 0.85**0.05 ~ 0.0081 < 0.01
