@@ -133,9 +133,8 @@ def test_a_univariate_settlement_is_the_same_report_with_or_without_max_channels
 
 
 def test_wiring_passes_generator_max_channels_from_the_config():
-    from cascade.validator.lane_d_wiring import _max_channels
-
     from cascade.shared.config import load_chain_config
+    from cascade.validator.lane_d_wiring import _max_channels
 
     cfg = load_chain_config(w7a.REPO / "chain.toml")
     with open(w7a.REPO / "chain.toml", "rb") as f:
