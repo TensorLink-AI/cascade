@@ -101,7 +101,7 @@ def add_lane_c(sub: argparse._SubParsersAction) -> None:
     f.add_argument("--chain-toml", type=Path, default=None, help="Override chain.toml path.")
     from .cli import add_gpu_args
 
-    add_gpu_args(f)
+    add_gpu_args(f, lane_c=True)
     _wallet_args(f)
     f.set_defaults(func=cmd_fund, command="lane-c fund")
 

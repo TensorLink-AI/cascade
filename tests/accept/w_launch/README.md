@@ -18,3 +18,9 @@ The tests run the real loader, `netconfig.plan_overlay` (allow-list, merged
 load checks, era start, retroactivity) and `cascade.laned.overlay_lint` on
 the shipped files. On a base without this change they fail with
 `AssertionError` (missing overlay file, old block).
+
+#894 (owner 2026-11-24): lane D launches LIVE-ONLY — both step-2 overlays set
+`[lane_d] public_weight = 0.0`. `test_w_launch_lane_d_launches_live_only` pins
+it and that the lane D judge (`_public_half`) and inputs source (`_public`)
+need no public index, eval-host public scores or block hash at 0 (at 0.5 the
+same calls fail closed).

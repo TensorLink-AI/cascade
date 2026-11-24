@@ -1728,6 +1728,15 @@ max_context_length = 32768
 embargo_days       = 30                         # recipe training data ends this long before submission
 max_synthetic_fraction = 1.0                    # miner generator share of the training mix (1.0 = pure synthetic allowed)
 max_leg_hours      = 12.0                       # cap on a recipe's own leg_hours (miner-paid wall); no leg_hours = [lane_c] leg_hours
+# Owner 2026-11-24: a MarketCast leg fine-tunes Timestral-28M in ONE worker
+# process on one GPU, so a miner may rent ANY Lium GPU type. This is the
+# RECOMMENDED list (no warning; a fund with no --gpu rents the cheapest
+# fitting one). Any other well-formed Lium type is accepted at the miner's OWN
+# RISK (warned, still capped by max_leg_hours / the recipe's leg_hours, own
+# Lium key, no refund). Lium only, never Shadeform. Separate from [round]
+# funded_pod_skus (lane A, unchanged). Trainer + intake policy: no validator
+# reads it. Absent / [] = [round] funded_pod_skus.
+funded_pod_skus    = ["1xRTX4090", "1xA100", "1xH100", "8xH100"]
 eval_context_length = 32768                     # owner 2026-11-21: UP TO 32k context steps the base and the fine-tune both see (shorter while the bank's history is shorter)
 # Owner 2026-11-24 (DEC-CA-0074): a verdict within 13 h of submission. Every
 # horizon is judged on windows DRAWN from the embargo (the embargo_eval_days

@@ -29,3 +29,8 @@ cascade/validator/main.py
 cascade/validator/loop.py
 cascade/validator/lane_d_wiring.py
 cascade/validator/lane_d_inputs.py
+# #891: an IN-FORCE overlay out of this release's envelope resolves each such
+# key to the release value (netconfig.build_config in_force) instead of
+# failing every round; the audit row and the status docs list the keys
+cascade/audit/main.py
+cascade/validator/receipts.py
