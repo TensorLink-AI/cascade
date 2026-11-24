@@ -4,3 +4,10 @@
 # WPs' files intact.
 cascade/laned/__init__.py
 cascade/laned/startup_gates.py
+# Lane D ops item 13: the lane A v2 trainer preflight that qualifies a
+# compliant initial king (read-only --preflight-v2-baseline-check, exit codes,
+# the blocked log line naming the real ref). Tooling only: lane A rules unchanged.
+cascade/trainer/launch_preflight.py
+cascade/trainer/main.py
+cascade/trainer/runner_generation.py
+docs/OPERATOR.md
