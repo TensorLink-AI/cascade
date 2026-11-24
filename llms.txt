@@ -15,7 +15,7 @@
 - [Generator interface](docs/INTERFACE.md): source, determinism, output shapes, dependencies and resource limits; read before editing a generator.
 - [Validator guide](docs/VALIDATOR.md): choose satellite, full evaluator or designated main-validator responsibilities.
 - [Operator runbook](docs/OPERATOR.md): services, capacity, release configuration, recovery and publishing.
-- [Lane D guide](docs/LANE_D.md): open weights: checkpoint format, `cascade lane-d` export/verify/submit/ready/status, forward-only judging, caps, skip reasons and FAQ. Lane D needs no compute keys; submit and commit need human authorization.
+- [Lane D guide](docs/LANE_D.md): open weights: checkpoint format, `cascade lane-d` test/export/verify/submit/ready/status, forward-only judging, caps, skip reasons and FAQ. Lane D needs no compute keys; submit and commit need human authorization.
 
 V2 synthetic generators must emit finite float arrays `(C, L)` with **exactly 32 channels per yield**. One-dimensional and 1–31-channel yields are rejected. Read the effective policy for length and resource limits.
 
@@ -118,7 +118,24 @@ series longer than 4096 are cropped into random 4096-point windows.
 | A | Synthetic data for the full fixed model | Beats the king on private tests and active public benchmark gates; a later checked promotion can advance the shared starting checkpoint |
 | B | Synthetic data for declared targets; the trainer selects expert rows | Passes target and regression tests, then merge acceptance when enabled; accepted updates enter the shared starting model and earn target rewards |
 | C | Currently an eligible MarketCast recipe on a separately pinned Timestral base | Passes future-data tests and later confirmation, then wins an application slot; it does not merge into A/B |
-| D | Miner-trained BF16 weights for the fixed cascade_pyramid architecture (armed on mainnet at block 9586800 by the launch overlay) | Beats both the lane D king and the lane A king (the house) on forward-only private windows and the gate; crowned at the first verdict and published. See [LANE_D.md](docs/LANE_D.md) |
+| D | Miner-trained BF16 weights for the fixed cascade_pyramid architecture (armed on mainnet at block 9586800 by the launch overlay) | Beats the lane D king (before the first crown, the lane A king: the house) on forward-only private windows and the gate; crowned at the first verdict and published. See [LANE_D.md](docs/LANE_D.md) |
+
+### The four competitions at launch: offline loop, submit, fund
+
+Mainnet launch (signed overlay `deploy/overlays/launch-20261125.mainnet.toml`):
+lanes B, C (MarketCast) and D open together at block 9586800 (about Wed
+2026-11-25 22:28 UTC). Split from then: A 0 / B 35 / C 15 / D 50 (C and D
+carve from lane A). Until a miner first wins the lane D crown, lane D's 50%
+stays with lane A (owner decision DEC-CA-0076). Lane D launches live-only
+(`public_weight = 0.0`); the 50/50 live/public rule comes later by overlay.
+
+- **A, optimise generator data for the full model.** Offline: `cascade score DIR --pool-dir P` and `cascade iterate DIR --pool-dir P --seeds 0,1` (`--warm-start live` for the final check). Submit: `cascade submit`, or `cascade deploy` plus `cascade fund` (your compute key).
+- **B, optimise generator data for 1–4 declared targets on selected expert rows.** Offline: `cascade lane-b test DIR --targets energy --base live --pool-dir P` runs the validators' slot judge on every slot. Submit: `cascade deploy DIR --expert-domain energy`, then `cascade lane-b fund` (your compute key).
+- **C (MarketCast), optimise a fine-tuning recipe on the pinned Timestral base.** Offline: `cascade lane-c fetch-base`, `cascade lane-c snapshot`, then `cascade lane-c test DIR --target mkt:market --base-dir B --train-snapshot S --eval-snapshot E` (the validators' MarketCast scorer and verdict). Submit: `cascade lane-c upload`, `cascade lane-c commit`, `cascade lane-c fund` (your compute key).
+- **D, optimise BF16 cascade_pyramid weights trained anywhere.** Offline: `cascade lane-d test CKPT --king KING --context C --pool-dir P` (or `--series S.npz`) runs the validators' window draw, `score_window` and `judge_cohort`, and prints per-window and aggregate CRPS/MASE, the LCB and the crown bar (3% at tenure 0 falling to 1%, `--tenure`). Before the first crown the bar is the house (the lane A king). `--public-weight 0.5` previews the later rule. Submit: `cascade lane-d export`, `verify`, `submit`, `ready`; free, no compute key.
+
+Offline results are directional; submitting, funding and committing need the
+human's authorization.
 
 V1 centred on full-model data competition with the Toto2 lineage. V2 starts a
 fresh Cascade mixture-of-experts lineage and adds B/C. Discover what is open;

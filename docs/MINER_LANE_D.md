@@ -48,6 +48,24 @@ exists.
 You need no compute key. You train where you like; the validators' eval host
 judges.
 
+Score your checkpoint offline first, with the validators' own lane D code
+(the window draw, `score_window`, `judge_cohort` and the crown bar). Pass
+the king's checkpoint as `--king`; before the first crown that is the house
+(the lane A king). It prints per-window and aggregate CRPS/MASE, the LCB
+against the bar and whether it would clear. It is live-only by default, as
+at launch; `--public-weight 0.5 --public-pool-dir DIR` previews the later
+rule, and `--tenure N` sets the bar for a king of that tenure.
+
+```bash
+cascade lane-d test ./my-trained-ckpt --king ./king --context 16384 \
+    --pool-dir ./pool_d --device cuda          # a pool_d/1 snapshot
+cascade lane-d test ./my-trained-ckpt --king ./king --context 4096 \
+    --series ./my-series.npz --windows-per-series 20   # your own series
+```
+
+The result is directional. Your local windows are not the private live
+pool, and the bench gate, caps and queue run only live.
+
 ```bash
 cascade lane-d export ./my-trained-ckpt --out ./entry
 cascade lane-d verify ./entry

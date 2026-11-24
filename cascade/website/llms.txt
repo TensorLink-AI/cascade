@@ -32,7 +32,7 @@ not live configuration.
 - [Generator interface](https://github.com/TensorLink-AI/cascade/blob/main/docs/INTERFACE.md): read before editing a generator.
 - [Agent instructions](https://github.com/TensorLink-AI/cascade/blob/main/AGENTS.md): local checks and spending boundaries.
 - [Agent walkthrough](https://github.com/TensorLink-AI/cascade/blob/main/docs/AGENT_MINING.md): complete lane A/B/C setup, local tests and review flow.
-- [Lane D guide](https://github.com/TensorLink-AI/cascade/blob/main/docs/LANE_D.md): open weights (armed on mainnet at block 9586800, live windows only at launch): submit miner-trained BF16 cascade_pyramid weights, judged on forward-only private windows; no compute keys needed; submit and commit need the human's authorization.
+- [Lane D guide](https://github.com/TensorLink-AI/cascade/blob/main/docs/LANE_D.md): open weights (armed on mainnet at block 9586800, live windows only at launch): submit miner-trained BF16 cascade_pyramid weights, judged on forward-only private windows; preview offline with `cascade lane-d test`; no compute keys needed; submit and commit need the human's authorization.
 
 Use the matching network configuration throughout. A testnet host reads a
 different manifest bucket; do not combine its queues/checkpoints with mainnet.
@@ -302,6 +302,49 @@ After authorization, `lane-c upload` returns an immutable recipe ref without
 committing or funding; use that exact ref for commit, reveal checks and funding.
 
 Live queue: `status/lane_c.json` and the intake's `/v1/lane-c/queue`.
+
+### Lane D — open weights
+
+Train a `cascade_pyramid` checkpoint anywhere, on any data and recipe, and
+submit only the BF16 weights at a declared context. It is judged on
+forward-only live windows (targets that reached the pool after your entry)
+against the lane D king; before the first crown the bar is the house, our
+lane A king. The crown bar is 3% at a king's tenure 0 and falls linearly to
+1% over 32 lane D settlements. Lane D needs no compute key and no funding.
+
+Score a checkpoint offline with the validators' own lane D code (window draw,
+`score_window`, `judge_cohort`, crown bar) before you submit. It prints
+per-window and aggregate CRPS/MASE, the LCB against the bar and whether it
+would clear. It is live-only by default, as at launch; `--public-weight 0.5`
+with `--public-pool-dir` previews the later combined rule.
+
+```bash
+cascade lane-d test ./my-ckpt --king ./king --context 16384 --pool-dir ./pool_d --device cuda --json
+cascade lane-d test ./my-ckpt --king ./king --context 4096 --series ./my-series.npz --tenure 0 --json
+cascade lane-d export ./my-ckpt --out ./entry
+cascade lane-d verify ./entry --json
+cascade lane-d status https://submissions.cascadesub.net --hotkey HOTKEY --json
+```
+
+After authorization: `cascade lane-d submit` (upload to the private vault)
+and `cascade lane-d ready` (MIT licence attestation and the on-chain commit).
+Guide: [MINER_LANE_D.md](https://github.com/TensorLink-AI/cascade/blob/main/docs/MINER_LANE_D.md).
+
+### The four competitions at launch
+
+Mainnet launch (signed overlay `deploy/overlays/launch-20261125.mainnet.toml`):
+lanes B, C (MarketCast) and D open together at block 9586800 (about Wed
+2026-11-25 22:28 UTC). Split from then: A 0 / B 35 / C 15 / D 50 (C and D
+carve from lane A). Until a miner first wins the lane D crown, lane D's 50%
+stays with lane A (owner decision DEC-CA-0076). Lane D launches live-only
+(`public_weight = 0.0`).
+
+| Lane | Optimise | Offline loop | Submit and fund |
+|---|---|---|---|
+| A | Generator data for the full model | `cascade score`, `cascade iterate` | `cascade submit`, or `cascade deploy` + `cascade fund` (your compute key) |
+| B | Generator data for 1–4 declared targets on selected expert rows | `cascade lane-b test` | `cascade deploy --expert-domain` + `cascade lane-b fund` (your compute key) |
+| C (MarketCast) | A fine-tuning recipe on the pinned Timestral base | `cascade lane-c fetch-base`, `cascade lane-c snapshot`, `cascade lane-c test` | `cascade lane-c upload`, `commit`, `fund` (your compute key) |
+| D | BF16 cascade_pyramid weights trained anywhere | `cascade lane-d test` | `cascade lane-d export`, `verify`, `submit`, `ready` (free) |
 
 ## Emissions, warm starts and waiting
 

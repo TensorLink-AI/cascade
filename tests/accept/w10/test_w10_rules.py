@@ -166,7 +166,7 @@ def test_lane_d_help_has_runnable_examples_and_points_at_rules():
     for line in examples:
         args = _parse(shlex.split(line)[1:])
         seen.add(args.lane_d_cmd)
-    assert seen == {"export", "verify", "submit", "ready", "status"}, seen
+    assert seen == {"export", "verify", "submit", "ready", "status", "test"}, seen
     assert any("--licence MIT" in line for line in examples)
 
 
