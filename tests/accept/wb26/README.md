@@ -36,6 +36,7 @@ tests are the spec; the builder touches only the paths in `PATHS`.
 - `test_wb26_audit.py`: the real audit row check on honest rows from the
   validator and on tampered copies of them.
 - `test_wb26_config.py`: the real loader and overlay path (WB10's helpers).
+- `test_wb26_trainer.py`: the trainer side (below).
 
 ## On main
 
@@ -45,8 +46,14 @@ keywords are missing, the keys are not parsed, a suite target is
 exception is an `ImportError` for a WB26 name in a PATHS module
 (`lane_b_anchor_pointer`). No PATHS module is imported at module level.
 
-## Out of scope
+## Trainer side (in scope, orchestrator 2026-11-24)
 
-The trainer attaching `public_rows["anchor"]` (a bench pass of the anchor)
-is a follow-up. Until it lands, a suite target cannot win, which is the
-fail-closed default.
+`test_wb26_trainer.py` runs WB18's real intake, funding queue and driver. A
+settling suite-target leg carries the era anchor's bench rows
+(`public_rows["anchor"]`). They are benched once per anchor, and the
+self-judge is called with the same `anchor_pointer`. The rolling trainer
+derives the anchor with the validator's `lane_b_anchor_pointer` while
+`suite_targets` is on. A domain leg never benches the anchor.
+
+`suite_targets` arming is unchanged: it still needs the contamination hash
+set.

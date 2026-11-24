@@ -22,3 +22,9 @@ chain.toml
 chain.testnet.toml
 # The audit: check_lane_b re-derives every suite-target row.
 cascade/audit/checks.py
+# The trainer side: a settling suite-target leg carries the era anchor's
+# bench rows (public_rows["anchor"], benched once per anchor) and the
+# self-judge (RunnerLaneBOps.judge) gets the same anchor; the rolling trainer
+# derives it with lane_b_anchor_pointer.
+cascade/trainer/lane_b_driver.py
+cascade/trainer/rolling.py

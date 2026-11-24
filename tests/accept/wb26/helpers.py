@@ -288,3 +288,63 @@ def validator_round(tmp: Path, cfg, em, *, warm_start_ckpt: str = "", warm_start
     with ws2.torch_blocked(), ws2.gpu_boundary():
         out = Runner()._lane_b_judge_experts(manifest)
     return out, seen
+
+
+# ── trainer level ────────────────────────────────────────────────────────────
+
+
+def trainer_scenario(tmp: Path, *, target: str = "suite:gift"):
+    """WB18's real intake / funding queue / driver (via W-S2's scenario
+    shape) with one funded entry for ``target`` trained and finished in era
+    1, ready to settle at block 2000; the §16 sentinel is off. ``ops.fetch``
+    / ``ops.bench_rows`` log what they read; the anchor checkpoint has its
+    own directory and its own (king-identical) rows."""
+    from dataclasses import replace
+
+    from tests.accept.wb18 import helpers as wb18
+
+    sc = wb18.Scenario(Path(tmp), suite_targets=True, sentinel_from_block=0)
+    sc.cfg.lane_b = replace(sc.cfg.lane_b, require_public=SUITES)
+    ops = sc.ops
+    ops.judge_calls, ops.published, ops.fetched, ops.benched = [], [], [], []
+    king_rows = bench_rows({})
+    anchor_dir = Path(tmp) / "anchor"
+
+    def fetch(p):
+        ops.fetched.append(p)
+        return anchor_dir if p == ANCHOR_PTR else Path(tmp) / "ckpt"
+
+    def bench_rows_(ckpt_dir):
+        ops.benched.append(Path(ckpt_dir))
+        if Path(ckpt_dir) in (Path(tmp) / "ckpt", anchor_dir):
+            return king_rows
+        return bench_rows({("gift", "crps"): 0.95})
+
+    def judge_(manifest, round_id, block, *args, **kw):
+        ops.judge_calls.append({"manifest": manifest, "kw": dict(kw)})
+        return []
+
+    ops.fetch, ops.bench_rows, ops.judge = fetch, bench_rows_, judge_
+    ops.upload = lambda ckpt_dir, repo: ws2.pointer(repo)
+    ops.publish_expert_manifest = ops.published.append
+    sc.fund(wb18.HK_E, 5, target)
+    sc.driver.add_lineage_tokens(1000)
+    assert sc.tick(0, ws2.TRAINER_PREV_KING) == []
+    sc.tick(1, ws2.TRAINER_KING)
+    assert ops.dispatched, "fixture: the funded entry did not start"
+    for leg, done in ops.dispatched:
+        done(leg, ws2.pointer(f"leg-{leg.sub.hotkey[7:9]}"), "corpus", 1500, "cpu")
+    assert sc.driver.st.finished, "fixture: the finished leg was not recorded"
+    return sc
+
+
+def trainer_settle(sc, tmp: Path, **kw):
+    from cascade.trainer.lane_b_driver import LaneBDriver
+
+    if "anchor_pointer" in kw:
+        assert has_param(LaneBDriver.settle, "anchor_pointer"), (
+            "LaneBDriver.settle takes the era's anchor king as keyword `anchor_pointer` (WB26)")
+    with ws2.torch_blocked(), ws2.gpu_boundary(), ws2.stub_settle_leg(tmp):
+        return sc.driver.settle(round_id=str(ws2.SETTLE_BLOCK), block=ws2.SETTLE_BLOCK,
+                                era_index=1, king_pointer=ws2.TRAINER_KING,
+                                work_dir=Path(tmp) / "work", **kw)

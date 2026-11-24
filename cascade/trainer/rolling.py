@@ -1046,11 +1046,21 @@ class RollingScheduler:
             slot = {"rid": rid, "started": self.clock(), "digest": "", "error": None,
                     "king": king.trained_pointer, "boundary": int(block)}
 
+            # WB26: suite-target legs carry the era anchor king's bench rows —
+            # the anchor the validator derives from this era's manifest
+            anchor_kw = {}
+            if self.cfg.lane_b.suite_targets:
+                from ..validator.lane_b import lane_b_anchor_pointer
+
+                anchor = lane_b_anchor_pointer(cur)
+                if anchor:
+                    anchor_kw = {"anchor_pointer": anchor}
+
             def _run(slot=slot) -> None:
                 try:
                     drv.settle(round_id=rid, block=int(block), era_index=cur.index,
                                king_pointer=king.trained_pointer,
-                               work_dir=Path(self.r.work_root) / "lane_b")
+                               work_dir=Path(self.r.work_root) / "lane_b", **anchor_kw)
                     slot["digest"] = drv.expert_manifest_digest(rid)
                 except Exception as e:  # noqa: BLE001 — lane B never stalls lane A
                     slot["error"] = e
