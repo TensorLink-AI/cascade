@@ -15,3 +15,6 @@ cascade/validator/lane_d_inputs.py
 # Lane D recurring jobs (ops tooling PR): the module of the w5d job these
 # tests pin (python -P -m cascade.lane_d.ops_jobs).
 cascade/lane_d/ops_jobs.py
+# Lane D ops gaps PR: the T7 pod command (1000 and 5000 windows per variant;
+# writes the laned_t7/1 the evidence job installs).
+cascade/eval/lane_d_t7_pod.py

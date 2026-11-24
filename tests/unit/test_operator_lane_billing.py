@@ -55,7 +55,7 @@ def test_knobs_round_trip_through_the_loader(tmp_path):
     """Config knobs need loader parsing: a dataclass field alone makes TOML
     arming a silent no-op (the 3x defect class of 2026-08-28)."""
     src = REPO_TOML.read_text(encoding="utf-8")
-    anchor = "funded_operator_fallback = false\n"
+    anchor = "funded_operator_fallback = true\n"
     assert src.count(anchor) == 1
     edited = src.replace(anchor, anchor + "operator_lanes_operator_billed_only = true\n"
                          "operator_max_price_per_hour = 30.0\n"
@@ -74,7 +74,7 @@ def test_knobs_round_trip_through_the_loader(tmp_path):
                                   "operator_billed_retry_seconds = -5"])
 def test_bad_knob_values_fail_loud(tmp_path, line):
     src = REPO_TOML.read_text(encoding="utf-8")
-    anchor = "funded_operator_fallback = false\n"
+    anchor = "funded_operator_fallback = true\n"
     (tmp_path / "chain.toml").write_text(src.replace(anchor, anchor + line + "\n", 1),
                                          encoding="utf-8")
     with pytest.raises(ValueError, match=line.split(" ")[0]):
