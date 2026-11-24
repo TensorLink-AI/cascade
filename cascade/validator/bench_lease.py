@@ -59,6 +59,15 @@ HW_KEY = "hw"
 # Hosts lost under a sweep (without a good sweep between) before the next
 # loss stops granting a fresh bounded wait.
 MAX_HOST_LOSSES = 2
+# On-pod "is a sweep still running?" probe (run over ssh before a release).
+# The sidecar runs as ``uv run … cascade-benchmark …`` (a HYPHEN — the console
+# script; ``python -m cascade_benchmark.*`` for the direct CLI), so the pattern
+# takes either separator. The bracket keeps it from matching its OWN command
+# line: sshd runs the probe through ``$SHELL -c '<probe>'``, and a bare
+# ``pgrep -f cascade_benchmark`` saw that wrapper shell (always "busy" — the
+# lease never released) while never matching the real hyphenated sidecar.
+BENCH_BUSY_PATTERN = "[c]ascade[-_]benchmark"
+BENCH_BUSY_PROBE = f"pgrep -f {shlex.quote(BENCH_BUSY_PATTERN)} >/dev/null"
 PHASE_IDLE = "idle"
 PHASE_RENTING = "renting"
 PHASE_READY = "ready"
@@ -489,7 +498,7 @@ class BenchLease:
         s = self.state
         # Never terminate a pod with a sweep still running on it (on-pod check).
         try:
-            busy = self.ssh(s.ip, s.port, "pgrep -f cascade_benchmark >/dev/null", 30)
+            busy = self.ssh(s.ip, s.port, BENCH_BUSY_PROBE, 30)
             if busy.returncode == 0:
                 log.warning("bench lease: NOT releasing %s — a benchmark process is still "
                             "running on it", s.pod_id)
