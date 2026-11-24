@@ -75,13 +75,20 @@ def _with_round(text: str, extra: str) -> str:
 # ── config: every knob is parsed by the loader (round-trip) ──────────────────
 
 def test_knobs_default_and_round_trip_through_the_loader(tmp_path):
+    from cascade.shared.config import RoundConfig
+
     base = load_chain_config(ROOT / "chain.toml").round
-    assert base.funded_sku_wall_measured_image == ""          # gate off by default
+    # gate off by default; the shipped file types the live rc15 pin (S0a B9)
+    assert RoundConfig().funded_sku_wall_measured_image == ""
+    assert base.funded_sku_wall_measured_image == (
+        "sha256:5d41d94bc0c0d3ae3dfd042b0cc7e4d900c7d1f48173808436c12bf764a67641")
     assert base.progress_watchdog_grace_seconds == 1200
     assert base.progress_watchdog_tolerance == 1.5
     assert base.provider_ttl_margin_seconds == 3600
     assert base.payer_key_check_seconds == 1800
-    text = _with_round((ROOT / "chain.toml").read_text(), "\n".join([
+    shipped = re.sub(r"(?m)^funded_sku_wall_measured_image = .*\n", "",
+                     (ROOT / "chain.toml").read_text())
+    text = _with_round(shipped, "\n".join([
         f'funded_sku_wall_measured_image = "ghcr.io/x/worker@{DIGEST_A}"',
         "progress_watchdog_grace_seconds = 600",
         "progress_watchdog_tolerance = 2.0",

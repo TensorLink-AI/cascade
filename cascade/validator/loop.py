@@ -458,9 +458,9 @@ class ValidatorRunner(
         epoch_block = self._epoch_start_block(manifest)
         base_params = self.cfg.koth_params(block=epoch_block)
         # Score the shared warm-start init when either consumer needs it: the
-        # increment margin (DEC-CA-0027) or the init-baseline floor
-        # ([scoring] init_gate_mode). The increment fallback mutates only the
-        # JUDGED params — the receipt keeps recording the unmodified config
+        # increment margin (DEC-CA-0027) or the legacy shadow init floor
+        # (before [scoring] init_gate_retired_from_block). The increment
+        # fallback mutates only the JUDGED params — the receipt keeps recording the unmodified config
         # params (check_koth_params compares them against chain.toml) — and
         # the audit re-derives the judged margin rule as "params say
         # increment AND baseline rows exist" (rows alone do not imply
@@ -580,17 +580,6 @@ class ValidatorRunner(
                 break
             judged.append((hk, by_size[paired_sizes[0]], result))
             cohort_scores.append((hk, chal_scores))
-            if result.init_floor_passed is not None:
-                log.info(
-                    "round=%s init-baseline floor (%s) %s: chal=%.5f vs "
-                    "init=%.5f (tol=%.3f) — %s%s",
-                    manifest.round_id, base_params.init_gate_mode, hk,
-                    result.chal_geomean, result.baseline_geomean,
-                    base_params.init_gate_tolerance,
-                    "passes" if result.init_floor_passed else "WORSE THAN INIT",
-                    ("" if base_params.init_gate_mode == "enforce"
-                     or result.init_floor_passed else " (shadow: not gating)"),
-                )
 
         # Cohort family-wise correction (DEC-CA-0038): replace each judged
         # challenger's solo lcb with its joint max-T bound — one shared
