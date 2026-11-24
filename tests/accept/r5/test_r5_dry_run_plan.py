@@ -138,6 +138,20 @@ def test_eval_host_restart_pins_known_hosts_and_frozen_sync(box):
     assert "UserKnownHostsFile=/dev/null" not in proc.stdout
 
 
+def test_eval_host_restart_sync_keeps_the_profile_extras(box):
+    """#892 class: a bare ``uv sync --frozen`` makes the venv exact to the
+    lock's base set and UNINSTALLS the host profile's extras (launch_eval
+    installs ``--extra train``, so torch would vanish). The restart sync must
+    keep what the profile installed."""
+    proc = box.run("eval_host")
+    assert proc.returncode == 0, output(proc)
+    syncs = [ln for ln in plan_lines(proc.stdout) if "uv sync --frozen" in ln]
+    assert syncs, f"no uv sync in the eval host plan:\n{proc.stdout}"
+    for ln in syncs:
+        assert "--inexact" in ln or "--extra" in ln or "--all-extras" in ln, (
+            f"bare `uv sync --frozen` on the eval host uninstalls its extras: {ln}")
+
+
 @pytest.mark.parametrize("svc", ALL)
 def test_scripts_never_touch_keys(box, svc):
     proc = box.run(svc)
