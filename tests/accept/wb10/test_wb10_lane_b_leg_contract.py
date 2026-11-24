@@ -9,8 +9,6 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-import pytest
-
 from . import helpers as h
 
 SCHEDULE = "warmup_constant_ema"
@@ -40,12 +38,13 @@ def test_lane_b_leg_contract_is_the_ema_schedule():
     assert contract_digest(cfg.throne_contracts_at(h.EFFECTIVE)[0]) == before
 
 
-def test_lane_b_leg_contract_refuses_a_non_pyramid_contract():
+def test_lane_b_leg_contract_leaves_a_non_pyramid_contract_alone():
+    """Only the pyramid trainer implements the schedule; lane B runs only on
+    v2 (pyramid) eras, so a pre-v2 contract passes through unchanged."""
     lane_b = _lane_b()
     cfg = h.load_ok(h.shipped_raw("chain.toml"))
     leg = replace(cfg.throne_contracts_at(h.EFFECTIVE)[0].for_hours(3.0), base_arch="toto2")
-    with pytest.raises(ValueError, match="cascade_pyramid"):
-        lane_b.lane_b_leg_contract(leg)
+    assert lane_b.lane_b_leg_contract(leg) is leg
 
 
 def test_no_lane_b_key_arms_it():

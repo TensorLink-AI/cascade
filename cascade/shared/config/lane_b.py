@@ -68,12 +68,14 @@ def lane_b_leg_contract(contract):
     """The lane B leg contract: ``contract`` (the era's contract at the leg's
     hours, ``for_hours``) with ``lr_schedule = LANE_B_EMA_SCHEDULE``. The ONE
     rule the trainer (expected receipt digest) and the worker (the contract
-    it trains) both apply. Only the cascade_pyramid trainer implements it."""
+    it trains) both apply. Only the cascade_pyramid trainer implements the
+    schedule; lane B runs only on v2 (pyramid) eras, so any other contract
+    (a pre-v2 config, tests) passes through unchanged, and a leg trained on
+    it never records the EMA and is refused by the judge."""
     from dataclasses import replace
 
     if str(getattr(contract, "base_arch", "") or "") != "cascade_pyramid":
-        raise ValueError("lane B legs (EMA, no cooldown) need a cascade_pyramid contract; "
-                         f"got {getattr(contract, 'base_arch', '')!r}")
+        return contract
     return replace(contract, lr_schedule=LANE_B_EMA_SCHEDULE)
 
 
