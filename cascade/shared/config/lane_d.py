@@ -9,14 +9,18 @@ overlay-settable. With ``from_block = 0`` (shipped) the lane is never active
 and no consensus surface reads the table, so an unarmed table moves no
 digest, receipt, verdict or weight vector (invariant 1).
 
-The DEC-CA-0062 keys (``targets``, ``teacher_*``, ``real_corpus_ref``,
-``data_sources``, ``augmentations``, ``expert_choice``,
-``max_context_length``, ``pool_prefix``, ``gain_margin``, the payout
-schedule, ``notes``) keep parsing as written: the deployed file carries them.
+Retired (rev6.18 B11): ``confirm_on_king_change`` and the DEC-CA-0062 keys
+(``targets``, ``teacher_*``, ``real_corpus_ref``, ``data_sources``,
+``augmentations``, ``expert_choice``, ``max_context_length``,
+``pool_prefix``, ``gain_margin``, the payout schedule). No lane D code read
+them; the parser ignores them (:data:`RETIRED_LANE_D_KEYS`, listed in the
+loader's ``RETIRED_KEYS``) so a deployed file that still carries them loads.
+``notes`` is still carried for the dashboards.
 """
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -31,13 +35,34 @@ LANE_D_MAX_CONTEXT = 131072
 LANE_D_MAX_HORIZON = 512
 # D14: BF16 only.
 LANE_D_DTYPES = ("BF16",)
-# D20: on a king change mid-duel, (a) restart against the new king.
-LANE_D_CONFIRM_ON_KING_CHANGE = ("restart", "original")
+# rev6.18 B11: keys a deployed [lane_d] table may still carry that no code
+# reads. The parser ignores them; never re-use one of these names for a knob.
+RETIRED_LANE_D_KEYS = frozenset({
+    "confirm_on_king_change",
+    # rev6.23 (owner 2026-11-24): the court pays explicit court_weights; the
+    # geometric king_decay is read by no release. (Lane A's [scoring]
+    # king_decay is a different, live key.)
+    "king_decay",
+    "targets", "teacher_ref", "teacher_api", "teacher_mode", "teacher_models",
+    "real_corpus_ref", "data_sources", "augmentations", "expert_choice",
+    "max_context_length", "pool_prefix", "gain_margin", "full_rounds",
+    "half_life_rounds", "floor", "win_ttl_eras",
+})
 # §16 suite names (data, not a closed list: any non-empty unique names load).
 LANE_D_GATE_SUITES = ("gift", "boom", "time", "fev")
 # A10 "daily and slower": the pandas-style base codes of
 # cascade/eval/seasonality.py from daily down to yearly.
 LANE_D_LOWFREQ_FREQS = ("D", "W", "M", "ME", "MS", "Q", "QE", "QS", "A", "Y", "YE")
+
+
+def lane_d_crown_bar(start: float, end: float, warmup: int, tenure: int) -> float:
+    """``start - (start - end) * tenure / warmup`` (rev6.23): exactly
+    ``start`` at tenure 0 and exactly ``end`` from tenure ``warmup`` on. One
+    expression, so every re-derivation gets the same float."""
+    t, w = max(0, int(tenure)), int(warmup)
+    if t >= w:
+        return float(end)
+    return float(start) - (float(start) - float(end)) * t / w
 
 
 @dataclass(frozen=True)
@@ -61,7 +86,12 @@ class LaneDConfig:
     min_clusters: int = 20
     min_long_series: int = 300
     max_source_share: float = 0.25
+    # rev6.23 (owner 2026-11-24): the crown bar decays with KING_D's tenure,
+    # linearly from ``d_margin_start`` to ``d_margin`` (the end, the floor)
+    # over ``d_margin_warmup_settlements`` settlements (see :meth:`crown_bar`).
     d_margin: float = 0.01
+    d_margin_start: float = 0.03
+    d_margin_warmup_settlements: int = 32
     alpha: float = 0.05
     bootstrap_B: int = 10_000
     # W2e (rev6.10 (a)/(b), rev6.11 (a), rev6.12 (b)): the per-series embargo
@@ -80,10 +110,11 @@ class LaneDConfig:
     gate_weights: tuple[tuple[str, float], ...] = tuple((s, 1.0) for s in LANE_D_GATE_SUITES)
     tau_public: float = 0.01
     lowfreq_freqs: tuple[str, ...] = LANE_D_LOWFREQ_FREQS
-    # Court (§1.4, D7).
+    # Court (§1.4, D7). rev6.23 (owner 2026-11-24): explicit slot weights,
+    # KING_D first, one per slot (``1 + reward_prior_kings``), summing to 1;
+    # they replace the retired geometric ``king_decay``.
     reward_prior_kings: int = 2
-    king_decay: float = 0.5
-    confirm_on_king_change: str = "restart"
+    court_weights: tuple[float, ...] = (0.80, 0.15, 0.05)
     # Rate limits, queue and TTLs (D3, D8, A1, A8, A9, B10).
     max_entries_per_settlement: int = 8
     max_open_per_coldkey: int = 2
@@ -94,27 +125,16 @@ class LaneDConfig:
     loser_ttl_eras: int = 4
     max_mirror_lag_hours: float = 6.0
     ready_ttl_blocks: int = 7200
-    # DEC-CA-0062 keys, carried as written: distillation targets, the teacher
-    # (owner 2026-10-19: the Ephemeris TS foundation-model API; validators
-    # never call it) and the owner-pinned real corpus.
-    targets: tuple[str, ...] = ()
-    teacher_ref: str = ""
-    teacher_api: str = "ephemeris"
-    teacher_mode: str = "route"
-    teacher_models: tuple[str, ...] = ()
-    real_corpus_ref: str = ""
-    data_sources: tuple[str, ...] = ("real", "prior_corpus")
-    augmentations: tuple[str, ...] = ()
-    expert_choice: str = "miner"
-    max_context_length: int = 32768
-    pool_prefix: str = "pool_d"
-    gain_margin: float = 0.01
-    full_rounds: int = 5
-    half_life_rounds: float = 1.0
-    floor: float = 0.1
-    win_ttl_eras: int = 28
     # Free-form owner notes carried through for the dashboards.
     notes: dict = field(default_factory=dict)
+
+    def crown_bar(self, tenure: int) -> float:
+        """rev6.23: the bar a combined LCB must reach to crown at a settlement
+        where KING_D (a miner or the house) has held the crown ``tenure``
+        lane D settlements: ``d_margin_start`` at tenure 0, falling linearly
+        to ``d_margin`` at ``d_margin_warmup_settlements`` and flat after."""
+        return lane_d_crown_bar(self.d_margin_start, self.d_margin,
+                                self.d_margin_warmup_settlements, tenure)
 
     def active(self, boundary: int | None) -> bool:
         """Whether the SETTLEMENT at ``boundary`` judges lane D: its era starts
@@ -209,10 +229,24 @@ def _gate_weights(raw: object, suites: tuple[str, ...]) -> tuple[tuple[str, floa
     return tuple(out)
 
 
-def _str_list(raw: object, name: str) -> tuple[str, ...]:
-    if not isinstance(raw, (list, tuple)) or not all(isinstance(x, str) for x in raw):
-        raise ValueError(f"[lane_d] {name} must be a list of strings; got {raw!r}")
-    return tuple(raw)
+def _court_weights(raw: object, reward_prior_kings: int) -> tuple[float, ...]:
+    """rev6.23: one finite weight >= 0 per court slot (KING_D, then
+    ``reward_prior_kings`` prior kings), summing to 1 within 1e-9."""
+    want = 1 + int(reward_prior_kings)
+    if not isinstance(raw, (list, tuple)) or len(raw) != want:
+        raise ValueError(f"[lane_d] court_weights must be a list of {want} numbers "
+                         f"(1 + reward_prior_kings); got {raw!r}")
+    out = []
+    for i, w in enumerate(raw):
+        v = _float(w, f"court_weights[{i}]")
+        if not math.isfinite(v) or v < 0.0:
+            raise ValueError(f"[lane_d] court_weights[{i}] must be a finite number >= 0; "
+                             f"got {w!r}")
+        out.append(v)
+    if abs(math.fsum(out) - 1.0) > 1e-9:
+        raise ValueError(f"[lane_d] court_weights must sum to 1 (within 1e-9); got "
+                         f"{math.fsum(out)!r}")
+    return tuple(out)
 
 
 def parse_lane_d(raw: object, *, era_blocks_at: Callable[[int], int] | None = None
@@ -261,38 +295,23 @@ def parse_lane_d(raw: object, *, era_blocks_at: Callable[[int], int] | None = No
     tau = _float(ld.get("tau_public", 0.01), "tau_public")
     if not 0.0 <= tau < 1.0:
         raise ValueError(f"[lane_d] tau_public must be in [0, 1); got {tau!r}")
-    coc = ld.get("confirm_on_king_change", "restart")
-    if coc not in LANE_D_CONFIRM_ON_KING_CHANGE:
-        raise ValueError(f"[lane_d] confirm_on_king_change must be one of "
-                         f"{LANE_D_CONFIRM_ON_KING_CHANGE}; got {coc!r}")
     suites = _names(ld.get("gate_suites", list(LANE_D_GATE_SUITES)), "gate_suites")
     gate_w = _gate_weights(ld.get("gate_weights"), suites)
     lowfreq = _names(ld.get("lowfreq_freqs", list(LANE_D_LOWFREQ_FREQS)), "lowfreq_freqs")
 
-    # DEC-CA-0062 keys.
-    targets = _str_list(ld.get("targets", ()), "targets")
-    srcs = ld.get("data_sources", ("real", "prior_corpus"))
-    if (not isinstance(srcs, (list, tuple)) or not srcs
-            or not set(srcs) <= {"real", "prior_corpus"}):
-        raise ValueError(f"[lane_d] data_sources must be a non-empty subset of "
-                         f"['real', 'prior_corpus']; got {srcs!r}")
-    augs = _str_list(ld.get("augmentations", ()), "augmentations")
-    ec = str(ld.get("expert_choice", "miner"))
-    if ec not in ("miner", "affinity", "all"):
-        raise ValueError(f"[lane_d] expert_choice must be miner|affinity|all; got {ec!r}")
-    mcl = ld.get("max_context_length", 32768)
-    if isinstance(mcl, bool) or not isinstance(mcl, int) or not 0 < mcl <= 32768:
-        raise ValueError(f"[lane_d] max_context_length must be in (0, 32768]; got {mcl!r}")
-    mode = str(ld.get("teacher_mode", "route"))
-    if mode not in ("route", "ensemble", "explicit"):
-        raise ValueError(f"[lane_d] teacher_mode must be route|ensemble|explicit; got {mode!r}")
-    models = _str_list(ld.get("teacher_models", ()), "teacher_models")
-    if mode == "explicit" and not models:
-        raise ValueError("[lane_d] teacher_mode = 'explicit' needs teacher_models")
     # W2e keys and their cross-key checks (re-run at every overlay adoption:
     # netconfig.validate_overlay rebuilds the merged config through here).
     min_windows = _int(ld.get("min_windows", 1000), "min_windows", lo=1)
     d_margin = _open_unit(ld.get("d_margin", 0.01), "d_margin")
+    # rev6.23: the tenure-decaying crown bar; ``d_margin`` is its end.
+    d_start = _open_unit(ld.get("d_margin_start", 0.03), "d_margin_start")
+    if d_margin > d_start:
+        raise ValueError(f"[lane_d] d_margin={d_margin} (the bar's end) must be <= "
+                         f"d_margin_start={d_start} (rev6.23)")
+    d_warmup = _int(ld.get("d_margin_warmup_settlements", 32),
+                    "d_margin_warmup_settlements", lo=1)
+    rpk = _int(ld.get("reward_prior_kings", 2), "reward_prior_kings", lo=0)
+    court_w = _court_weights(ld.get("court_weights", [0.80, 0.15, 0.05]), rpk)
     embargo = _float(ld.get("embargo_hours", 48.0), "embargo_hours")
     if embargo < 0.0:
         raise ValueError(f"[lane_d] embargo_hours must be >= 0; got {embargo!r}")
@@ -312,9 +331,6 @@ def parse_lane_d(raw: object, *, era_blocks_at: Callable[[int], int] | None = No
         raise ValueError(f"[lane_d] backtest_weight_cap={bt_cap} needs 1 - backtest_ratio_floor"
                          f" ** backtest_weight_cap < d_margin (rev6.9 (a)); got "
                          f"{1.0 - bt_floor ** bt_cap:.6f} >= {d_margin}")
-    margin = float(ld.get("gain_margin", 0.01))
-    if not 0.0 < margin < 1.0:
-        raise ValueError(f"[lane_d] gain_margin must be in (0, 1); got {margin}")
     notes = ld.get("notes", {})
     return LaneDConfig(
         from_block=fb, until_block=ub, share=share, takes_from=takes, remainder=rem,
@@ -331,9 +347,8 @@ def parse_lane_d(raw: object, *, era_blocks_at: Callable[[int], int] | None = No
         min_fresh_window_share=fresh, backtest_weight_cap=bt_cap,
         backtest_ratio_floor=bt_floor,
         gate_suites=suites, gate_weights=gate_w, tau_public=tau, lowfreq_freqs=lowfreq,
-        reward_prior_kings=_int(ld.get("reward_prior_kings", 2), "reward_prior_kings", lo=0),
-        king_decay=_half_open_unit(ld.get("king_decay", 0.5), "king_decay"),
-        confirm_on_king_change=coc,
+        d_margin_start=d_start, d_margin_warmup_settlements=d_warmup,
+        reward_prior_kings=rpk, court_weights=court_w,
         max_entries_per_settlement=_int(ld.get("max_entries_per_settlement", 8),
                                         "max_entries_per_settlement", lo=1),
         max_open_per_coldkey=_int(ld.get("max_open_per_coldkey", 2),
@@ -350,17 +365,6 @@ def parse_lane_d(raw: object, *, era_blocks_at: Callable[[int], int] | None = No
         loser_ttl_eras=_int(ld.get("loser_ttl_eras", 4), "loser_ttl_eras", lo=0),
         max_mirror_lag_hours=lag,
         ready_ttl_blocks=_int(ld.get("ready_ttl_blocks", 7200), "ready_ttl_blocks", lo=1),
-        targets=targets, teacher_ref=str(ld.get("teacher_ref", "")),
-        teacher_api=str(ld.get("teacher_api", "ephemeris")), teacher_mode=mode,
-        teacher_models=models,
-        real_corpus_ref=str(ld.get("real_corpus_ref", "")),
-        data_sources=tuple(srcs), augmentations=augs, expert_choice=ec,
-        max_context_length=int(mcl),
-        pool_prefix=str(ld.get("pool_prefix", "pool_d")),
-        gain_margin=margin,
-        full_rounds=int(ld.get("full_rounds", 5)),
-        half_life_rounds=float(ld.get("half_life_rounds", 1.0)),
-        floor=float(ld.get("floor", 0.1)), win_ttl_eras=int(ld.get("win_ttl_eras", 28)),
         notes=dict(notes) if isinstance(notes, dict) else {},
     )
 
@@ -570,7 +574,6 @@ __all__ = [
     "load_scoring_envs",
     "parse_scoring_envs",
     "scoring_envs_path",
-    "LANE_D_CONFIRM_ON_KING_CHANGE",
     "LANE_D_CONTEXTS",
     "LANE_D_DTYPES",
     "LANE_D_GATE_SUITES",
@@ -579,6 +582,8 @@ __all__ = [
     "LANE_D_MAX_HORIZON",
     "LANE_D_REMAINDERS",
     "LANE_D_TAKES_FROM",
+    "RETIRED_LANE_D_KEYS",
     "LaneDConfig",
+    "lane_d_crown_bar",
     "parse_lane_d",
 ]

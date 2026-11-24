@@ -27,6 +27,36 @@ T-rows and no invariants.
   the owner's evidence against this checkout. With `LANED_S0A_DEPLOYED=<file>`
   as well (on the box), it also re-derives the deployed side from the file.
 
+## F6 (plan rev6.18 B9 main side, B12): `test_r6x_f6.py`
+
+- **B9 main <- deployed.** The release `chain.toml` carries
+  `[round] funded_sku_wall_seconds` `8xH100 = 13600`, `8xH200 = 12270`,
+  `funded_sku_wall_measured_image` (rc15), and the two owner keys at their
+  live values (owner 2026-11-23): `[training] budget_denomination_after =
+  "points+mv20"`, `_block = 9165600`; `[static_guard] packed_sources =
+  "reject"`, `_from_block = 9169200`. `cascade-audit decided` (the in-process
+  `decided.drift_report` against the shipped record) has no failing finding.
+- **Deployed edits.** `docs/notes/S0A_DEPLOYED_EDITS.md` has exactly one
+  ` ```toml ` block: the two decided votes (`[v2] prelaunch_burn_from_block =
+  9486900`, `image_decoupled_from_block = 9493200`) and `[scoring]
+  init_gate_retired_from_block` at main's value. Main with the votes untyped
+  and the block dropped (the deployed state) has 2 failing findings; with the
+  block's lines applied, none. With `LANED_S0A_DEPLOYED=<file>` (on the box)
+  the same holds for the real deployed file.
+- **B12.** `[scoring] init_gate_mode` / `init_gate_tolerance` are no
+  `ScoringConfig` fields, are listed in `RETIRED_KEYS["scoring"]` and change
+  nothing when a file still carries them; `KothParams` keeps `init_gate_mode`
+  (archived params replay) but not the tolerance. `koth_params(block)` is
+  `"shadow"` before `init_gate_retired_from_block` and `"off"` (the
+  drop-when-default value) from it; `0` = off everywhere. The archived
+  shadow-era receipt fixture (`fixtures/receipt_shadow_init_gate.json`:
+  mainnet round 9550553995117568107, entry rows trimmed, re-signed by
+  `//Alice` with the pre-F6 code) loads with no unknown field, re-dumps
+  byte-identically, verifies (received bytes and re-built body) and passes
+  `check_koth_params` against the release file.
+- The 19 operator-only keys get no marker (see the notes file: dedrift has no
+  operator marker; a `LIVE OVERRIDE` marker would class 15 of them `main`).
+
 ## `s0a_evidence.py`
 
 `collect` (the owner, on the box) and `verify` (CI, or by hand). Both read

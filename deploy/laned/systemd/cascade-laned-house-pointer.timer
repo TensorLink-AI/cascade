@@ -1,0 +1,13 @@
+# TEMPLATE: every 15 min, well inside a 3 h settlement (900 blocks), so a lane
+# A king change reaches the house pointer before the next lane D boundary.
+
+[Unit]
+Description=cascade lane D house pointer re-sign, every 15 min
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

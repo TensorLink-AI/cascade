@@ -55,7 +55,7 @@ NEW_KNOBS = ("harvest_keep_cost_fraction", "operator_runway_alert_hours",
 
 def _edited(tmp_path, round_lines: str) -> Path:
     src = REPO_TOML.read_text(encoding="utf-8")
-    anchor = "funded_operator_fallback = false\n"
+    anchor = "funded_operator_fallback = true\n"
     assert src.count(anchor) == 1
     p = tmp_path / "chain.toml"
     p.write_text(src.replace(anchor, anchor + round_lines, 1), encoding="utf-8")

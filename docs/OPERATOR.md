@@ -3441,7 +3441,10 @@ cascade-trainer --chain-toml chain.toml --work-root ./_train_work --preflight-v2
 
 This fetches the pinned tree, runs full bounded verification, and records a
 local proof tied to its ref, contract, generator policy and verifier source.
-It rents nothing. The first v2 king leg refuses rental without a matching
+It rents nothing. It exits 3 when the launch is still blocked after
+qualification (the printed blockers). `--preflight-v2-baseline-check REF` is
+the read-only version: it lists every blocker without fetching or writing
+(see [Lane D recurring jobs](#lane-d-recurring-jobs)). The first v2 king leg refuses rental without a matching
 proof and a pinned validator receipt anchor. A launch root survives a later
 v2 dethrone; changing the verifier or policy requires qualification again.
 The trainer and validator may share the configured signer; receipts then share
@@ -3664,3 +3667,92 @@ python -P -m cascade.laned.cli elastic down  --role lane-d-eval-host --cohort-do
 Exit codes: 3 `no_capacity`, 4 `price_cap`, 5 `monthly_cap`, 6 `gpu_refused`,
 7 `cohort_open`, 8 `not_qualified`, 9 `state_conflict`, 10 `step_failed`,
 11 `teardown_unverified`, 12 `host_mismatch` (tests/accept/r13/README.md).
+
+### Lane D recurring jobs
+
+Each job is one idempotent command (a re-run with nothing new does nothing),
+takes `--dry-run` (prints the plan, writes nothing) and reads only local
+files: no chain read, rental or deploy. Only `king-publish` and `takedown`
+write a bucket or repo (the existing public mirrors and manifest store, never
+a new one), and only live (without `--dry-run`, `--vault-dir` / `--mirror` /
+`--index-store-dir`, the filesystem mode testnet uses). The systemd units in
+`deploy/laned/systemd/` are **templates**: nothing installs or starts them.
+Installing one (copy to `/etc/systemd/system/`, fill
+`/etc/cascade-laned-jobs.env` from `cascade-laned-jobs.env.example`,
+`systemctl enable --now <name>.timer`) is an owner step, testnet first. Every
+mutating unit ships with `--dry-run`. Going live is a drop-in that repeats
+`ExecStart` without it, after the dry-run output has been reviewed.
+
+Exit codes for `python -P -m cascade.lane_d.ops_jobs <job>`: 0 means done,
+nothing to do, or dry-run planned. 1 means an input is invalid or a check
+found a problem, and nothing was written. 2 is a usage error. 3 means the job
+is blocked on an owner step.
+
+| Unit (`.service` + `.timer`) | Schedule | Command | Inputs (names only) | Owner steps |
+|---|---|---|---|---|
+| `cascade-laned-house-pointer` | 15 min | `ops_jobs house-pointer` | `LANED_KING_SOURCE` (the validator's JSON state, `king_pointer`, read only), `LANED_HOUSE_POINTER` (the inputs TOML `house_pointer`), `LANED_HOUSE_SOURCE`, `LANED_SIGNER_SS58`, `LANED_WALLET_NAME` / `LANED_WALLET_HOTKEY` (validator **hotkey**) | For each new lane A king, build the house on the eval host pod (below, `house_source build`) and stage it for `cascade-laned-house-source`; until it is installed the job exits 3. Then approve the live drop-in. |
+| `cascade-laned-house-source` | 15 min | `ops_jobs house-source` | `LANED_HOUSE_SOURCE_STAGE` (the pod-built `laned_house_source/1`, its `.provenance.json` beside it), `LANED_HOUSE_SOURCE` | **Pod step:** `python -P -m cascade.lane_d.house_source build --king-pointer <KING_A pointer> --lineage-block <commit block> … --network <net> --chain-toml chain.toml --entry-dir <dir> --out house_source.json --cache-dir <eval cache> --budget-bytes <N>` on the eval host (the house is not in the vault; `--cache-dir` admits it). It casts KING_A to BF16 (D47, rule `laned_bf16_cast/1`: round-to-nearest-even, sorted tensors, F32/F16/BF16 in, anything else or non-finite refused) into the four lane D entry files and dates it by D46 (the chain timestamp of the latest lineage commit block). Copy `house_source.json` and its `.provenance.json` to the stage. The install re-checks the provenance (manifest re-hash, release code, cast rule, lineage) without reading weights. Live drop-in. |
+| `cascade-laned-published-weights` | hourly | `python -P -m cascade.lane_d.published_weights` | `LANED_INTAKE_STATE`, `LANED_INDEX`, `LANED_SIGNER_SS58`, `LANED_MIRROR_DIR` (local copy of one public mirror); lane A legs, kings and the house via `--shas-file` | Fetchers: `python -P -m cascade.lane_d.published_sources mirror-index --index-url <public index URL> --mirror-url <public mirror base URL> --signer-ss58 … --dest $LANED_MIRROR_DIR` (box-safe, kilobytes) and, **on a pod or the builder** (it downloads and casts checkpoints), `published_sources checkpoint-shas --refs-from <round manifests> --work-dir … --out shas.json` (each checkpoint's weights sha256 and its D47 BF16-cast sha256, the house included); add `--shas-file shas.json`. Live drop-in. |
+| `cascade-laned-readiness-measure` | 3 h, **builder VM only** | `scripts/laned_w1_measure.py --forge-dir … --readiness-out …` | `LANED_FORGE_DIR` (synced forge mirror), `LANED_EVIDENCE_STAGE` | Move the staged `laned_readiness.json` to the validator host's stage. With the elastic builder ([above](#elastic-lane-d-hosts-cascade-laned-elastic)), the VM exists only during a build, so the owner runs this command inside that cycle rather than from a standing timer. The template suits a standing testnet builder. |
+| `cascade-laned-evidence` | 3 h | `ops_jobs evidence` | `LANED_CHAIN_TOML`, `LANED_EVIDENCE_STAGE`, `LANED_PINNED_READINESS` / `LANED_PINNED_T7` (the inputs TOML `readiness` / `t7`) | **T7 is an owner step.** On the eval host pod run `python -P -m cascade.eval.lane_d_t7_pod --checkpoint-dir <a lane D entry> --histories <pool_d windows .npz> (or --synthetic-seed N) --host <eval_host> --gpu <model> --mem-gb <GB> --out t7.json` (CUDA, `source = "pod"`; every variant at 1000 and 5000 windows, the 5000 row gates, both under `window_sweep`), stage `t7.json`, then add `--t7`. A non-pod T7, an unparseable document, or one that disarms an armed context is refused (`--allow-disarm` overrides the last). |
+| `cascade-laned-vault-sweep` | daily 04:30 UTC | `ops_jobs vault-ledger`, then `python -P -m cascade.laned.vault_sweeper --dry-run` | `LANED_STATE`, `LANED_LEDGER`, `LANED_VAULT_DIR` / `LANED_ARCHIVE_DIR` (fs mode, testnet), `LANED_SWEEP_LOG_DIR` | A `--live` sweep needs the standing approval **D16** and a drop-in. S3 mode (`--s3 --archive-bucket`) takes its credentials from the owner's own mode-600 env file, never this one. |
+| `cascade-laned-king-check` | hourly | `ops_jobs king-check` | `LANED_STATE` (its persisted reports), `LANED_INDEX`, `LANED_SIGNER_SS58`; optional `--vault-dir` and `--mirror hub=… r2=… hf=…` local copies for the full re-hash | A red check after `cascade-laned-king-publish` ran is an owner look. |
+| `cascade-laned-king-publish` (+ `.path`) | on each publish request, hourly backstop; **testnet-ctl / builder, not the loaded 7 GB box** (one checkpoint in memory) | `ops_jobs king-publish` | `LANED_STATE` (its reports and `lane_d_publish_requests/`), `LANED_INTAKE_STATE` (ready licences), `LANED_INDEX`, `LANED_SIGNER_SS58`, `LANED_CHAIN_TOML` (`[storage]` names), `LANED_WALLET_NAME` / `LANED_WALLET_HOTKEY`; env credentials by name only: `HIPPIUS_S3_*`, `HIPPIUS_HUB_TOKEN`, `HF_TOKEN`, `BACKUP_S3_*` | The validator's settlement step writes `lane_d_publish_requests/<boundary>.json` for each crowning (with the era's sentinel record). The job copies the king vault → Hub `{hub_namespace}/laned-king-c{context}-{hotkey8}`, R2 (`[storage] backup_bucket`, else `manifest_bucket`, under `lane-d-kings/`) and HF `tensorlink-dev/cascade-lane-d-kings`, re-signs the index, puts it on the manifest store and writes `LANED_INDEX`. Exit 3 without a ready licence record or a missing armed sentinel record. Live drop-in. **Takedown** (B13) is a one-shot: `ops_jobs takedown --digest D --reason licence\|rights --block B --index … --signer-ss58 … --chain-toml …` (`--dry-run` first). |
+
+**Lane A item (testnet bring-up): qualify a compliant initial king.** Run
+`cascade-trainer --chain-toml chain.testnet.toml --work-root ./_train_work
+--preflight-v2-baseline-check NAMESPACE/GENERATOR@sha256:DIGEST` first. It is
+read-only: it fetches, writes and rents nothing. It prints every blocker at
+once (`worker_release: …`, `identity: …`, `no_validator_anchor`,
+`no_proof`, `proof_stale:<keys>`, `proof_not_full`) and exits 0 when ready, 3
+when blocked, 2 on error. Then run `--preflight-v2-baseline` with the same
+ref. That fetches the generator, runs the full sandbox verification and
+records the proof, then reports the same way. It exits 3, not 0, when another
+blocker remains. The trainer's `v2 launch blocked before rental` line names
+the king's real ref and work root.
+
+**Watcher tags** for cascade-ops (owner: add follower patterns; nothing here
+writes to cascade-ops). Lines are `<ts> LEVEL cascade.lane_d.ops: <tag> …` in
+`LANED_LOG` (`--log-file`):
+
+| Tag | Level | Meaning |
+|---|---|---|
+| `lane_d_ops_house_current` | info | pointer matches the lane A king |
+| `lane_d_ops_house_no_lane_a_king` | info | lane A has no king, so the previous house stays |
+| `lane_d_ops_house_resign_planned` | info | dry-run: the payload it would sign |
+| `lane_d_ops_house_resigned` | warning | new house pointer signed |
+| `lane_d_ops_house_resign_blocked` | error | lane A king changed and its house source is not prepared (exit 3) |
+| `lane_d_ops_house_failed` | error | unreadable or invalid input, or the wrong signer; nothing written |
+| `lane_d_ops_evidence_current` | info | pinned readiness / T7 already current |
+| `lane_d_ops_evidence_planned` | info | dry-run install plan |
+| `lane_d_ops_evidence_installed` | warning | new readiness / T7 installed (armed before → after) |
+| `lane_d_ops_evidence_refused` | error | invalid, non-pod or disarming document |
+| `lane_d_ops_ledger_current` | info | vault ledger unchanged |
+| `lane_d_ops_ledger_planned` | info | dry-run ledger |
+| `lane_d_ops_ledger_written` | info | ledger exported for the sweeper |
+| `lane_d_ops_ledger_failed` | error | state or closure unprovable; nothing written |
+| `lane_d_ops_king_ok` | info | every crowned report agrees with the index |
+| `lane_d_ops_king_unpublished` | critical | a crowned king is missing or disagrees (index, vault or mirror) |
+| `lane_d_ops_king_check_failed` | error | the index or the inputs are unreadable or unverified |
+| `lane_d_ops_house_source_current` | info | the installed house source is current |
+| `lane_d_ops_house_source_planned` | info | dry-run: the house source it would install |
+| `lane_d_ops_house_source_installed` | warning | a new house source installed for the house-pointer job |
+| `lane_d_ops_house_source_refused` | error | the provenance does not prove the source; nothing installed |
+| `lane_d_ops_king_publish_current` | info | every crowned settlement is in the index |
+| `lane_d_ops_king_publish_planned` | info | dry-run: the kings it would publish |
+| `lane_d_ops_king_published` | warning | kings copied to the mirrors and the index re-signed |
+| `lane_d_ops_king_publish_blocked` | error | no ready licence record or an armed sentinel record missing (exit 3) |
+| `lane_d_ops_king_publish_failed` | error | a vault or mirror re-hash failed, or the wrong signer; index unchanged |
+| `lane_d_ops_takedown_planned` | info | dry-run (or already taken down) |
+| `lane_d_ops_takedown_done` | warning | Hub and HF copies removed, index re-signed |
+| `lane_d_ops_takedown_failed` | error | unknown king, a copy left behind, or the wrong signer; index unchanged |
+
+The validator logs `lane_d_king_publish_requested` (info) when it leaves a
+publish request and `lane_d_king_publish_request_failed` (warning) when it
+could not; the settlement and pay stand either way and `king-check` flags the
+unpublished king.
+
+The published-weights job prints `published_weights: wrote …`,
+`published_weights: current …`, `published_weights: dry-run …` and, on
+failure, `published_weights: … nothing written`. The sweeper writes its own
+JSON action log under `LANED_SWEEP_LOG_DIR`.

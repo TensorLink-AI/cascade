@@ -1,0 +1,14 @@
+# TEMPLATE: start cascade-laned-king-publish.service when the validator's
+# settlement step writes a publish request (a crowning settled). The path is
+# the default LANED_STATE dir + lane_d_publish_requests (systemd path units
+# take no environment file: edit it with LANED_STATE).
+
+[Unit]
+Description=cascade lane D king publication on a new crowning
+
+[Path]
+PathChanged=/root/cascade-state/lane-d/lane_d_publish_requests
+Unit=cascade-laned-king-publish.service
+
+[Install]
+WantedBy=paths.target

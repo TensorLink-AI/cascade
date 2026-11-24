@@ -115,7 +115,9 @@ ENUM_DEFS = {
 TOP_LEVEL_REQUIRED = ("schema", "boundary", "signer", "signature", "scoring_method", "params",
                       "seed", "pool", "house", "king_before", "king_after", "crowned",
                       "prior_kings", "entries", "judged", "skipped", "cohorts", "windows",
-                      "verdicts", "rows", "rows_sha256", "pay")
+                      "verdicts", "rows", "rows_sha256", "pay",
+                      # rev6.23: {tenure, margin}, the crown bar applied
+                      "crown_bar")
 # `gate` (RV4): the §1.3b gate record, present iff a candidate reached the gate.
 # rev6.6: `armed_contexts` + `armed_evidence`, present together iff the
 # settlement was handed the W5d armed record (README "Armed contexts").
@@ -124,7 +126,11 @@ TOP_LEVEL_REQUIRED = ("schema", "boundary", "signer", "signature", "scoring_meth
 TOP_LEVEL_OPTIONAL = ("extensions", "gate", "armed_contexts", "armed_evidence", "draw", "host")
 PARAMS_FIELDS = ("share", "takes_from", "remainder", "horizon", "horizons", "contexts",
                  "forward_margin_hours", "max_mirror_lag_hours", "min_windows", "min_clusters",
-                 "d_margin", "alpha", "bootstrap_B", "king_decay", "reward_prior_kings",
+                 "d_margin", "alpha", "bootstrap_B", "reward_prior_kings",
+                 # rev6.23 (owner 2026-11-24): the tenure-decaying crown bar
+                 # (d_margin is its end) and the explicit court weights, which
+                 # replace king_decay.
+                 "d_margin_start", "d_margin_warmup_settlements", "court_weights",
                  "max_entries_per_settlement",
                  "max_judged_per_coldkey_per_settlement", "scoring_levels", "gate_suites",
                  "tau_public", "lowfreq_freqs",

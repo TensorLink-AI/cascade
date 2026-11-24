@@ -124,7 +124,12 @@ def _expected_params(cfg) -> dict:
             "forward_margin_hours": float(cfg.forward_margin_hours),
             "min_windows": int(cfg.min_windows), "min_clusters": int(cfg.min_clusters),
             "d_margin": float(cfg.d_margin), "alpha": float(cfg.alpha),
-            "bootstrap_B": int(cfg.bootstrap_B), "king_decay": float(cfg.king_decay),
+            "bootstrap_B": int(cfg.bootstrap_B),
+            # rev6.23: the tenure-decaying crown bar (d_margin is its end) and
+            # the explicit court weights (they replace king_decay).
+            "d_margin_start": float(cfg.d_margin_start),
+            "d_margin_warmup_settlements": int(cfg.d_margin_warmup_settlements),
+            "court_weights": [float(w) for w in cfg.court_weights],
             "reward_prior_kings": int(cfg.reward_prior_kings),
             "max_entries_per_settlement": int(cfg.max_entries_per_settlement),
             "max_judged_per_coldkey_per_settlement":
@@ -197,8 +202,55 @@ def _judge(report: dict, cfg, scores: dict, bar: str, members: list[str],
     out = []
     for m, lcb in zip(members, lcbs, strict=True):
         gain = (bg - _geo(*scores[m])) / (bg if abs(bg) >= 1e-9 else 1e-9)
-        out.append((float(lcb), float(gain), bool(lcb >= float(cfg.d_margin) and gain > 0.0)))
+        out.append((float(lcb), float(gain), bool(lcb >= _report_bar(report, cfg)
+                                                  and gain > 0.0)))
     return out
+
+
+def crown_bar_of(cfg, tenure: int) -> float:
+    """rev6.23, re-derived from the parsed ``[lane_d]`` keys (never the
+    producer's): ``d_margin_start`` at tenure 0, falling linearly to
+    ``d_margin`` at ``d_margin_warmup_settlements`` and flat after."""
+    w = int(cfg.d_margin_warmup_settlements)
+    t = max(0, int(tenure))
+    start, end = float(cfg.d_margin_start), float(cfg.d_margin)
+    if t >= w:
+        return end
+    return start - (start - end) * t / w
+
+
+def _crown_bar_problem(report: dict, cfg) -> str | None:
+    """rev6.23: ``crown_bar`` is ``{tenure, margin}`` with ``margin`` the bar
+    re-derived from the config at ``tenure`` (the tenure itself is a chain
+    rule: :func:`_continuity_problem`)."""
+    cb = report.get("crown_bar")
+    if not isinstance(cb, dict) or set(cb) != {"tenure", "margin"}:
+        return f"crown_bar {cb!r} is not {{tenure, margin}}"
+    t = cb["tenure"]
+    if not _int_value(t) or t < 0:
+        return f"crown_bar.tenure {t!r} is not an int >= 0"
+    want = crown_bar_of(cfg, t)
+    if not _close(cb["margin"], want):
+        return f"crown_bar.margin {cb['margin']!r} != {want!r} re-derived at tenure {t}"
+    return None
+
+
+def _report_bar(report: dict, cfg) -> float:
+    """The bar a verdict clears against: re-derived at the report's stated
+    tenure (checked by :func:`_crown_bar_problem` before any cohort)."""
+    return crown_bar_of(cfg, int(report["crown_bar"]["tenure"]))
+
+
+def next_tenure(prior: dict) -> int | None:
+    """rev6.23: the tenure the settlement after ``prior`` must state: 1
+    after a crown (a miner crowned, or the house retaking from a miner), else
+    the prior tenure + 1; ``None`` when ``prior`` carries no ``crown_bar``."""
+    cb = prior.get("crown_bar")
+    if not isinstance(cb, dict) or not _int_value(cb.get("tenure")):
+        return None
+    kb, ka = prior.get("king_before") or {}, prior.get("king_after") or {}
+    retake = bool(ka.get("house")) and not bool(kb.get("house"))
+    return 1 if (prior.get("crowned") is not None or retake) else int(cb["tenure"]) + 1
 
 
 def _bars(kd: str, hd: str, members) -> list[str]:
@@ -1030,6 +1082,12 @@ def _continuity_problem(report: dict, priors, entries: dict) -> str | None:
             continue
         return (f"king_before {str(kb.get('digest'))[:12]} is not where the report at {b} "
                 f"left KING_D ({str((ka or {}).get('digest'))[:12]})")
+    # rev6.23: KING_D's tenure continues from the latest earlier report.
+    want_t = next_tenure(next(p for b, p in earlier if b == latest))
+    got_t = (report.get("crown_bar") or {}).get("tenure")
+    if want_t is not None and got_t != want_t:
+        return (f"crown_bar.tenure {got_t!r} does not continue the report at {latest} "
+                f"(want {want_t})")
     for b, p in sorted(earlier, key=lambda x: x[0]):
         ph = p.get("house")
         if isinstance(ph, dict) and ph.get("digest") == house["digest"] and ph != house:
@@ -1507,6 +1565,10 @@ def lane_d_findings(report: dict, cfg, *, signer_hotkey: str, prior_reports=None
                             for c in cohorts)
         if expected_rows != len(rows):
             f.add("ld_rows_count", f"{len(rows)} rows; the cohorts account for {expected_rows}")
+            return f
+        # rev6.23: the crown bar applied is the config's at the stated
+        # tenure; every verdict below clears against it.
+        if one("ld_params", _crown_bar_problem(report, cfg)):
             return f
         problems, confirms = [], {}
         for c in cohorts:

@@ -89,6 +89,21 @@ compact separators) over **every** regular file of the entry, as
     published by `os.replace` of a hashed staging directory, the index by
     `os.replace` of a unique temp file in `root`: a reader never sees a
     partial entry or index. The lock file is never an entry.
+  - **Shared pins and scoring leases.** The pins are published to
+    `root/.lane_d_cache_pins.json` (`PINS_FILE`; written at open when pins
+    are given and by every `set_pinned`, latest setter wins).
+    **`lease(digest, *, ttl_s=LEASE_TTL_S)`** is a context manager that
+    holds `digest` (cached or not yet) against eviction by any process: a
+    file `root/.lane_d_lease-<digest>-<pid>-<token>.json` (`LEASE_PREFIX`)
+    with `{"digest", "pid", "expires"}`, removed on exit. A bad digest is
+    `CacheError("bad_digest")`, a non-positive or non-number `ttl_s` is
+    `ValueError`. A lease is live while its pid is alive and `expires` is in
+    the future; anything else (dead pid, expired, unparseable) is stale and
+    is deleted by the next scan. Eviction (admission and open) skips the
+    instance's pins, the shared pins and every live lease
+    (**`protected()`**; **`leased()`** = the live leases).
+    `lane_d_forecasts.forecast_entry` holds a lease from before the fetch
+    until the forecast returns or fails.
   - **Deterministic.** The same operation sequence on two roots gives the same
     `entries()`, `total_bytes()` and on-disk entry set after every step.
   - Logs (logger `cascade.eval.lane_d_cache`): INFO `lane_d_cache_evict ...
@@ -123,6 +138,7 @@ compact separators) over **every** regular file of the entry, as
 | Resumable | `test_reopen_keeps_entries_bytes_and_lru_order`, `test_reopen_order_does_not_come_from_mtimes`, `test_reopen_ignores_staging_leftovers_from_a_crash`, `test_reopen_with_a_smaller_budget_evicts_lru_but_keeps_pins` |
 | Determinism | `test_same_operations_give_the_same_cache` |
 | Shared root: concurrent processes/threads never fail, never serve partial bytes, fill once | `test_w15_concurrency.py`: `test_two_processes_filling_one_root_never_fail_and_fill_each_digest_once`, `test_racing_processes_under_eviction_pressure_stay_consistent`, `test_opening_a_cache_never_sweeps_a_live_fill`, `test_a_second_instance_sees_the_first_instances_fill`, `test_threads_sharing_one_instance_do_not_interleave`, `test_index_writes_are_atomic_for_a_reader`, `test_the_lock_file_is_never_an_entry` |
+| Shared pins and scoring leases: no process evicts a pinned or leased entry; stale leases reclaimed | `test_a_scorer_lease_blocks_eviction_by_another_process` (evictor process + scorer process holding a lease), `test_a_lease_taken_before_the_fill_protects_the_entry_once_admitted`, `test_stale_leases_are_reclaimed`, `test_lease_refuses_a_bad_digest_or_ttl`, `test_pins_are_shared_across_instances_and_processes`, `test_forecast_entry_holds_a_lease_while_scoring` |
 | Path safety | `test_bad_digest_refused_everywhere[*]`, `test_prefetch_refuses_a_grant_with_a_bad_digest_before_any_request` |
 | Prefetch via W4 presigned ingest | `test_prefetch_hit_makes_no_request`, `test_prefetch_refused_by_ingest_admits_nothing[*]`, torch `test_prefetch_miss_ingests_admits_and_then_hits` |
 | Invariant 1 pair | `test_inv1_prefetch_cache_unchanged_when_unarmed` + `test_inv1_prefetch_cache_armed_nonempty_lane_d_effect` |

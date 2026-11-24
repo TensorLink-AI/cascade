@@ -186,6 +186,7 @@ from .lane_d_state import (
     CONFIRM_MIGRATION_EXTENSION,
     CONFIRM_MIGRATION_TAG,
     HOUSE_ENTRY_KEY,
+    KING_TENURE_KEY,
     PRIOR_STATE_EXTENSION,
     LaneDReceiptError,
     LaneDStateError,
@@ -348,10 +349,14 @@ def _components(crps: np.ndarray, mase: np.ndarray):
             np.ones(len(crps), dtype=np.float64), np.asarray(mase, dtype=np.float64))
 
 
-def judge_cohort(king: tuple, members: list[tuple], *, clusters: list, cfg, seed: str
-                 ) -> list[dict]:
+def judge_cohort(king: tuple, members: list[tuple], *, clusters: list, cfg, seed: str,
+                 bar: float | None = None) -> list[dict]:
     """``[{"lcb", "gain", "cleared"}]`` per member: max-T LCB over the cohort
-    (k = 1 is the plain percentile LCB) and the full-sample relative gain."""
+    (k = 1 is the plain percentile LCB) and the full-sample relative gain.
+    A member clears iff ``lcb >= bar`` and its gain is positive; ``bar`` is
+    the settlement's crown bar (rev6.23, :meth:`LaneDConfig.crown_bar`),
+    ``None`` = ``cfg.d_margin`` (the bar's floor)."""
+    bar = float(cfg.d_margin) if bar is None else float(bar)
     lcbs = cohort_maxt_lcbs(_components(*king), [_components(*m) for m in members],
                             alpha=float(cfg.alpha), B=int(cfg.bootstrap_B), seed=seed,
                             clusters=clusters)
@@ -360,7 +365,7 @@ def judge_cohort(king: tuple, members: list[tuple], *, clusters: list, cfg, seed
     for (c, m), lcb in zip(members, lcbs, strict=True):
         gain = (kg - _geo(c, m)) / (kg if abs(kg) >= 1e-9 else 1e-9)
         out.append({"lcb": float(lcb), "gain": float(gain),
-                    "cleared": bool(float(lcb) >= float(cfg.d_margin) and gain > 0.0)})
+                    "cleared": bool(float(lcb) >= bar and gain > 0.0)})
     return out
 
 
@@ -858,7 +863,12 @@ def _params(cfg) -> dict:
             "max_mirror_lag_hours": float(cfg.max_mirror_lag_hours),
             "min_windows": int(cfg.min_windows), "min_clusters": int(cfg.min_clusters),
             "d_margin": float(cfg.d_margin), "alpha": float(cfg.alpha),
-            "bootstrap_B": int(cfg.bootstrap_B), "king_decay": float(cfg.king_decay),
+            "bootstrap_B": int(cfg.bootstrap_B),
+            # rev6.23: the tenure-decaying crown bar (d_margin is its end) and
+            # the explicit court weights (they replace king_decay).
+            "d_margin_start": float(cfg.d_margin_start),
+            "d_margin_warmup_settlements": int(cfg.d_margin_warmup_settlements),
+            "court_weights": [float(w) for w in cfg.court_weights],
             "reward_prior_kings": int(cfg.reward_prior_kings),
             "max_entries_per_settlement": int(cfg.max_entries_per_settlement),
             "max_judged_per_coldkey_per_settlement":
@@ -1076,6 +1086,12 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     migrated = migrate_confirm_pending(state)
     refresh_house(state, house)
     king_before = _king_record(state["king"])
+    # rev6.23 (owner 2026-11-24): the crown bar decays with KING_D's tenure,
+    # the lane D settlements it has held the crown before this one (a house
+    # KING_D counts; a house refresh in place does not reset it). Absent in
+    # a state written before rev6.23: 0.
+    tenure = int(state.get(KING_TENURE_KEY, 0))
+    crown_bar = cfg.crown_bar(tenure)
     pools = _load_pools(pool_dir, prior_pool_dirs, int(cfg.horizon))
     # rev6.18 A4 (F2): multichannel windows reduced to their scored channels
     # (a no-op on a univariate pool).
@@ -1248,7 +1264,7 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
                              "crps": float(scores[dg][0][i]), "mase": float(scores[dg][1][i])})
         clusters = [w["source"] for w in ws]
         res = judge_cohort(scores[kd], [scores[m] for m in members],
-                           clusters=clusters, cfg=cfg, seed=seed)
+                           clusters=clusters, cfg=cfg, seed=seed, bar=crown_bar)
         if len(bars) > 1:
             # The same max-T judgment with the house as the bar: a member
             # clears only if it clears both. ``judge_cohort`` needs a
@@ -1257,7 +1273,7 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
             # the KING_D ``lcb`` / ``gain`` and records the house judgement
             # as ``house``, so a satellite re-derives both from the rows.
             vs_house = judge_cohort(scores[hd], [scores[m] for m in members],
-                                    clusters=clusters, cfg=cfg, seed=seed)
+                                    clusters=clusters, cfg=cfg, seed=seed, bar=crown_bar)
             res = [{**r, "cleared": bool(r["cleared"] and rh["cleared"]),
                     "house": {"digest": hd, "lcb": rh["lcb"], "gain": rh["gain"],
                               "cleared": bool(rh["cleared"])}}
@@ -1415,6 +1431,9 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
         for v in verdicts:
             if v["digest"] == best["digest"]:
                 v["outcome"] = "crowned"
+    # rev6.23: a crown (a miner, or the house retaking) restarts the tenure;
+    # the next settlement is the new KING_D's first after its crowning.
+    state[KING_TENURE_KEY] = 1 if passing else tenure + 1
     court = _court(state, cfg, uid_of)
     pay = {"share": float(cfg.share), "court_uids": [s["uid"] for s in court]}
     pool_rec = _pool_record(pools, windows_out)
@@ -1442,6 +1461,8 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
         "windows": [windows_out[k] for k in sorted(windows_out)],
         "verdicts": verdicts, "rows": rows, "rows_sha256": rows_sha256(rows),
         "pay": {"share": pay["share"], "court": court},
+        # rev6.23: the tenure the bar was taken at and the bar applied.
+        "crown_bar": {"tenure": tenure, "margin": crown_bar},
         # RV7 B1: the state this settlement ran from, under the signature, so
         # recovery can check a persisted report against the state as loaded.
         "extensions": {PRIOR_STATE_EXTENSION: prior_sha,
