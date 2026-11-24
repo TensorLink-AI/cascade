@@ -27,7 +27,8 @@ MODULE = "cascade.funding.lane_b_gpus"
 # 8xRTX4090 (lane B only); never a single-GPU layout.
 OWNER_LANE_B_SKUS = ("8xH200", "8xH100", "4xH200", "4xH100", "8xRTX4090")
 # [round] funded_pod_skus on main (lane A's list); WB22 never changes it.
-MAIN_ROUND_SKUS = ("8xH200", "8xH100", "4xH200", "4xH100")
+# F6 (owner 2026-11-24, #532 folded in) typed the live mainnet list: 8x only.
+MAIN_ROUND_SKUS = ("8xH100", "8xH200")
 UNMEASURED = "gpu_rate_unmeasured"
 STEP_RATES_ENV = "CASCADE_LANE_B_STEP_RATES"
 
