@@ -3559,3 +3559,93 @@ trainer (no legs in flight).
 `[lane_d] max_coldkey_unresolved_settlements` settlements. Alerts reach a
 webhook only when `/etc/cascade-ops.env` is filled; otherwise they reach only
 `alerts.jsonl`.
+
+### Elastic lane D hosts (`cascade-laned elastic`)
+
+Owner decision 2026-11-24 (plan R13, W6d): both lane D hosts are rented only
+while they have work. **GPU is always Lium; Shadeform is CPU only.** The
+controller runs on the box (HTTP and ssh only, nothing heavy) and is
+configured by `deploy/laned/elastic.toml` (operator-only, never consensus).
+
+| Role | Provider | Comes up | Goes down |
+|---|---|---|---|
+| `pool-d-builder` | Shadeform CPU VM (VM mode, user `shadeform`); any type with `num_gpus > 0` is refused | every 3 h (`cascade-laned-pool-d.timer`, 00/03/…/21:05 UTC) | right after `pool_d_publish` and `state-push`, unless `keep_warm = true`; always on failure |
+| `lane-d-eval-host` | Lium, through the existing adapter (digest-pinned worker image, host quarantine, lemon recording) | for a settlement with lane D work: `ceil(entries / per_host_entries)` hosts, at most `max_hosts` | when that settlement's scoring has decided (`down --cohort-done`) |
+
+**Costs.** Builder: the cheapest available type meeting the spec, at the
+2026-11-24 snapshot `massedcompute cpu_small` $0.22/h (40 GB / 800 GB) or
+`cpu_medium` $0.44/h (80 GB / 1600 GB), times the build hours (boot +
+`uv sync --frozen` + mirror delta + build). Eight builds a day at 1 h each and
+$0.44/h is about $106 a month; a build that runs the full 3 h makes it the
+same as keeping one VM warm (about $317 a month). Eval hosts: Lium price per
+host times the settlement's scoring hours, times the number of hosts (for
+example 2 H200 hosts at $3–4/h for 3 h is $18–24 a settlement). Caps:
+`max_price_per_hour` per role (never rented above), `monthly_cap_usd` per role
+over the controller's own spend ledger (`<state_dir>/spend.jsonl`); an eval
+cohort that the monthly cap cannot fund in full gets fewer hosts and an
+alert. Every rental carries a provider-side backstop (Shadeform
+`auto_delete` date + spend threshold, Lium `--ttl`).
+
+**Which GPU.** A candidate in `[[eval_host.candidates]]` is rented only when
+its `gpu_model` is listed by a `status = "qualified"` environment in F5's
+`deploy/laned/scoring_envs.toml`. Until that file is on main the
+`fallback_qualified_gpu_models` list applies (H200 on the pinned
+torch 2.4.1+cu124). The RTX PRO 6000 Blackwell (`Edition`) stays refused until
+F5's sm_120 environment is qualified. No qualified Lium GPU: the controller
+retries Lium for `retry_window_minutes`, writes the alert
+`lane_d_eval_no_lium_gpu` and exits `no_capacity` (the settlement retries).
+It never rents a GPU on Shadeform.
+
+**Same host per cohort (B6), many hosts.** A cohort keeps its hosts until it
+decides; a second `up` for the same cohort reuses them, `up` for another
+cohort and `down` without `--cohort-done` refuse (`cohort_open`).
+`run --role lane-d-eval-host` writes the shard plan: entries split
+deterministically from the boundary block hash and the entry ids, KING_D and
+the house on every host. The consensus half (each challenger paired with its
+own host's king inside the max-T LCB, and the signed report's per-model host
+and per-host king scores) extends F5 (#830) and needs a plan revision; until
+then the merge refuses `host_mismatch` when hosts disagree on the king.
+
+**Builder state.** The W6fs first-seen log and each snapshot's `metadata.json`
+(the next build's `--prior-dir`) live in the private `pool_d` bucket under
+`<pool_d_prefix>/_builder/`. Object storage, not a Shadeform volume: a volume
+is tied to one cloud and region, which would defeat the cheapest-available
+pick. `state-push` refuses (`state_conflict`) unless the bucket copy is a
+byte prefix of the local log and the bucket `HEAD.json` is the one
+`state-pull` saw. `mirror-sync` never touches `first_seen/`.
+
+**Keys the owner fills (names only).**
+
+- `/etc/cascade-laned-elastic.env` (mode 600, the systemd `EnvironmentFile`):
+  `SHADEFORM_API_KEY`, `SHADEFORM_SSH_KEY_ID`, and `LIUM_API_KEY` if the Lium
+  CLI is not already configured.
+- `/etc/cascade-laned-pool-d.env` (mode 600, copied to the builder at mode
+  600; create it with the `env-template` action, below): `HIPPIUS_S3_ACCESS_KEY`,
+  `HIPPIUS_S3_SECRET_KEY`, `TSFORGE_S3_ACCESS_KEY`, `TSFORGE_S3_SECRET_KEY`,
+  `TSFORGE_BUCKET`, `TSFORGE_S3_ENDPOINT`.
+- `deploy/laned/elastic.toml [eval_host] image`: the digest-pinned worker
+  image from the deployed provision.toml, and `per_host_entries` from the A9
+  timing.
+
+**How to run.** Always `quote` (or `--dry-run`) first; renting is
+Approve-tier. The console script `cascade-laned elastic` is the same tool;
+the snippets use the module form.
+
+```
+python -P -m cascade.laned.cli elastic env-template --path /etc/cascade-laned-pool-d.env
+python -P -m cascade.laned.cli elastic quote --role pool-d-builder
+python -P -m cascade.laned.cli elastic cycle --role pool-d-builder --dry-run
+python -P -m cascade.laned.cli elastic cycle --role pool-d-builder        # one build; the timer runs this
+python -P -m cascade.laned.cli elastic down  --role pool-d-builder
+
+python -P -m cascade.laned.cli elastic quote --role lane-d-eval-host --entries 5 --cohort B
+python -P -m cascade.laned.cli elastic up    --role lane-d-eval-host --entries 5 --cohort B
+python -P -m cascade.laned.cli elastic bootstrap --role lane-d-eval-host
+python -P -m cascade.laned.cli elastic run   --role lane-d-eval-host --block-hash H --king K \
+    --house HOUSE --entry-id E1 --entry-id E2 --out shards.json
+python -P -m cascade.laned.cli elastic down  --role lane-d-eval-host --cohort-done
+```
+
+Exit codes: 3 `no_capacity`, 4 `price_cap`, 5 `monthly_cap`, 6 `gpu_refused`,
+7 `cohort_open`, 8 `not_qualified`, 9 `state_conflict`, 10 `step_failed`,
+11 `teardown_unverified`, 12 `host_mismatch` (tests/accept/r13/README.md).
