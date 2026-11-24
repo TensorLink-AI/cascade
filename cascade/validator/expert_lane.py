@@ -239,7 +239,12 @@ def judge_entry(entry: ExpertEntry, *, manifest: ExpertManifest, king_pointer: s
     )
     v = tv.verdicts[declared[0]]
     won = tv.won
-    reason = (f"won {won}" if won else (tv.guard_reason or "no target won"))
+    if len(declared) == 1 and won == [declared[0]]:
+        reason = v.reason                    # a single target won alone: "merge", as before
+    elif len(declared) == 1 and not won:
+        reason = v.reason                    # the single target's own refusal
+    else:
+        reason = f"won {won}" if won else (tv.guard_reason or "no target won")
     return ExpertJudgement(entry, bool(won), "verdict", reason, v, king_pointer=king_pointer,
                            targets=tv)
 
