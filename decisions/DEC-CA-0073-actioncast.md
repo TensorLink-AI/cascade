@@ -9,9 +9,14 @@ revisit_when: "the owner settles Q1–Q10; or a scenario cannot supply enough fo
 relations: {depends_on: [DEC-CA-0056, DEC-CA-0064, DEC-CA-0063], relates_to: [DEC-CA-0015, DEC-CA-0053, DEC-CA-0069]}
 ---
 
-**Naming (owner):** the Cast set. Fine-tunes are named per vertical
-(MarketCast, EnergyCast, InventoryCast, …). ActionCast is the competition
-for the software that uses them.
+**Naming (owner, 2026-11-24):** the Cast set.
+
+* **Models are `<Vertical>Cast`:** MarketCast, EnergyCast, InventoryCast,
+  and so on, one fine-tune competition per vertical.
+* **Software is always ActionCast.** There is one software competition, and
+  every vertical joins it as an `act:<scenario>` target. A new vertical adds
+  a `<Vertical>Cast` and an ActionCast scenario, never a new software
+  competition.
 
 **Design:** [docs/ACTIONCAST.md](../docs/ACTIONCAST.md) has the system
 diagram, the lifecycle, the kit, the scenarios, the scoring, the

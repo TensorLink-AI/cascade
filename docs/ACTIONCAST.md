@@ -25,6 +25,10 @@ software that uses it):
 | inventory | **InventoryCast** (to build) | `inv:` | `act:inventory` |
 | next vertical | **<Vertical>Cast** | `<abc>:` | `act:<scenario>` |
 
+The rule (owner): **models are `<Vertical>Cast`; software is always
+ActionCast.** A new vertical never gets its own software competition. It
+gets a `<Vertical>Cast` fine-tune and an `act:` scenario on the shared kit.
+
 ## Contents
 
 1. [Why](#1-why)
