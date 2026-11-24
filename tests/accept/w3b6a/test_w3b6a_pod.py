@@ -186,3 +186,33 @@ def test_bench_sweep_module_is_torch_free_at_import():
                           capture_output=True, text=True, timeout=300,
                           env={**os.environ, "PYTHONPATH": str(h.REPO)})
     assert proc.returncode == 0, proc.stderr[-2000:] or "torch imported at module import"
+
+
+def test_each_entry_is_leased_from_fetch_through_materialise(tmp_path, monkeypatch):
+    """W15 shared-root lease: while ``serve_sweep`` copies an entry into its
+    sidecar dir, the entry is under a live lease (no process sharing the cache
+    root may evict it mid-copy); the lease is released once the copy is made,
+    also when the copy fails."""
+    m = h.sweep_mod()
+    a, b = h.Entry(6), h.Entry(7)
+    cache = h.cache(tmp_path, a, b)
+    assert hasattr(cache, "leased"), "W15: PrefetchCache.leased() lists the live leases"
+    real, seen = m.materialise, []
+
+    def spy(entry, work_dir, *, digest, context):
+        seen.append((digest, cache.leased()))
+        return real(entry, work_dir, digest=digest, context=context)
+
+    monkeypatch.setattr(m, "materialise", spy)
+    sidecar = h.Sidecar({a.digest: h.report_for(6), b.digest: h.report_for(7)})
+    _serve(tmp_path, h.request([a.digest, b.digest]), cache, sidecar)
+    assert seen == [(a.digest, frozenset({a.digest})), (b.digest, frozenset({b.digest}))]
+    assert cache.leased() == frozenset(), "the leases are released after the copy"
+
+    def broken(entry, work_dir, *, digest, context):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(m, "materialise", broken)
+    with pytest.raises(m.LaneDBenchSweepError):
+        _serve(tmp_path, h.request([a.digest]), cache, sidecar)
+    assert cache.leased() == frozenset()

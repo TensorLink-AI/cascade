@@ -140,26 +140,31 @@ def serve_sweep(request, *, cache, work_dir, contract=None, expect=None,
     """Answer one :data:`REQUEST_SCHEMA` request (see the module docstring).
     ``ValueError`` on a malformed request; :class:`LaneDBenchSweepError` when
     the sweep cannot run here."""
-    from .lane_d_forecasts import LaneDForecastError, _checkpoint
+    from .lane_d_forecasts import LaneDForecastError, _checkpoint, _scoring_lease
 
     digests, suites, contexts, grants = _checked(request)
     names = _gate_keys()
     rows: dict[str, dict] = {}
     dirs: list[tuple[str, Path]] = []
     for dg in digests:
-        try:
-            entry = _checkpoint(cache, dg, grants[dg], contract=contract, expect=expect)
-        except LaneDForecastError as e:
-            if e.code != "checkpoint_refused":
-                raise LaneDBenchSweepError("checkpoint_unavailable", f"{dg[:16]}: {e}") from e
-            log.warning("lane_d_bench_refused digest=%s detail=%s", dg[:16], e)
-            rows[dg] = _error_rows(suites)
-            continue
-        try:
-            dirs.append((dg, materialise(entry, work_dir, digest=dg, context=contexts[dg])))
-        except (OSError, ValueError) as e:
-            raise LaneDBenchSweepError("checkpoint_unavailable",
-                                       f"{dg[:16]}: cannot materialise ({e})") from e
+        # W15 lease: no process sharing the cache root evicts the entry between
+        # the fetch and the end of the copy into work_dir (the sidecar then
+        # reads only the copy).
+        with _scoring_lease(cache, dg):
+            try:
+                entry = _checkpoint(cache, dg, grants[dg], contract=contract, expect=expect)
+            except LaneDForecastError as e:
+                if e.code != "checkpoint_refused":
+                    raise LaneDBenchSweepError("checkpoint_unavailable",
+                                               f"{dg[:16]}: {e}") from e
+                log.warning("lane_d_bench_refused digest=%s detail=%s", dg[:16], e)
+                rows[dg] = _error_rows(suites)
+                continue
+            try:
+                dirs.append((dg, materialise(entry, work_dir, digest=dg, context=contexts[dg])))
+            except (OSError, ValueError) as e:
+                raise LaneDBenchSweepError("checkpoint_unavailable",
+                                           f"{dg[:16]}: cannot materialise ({e})") from e
     if dirs:
         run = _default_sidecar() if sidecar is None else sidecar
         reports = list(run([d for _, d in dirs], tuple(names[s] for s in suites)))
