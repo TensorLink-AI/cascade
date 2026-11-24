@@ -293,7 +293,7 @@ def apply_judgements(state: LaneBState, judgements: list[ExpertJudgement], *, ro
                       rebased_pointer=j.entry.rebased_pointer, king_pointer=j.king_pointer,
                       selection={str(k): list(v) for k, v in j.entry.selection.items()},
                       **({"commit_block": j.entry.commit_block, "targets": j.entry.declared,
-                          "qualified_block": int(settle_block)} if qualify_only else {})
+                          "qualified_block": int(settle_block)} if qualify_only else {}),
                       **({"curve": str(curve)} if curve else {}),
                       ).with_full_pay(full_pay(float(v.target_lcb), tiers))
         if qualify_only:

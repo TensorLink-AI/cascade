@@ -122,7 +122,9 @@ def test_w_ov_lane_share_the_carve_would_clamp_is_refused():
 def test_w_ov_lane_c_eval_data_is_overlay_settable():
     """Owner 2026-11-24: lane C's data (assets, timeframes, suite weights,
     grid density) changes by overlay; the model pins, the suite list, data
-    sources, pool and embargo stay release-only."""
+    sources and pool stay release-only. (DEC-CA-0075, owner 2026-11-24,
+    tests-correction: the embargo is overlay-settable because each leg's
+    dispatch-time embargo is recorded and used — tests/accept/w_cmp.)"""
     from cascade.shared import netconfig as nc
     from cascade.shared import netconfig_bounds as nb
 
@@ -136,7 +138,7 @@ def test_w_ov_lane_c_eval_data_is_overlay_settable():
     assert out.marketcast.windows_per_cell == 96
     assert "JUP" not in out.marketcast.assets_map["crypto"]
     assert "JUP" in base.marketcast.assets_map["crypto"]
-    for key in ("embargo_days", "suites", "data_sources", "pool_prefix", "base_ref"):
+    for key in ("suites", "data_sources", "pool_prefix", "base_ref"):
         try:
             nc.check_overrides({"marketcast": {key: base.raw["marketcast"][key]}})
         except nc.NetConfigError:
