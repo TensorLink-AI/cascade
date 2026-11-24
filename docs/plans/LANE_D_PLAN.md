@@ -1,10 +1,438 @@
 # Plan: lane D "open weights" (anything goes on our architecture), with lane E and lane A flexibility — v3
 
-Status: **PLAN v3, ~~rev6.12~~ ~~rev6.14~~ ~~rev6.15~~ rev6.16 (proposed 2026-11-22; ~~rev6.12~~ ~~rev6.14~~ ~~rev6.15~~ rev6.16 2026-11-23)**: v2's design, made buildable by an
+Status: **PLAN v3, ~~rev6.12~~ ~~rev6.14~~ ~~rev6.15~~ ~~rev6.16~~ ~~rev6.17~~ rev6.18 (proposed 2026-11-22; ~~rev6.12~~ ~~rev6.14~~ ~~rev6.15~~ ~~rev6.16~~ ~~rev6.17~~ rev6.18 2026-11-23)**: v2's design, made buildable by an
 autonomous loop. A work package is done **only when its Accept command exits
 0**; **(rev6)** its level is only what `scripts/laned/status` computes (§17),
 never a claim. Owner decisions are marked **[DECIDE]**. Nothing is armed. **No calendar
 dates**: stages are gated (§5).
+
+## rev6.18 (owner 2026-11-23; main @ 78b1d45): eval v2 (live 50% + public 50%), multivariate, one checker, burn scoping, GPU environments
+
+One owner brief (2026-11-23, "now also do this"), Parts A and B, and the
+owner's answers to its four open items (B12, B9 owner keys, A3 clamp, A5
+BOOM; (owner 2026-11-23, DECIDED: "they're all reasonable")). Plan text
+only. Every changed item elsewhere is marked **(rev6.18)**; superseded text is
+struck, not deleted. Under the rev6.17 rule this is the ONE plan PR for the
+batch; the code lands as the feature PRs in **rev6.18 (F)** below, tests and
+code together.
+
+**Owner decisions (final, verbatim list; not reopened by this rev).**
+
+- Miners may submit any context up to 128k.
+- Entries are scored as soon as possible, first come first served.
+- Live targets are the 48 h embargo data plus the data after submission.
+- No confirmation duel. Crown at the first verdict.
+- No false-win test. Do not add one or gate the release on one.
+- No shadow modes. Everything goes live at one block.
+- Lane D may be scored on any GPU, including RTX PRO 6000 Blackwell.
+- A challenger must IMPROVE on public pretrain data as well as live data.
+- The score is 50% live, 50% public.
+- GiftEvalPretrain and RMISC count together as one public half.
+- Public data is sampled from the whole dataset, not a fixed subset.
+- RMISC is scored as multivariate.
+- ~~The slow-cadence backtest windows stay, at 5%.~~ **Superseded (owner 2026-11-24, DECIDED): the slow-cadence backtest windows (W5i) are DROPPED; the public half replaces them** (rev6.18 (D24) below).
+- The low-frequency check A10 is removed.
+- The coldkey caps stay as built. No entry fee at launch.
+- Disputes and wrong crowns: the owner decides; pay already sent stands.
+
+### rev6.18 (D24) Backtest windows dropped (owner 2026-11-24, DECIDED)
+
+The slow-cadence backtest windows (W5i) are dropped; the public half
+(GiftEvalPretrain + RMISC) replaces them. This supersedes the brief's
+"backtest stays at 5%" decision and its A7 keep line, rev6.9 (a) (the
+backtest part of it) and rev6.15 (b) (backtest ON at launch). Concretely:
+
+- **Live half = forward windows only** (fresh + 48 h embargo top-up, the W5j
+  forward cells and the W2e embargo rule, unchanged). No backtest cell is
+  built, drawn or scored; slow cadences enter the live half only as
+  forward windows that pass W5a.
+- **W5i is not built; it is retired** (row struck below).
+- **`[lane_d] backtest_weight_cap` and `backtest_ratio_floor`** (W2e, on main,
+  default 0.05 / 0.85) are **deleted in F4**: the loader drops their parse
+  and the `1 − floor**cap < d_margin` inequality check, and lists both in
+  `RETIRED_KEYS["lane_d"]` so a deployed file that still carries them
+  loads; their `chain.toml` lines go. The audit's two-part
+  `combined_log_ratio` (`cascade/audit/lane_d.py:841-850`) and the report's
+  forward/backtest sub-score split go with them.
+- **`public_weight` stays at 0.50** (overlay-settable, unchanged), so the
+  score is 50% live (forward) + 50% public.
+
+### rev6.18 (V) Verification against main @ 78b1d45
+
+The brief's references were read at 1605ff7. Each was re-read on 78b1d45.
+"STOP" means the item is not specified further here and needs the owner.
+
+| Item | Reference | Matches main? |
+|---|---|---|
+| B1 | `cascade/audit/checks.py:2958-2961` (`_lane_d_court` returns `(None, "lane_d_report_unverified: …")` when `check_lane_d` is not PASS) | yes (same lines). The caller `derive_weights` (`checks.py:3784-3786`) returns `(None, why)` for the WHOLE vector |
+| B1 | `cascade/validator/satellite.py` burns the whole vector on any failure | yes: `replay_receipt` → `_fail("weights-derive", …)` (`satellite.py:374-376`) and `desired()` returns `burn_vec` (`:629-647`), module docstring `:38-41` |
+| B2 | `cascade/satellite/lane_d_replay.py` imported only by tests | yes, still: importers are `tests/accept/{w3b6b,w5e,w7d,w8b}/…` and the package docstring `cascade/satellite/__init__.py`. W3b6b **extended** it (now **1,885** lines, not 1,701) but added no production importer. The running satellite verifies only through `audit_receipt` → `check_lane_d` |
+| B3 | refusal codes | `check_lane_d` (`cascade/audit/lane_d.py:1205-1340`) returns one name (`NAME`) with free-text detail: there are **no per-check codes** today, only `LANE_D_WEIGHT_ERRORS` (`checks.py:2874-2876`). The code table below is new |
+| B4 | `cascade/shared/config/lane_d.py:59`, `:255`; `chain.toml` `[lane_d] forward_margin_hours = 6.0` (`:1653`); no `eval_delay_hours` in `cascade/` | yes, all. **In flight** (rev6.14 build, branch `laned/rev612-rev614`); not duplicated here |
+| B5 | plan §1.6 `:2703`, D11 `:3448` and `:4565` | yes (same lines). Also `:3577-3581` (S8 host text), `:4193` (risk row), `:1292` (rev6.6 (a) open flag) |
+| B7 | `cascade/eval/lane_d_handshake.py:32` | yes: `HANDSHAKE_FIELDS = ("git_head", "package_hash", "schema")`, code identity only |
+| B8 | `ab0b412` | **the SHA is not on origin/main.** Its change landed squashed in `0c52d07a` (#471, with the weight keep-alive and bench evidence). The live validator runs `/root/cascade-v2` @ `5e3fade3` (#394), which has neither. `ab0b412` applies cleanly onto `5e3fade3` (merge-tree, no conflict). Deploy-gate needs: see B8 below |
+| B9 | "52 unmarked keys" | **count does not reproduce.** A flattened-key TOML diff of `/root/cascade/chain.toml` vs `origin/main:chain.toml` gives 36 unmarked deployed-side keys + 12 main-only keys in shared tables = 48 (plus 98 keys of tables the deployed file predates). The two owner keys are present as described. Classification below; `cascade-audit decided` today: 2 TYPE findings, exit 1 |
+| B11 | `lane_d.py:86` and `:100-115` | yes (same lines): `:86` `confirm_on_king_change`; `:100-115` the DEC-CA-0062 keys `targets … win_ttl_eras`. No lane D code reads any of them (every same-named read is on `[marketcast]`, `[lane_b]`, `[lane_c]` or the trainer config). `confirm_on_king_change` is still parsed and validated (`lane_d.py:264-266`) |
+| B12 | readers of `init_baseline_geomean` / `init_floor_passed` | **STOP.** They are read: `cascade/shared/receipt.py:974-978` parses both back from archived receipts (the shadow gate has written them into signed verdict bodies since 2026-08-27, so receipt signature verification and audit replay depend on the parse); `receipt.py:498-501` (drop-when-None body); `cascade/validator/loop.py:583-592` (log); `cascade/eval/koth.py:233,454,594-618` (producer). `receipt.py:266` also carries `init_gate_mode` in the default verdict params. Deleting the gate can't delete these fields. ~~Owner call: keep the receipt fields parse-only (read, never written) and delete only the producer + key, or keep the gate~~ **Resolved (owner 2026-11-23, DECIDED: "they're all reasonable"): parse-only receipt fields, producer + key deleted (B12 below)** |
+| B13 | `dedup_probe_*` ignored by the loader | yes: `[round]` `dedup_probe_mode`, `dedup_probe_series`, `dedup_probe_budget_seconds` are in `RETIRED_KEYS["round"]` (`cascade/shared/config/loader.py:86-97`, tested in `tests/unit/test_config.py`). One reader remains: `cascade/shared/sandbox_policy.py:93` refuses `dedup_probe_series > 0` on a weak sandbox; with the line deleted it reads the default 0, so behaviour is unchanged. Safe to delete (`chain.toml:498-500`) |
+| B14 | plan `:3622`, `:3680` (30 h) | yes. No code implements the alarm yet (no `pool_d_stale` in `cascade/`, `deploy/`, `scripts/`) |
+| A4 | no channel handling in `cascade/eval/lane_d_scorer.py`, `cascade/validator/lane_d.py` | yes: lane D is univariate. `_forward` takes `(B, L)` and lifts it to one variate (`lane_d_scorer.py:301-324`, `[:, None]`); `forecast_quantiles` returns `(n, horizon, 9)`. So F2 (C, L) is the first eval feature |
+| A4 | `decisions/DEC-CA-0041-multivariate-scoring.md` | yes (rule as quoted) |
+| A4 | `chain.toml max_channels = 32` | yes, `[generator] max_channels = 32` (`chain.toml:52`) |
+| A5 | TIME dataset list in `cascade/eval/benchmarks.py` | **moved**: `benchmarks.py` only shells out to the sidecar. The TIME source is `Real-TSF/TIME` @ `83e3d0b3be28d11c7182bffcc1892d19b36c4da1` (`benchmarks/cascade_benchmark/datasets.py:56-59`); the task list is timebench's bundled config (`benchmarks/cascade_benchmark/suites/time_bench.py:93-103`). Note: `Datadog/BOOM` (`datasets.py:52-55`) is also a gate suite and is not in the brief's exclusion list; **added to it (owner 2026-11-23, DECIDED: "they're all reasonable")** |
+
+### rev6.18 Part A: eval v2 (decided spec)
+
+**A1 Sources.** Three sources per settlement, all drawn from the settlement
+block hash:
+
+| Source | Windows | Half |
+|---|---|---|
+| live (the existing W5j per-bin draw; forward windows only — ~~+ W5i backtest cells~~, D24) | ≤ 5000 (`max_windows_per_settlement`) | live |
+| `Salesforce/GiftEvalPretrain` (Apache-2.0; 71 univariate + 17 multivariate datasets) | 5000 | public |
+| `nju-zhangsq/RMISC` (MIT card; allowed folders only, A5) | 5000 | public |
+
+GiftEvalPretrain + RMISC are one **public half** of 10000 windows.
+
+**A2 Public draw.** Pure function of (block hash, index hash, config):
+
+- one window per series, cut point uniform inside the series' valid range
+  (history ≥ the scored context's minimum, target = `horizon` points);
+- cells = (dataset family, frequency); equal share per cell; a scarce cell is
+  taken whole and its surplus re-split over the rest (the W5j rule, same code
+  path);
+- families merge year-split folders: `cmip6_*`, `era5_*`, `largest_*` are
+  one family each (63 of ~150 GiftEvalPretrain folders are climate);
+- a small RMISC folder with few long series gets several windows per series
+  at distinct cut points (non-overlapping targets), until its cell share is
+  met or the series run out;
+- the same window list for KING_D, the house and every challenger.
+
+**A3 Winning rule.**
+
+- **(D24)** `L_live` = the mean per-window log-ratio over the forward
+  windows (fresh + embargo). ~~`L_live` = the W5i combined log-ratio over forward + backtest windows
+  (`backtest_weight_cap = 0.05`, `backtest_ratio_floor`, unchanged; loader rule
+  `1 − floor**cap < d_margin` unchanged).~~
+- `L_pub` = mean per-window log-ratio over the public windows.
+- **Per-window clamp:** every per-window ratio (live forward, ~~backtest,~~ public)
+  is clamped to `[window_ratio_floor, 1 / window_ratio_floor]` before it
+  enters a half. New key `[lane_d] window_ratio_floor`, overlay-settable,
+  default **0.5**: each window's ratio is clamped to **[0.5, 2]** (one window
+  can at most halve or double its contribution) (owner 2026-11-23, DECIDED: "they're all reasonable").
+  Loader: `0 < window_ratio_floor < 1`.
+- `L = (1 − w) · L_live + w · L_pub`, `w = [lane_d] public_weight`.
+- **`public_weight`**: new `[lane_d]` key, **overlay-settable, default
+  0.50**, range `[0, 1)`. It is **not** subject to the `backtest_weight_cap`
+  loader rule ~~(that rule stays as is for the backtest cap)~~ **(D24: that rule and key are deleted in F4)**. `w = 0` turns the
+  public half off (not drawn; its point-gain condition not applied).
+- Crown iff **all** of: (1) the combined LCB on `L` (one max-T paired cluster
+  bootstrap over the cohort, same `alpha`, `bootstrap_B`) ≥ `d_margin`;
+  (2) point gain > 0 on the live half; (3) point gain > 0 on the public half
+  (when `w > 0`); then (4) the existing §1.3b benchmark gate, unchanged.
+- **Bootstrap clusters:** live = source (unchanged); public = dataset family
+  (A2). Each bootstrap replicate resamples clusters within each half and
+  recombines with `w`, so both halves enter one max-T LCB ~~(the W5i
+  machinery, extended from two parts to three)~~ **(D24: a two-part
+  live/public combination built in F4; W5i is retired, so there is no
+  backtest part)**.
+- No confirmation duel, no false-win test, no shadow stage: the rule is live
+  at the lane D activation block.
+
+**A4 Multivariate** (DEC-CA-0041, applied to lane D for RMISC and the 17
+multivariate GiftEvalPretrain datasets):
+
+- a window is the whole `(C, L)` series, forecast jointly by one model call;
+- per-channel CRPS/MASE, channels averaged (arithmetic) into ONE per-window
+  score; zero-target channels masked from the quantile (CRPS/WQL) half only;
+- a window is one resampling unit; evidence counts clusters (sources /
+  families), never channels;
+- `C ≤ 32` (`[generator] max_channels`); a wider series keeps 32 channels
+  picked by `sha256(block_hash ‖ series_id ‖ "lane_d_channels")`, the same
+  for every model;
+- drop all-empty columns left by RMISC's file merge (before the 32 cap);
+- skip RMISC `KnownOpen` / `KnownOil` duplicate folders;
+- univariate windows (`C = 1`) score bit-identically to today.
+
+**A5 RMISC allowed list.** Start from the RMISC folders whose names are not in
+`Salesforce/GiftEval`, `Salesforce/GiftEvalPretrain`,
+`autogluon/fev_datasets`, `autogluon/chronos_datasets`, the TIME task list
+(`Real-TSF/TIME` @ `83e3d0b`; see (V)), or **`Datadog/BOOM`** (@ `69325b5`, a
+gate suite; (owner 2026-11-23, DECIDED: "they're all reasonable")) — about 71 of 197 by name. Then per
+folder: (1) confirm by **data** comparison (series hashes on sampled
+windows), not names; (2) drop non-forecasting sets (EEG/EMG, activity
+recognition, classification, anomaly); (3) read `meta.json`, drop any licence
+that forbids redistribution. Commit the list as
+`data/lane_d/rmisc_allowed.toml` (folder, reason kept, licence, revision).
+Publish the filtered copy + list as the official training source (19 RMISC
+folders are GIFT-Eval test data). The data comparison in step (1) covers
+BOOM as well as the other four sources and TIME.
+
+**A6 Storage.** Mirror full GiftEvalPretrain and the allowed RMISC folders,
+each at one pinned HF revision, to Hippius and R2 (owner provides bucket and
+keys; size on disk measured from HF metadata before the copy and reported).
+Per dataset an **index**: one row per series (family, frequency, length,
+channel count, file, row/offset). Each settlement draws from the index and
+reads only the drawn series. The signed report carries `public.index_sha256`,
+`public.files_sha256` (the file list) and `public.revisions`.
+
+**A7 Removals and keeps.** ~~W5i backtest windows stay as built.~~ **(D24) W5i
+backtest windows are dropped (not built); `backtest_weight_cap` /
+`backtest_ratio_floor` are deleted in F4.** **A10 / W3b5
+is removed** from code (`cascade/validator/lane_d_lowfreq.py`, its call in
+`validator/lane_d.py`), the report schema (`lowfreq` verdict block,
+`lowfreq_regression` reason; a new schema minor, see F4), the audit
+(`audit/lane_d.py` `_lowfreq_problem`), config (`[lane_d] lowfreq_freqs`,
+`tau_public` stays only if the §1.3b gate uses it — it does) and the plan
+(rows struck below).
+
+**A8 Reporting.** Every entry's report row carries: combined point and LCB;
+per half (live, public) point gain; per source (live, GiftEvalPretrain,
+RMISC) point gain; per domain (family) point gain and window count.
+
+**A9 Timing (before launch).** 15000 windows × 10 models on the scoring GPU
+must fit in ≤ ½ settlement (≤ 1.5 h at 900 blocks). Owner approves the pod,
+cost cap **$40**. Evidence file `evidence/lane_d_a9_timing.json`.
+
+### rev6.18 Part B (design text)
+
+**B1 Burn scoping.** A failed lane D check burns **only lane D's share**.
+`derive_weights` builds lanes A, B, C as today and, when `_lane_d_court`
+returns a BURN code, substitutes a lane-D-burn part (lane D's share →
+`burn_uid`) instead of returning `None`. The satellite then replays a vector
+whose A/B/C parts are unchanged. Done: a deliberately broken lane D report
+on a satellite leaves lane A, B and C weights unchanged (test).
+
+**B2 One checker.** The lane D checker for outside validators is
+**`cascade.audit.lane_d.check_lane_d`**, reached by the satellite through
+`audit_receipt` → `_lane_d_court`. `cascade/satellite/lane_d_replay.py`
+(1,885 lines) and its tests are deleted (`tests/accept/w7d/*`, the
+`lane_d_replay` helpers in `tests/accept/{w3b6b,w5e,w8b}`; the W3b6b
+re-derivation of bench rows moves into `check_lane_d` first if not already
+there — F1 checks). W7d's row becomes "satellite = audit checker".
+Invariant 12 stays (the audit never imports producer code).
+
+**B3 Refusal codes.** Only four checks stop pay (BURN, lane D share only):
+report signature; config echo = `config_at(boundary)`; scores reproduce the
+named winner (`rows_sha256` and bootstrap); weights match the paid court.
+Everything else logs, alerts (`cascade-ops`), and keeps paying the signed
+court. `check_lane_d` returns a code per check (`code: detail`), and the
+audit row keeps the code.
+
+| Code | Check | Class |
+|---|---|---|
+| `lane_d_record_missing` | lane D pays but no record | burn |
+| `lane_d_record_malformed` | record not `{report, receipt}` | burn |
+| `lane_d_boundary_mismatch` | report/record boundary ≠ settlement | burn (signature binding) |
+| `lane_d_report_mismatch` | receipt binds another report body | burn (signature binding) |
+| `ld_schema` | unknown report schema | burn |
+| `ld_signature` | report signature | **burn** |
+| `ld_not_armed` / `lane_d_not_armed` | config says lane D does not judge this boundary | burn (config echo) |
+| `ld_params` | stated params ≠ `config_at(boundary)` | **burn** |
+| `ld_pay_share` | `pay.share` ≠ config | burn (config echo) |
+| `ld_seed` | bootstrap seed ≠ `lane-d/1:{boundary}:{pool}` | burn (reproduce) |
+| `ld_rows_sha256` | rows ≠ `rows_sha256` | **burn** |
+| `ld_rows_count` / `ld_rows_duplicate` | row set ≠ cohorts | burn (reproduce) |
+| `ld_cohort` | verdict / LCB / sub-scores don't re-derive from rows | burn (reproduce) |
+| `ld_crown` | crowned ≠ re-derived winner (incl. house retake) | **burn** |
+| `ld_court` | court ≠ KING_D first / too many slots / house as prior | **burn** |
+| `lane_d_carve_unsupported` | lane D share can't be carved | burn (weights) |
+| `ld_malformed` | report unreadable (`KeyError`/`TypeError`/`ValueError`) | burn (cannot reproduce) |
+| `ld_scoring_method` | not `quantile_head` | alert |
+| `ld_sentinel` | era sentinel pin | alert |
+| `ld_row_order` | row order | alert |
+| `ld_clock` | both-clock eligibility | alert |
+| `ld_embargo` | embargo / draw rules | alert |
+| `ld_draw` | window draw re-derivation (live and public) | alert |
+| `ld_judged_set` | coldkey caps, queue, registration | alert |
+| `ld_chain` | `held_from` provenance in prior reports | alert |
+| `ld_snapshot` | snapshot / pool files | alert |
+| `ld_public_index` | public index / file list / revision hash (A6) | alert |
+| `ld_bench` | §1.3b gate rows (W3b6b) | alert |
+| (WARN) verifier unavailable | sr25519 verifier missing | transient (retry; neither) |
+
+Tests: one burn case (`ld_rows_sha256`: lane D burns, A/B/C unchanged) and
+one alert case (`ld_clock`: alert row, pay unchanged).
+
+**B4 Timing keys.** In flight (rev6.14 build, `laned/rev612-rev614`):
+`eval_delay_hours = 6`, `forward_margin_hours` default 0, `chain.toml` line
+deleted, `boundary_ts` from chain `Timestamp`, fail closed. Not repeated.
+
+**B5 Qualified scoring environments.** §1.6 / D11's "pinned torch 2.4.1 only,
+not Blackwell" is replaced by a list `deploy/laned/scoring_envs.toml`: each
+entry = `name`, lock file + sha256 (a separate scoring venv lock; the lane A
+`uv.lock` / `torch==2.4.1+cu124` contract is untouched), torch build, CUDA,
+allowed GPU models, driver floor. Launch list: `cu124-torch241` (the release
+venv) and one sm_120 environment for RTX PRO 6000 Blackwell (the bench
+sidecar's torch line). **Qualifying a new environment:** (1) PR adding the
+entry; (2) on that GPU run the W0b context-equivalence test and a golden set
+(500 live + 500 public windows, 3 models) against `cu124-torch241`: per-window
+score relative difference ≤ 1e-3 and identical crown decisions on a replayed
+cohort; (3) A9 timing passes; (4) evidence `evidence/lane_d_env_<name>.json`
+committed; owner merges. Lane D scores are only compared within one cohort
+on one machine (B6), so cross-environment bit-identity is not required;
+satellites re-derive from signed rows, not by re-forecasting.
+
+**B6 Same machine, same run.** Every model in a cohort (entries, KING_D,
+house) is forecast on one host in one run. The score-cache key becomes
+`(digest, context, window_id, host_identity)`, `host_identity =
+sha256(env name ‖ GPU model ‖ driver ‖ torch build)`; a host change forces a
+re-score of the cohort.
+
+**B7 Report host fields.** The signed report carries `host.{gpu_model,
+driver, torch_build, env}`; the handshake (`lane_d_handshake.py`) adds
+`env` + `torch_build` to `HANDSHAKE_FIELDS` and refuses an environment not in
+B5's list.
+
+**B8 Ship the rate-limit emission fix alone.** Content = `ab0b412` (one hunk
+in `cascade/validator/weights.py` + one test). Receipt-only: the vector,
+ladder state and satellite derivation are unchanged; not a consensus change.
+`scripts/deploy_gate.py check` as written refuses it twice: (1)
+`provenance` — `ab0b412` is not an ancestor of origin/main (its squash is
+`0c52d07a`); (2) `consensus` — `cascade/validator/weights.py` matches
+`CONSENSUS` and the diff has no `*_from_block` key; the consensus rule can't
+be acked. To accept it the gate needs one of: (a) a hotfix provenance rule —
+a `release/*` revision whose every commit is `git patch-id`-equal to a
+commit on origin/main (here `ab0b412` ≙ the weights hunk of `0c52d07a`); and
+(b) a `--receipt-only` class for consensus-path diffs that is refused unless
+the CI receipt-replay job is green on that revision, recorded in the gate
+output. Alternatively the owner deploys main (≥ `0c52d07a`), which brings
+507 commits and is not "on its own". Owner deploys; gate change is optional
+work (not in this batch).
+
+**B9 Config clean-up (S0a).** Classes for the 48 measured keys (V):
+
+| Class | Keys | Action |
+|---|---|---|
+| operator-only (box money/ops; never read by other validators) | `eval.calib_num_samples`, `eval.calib_windows`, `generation.exclude_offers`, `round.funded_host_blocklist`, `round.operator_balance_reserve_usd`, `round.operator_daily_spend_cap_usd`, `round.operator_inventory_host_files`, `round.operator_lanes_operator_billed_only`, `round.operator_max_price_per_hour`, `round.operator_standing_pods_usd_per_hour.{valeval-blackwell2,valpriv-4090}`, `round.ops_continuation_{image_digest,interval_seconds,max_bytes}`, `round.payer_projected_rate_per_hour`, `round.progress_first_step_seconds`, `round.receipt_watch_validator_hotkey`, `round.funded_max_leg_cost_usd`, `round.funded_ready_timeout_seconds` (19) | mark in the deployed file (dedrift `operator` marker); main unchanged |
+| main ← deployed (measured live values) | `round.funded_sku_wall_seconds.{8xH100,8xH200}`, `round.funded_sku_wall_measured_image` (3) | type into main with their evidence (#532 pattern) |
+| release lag (main ahead; deployed takes them at its next release) | `lane_c.from_block`, `lane_c.targets`, `marketcast.{from_block,suites,coarse_history_days,eval_context_length,max_synthetic_fraction,snapshot_days}`, `v2.commit_from_block`, `scoring.crowning_anchor_from_block`, `v2.{funded_pod_image_after,funded_sku_wall_measured_image_after,image_after_unqualified_override,prior_train_image_digests,sentinel_from_block,sentinel_ratchet,sentinel_suites,sentinel_tau,train_image_digest_after,worker_code_fingerprint_after}` (20) | none in main. Note: main arms `[marketcast]`/`[lane_c] from_block = 9579600`; the deployed file has 0 |
+| decided votes to type (`cascade-audit decided` findings) | `v2.prelaunch_burn_from_block = 9486900`, `v2.image_decoupled_from_block = 9493200` (2; deployed 0) | owner types both into the deployed file at its next quiet restart ⇒ `decided` exits 0 |
+| owner keys, **decided: add to main at live values** (owner 2026-11-23, DECIDED: "they're all reasonable") | `training.budget_denomination_after(_block)`, `static_guard.packed_sources(_from_block)` (2 + 2 gates) | F6 types `[training] budget_denomination_after = "points+mv20"`, `budget_denomination_after_block = 9165600` and `[static_guard] packed_sources = "reject"`, `packed_sources_from_block = 9169200` into main's `chain.toml` |
+
+The 10 already-marked drifted keys stay with #532 (R6x). Done when
+`cascade-audit decided --config <deployed>` exits 0.
+
+*Owner keys (live values). **Decided (owner 2026-11-23, DECIDED: "they're all reasonable"): both are added to main at their live values (the "Add to main" branch of each bullet below).***
+
+- `[training] budget_denomination_after = "points+mv20"`, `_block = 9165600`.
+  The DEC-CA-0047 scheduled budget switch of the **v1** contract
+  (`TrainingContractConfig.at_block`). v2 is live from 9399600 and
+  `at_block` returns the v2 contract there (the loader refuses a schedule
+  inside `[v2.training]`, `loader.py:324`), so the key only shapes eras
+  [9165600, 9399600). **Add to main:** audit/replay of those v1 rounds
+  computes the contract they trained under. **Leave out of main (delete from
+  deployed):** a validator on main re-derives those rounds' contract as
+  `series_points`, so their contract digests won't match the archived
+  receipts; live rounds are unaffected.
+- `[static_guard] packed_sources = "reject"`, `_from_block = 9169200`.
+  Live: miner source packed in string constants is refused at admission
+  (`trainer/rolling.py:2739`). Main's default is `"scan"` (unpack and
+  inspect). **Add to main:** every validator/trainer on main keeps
+  rejecting; the release matches live. **Leave out of main:** the next
+  deploy relaxes the static guard to `scan` (CLAUDE.md treats relaxing
+  `[static_guard]` as Blocked-tier), and admission outcomes for packed
+  submissions change.
+
+**B10 Overlay proof (S0c).** One overlay that restates current values,
+testnet then mainnet. Owner publishes. No code.
+
+**B11 Legacy lane D keys.** Delete `confirm_on_king_change`
+(`lane_d.py:86`, parse `:264-266`, `:336`) and the DEC-CA-0062 block
+(`lane_d.py:100-115`) with their `chain.toml` `[lane_d]` lines
+(`confirm_on_king_change` and `targets … gain_margin`). The loader then
+**ignores** them (listed in `RETIRED_KEYS["lane_d"]` so a deployed file still
+loads).
+
+**B12 Init gate.** ~~**STOPPED** (see V): the receipt fields are read. Not
+specified further until the owner picks.~~ **Decided (owner 2026-11-23, DECIDED: "they're all reasonable").** Delete the
+init gate: `[scoring] init_gate_mode` / `init_gate_tolerance` (config,
+loader parse, `chain_config.py:209-223` pass-through, `chain.toml:910-911`),
+the producer in `cascade/eval/koth.py` (`KothParams.init_gate_mode`, the floor
+computation and both `enforce` branches, `:233`, `:454`, `:594-618`) and the
+log in `cascade/validator/loop.py:583-592`. **Keep** `cascade/shared/receipt.py`
+parsing `init_baseline_geomean` / `init_floor_passed` (`:350-351`, `:453-455`,
+`:498-501`, `:974-978`): read and re-serialised drop-when-None, never
+written again, so every archived receipt still verifies. The `[round]
+init_gate_mode` retired key (`loader.py:91`) is unchanged. This is lane A
+consensus config: it ships in a **release with an activation block**
+(DEC-CA-0045 typed `*_from_block`; before the block the gate runs as today in
+shadow, from it the producer stops), never as a hand edit. Test: an archived
+shadow-era receipt with both fields round-trips byte-identically and its
+signature verifies.
+
+**B13 Dedup probe lines.** Delete `chain.toml:498-500`
+(`dedup_probe_mode`, `dedup_probe_series`, `dedup_probe_budget_seconds`).
+Loader behaviour unchanged (V). The `RETIRED_KEYS` entries stay.
+
+**B14 Stale pool alarm.** ~~30 h~~ **6 h** (`pool_d` builds every 3 h, so
+6 h = two missed builds). Lines struck below.
+
+**B15 Miner status context.** `status/lane_d.json` (W17) and `cascade
+lane-d status` (W10) show, per entry, `declared_context` and
+`scored_context` (from the signed report's per-entry effective context;
+`null` + `context_below_armed` when skipped, rev6.15).
+
+**B16 Disputes and wrong crowns.** The owner decides every dispute and every
+claimed wrong crown; there is no automatic reversal and no appeal process.
+Pay already sent stands: nothing is clawed back and no past weight vector is
+re-set. A reversal is prospective only:
+
+- the owner publishes a signed overlay (or a release note for a code fault)
+  naming the reversed crown and the boundary it takes effect from;
+- the next lane D report states `reversal: {reversed_digest, from_boundary,
+  reason, overlay_sha256}`; its `king_before` is the reversed king and its
+  `king_after` is the king the owner restores (the previous KING_D or the
+  house);
+- `lane_d_state.json` gets the restored king and a reversal entry; earlier
+  posterior digests are untouched, so the state chain and every archived
+  report still verify;
+- the reversed digest drops out of the court from that boundary; no other
+  entry's status is changed retroactively.
+
+**B17 (deferred).** After Part A and B1–B7 land: a short current-rules spec
+and the rev history moved to a changelog. Separate PR.
+
+### rev6.18 (F) Feature build list
+
+One PR per feature, tests and code together (rev6.17 rule). WP labels name
+the rows each PR touches.
+
+| # | Feature | Items | WPs touched | Depends |
+|---|---|---|---|---|
+| F1 | Burn scoping + one checker + refusal codes | B1, B2, B3 | W9 (`audit/lane_d.py` codes, `checks.py` `_lane_d_court`/`derive_weights`), W7d (deleted; satellite = audit), W8b (satellite path), W11 (alert patterns) | — (first: it removes the second checker before F2–F5 would change two) |
+| F2 | (C, L) multivariate lane D scoring | A4 | W5d (scorer `(B, C, L)`, channel pick, empty-column drop), W5e (per-window collapse), W7a (per-window `n_channels`, `channels_sha256`), W9 | F1 |
+| F3 | Public sources: allowed list, index, draw, mirror tooling | A1, A2, A5, A6 (code); data ops = owner | new W5k (public draw), new W6p (index builder + mirror script, read-only on HF until owner keys), W7a (`public.*` hashes), W9 (`ld_draw`, `ld_public_index`) | F2 |
+| F4 | Combined winning rule (live forward + public) + per-half reporting + A10 removal + backtest removal (D24) | A3, A7, A8, D24 | W2e (add `public_weight`, `window_ratio_floor`; **delete** `backtest_weight_cap`, `backtest_ratio_floor` and the loader inequality, both keys to `RETIRED_KEYS["lane_d"]`, `chain.toml` lines out), W5i (retired, not built), W5j (forward cells only), W5e (two-part live/public max-T LCB), W3b5 (removed), W7a (schema minor: per-half/source/domain fields; `lowfreq` and the forward/backtest sub-score split dropped), W9 (`combined_log_ratio` removed; re-derives the new rule), W12a, W17 | F3, F1 |
+| F5 | GPU environments + handshake + cache key | B5, B6, B7 | W4 (handshake fields), W15 (cache key), W7a (`host.*`), W6-S8 / T7 (env list), D11 | — (parallel with F2) |
+| F6 | Config cleanup + init-gate removal | B9 (main-side typing incl. both owner keys), B11, B12, B13 | W2, `chain.toml`, R6x / #532, `koth.py`, `loop.py`, `scoring.py`/`loader.py` (B12 is lane A consensus: release + activation block) | — |
+| F7 | Miner status context | B15 | W17, W10, W12b | rev6.15 W7a/W8c landed |
+| F8 | A9 timing harness + evidence | A9 | T7, W1 (`scripts/laned_a9_time.py`) | F4, F5; owner pod |
+
+Not in the list: B4 (in flight), B8 (owner deploy; gate change optional),
+B10 (owner overlay), B14 and B16 (this plan text), B17 (deferred).
+
+**Owner steps left:** type the two decided votes into the deployed file;
+buckets + keys for A6 and the mirror run (data ops); approve the A9 pod ($40
+cap); deploy B8; publish the B10 overlay (testnet, then mainnet); pick the B12
+activation block when the F6 release is cut. (Resolved (owner 2026-11-23, DECIDED: "they're all reasonable"): B12
+option, both B9 owner keys, A3 clamp 0.5, BOOM in the A5 exclusion set.)
+## rev6.17 (owner 2026-11-23; main @ 78b1d45): one PR per feature; tests+code together; PATHS ride along; one plan PR per batch of decisions
+
+One owner decision about the build loop's PR rules ("stop the PR
+bureaucracy"). The design doesn't change. Changed text is marked
+**(rev6.17)**, and superseded text is struck through, not deleted. The
+tooling is W0c (`scripts/laned/accept` FEATURE rule and LABELLED L2 rule,
+`accept --help`), with its acceptance tests in `tests/accept/w0c/`.
+
+| Item | Decision | Landed in |
+|---|---|---|
+| (a) | **Tests + code together (owner 2026-11-23, DECIDED).** A PR may change a WP's `tests/accept/<wp>/` and its code in one diff. CI still proves the contract: the WP's NEW tests, taken from the PR head, run against the base's code and must fail there for a right reason (a new test that already passes on the base proves nothing and is refused, unless the WP is a declared verification WP); then the full Accept must pass on the head. Tests-only and tests-correction PRs stay available but are no longer required. Deleting or weakening an existing assertion (or dropping a `PATHS` entry) needs the `laned:tests-correction` label. The stub scan, invariant 10 and the protected files (`docs/plans/`, `scripts/laned/` outside W0c, status files) stay | §3.1 rules 1, 6; §3 roles; W0c (`accept --combined`) |
+| (b) | **PATHS ride along (owner 2026-11-23, DECIDED).** A PR may add entries to `tests/accept/<wp>/PATHS` and change those files in the same PR: scope is the base's PATHS plus the added entries; a removed entry still counts from the base | §3.1 rule 1; W0c |
+| (c) | **One PR per feature (owner 2026-11-23, DECIDED).** A PR whose labels are all `laned:<WP>` may carry every WP a feature touches: no 3-WP cap, no disjoint-PATHS or no-dependency refusal, no `coupled_batches` declaration. Every WP still runs its own Accept (or combined run) and CROSS, with one ledger row each. A tests-only batch has no cap and may mix built and unbuilt WPs | §3.1 rules 6, 7; W0c |
+| (d) | **L2 needs the label (orchestrator 2026-11-23, follows (c)).** A squash merge `(#N)` is a WP's L2 commit only if PR N carried `laned:<WP>` and changed at least one non-test path in its PATHS (#817 made W5i read L2 through broad PATHS). A merge that changes the WP's tests is also its L1 when its combined run is green | §17.1 L1, L2; W0c (status) |
+| (e) | **One plan PR per batch of decisions (owner 2026-11-23, DECIDED).** Plan text stays out of WP PRs (`docs/plans/` is protected); the decisions of one owner session land in one plan PR | §17.6 |
 
 ## rev6.16 (owner 2026-11-23; main @ 65bcb4b): partial WB19 evidence
 
@@ -42,7 +470,7 @@ case `(4096, (8192, 16384), 8192, 8192)`).
 | Item | Decision | Landed in |
 |---|---|---|
 | (a) | **Highest armed ≤ declared, else skip (owner 2026-11-23, DECIDED, verbatim choice: "Highest ≤ declared, else skip").** An entry is scored at its declared context when that variant is armed, else at the **highest armed variant below its declared context**. If no armed variant is ≤ the declared context, the entry is **not scored this settlement**: it stays `pending` with the new typed skip reason **`context_below_armed`**, and it is never run above its declared context. Spec below | §1.1 context bullet; rev6.6 (a); W5d, W7a, W7d, W8c, W9 rows; T7; D2 (§6); §11.2 `docs/LANE_D.md` row; §17.4 D2 |
-| (b) | **Backtest windows ON at launch (owner 2026-11-23, DECIDED).** `[lane_d] backtest_weight_cap` default **0.05** (was 0, "off by default", rev6.9). `backtest_ratio_floor` stays 0.85; the loader inequality `1 − 0.85^0.05 ≈ 0.0081 < d_margin` (0.01) holds at the defaults, so the default config loads. With the default, the slow-cadence backtest cells (W5i) are built and scored from launch. Setting the cap to 0 by overlay still turns them off (the rev6.9 "at 0" behaviour is kept as the off switch). The W2e default and its tests are changed by a separate builder; this rev changes plan text only | rev6.9 "Off by default" bullet; rev6.10 "What gets drawn" bullet; §1.7 horizon paragraph; W2 row; W5i row |
+| (b) | ~~**Backtest windows ON at launch (owner 2026-11-23, DECIDED).**~~ **Superseded (owner 2026-11-24, DECIDED) by rev6.18 D24 (backtest dropped).** `[lane_d] backtest_weight_cap` default **0.05** (was 0, "off by default", rev6.9). `backtest_ratio_floor` stays 0.85; the loader inequality `1 − 0.85^0.05 ≈ 0.0081 < d_margin` (0.01) holds at the defaults, so the default config loads. With the default, the slow-cadence backtest cells (W5i) are built and scored from launch. Setting the cap to 0 by overlay still turns them off (the rev6.9 "at 0" behaviour is kept as the off switch). The W2e default and its tests are changed by a separate builder; this rev changes plan text only | rev6.9 "Off by default" bullet; rev6.10 "What gets drawn" bullet; §1.7 horizon paragraph; W2 row; W5i row |
 | (c) | **Follow-ups** (WP list below) | this section |
 
 **(a) Spec: the scored context.**
@@ -593,7 +1021,7 @@ are shared. Whichever merges second keeps both sections, newest on top.
 - **The crown path.** For a cohort frozen at a settlement:
   1. the challenger clears iff `LCB_α ≥ d_margin` (max-t over the cohort)
      and the point gain is strictly positive;
-  2. a cleared entry goes straight to A10 (W3b5) and the §1.3b gate. If it
+  2. a cleared entry goes straight to ~~A10 (W3b5) and~~ the §1.3b gate **(rev6.18: A10 removed)**. If it
      passes both, it's crowned at that settlement or the next one the gate
      can decide (`bench_hold`, W5g).
 
@@ -647,7 +1075,7 @@ are shared. Whichever merges second keeps both sections, newest on top.
   - **W7d and W9:** replay and audit expect **no** confirmation stage.
     - A report carrying one is refused (`confirmation_stage_present`).
     - The confirmation rule check comes out of W9's re-derived set.
-    - Both re-derive crowning as first clear ∧ A10 ∧ gate.
+    - Both re-derive crowning as first clear ∧ ~~A10 ∧~~ gate **(rev6.18)**.
   - **W5g (not edited here; see the ordering note):** the hold rules that
     reference the confirm stage change. A `bench_hold` now covers "a
     first-clear candidate the gate could not decide", not "a cleared
@@ -686,7 +1114,7 @@ are shared. Whichever merges second keeps both sections, newest on top.
     measures at that 50% share.
 
   Other mitigations kept: the per-feed override, the forward/backtest
-  sub-scores (rev6.9), the §1.3b gate and A10. **B1 also checks the cap.**
+  sub-scores (rev6.9), the §1.3b gate ~~and A10~~ **(rev6.18)**. **B1 also checks the cap.**
   The null FPR is measured with embargo windows at the cap. The share cap
   bounds the windows, not the log ratio: memorised embargo windows push CRPS
   toward the floor, which is the same issue rev6.9 meets for backtest
@@ -1160,9 +1588,13 @@ rev6.9's per-window sha256 draw seed is struck in favour of rev6.10 (b) / W5j
 
 | Item | Decision | Landed in |
 |---|---|---|
-| (a) | **Slow-cadence backtest windows, owner horizon bins, 5% weight cap (owner 2026-11-23, DECIDED).** See the spec below | §1.1 Horizon; §1.3 Window identity; §1.6 Box row; W2 row (keys); **W5i** row (new, after W5g); §14 lane D tuning row |
+| (a) | ~~**Slow-cadence backtest windows, owner horizon bins, 5% weight cap (owner 2026-11-23, DECIDED).**~~ **Superseded (owner 2026-11-24, DECIDED) by rev6.18 D24: backtest windows dropped, W5i retired; the struck spec below is kept for history.** See the spec below | §1.1 Horizon; §1.3 Window identity; §1.6 Box row; W2 row (keys); **W5i** row (new, after W5g); §14 lane D tuning row |
 
-**(a) Spec.**
+**(a) Spec.** **(rev6.18 D24, owner 2026-11-24): the backtest parts of this
+spec ("Everything else is a backtest window", the weight cap, the
+combination rule and its loader check, the backtest draw and sub-scores) are
+superseded: no backtest window is built or scored, and
+`backtest_weight_cap` / `backtest_ratio_floor` are deleted (F4).**
 
 - **Horizon bins (points).** The forward pass appends `ceil(h/32)` masked
   patches and scores only the first h points (`lane_d_scorer.py:142, 156`).
@@ -1184,7 +1616,7 @@ rev6.9's per-window sha256 draw seed is struck in favour of rev6.10 (b) / W5j
   unchanged. A daily window whose draw lands in the short bin is a
   **forward** window with that drawn h ∈ [7, 30]. It must pass W5a on all h
   target points, and it counts toward the floors like any forward window.
-- **Everything else is a backtest window.** That's daily medium and long,
+- ~~**Everything else is a backtest window.**~~ **(rev6.18 D24) superseded.** That's daily medium and long,
   plus every weekly, monthly, quarterly and yearly bin. A backtest window is
   a hold-out of the last h points of the series in the boundary's pinned
   `pool_d` snapshot, with the history before it as context (truncated to the
@@ -1194,7 +1626,7 @@ rev6.9's per-window sha256 draw seed is struck in favour of rev6.10 (b) / W5j
   eval. **Rec:** a series with fewer than 32 points (one patch) of history
   before the hold-out is skipped with the typed reason
   `backtest_short_history`.
-- **Weight cap.** Together, backtest windows carry at most
+- ~~**Weight cap.**~~ **(rev6.18 D24) superseded.** Together, backtest windows carry at most
   `[lane_d] backtest_weight_cap` = 0.05 of the lane D score; forward-only
   windows carry ≥ 0.95. **Rec:** the effective weight is
   `c = min(backtest_weight_cap, n_bt / (n_bt + n_fwd))`, so a handful of
@@ -1212,7 +1644,7 @@ rev6.9's per-window sha256 draw seed is struck in favour of rev6.10 (b) / W5j
   gain = 1 − R. `r_floor` is the new key `[lane_d] backtest_ratio_floor`
   (**rec 0.85**). Perfect memorisation (with forward equal) gains at most
   `1 − r_floor^c`.
-  - **Loader check (W2/W5i):** whenever `backtest_weight_cap > 0`, refuse
+  - ~~**Loader check (W2/W5i):**~~ **(rev6.18 D24) deleted in F4.** Whenever `backtest_weight_cap > 0`, refuse
     the config (and any overlay) unless
     **`1 − backtest_ratio_floor ** backtest_weight_cap < d_margin`**,
     equivalently `backtest_weight_cap · ln(1 / backtest_ratio_floor) <
@@ -1251,7 +1683,7 @@ rev6.9's per-window sha256 draw seed is struck in favour of rev6.10 (b) / W5j
   its forward relative gain by more than an ops-side threshold (non-consensus;
   rec 0.15).
 - ~~**Off by default.** `backtest_weight_cap = 0` until the owner arms it by
-  overlay/config.~~ **(rev6.15, owner 2026-11-23) On at launch:**
+  overlay/config.~~ ~~**(rev6.15, owner 2026-11-23) On at launch:**~~ **(rev6.18 D24, owner 2026-11-24) superseded: dropped, key deleted.**
   `backtest_weight_cap` defaults to **0.05**. Setting it to 0 by overlay or
   config turns it off: at 0 no backtest window is built or scored, the
   per-window daily h draw is not applied (daily stays h = 64 forward), and
@@ -2547,7 +2979,7 @@ every challenger shares one window draw and the king's scores
   - Suite identity is verified per drawn suite. Scope-skips are not
     "partial" (§13).
   - The house and KING_D are re-swept in the same host session as the candidate (cached rows are re-used only within that session).
-- **(rev3) Always-run low-frequency check (A10).** Alongside the drawn
+- **(rev6.18) REMOVED (owner 2026-11-23: "The low-frequency check A10 is removed"); the text below is kept struck.** ~~**(rev3) Always-run low-frequency check (A10).**~~ Alongside the drawn
   suite, every crowning candidate also runs a **paired non-inferiority
   check on a low-frequency slice of the private pool**.
   - The slice: `[lane_d] lowfreq_freqs`, recommended daily and slower.
@@ -2635,7 +3067,7 @@ every challenger shares one window draw and the king's scores
       at `ready` (A8);
     - ~~the `confirmation` block: stage, first-clear set id, king at the first
       clear, rule (A2, D20);~~ **(rev6.11)** removed (no confirmation duel);
-    - the low-frequency check result (A10).
+    - ~~the low-frequency check result (A10).~~ **(rev6.18)** removed.
 - **Satellites** hold no pool (DEC-CA-0058:17-33), and `pool_d` is private.
   They check the signature, the structural rules (declared timestamps
   against declared T values, floors, cohort construction), and they re-run
@@ -2700,7 +3132,7 @@ every challenger shares one window draw and the king's scores
 
 | Resource | Load | Plan |
 |---|---|---|
-| **(rev3) Launch eval host:** valpriv-4090 or another pod running the pinned torch 2.4.1+cu124 venv | prefetch on reveal; forecasts for up to 8 entries + KING_D + house per settlement on frozen sets, at ≤ 16k context; one forward pass per window, cost roughly quadratic in context (§1.1) | **Not valeval-blackwell4**: sm_120 can't run the pinned torch (only the sidecar venv), so numerics would differ from testnet and the worker handshake fails. **S1 check (B2, OA4):** does a 16k-context batch fit in 24 GB on valpriv-4090? If not, name the smallest pinned-torch pod that fits. valeval-laned (96 GB) is rented **only at S8**. Measure in T7; arm only variants that fit ≤ 50% of a settlement |
+| **(rev6.18)** Lane D scoring host: any GPU running a qualified scoring environment (rev6.18 B5; RTX PRO 6000 Blackwell allowed). ~~**(rev3) Launch eval host:** valpriv-4090 or another pod running the pinned torch 2.4.1+cu124 venv~~ | prefetch on reveal; forecasts for up to 8 entries + KING_D + house per settlement on frozen sets, at ≤ 16k context; one forward pass per window, cost roughly quadratic in context (§1.1) | ~~**Not valeval-blackwell4**: sm_120 can't run the pinned torch (only the sidecar venv), so numerics would differ from testnet and the worker handshake fails.~~ **(rev6.18)** Superseded by B5/B6: one cohort is scored on one host, and the handshake checks the qualified environment. **S1 check (B2, OA4):** does a 16k-context batch fit in 24 GB on valpriv-4090? If not, name the smallest pinned-torch pod that fits. valeval-laned (96 GB) is rented **only at S8**. Measure in T7; arm only variants that fit ≤ 50% of a settlement |
 | Box | target slicing, scoring and bootstrap for returned forecasts; report signing | Targets only: small, ~~h=64~~ **(rev6.9)** h = 64, or ≤ 180 points for W5i slow-cadence bins. **No histories, weights or torch on the box.** Bound the report size |
 | valeval-blackwell4 (43 GB, ~19 GB cache) | per crowning: **2.5 GB (BF16, rev3)** upload + 1 drawn suite; per new king: **(rev5)** the era's sentinel suite | Byte-based LRU (#467); lane A first; second bench pod if crownings slip > 1 settlement (D6) |
 | Weight loop | must never wait on lane D | Lane D runs off the poll thread; keep-alive (#471) live before S6 (T15). **(rev3) Status:** #471 is merged on main (0c52d07; `_weights_keepalive_tick` at `cascade/validator/weights.py:317`, wired into `validator_bench.py:901`) but **not deployed**: the live rc37 validator has no `_weights_keepalive_tick`. It ships at the latest with S2b |
@@ -2948,8 +3380,12 @@ Accept command exits 0**, never on a builder's word. Conventions:
     batching several WPs, one `laned:<WP>` label per WP, per §3.1 rule 6**)**.
   - **Builder:** starts from origin/main after L1 and opens ONE implementation
     PR labelled `laned:<WP>`, staged with explicit paths. **A builder never
-    edits `tests/accept/`, this plan, `scripts/laned/` or any status file
+    edits ~~`tests/accept/`,~~ this plan, `scripts/laned/` or any status file
     (`status/laned_build.json`, `docs/plans/STATUS.md`).**
+    **(rev6.17)** One agent may write the tests and the code of a feature in
+    one PR (§3.1 rules 1 and 7), labelled with every WP it touches; CI proves
+    the new tests fail on the base and pass on the head. It never deletes or
+    weakens an existing assertion without the `laned:tests-correction` label.
   - **Preparer** (external and owner WPs): writes the scripts and runs their
     dry-runs only; the owner executes and the evidence verifier checks the
     result.
@@ -3013,7 +3449,7 @@ Accept command exits 0**, never on a builder's word. Conventions:
 | W5e | Verdict (paired cluster bootstrap, `d_margin`, max-T; ~~**(rev3)** mandatory confirmation duel on the next disjoint set, D20 king-change rule,~~ `rows_sha256` (A2, A9)). **(rev6.11)** **Crown at the first verdict** (owner 2026-11-23): first clear (max-t LCB vs KING_D on the W5j draw) ∧ A10 (W3b5) ∧ §1.3b gate ⇒ crowned. **Remove the `confirm` stage** (chosen over a `confirmation_duel` key; rev6.11 (b)): drop `confirm_pending` from `OPEN_STATUSES` (`lane_d.py`, `lane_d_queue.py:42`, `lane_d_status.py:51`), the `confirm` record, `_confirm_king_ts`, the D20 king-change sweep and `lost_confirmation`; `confirm_on_king_change` parse-only (legacy). **Includes the W5g follow-up** (the W5g row isn't edited, so it doesn't conflict with #745): `bench_hold` = a first-clear candidate the gate couldn't decide; the hold sweep keys on the first clear; the reason-enum assertions drop `confirm_pending`. **(rev6.14) Judging start:** an entry is not drawn, frozen or judged at a settlement whose boundary wall time is < `j = wall(max(T_E, T_K)) + eval_delay_hours` (skip reason `before_eval_delay`, distinct from `fresh_share_short` and the floor reasons) | W5c, W5d | ci | `scripts/laned/accept W5e` |
 | W5f | House entry and refresh | W5e | ci | `scripts/laned/accept W5f` |
 | W5g | Holds, `checkpoint_fault`, typed reason enums | W5e | ci | `scripts/laned/accept W5g` (asserts the exact reason enum per case) |
-| W5i | **(rev6.9, owner 2026-11-23)** Slow-cadence backtest windows and their scoring weight (rev6.9 spec). (1) **Windows builder:** the per-cadence horizon bins; bin and h drawn per window from the boundary block hash ~~(`sha256(block_hash ‖ series_id ‖ "lane_d_backtest")`)~~ **(on merge with rev6.10)** by the W5j seeded per-cell draw (W5i supplies the slow-cadence cells and the hold-out rule), the same for king and every cohort member; daily short ⇒ a forward window at the drawn h through W5a's both-clocks rule; every other slow bin ⇒ a backtest hold-out (the last h points of the pinned `pool_d` snapshot's series, history before it, no padding); `backtest_short_history` skip; floors, freeze and `max_source_share` count forward windows only. (2) **Scorer/verdict:** forward and backtest sub-scores, combined as `log R = (1 − c)·log R_fwd + c·log clamp(R_bt, r_floor, 1/r_floor)` with `c = min(backtest_weight_cap, n_bt/(n_bt + n_fwd))`, clamped inside every bootstrap replicate of the max-T cohort LCB. (3) **Config:** `backtest_weight_cap`, `backtest_ratio_floor`; the loader refuses `backtest_weight_cap > 0` unless `1 − backtest_ratio_floor ** backtest_weight_cap < d_margin` (re-checked on overlay adoption); ~~default 0 = nothing built or scored~~ **(rev6.15)** default 0.05 (on at launch); 0 = nothing built or scored. (4) **Report:** per window `kind`, `freq_class`, `bin`, `h`; per entry and bar `forward` and `backtest` sub-scores plus the combined score. (5) **Audit + replay:** re-derive the draws, the clamp and the combined verdict independently. Touched modules: `cascade/validator/lane_d.py` (`load_pool`, `window_id`, `judge_cohort`), `cascade/validator/lane_d_forward.py` (per-window h for daily short), `cascade/validator/lane_d_frozen.py` (forward-only floors), `cascade/eval/lane_d_scorer.py` (h ≤ 180 per window; already capped at 512), `cascade/eval/bootstrap.py` (the combined statistic for `cohort_maxt_lcbs`), `cascade/shared/config/lane_d.py` (keys + inequality), `cascade/validator/schemas/lane_d_report_1.json` and `cascade/validator/lane_d_report.py` (fields + cross-field checks), `cascade/audit/lane_d.py` (W9 re-derivation), `cascade/satellite/lane_d_replay.py` (W7d, independent implementation), `cascade/validator/lane_d_inputs.py` (W8c supplies backtest histories and targets). **Follow-up (W11):** the cascade-ops alert on backtest gain ≫ forward gain | W5a, W5b, W5d, W7a, W9, W7d, W5j | ci + testnet | `scripts/laned/accept W5i` |
+| W5i | **RETIRED (owner 2026-11-24, DECIDED), rev6.18 D24: not built; the public half replaces it.** ~~**(rev6.9, owner 2026-11-23)** Slow-cadence backtest windows and their scoring weight (rev6.9 spec). (1) **Windows builder:** the per-cadence horizon bins; bin and h drawn per window from the boundary block hash ~~(`sha256(block_hash ‖ series_id ‖ "lane_d_backtest")`)~~ **(on merge with rev6.10)** by the W5j seeded per-cell draw (W5i supplies the slow-cadence cells and the hold-out rule), the same for king and every cohort member; daily short ⇒ a forward window at the drawn h through W5a's both-clocks rule; every other slow bin ⇒ a backtest hold-out (the last h points of the pinned `pool_d` snapshot's series, history before it, no padding); `backtest_short_history` skip; floors, freeze and `max_source_share` count forward windows only. (2) **Scorer/verdict:** forward and backtest sub-scores, combined as `log R = (1 − c)·log R_fwd + c·log clamp(R_bt, r_floor, 1/r_floor)` with `c = min(backtest_weight_cap, n_bt/(n_bt + n_fwd))`, clamped inside every bootstrap replicate of the max-T cohort LCB. (3) **Config:** `backtest_weight_cap`, `backtest_ratio_floor`; the loader refuses `backtest_weight_cap > 0` unless `1 − backtest_ratio_floor ** backtest_weight_cap < d_margin` (re-checked on overlay adoption); ~~default 0 = nothing built or scored~~ **(rev6.15)** default 0.05 (on at launch); 0 = nothing built or scored. (4) **Report:** per window `kind`, `freq_class`, `bin`, `h`; per entry and bar `forward` and `backtest` sub-scores plus the combined score. (5) **Audit + replay:** re-derive the draws, the clamp and the combined verdict independently. Touched modules: `cascade/validator/lane_d.py` (`load_pool`, `window_id`, `judge_cohort`), `cascade/validator/lane_d_forward.py` (per-window h for daily short), `cascade/validator/lane_d_frozen.py` (forward-only floors), `cascade/eval/lane_d_scorer.py` (h ≤ 180 per window; already capped at 512), `cascade/eval/bootstrap.py` (the combined statistic for `cohort_maxt_lcbs`), `cascade/shared/config/lane_d.py` (keys + inequality), `cascade/validator/schemas/lane_d_report_1.json` and `cascade/validator/lane_d_report.py` (fields + cross-field checks), `cascade/audit/lane_d.py` (W9 re-derivation), `cascade/satellite/lane_d_replay.py` (W7d, independent implementation), `cascade/validator/lane_d_inputs.py` (W8c supplies backtest histories and targets). **Follow-up (W11):** the cascade-ops alert on backtest gain ≫ forward gain~~ | W5a, W5b, W5d, W7a, W9, W7d, W5j | ci + testnet | `scripts/laned/accept W5i` |
 | W6a | `pool_d` selection = `pool`'s selected series ids (joined, not re-selected). **(rev5) Join rule:** the emitted `series_id` isn't stable. Collision suffixes `-2`, `-3`… are assigned in sort order (`builder.py:361-370, 471-480`), and `content_hash` is the sha256 of the (truncated) values (`:295`), so it changes whenever the tail moves and differs between `pool` and `pool_d` histories. Join on **(source, the pre-suffix source series key, channel)**, both built in the **same builder run** from the same forge records, never by emitted id or content hash. A key collision inside one source refuses the series from `pool_d` (logged) | W1 | ci + builder | `scripts/laned/accept W6a` (`pool` bytes unchanged) |
 | W6fs | **(rev3, launch-blocking)** First-seen recording: an append-only ingest log in the forge mirror path recording, per partition or point, the first time our mirror saw it, plus a per-feed mirror-lag measurement (source publish stamp where available). **Scope:** a recorder + reader used only by the `pool_d` builder. **Invariant:** `pool` bytes and lane A windows byte-identical (the test diffs a `pool` build with and without the recorder). **Tests:** first-seen never later than any snapshot containing the point; rewrites and backfills keep the *first* time; lag computed per feed. Not implemented in this PR  **(rev5) Attestation (B12):** a ~~daily~~ **(rev6.11)** per-3-hourly-period digest (Merkle root) of the ingest log is committed **before** any snapshot uses that ~~day's~~ period's records: in the signed receipt, or on chain via the main validator's commitment. A snapshot whose first-seen records postdate their committed root is refused. **(rev6.10) Release-time record:** W6fs is **required** for the embargo rule (`release(p) = first_seen(p) + e`). The recorder doesn't store `release` (it's derived, so the catalog can't rewrite history). It stores first-seen per point under the B12 Merkle root, plus per feed the measured `max(data_ts − first_seen)`, which W6b uses to force `e = 0` on publish-ahead feeds (rec). Test: release is recomputable from the signed first-seen record and the pinned `e` alone | W1 | builder | `scripts/laned/accept W6fs --evidence evidence/w6fs.json` |
 | W6b | **(rev3)** Extended history **to 16384 + 64** + per-series (per-channel) `end_ts` / `first_target_ts`. **(rev6.1)** Also writes, for **every** series, `frontier` (a list, possibly empty: one record per earlier snapshot holding that series), and, for **every** feed in `pool_d`, a `feeds` entry (`mirror_lag_hours`, a number or `null`, and `forecast_product`). A `pool_d` in which any series lacks `frontier` (absent or `null`) or any feed lacks a `feeds` entry is **invalid**; the builder's tests assert that none does (RV3 BLOCKING 1: W5a's eligibility fails open on a missing key). **(rev6.10)** Each `feeds` entry also carries `embargo_hours`, the **effective** value: the TSBench-Forge catalog's per-feed `embargo_hours` (`sources.yaml`, read by the `pool_d` builder alongside the catalog fields `tsbench_forge.py:340` already reads), clamped to `[lane_d] embargo_hours`; the global value when the catalog has none; **0** for a feed W6fs shows as publish-ahead (rec). ~~**(rev6.11)** The sub-hourly zero is applied per series by W5a from `freq`, not written here.~~ **(rev6.12)** No sub-hourly zero: the pinned value applies to every series of the feed. A negative or non-numeric catalog value leaves the feed out of `feeds` (fail closed). `pool` bytes unchanged | W6a, W6fs, W2e | builder | `scripts/laned/accept W6b --evidence evidence/w6b.json` |
@@ -3026,13 +3462,13 @@ Accept command exits 0**, never on a builder's word. Conventions:
 | W3b2 | Paired sweep vs KING_D and house on one host | W3b1 | ci (recorded suite outputs) + pod | `scripts/laned/accept W3b2` |
 | W3b3 | **(rev5)** Sentinel sweep + publish: the era's §16 sentinel suite (not fixed TIME), swept and published for every new king, never gating | W3b2 | ci | `scripts/laned/accept W3b3` |
 | W3b4 | Suite identity + partial classification | W3b2 | ci | `scripts/laned/accept W3b4` |
-| W3b5 | **(rev3)** Always-run low-frequency private-pool non-inferiority check (`lowfreq_freqs`, `tau_public`; `lowfreq_regression`) (A10). **(rev6.1)** Result for a ~~confirm candidate (a verdict that cleared at stage `confirm`)~~ **(rev6.11)** crown candidate (a verdict that cleared at the first, only, stage) whose frozen set **does** hold low-frequency windows: `pass` or `fail` (`fail` = `lowfreq_regression`, not crowned), with the true `n_windows`; it is never `not_candidate`. W3b5 replaces W7a's interim path, which emits `not_candidate` with the true count (`validator/lane_d.py:371-387`). `no_windows` stays for a candidate with none; `not_candidate` (with `n_windows = 0`) stays for every non-candidate verdict. The W7a enum (`schemas/lane_d_report_1.json`, `LOWFREQ_RESULTS`) already holds `pass`/`fail`; W3b5 adds a value to it only if it introduces a new one | W5d | ci | `scripts/laned/accept W3b5` (T4b) |
+| W3b5 | **(rev6.18) REMOVED (A7): code, schema block, audit rule and tests deleted in F4.** ~~**(rev3)** Always-run low-frequency private-pool non-inferiority check (`lowfreq_freqs`, `tau_public`; `lowfreq_regression`) (A10). **(rev6.1)** Result for a ~~confirm candidate (a verdict that cleared at stage `confirm`)~~ **(rev6.11)** crown candidate (a verdict that cleared at the first, only, stage) whose frozen set **does** hold low-frequency windows: `pass` or `fail` (`fail` = `lowfreq_regression`, not crowned), with the true `n_windows`; it is never `not_candidate`. W3b5 replaces W7a's interim path, which emits `not_candidate` with the true count (`validator/lane_d.py:371-387`). `no_windows` stays for a candidate with none; `not_candidate` (with `n_windows = 0`) stays for every non-candidate verdict. The W7a enum (`schemas/lane_d_report_1.json`, `LOWFREQ_RESULTS`) already holds `pass`/`fail`; W3b5 adds a value to it only if it introduces a new one | W5d | ci | `scripts/laned/accept W3b5` (T4b) |
 | W3b6a | **(rev6.13)** Lane D bench sweep transport (rev6.13 W3b6 spec). Pod side: `cascade/eval/lane_d_bench_sweep.py` (`hello` / `sweep`): W15 cache + W4 `prefetch_grant` per digest (grants only, no weights through the box; infra faults fail the sweep, a W4 refusal is that digest's `error`), materialised per (digest, context) in lane A's sidecar layout (W4-verified release code, `config.json` `context_length` = the effective context, weights as ingested); one paired `_invoke_sidecar_many` pass; `item_rows_from_report` rows + hardware fingerprint. Box side: `cascade/validator/lane_d_bench_host.py` `SSHBenchHost`, the `SweepSession` sweep over SSH to the first `final`/`any` host of a re-read hosts file (a `bench_lease` file works); any defect raises ⇒ `bench_hold`. `cascade/validator/lane_d_inputs.py`: optional `bench_hosts` TOML key (absent ⇒ `bench_host = None`, today's behaviour). PATHS: those three files | W3b2, W8c, W15, W4 | ci + pod | `scripts/laned/accept W3b6a` |
 | W3b6b | **(rev6.13)** Lane D bench rows published, bound and re-derived (rev6.13 W3b6 spec). `lane_d_bench.sweep_record_text` (canonical JSON); each swept gate result gains `rows: {candidate, king_d, house}` sha256 inside the signed body (schema: optional, additive, `/1` kept); W8b's step PUTs each record at `bench_v/lane_d/<boundary>/<sha256>.json` through its existing store before the report (`publish_failed` on error); W7d's replay fetches, checks the sha256 (`gate_rows_mismatch`), recomputes the four LCBs with `expert_lane.paired_geomean_lcb` (`gate_lcb_mismatch`) and refuses a crowned pass without `rows` (`gate_rows_missing`). Deterministic, signed, content-addressed; satellites re-derive, never re-sweep; lane A byte-identical. PATHS: `cascade/validator/lane_d_bench.py`, `cascade/validator/lane_d.py`, `cascade/validator/schemas/lane_d_report_1.json`, `cascade/validator/lane_d_wiring.py`, `cascade/satellite/lane_d_replay.py` | W3b2, W7a, W7d, W8b | ci | `scripts/laned/accept W3b6b` |
 | W7a | Report schema `lane-d-report/1`, including §14.3 forward fields and **(rev3)** `rows_sha256`, both clocks per window, mirror lag, the judged set and skip reasons, `coldkey`, ~~the `confirmation` block~~ **(rev6.11)** (removed: no `confirmation` block; enums lose `confirm_pending`, `confirmed`, `lost_confirmation`, stage `confirm`, `confirm_rule`; `confirm_on_king_change` leaves the config echo; stay on `/1` unless a testnet `confirm` report must stay verifiable, then `/2`), the low-frequency result, **(rev5)** a `scoring_method: "quantile_head"` field (refused if absent or different)  **(rev5)** Plus the first-seen Merkle root(s) each frozen set relies on (B12). **(rev6.10)** Per window: effective `embargo_hours`, `min_release_ts`, `rule` (`embargo` \| `embargo0`), `timeframe`, `bin`, `h`, origin, `kind`; per draw: the boundary block hash, `max_windows_per_settlement`, the per-cell quota and capacity, and the per-cell candidate window ids the draw was made from (so W7d can re-draw; bounded by §1.6's report-size limit, else their sha256 with the list published after the dispute window); config echo `embargo_hours`, **(rev6.11)** ~~`embargo_window_share_cap`~~ **(rev6.12)** `min_fresh_window_share`, each window's series `freq` and an `embargo_window` flag, and the set's embargo-window count **(rev6.12)** plus fresh count and the per-entry fresh and embargo sub-scores (cross-check: ~~count ≤ cap × set size~~ **(rev6.12)** fresh / (fresh + embargo) ≥ `min_fresh_window_share`; ~~no `embargo_window` on a sub-hourly series~~ **(rev6.12)** any cadence may carry `embargo_window`); cross-field checks (`rule = embargo0` ⇒ every point passes at `e = 0`; ~~the confirmation set is `embargo0` and disjoint by target points;~~ a window's `embargo_hours` ≤ the config echo). **(rev6.14)** Config echo `eval_delay_hours` and `forward_margin_hours`; per entry `b` and `j`; cross-checks: freeze settlement's boundary wall time ≥ `j`, `b ≤ j`, and each window's fresh class at the echoed `b`. **(rev6.15)** Skip reason `context_below_armed` (enum in `lane_d_report.py` and the schema file; stays `/1`): with the `armed` record given, `settle_lane_d` skips each chosen member whose declared context is below every armed variant (`min(armed_contexts) > context`), status stays `pending`; the house challenger is exempt (it declares no context); cross-check: such a skip needs `armed_contexts` present and below-armed | W1.5 | ci | `scripts/laned/accept W7a` (JSON-schema; unknown version refused) |
 | W7b | Report signing | W7a | ci | `scripts/laned/accept W7b` |
 | W7c | `lane_d_state.json` + receipt prior/posterior digest binding. **(rev6.1)** Wiring trap (RV3 note 10): `validator/weights.py:517-524` passes the second element to `emission_vector` only when a lane B or C pay record exists (`pay is not None or pay_c is not None`); if lane D pays while B and C are off, the lane D share is dropped and `set_weights` normalisation hands it to lane A. The WP that wires lane D pay into weights (W7c, or the one that passes `lane_d_cfg` first) adds the lane D pay record to that condition, with a test for "lane D on, B and C off". **(rev6.11)** **Recovery of a `confirm_pending` state** (testnet only; never armed on mainnet): on load, an entry in `confirm_pending` whose `confirm.king_digest` equals KING_D becomes a crown candidate on its first-clear set; otherwise `pending` / `pending_floor` (first clear discarded). Logged `confirm_state_migrated`, once, at the first settlement after the release, covered by the prior/posterior digest binding. Test: both branches | W7b | ci | `scripts/laned/accept W7c` |
-| W7d | Satellite replay: an **independent** implementation, no imports from producer eligibility, verdict or weight code (invariant 12). **(rev6.10)** Re-derives eligibility with the per-feed bound `b − e` from the signed per-window `min_target_ts`, `min_first_seen_ts` and `embargo_hours` (today it checks both against one bound, `cascade/satellite/lane_d_replay.py:891-895`); refuses a window `embargo_hours` above the signed config value; **(rev6.11)** ~~applies e = 0 to sub-hourly series (from the signed `freq`) and~~ **(rev6.12)** applies the signed `e` to every cadence and **(rev6.11)** checks the embargo-window share ≤ ~~`embargo_window_share_cap`~~ **(rev6.12)** 1 − `min_fresh_window_share` (re-derives each window's fresh / embargo class and the fresh-first trim; refuses a set below the share, `fresh_share_short`); ~~checks the confirmation set at `e = 0`;~~ **(rev6.11)** expects **no** confirmation stage (refuses a report with one, `confirmation_stage_present`) and re-derives crowning as first clear ∧ A10 ∧ gate; re-derives the W5j draw (seed, quotas, picks) from the block hash and the signed candidate list. **(rev6.14)** Re-derives `b` (forward_margin, default 0) and `j` (eval_delay_hours) from the signed T values and the config echo; re-classes fresh / embargo at `b`; refuses a set frozen before `j` (`frozen_before_eval_delay`). **(rev6.15)** Re-derives `context_below_armed` from the signed `armed_contexts` and each entry's declared context: refuses a report that skips an entry with an armed variant ≤ its context, or judges one with none | W7c | ci | `scripts/laned/accept W7d` (import-graph check included) |
+| W7d | **(rev6.18) B2: deleted — the satellite verifies through `audit_receipt` → `check_lane_d` (W9), the one lane D checker (F1).** ~~Satellite replay: an **independent** implementation,~~ no imports from producer eligibility, verdict or weight code (invariant 12). **(rev6.10)** Re-derives eligibility with the per-feed bound `b − e` from the signed per-window `min_target_ts`, `min_first_seen_ts` and `embargo_hours` (today it checks both against one bound, `cascade/satellite/lane_d_replay.py:891-895`); refuses a window `embargo_hours` above the signed config value; **(rev6.11)** ~~applies e = 0 to sub-hourly series (from the signed `freq`) and~~ **(rev6.12)** applies the signed `e` to every cadence and **(rev6.11)** checks the embargo-window share ≤ ~~`embargo_window_share_cap`~~ **(rev6.12)** 1 − `min_fresh_window_share` (re-derives each window's fresh / embargo class and the fresh-first trim; refuses a set below the share, `fresh_share_short`); ~~checks the confirmation set at `e = 0`;~~ **(rev6.11)** expects **no** confirmation stage (refuses a report with one, `confirmation_stage_present`) and re-derives crowning as first clear ∧ A10 ∧ gate; re-derives the W5j draw (seed, quotas, picks) from the block hash and the signed candidate list. **(rev6.14)** Re-derives `b` (forward_margin, default 0) and `j` (eval_delay_hours) from the signed T values and the config echo; re-classes fresh / embargo at `b`; refuses a set frozen before `j` (`frozen_before_eval_delay`). **(rev6.15)** Re-derives `context_below_armed` from the signed `armed_contexts` and each entry's declared context: refuses a report that skips an entry with an armed variant ≤ its context, or judges one with none | W7c | ci | `scripts/laned/accept W7d` (import-graph check included) |
 | W8 | Emission: lane D in `lane_parts` / `lane_pool_shares` (`emission.py:330-383`, `lane_c.py`), court decay, house burn  **(rev5)** A deregistered court member's slot burns (B8). **C3 (D48)** decides where lane D's share comes from inside lane A; W8 also changes `lane_pool_shares` (`shared/lane_c.py:584`, returns a `(B, C)` tuple, callers `emission.py:361`, `lane_c.py:605`), a consensus signature at every caller. | W1.5 | ci | `scripts/laned/accept W8` |
 | W8b | **(rev6.2) (rev6.4, accepted owner 2026-11-23)** Production wiring: today nothing outside tests calls `cascade.validator.lane_d.settle_lane_d`. The validator loop calls it at each lane D settlement boundary with: the boundary block hash (read-only chain read); the era's sentinel (W-S1 draw from the era-start hash); a bench `SweepSession` on the configured bench host (the W3b2/W5e gate inputs; an armed crown without them is a `bench_hold`); `expect_prior_sha256` from the last published receipt (W7c); the low-frequency check (W3b5); and the house/king state. After settlement: W3b3 `sweep_and_publish` for a new king; W-S3 `build_sentinel_board` with the era's kings list (from W7c state / W17); publish the signed report + receipt; lane D pay reaches weights (W8 emission) **only via the published report**. **Fail-closed:** any unreadable input ⇒ no settlement this tick (retry next tick), never a guessed input. **Restart-safe:** a re-call after restart is idempotent (W7c). **Weight loop:** lane D's bench work runs off the weight loop (W19) or is bounded so weight reasserts are never delayed past a stated bound (2026-11-22: weights went stale ≥ 2 h during a synchronous king-check sweep). **Unarmed:** byte-identical (invariant 1). Ships release-then-activate (external validators on netuid 91) | W5e, W3b5, W7c, W8, W3b3, W-S3, W17 | ci + testnet | `scripts/laned/accept W8b` |
 | W8c | **(rev6.7, owner 2026-11-23)** Production `LaneDInputs` source: W8b's step calls `settle_lane_d` with a `LaneDInputs` from its `inputs` source, but nothing in production supplies one, so an armed lane D refuses `inputs_unavailable` at every settlement. W8c builds a `LaneDInputs` per armed boundary from signed or pinned sources only: (1) the queued entries from the W3 intake state and vault (`cascade/lane_d/`), revealed by the boundary; (2) each entry's, KING_D's and the house's forecasts on the boundary's frozen windows, computed on the lane D eval host by the W5d scorer (`cascade/eval/lane_d_scorer.py`) over checkpoints fetched through the W15 prefetch cache (`cascade/eval/lane_d_cache.py`) and W4 ingest, behind the W4 handshake; (3) the pinned `pool_d` snapshot(s) (W6d), each re-hashed against its pin, and their windows (W5a/W5b); (4) the house record from the W5f signed pointer, and the bench `SweepSession` (W3b*) for W8b's `bench`. **Deterministic:** the same boundary and sources give the same `LaneDInputs`. **Fail-closed:** each missing or unverifiable input is its own typed code (no inputs, no settlement this tick; W8b retries), never a guessed or default input. **Off the poll thread:** it runs inside the W19 worker's step; its chain reader is built on that thread. **No new chain reads beyond `ChainClient`.** **Unarmed:** no source is built and nothing is read (invariant 1); nothing reachable from `cascade.audit` imports it (invariant 12). Wired into `cascade/validator/main.py` through `build_lane_d_step`'s `inputs` and `bench` parameters. **(rev6.13, rev6.6 follow-up)** The source also computes the settlement's armed set: W5d `armed_record` over the pinned `laned_readiness/1` / `laned_t7/1` bytes named in the inputs TOML (`readiness`, `t7`, required, re-read per settlement), each digest forecast at `effective_context`, the record passed to `settle_lane_d(armed=)` via `LaneDInputs.armed` (W8b field, default `None`); missing/invalid documents or nothing armed fail closed (`readiness_unavailable`, `t7_unavailable`, `armed_invalid`, `no_armed_context`). **(rev6.15)** A digest whose `effective_context` is `None` (no armed variant ≤ its declared context) is not forecast: an entry or open record is then skipped by the settlement (`context_below_armed`, W7a); a miner KING_D without a forecast makes its cohort `king_unscored` (existing rule). The house declares no context and keeps its rule (4096 if armed, else the highest armed below, else the lowest armed), so it is always forecast. No new input error code | W8b, W5d, W15, W4, W3, W6d (`pool_d` is owner/forge data; tests use fixtures), W5f | ci + testnet | `scripts/laned/accept W8c` |
@@ -3102,8 +3538,17 @@ BLOCKING item, and each finding is either fixed or filed as a WP.
 ### 3.1 Build rules
 
 1. **Tests first.** Acceptance tests are written first in `tests/accept/<wp>/`
-   and are **read-only to builders**. CI fails a PR that edits
-   `tests/accept/` together with that WP's implementation.
+   ~~and are **read-only to builders**. CI fails a PR that edits
+   `tests/accept/` together with that WP's implementation.~~
+   **(rev6.17, owner 2026-11-23)** and MAY land in the same PR as the code.
+   "First" is proved by CI, not by PR order: the WP's new tests, taken from
+   the PR head, must fail on the base's code for a right reason, then pass
+   on the head with the full Accept (`accept <WP> --combined`). A new test
+   that already passes on the base proves nothing and is refused, unless the
+   WP is a declared verification WP. A PR may add `PATHS` entries and change
+   those files in the same PR (scope = base PATHS + added entries; removals
+   still count from the base). Deleting or weakening an existing assertion,
+   or dropping a `PATHS` entry, needs the `laned:tests-correction` label.
 2. **Mock only external services**, never the component under change.
 3. **No placeholders.** No `TODO`, stubs, `pass`, `NotImplementedError`,
    hardcoded sample values or mocks outside `tests/`. The stub scan runs in
@@ -3113,18 +3558,23 @@ BLOCKING item, and each finding is either fixed or filed as a WP.
    parser reads.
 5. **Every lane D log line** has a follower pattern, checked by
    `follower_patterns.py`.
-6. **(rev6) Each WP has a tests-only PR (`tests/accept/<wp>/`) followed by
-   ONE implementation PR.** Explicit paths, no stacks, owner-merged;
+6. ~~**(rev6) Each WP has a tests-only PR (`tests/accept/<wp>/`) followed by
+   ONE implementation PR.**~~ **(rev6.17) One PR per feature** (rule 7);
+   tests-only and tests-correction PRs remain available, not required.
+   Explicit paths, no stacks, owner-merged;
    dependents start only after the dependency's code is **on main** (verify `git log
-   origin/main`, never a MERGED badge). This matches rule 1: the tests land
-   first and alone, and the implementation PR never touches them.
-   **(rev6.2, owner 2026-11-22)** Implementation, tests-correction, evidence
-   and review PRs stay **one WP per PR**. A **tests-only PR** (new acceptance
+   origin/main`, never a MERGED badge) **(rev6.17:** or ride in the same
+   feature PR**)**. ~~This matches rule 1: the tests land
+   first and alone, and the implementation PR never touches them.~~
+   **(rev6.2, owner 2026-11-22)** ~~Implementation, tests-correction, evidence
+   and review PRs stay **one WP per PR**.~~ **(rev6.17)** Evidence and review
+   PRs stay one WP per PR. A **tests-only PR** (new acceptance
    tests, no implementation yet) MAY carry several WPs' `tests/accept/<wp>/`
    directories, with one `laned:<WP>` label per WP; each WP's expect-fail (or
    verification) accept run is executed and ledger-recorded separately, and the
-   whole PR fails if any WP's check fails.
-7. **(rev6.3, owner 2026-11-23) Implementation PRs MAY batch up to 3 WPs**
+   whole PR fails if any WP's check fails. **(rev6.17)** No cap, and built
+   and unbuilt WPs may mix (each runs its own mode).
+7. ~~**(rev6.3, owner 2026-11-23) Implementation PRs MAY batch up to 3 WPs**
    when (1) their PATHS sets are disjoint, (2) none depends on another in the
    batch, and (3) each WP's tests are already on main. Each WP in the batch is
    still checked on its own: scope (its PATHS only, files attributed per WP),
@@ -3133,8 +3583,17 @@ BLOCKING item, and each finding is either fixed or filed as a WP.
    overlap stay serial. Tests-corrections found in one pass may likewise be
    batched in one PR (one dir per WP). Labels: one `laned:<WP>` per WP in the
    batch. This narrows rule 6's "one WP per PR" for implementation and
-   tests-correction PRs; evidence and review PRs stay one WP per PR. (Former
+   tests-correction PRs; evidence and review PRs stay one WP per PR.~~ (Former
    rules 7–8 are now 8–9.)
+   **(rev6.17, owner 2026-11-23) One PR per feature.** A PR whose labels are
+   all `laned:<WP>` may carry every WP a feature touches, with tests and code
+   together: no WP cap, no disjoint-PATHS or no-dependency refusal, no
+   `coupled_batches` declaration. Each WP is still checked on its own: its
+   scope (base PATHS + added entries; a file in several WPs' PATHS counts for
+   each), its own Accept or combined run, CROSS, and one ledger row. Every
+   label must own a changed file or test. Every WP whose code the PR changes
+   must carry its label: the squash merge is a WP's L2 commit only if the PR
+   carried `laned:<WP>` and changed a non-test path in its PATHS (§17.1).
 8. **A fresh-context review WP** after every 5 build WPs reach L3 **(rev6)**.
 9. **Blocked is acceptable; faked completion is not.** If a WP can't be fully
    built, the builder stops and records the blocker in `evidence/blocked/<wp>.md`.
@@ -3445,7 +3904,7 @@ is **accepted** unless a row says otherwise. The explicit answers:
 | D8 | Losers | Private; vault TTL 4 eras; owner-only archive 14 days; then delete |
 | D9 | House paid? | No: the slot burns; prior miner tails keep paying |
 | D10 | Activation | **(rev5, D45)** One overlay: `from_block` with **`share = 0.25`** (D1) and `takes_from = "lane_a"` together (no `share = 0` shadow), published with an `effective_block` far enough ahead that observed `cfg-` stake reaches ≥ 2/3 before it; kill switch by a staged revert overlay (latency up to about one era); ~~**(rev3)** the S8 long-context arming is also an overlay (`contexts`), live at its block, no shadow~~ **(rev6.6)** long-context arming needs no overlay: every variant is in `contexts` from launch and arms automatically on its gates (§1.1, D2) |
-| D11 | Eval host | **(rev3)** Launch: valpriv-4090 or another pinned-torch 2.4.1+cu124 pod (≥ 24 GB; the 16k fit is checked in B2). **Not** Blackwell sm_120. valeval-laned (H100/A100 80 GB class, pinned torch) only at S8 |
+| D11 | Eval host | **(rev6.18)** Any GPU with a qualified scoring environment (B5), incl. RTX PRO 6000 Blackwell (owner 2026-11-23). ~~**(rev3)** Launch: valpriv-4090 or another pinned-torch 2.4.1+cu124 pod (≥ 24 GB; the 16k fit is checked in B2). **Not** Blackwell sm_120.~~ valeval-laned (H100/A100 80 GB class, pinned torch) only at S8 |
 | D12 | Pool packaging | `pool` untouched (keep length never raised); **(rev3)** launch `pool_d` = `pool`'s series ids joined, history to 16384 + 64, A1 timestamps, `pool_d_hist` (no targets) to the eval pod, `pool_d_tgt` on the box; 32k–128k history work at S8; dedicated builder |
 | D13 | Weights license | Open licenses only (Apache-2.0 / OpenMDW-1.1); kings are published |
 | D14 | dtype | **(rev3)** BF16 only (~2.5 GB), scored in lane A's eval precision (fp32 upcast); F32 refused (4.9 GB is near the 5 GiB single-PUT limit) |
@@ -3540,7 +3999,7 @@ is **accepted** unless a row says otherwise. The explicit answers:
 | **(rev3)** Coldkeys are free | The A8 caps limit casual flooding only, not a determined Sybil (one IP drove ~70 hotkeys across coldkeys; **(rev5) unverified:** the `OPSLOG:164` line ref has drifted and a grep for the fact didn't re-find it). Registration cost, the eval fee (D4), and the §15 pre-screen [DECIDE] are the levers. k = 32 per era is sized for this in §1.3 |
 | **(rev3)** Owner conflict of interest | The owner runs the judging (main) validator **and** enters the house. Mitigations: the house is never paid (D9/D21); verdicts carry `rows_sha256` and signed rows; satellites re-run the bootstrap; `check_lane_d` re-derives the judged set and eligibility; kings are public and re-scorable; D23 (i) would let losers fully re-score; the builder's per-snapshot metadata digest is published (§15 / review round 2 item 12). **(rev5)** The first-seen log's daily Merkle root is committed before any snapshot uses it (W6fs), so we can't backdate first-seen to admit or exclude windows after seeing entries |
 | **(rev5)** Rented eval host sees private data | Loser weights and `pool_d_hist` (histories, no targets) are visible to the rented (Lium) eval host. That's the same accepted risk as lane A's private offload: targets and scoring stay on the box, the host gets presigned GETs only, and losers are deleted on TTL |
-| **(rev3)** The low-frequency check is weak against contamination | The private pool isn't forward-only, so a contaminated model passes A10's check more easily. It catches honest regressions only |
+| ~~**(rev3)** The low-frequency check is weak against contamination~~ **(rev6.18)** A10 removed | The private pool isn't forward-only, so a contaminated model passes A10's check more easily. It catches honest regressions only |
 | **(rev4)** Procedurally recreated benchmark series in lane B | The static contamination check (LB1) can't see a series regenerated from fitted parameters. **Guard 4** (whole-pool point gain ≥ 0) and the **anchor guard** are the backstop: a gain that exists only on a public test set is refused before merge |
 | Bench-pod contention and disk | Lane A first; byte LRU; second pod on demand |
 | Eval GPU can't hold 64k/128k | Arm only measured variants; larger pinned-torch GPU later |
@@ -3575,8 +4034,8 @@ anything else touches them.
   status`; the latest public KING_A as a start point; a reference fine-tune
   script (runs on the miner's GPU).
 - **(rev3) Launch eval host:** valpriv-4090 or another pinned torch 2.4.1+cu124 pod (≥ 24 GB; the 16k fit is checked in B2, OA4). **valeval-laned is rented only at S8:**
-  - Hardware: a **pinned-venv-capable GPU** (H100 or A100 80 GB; not
-    Blackwell sm_120); ≥ 300 GB disk for the prefetch cache and
+  - Hardware: ~~a **pinned-venv-capable GPU** (H100 or A100 80 GB; not
+    Blackwell sm_120);~~ **(rev6.18)** any GPU with a qualified scoring environment (B5); ≥ 300 GB disk for the prefetch cache and
     `pool_d_hist`.
   - Software: the release's `uv sync --frozen` venv (torch 2.4.1+cu124),
     re-synced with every validator deploy, **with the worker handshake**.
@@ -3619,7 +4078,7 @@ anything else touches them.
 ```
 boundary B
  ├─ refresh house if KING_A digest changed (T = its publish block)
- ├─ newest pool_d_hist/_tgt pinned? (stale > 30 h ⇒ CRIT; entries stay pending)
+ ├─ newest pool_d_hist/_tgt pinned? (stale > ~~30 h~~ **(rev6.18) 6 h** ⇒ CRIT; entries stay pending)
  ├─ for each open entry: update eligible union (§1.3, max(T_E, T_K) + margin)
  │     → frozen this settlement? → cohort (intersection; defer latest-T if short)
  ├─ eval host (rev5: launch eval host; valeval-laned from S8): forecasts for cohort + KING_D + house on the frozen set
@@ -3677,7 +4136,7 @@ recovery, because remote writes are often classifier-blocked.
   visible.
 - `lane_d_bench_hold`: a held crowning.
 - `pod_disk` for valeval-blackwell4 under the added lane D load.
-- `pool_d_stale`: the newest snapshot is older than about 30 h.
+- `pool_d_stale`: the newest snapshot is older than about ~~30 h~~ **(rev6.18) 6 h** (two missed 3 h builds).
 - `runway`: the balance covers ≥ 3 days of **all** standing pods.
 - `primary_store_failed`.
 - `vault_lane_d_bytes`.
@@ -4190,7 +4649,7 @@ type, OA8):**
 | Pool publish fragility | the job died for 6 days | dedicated builder; `pool_d_stale` |
 | Suite identity / partial | FEV scope-skips counted as partial | W3b identity checks |
 | Remote writes need the owner | classifier blocks | owner-paste scripts |
-| Blackwell vs pinned torch | sm_120 unsupported by torch 2.4.1 | D11 eval-host GPU class |
+| ~~Blackwell vs pinned torch~~ | ~~sm_120 unsupported by torch 2.4.1~~ **(rev6.18)** handled by qualified scoring environments (B5) | D11 eval-host GPU class |
 | Private offload rule | targets stay local | D18 / invariant 8 |
 
 ---
@@ -4487,8 +4946,8 @@ Each level needs all the levels below it.
 | Level | Name | Condition |
 |---|---|---|
 | L0 | todo | Listed in §3 |
-| L1 | specified | `tests/accept/<wp>/` and `PATHS` merged on main, and those tests fail on main before L2 (checked by the W0c workflow's expect-fail run) |
-| L2 | built | Implementation PR merged on main (checked with `git log origin/main`), explicit paths only (every changed path is in the WP's `PATHS`) |
+| L1 | specified | `tests/accept/<wp>/` and `PATHS` merged on main, and those tests fail on main before L2 (checked by the W0c workflow's expect-fail run). **(rev6.17)** Or merged with the code in one PR whose `combined` run proved the new tests fail on the base and pass on the head |
+| L2 | built | Implementation PR merged on main (checked with `git log origin/main`), explicit paths only (every changed path is in the WP's `PATHS`). **(rev6.17)** The merged PR carried `laned:<WP>` and changed at least one non-test path in the WP's `PATHS`; a PR without the label never builds the WP, however broad its `PATHS` |
 | L3 | accepted | `scripts/laned/accept <WP>` green in CI on main after the merge. A later red run on main drops the WP back to L2 |
 | L4 | evidenced | External and owner WPs only (Runs in includes `builder`, `pod`, `testnet` or `owner`): evidence JSON present, and the verifier passes against the live resource. n/a for ci-only WPs, which pass L4 automatically |
 | L5 | reviewed | Covered by an RVn whose `evidence/rv<n>.md` has no open BLOCKING item for this WP |
@@ -4562,7 +5021,7 @@ script parses this table on main; it changes only by an owner-merged plan PR.
 | D8 | decided | Losers private; vault TTL 4 eras; archive 14 days; delete | O | owner (default), 2026-11-21 |
 | D9 | decided | House unpaid: the slot burns | S | owner (default), 2026-11-21 |
 | D10 | decided | One activation overlay (D45) | S | owner, 2026-11-21 |
-| D11 | decided | Launch eval host: valpriv-4090 or a pinned-torch pod (≥ 24 GB) | O (ops) | owner (default), 2026-11-21 |
+| D11 | decided | ~~Launch eval host: valpriv-4090 or a pinned-torch pod (≥ 24 GB)~~ **(rev6.18)** any GPU in a qualified scoring environment (B5) | O (ops) | owner (default), 2026-11-21 |
 | D12 | decided | `pool` untouched; `pool_d` joined to `pool`'s ids, history to 16384 + 64 | S | owner (default), 2026-11-21 |
 | D13 | decided | Open licences only; kings published | S | owner (default), 2026-11-21 |
 | D14 | decided | BF16 only | S | owner (default), 2026-11-21 |
@@ -4614,7 +5073,7 @@ rules inside existing WPs, not §6 D-numbers, so they aren't table rows:
 | (d) | A deferred lane B funded entry's `PayerKeyVault` key has its TTL refreshed on each deferred tick (#629/#633) | WB18 follow-up | owner, 2026-11-22 |
 | (e) | `laned_vault_ledger/1` is produced by W17 | W17 | owner, 2026-11-22 |
 | (f) | An era-init warm-start acceptance is governed by the sentinel of the era its init block opens | W-S2 follow-up | owner, 2026-11-22 |
-| (h) | Tests-only PRs may batch several WPs (one `laned:<WP>` label and one separately recorded accept run per WP; whole PR fails if any WP fails); implementation, tests-correction, evidence and review PRs stay one WP per PR (§3.1 rule 6) | all build WPs | owner, 2026-11-22 |
+| (h) | Tests-only PRs may batch several WPs (one `laned:<WP>` label and one separately recorded accept run per WP; whole PR fails if any WP fails); ~~implementation, tests-correction, evidence and review PRs stay one WP per PR (§3.1 rule 6)~~ **(rev6.17)** one PR per feature, tests + code together, any number of `laned:<WP>` labels; evidence and review PRs stay one WP per PR (§3.1 rules 1, 6, 7) | all build WPs | owner, 2026-11-22; rev6.17 owner, 2026-11-23 |
 
 **Owner inputs** (moved from Appendix A, rev6). These are inputs to runs, not
 design decisions. They're never guessed: the dependent WP stays
@@ -4684,6 +5143,15 @@ S8 is tracked separately.
 - Roles and the builder's no-edit list are in §3 conventions.
 - Appendix A and `LANE_D_PROGRESS.md` are retired in favour of this board
   (Proposed change 21 adopted).
+- **(rev6.17, owner 2026-11-23) The loop.** ~~Tests-only PR, then one
+  implementation PR per WP (or a ≤ 3-WP disjoint batch).~~ One PR per
+  feature: every WP the feature touches, one `laned:<WP>` label each, tests
+  and code together, `PATHS` additions in the same PR. CI runs each WP's
+  `--combined` (or full Accept), CROSS and the freshness guard; merge only
+  when green on a fresh base. Never loosen an existing assertion without
+  `laned:tests-correction` and a reason in the PR body. Plan text never
+  rides in a WP PR: one plan PR (no `laned:` label) per batch of owner
+  decisions.
 
 ---
 
