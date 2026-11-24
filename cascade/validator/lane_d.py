@@ -205,6 +205,8 @@ from .lane_d_state import (
 )
 
 POOL_SCHEMA = "pool_d/1"
+# W-IMG (plan rev6.24 (e)): the eval host code identity a settlement ran on
+EVAL_IMAGE_EXTENSION = "eval_image"
 OPEN_STATUSES = ("pending", "hold")
 
 
@@ -1011,7 +1013,8 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
                   bench=None, armed: dict | None = None,
                   boundary_ts: int | None = None,
                   max_channels: int | None = None,
-                  host: dict | None = None) -> LaneDSettlement:
+                  host: dict | None = None,
+                  eval_identity: dict | None = None) -> LaneDSettlement:
     """Settle lane D at ``boundary`` (see the module docstring).
 
     ``boundary_ts`` (rev6.14 (a)) is the boundary block's on-chain
@@ -1065,7 +1068,12 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     model, driver, torch build, fingerprint and the B6 host identity). Every
     forecast in ``forecasts`` came from that one host (B6). Given, it must be
     well formed (a ``ValueError`` before anything is read or written) and is
-    signed as the report's ``host``; ``None`` records no host."""
+    signed as the report's ``host``; ``None`` records no host.
+
+    ``eval_identity`` (W-IMG, plan rev6.24 (e)): the eval host's code
+    identity the forecasts ran on, recorded under ``extensions`` as
+    :data:`EVAL_IMAGE_EXTENSION` (logged, never consensus). ``None`` (every
+    settlement before ``[v2] image_epoch_from_block``) records nothing."""
     if not cfg.active(boundary):
         return LaneDSettlement(report=None, pay=None, receipt=None)
     if boundary_ts is not None and (isinstance(boundary_ts, bool) or not isinstance(boundary_ts, int)
@@ -1509,7 +1517,11 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
                        # confirm_pending state (never consensus).
                        **({CONFIRM_MIGRATION_EXTENSION: {"tag": CONFIRM_MIGRATION_TAG,
                                                          "entries": migrated}}
-                          if migrated else {})},
+                          if migrated else {}),
+                       # W-IMG: the eval image the forecasts ran on (logged)
+                       **({EVAL_IMAGE_EXTENSION: {k: str(v) for k, v in
+                                                  sorted(dict(eval_identity).items())}}
+                          if eval_identity else {})},
     }
     if draws:
         # W5j: the settlement's draw record, present iff a cohort was drawn

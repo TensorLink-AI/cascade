@@ -351,6 +351,10 @@ class _FundedPodMixin:
             payload = {"contract_digest": contract_digest(contract),
                        "warm_start_ckpt": str(warm_start_ckpt or ""),
                        "entry": dataclasses.asdict(entry)}
+            walls = getattr(self.__dict__.get("_leg_local_obj"), "wall_record", None)
+            if walls:
+                # W-IMG: rented on an image without measured walls, under the cap
+                payload.update(dict(walls))
             if funded_by:
                 # DEC-CA-0055: who paid for a v2 king leg ("king" / "operator")
                 payload["funded_by"] = str(funded_by)
@@ -1284,6 +1288,11 @@ class _FundedPodMixin:
             self._record_funded_failure(gen.hotkey, why, miner_fault=False,
                                         error_class=OPERATOR_BLOCKED_CLASS, burn=False)
             raise _FundedLegSkip(gen.hotkey)
+        if not prior_alloc:
+            from .cost_guards import note_unmeasured_wall
+
+            # W-IMG: an unmeasured image rents under the 5 h wall cap (recorded)
+            note_unmeasured_wall(self, rnd, f"funded leg {gen.hotkey[:12]}")
         # No blind retrain (2026-11-02: every ENOSPC harvest re-rented on the
         # MINER's key and retrained, ~$640 lost). A leg an our-side fault hit
         # AFTER it trained either re-harvests its KEPT pod (adopted below,

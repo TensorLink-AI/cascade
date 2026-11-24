@@ -540,3 +540,42 @@ Lane handling:
    to `[v2] prior_train_image_digests` and repin by hand (OPERATOR.md).
 6. If you need to stop the switch before lock-in: ship a release without the
    segment, or type an override.
+
+## Amendment W-IMG (plan rev6.24 (e), owner 2026-11-24): one image per seed epoch, no fixed pin
+
+Owner decision, verbatim: "can we relax need for image to be pinned"; "we
+need a system so that we roll all these lanes out, validators only need to
+update for major upgrades, not if we tweak training image or comp rules";
+"we just log what image pin was used, it's auditable".
+
+- **Lane A.** The image stays inside each leg's `contract_digest` (duel
+  reproducibility intact). From the first v2 seed epoch starting at or after
+  the typed `[v2] image_epoch_from_block` (CONSENSUS, release-then-activate,
+  an era start; a block inside an epoch defers to the next epoch start),
+  validators check that every entry of a settlement ran the image its own
+  declared contract names (`era_image_mixed`, `era_image_missing`) and that a
+  seed epoch's image never changes (`era_image_changed`; recorded in the
+  validator's `epoch_init` at the epoch's first handled settlement). The seed
+  epoch is keyed by the era stamp's `seed_block`
+  (`era.seed_epoch_start_block`), so the audit replays it statelessly
+  (`image-epoch`, and `image-epoch-chain` across receipts in
+  `scripts/replay_mainnet_receipts.py`).
+- **Trainer.** The `[v2] *_after` release is no longer tied to the switch
+  block: with W-IMG armed it binds at the next seed-epoch start at least two
+  eras ahead (`era.next_image_epoch_block`), persisted in
+  `image_epoch_state.json` and applied as `[v2] image_after_epoch_block`
+  (`era.image_after_from` generalises the switch block for `round_pins_at`,
+  `bind_image_after`, `leg_pins`, the rendered worker chain.toml and the
+  MarketCast leg kwarg). The qualification record still applies per after
+  image. **Unmeasured walls (owner 2026-11-24, "YES to the 5 h cap"):** a
+  funded or king rent on an image with no measured pod walls rents with
+  every leg wall capped at `[round] unmeasured_image_wall_cap_seconds`
+  (18000), records `walls_measured: false` and the cap in the leg record, and
+  is no longer refused (0 = the old refusal). Measured images are unchanged.
+- **Lanes B, C, D.** From the same block the signed records log the image:
+  `ExpertEntry.train_image_digest`, `LaneCEntry.train_image_digest`, and the
+  lane D report's `extensions.eval_image` (eval host code identity). No
+  enforcement. Dropped from every body at its default, so every earlier
+  record and receipt keeps its bytes.
+- **Before activation** every path is byte-identical: `image_epoch_from_block
+  = 0` returns the old switch block, adds no audit row and stamps nothing.

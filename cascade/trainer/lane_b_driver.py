@@ -58,6 +58,7 @@ from typing import Protocol
 import numpy as np
 
 from ..shared.atomic import read_text_with_backup, write_text_atomic
+from ..shared.era import image_record_at
 from . import expert_lane as _tel
 from .expert_lane import (
     GATE_TOKENS_SHORT,
@@ -145,6 +146,8 @@ class FinishedExpertLeg:
     gpu_name: str = ""
     # WB22 / WB25: GPUs the leg trained on (the rented layout); 0 = not recorded
     gpu_n: int = 0
+    # W-IMG: the worker image digest the leg ran ("" = not recorded)
+    train_image_digest: str = ""
 
 
 @dataclass
@@ -1122,7 +1125,7 @@ class LaneBDriver:
 
     def _leg_done(self, leg: OpenLeg, leg_pointer: str | None, corpus_digest: str = "",
                   train_block: int = 0, gpu_name: str = "", failure=None,
-                  gpu_n: int = 0) -> None:
+                  gpu_n: int = 0, train_image_digest: str = "") -> None:
         """A leg returned. ``failure`` (a funded leg's
         :class:`~cascade.trainer.lane_c_driver.LegFailure`) decides its queue
         entry: a miner fault ends it; anything else requeues it — a capacity
@@ -1141,7 +1144,8 @@ class LaneBDriver:
                 self.queue.finish(leg, ok=True)
                 self.st.finished.append(asdict(FinishedExpertLeg(
                     leg=asdict(leg), leg_pointer=leg_pointer, corpus_digest=corpus_digest,
-                    train_block=int(train_block), gpu_name=gpu_name, gpu_n=int(gpu_n))))
+                    train_block=int(train_block), gpu_name=gpu_name, gpu_n=int(gpu_n),
+                    train_image_digest=str(train_image_digest or ""))))
             elif leg.funding and not getattr(failure, "miner_fault", False):
                 msg = str(getattr(failure, "msg", "") or "leg produced no checkpoint")
                 cls = str(getattr(failure, "error_class", "") or "operator")
@@ -1275,6 +1279,9 @@ class LaneBDriver:
                 corpus_digest=f["corpus_digest"], train_block=int(f["train_block"]),
                 commit_block=int(sub["commit_block"]), gpu_name=f.get("gpu_name", ""),
                 gpu_n=int(f.get("gpu_n", 0) or 0), public_rows=rows, targets=declared if len(declared) > 1 else (),
+                # W-IMG: logged, never enforced; absent before the activation
+                train_image_digest=(str(f.get("train_image_digest", "") or "")
+                                    if image_record_at(self.cfg, int(block)) else ""),
                 # WB23: the signed leg length (0s = no train_hours: today's bytes)
                 train_hours=float((leg.get("funding") or {}).get("train_hours", 0.0) or 0.0),
                 leg_steps=int((leg.get("funding") or {}).get("leg_steps", 0) or 0),
@@ -1891,8 +1898,14 @@ class RunnerLaneBOps:
                 # WB22 / WB25: the leg's GPU count is the rented layout's (every
                 # GPU of it trains); 0 = not known (no rent recorded)
                 sku = str(getattr(loc, "funded_pod_sku", "") or "")
+                from ..shared.config import image_digest
+
                 done(leg, entry.trained_pointer, entry.corpus_digest, entry.train_block,
-                     getattr(entry, "gpu_name", ""), gpu_n=layout_gpus(sku) if sku else 0)
+                     getattr(entry, "gpu_name", ""), gpu_n=layout_gpus(sku) if sku else 0,
+                     # W-IMG: the image the leg ran (its contract's pin, which
+                     # the worker's FINAL image check enforced on the pod)
+                     train_image_digest=image_digest(str(
+                         getattr(contract, "train_image_digest", "") or "")))
             except LegFailure as f:
                 done(leg, None, failure=f)
             except Exception as e:  # noqa: BLE001 — an unclassified failure is ours

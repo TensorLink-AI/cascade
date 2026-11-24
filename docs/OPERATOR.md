@@ -226,6 +226,46 @@ Tier 2 uses the match to decide when a byte-exact checkpoint comparison
 applies. Rented pods boot `[round] funded_pod_image`; pin it as described in
 [Credentials on payer pods](#credentials-on-payer-pods).
 
+### Changing the worker image per seed epoch (W-IMG, plan rev6.24 (e))
+
+Once the fleet runs the W-IMG release and `[v2] image_epoch_from_block` is
+typed (an era start, deployed to every validator before it), validators no
+longer need a config change for a new training image:
+
+1. Commit the qualification record and measure the SKU walls on the new
+   image (the rent gates are unchanged).
+2. Set the trainer's `[v2] *_after` pins to the new release and restart the
+   trainer outside a scoring window with no legs in flight.
+3. The trainer binds the release at the next seed-epoch start at least two
+   eras ahead (log: `W-IMG: after image … BOUND at seed-epoch start block N`,
+   file `image_epoch_state.json`). Every leg of that epoch runs it; earlier
+   eras keep the current pins.
+4. Once that epoch has started and no earlier-epoch leg is in flight, move the
+   after pins into `[v2.training] train_image_digest` / `[round]` pins, append
+   the old pin to `[v2] prior_train_image_digests` and clear the `*_after`
+   pins (or set the next release).
+
+Validators reject a settlement whose entries ran mixed images
+(`era_image_mixed`) or whose image changed inside a seed epoch
+(`era_image_changed`).
+
+**An image without measured pod walls (owner 2026-11-24).** If
+`[round] funded_sku_wall_measured_image` names another image than the one a
+funded leg or king pod would rent, the rent is no longer refused. Instead:
+
+- every SKU's leg wall is planned at `[round]
+  unmeasured_image_wall_cap_seconds` (default 18000 = 5 h, never above the
+  contract's `max_train_seconds`), instead of the measured table;
+- the progress watchdog holds the leg to that cap;
+- the completed-leg record carries `walls_measured: false` and
+  `wall_cap_seconds`;
+- the trainer logs `image … has NO measured pod walls — renting with the
+  leg wall capped at 18000 s`.
+
+Measure the walls on the new image and set `funded_sku_wall_measured_image`
+to return to the table. `unmeasured_image_wall_cap_seconds = 0` restores the
+old refusal. A measured image behaves exactly as before.
+
 ### Re-pinning the image inside a v2 seed epoch (DEC-CA-0067)
 
 `train_image_digest` is part of `contract_digest`. Before DEC-CA-0067 is in
