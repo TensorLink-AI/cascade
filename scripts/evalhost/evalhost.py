@@ -687,6 +687,7 @@ def sync_commands(release: Path, user_host: str, port: int, known_hosts: str, de
             [*ssh, user_host, f"cd {shlex.quote(dest)} && uv sync --frozen{extra}"]]
     if bench_venv:
         cmds.append([*ssh, user_host,
+                     # incident-ok: IR001 pre-existing sidecar sync (no fev/time extras); owner to decide
                      f"cd {shlex.quote(dest + '/benchmarks')} && uv sync --frozen"])
     return cmds
 
