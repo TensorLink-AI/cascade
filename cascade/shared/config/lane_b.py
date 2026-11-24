@@ -45,44 +45,35 @@ LANE_B_TRACK_DEFAULTS: dict[str, object] = {
     "max_leg_hours": 6.0,
     "max_leg_seconds": 27_000,         # 6 h x 1.25
     "guard_factor": 1.25,
-    "ema_no_cooldown_from_block": 0,   # 0 = never (rev6.20; loader: era boundary)
 }
 
 # Lane B EMA, no cooldown (plan rev6.20, owner 2026-11-24: "let's just do EMA,
-# no cooldown"). From ``[lane_b] ema_no_cooldown_from_block`` (0 = never) a
-# lane B leg's contract carries this ``lr_schedule`` (warmup as WSD, then
-# constant LR to the last step, no decay tail) and its scored + merged
-# ``weights.safetensors`` is the image's sigma_rel 0.10 power EMA (the owner's
-# standing scored width, ``pyramid_trainer.POWER_EMA_SIGMA_RELS[POWER_EMA_EVAL]``).
-# The expert manifest entry records ``scored_weights``; judges re-derive it
-# from the entry's ``train_block``. Lane A never takes this schedule.
+# no cooldown"; no activation block, owner 2026-11-24: lanes B/C/D are not
+# rolled out yet, so this IS lane B). Every lane B leg's contract carries this
+# ``lr_schedule`` (warmup as WSD, then constant LR to the last step, no decay
+# tail) and its scored + merged ``weights.safetensors`` is the image's
+# sigma_rel 0.10 power EMA (the owner's standing scored width,
+# ``pyramid_trainer.POWER_EMA_SIGMA_RELS[POWER_EMA_EVAL]``). Every expert
+# manifest entry records ``scored_weights = "ema010"`` and judges refuse any
+# other value. Lane A never takes this schedule.
 LANE_B_EMA_SCHEDULE = "warmup_constant_ema"
 LANE_B_EMA_SIGMA_REL = 0.10
 LANE_B_SCORED_EMA = "ema010"
-# "" = the raw cooled endpoint (W-EMA; dropped from the manifest body)
+# what an entry may carry ("" = the raw cooled endpoint: parseable, refused
+# by the judge); what every lane B entry must carry is LANE_B_SCORED_EMA
 LANE_B_SCORED_WEIGHTS = ("", LANE_B_SCORED_EMA)
 
 
-def lane_b_scored_weights(lane_b_cfg, block: int | None) -> str:
-    """The ``scored_weights`` a lane B leg dispatched at ``block`` must carry:
-    ``"ema010"`` from ``ema_no_cooldown_from_block`` (> 0), else ``""``."""
-    n = int(getattr(lane_b_cfg, "ema_no_cooldown_from_block", 0) or 0)
-    return LANE_B_SCORED_EMA if n > 0 and block is not None and int(block) >= n else ""
-
-
-def lane_b_leg_schedule(lane_b_cfg, contract, block: int | None):
-    """The lane B leg contract at dispatch ``block``: ``contract`` unchanged
-    before the key (or while unset), else the same contract with
-    ``lr_schedule = LANE_B_EMA_SCHEDULE``. The ONE rule the trainer (expected
-    receipt digest) and the worker (the contract it trains) both apply."""
-    if not lane_b_scored_weights(lane_b_cfg, block):
-        return contract
+def lane_b_leg_contract(contract):
+    """The lane B leg contract: ``contract`` (the era's contract at the leg's
+    hours, ``for_hours``) with ``lr_schedule = LANE_B_EMA_SCHEDULE``. The ONE
+    rule the trainer (expected receipt digest) and the worker (the contract
+    it trains) both apply. Only the cascade_pyramid trainer implements it."""
     from dataclasses import replace
 
     if str(getattr(contract, "base_arch", "") or "") != "cascade_pyramid":
-        raise ValueError("[lane_b] ema_no_cooldown_from_block: the lane B EMA schedule "
-                         "needs a cascade_pyramid leg contract; got "
-                         f"{getattr(contract, 'base_arch', '')!r}")
+        raise ValueError("lane B legs (EMA, no cooldown) need a cascade_pyramid contract; "
+                         f"got {getattr(contract, 'base_arch', '')!r}")
     return replace(contract, lr_schedule=LANE_B_EMA_SCHEDULE)
 
 
@@ -190,9 +181,6 @@ def parse_lane_b_track(lb: dict, *,
         "max_leg_seconds": _int("max_leg_seconds",
                                 lb.get("max_leg_seconds", d["max_leg_seconds"]), lo=1),
         "guard_factor": _float("guard_factor", lb.get("guard_factor", d["guard_factor"])),
-        "ema_no_cooldown_from_block": _int(
-            "ema_no_cooldown_from_block",
-            lb.get("ema_no_cooldown_from_block", d["ema_no_cooldown_from_block"]), lo=0),
     }
     if out["suite_targets"] and not out["contamination_hashset"]:
         raise ValueError("[lane_b] suite_targets = true needs contamination_hashset pinned "

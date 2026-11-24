@@ -124,7 +124,7 @@ def test_lane_b_ema_leg_scores_the_sigma_0_10_average(tmp_path, contract, king, 
 def test_settlement_rebases_the_scored_ema_not_the_raw_endpoint(tmp_path, contract, king,
                                                                 monkeypatch):
     """settle_leg (the judged + merged checkpoint) is built from the leg's
-    scored weights.safetensors, and the trainer reads the leg as "ema010"."""
+    scored weights.safetensors (the EMA), not from weights_raw."""
     import torch
     from safetensors.torch import load_file
 
@@ -132,9 +132,6 @@ def test_settlement_rebases_the_scored_ema_not_the_raw_endpoint(tmp_path, contra
     from cascade.trainer.moe_model import rebase_expert_delta
 
     leg, selection, _ = _ema_leg(tmp_path, contract, king, monkeypatch)
-    from cascade.trainer.lane_b_driver import leg_scored_weights
-
-    assert leg_scored_weights(leg.local_dir) == "ema010"
     rebased = settle_leg(king, king, leg.local_dir, selection, tmp_path / "rebased")
     got = load_file(str(rebased / "weights.safetensors"))
     kw = load_file(str(king / "weights.safetensors"))

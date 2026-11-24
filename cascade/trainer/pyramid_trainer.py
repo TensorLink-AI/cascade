@@ -173,9 +173,9 @@ def power_ema_active(warm_start_dir, expert_selection):
 def lane_b_ema_leg(lr_schedule, expert_selection):
     """Is this a lane B EMA / no-cooldown leg (plan rev6.20, owner
     2026-11-24)? ``True`` iff the leg contract's ``lr_schedule`` is
-    ``"warmup_constant_ema"`` (set only by ``lane_b_leg_schedule`` from
-    ``[lane_b] ema_no_cooldown_from_block``) on an expert leg; ``False`` for
-    ``"wsd"`` (every lane A leg and every lane B leg before the key). Any
+    ``"warmup_constant_ema"`` (set by ``lane_b_leg_contract`` on every lane B
+    leg contract) on an expert leg; ``False`` for ``"wsd"`` (every lane A
+    leg, and an expert leg trained directly on the era contract). Any
     other schedule, or the EMA schedule on a lane A leg, is refused. Pure."""
     if lr_schedule == "wsd":
         return False

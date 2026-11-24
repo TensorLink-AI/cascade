@@ -374,15 +374,6 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
         if not _v2_from or _ab < _v2_from or _ab % _ab_era:
             raise ValueError("[lane_b] acceptance_from_block must be an era boundary "
                              "at or after [v2] from_block")
-    _en = int(lane_b.ema_no_cooldown_from_block)
-    if _en:
-        # plan rev6.20: a typed era boundary at/after the v2 go-live, like
-        # acceptance_from_block (legs dispatched at or after it take the rule)
-        _en_grid = _ebp if (_eab and _ebp and 0 < _en < _eab) else _eb
-        _en_era = max(1, _en_grid) * max(1, _era_settlements)
-        if not _v2_from or _en < _v2_from or _en % _en_era:
-            raise ValueError("[lane_b] ema_no_cooldown_from_block must be an era boundary "
-                             "at or after [v2] from_block")
     # DEC-CA-0056: lane C's typed block must be an era boundary on the grid
     # in force at it, at or after the v2 go-live (checked inside parse_lane_c).
     # DEC-CA-0064: [marketcast] suites admit the mkt:<suite> lane-C targets

@@ -3225,7 +3225,7 @@ def _check_lane_b_weights(name: str, receipt: RoundReceipt, cfg: ChainConfig,
                        f"payout record to rebuild it ({passing} passing legs this round)")
 
 
-# "scored_weights": plan rev6.20 ([lane_b] ema_no_cooldown_from_block)
+# "scored_weights": plan rev6.20 (a lane B leg that did not score its EMA)
 LANE_B_STAGES = ("stale", "selection", "merge", "verdict", "targets", "scored_weights")
 
 

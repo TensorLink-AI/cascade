@@ -278,12 +278,12 @@ def main(argv: list[str] | None = None) -> int:
             guard_factor=cfg.round.heat_guard_factor,
             guard_floor_seconds=cfg.round.heat_guard_floor_seconds,
         )
-        # plan rev6.20: from [lane_b] ema_no_cooldown_from_block the leg trains
-        # with no cooldown and scores its power EMA — the same rule the
-        # trainer applies to the contract whose digest it expects back
-        from ..shared.config.lane_b import lane_b_leg_schedule
+        # plan rev6.20: every lane B leg trains with no cooldown and scores its
+        # power EMA — the same rule the trainer applies to the contract whose
+        # digest it expects back
+        from ..shared.config.lane_b import lane_b_leg_contract
 
-        contract = lane_b_leg_schedule(cfg.lane_b, contract, int(args.block))
+        contract = lane_b_leg_contract(contract)
     if args.anneal:
         contract = anneal_recipe(contract)
     if args.router_slow:

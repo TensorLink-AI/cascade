@@ -16,5 +16,5 @@ cascade/trainer/pyramid_trainer.py
 tests/unit/test_pyramid_power_ema.py
 # Plan rev6.20 (owner 2026-11-24, lane B only: EMA, no cooldown): the expert
 # role turns its for_hours leg contract into the lane B leg contract with
-# lane_b_leg_schedule (cascade/shared/config/lane_b.py, WB10) at --block.
+# lane_b_leg_contract (cascade/shared/config/lane_b.py, WB10).
 cascade/trainer/worker.py

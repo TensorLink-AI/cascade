@@ -1107,6 +1107,7 @@ class LaneBDriver:
         once the whole settlement succeeded — an I/O failure anywhere keeps
         them for the next settlement (and binds nothing this round).
         Idempotent per ``round_id``."""
+        from ..shared.config.lane_b import LANE_B_SCORED_EMA
         from ..shared.expert_manifest import ExpertEntry, ExpertManifest, leg_label
         from .moe_model import MergeError
 
@@ -1168,21 +1169,9 @@ class LaneBDriver:
             declared = tuple(sub.get("targets") or (sub["domain"],))
             label = leg_label(declared)          # == the domain for a single target
             out = Path(work_dir) / f"rebased-{rid}-{sub['hotkey'][:12]}-{label}"
-            base_dir = self.ops.fetch(leg["base_king_ref"])
-            leg_dir = self.ops.fetch(f["leg_pointer"])
-            # plan rev6.20: the leg must have scored what the rule says at its
-            # dispatch block (its checkpoint marker); the rebased checkpoint —
-            # judged and merged — is built from that same weights.safetensors
-            scored = lb.scored_weights_at(int(f["train_block"]))
-            got = leg_scored_weights(leg_dir)
-            if got != scored:
-                log.warning("lane B: %s/%s scored %r, the rule at block %s says %r — dropped",
-                            sub["hotkey"][:8], sub["domain"], got, f["train_block"], scored)
-                _drop(f, "scored_weights_mismatch", {"scored_weights": got, "expected": scored,
-                                                     "train_block": int(f["train_block"])})
-                continue
             try:
-                rebased = settle_leg(king_dir, base_dir, leg_dir, sel, out,
+                rebased = settle_leg(king_dir, self.ops.fetch(leg["base_king_ref"]),
+                                     self.ops.fetch(f["leg_pointer"]), sel, out,
                                      refuse_nonfinite=lb.merge_guard_at_settlement(block))
             except MergeError as e:
                 log.warning("lane B: %s/%s refused at settlement: %s", sub["hotkey"][:8],
@@ -1209,7 +1198,9 @@ class LaneBDriver:
                 corpus_digest=f["corpus_digest"], train_block=int(f["train_block"]),
                 commit_block=int(sub["commit_block"]), gpu_name=f.get("gpu_name", ""),
                 gpu_n=int(f.get("gpu_n", 0) or 0), public_rows=rows, targets=declared if len(declared) > 1 else (),
-                scored_weights=scored))
+                # plan rev6.20: the receipt check (receipt_contract_ok) bound
+                # the pod to the lane B EMA leg contract, so it scored its EMA
+                scored_weights=LANE_B_SCORED_EMA))
             used.append((ptr, f, sel))
         judgements: list = []
         digest = ""
@@ -1597,34 +1588,6 @@ class LaneBDriver:
         return ptr, chosen
 
 
-def leg_scored_weights(leg_dir) -> str:
-    """Which weights a finished lane B leg checkpoint scores, from its
-    ``config.json`` ``power_ema`` marker (plan rev6.20): ``"ema010"`` for the
-    lane B EMA / no-cooldown schedule at sigma_rel 0.10, ``""`` for the raw
-    cooled endpoint (no marker, or no readable ``config.json``: today's
-    leg, which the armed rule then refuses), ``"?"`` for any other marker —
-    never equal to an expected value."""
-    import json
-
-    from ..shared.config.lane_b import (
-        LANE_B_EMA_SCHEDULE,
-        LANE_B_EMA_SIGMA_REL,
-        LANE_B_SCORED_EMA,
-    )
-
-    try:
-        meta = json.loads((Path(leg_dir) / "config.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError):
-        return ""
-    marker = meta.get("power_ema") if isinstance(meta, dict) else None
-    if marker is None:
-        return ""
-    if (isinstance(marker, dict) and marker.get("schedule") == LANE_B_EMA_SCHEDULE
-            and marker.get("scored_sigma_rel") == LANE_B_EMA_SIGMA_REL):
-        return LANE_B_SCORED_EMA
-    return "?"
-
-
 def _latest_commitments(rows) -> dict:
     """hotkey -> its LATEST commitment row (highest ``commit_block``)."""
     out: dict = {}
@@ -1785,10 +1748,10 @@ class RunnerLaneBOps:
                     guard_factor=self.r.cfg.round.heat_guard_factor,
                     guard_floor_seconds=self.r.cfg.round.heat_guard_floor_seconds)
                 # plan rev6.20: the worker derives the same leg contract
-                # (EMA, no cooldown from [lane_b] ema_no_cooldown_from_block)
-                from ..shared.config.lane_b import lane_b_leg_schedule
+                # (every lane B leg: EMA, no cooldown)
+                from ..shared.config.lane_b import lane_b_leg_contract
 
-                contract = lane_b_leg_schedule(self.r.cfg.lane_b, contract, int(block))
+                contract = lane_b_leg_contract(contract)
                 label = leg_label(leg.sub.declared)   # the domain for a single target
                 gen = ResolvedGenerator(hotkey=leg.sub.hotkey, uid=leg.sub.uid,
                                         ref=leg.sub.gen_ref)
@@ -1904,9 +1867,9 @@ class RunnerLaneBOps:
                         self.r.cfg.lane_b.leg_hours,
                         guard_factor=self.r.cfg.round.heat_guard_factor,
                         guard_floor_seconds=self.r.cfg.round.heat_guard_floor_seconds)
-                    from ..shared.config.lane_b import lane_b_leg_schedule
+                    from ..shared.config.lane_b import lane_b_leg_contract
 
-                    lc = lane_b_leg_schedule(self.r.cfg.lane_b, lc, int(block))
+                    lc = lane_b_leg_contract(lc)
                     entry = self.r.train_one(
                         gen, "challenger", seeds, block, contract=lc,
                         token_budget=lc.train_tokens, repo_suffix=suffix,

@@ -1493,7 +1493,13 @@ only a release can change. Read the effective values with
 | `max_leg_hours` | `6.0` | The most training hours a lane B leg may ask for, in 0.5 h steps. |
 | `max_leg_seconds` | `27000` | Hard wall-clock cap on a lane B leg (6 h × 1.25). |
 | `guard_factor` | `1.25` | Leg guard: train hours × this factor plus overhead, capped at `max_leg_seconds`. |
-| `ema_no_cooldown_from_block` | `0` | From this era-boundary block (0 = never), a lane B leg trains with no LR cooldown (warmup, then constant LR to the end), and its scored and merged weights are its σ_rel 0.10 power EMA. The expert manifest records this as `scored_weights = "ema010"`. Lane A is unaffected. |
+
+Every lane B leg trains with no learning-rate cooldown: the learning rate
+warms up, then stays at its peak to the last step. Its scored and merged
+weights are its own σ_rel 0.10 power EMA, not the raw endpoint. The expert
+manifest records this on every entry as `scored_weights = "ema010"`, and
+validators refuse an entry without it. No key turns this on or off. Lane A
+is unaffected.
 
 ### Lane B suite targets
 

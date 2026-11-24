@@ -60,11 +60,11 @@ class ExpertEntry:
     # canonical body, so an entry without it keeps its bytes.
     gpu_n: int = 0
     # plan rev6.20 (owner 2026-11-24): which weights the leg scored (and the
-    # rebased / merged checkpoint carries): "ema010" = the sigma_rel 0.10
-    # power EMA of a no-cooldown leg, from [lane_b] ema_no_cooldown_from_block;
-    # "" = the raw cooled endpoint — dropped from the canonical body, so an
-    # entry without it keeps its bytes. Judges re-derive it from train_block.
-    scored_weights: str = ""
+    # rebased / merged checkpoint carries). Every lane B leg scores its
+    # sigma_rel 0.10 power EMA of a no-cooldown leg: "ema010", always in the
+    # signed body. A manifest that lacks the field loads as "" (the raw cooled
+    # endpoint), which the judge refuses (stage ``scored_weights``).
+    scored_weights: str = "ema010"
 
     def __post_init__(self) -> None:
         from .config.lane_b import LANE_B_SCORED_WEIGHTS
@@ -116,8 +116,6 @@ class ExpertManifest:
                 e["targets"] = list(e["targets"])
             if not e.get("gpu_n"):
                 e.pop("gpu_n", None)          # not recorded: today's bytes
-            if not e.get("scored_weights"):
-                e.pop("scored_weights", None)  # raw cooled endpoint: today's bytes
         return json.dumps(d, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
     def digest(self) -> str:
@@ -135,6 +133,8 @@ def load_expert_manifest(text: str) -> ExpertManifest:
         raise ValueError(f"unsupported expert manifest version {o.get('version')}")
     entries = tuple(
         ExpertEntry(**{**e,
+                       # no record = not an EMA-scored leg (refused when judged)
+                       "scored_weights": e.get("scored_weights", ""),
                        "selection": {int(k): list(v) for k, v in e["selection"].items()},
                        "exclude": {int(k): list(v) for k, v in e["exclude"].items()}})
         for e in o["entries"]

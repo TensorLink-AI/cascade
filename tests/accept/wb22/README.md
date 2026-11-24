@@ -123,8 +123,7 @@ nice -n 19 env PYTHONPATH=<wt> python -P -m pytest --rootdir <wt> \
 
 ## rev6.20 (owner 2026-11-24): `scored_weights`
 
-`ExpertEntry.scored_weights` (`"ema010"` | `""`, dropped at `""`); the
-dispatch paths apply `lane_b_leg_schedule`; `settle` drops a leg whose
-checkpoint marker (`leg_scored_weights`) disagrees with the rule at its
-`train_block` (`scored_weights_mismatch`) and records the value on the
-entry. `test_wb22_scored_weights.py`.
+`ExpertEntry.scored_weights` defaults to `"ema010"` and is always in the
+signed body; a manifest without it loads as `""` (refused by the judge). The
+dispatch paths build `lane_b_leg_contract(...)`; `settle` records `"ema010"`
+on every entry. `test_wb22_scored_weights.py`.

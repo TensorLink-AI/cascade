@@ -162,9 +162,10 @@ is pinned under its own name).
 ## rev6.20 (owner 2026-11-24): lane B legs train with EMA, no cooldown
 
 Lane B only. Lane A keeps everything above (every test above is unchanged).
-From `[lane_b] ema_no_cooldown_from_block` (WB10; 0 = never) the trainer and
-the worker derive the lane B leg contract with `lr_schedule =
-"warmup_constant_ema"` (`lane_b_leg_schedule`). `train_pyramid` then:
+With no activation key (owner 2026-11-24: lanes B/C/D are not rolled out),
+the trainer and the worker derive every lane B leg contract with
+`lr_schedule = "warmup_constant_ema"` (`lane_b_leg_contract`, WB10).
+`train_pyramid` then:
 
 - recognises the schedule with the pure `lane_b_ema_leg(lr_schedule,
   expert_selection)`: `False` for `"wsd"`, `True` for the EMA schedule on an

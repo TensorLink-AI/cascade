@@ -5,9 +5,8 @@ Per entry, in order — the first failure rejects the entry:
 
 1. ``stale``     the leg must be rebased onto THIS validator's current king
                  (``ExpertManifest.king_pointer`` == the king pointer it holds);
-1b. ``scored_weights`` (plan rev6.20) the entry's recorded scored weights must
-                 be what ``[lane_b] ema_no_cooldown_from_block`` gives at its
-                 ``train_block`` ("ema010" from it, "" = raw before / unset);
+1b. ``scored_weights`` (plan rev6.20) every lane B leg scores (and merges) its
+                 sigma_rel 0.10 power EMA: the entry must record "ema010";
 2. ``selection`` only when a re-derivation hook is passed (tests, tools):
                  the expert rows must equal the ESFT selection on the king +
                  affinity slice + recorded ``exclude``. The live validator
@@ -177,13 +176,13 @@ def judge_entry(entry: ExpertEntry, *, manifest: ExpertManifest, king_pointer: s
         return ExpertJudgement(entry, False, "targets",
                                f"declared targets {list(declared)} are not 1..max_domains_per_leg"
                                f" configured lane-B targets")
-    # plan rev6.20: the weights the leg scored (and that merge) are re-derived
-    # from its dispatch block and [lane_b] ema_no_cooldown_from_block
-    want = _scored_weights_rule(cfg, entry.train_block)
-    if entry.scored_weights != want:
+    # plan rev6.20: every lane B leg scores (and merges) its power EMA
+    from ..shared.config.lane_b import LANE_B_SCORED_EMA
+
+    if entry.scored_weights != LANE_B_SCORED_EMA:
         return ExpertJudgement(entry, False, "scored_weights",
-                               f"entry scored {entry.scored_weights or 'raw'!r}, the rule at "
-                               f"train_block {entry.train_block} says {want or 'raw'!r}")
+                               f"entry scored {entry.scored_weights or 'raw'!r}; lane B legs "
+                               f"score {LANE_B_SCORED_EMA!r}")
     if recompute_selection is not None:
         from ..trainer.expert_lane import union_selection
 
@@ -251,14 +250,6 @@ def judge_entry(entry: ExpertEntry, *, manifest: ExpertManifest, king_pointer: s
     reason = (f"won {won}" if won else (tv.guard_reason or "no target won"))
     return ExpertJudgement(entry, bool(won), "verdict", reason, v, king_pointer=king_pointer,
                            targets=tv)
-
-
-def _scored_weights_rule(cfg, block) -> str:
-    """``scored_weights`` the rule expects at ``block`` (``""`` for a config
-    without the key: the raw cooled endpoint, today's judgement)."""
-    from ..shared.config.lane_b import lane_b_scored_weights
-
-    return lane_b_scored_weights(cfg, block)
 
 
 def _targets(cfg) -> tuple[str, ...]:
