@@ -265,3 +265,208 @@ def test_the_lock_file_is_never_an_entry(tmp_path, name):
     assert (root / LOCK_FILE).is_file()
     assert _cache(root, 10_000).entries() == [x.digest]
     assert os.path.basename(LOCK_FILE).startswith(".")
+
+
+# ── shared pins and scoring leases ──────────────────────────────────────────
+# A path the cache returns is read outside the lock (the forecast runs for
+# minutes). Pins (KING_D, house) and every entry being fetched or scored are
+# shared across processes: eviction by ANY process skips them.
+
+
+def _lease_files(root: Path) -> list[str]:
+    from cascade.eval.lane_d_cache import LEASE_PREFIX
+
+    return sorted(p.name for p in root.iterdir()
+                  if p.name.startswith(LEASE_PREFIX) and ".tmp-" not in p.name)
+
+
+def _scorer_proc(root: str, flags: str, out: str) -> None:
+    """Lease entry 1, admit it, signal ``ready``, then read its bytes until
+    ``done`` appears (the evictor runs meanwhile) and record the verdict."""
+    try:
+        x = Entry(1)
+        c = _cache(root, 2000)
+        with c.lease(x.digest):
+            path = c.ensure(x.digest, x.fill)
+            (Path(flags) / "ready").touch()
+            deadline = time.time() + 60
+            while not (Path(flags) / "done").exists():
+                assert read_tree(path) == x.files, "a leased entry changed mid-score"
+                assert time.time() < deadline, "evictor never finished"
+                time.sleep(0.01)
+            assert read_tree(path) == x.files
+        Path(out).write_text("ok", encoding="utf-8")
+    except BaseException:
+        Path(out).write_text(traceback.format_exc(), encoding="utf-8")
+
+
+def _evictor_proc(root: str, flags: str, out: str) -> None:
+    """Under a two-entry budget, admit entries 2..6: each admission must evict
+    the LRU unprotected entry. Entry 1 (leased by the scorer) is the LRU."""
+    try:
+        deadline = time.time() + 60
+        while not (Path(flags) / "ready").exists():
+            assert time.time() < deadline, "scorer never got ready"
+            time.sleep(0.01)
+        c = _cache(root, 2000)
+        for i in range(2, 7):
+            y = Entry(i)
+            c.put(y.digest, y.fill)
+            assert Entry(1).digest in c.entries(), f"entry {i} evicted the leased entry"
+        (Path(flags) / "done").touch()
+        Path(out).write_text("ok", encoding="utf-8")
+    except BaseException:
+        (Path(flags) / "done").touch()
+        Path(out).write_text(traceback.format_exc(), encoding="utf-8")
+
+
+def test_a_scorer_lease_blocks_eviction_by_another_process(tmp_path):
+    """An evictor process under budget pressure plus a scorer process holding a
+    lease on the LRU entry: the leased entry is never evicted while the scorer
+    reads it; once the lease is released it is evictable again."""
+    root, flags = tmp_path / "shared", tmp_path / "flags"
+    flags.mkdir()
+    _cache(root, 2000)
+    ctx = multiprocessing.get_context("fork")
+    outs = [tmp_path / "scorer.out", tmp_path / "evictor.out"]
+    procs = [ctx.Process(target=_scorer_proc, args=(str(root), str(flags), str(outs[0]))),
+             ctx.Process(target=_evictor_proc, args=(str(root), str(flags), str(outs[1])))]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(120)
+        assert p.exitcode == 0
+    for o in outs:
+        assert o.read_text(encoding="utf-8") == "ok", o.read_text(encoding="utf-8")
+    assert _lease_files(root) == [], "a released lease left its file"
+    c = _cache(root, 2000)
+    x = Entry(1)
+    assert x.digest in c.entries() and c.total_bytes() <= 2000
+    # Released: the next admissions evict it as the LRU entry it is.
+    for i in (7, 8):
+        y = Entry(i)
+        c.put(y.digest, y.fill)
+    assert x.digest not in c.entries()
+
+
+def test_a_lease_taken_before_the_fill_protects_the_entry_once_admitted(tmp_path):
+    root = tmp_path / "shared"
+    scorer, other = _cache(root, 2000), _cache(root, 2000)
+    x, y, z = Entry(1), Entry(2), Entry(3)
+    with scorer.lease(x.digest):
+        assert scorer.leased() == frozenset({x.digest})
+        scorer.put(x.digest, x.fill)
+        other.put(y.digest, y.fill)
+        other.put(z.digest, z.fill)          # must evict y, not the leased (older) x
+        assert other.entries() == [x.digest, z.digest]
+    assert other.leased() == frozenset()
+
+
+def test_stale_leases_are_reclaimed(tmp_path):
+    """A lease whose owner pid is gone, or whose expiry passed, or that does
+    not parse, is stale: eviction ignores it and the scan deletes it."""
+    import json
+
+    from cascade.eval.lane_d_cache import LEASE_PREFIX
+
+    root = tmp_path / "shared"
+    c = _cache(root, 2000)
+    x, y, z = Entry(1), Entry(2), Entry(3)
+    c.put(x.digest, x.fill)
+    ctx = multiprocessing.get_context("fork")
+    gone = ctx.Process(target=os._exit, args=(0,))
+    gone.start()
+    gone.join(30)
+    dead_pid = gone.pid
+    stale = {
+        f"{LEASE_PREFIX}{x.digest}-{dead_pid}-a.json":
+            {"digest": x.digest, "pid": dead_pid, "expires": time.time() + 3600},
+        f"{LEASE_PREFIX}{x.digest}-{os.getpid()}-b.json":
+            {"digest": x.digest, "pid": os.getpid(), "expires": time.time() - 1},
+    }
+    for name, body in stale.items():
+        (root / name).write_text(json.dumps(body), encoding="utf-8")
+    (root / f"{LEASE_PREFIX}{x.digest}-1-c.json").write_text("{not json", encoding="utf-8")
+    assert c.leased() == frozenset()
+    assert _lease_files(root) == []
+    c.put(y.digest, y.fill)
+    c.put(z.digest, z.fill)                  # x (LRU, no live lease) is evicted
+    assert c.entries() == [y.digest, z.digest]
+
+
+def test_lease_refuses_a_bad_digest_or_ttl(tmp_path):
+    from cascade.eval.lane_d_cache import CacheError
+
+    c = _cache(tmp_path / "c", 2000)
+    with pytest.raises(CacheError), c.lease("../etc"):
+        pass
+    for bad in (0, -1, True, "1"):
+        with pytest.raises(ValueError), c.lease(Entry(1).digest, ttl_s=bad):
+            pass
+    assert _lease_files(tmp_path / "c") == []
+
+
+def test_pins_are_shared_across_instances_and_processes(tmp_path):
+    """KING_D pinned by one cache is honoured by a pinless cache on the same
+    root (another process's eviction must not drop the king); clearing the
+    pins releases it."""
+    root = tmp_path / "shared"
+    king, y, z = Entry(1), Entry(2), Entry(3)
+    pinned = _cache(root, 2000, king_d=king.digest)
+    pinned.put(king.digest, king.fill)
+
+    def evict_in_child(out):
+        try:
+            c = _cache(root, 2000)           # no pins of its own
+            c.put(y.digest, y.fill)
+            c.put(z.digest, z.fill)          # must evict y, never the shared-pinned king
+            assert king.digest in c.entries()
+            assert king.digest in c.protected()
+            Path(out).write_text("ok", encoding="utf-8")
+        except BaseException:
+            Path(out).write_text(traceback.format_exc(), encoding="utf-8")
+
+    out = tmp_path / "child.out"
+    p = multiprocessing.get_context("fork").Process(target=evict_in_child, args=(str(out),))
+    p.start()
+    p.join(60)
+    assert p.exitcode == 0 and out.read_text(encoding="utf-8") == "ok", out.read_text()
+    assert pinned.entries() == [king.digest, z.digest]
+    pinned.set_pinned(king_d=None, house=None)
+    other = _cache(root, 2000)
+    other.put(y.digest, y.fill)               # king is now the unprotected LRU
+    assert king.digest not in other.entries()
+
+
+def test_forecast_entry_holds_a_lease_while_scoring(tmp_path):
+    """lane_d_forecasts.forecast_entry leases the entry from before the fetch
+    until the forecast returns; the lease is gone afterwards, also when the
+    scorer fails."""
+    import numpy as np
+
+    from cascade.eval.lane_d_forecasts import LaneDForecastError, forecast_entry
+
+    root = tmp_path / "shared"
+    cache = _cache(root, 10_000)
+    x = Entry(1)
+    cache.put(x.digest, x.fill)
+    seen: list[frozenset] = []
+
+    def scorer(ckpt, histories, *, context, horizon, contexts, device):
+        seen.append(_cache(root, 10_000).leased())
+        return np.zeros((len(histories), horizon, 9))
+
+    wins = [{"window_id": "w0", "history": np.arange(64.0)}]
+    q = forecast_entry(cache, x.digest, wins, context=4096, horizon=8, contexts=(4096,),
+                       forecast=scorer)
+    assert q.shape == (1, 8, 9)
+    assert seen == [frozenset({x.digest})]
+    assert cache.leased() == frozenset() and _lease_files(root) == []
+
+    def crash(*a, **k):
+        raise RuntimeError("CUDA OOM")
+
+    with pytest.raises(LaneDForecastError):
+        forecast_entry(cache, x.digest, wins, context=4096, horizon=8, contexts=(4096,),
+                       forecast=crash)
+    assert _lease_files(root) == []
