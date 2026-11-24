@@ -931,7 +931,10 @@ network_id = "bittensor:test"
 # `cfg-<8 hex>` note segment, 51 % of permit stake) and applies at its
 # era-start effective_block (or the first era start after a late lock-in).
 # "" = completely inert: nothing fetched, signalled or applied.
-owner_hotkey = ""
+# Owner 2026-11-24: the testnet main validator hotkey (validator0, netuid
+# 259) — must equal [manifest] validator_hotkey (check_bench_source,
+# docs/OPERATOR.md item 6); NOT the subnet-owner hotkey (trainer_hotkey).
+owner_hotkey = "5F1VmMSaPPi2qm91HE8VyMiHoCz4YxGaexJ3qmbyAPBUcUtR"
 poll_seconds = 300                 # how often latest.json is re-read
 
 [satellite]
