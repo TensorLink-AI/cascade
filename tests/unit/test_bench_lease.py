@@ -354,6 +354,79 @@ def test_pod_running_a_sweep_is_never_released(tmp_path):
     assert prov.live == set()
 
 
+def test_release_probe_is_the_self_safe_pattern(tmp_path):
+    """The release path sends BENCH_BUSY_PROBE, never the old self-matching
+    bare ``pgrep -f cascade_benchmark``."""
+    from cascade.validator.bench_lease import BENCH_BUSY_PROBE
+
+    ssh = FakeSSH()
+    lease, _, _, clock = _lease(tmp_path, ssh=ssh, idle_release_minutes=20)
+    lease.need()
+    lease.need()
+    clock.advance(21)
+    lease.tick()
+    probes = [c for _, c in ssh.calls if c.startswith("pgrep")]
+    assert probes == [BENCH_BUSY_PROBE]
+    assert "cascade_benchmark" not in BENCH_BUSY_PROBE
+
+
+@pytest.mark.parametrize("cmdline, busy", [
+    # the real on-pod sidecar shapes (eval_offload.build_bench_remote_command)
+    ("timeout --signal=TERM --kill-after=15s 14385s /root/.local/bin/uv run --project "
+     "/root/cascade/benchmarks --extra fev cascade-benchmark /root/ck /root/r.json", True),
+    ("/root/cascade/benchmarks/.venv/bin/python /root/cascade/benchmarks/.venv/bin/"
+     "cascade-benchmark /root/ck /root/r.json --suites gift-eval", True),
+    ("python -m cascade_benchmark.direct_cli --x 1", True),
+    # the probe's own remote wrapper shell (sshd runs `$SHELL -c '<probe>'`)
+    ("bash -c pgrep -f '[c]ascade[-_]benchmark' >/dev/null", False),
+    ("pgrep -f [c]ascade[-_]benchmark", False),
+    ("/usr/sbin/sshd -D", False),
+])
+def test_busy_pattern_matches_sweeps_never_itself(cmdline, busy):
+    import re
+
+    from cascade.validator.bench_lease import BENCH_BUSY_PATTERN, BENCH_BUSY_PROBE
+
+    # pgrep -f is an ERE search over the full command line; this bracket/class
+    # pattern means the same in Python re.
+    assert bool(re.search(BENCH_BUSY_PATTERN, cmdline)) is busy
+    # and the probe string itself (the wrapper's argv) never matches
+    assert re.search(BENCH_BUSY_PATTERN, BENCH_BUSY_PROBE) is None
+
+
+@pytest.mark.skipif(not (Path("/proc").is_dir() and __import__("shutil").which("pgrep")
+                         and __import__("shutil").which("bash")),
+                    reason="needs /proc, pgrep and bash")
+def test_busy_probe_through_a_real_wrapper_shell():
+    """End to end on a real shell: the probe run as ``bash -c '<probe>; true'``
+    (the wrapper survives, as under sshd) sees a decoy ``cascade-benchmark``
+    process and stops seeing it once it exits — and does NOT see itself (the
+    old bare pattern does, which is the bug)."""
+    import time
+
+    from cascade.validator.bench_lease import BENCH_BUSY_PROBE
+
+    def probe(cmd: str) -> int:
+        return subprocess.run(["bash", "-c", f"{cmd}; rc=$?; exit $rc"],
+                              capture_output=True, timeout=30).returncode
+
+    old = "pgrep -f cascade_benchmark_selfmatch_token >/dev/null"
+    assert probe(old) == 0  # the old shape matches its own wrapper shell
+    if probe(BENCH_BUSY_PROBE) == 0:
+        pytest.skip("a real cascade-benchmark process runs on this host")
+    decoy = subprocess.Popen(["bash", "-c", "exec -a cascade-benchmark sleep 30"])
+    try:
+        for _ in range(50):
+            if probe(BENCH_BUSY_PROBE) == 0:
+                break
+            time.sleep(0.1)
+        assert probe(BENCH_BUSY_PROBE) == 0
+    finally:
+        decoy.kill()
+        decoy.wait(timeout=10)
+    assert probe(BENCH_BUSY_PROBE) == 1
+
+
 def test_tick_without_a_need_never_rents(tmp_path):
     lease, prov, _, clock = _lease(tmp_path)
     for _ in range(10):

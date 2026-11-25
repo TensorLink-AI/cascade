@@ -46,6 +46,14 @@ log = logging.getLogger("cascade.provision.main")
 
 # ── config (pure parse + validation; tested) ─────────────────────────────────
 
+# Every [provisioner.<stage>] built here (eval, mkt) rents GPUs (gpus_per_pod
+# >= 1). Owner rule 2026-11-24: GPU = Lium only, Shadeform = CPU hosts only —
+# a GPU stage naming shadeform is refused at load, and the default is Lium.
+# (The retired heat/final tables are not built here: their providers stay
+# reachable through provider_names for ledger teardown only.)
+GPU_STAGE_PROVIDERS = ("lium",)
+CPU_ONLY_PROVIDERS = frozenset({"shadeform"})
+
 
 def build_stage_policy(raw: dict, stage: str) -> StagePolicy:
     """One ``[provisioner.<stage>]`` table → a validated :class:`StagePolicy`."""
@@ -63,9 +71,15 @@ def build_stage_policy(raw: dict, stage: str) -> StagePolicy:
     price = float(raw.get("max_price_hr", 0))
     if price <= 0:
         raise ProvisionError(f"[provisioner.{stage}] max_price_hr must be > 0; got {price}")
-    providers = tuple(str(p) for p in raw.get("providers", ("lium", "shadeform")))
+    providers = tuple(str(p) for p in raw.get("providers", GPU_STAGE_PROVIDERS))
     if not providers:
         raise ProvisionError(f"[provisioner.{stage}] providers must list at least one adapter")
+    gpu_only_off = [p for p in providers if p.strip().lower() in CPU_ONLY_PROVIDERS]
+    if gpu_only_off:
+        raise ProvisionError(
+            f"[provisioner.{stage}] providers lists {gpu_only_off} on a GPU stage — GPUs rent "
+            "on Lium only; Shadeform is CPU-only (owner rule 2026-11-24). Drop it from "
+            f"providers (e.g. providers = {list(GPU_STAGE_PROVIDERS)!r})")
     candidates = []
     for i, c in enumerate(raw.get("candidate", ())):
         csku = str(c.get("sku", "")).strip()

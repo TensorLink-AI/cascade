@@ -850,6 +850,35 @@ def test_build_policy_rejects_bad_config(bad):
         build_policy(_raw_config(**bad))
 
 
+@pytest.mark.parametrize("stage", ["eval", "mkt"])
+@pytest.mark.parametrize("providers", [["lium", "shadeform"], ["shadeform"], ["Shadeform"]])
+def test_gpu_stage_refuses_shadeform(stage, providers):
+    """Owner rule 2026-11-24: GPU = Lium only, Shadeform CPU-only. Every
+    stage build_policy builds rents GPUs, so naming shadeform is refused."""
+    table = {"sku": "NVIDIA GeForce RTX 3090", "gpus_per_pod": 1, "max_pods": 1,
+             "providers": providers, "max_price_hr": 0.45}
+    with pytest.raises(ProvisionError, match="Lium only"):
+        build_policy(_raw_config(**{stage: table}))
+
+
+def test_gpu_stage_defaults_to_lium_only():
+    raw = _raw_config(eval={"sku": "NVIDIA GeForce RTX 3090", "gpus_per_pod": 1,
+                            "max_pods": 1, "max_price_hr": 0.45})
+    p = build_policy(raw)
+    assert p.eval.providers == ("lium",)
+    assert provider_names(raw, p) == ["lium"]
+
+
+def test_mainnet_template_eval_stage_is_lium_only():
+    import tomllib
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[2] / "deploy" / "provision.mainnet.toml"
+    raw = tomllib.loads(path.read_text())
+    p = build_policy(raw)
+    assert p.eval is not None and p.eval.providers == ("lium",)
+
+
 def test_retired_fleet_tables_still_load_and_name_their_providers():
     """A deployed provision.toml still carries the retired per-round fleet
     (heat/final tables, trigger/escalation keys): it loads unchanged, and the
