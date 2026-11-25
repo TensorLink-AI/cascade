@@ -60,5 +60,16 @@ reproducibility-contract decision, signed off by the owner.**
   refuses as before.
 - `test_w_img_config.py`: the loader, the shipped files are off, and the keys
   are release-only.
+- `test_w_img_era_king_fixed.py` (#934): the trainer side of "the image
+  changes only at a seed-epoch boundary":
+  - a king the validators hold (published, or carried into a later era of
+    its seed epoch) is never dropped or retrained after a restart onto a
+    new image or contract;
+  - an image-only repin keeps proving it with the image it was dispatched
+    under, so settlements keep the SAME king pointer;
+  - an unprovable change HOLDS the settlement with a loud error; the next
+    seed epoch trains its king under the new contract;
+  - the normal rollover is unchanged, and a king nobody holds yet (the
+    epoch's first era, nothing published) still retrains as before.
 
 No torch: never run torch-backed files or `make laned-e2e` on the ops box.
