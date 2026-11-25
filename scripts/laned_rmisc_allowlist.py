@@ -574,7 +574,7 @@ def _size_batches(files: list[tuple[str, int]], budget: int) -> list[list[str]]:
     return out
 
 
-def _stream_source(key: str, stream_dir: Path, budget: int):
+def _stream_source(key: str, stream_dir: Path, budget: int, workers: int = 16):
     """Yields ``(dir, [file paths])`` per download batch of ``key``'s data at
     its pinned revision (the next batch downloads while the caller hashes this
     one; the caller deletes each dir when done, so disk stays ~2 batches)."""
@@ -595,7 +595,7 @@ def _stream_source(key: str, stream_dir: Path, budget: int):
                 if d.exists():
                     shutil.rmtree(d)
                 snapshot_download(repo_id=repo, repo_type="dataset", revision=rev,
-                                  local_dir=str(d), allow_patterns=paths, max_workers=16)
+                                  local_dir=str(d), allow_patterns=paths, max_workers=workers)
                 q.put((d, [d / p for p in paths]))
             q.put(None)
         except BaseException as e:  # noqa: BLE001 — re-raised in the consumer
@@ -710,21 +710,11 @@ def _cand_job(job):
     return name, f, n, h
 
 
-def cmd_datacompare(args) -> int:
+def _candidate_pairs(cands: dict, args, k: int, mod: int):
+    """``(folders, ph, pfo)``: the candidate folders' records and their
+    (hash, folder index) pairs sorted by hash."""
     import numpy as np
 
-    cands = json.loads(Path(args.candidates).read_text(encoding="utf-8"))
-    if cands.get("schema") != CANDIDATES_SCHEMA:
-        raise SystemExit("not a candidates file")
-    k, mod = int(args.k), int(args.mod)
-    roots = dict(x.split("=", 1) for x in args.exclude_root)
-    for key in getattr(args, "stream", None) or []:
-        if key not in EXCLUSION_SOURCES:
-            raise SystemExit(f"--stream {key}: not an exclusion source")
-        roots.setdefault(key, "hf")
-    missing = sorted(set(EXCLUSION_SOURCES) - set(roots))
-    if missing:
-        raise SystemExit(f"--exclude-root missing for {missing} (every source is compared)")
     folders = []
     jobs = [(c["name"], str(f)) for c in cands["candidates"]
             for f in sorted((Path(args.rmisc_root) / c["name"]).glob("*.parquet"))]
@@ -760,12 +750,50 @@ def cmd_datacompare(args) -> int:
         folders.append({"name": c["name"], "n_series_sampled": n_series, "n_hashes": int(arr.size)})
     ph = np.concatenate(ph) if ph else np.empty(0, dtype=np.uint64)
     pfo = np.concatenate(pfo) if pfo else np.empty(0, dtype=np.int32)
-    order = np.argsort(ph, kind="stable")
+    order = np.argsort(ph)          # ties are (hash, folder) duplicates-free
     ph, pfo = ph[order], pfo[order]
     del order
+    return folders, ph, pfo
+
+
+def cmd_datacompare(args) -> int:
+    import numpy as np
+
+    cands = json.loads(Path(args.candidates).read_text(encoding="utf-8"))
+    if cands.get("schema") != CANDIDATES_SCHEMA:
+        raise SystemExit("not a candidates file")
+    k, mod = int(args.k), int(args.mod)
+    roots = dict(x.split("=", 1) for x in args.exclude_root)
+    for key in getattr(args, "stream", None) or []:
+        if key not in EXCLUSION_SOURCES:
+            raise SystemExit(f"--stream {key}: not an exclusion source")
+        roots.setdefault(key, "hf")
+    missing = sorted(set(EXCLUSION_SOURCES) - set(roots))
+    if missing:
+        raise SystemExit(f"--exclude-root missing for {missing} (every source is compared)")
+    agg = getattr(args, "candidate_agg", None)
+    meta = {"candidates_sha256": hashlib.sha256(Path(args.candidates).read_bytes()).hexdigest(),
+            "k": k, "mod": mod, "sample_series": int(args.sample_series),
+            "max_points": int(args.max_points)}
+    if agg and Path(agg).is_file():
+        z = np.load(agg, allow_pickle=False)
+        if json.loads(str(z["meta"])) != meta:
+            raise SystemExit(f"--candidate-agg {agg}: built for other candidates / params")
+        folders, ph, pfo = json.loads(str(z["folders"])), z["ph"], z["pfo"]
+        print(f"candidates: loaded {agg}", flush=True)
+    else:
+        folders, ph, pfo = _candidate_pairs(cands, args, k, mod)
+        if agg:
+            tmp = Path(str(agg) + ".tmp.npz")
+            np.savez(tmp, ph=ph, pfo=pfo, folders=np.asarray(json.dumps(folders)),
+                     meta=np.asarray(json.dumps(meta, sort_keys=True)))
+            tmp.replace(agg)
+            print(f"candidates: saved {agg}", flush=True)
     all_c = np.unique(ph)
     print(f"candidates: {len(folders)} folders, {ph.size} (hash, folder) pairs, "
           f"{all_c.size} distinct hashes", flush=True)
+    if getattr(args, "candidates_only", False):
+        return 0
     hit_parts: dict[str, list] = {s: [] for s in EXCLUSION_SOURCES}
     emax = int(args.exclude_max_points)
     workers = max(1, int(getattr(args, "workers", 1) or 1))
@@ -796,7 +824,8 @@ def cmd_datacompare(args) -> int:
             if not getattr(args, "stream_dir", None):
                 raise SystemExit(f"{key}=hf needs --stream-dir")
             budget = int(float(args.stream_batch_gib) * 2**30)
-            for d, files in _stream_source(key, Path(args.stream_dir), budget):
+            for d, files in _stream_source(key, Path(args.stream_dir), budget,
+                                            int(args.stream_workers)):
                 scan(key, [f for f in files if f.is_file()])
                 shutil.rmtree(d, ignore_errors=True)
         else:
@@ -914,6 +943,12 @@ def main(argv=None) -> int:
                         "download batches (hash, then delete) instead of --exclude-root")
     p.add_argument("--stream-dir", help="scratch dir for --stream batches")
     p.add_argument("--stream-batch-gib", type=float, default=64.0)
+    p.add_argument("--stream-workers", type=int, default=16,
+                   help="parallel HF downloads per --stream batch")
+    p.add_argument("--candidate-agg", help="npz of the aggregated candidate (hash, folder) "
+                   "pairs: loaded when present (no --rmisc-root data needed), else saved")
+    p.add_argument("--candidates-only", action="store_true",
+                   help="stop after the candidate side (with --candidate-agg: build it)")
     p.add_argument("--candidate-cache", help="dir caching each candidate file's hashes "
                    "(keyed by path, size, mtime and the hash params): a rerun skips them")
     p.add_argument("--candidate-workers", type=int, default=12,

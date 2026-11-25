@@ -203,6 +203,12 @@ def test_datacompare_compares_data_not_names(tmp_path, capsys):
         "--workers", "2", "--candidate-workers", "2", "--candidate-cache", str(tmp_path / "cc")]
     assert a.main(fast) == 0 and a.main(fast) == 0          # second run: cache hits
     assert json.loads(out2.read_text())["folders"] == doc["folders"]
+    # --candidate-agg: built once, then loaded without the RMISC data
+    agg = tmp_path / "agg.npz"
+    assert a.main(fast + ["--candidate-agg", str(agg), "--candidates-only"]) == 0 and agg.is_file()
+    nodata = [x if x != str(rm) else str(tmp_path / "gone") for x in fast]
+    assert a.main(nodata + ["--candidate-agg", str(agg)]) == 0
+    assert json.loads(out2.read_text())["folders"] == doc["folders"]
     v = {f["name"]: f for f in doc["folders"]}
     assert v["Renamed"]["verdict"] == "duplicate" and v["Renamed"]["hits"]["gift_eval_pretrain"]
     assert v["Fresh"]["verdict"] == "pass"
