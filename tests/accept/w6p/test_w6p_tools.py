@@ -220,3 +220,41 @@ def test_finalize_writes_a_valid_final_list(tmp_path):
     p = tmp_path / "allowed.toml"
     p.write_text(text)
     assert a.main(["validate", str(p)]) == 0
+
+
+def test_datacompare_vectorised_scan_equals_the_reference_channels(tmp_path):
+    """W-LAUNCH: `file_hits` (Arrow buffers, batch by batch, the --workers /
+    --stream path) hits exactly the hashes the reference `iter_channels` +
+    `kgram_hashes` loop hits: flat and nested list columns, nulls, empty rows,
+    channels past max_points, scalar numeric columns, arrow and parquet."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    a = _load(ALLOW, "laned_rmisc_allowlist_accept5")
+    rng = np.random.default_rng(7)
+    k, mod, maxp = 4, 2, 50
+    flat = [list(np.round(rng.normal(size=n), 2)) for n in (0, 3, 30, 80, 200)]
+    flat[2][5] = None
+    nested = [[list(np.round(rng.normal(size=n), 1)) for n in (10, 60)], [], None,
+              [list(np.round(rng.normal(size=70), 1))]]
+    scalar = np.round(rng.normal(size=4000), 1)
+    t = pa.table({"target": pa.array(flat + [None], type=pa.list_(pa.float64())),
+                  "multi": pa.array(nested + [None, [[1.0, 2.0, 3.0, 4.0, 5.0]]],
+                                    type=pa.list_(pa.list_(pa.float32()))),
+                  "start": pa.array([f"s{i}" for i in range(6)])})
+    pq.write_table(t, str(tmp_path / "x.parquet"), row_group_size=2)
+    with pa.OSFile(str(tmp_path / "x.arrow"), "wb") as sink, \
+            pa.ipc.new_stream(sink, t.schema) as w:
+        for b in t.to_batches(max_chunksize=2):
+            w.write_batch(b)
+    pq.write_table(pa.table({"v": pa.array(scalar), "i": pa.array(np.arange(4000))}),
+                   str(tmp_path / "long.parquet"), row_group_size=333)
+    for name in ("x.parquet", "x.arrow", "long.parquet"):
+        p = tmp_path / name
+        ref = [a.kgram_hashes(ch, k, mod) for ch in a.iter_channels(p, maxp)]
+        ref = np.unique(np.concatenate(ref)) if ref else np.empty(0, dtype=np.uint64)
+        assert ref.size > 10, name
+        half = np.sort(ref[::2])                           # a candidate set: half of them
+        decoy = np.sort(np.concatenate([half, np.asarray([1, 3, 2**63 + 1], dtype=np.uint64)]))
+        got = a.file_hits(p, decoy, k, mod, maxp)
+        assert got.tolist() == half.tolist(), name

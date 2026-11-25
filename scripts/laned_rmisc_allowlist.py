@@ -318,9 +318,20 @@ def kgram_hashes(values, k: int, mod: int):
     polynomial hash mod 2^64, kept iff ``hash % mod == 0``."""
     import numpy as np
 
-    q, ok = _quantise(values)
-    if q.size < k:
+    if np.asarray(values).size < k:
         return np.empty(0, dtype=np.uint64)
+    h, okw = _window_hashes(values, k)
+    h = h[okw]
+    return np.unique(h[h % np.uint64(mod) == 0])
+
+
+def _window_hashes(values, k: int):
+    """``(hash, finite)`` of every K-gram window of ``values`` (``size - k +
+    1`` windows; ``size >= k``): the one hash :func:`kgram_hashes` and the
+    vectorised exclusion scan (:func:`file_hits`) share."""
+    import numpy as np
+
+    q, ok = _quantise(values)
     mult = (np.arange(1, k + 1, dtype=np.uint64) * np.uint64(0x9E3779B97F4A7C15)) | np.uint64(1)
     win = np.lib.stride_tricks.sliding_window_view(q.astype(np.uint64), k)
     okw = np.lib.stride_tricks.sliding_window_view(ok, k).all(axis=1)
@@ -329,8 +340,7 @@ def kgram_hashes(values, k: int, mod: int):
         h ^= h >> np.uint64(29)
         h *= np.uint64(0xBF58476D1CE4E5B9)
         h ^= h >> np.uint64(32)
-    h = h[okw]
-    return np.unique(h[h % np.uint64(mod) == 0])
+    return h, okw
 
 
 def iter_channels(path: Path, max_points: int):
@@ -372,6 +382,233 @@ def iter_channels(path: Path, max_points: int):
                 yield arr[i:i + max_points]
 
 
+def _batches(path: Path, columns=None):
+    """The record batches of one data file (arrow stream / arrow file /
+    parquet / csv), so a multi-GB file is never materialised whole."""
+    import pyarrow as pa
+
+    suf = path.suffix.lower()
+    if suf == ".arrow":
+        src = pa.memory_map(str(path), "r")
+        try:
+            rd = pa.ipc.open_stream(src)
+        except pa.ArrowInvalid:
+            f = pa.ipc.open_file(src)
+            for i in range(f.num_record_batches):
+                b = f.get_batch(i)
+                yield b.select(columns) if columns is not None else b
+            return
+        for b in rd:
+            yield b.select(columns) if columns is not None else b
+    elif suf == ".parquet":
+        import pyarrow.parquet as pq
+        yield from pq.ParquetFile(str(path)).iter_batches(batch_size=1024, columns=columns)
+    elif suf == ".csv":
+        import pyarrow.csv as pcsv
+        t = pcsv.read_csv(str(path))
+        if columns is not None:
+            t = t.select(columns)
+        yield from t.to_batches()
+
+
+def _schema(path: Path):
+    import pyarrow as pa
+
+    suf = path.suffix.lower()
+    if suf == ".arrow":
+        src = pa.memory_map(str(path), "r")
+        try:
+            return pa.ipc.open_stream(src).schema
+        except pa.ArrowInvalid:
+            return pa.ipc.open_file(src).schema
+    if suf == ".parquet":
+        import pyarrow.parquet as pq
+        return pq.read_schema(str(path))
+    if suf == ".csv":
+        import pyarrow.csv as pcsv
+        return pcsv.read_csv(str(path)).schema
+    return None
+
+
+def _is_num(ty) -> bool:
+    import pyarrow as pa
+
+    return pa.types.is_integer(ty) or pa.types.is_floating(ty)
+
+
+def _hits_of(values, lengths, k: int, mod: int, all_c, max_points: int):
+    """The candidate hashes (``all_c``, sorted) hit by any channel: ``values``
+    is the channels laid end to end, ``lengths`` their lengths. Each channel
+    is truncated to ``max_points`` and no window crosses a channel boundary,
+    so the set equals the union of :func:`kgram_hashes` over the channels
+    (the same hash, :func:`_window_hashes`) — vectorised over a whole batch."""
+    import numpy as np
+
+    lengths = np.asarray(lengths, dtype=np.int64)
+    if not lengths.size or not all_c.size:
+        return np.empty(0, dtype=np.uint64)
+    vals = np.asarray(values, dtype=np.float64)
+    starts = np.concatenate([[0], np.cumsum(lengths)[:-1]]).tolist()
+    use = np.minimum(lengths, max_points).tolist()
+    out = []
+
+    def flush(segs, lens):
+        cat = np.concatenate(segs)
+        ln = np.asarray(lens, dtype=np.int64)
+        ends = np.cumsum(ln)
+        # window j is valid iff it ends inside its own channel
+        pos = np.arange(cat.size, dtype=np.int64) - np.repeat(ends - ln, ln)
+        lim = np.repeat(ln, ln)
+        h, okw = _window_hashes(cat, k)
+        valid = okw & (pos[:h.size] + k <= lim[:h.size])
+        h = h[valid]
+        h = h[h % np.uint64(mod) == 0]
+        if h.size:
+            p = np.searchsorted(all_c, h)
+            p[p >= all_c.size] = 0
+            out.append(np.unique(h[all_c[p] == h]))
+
+    segs, lens, n = [], [], 0
+    for s0, u in zip(starts, use, strict=True):
+        if u < k:
+            continue                                   # no window (kgram_hashes: empty)
+        segs.append(vals[s0:s0 + u])
+        lens.append(u)
+        n += u
+        if n >= (1 << 22):                             # ~4M points per block
+            flush(segs, lens)
+            segs, lens, n = [], [], 0
+    if segs:
+        flush(segs, lens)
+    return np.unique(np.concatenate(out)) if out else np.empty(0, dtype=np.uint64)
+
+
+def file_hits(path: Path, all_c, k: int, mod: int, max_points: int):
+    """The candidate hashes one exclusion file hits: the same channels as
+    :func:`iter_channels` (list columns row by row, one per channel, nested
+    lists one per inner list, nulls as NaN; scalar numeric columns whole, in
+    ``max_points`` chunks over the first ``64 * max_points`` values), read
+    batch by batch with Arrow's buffers instead of Python lists."""
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    schema = _schema(path)
+    if schema is None:
+        return np.empty(0, dtype=np.uint64)
+    list_cols, scalar_cols = [], []
+    for fld in schema:
+        ty = fld.type
+        if pa.types.is_list(ty) or pa.types.is_large_list(ty):
+            inner = ty.value_type
+            if _is_num(inner) or ((pa.types.is_list(inner) or pa.types.is_large_list(inner))
+                                  and _is_num(inner.value_type)):
+                list_cols.append(fld.name)
+        elif _is_num(ty):
+            scalar_cols.append(fld.name)
+    hits = []
+    cap = max_points * 64
+    scal = {c: [] for c in scalar_cols}
+    got = dict.fromkeys(scalar_cols, 0)
+    cols = list_cols + scalar_cols
+    if not cols:
+        return np.empty(0, dtype=np.uint64)
+    for b in _batches(path, cols):
+        for name in list_cols:
+            arr = b.column(name)
+            nested = not _is_num(arr.type.value_type)
+            if nested:
+                arr = arr.flatten()                    # one element per channel
+            ln = pc.fill_null(pc.list_value_length(arr), 0).to_numpy(zero_copy_only=False)
+            vals = pc.fill_null(pc.cast(arr.flatten(), pa.float64()), float("nan"))
+            hits.append(_hits_of(vals.to_numpy(zero_copy_only=False), ln, k, mod, all_c,
+                                 max_points))
+        for name in scalar_cols:
+            if got[name] >= cap:
+                continue
+            a = pc.cast(b.column(name), pa.float64()).to_numpy(zero_copy_only=False)
+            a = a[:cap - got[name]]
+            scal[name].append(a)
+            got[name] += a.size
+    for name in scalar_cols:
+        if not scal[name]:
+            continue
+        arr = np.concatenate(scal[name])
+        ln = [min(max_points, arr.size - i) for i in range(0, arr.size, max_points)]
+        hits.append(_hits_of(arr, ln, k, mod, all_c, max_points))
+    hits = [h for h in hits if h.size]
+    return np.unique(np.concatenate(hits)) if hits else np.empty(0, dtype=np.uint64)
+
+
+_POOL_STATE: dict = {}
+
+
+def _pool_init(all_c, k, mod, max_points):
+    _POOL_STATE.update(all_c=all_c, k=k, mod=mod, max_points=max_points)
+
+
+def _pool_file(path: str):
+    s = _POOL_STATE
+    return path, file_hits(Path(path), s["all_c"], s["k"], s["mod"], s["max_points"])
+
+
+def _hf_data_files(repo: str, rev: str) -> list[tuple[str, int]]:
+    return sorted((e["path"], int(e.get("size") or 0)) for e in hf_tree(repo, rev, recursive=True)
+                  if e.get("type") == "file"
+                  and e["path"].lower().endswith((".arrow", ".parquet", ".csv")))
+
+
+def _size_batches(files: list[tuple[str, int]], budget: int) -> list[list[str]]:
+    out, cur, n = [], [], 0
+    for p, sz in files:
+        if cur and n + sz > budget:
+            out.append(cur)
+            cur, n = [], 0
+        cur.append(p)
+        n += sz
+    if cur:
+        out.append(cur)
+    return out
+
+
+def _stream_source(key: str, stream_dir: Path, budget: int):
+    """Yields ``(dir, [file paths])`` per download batch of ``key``'s data at
+    its pinned revision (the next batch downloads while the caller hashes this
+    one; the caller deletes each dir when done, so disk stays ~2 batches)."""
+    import queue
+    import shutil
+    import threading
+
+    from huggingface_hub import snapshot_download
+
+    repo, rev = EXCLUSION_SOURCES[key]
+    batches = _size_batches(_hf_data_files(repo, rev), budget)
+    q: queue.Queue = queue.Queue(maxsize=1)
+
+    def produce():
+        try:
+            for i, paths in enumerate(batches):
+                d = stream_dir / key / f"b{i:05d}"
+                if d.exists():
+                    shutil.rmtree(d)
+                snapshot_download(repo_id=repo, repo_type="dataset", revision=rev,
+                                  local_dir=str(d), allow_patterns=paths, max_workers=16)
+                q.put((d, [d / p for p in paths]))
+            q.put(None)
+        except BaseException as e:  # noqa: BLE001 — re-raised in the consumer
+            q.put(e)
+
+    threading.Thread(target=produce, daemon=True).start()
+    print(f"stream {key}: {repo}@{rev[:7]} {len(batches)} batches", flush=True)
+    while True:
+        item = q.get()
+        if item is None:
+            return
+        if isinstance(item, BaseException):
+            raise SystemExit(f"stream {key}: download failed ({item})")
+        yield item
+
+
 def data_files(root: Path) -> list[Path]:
     return sorted(p for p in root.rglob("*") if p.is_file()
                   and p.suffix.lower() in (".arrow", ".parquet", ".csv"))
@@ -386,6 +623,10 @@ def cmd_datacompare(args) -> int:
         raise SystemExit("not a candidates file")
     k, mod = int(args.k), int(args.mod)
     roots = dict(x.split("=", 1) for x in args.exclude_root)
+    for key in getattr(args, "stream", None) or []:
+        if key not in EXCLUSION_SOURCES:
+            raise SystemExit(f"--stream {key}: not an exclusion source")
+        roots.setdefault(key, "hf")
     missing = sorted(set(EXCLUSION_SOURCES) - set(roots))
     if missing:
         raise SystemExit(f"--exclude-root missing for {missing} (every source is compared)")
@@ -422,18 +663,41 @@ def cmd_datacompare(args) -> int:
         folders.append({"name": c["name"], "n_series_sampled": n_series, "n_hashes": int(arr.size)})
     all_c = np.asarray(sorted(owner), dtype=np.uint64)
     hits = {f["name"]: {s: set() for s in EXCLUSION_SOURCES} for f in folders}
-    for key in sorted(EXCLUSION_SOURCES):
-        for f in data_files(Path(roots[key])):
-            for ch in iter_channels(f, int(args.exclude_max_points)):
-                h = kgram_hashes(ch, k, mod)
-                if not h.size or not all_c.size:
-                    continue
-                pos = np.searchsorted(all_c, h)
-                pos[pos >= all_c.size] = 0
-                for x in h[all_c[pos] == h].tolist():
-                    for name in owner[x]:
-                        hits[name][key].add(x)
+    emax = int(args.exclude_max_points)
+    workers = max(1, int(getattr(args, "workers", 1) or 1))
+    pool = None
+    if workers > 1:
+        import multiprocessing as mp
+        from concurrent.futures import ProcessPoolExecutor
+
+        pool = ProcessPoolExecutor(workers, mp_context=mp.get_context("fork"),
+                                   initializer=_pool_init, initargs=(all_c, k, mod, emax))
+
+    def scan(key, files):
+        if pool is None:
+            res = ((str(f), file_hits(f, all_c, k, mod, emax)) for f in files)
+        else:
+            res = pool.map(_pool_file, [str(f) for f in files], chunksize=1)
+        for f, h in res:
+            for x in h.tolist():
+                for name in owner[x]:
+                    hits[name][key].add(x)
             print(f"compared {key}: {f}", flush=True)
+
+    import shutil
+
+    for key in sorted(EXCLUSION_SOURCES):
+        if roots[key] == "hf":
+            if not getattr(args, "stream_dir", None):
+                raise SystemExit(f"{key}=hf needs --stream-dir")
+            budget = int(float(args.stream_batch_gib) * 2**30)
+            for d, files in _stream_source(key, Path(args.stream_dir), budget):
+                scan(key, [f for f in files if f.is_file()])
+                shutil.rmtree(d, ignore_errors=True)
+        else:
+            scan(key, data_files(Path(roots[key])))
+    if pool is not None:
+        pool.shutdown()
     for f in folders:
         n = max(1, f["n_hashes"])
         f["hits"] = {s: len(v) for s, v in sorted(hits[f["name"]].items())}
@@ -528,6 +792,13 @@ def main(argv=None) -> int:
     p.add_argument("--max-points", type=int, default=16384)
     p.add_argument("--exclude-max-points", type=int, default=1_000_000)
     p.add_argument("--dup-threshold", type=float, default=0.02)
+    p.add_argument("--workers", type=int, default=1,
+                   help="processes scanning exclusion files (the result is identical)")
+    p.add_argument("--stream", action="append", default=[], metavar="KEY",
+                   help="stream this exclusion source from HF at its pinned revision in "
+                        "download batches (hash, then delete) instead of --exclude-root")
+    p.add_argument("--stream-dir", help="scratch dir for --stream batches")
+    p.add_argument("--stream-batch-gib", type=float, default=64.0)
     p.set_defaults(fn=cmd_datacompare)
     p = sub.add_parser("finalize")
     p.add_argument("--candidates", required=True)
