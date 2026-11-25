@@ -38,6 +38,9 @@ log = logging.getLogger("cascade.validator.eval_offload")
 # uv on the pod (runs the benchmarks/ sidecar's own locked env), matching
 # cascade.trainer.bench_hook.BenchPlan.uv_bin.
 DEFAULT_UV_BIN = "~/.local/bin/uv"
+# #903: the default is resolved ON the host (the Lium template has /usr/local/bin/uv,
+# the worker image /bin/uv): PATH first, the bootstrap-era path as the fallback.
+UV_RESOLVE = '"$(command -v uv 2>/dev/null || echo ~/.local/bin/uv)"'
 
 
 class PrivateEvalUnavailable(RuntimeError):
@@ -652,7 +655,7 @@ def build_bench_remote_command(
     return (
         prefix
         + (f"timeout --signal=TERM --kill-after=15s {max(1, timeout_s)}s " if timeout_s else "")
-        + f"{uv_bin} run --project {shlex.quote(f'{host.workdir}/benchmarks')} "
+        + f"{UV_RESOLVE if uv_bin == DEFAULT_UV_BIN else uv_bin} run --project {shlex.quote(f'{host.workdir}/benchmarks')} "
         + " ".join(bench_uv_args(suites)) + " "
         + quoted
     )
