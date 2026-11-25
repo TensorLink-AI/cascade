@@ -1319,8 +1319,22 @@ def _forge_client():
     return _s3_client(cfg), bucket
 
 
+def select_lane_a_snapshot(index: Sequence):
+    """The newest REAL lane A index entry: smoke-test sentinels
+    (``effective_block >= POOL_SENTINEL_MIN_BLOCK``, e.g. the 999999999999
+    workflow_dispatch default of publish-pool.yml) are never a validator's
+    pool, so W6b must never replay one (2026-11-25: the 2026-09-29 sentinel
+    was picked and the replay refused with 4586 mismatching files)."""
+    from ..shared.hippius import POOL_SENTINEL_MIN_BLOCK
+
+    real = [s for s in index if int(s.effective_block) < POOL_SENTINEL_MIN_BLOCK]
+    if not real:
+        raise ElasticError("usage", "lane A pool index has no real (non-sentinel) snapshot")
+    return max(real, key=lambda s: s.effective_block)
+
+
 def lane_a_pool(chain_toml: Path, out: Path) -> dict:
-    """Fetch the newest lane A pool snapshot (sha-checked) for W6b's replay."""
+    """Fetch the newest real lane A pool snapshot (sha-checked) for W6b's replay."""
     from ..shared.config import load_chain_config
     from ..shared.hippius import fetch_pool_snapshot, pool_s3_store, read_pool_index
 
@@ -1329,7 +1343,7 @@ def lane_a_pool(chain_toml: Path, out: Path) -> dict:
     index = read_pool_index(store)
     if not index:
         raise ElasticError("usage", "lane A pool index is empty")
-    meta = max(index, key=lambda s: s.effective_block)
+    meta = select_lane_a_snapshot(index)
     fetch_pool_snapshot(store, meta, out)
     return {"effective_block": meta.effective_block, "sha256": meta.sha256, "out": str(out)}
 
