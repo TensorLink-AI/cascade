@@ -27,6 +27,12 @@ share      = 0.35
 share      = 0.15
 takes_from = "lane_a"
 
+# Owner 2026-11-25: lane A shuts down when lanes B/C/D start. No king checks
+# from here on, so uid 164's checkpoint 0d7e107f stays the frozen reference
+# for lanes B and D (v2_check_due is False when this is <= 0).
+[v2]
+reign_warm_start_blocks = 0
+
 [lane_d]
 from_block    = 9586800
 share         = 0.5

@@ -64,3 +64,23 @@ cascade/funding/main.py
 cascade/provision/loop.py
 cascade/provision/state.py
 tests/unit/test_provision_loop.py
+# Launch miner docs + CLI (owner 2026-11-25): lane A closed to new challengers
+# from 9586800 in every miner-facing guide and the CLI help; `cascade deploy` /
+# `submit` refuse a lane A entry past the cutoff before any upload or commit
+# (--allow-closed-lane-a). The generated cascade:rewards:summary block states
+# the LIVE launch split (scripts/check_docs.py computes it from the overlays).
+cascade/miner/cli.py
+cascade/miner/lane_d_preview.py
+scripts/check_docs.py
+tests/unit/test_docs_consistency.py
+README.md
+AGENTS.md
+agent.md
+llms.txt
+cascade/website/llms.txt
+docs/MINER.md
+docs/MINER_LANE_A.md
+docs/MINER_LANE_B.md
+docs/MINER_LANE_D.md
+docs/LANE_D.md
+docs/VALIDATOR.md

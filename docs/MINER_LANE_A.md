@@ -12,6 +12,18 @@ cascade rules a --all      # every [v2] and [scoring] key
 cascade round              # the live bar, countdown and king
 ```
 
+> **Lane A is closed to new challengers from block 9,586,800** (mainnet
+> launch, about 2026-11-25 22:28 UTC). From that block the intake refuses a new
+> lane A fund or funded submit (`409 lane_ended`, nothing charged), the trainer
+> seats no new challenger, and king checks and promotions stop
+> (`[v2] reign_warm_start_blocks = 0`). The lane A king (uid 164) is frozen as
+> the reference model for lanes B and D. `cascade deploy` and `cascade submit`
+> refuse a lane A entry past the cutoff before uploading or committing
+> (`--allow-closed-lane-a` overrides; the entry still will not be seated).
+> In-flight legs, the king leg and king-only settlements continue. Compete in
+> [lane B](MINER_LANE_B.md), [C](MINER_LANE_C_MARKETCAST.md) or
+> [D](MINER_LANE_D.md). The rest of this brief describes lane A as it ran.
+
 ## Intent
 
 Lane A competes on **data alone**. The model, its training recipe and its
@@ -42,7 +54,8 @@ cascade duel
 ```
 
 `cascade submit` keeps your code private unless it takes the throne. The
-public path is `cascade deploy` plus `cascade fund`.
+public path is `cascade deploy` plus `cascade fund`. Both refuse a new lane A
+entry from block 9,586,800 (see the notice above).
 
 ## How it is scored
 
@@ -61,15 +74,16 @@ public path is `cascade deploy` plus `cascade fund`.
 
 ## How you are paid
 
-**Under the owner-proposed split A0 / B35 / C15 / D50 (plan rev6.24, set by
-the mainnet launch overlay at block 9,586,800, about 2026-11-25 22:28 UTC),
-lane A's pool is 0% once lane D is armed.** A lane A king then
-earns no emissions from lane A. Its model still matters: the lane A king is
-the **house** entry in lane D, and promoted kings become the shared init for
-later eras. Until lane D arms, lane D's share stays with lane A.
+**From block 9,586,800 the step 1 launch overlay sets A 50 / B 35 / C 15,
+and the frozen lane A king keeps its ladder share of A's 50% (no further
+king checks change it); the rest of A burns.** A second overlay arms lane D
+(at 9,586,800 if it locks in, otherwise at a later era start) and sets the
+owner-proposed split A0 / B35 / C15 / D50. The lane A king is then the
+**house** entry in lane D, and D's 50% stays with it until the first miner is
+crowned lane D king. With promotions off, no king becomes a new shared init.
 
-Before that split takes effect, and on any network still on the checked-in
-template (all of A, B and C launched, A at 50%), the v2 ladder applies:
+The v2 ladder below set the king's share while lane A ran. On the checked-in
+template (all of A, B and C launched, A at 50%) it reads:
 
 | Event | Share of A's pool |
 |---|---:|
@@ -126,9 +140,8 @@ See [failure classes](MINER.md#8-failure-classes) for the full list.
 
 ## FAQ
 
-**Is lane A still worth mining under A0?** It pays nothing directly under
-that split. Its kings feed lane D (as the house) and the shared init. Mine it
-for that, or move to lane B, C or D for direct pay.
+**Is lane A still open?** No. It takes no new challengers from block
+9,586,800; the intake answers `409 lane_ended`. Move to lane B, C or D.
 
 **Can I change the model or recipe?** No. That is lane D.
 
