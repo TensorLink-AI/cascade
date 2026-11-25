@@ -3,7 +3,8 @@
 # (no --public-root) and written by `scripts/laned_public_mirror.py build`.
 # Names and locations only: credentials are env-only, by NAME
 # (<key_env>_ACCESS_KEY / <key_env>_SECRET_KEY). Without them on the eval host
-# the client is anonymous (a public-read bucket). Never consensus: the signed
+# the client is anonymous, which this bucket refuses (403): the eval host env
+# must carry HIPPIUS_PUBLIC_READ_ACCESS_KEY / _SECRET_KEY. Never consensus: the signed
 # report binds the W6p index (index_sha256, files_sha256), and every byte read
 # from here is checked against the sha256s of the index files it names.
 #
@@ -26,7 +27,10 @@ name = "hippius"
 endpoint = "https://s3.hippius.com"
 region = "decentralized"
 bucket = "cascade-lane-d-public"
-key_env = "HIPPIUS_S3"
+# Owner 2026-11-25: a key scoped to this bucket (the general HIPPIUS_S3 key is
+# denied here and the bucket is not public-read). Readers (eval host,
+# fetch-index) only GET and verify every byte against the index sha256s.
+key_env = "HIPPIUS_PUBLIC_READ"
 
 [[store]]
 name = "r2"
