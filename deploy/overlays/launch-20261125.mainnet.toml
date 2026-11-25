@@ -35,3 +35,9 @@ takes_from    = "lane_a"
 # live half alone; no public index is drawn, scored or required. Raise it
 # later by overlay (W-OV bound [0, 1], the loader keeps it < 1).
 public_weight = 0.0
+# Owner 2026-11-25 (leak mitigation, OPSLOG + cascade#935): lane A pool data
+# up to snapshot block 9579600 (built ~19:30 UTC 11-24) is already revealed on
+# HF; a 24 h embargo keeps every lane D embargo window clear of it (48 h would
+# overlap). Restore 48 by overlay after ~2026-11-27 once cascade#935 is in
+# force (W-OV bound [0, 168]).
+embargo_hours = 24.0

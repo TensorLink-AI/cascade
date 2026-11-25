@@ -11,7 +11,7 @@ import math
 
 import pytest
 
-from .helpers import MAINNET_LAUNCH, PAIRS, TESTNET_LAUNCH, bodies, overrides, shipped_cfg
+from .helpers import MAINNET_LAUNCH, PAIRS, ROOT, TESTNET_LAUNCH, bodies, overrides, shipped_cfg
 
 
 def _era(cfg, block: int) -> int:
@@ -185,6 +185,25 @@ def test_w_launch_lane_d_launches_live_only(net):
 
     with pytest.raises(LaneDPublicError):
         _public_half(half.lane_d, None, None, None, 0, ["d" * 64])
+
+
+@pytest.mark.parametrize("net", sorted(PAIRS))
+def test_w_launch_lane_d_embargo_is_24h_inside_the_bound(net):
+    """Owner 2026-11-25 (leak mitigation, OPSLOG + cascade#935): lane A pool
+    data up to snapshot 9579600 is already revealed on HF, so step 2 sets
+    ``[lane_d] embargo_hours = 24`` (shipped 48) and no lane D embargo window
+    overlaps it. Restore 48 by overlay after ~2026-11-27. Step 1 carries no
+    lane D key; the value sits inside the W-OV bound and reaches the built
+    config."""
+    from cascade.shared.netconfig_bounds import BOUNDS
+
+    base, b1, b2, _ = bodies(net)
+    assert overrides(PAIRS[net][2])["lane_d"].get("embargo_hours") == 24.0
+    assert "lane_d" not in b1["overrides"]
+    bound = BOUNDS[("lane_d", "embargo_hours")]
+    assert bound.lo <= 24.0 <= bound.hi
+    assert float(nc_build(base, b2).lane_d.embargo_hours) == 24.0
+    assert "restore 48" in (ROOT / PAIRS[net][2]).read_text().lower()
 
 
 def nc_build(base, body):

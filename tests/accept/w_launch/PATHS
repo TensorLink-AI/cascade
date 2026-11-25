@@ -28,4 +28,7 @@ tests/unit/test_dec55_config_wire.py
 tests/unit/test_validator_bench_budget.py
 tests/unit/test_validator_bench_liveness.py
 docs/MARKETCAST.md
+# Owner 2026-11-25 (leak mitigation, cascade#935): the launch runbook's
+# step-2 embargo_hours = 24 line and its restore-to-48 reminder.
+docs/OPERATOR.md
 docs/AGENT_MINING.md
