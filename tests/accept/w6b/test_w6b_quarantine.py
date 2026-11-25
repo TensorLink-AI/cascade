@@ -42,7 +42,11 @@ def _world(base):
     root = forge_mirror(base / "forge")
     (root / "data" / "air_temp" / f"{LATE_DAY}.parquet").write_bytes(CORRUPT)
     log = fs.FirstSeenLog(root / "first_seen")
-    log.record(root, now_ts=T0 + 600)
+    try:
+        log.record(root, now_ts=T0 + 600)
+    except Exception as e:  # noqa: BLE001 — the pre-fix abort is the defect under test
+        raise AssertionError(f"first_seen record aborted on an unreadable partition: "
+                             f"{e!r}") from e
     log.commit(now_ts=AS1)
     _summary, selection = sel.build_pool_with_selection(
         [forge_source(root)], base / "pool", CTX_A, LANE_A_CFG, fetch=no_fetch)
