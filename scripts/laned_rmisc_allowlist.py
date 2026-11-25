@@ -437,7 +437,8 @@ def _is_num(ty) -> bool:
 
 
 def _hits_of(values, lengths, k: int, mod: int, all_c, max_points: int):
-    """The candidate hashes (``all_c``, sorted) hit by any channel: ``values``
+    """The candidate hashes (``all_c``, sorted; ``None`` = every winnowed
+    hash) hit by any channel: ``values``
     is the channels laid end to end, ``lengths`` their lengths. Each channel
     is truncated to ``max_points`` and no window crosses a channel boundary,
     so the set equals the union of :func:`kgram_hashes` over the channels
@@ -445,7 +446,7 @@ def _hits_of(values, lengths, k: int, mod: int, all_c, max_points: int):
     import numpy as np
 
     lengths = np.asarray(lengths, dtype=np.int64)
-    if not lengths.size or not all_c.size:
+    if not lengths.size or (all_c is not None and not all_c.size):
         return np.empty(0, dtype=np.uint64)
     vals = np.asarray(values, dtype=np.float64)
     starts = np.concatenate([[0], np.cumsum(lengths)[:-1]]).tolist()
@@ -463,7 +464,9 @@ def _hits_of(values, lengths, k: int, mod: int, all_c, max_points: int):
         valid = okw & (pos[:h.size] + k <= lim[:h.size])
         h = h[valid]
         h = h[h % np.uint64(mod) == 0]
-        if h.size:
+        if h.size and all_c is None:                  # every winnowed hash (candidate side)
+            out.append(np.unique(h))
+        elif h.size:
             p = np.searchsorted(all_c, h)
             p[p >= all_c.size] = 0
             out.append(np.unique(h[all_c[p] == h]))
@@ -675,11 +678,13 @@ def cand_file_hashes(path, sample_series: int, max_points: int, k: int, mod: int
     take = pa.array(sel)
     for b0 in range(0, len(cols), 32):                        # wide tables: 32 columns a read
         part = pf.read(columns=cols[b0:b0 + 32])
-        for c in cols[b0:b0 + 32]:
-            v = part.column(c).take(take).cast(pa.float64()).to_numpy(zero_copy_only=False)
-            for j in range(len(groups)):
-                hs.append(kgram_hashes(v[offs[j]:offs[j + 1]], k, mod))
+        vs = [part.column(c).take(take).cast(pa.float64()).to_numpy(zero_copy_only=False)
+              for c in cols[b0:b0 + 32]]
         del part
+        # every (column, series) segment at once: the union of kgram_hashes
+        # over the segments (no window crosses a segment boundary)
+        lens = [offs[j + 1] - offs[j] for j in range(len(groups))] * len(vs)
+        hs.append(_hits_of(np.concatenate(vs), lens, k, mod, None, 1 << 62))
     h = np.unique(np.concatenate(hs)) if hs else np.empty(0, dtype=np.uint64)
     return len(uniq), h
 
