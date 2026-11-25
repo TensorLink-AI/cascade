@@ -91,6 +91,11 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Run credential-free direct-MoE counter simulation into a NEW directory.")
     p.add_argument("--trainer", default=None, help="BaseTrainer as 'module:Class'.")
     p.add_argument("--work-root", type=Path, default=Path("./_train_work"))
+    p.add_argument(
+        "--lane-b-bench-hosts", type=Path, default=None,
+        help="#909: eval-hosts TOML ([[host]], re-read per bench; e.g. targon-eval.toml, "
+             "lane A's bench pod) where lane B's king / candidate / anchor public rows are "
+             "benched. Unset or empty = lane B fails closed: the trainer box never benches.")
     p.add_argument("--network", default="finney")
     p.add_argument("--wallet-name", default=None)
     p.add_argument("--wallet-hotkey", default=None)
@@ -384,7 +389,8 @@ def main(argv: list[str] | None = None) -> int:
         from .lane_b_driver import LaneBDriver, RunnerLaneBOps
 
         runner.lane_b_driver = LaneBDriver(
-            cfg, RunnerLaneBOps(runner, client, window_source, device=_local_device()),
+            cfg, RunnerLaneBOps(runner, client, window_source, device=_local_device(),
+                                bench=_lane_b_bench(args, cfg, runner)),
             Path(args.work_root) / "lane_b_driver.json")
     if int(getattr(getattr(cfg, "lane_c", None), "from_block", 0) or 0) > 0:
         # DEC-CA-0056: the fine-tune lane rides the rolling scheduler the same
@@ -408,6 +414,23 @@ def main(argv: list[str] | None = None) -> int:
     install_generation_shutdown(runner)
     runner.run_forever(client)
     return 0
+
+
+def _lane_b_bench(args, cfg, runner):
+    """#909: the eval-pod lane-B bench, or None (no --lane-b-bench-hosts:
+    lane B fails closed — the trainer box never benches)."""
+    from .lane_b_bench import LaneBBench
+
+    log = logging.getLogger("cascade.trainer")
+    path = getattr(args, "lane_b_bench_hosts", None)
+    if path is None:
+        if cfg.lane_b.require_public:
+            log.error("lane B: no --lane-b-bench-hosts — lane-B settlements fail closed "
+                      "(public rows are benched only on an eval pod, never on this box)")
+        return None
+    log.info("lane B: public rows benched on the eval pod(s) in %s", path)
+    return LaneBBench(hosts_path=path, cache_dir=Path(args.work_root) / "lane_b_bench_rows",
+                      eval_cfg=cfg.eval, fetch=runner._fetch_checkpoint_dir)
 
 
 def _local_device() -> str:

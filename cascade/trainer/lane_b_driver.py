@@ -877,6 +877,14 @@ class LaneBDriver:
         if not lb.active(block) or not king_pointer:
             self._deferred = []
             return []
+        # #909: a finished leg settles against the king's public rows — queue
+        # the king's eval-pod bench now, not at the settlement
+        pre = getattr(self.ops, "prebench", None)
+        if self.st.finished and lb.require_public and callable(pre):
+            try:
+                pre(king_pointer)
+            except Exception as e:  # noqa: BLE001 — a prebench never fails the tick
+                log.warning("lane B: king prebench not queued: %s", e)
         miner = self._miner_funded()
         fq = self._funded_queue() if miner else None
         if fq is not None:
@@ -1300,6 +1308,12 @@ class LaneBDriver:
                                  min_items=lb.min_public_items)
             except MissingPublicGuard as e:
                 raise OSError(f"lane-B king public benchmarks unavailable: {e}") from e
+        # #909: rows come from the eval pod's background bench (None = queued,
+        # the king's at tick time — RunnerLaneBOps.prebench); an unavailable
+        # candidate (or anchor) no longer stops the loop, so every candidate's
+        # bench is queued in the same settlement — the first such failure is
+        # raised after the loop, before anything is published or committed
+        bench_err: OSError | None = None
 
         def _drop(f: dict, outcome: str, detail) -> None:
             sub = f["leg"]["sub"]
@@ -1367,9 +1381,13 @@ class LaneBDriver:
                     pair_public_rows(rows["king"], rows["candidate"], require=require,
                                      min_items=lb.min_public_items)
                 except MissingPublicGuard as e:
-                    raise OSError(f"lane-B candidate public benchmarks unavailable: {e}") from e
+                    bench_err = bench_err or OSError(
+                        f"lane-B candidate public benchmarks unavailable: {e}")
                 if anchor_pointer:
-                    rows["anchor"] = self._anchor_bench_rows(anchor_pointer, require)
+                    try:
+                        rows["anchor"] = self._anchor_bench_rows(anchor_pointer, require)
+                    except OSError as e:
+                        bench_err = bench_err or e
             entries.append(ExpertEntry(
                 miner_hotkey=sub["hotkey"], miner_uid=int(sub["uid"]), gen_ref=sub["gen_ref"],
                 domain=sub["domain"], selection=sel,
@@ -1396,6 +1414,8 @@ class LaneBDriver:
                 trained_tokens=int(actual.get("tokens", 0) or 0),
                 stop=str(actual.get("stop", "") or "")))
             used.append((ptr, f, sel))
+        if bench_err is not None:
+            raise bench_err
         judgements: list = []
         digest = ""
         if entries:
@@ -1848,8 +1868,11 @@ class RunnerLaneBOps:
     sidecar, and the rolling dispatcher (or a local train when the trainer
     runs without remote hosts)."""
 
-    def __init__(self, runner, client, window_source, *, device: str = "cpu"):
+    def __init__(self, runner, client, window_source, *, device: str = "cpu", bench=None):
         self.r, self.client, self.source, self.device = runner, client, window_source, device
+        # #909: the eval-pod lane-B bench (cascade.trainer.lane_b_bench.LaneBBench);
+        # None = no --lane-b-bench-hosts: lane B fails closed, never benches here
+        self.bench = bench
 
     # ── funding (DEC-CA-0059 item 8) ─────────────────────────────────────────
 
@@ -2144,11 +2167,18 @@ class RunnerLaneBOps:
         threading.Thread(target=_run, name=f"laneb-{label}", daemon=True).start()
 
     def bench_rows(self, ckpt_dir: Path) -> dict | None:
-        from ..eval.benchmarks import run_item_rows
+        """#909: the rows of ckpt_dir benched on the eval pod (cached by
+        content), or None (queued / no bench host) — NEVER the trainer box."""
+        if self.bench is None:
+            log.error("lane B bench: no --lane-b-bench-hosts configured — lane-B public rows "
+                      "are never benched on the trainer box; settlement fails closed")
+            return None
+        return self.bench.rows(Path(ckpt_dir))
 
-        ec = self.r.cfg.eval
-        return run_item_rows(ckpt_dir, project_dir=ec.benchmark_project_dir,
-                             max_series=ec.cascade_bench_max_series, device=self.device)
+    def prebench(self, pointer: str) -> None:
+        """#909: queue pointer's eval-pod bench ahead of the settlement."""
+        if self.bench is not None:
+            self.bench.prebench(pointer)
 
     def publish_expert_manifest(self, manifest) -> None:
         from ..shared.expert_manifest import expert_manifest_key, sign_expert_manifest
