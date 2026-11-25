@@ -82,3 +82,26 @@ reads it. From that block:
   king-only settlements continue.
 
 `test_w_launch_lane_a_cutoff.py` pins it.
+
+Launch miner docs + CLI (owner 2026-11-25). Every miner-facing guide states
+that lane A is closed to new challengers from 9586800, the step 1 / step 2
+splits (A 50 / B 35 / C 15, then A 0 / B 35 / C 15 / D 50 once lane D is
+armed), that D's 50% stays with the lane A king until the first lane D crown,
+the 24 h launch embargo and that the lane D public weight is set by overlay.
+- The generated `cascade:rewards:summary` block is computed by
+  `scripts/check_docs.py` from `chain.toml` plus the mainnet launch overlays
+  (`launch_configs`), so every copy states the LIVE split; the allocation,
+  king-start and slot-tiers tables stay the checked-in template.
+- The CLI help (top level, `deploy`, `submit`, `fund`) says lane A is closed.
+  `cascade deploy` (without `--expert-domain`) and `cascade submit` (unless
+  store only, `--no-fund --no-commit`) read the chain head and refuse a lane A
+  entry at or past the cutoff BEFORE any upload, intake POST or chain commit
+  (`lane_a_closed`, exit 1; `--allow-closed-lane-a` overrides). The cutoff is
+  `[round] lane_a_until_block` when the loaded config types it, else the
+  published per-netuid cutoff (mainnet 91: 9586800); the miner's checked-in
+  chain.toml keeps the key at 0.
+- The overlay sync: both mainnet launch steps and the next-era fallback step 2
+  restate `[v2] reign_warm_start_blocks = 0` from the published step 1
+  (cfg-961291bc); without it the R3 `non-lane-d` lint refuses step 2.
+
+`test_w_launch_miner_cli.py` and `test_w_launch_overlay_sync.py` pin it.

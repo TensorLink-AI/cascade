@@ -563,22 +563,19 @@ own payout constants. Historical settlements retain the older geometric court
 rule. For mainnet v2:
 
 <!-- cascade:rewards:summary:start -->
-These are the checked-in mainnet v2 rules. Check live activation and signed policy before submitting.
-Percentages are shares of the competition reward vector. A lane's pool is its budget; miners receive only the shares they earn.
+These are the live mainnet rules from the launch at block 9,586,800 (about 2026-11-25 22:27 UTC): the checked-in `chain.toml` plus the launch overlays `deploy/overlays/launch-20261125.pre.mainnet.toml` (step 1) and `launch-20261125.mainnet.toml` (step 2). A later signed overlay can change them; check `cascade status --json` and the signed reward records before submitting.
+Percentages are shares of total emissions. A lane's pool is its budget; miners receive only the shares they earn, and the rest burns.
 
-| Launched lanes | A pool | B pool | C pool |
-|---|---:|---:|---:|
-| A | 100% | 0% | 0% |
-| A + C | 75% | 0% | 25% |
-| A + B | 75% | 25% | 0% |
-| A + B + C | 50% | 25% | 25% |
+| From block 9,586,800 | A pool | B pool | C pool | D pool |
+|---|---:|---:|---:|---:|
+| Step 1 (overlay cfg-961291bc, lanes B and C) | 50% | 35% | 15% | 0% |
+| Step 2 (second overlay, lane D armed) | 0% | 35% | 15% | 50% |
 
-- **At launch:** a separately activated pre-v2 policy burns 95%. Until the first v2 winner is crowned, the inherited king/court receives at most 5% of total emissions; the rest of A burns.
-- **A winner:** a random-init or other level-unit win starts at 50% of A. Increment-unit wins use the duel's lower confidence bound (LCB): LCB ≥ 0.5 → 80%; LCB ≥ 0.25 → 65%; LCB ≥ 0.1 → 50%; LCB ≥ 0.01 → 25%. These are the duel's increment units, not percentages of absolute forecast-error reduction.
-- **A progression:** each passed scheduled king check adds 10 percentage points of A, up to 95%. Failure sets 10%; a deferred check holds the share. Time alone does not increase it.
-- **Former king:** only the immediate former king can receive 5% of A for 36,000 blocks, while eligible. A qualifying compute-key lapse reduces the current king's payout to 1% of A, without reducing separately earned B/C rewards.
-- **B winner:** with merge acceptance enabled, qualification is unpaid. Acceptance into a scheduled shared starting checkpoint starts payment. The 10 slots each pay 2.5% of total emissions to their holder every settlement, with no decay or expiry, until a newer leg's accepted merge takes the slot. Every leg is tested on every slot: up to 4 declared targets clear at a 1% gain LCB, any other slot at 2%; one miner may hold every slot.
-- **C winner:** an initial test pass is unpaid. A later confirmation must win the target slot. C's pool is divided by competition weight, then target count. The current sole competition, MarketCast, has 1 target: each full-pay slot is 25% of total emissions.
+- **Lane A is closed to new challengers from block 9,586,800.** The intake refuses a new lane A fund or funded submit (`409 lane_ended`) and the trainer seats no new challenger. King checks and promotions are off (`[v2] reign_warm_start_blocks = 0`), so the lane A king is frozen as the reference model for lanes B and D. In step 1, A's pool pays that king its ladder share, which no longer changes; the rest of A burns.
+- **Lane D:** step 2 arms lane D at 9,586,800 if its overlay locks in by then, otherwise at a later era start. D takes its 50% from lane A. At lane D genesis the house entry (the frozen lane A king) holds the lane D throne and D's share stays with the lane A king until the first miner is crowned lane D king. Then D's pool pays its court 80/15/5 (king, then the two previous kings). The crown bar is a 3% LCB falling linearly to 1% over 32 settlements. The embargo is 24 h at launch and the public-half weight is set by overlay (currently 0, live-only: no public index is scored).
+- **B winner:** the 10 slots each pay 3.5% of total emissions to their holder every settlement, with no decay or expiry, until a newer leg's accepted merge takes the slot. Qualification is unpaid: pay starts only when a qualified expert is accepted into a shared era init, and the code opens a new init only at a lane A promotion. With lane A promotions off, **no lane B slot is paid under the launch config**; qualified experts wait as pending until the owner changes this. Every leg is tested on every slot: up to 4 declared targets clear at a 1% gain LCB, any other slot at 2%; one miner may hold every slot.
+- **B timing:** a finished leg typically settles about one settlement (3 h) after it finishes: its public bench is queued at the first settlement and the leg is judged once the bench rows exist.
+- **C winner:** an initial test pass is unpaid. A later confirmation must win the target slot. C's pool is divided by competition weight, then target count. The current sole competition, MarketCast, has 1 target: each full-pay slot is 15% of total emissions.
 - **C full-pay duration:** MarketCast C: 5 days (10 eras) at LCB 0.01, rising linearly to 20 days (40 eras) at LCB ≥ 0.05. C uses confirmed gain; each win keeps its recorded duration. B has no tiers.
 - **C progression:** C has no decay: its slot ends when the full-pay duration ends. Age starts at C confirmation. A new holder stops the old holder's pay.
 - **Burn:** unpaid A, empty B slots, empty/ended C slots and inactive competition allocations go to `burn_uid`; they are not shared among other miners. An unlaunched lane has no reserved pool.

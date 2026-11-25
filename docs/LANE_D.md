@@ -203,7 +203,8 @@ frequency. Evidence accumulates over every daily `pool_d` snapshot since T
 and freezes at the first settlement that meets the floors, `min_windows`
 (1000) and `min_clusters` (20 sources). Five-minute and hourly feeds fill the
 floors in days; daily and slower series rarely reach a forward-only set at
-h = 64. The 48 h embargo top-up (`embargo_hours`) fills the live half
+h = 64. The embargo top-up (`embargo_hours`: 24 h from the launch overlay,
+48 h in the template and once a later overlay restores it) fills the live half
 sooner: at least `min_fresh_window_share` (0.2) of the live windows are fresh,
 and the rest may be embargo windows. Judging starts no earlier than
 `eval_delay_hours` (6 h) after max(T_E, T_K), and the crown is decided at the

@@ -73,8 +73,35 @@ def training_reference(root=ROOT):
     return "\n".join(rows)
 
 
+# W-LAUNCH (owner 2026-11-25): the mainnet launch overlays. Step 1 (published,
+# cfg-961291bc) arms lanes B and C and freezes lane A; step 2 adds lane D.
+LAUNCH_BLOCK = 9586800
+LAUNCH_OVERLAYS = ("deploy/overlays/launch-20261125.pre.mainnet.toml",
+                   "deploy/overlays/launch-20261125.mainnet.toml")
+
+
+def launch_configs(root=ROOT):
+    """(template, step 1, step 2): ``chain.toml`` and the configs the two
+    mainnet launch overlays put in force on it, through the real overlay path."""
+    from cascade.shared import netconfig as nc
+    from cascade.shared.config import load_chain_config
+
+    base = load_chain_config(root / "chain.toml")
+    ident, prev, out = nc.network_identity(base), None, []
+    for rel in LAUNCH_OVERLAYS:
+        src = root / rel if (root / rel).is_file() else ROOT / rel   # tmp-root tests copy chain.toml only
+        prev = nc.next_overlay(tomllib.loads(src.read_text()), LAUNCH_BLOCK, prev,
+                               network=ident)
+        out.append((nc.build_config(base, prev), nc.cfg_feature_name(prev)))
+    return base, out[0], out[1]
+
+
 def reward_reference(root=ROOT):
-    """Mainnet tables computed from configuration and the actual payout helpers."""
+    """Mainnet tables computed from configuration and the actual payout helpers.
+
+    The ``summary``, ``slot-decay`` and ``worked-example`` blocks state the LIVE
+    launch rules (``chain.toml`` + the launch overlays); ``allocation``,
+    ``king-start`` and ``slot-tiers`` are the checked-in template."""
     from dataclasses import replace
 
     from cascade.eval.expert_lane import LaneBWin
@@ -95,7 +122,8 @@ def reward_reference(root=ROOT):
         target_full_pay_record,
     )
 
-    cfg = load_chain_config(root / "chain.toml")
+    cfg, (live1, cfg1_name), (live2, _) = launch_configs(root)
+    assert cfg == load_chain_config(root / "chain.toml")
 
     def percent(value):
         return f"{value * 100:.6g}%"
@@ -124,18 +152,21 @@ def reward_reference(root=ROOT):
     for g in c_points:
         mark = "≥ " if g == c_points[-1] else ""
         tiers.append(f"| C: confirmed MarketCast gain | {mark}{g:g} | {c_eras(g)} |")
-    b_share, c_share, _ = lane_pool_shares(cfg.lane_b, cfg.lane_c)
-    b_slot = b_share / len(lane_b_slots(cfg.lane_b))
-    decay = [f"B: a held slot pays 100% of its slot ({percent(b_slot)} of total emissions) "
-             "every settlement, with no decay and no expiry, until a newer leg's merge passes "
-             "acceptance on that slot. C has no decay: its slot pays 100% for its recorded "
+    b_share, c_share, _ = lane_pool_shares(live1.lane_b, live1.lane_c)
+    n_slots = len(lane_b_slots(live1.lane_b))
+    b_slot = b_share / n_slots
+    decay = [f"B (live launch split): a held slot pays 100% of its slot ({percent(b_slot)} of total "
+             "emissions) every settlement, with no decay and no expiry, until a newer leg's merge "
+             "passes acceptance on that slot. C has no decay: its slot pays 100% for its recorded "
              "full-pay duration, then ends."]
     # Explicit hypothetical launched-lane state, with eligible holders, no I/O.
-    _, slots = lane_c_split(cfg.lane_c, 1, 1, mc=replace(cfg.marketcast, from_block=1))
-    target = cfg.lane_c.targets[0]
+    # Step 1 of the launch (A + B + C, lane D not yet armed).
+    lb, lc = live1.lane_b, live1.lane_c
+    _, slots = lane_c_split(lc, 1, 1, mc=replace(live1.marketcast, from_block=1))
+    target = lc.targets[0]
     a, other = lane_parts([1, 2], 5, king_decay=cfg.scoring.king_decay, burn_uid=0,
-        lane_b_cfg=cfg.lane_b, wins=[LaneBWin(3, lane_b_slots(cfg.lane_b)[0], 1.0)],
-        lane_c_cfg=cfg.lane_c, c_wins=[LaneCWin(4, target, 1.0)], c_slot_frac=slots)
+        lane_b_cfg=lb, wins=[LaneBWin(3, lane_b_slots(lb)[0], 1.0)],
+        lane_c_cfg=lc, c_wins=[LaneCWin(4, target, 1.0)], c_slot_frac=slots)
     king_share = ladder_step(cfg.v2.ladder_start_level_bp, crowned=False, check="pass", cfg=cfg) / 10000
     vector = emission_vector(a, other, EmissionPolicy(king_share=king_share,
         former_share=cfg.v2.court_bp / 10000), burn_uid=0, lane_a_uids=[1, 2])
@@ -146,18 +177,26 @@ def reward_reference(root=ROOT):
     c_duration = (f"MarketCast C: {cfg.lane_c.full_pay_min_days:g} days ({c_eras(c_margin)} eras) "
                   f"at LCB {c_margin:g}, rising linearly to {cfg.lane_c.full_pay_max_days:g} days "
                   f"({c_eras(c_top)} eras) at LCB ≥ {c_top:g}")
-    starts_text = "; ".join(f"LCB ≥ {threshold:g} → {percent(bp / 10000)}"
-                            for threshold, bp in cfg.v2.ladder_start_tiers)
+    split = ["| From block 9,586,800 | A pool | B pool | C pool | D pool |", "|---|---:|---:|---:|---:|"]
+    for label, live in ((f"Step 1 (overlay {cfg1_name}, lanes B and C)", live1),
+                        ("Step 2 (second overlay, lane D armed)", live2)):
+        sh = lane_pool_shares(live.lane_b, live.lane_c, live.lane_d)
+        split.append(f"| {label} | {percent(1 - sh.b - sh.c - sh.d)} | {percent(sh.b)} "
+                     f"| {percent(sh.c)} | {percent(sh.d)} |")
+    d = live2.lane_d
+    court = "/".join(f"{w * 100:g}" for w in d.court_weights)
+    pw = float(d.public_weight)
+    public = ("currently 0, live-only: no public index is scored" if pw == 0
+              else f"currently {pw:g}")
     summary = [
-        "These are the checked-in mainnet v2 rules. Check live activation and signed policy before submitting.",
-        "Percentages are shares of the competition reward vector. A lane's pool is its budget; miners receive only the shares they earn.", "",
-        *allocations, "",
-        f"- **At launch:** a separately activated pre-v2 policy burns {percent(cfg.v2.prelaunch_burn)}. Until the first v2 winner is crowned, the inherited king/court receives at most {percent(cfg.v2.carryover_king_share)} of total emissions; the rest of A burns.",
-        f"- **A winner:** a random-init or other level-unit win starts at {percent(cfg.v2.ladder_start_level_bp / 10000)} of A. Increment-unit wins use the duel's lower confidence bound (LCB): {starts_text}. These are the duel's increment units, not percentages of absolute forecast-error reduction.",
-        f"- **A progression:** each passed scheduled king check adds {cfg.v2.ladder_step_bp / 100:g} percentage points of A, up to {percent(cfg.v2.ladder_cap_bp / 10000)}. Failure sets {percent(cfg.v2.ladder_fail_bp / 10000)}; a deferred check holds the share. Time alone does not increase it.",
-        f"- **Former king:** only the immediate former king can receive {percent(cfg.v2.court_bp / 10000)} of A for {cfg.v2.court_blocks:,} blocks, while eligible. A qualifying compute-key lapse reduces the current king's payout to {percent(cfg.v2.key_slash_bp / 10000)} of A, without reducing separately earned B/C rewards.",
-        f"- **B winner:** with merge acceptance enabled, qualification is unpaid. Acceptance into a scheduled shared starting checkpoint starts payment. The {len(lane_b_slots(cfg.lane_b))} slots each pay {percent(b_slot)} of total emissions to their holder every settlement, with no decay or expiry, until a newer leg's accepted merge takes the slot. Every leg is tested on every slot: up to {cfg.lane_b.max_domains_per_leg} declared targets clear at a {percent(cfg.lane_b.gain_margin)} gain LCB, any other slot at {percent(cfg.lane_b.undeclared_gain_margin)}; one miner may hold every slot.",
-        f"- **C winner:** an initial test pass is unpaid. A later confirmation must win the target slot. C's pool is divided by competition weight, then target count. The current sole competition, MarketCast, has {len(cfg.lane_c.targets)} target{'' if len(cfg.lane_c.targets) == 1 else 's'}: each full-pay slot is {percent(c_share * slots[target])} of total emissions.",
+        "These are the live mainnet rules from the launch at block 9,586,800 (about 2026-11-25 22:27 UTC): the checked-in `chain.toml` plus the launch overlays `deploy/overlays/launch-20261125.pre.mainnet.toml` (step 1) and `launch-20261125.mainnet.toml` (step 2). A later signed overlay can change them; check `cascade status --json` and the signed reward records before submitting.",
+        "Percentages are shares of total emissions. A lane's pool is its budget; miners receive only the shares they earn, and the rest burns.", "",
+        *split, "",
+        f"- **Lane A is closed to new challengers from block 9,586,800.** The intake refuses a new lane A fund or funded submit (`409 lane_ended`) and the trainer seats no new challenger. King checks and promotions are off (`[v2] reign_warm_start_blocks = {live1.v2.reign_warm_start_blocks}`), so the lane A king is frozen as the reference model for lanes B and D. In step 1, A's pool pays that king its ladder share, which no longer changes; the rest of A burns.",
+        f"- **Lane D:** step 2 arms lane D at 9,586,800 if its overlay locks in by then, otherwise at a later era start. D takes its {percent(d.share)} from lane A. At lane D genesis the house entry (the frozen lane A king) holds the lane D throne and D's share stays with the lane A king until the first miner is crowned lane D king. Then D's pool pays its court {court} (king, then the two previous kings). The crown bar is a {percent(d.d_margin_start)} LCB falling linearly to {percent(d.d_margin)} over {d.d_margin_warmup_settlements} settlements. The embargo is {d.embargo_hours:g} h at launch and the public-half weight is set by overlay ({public}).",
+        f"- **B winner:** the {n_slots} slots each pay {percent(b_slot)} of total emissions to their holder every settlement, with no decay or expiry, until a newer leg's accepted merge takes the slot. Qualification is unpaid: pay starts only when a qualified expert is accepted into a shared era init, and the code opens a new init only at a lane A promotion. With lane A promotions off, **no lane B slot is paid under the launch config**; qualified experts wait as pending until the owner changes this. Every leg is tested on every slot: up to {live1.lane_b.max_domains_per_leg} declared targets clear at a {percent(live1.lane_b.gain_margin)} gain LCB, any other slot at {percent(live1.lane_b.undeclared_gain_margin)}; one miner may hold every slot.",
+        "- **B timing:** a finished leg typically settles about one settlement (3 h) after it finishes: its public bench is queued at the first settlement and the leg is judged once the bench rows exist.",
+        f"- **C winner:** an initial test pass is unpaid. A later confirmation must win the target slot. C's pool is divided by competition weight, then target count. The current sole competition, MarketCast, has {len(lc.targets)} target{'' if len(lc.targets) == 1 else 's'}: each full-pay slot is {percent(c_share * slots[target])} of total emissions.",
         "- **C full-pay duration:** " + c_duration + ". C uses confirmed gain; each win keeps its recorded duration. B has no tiers.",
         "- **C progression:** C has no decay: its slot ends when the full-pay duration ends. Age starts at C confirmation. A new holder stops the old holder's pay.",
         "- **Burn:** unpaid A, empty B slots, empty/ended C slots and inactive competition allocations go to `burn_uid`; they are not shared among other miners. An unlaunched lane has no reserved pool.",

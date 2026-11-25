@@ -135,6 +135,21 @@ guaranteed live value. Check `cascade rules b` for `share`.
 Lane B opens on mainnet at block 9,586,800 (about 2026-11-25 22:28 UTC),
 with suite targets not armed at launch.
 
+**When pay can start under the launch config.** Pay starts only when a
+qualified update is accepted into a new shared era init, and the code opens a
+new init only at a lane A king promotion (`v2_init_epoch_start`). From block
+9,586,800 lane A promotions are off (`[v2] reign_warm_start_blocks = 0`), so
+**no lane B slot is paid under the launch config**: a leg that clears is
+recorded as a pending qualification against the frozen lane A king (uid 164)
+and waits. Whether, and how, pending experts are merged and paid is an open
+owner decision; watch the signed overlays and `cascade rules b`.
+
+**When a leg settles.** A finished leg typically settles about one settlement
+(about 3 h) after it finishes: its public bench (GIFT-Eval, BOOM, TIME, FEV)
+is queued at the first settlement after it finishes, on an eval pod, and the
+leg is judged at a later settlement once those rows exist. A settlement whose
+bench rows are missing keeps the leg and publishes nothing for it.
+
 ## Strategies worth trying
 
 - **Target where the king is weakest.** The receipts' `per_domain` numbers
@@ -218,7 +233,9 @@ only narrow which experts train.
 in its family and the guards hold.
 
 **Does my leg get paid when it clears?** No. Pay starts when the merge is
-accepted at a warm start.
+accepted at a warm start, and under the launch config no warm start happens
+(lane A promotions are off), so no B slot is paid yet. See
+[when pay can start](#how-you-are-paid).
 
 **How long does a slot pay?** Until another leg is accepted on top of yours.
 There is no decay and no time limit.
