@@ -98,4 +98,3 @@ tests/unit/test_first_seen_record_memory.py
 # --mv-pack --max-panel-series-per-feed 20 (pinned against publish-pool.yml).
 cascade/laned/elastic.py
 deploy/laned/elastic.toml
-tests/accept/r13/test_r13_builder.py
