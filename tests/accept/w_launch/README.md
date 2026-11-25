@@ -123,3 +123,27 @@ the 24 h launch embargo and that the lane D public weight is set by overlay.
   (cfg-961291bc); without it the R3 `non-lane-d` lint refuses step 2.
 
 `test_w_launch_miner_cli.py` and `test_w_launch_overlay_sync.py` pin it.
+
+## pool_d builder OOM: first_seen record() bounded by one feed (2026-11-25)
+
+The first baseline `python -P -m cascade.pool.first_seen record` over 7,002
+feeds / 14 GB of parquet reached 39.8 GB RSS on the 39 GB `pool_d` builder
+and was OOM-killed. `record()` kept every point of every feed (`known`) and
+every new record in memory until the end, and loaded the whole log history
+the same way.
+
+- `record()` makes one streaming pass over `records.jsonl` / `quarantine.jsonl`
+  and keeps only the logged (feed, partition, sha256) keys, the logged feeds,
+  the quarantine versions and per-feed byte spans. It loads `known` for one
+  feed at a time from those spans and drops it when that feed is done.
+- New lines are staged in two unlinked temp files in `log_dir`. They are
+  appended only after the `too_many_unreadable` check passes, quarantine
+  first, so a systemic failure still records nothing.
+- `commit()` streams the log and keeps only 32-byte leaf hashes.
+- The output is byte-identical. Record, quarantine and root formats are
+  unchanged.
+
+`test_w_launch_first_seen_memory.py` pins that the peak memory does not grow
+with the feed count, on a baseline run and over a long history.
+`tests/unit/test_first_seen_record_memory.py` pins byte-identical logs
+against the previous implementation, kept verbatim in the test.

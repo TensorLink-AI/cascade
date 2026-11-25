@@ -84,3 +84,10 @@ docs/MINER_LANE_B.md
 docs/MINER_LANE_D.md
 docs/LANE_D.md
 docs/VALIDATOR.md
+
+# 2026-11-25 pool_d builder OOM (first baseline `first_seen record` over 7,002
+# feeds / 14 GB held every point in memory): record() bounded by one feed,
+# staged lines appended after the unreadable check, commit() streams the log;
+# byte-identical output pinned against the previous implementation.
+cascade/pool/first_seen.py
+tests/unit/test_first_seen_record_memory.py
