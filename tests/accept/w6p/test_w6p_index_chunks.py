@@ -65,7 +65,10 @@ def test_list_shape_survives_int32_offset_overflow():
     assert sum(len(c.values.values) for c in col.chunks) > 2**31 - 1
     with pytest.raises(pa.ArrowInvalid, match="offset overflow"):
         col.combine_chunks()                 # the pre-fix failure, reproduced
-    ch, ln = _idx()._list_shape(col)
+    try:
+        ch, ln = _idx()._list_shape(col)
+    except pa.ArrowInvalid as e:
+        raise AssertionError(f"_list_shape concatenated the whole column: {e}") from e
     assert ch.dtype == ln.dtype == np.int64
     assert ch.tolist() == [C] * (2 * n + 3)
     assert ln.tolist() == [L] * (2 * n) + [10] * 3
