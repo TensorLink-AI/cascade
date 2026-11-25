@@ -390,7 +390,7 @@ def test_partition_points_matches_previous_reader(tmp_path):
     pytest.importorskip("pyarrow")
     n = 50
     frame = pd.DataFrame({
-        "timestamp": [f"2026-11-19T{h % 24:02d}:00:00+00:00" for h in range(n)],
+        "timestamp": [f"2026-11-{19 + h // 24}T{h % 24:02d}:00:00+00:00" for h in range(n)],
         "v": np.arange(n, dtype=float),
         "_panel_site": [f"s{i % 3}" for i in range(n)],
         "_panel_kind": [i % 2 for i in range(n)],
