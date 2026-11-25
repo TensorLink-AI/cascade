@@ -238,3 +238,34 @@ def test_env_template_names_only_mode_600(tmp_path):
     p.chmod(0o644)
     with pytest.raises(m.ElasticError):
         m.check_env_file(p)
+
+
+def test_lane_a_snapshot_skips_smoke_test_sentinels():
+    from cascade.shared.hippius import PoolSnapshotMeta
+
+    m = mod()
+
+    def meta(block):
+        return PoolSnapshotMeta(effective_block=block, key=f"pool/snapshots/block-{block}.tar",
+                                sha256="0" * 64, size_bytes=1, as_of="2026-11-25",
+                                n_series=1, context_length=4096, horizon=64)
+
+    index = [meta(9586800), meta(9587700), meta(999_999_999_999)]
+    assert m.select_lane_a_snapshot(index).effective_block == 9587700
+    with pytest.raises(m.ElasticError) as e:
+        m.select_lane_a_snapshot([meta(999_999_999_999)])
+    assert "non-sentinel" in str(e.value)
+
+
+def test_shipped_build_args_match_lane_a_publish_flags():
+    """W6b replays lane A byte-for-byte, so the builder must pass the panel cap
+    lane A is published with (not recorded in provenance.json) and --mv-pack."""
+    import re
+
+    m = mod()
+    args = list(m.load_config(CONFIG).builder.build_args)
+    wf = (CONFIG.parents[2] / ".github" / "workflows" / "publish-pool.yml").read_text()
+    published = re.search(r"--max-panel-series-per-feed (\d+)", wf.split("TSFORGE_DIR=./tsforge cascade-pool publish", 1)[1])
+    assert "--mv-pack" in args
+    i = args.index("--max-panel-series-per-feed")
+    assert args[i + 1] == published.group(1)

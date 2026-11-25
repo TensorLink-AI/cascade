@@ -91,3 +91,11 @@ docs/VALIDATOR.md
 # byte-identical output pinned against the previous implementation.
 cascade/pool/first_seen.py
 tests/unit/test_first_seen_record_memory.py
+
+# 2026-11-25 pool_d build refused lane_a_replay_mismatch: `elastic lane-a-pool`
+# picked the 999999999999 smoke-test sentinel (2026-09-29 workflow_dispatch) and
+# the replay lacked lane A's publish flags. Skip sentinels; ship build_args
+# --mv-pack --max-panel-series-per-feed 20 (pinned against publish-pool.yml).
+cascade/laned/elastic.py
+deploy/laned/elastic.toml
+tests/accept/r13/test_r13_builder.py
