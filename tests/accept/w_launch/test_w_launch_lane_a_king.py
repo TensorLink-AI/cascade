@@ -29,13 +29,26 @@ def _setup(tmp_path, *, receipt: str | None, chain: str | None):
     return armed, clock, sched, ops, FakeClient(), era_start
 
 
-def _run_first_settlement(tmp_path, *, receipt, chain):
-    from tests.unit.test_rolling import EB, _advance, _join
+def _run_two_settlements(tmp_path, *, silent_after_first: bool):
+    """Two settlements with a lane D payee on top of the incentive. The
+    receipt names KING at the first; with ``silent_after_first`` every later
+    receipt names no king (a rejected round)."""
+    from tests.unit.test_rolling import EB, REF, _advance, _commit, _join
 
-    armed, clock, sched, ops, client, era_start = _setup(tmp_path, receipt=receipt, chain=chain)
+    armed, clock, sched, ops, client, era_start = _setup(tmp_path, receipt="KING",
+                                                         chain=LANE_D_PAYEE)
     sched.tick(client, era_start + 5)
     _join(sched)
-    _advance(clock, ops, sched, client, from_block=era_start + 5, to_block=era_start + EB + 1)
+    b1 = era_start + EB
+    _advance(clock, ops, sched, client, from_block=era_start + 5, to_block=b1 + 1)
+    # a second challenger for the second settlement
+    ops.commits.append(_commit("BRAV", REF["BRAV"], b1))
+    ops.queue().add("BRAV", REF["BRAV"], reveal_block=b1)
+    if silent_after_first:
+        ops.king_hk = None
+    sched.tick(client, b1 + 2)
+    _join(sched)
+    _advance(clock, ops, sched, client, from_block=b1 + 2, to_block=era_start + 2 * EB + 1)
     return sched, ops
 
 
@@ -102,12 +115,14 @@ def test_w_launch_first_run_without_receipt_or_state_holds(tmp_path):
                                                         or {})
 
 
-def test_w_launch_receipt_king_manifests_unchanged_by_incentive(tmp_path):
-    """Normal case: the receipt names the king. The manifests are
-    byte-identical whether the top incentive is the king or a lane D payee."""
-    _, ops_a = _run_first_settlement(tmp_path / "a", receipt="KING", chain="KING")
-    _, ops_b = _run_first_settlement(tmp_path / "b", receipt="KING", chain=LANE_D_PAYEE)
-    assert len(ops_a.manifests) == len(ops_b.manifests) == 1
-    assert ops_a.manifests[0].entry_for_role("king").miner_hotkey == "KING"
-    body = [m.canonical_body() for m in ops_a.manifests]
-    assert body == [m.canonical_body() for m in ops_b.manifests]
+def test_w_launch_manifests_byte_identical_with_and_without_receipt_king(tmp_path):
+    """Normal case unchanged: with the receipt naming the king at every
+    settlement, the king is KING whatever the incentive says. A run whose
+    later receipts name no king publishes byte-identical manifests — the
+    persisted king, never the top-incentive lane D payee."""
+    _, ops_a = _run_two_settlements(tmp_path / "a", silent_after_first=False)
+    _, ops_b = _run_two_settlements(tmp_path / "b", silent_after_first=True)
+    assert len(ops_a.manifests) == len(ops_b.manifests) == 2
+    assert all(m.entry_for_role("king").miner_hotkey == "KING" for m in ops_a.manifests)
+    assert ([m.canonical_body() for m in ops_a.manifests]
+            == [m.canonical_body() for m in ops_b.manifests])

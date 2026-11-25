@@ -54,4 +54,5 @@ read stays as a log-only cross-check. `test_w_launch_lane_a_king.py` pins:
 - no receipt: the persisted king is kept through settlements and the era roll;
 - a lane D payee with top incentive is never chosen;
 - first run, no receipt and no state: hold + alert;
-- receipt names the king: manifests byte-identical whatever the incentive says.
+- receipt names the king: the king whatever the incentive says, and a run whose
+  later receipts name no king publishes byte-identical manifests.
