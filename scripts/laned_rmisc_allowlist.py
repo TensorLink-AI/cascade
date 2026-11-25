@@ -628,34 +628,54 @@ def cand_file_hashes(path, sample_series: int, max_points: int, k: int, mod: int
 
     from cascade.eval.lane_d_public_index import RMISC_SERIES_COLUMN
 
-    t = pq.read_table(str(path))
-    cols = [x for x in t.column_names if x != RMISC_SERIES_COLUMN
-            and (pa.types.is_integer(t.column(x).type) or pa.types.is_floating(t.column(x).type))]
-    vals = {x: t.column(x).cast(pa.float64()).to_numpy(zero_copy_only=False) for x in cols}
     key = lambda s: hashlib.sha256(s.encode()).hexdigest()  # noqa: E731
-    has = RMISC_SERIES_COLUMN in t.column_names
-    col = t.column(RMISC_SERIES_COLUMN) if has else None
-    if has and pa.types.is_dictionary(col.type) and (pa.types.is_string(col.type.value_type)
-                                                     or pa.types.is_large_string(
-                                                         col.type.value_type)):
-        col = col.cast(col.type.value_type)               # RMISC: dictionary<string>
-    fast = (not reference and has
-            and (pa.types.is_string(col.type) or pa.types.is_large_string(col.type)))
-    hs = []
-    if fast:
-        col = pc.fill_null(col, "None")                   # str(None), as the reference
-        uniq = sorted(pc.unique(col).to_pylist(), key=key)[:sample_series]
-        pos = pc.fill_null(pc.index_in(col, value_set=pa.array(uniq, type=col.type)), -1)
-        pos = np.asarray(pos.to_numpy(zero_copy_only=False))
-        groups = [np.flatnonzero(pos == j) for j in range(len(uniq))]
-    else:
-        names = list(map(str, col.to_pylist())) if has else ["_all"] * t.num_rows
+    if reference:
+        t = pq.read_table(str(path))
+        cols = [x for x in t.column_names if x != RMISC_SERIES_COLUMN
+                and (pa.types.is_integer(t.column(x).type)
+                     or pa.types.is_floating(t.column(x).type))]
+        vals = {x: t.column(x).cast(pa.float64()).to_numpy(zero_copy_only=False) for x in cols}
+        names = list(map(str, t.column(RMISC_SERIES_COLUMN).to_pylist())) \
+            if RMISC_SERIES_COLUMN in t.column_names else ["_all"] * t.num_rows
         uniq = sorted(set(names), key=key)[:sample_series]
         arr_names = np.asarray(names, dtype=object)
-        groups = [np.flatnonzero(arr_names == s) for s in uniq]
-    for idx in groups:
-        for c in cols:
-            hs.append(kgram_hashes(vals[c][idx][:max_points], k, mod))
+        hs = [kgram_hashes(vals[c][np.flatnonzero(arr_names == s)][:max_points], k, mod)
+              for s in uniq for c in cols]
+        h = np.unique(np.concatenate(hs)) if hs else np.empty(0, dtype=np.uint64)
+        return len(uniq), h
+    # Memory-bounded: the name column first, then one numeric column at a time,
+    # taking only the sampled rows (a wide table is never materialised whole).
+    schema = pq.read_schema(str(path))
+    cols = [f.name for f in schema if f.name != RMISC_SERIES_COLUMN
+            and (pa.types.is_integer(f.type) or pa.types.is_floating(f.type))]
+    has = RMISC_SERIES_COLUMN in schema.names
+    if has:
+        col = pq.read_table(str(path), columns=[RMISC_SERIES_COLUMN]).column(RMISC_SERIES_COLUMN)
+        if pa.types.is_dictionary(col.type):
+            col = col.cast(col.type.value_type)               # RMISC: dictionary<string>
+        if pa.types.is_string(col.type) or pa.types.is_large_string(col.type):
+            col = pc.fill_null(col, "None")                   # str(None), as the reference
+            uniq = sorted(pc.unique(col).to_pylist(), key=key)[:sample_series]
+            pos = pc.fill_null(pc.index_in(col, value_set=pa.array(uniq, type=col.type)), -1)
+            pos = np.asarray(pos.to_numpy(zero_copy_only=False))
+            groups = [np.flatnonzero(pos == j) for j in range(len(uniq))]
+        else:
+            arr_names = np.asarray(list(map(str, col.to_pylist())), dtype=object)
+            uniq = sorted(set(arr_names.tolist()), key=key)[:sample_series]
+            groups = [np.flatnonzero(arr_names == s) for s in uniq]
+    else:
+        n = pq.ParquetFile(str(path)).metadata.num_rows
+        uniq = ["_all"]
+        groups = [np.arange(n)]
+    groups = [g[:max_points] for g in groups]                 # vals[idx][:m] == vals[idx[:m]]
+    sel = np.concatenate(groups) if groups else np.empty(0, dtype=np.int64)
+    offs = np.concatenate([[0], np.cumsum([g.size for g in groups])]).tolist()
+    hs = []
+    for c in cols:
+        v = pq.read_table(str(path), columns=[c]).column(c).take(pa.array(sel)) \
+            .cast(pa.float64()).to_numpy(zero_copy_only=False)
+        for j in range(len(groups)):
+            hs.append(kgram_hashes(v[offs[j]:offs[j + 1]], k, mod))
     h = np.unique(np.concatenate(hs)) if hs else np.empty(0, dtype=np.uint64)
     return len(uniq), h
 
