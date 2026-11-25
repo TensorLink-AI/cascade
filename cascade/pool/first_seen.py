@@ -45,9 +45,11 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import socket
 import statistics
 import sys
+import tempfile
 import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -98,7 +100,18 @@ def merkle_root(leaves: Sequence[bytes]) -> str:
     ``sha256(0x01 || left || right)``, an odd last node promoted unchanged."""
     if not leaves:
         raise ValueError("merkle_root of no leaves")
-    level = [hashlib.sha256(b"\x00" + bytes(leaf)).digest() for leaf in leaves]
+    return _merkle_root_of_hashes([_leaf_hash(leaf) for leaf in leaves])
+
+
+def _leaf_hash(leaf: bytes) -> bytes:
+    return hashlib.sha256(b"\x00" + bytes(leaf)).digest()
+
+
+def _merkle_root_of_hashes(level: list[bytes]) -> str:
+    """:func:`merkle_root` from the leaf hashes (``sha256(0x00 || leaf)``)."""
+    if not level:
+        raise ValueError("merkle_root of no leaves")
+    level = list(level)
     while len(level) > 1:
         nxt = []
         for i in range(0, len(level), 2):
@@ -172,10 +185,17 @@ def partition_points(path: Path) -> list[tuple[str, int]]:
     panel_cols = [c for c in df.columns if c.startswith("_panel_")]
     cols = [[str(v) for v in df[c].tolist()] for c in panel_cols]
     names = [c.removeprefix("_panel_") for c in panel_cols]
+    del df
+    # One panel_json string per distinct panel (not per row): the same keys,
+    # far fewer string objects in the per-feed ``known`` set downstream.
+    pj_of: dict[tuple, str] = {}
     out = set()
     for i in np.flatnonzero(ok):
-        panel = {n: col[i] for n, col in zip(names, cols, strict=True)}
-        out.add((panel_json(panel), int(secs[i])))
+        vals = tuple(col[i] for col in cols)
+        pj = pj_of.get(vals)
+        if pj is None:
+            pj = pj_of[vals] = panel_json(dict(zip(names, vals, strict=True)))
+        out.add((pj, int(secs[i])))
     return sorted(out)
 
 
@@ -247,17 +267,26 @@ class FirstSeenLog:
 
     @staticmethod
     def _lines(path: Path) -> list[dict]:
+        return [doc for _off, _len, doc in FirstSeenLog._scan(path)]
+
+    @staticmethod
+    def _scan(path: Path):
+        """Yield ``(byte offset, byte length, parsed doc)`` per non-blank line,
+        one line in memory at a time (``log_corrupt`` on a bad line)."""
         if not path.is_file():
-            return []
-        out = []
-        for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-            if not line.strip():
-                continue
-            try:
-                out.append(json.loads(line))
-            except json.JSONDecodeError as e:
-                raise FirstSeenError("log_corrupt", f"{path}:{n}: {e}") from e
-        return out
+            return
+        with open(path, "rb") as f:
+            off = 0
+            for n, raw in enumerate(f, 1):
+                start, off = off, off + len(raw)
+                line = raw.decode("utf-8")
+                if not line.strip():
+                    continue
+                try:
+                    doc = json.loads(line)
+                except json.JSONDecodeError as e:
+                    raise FirstSeenError("log_corrupt", f"{path}:{n}: {e}") from e
+                yield start, len(raw), doc
 
     def records(self) -> list[dict]:
         return self._lines(self.records_path)
@@ -318,6 +347,75 @@ class FirstSeenLog:
             f.flush()
             os.fsync(f.fileno())
 
+    @staticmethod
+    def _write_docs(f, docs) -> None:
+        for doc in docs:
+            f.write(canonical_json(doc) + b"\n")
+
+    def _append_staged(self, path: Path, staged) -> None:
+        """Append a staged (binary, canonical-JSON lines) temp file to ``path``
+        like :meth:`_append`: nothing when empty, fsync after the copy."""
+        if staged.tell() == 0:
+            return
+        staged.flush()
+        staged.seek(0)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        with open(path, "ab") as f:
+            shutil.copyfileobj(staged, f, 1 << 20)
+            f.flush()
+            os.fsync(f.fileno())
+
+    def _scan_history(self) -> dict:
+        """One streaming pass over ``records.jsonl`` and ``quarantine.jsonl``
+        keeping only what is small: the logged (feed, partition, sha256)
+        triples, the logged feeds, the quarantine keys and, per feed, the byte
+        spans of the lines carrying points (``known`` is then loaded one feed
+        at a time by :meth:`_feed_known`, never the whole history at once)."""
+        seen_parts: set = set()
+        logged_feeds: set = set()
+        rec_spans: dict[str, list[tuple[int, int]]] = {}
+        for off, n, r in self._scan(self.records_path):
+            seen_parts.add((r["feed"], r["partition"], r["partition_sha256"]))
+            logged_feeds.add(r["feed"])
+            if r["points"]:
+                rec_spans.setdefault(r["feed"], []).append((off, n))
+        q_names: set = set()
+        q_versions: dict = {}
+        blk_spans: dict[str, list[tuple[int, int]]] = {}
+        for off, n, e in self._scan(self.quarantine_path):
+            key = (str(e["feed"]), str(e["partition"]), str(e["partition_sha256"]))
+            if e.get("kind") == "unreadable":
+                q_names.add(key[:2])
+            q_versions[key] = e.get("kind")
+            if e.get("kind") == "blocked" and e.get("points"):
+                blk_spans.setdefault(key[0], []).append((off, n))
+        return {"seen_parts": seen_parts, "logged_feeds": logged_feeds,
+                "rec_spans": rec_spans, "q_names": q_names, "q_versions": q_versions,
+                "blk_spans": blk_spans}
+
+    @staticmethod
+    def _read_spans(path: Path, spans) -> list[dict]:
+        if not spans:
+            return []
+        out = []
+        with open(path, "rb") as f:
+            for off, n in spans:
+                f.seek(off)
+                out.append(json.loads(f.read(n).decode("utf-8")))
+        return out
+
+    def _feed_known(self, feed: str, hist: dict) -> set:
+        """Every point key already logged for ``feed``: its records' points
+        plus its ``blocked`` quarantine points (the same set the whole-history
+        load built, for this one feed)."""
+        known: set = set()
+        intern: dict[str, str] = {}
+        for r in self._read_spans(self.records_path, hist["rec_spans"].get(feed)):
+            known.update((intern.setdefault(pj, pj), int(t)) for pj, t in r["points"])
+        for e in self._read_spans(self.quarantine_path, hist["blk_spans"].get(feed)):
+            known.update((intern.setdefault(pj, pj), int(t)) for pj, t in e.get("points") or [])
+        return known
+
     def record(self, forge_dir: Path | str, *, now_ts: int,
                max_unreadable_files: int = DEFAULT_MAX_UNREADABLE_FILES,
                max_unreadable_frac: float = DEFAULT_MAX_UNREADABLE_FRAC) -> dict:
@@ -327,101 +425,120 @@ class FirstSeenLog:
         more than :func:`unreadable_limit` unreadable partitions (new ones plus
         quarantined versions still present) raises ``too_many_unreadable``
         before anything is written. The result gains ``quarantined`` /
-        ``blocked`` / ``unreadable`` only when non-zero."""
+        ``blocked`` / ``unreadable`` only when non-zero.
+
+        Memory is bounded by one feed (2026-11-25: a 7,002-feed baseline held
+        every point of every feed and OOM-killed a 39 GB builder): feeds are
+        processed one at a time, each feed's ``known`` set is loaded from the
+        log for that feed only and dropped when it is done, and its new lines
+        go to two unlinked staging files in ``log_dir``. Only after the
+        unreadable check passes are they appended, quarantine first, so a
+        systemic failure still records nothing and the logs get exactly the
+        bytes, in the same order, that the whole-forge version wrote."""
         now_ts = int(now_ts)
         p = period_start(now_ts)
         if p in self.roots():
             raise FirstSeenError("period_committed",
                                  f"period {p} already has a committed root; now_ts={now_ts}")
-        existing = self.records()
-        quarantine = self.quarantine()
-        seen_parts = {(r["feed"], r["partition"], r["partition_sha256"]) for r in existing}
-        known: dict[str, set] = {}
-        for r in existing:
-            known.setdefault(r["feed"], set()).update((pj, int(t)) for pj, t in r["points"])
-        q_names = {(str(e["feed"]), str(e["partition"])) for e in quarantine
-                   if e.get("kind") == "unreadable"}
-        q_versions = {(str(e["feed"]), str(e["partition"]), str(e["partition_sha256"])):
-                      e.get("kind") for e in quarantine}
-        for e in quarantine:
-            if e.get("kind") == "blocked":
-                known.setdefault(str(e["feed"]), set()).update(
-                    (pj, int(t)) for pj, t in e.get("points") or [])
-        logged_feeds = {r["feed"] for r in existing}
+        hist = self._scan_history()
+        seen_parts, logged_feeds = hist["seen_parts"], hist["logged_feeds"]
+        q_names, q_versions = hist["q_names"], hist["q_versions"]
         data = Path(forge_dir) / "data"
-        new: list[dict] = []
-        new_q: list[dict] = []
         unreadable: list[str] = []
-        n_points = n_blocked = n_parts = 0
+        n_points = n_blocked = n_parts = n_records = n_q = 0
+        any_blocked = False
         feed_dirs = sorted(d for d in data.iterdir() if d.is_dir()) if data.is_dir() else []
-        for feed_dir in feed_dirs:
-            feed = feed_dir.name
-            for part in sorted(feed_dir.glob("*.parquet")):
-                n_parts += 1
-                sha = _file_sha(part)
-                if (feed, part.name, sha) in seen_parts:
-                    continue
-                kind = q_versions.get((feed, part.name, sha))
-                if kind == "unreadable":                 # the same corrupt bytes
-                    unreadable.append(f"{feed}/{part.name}")
-                    continue
-                if kind == "blocked":                    # already blocked
-                    continue
-                size = part.stat().st_size
+        # The staging files live in log_dir (same filesystem, never tmpfs);
+        # dirs made only for them are removed again when nothing was written.
+        made_dirs = [d for d in (self.log_dir, *self.log_dir.parents) if not d.exists()]
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            with tempfile.TemporaryFile(dir=self.log_dir) as stage_q, \
+                    tempfile.TemporaryFile(dir=self.log_dir) as stage_r:
+                for feed_dir in feed_dirs:
+                    feed = feed_dir.name
+                    have: set | None = None       # this feed's known points, loaded lazily
+                    for part in sorted(feed_dir.glob("*.parquet")):
+                        n_parts += 1
+                        sha = _file_sha(part)
+                        if (feed, part.name, sha) in seen_parts:
+                            continue
+                        kind = q_versions.get((feed, part.name, sha))
+                        if kind == "unreadable":                 # the same corrupt bytes
+                            unreadable.append(f"{feed}/{part.name}")
+                            continue
+                        if kind == "blocked":                    # already blocked
+                            continue
+                        size = part.stat().st_size
+                        try:
+                            points = partition_points(part)
+                        except Exception as e:  # noqa: BLE001 — any read failure quarantines it
+                            reason = unreadable_reason(e)
+                            _warn(f"QUARANTINE unreadable partition data/{feed}/{part.name} "
+                                  f"(size={size} sha256={sha}): {reason}")
+                            unreadable.append(f"{feed}/{part.name}")
+                            self._write_docs(stage_q, [{
+                                "schema": QUARANTINE_SCHEMA, "kind": "unreadable",
+                                "feed": feed, "partition": part.name,
+                                "partition_sha256": sha, "size": int(size),
+                                "reason": reason, "quarantined_ts": now_ts}])
+                            n_q += 1
+                            q_versions[(feed, part.name, sha)] = "unreadable"
+                            q_names.add((feed, part.name))
+                            continue
+                        if have is None:
+                            have = self._feed_known(feed, hist)
+                        fresh = sorted(set(points) - have)
+                        del points
+                        have.update(fresh)
+                        if (feed, part.name) in q_names:
+                            # A quarantined partition readable again: its unknown
+                            # points are blocked forever, never first-seen now.
+                            _warn(f"quarantined partition data/{feed}/{part.name} is readable "
+                                  f"again (size={size} sha256={sha}); {len(fresh)} unseen "
+                                  f"point(s) blocked from lane D, not recorded as first seen")
+                            n_blocked += len(fresh)
+                            any_blocked = True
+                            self._write_docs(stage_q, [{
+                                "schema": QUARANTINE_SCHEMA, "kind": "blocked",
+                                "feed": feed, "partition": part.name,
+                                "partition_sha256": sha, "size": int(size),
+                                "quarantined_ts": now_ts,
+                                "points": [[pj, int(t)] for pj, t in fresh]}])
+                            q_versions[(feed, part.name, sha)] = "blocked"
+                            continue
+                        n_points += len(fresh)
+                        n_records += 1
+                        self._write_docs(stage_r, [{
+                            "schema": LOG_SCHEMA, "feed": feed, "partition": part.name,
+                            "partition_sha256": sha, "seen_ts": now_ts, "period_start": p,
+                            "baseline": feed not in logged_feeds,
+                            "points": [[pj, int(t)] for pj, t in fresh],
+                        }])
+                        del fresh
+                    del have                              # free this feed before the next
+                    self._feed_state_freed(feed)
+                limit = unreadable_limit(n_parts, max_files=max_unreadable_files,
+                                         max_frac=max_unreadable_frac)
+                if len(unreadable) > limit:
+                    raise FirstSeenError(
+                        "too_many_unreadable",
+                        f"{len(unreadable)} of {n_parts} partitions are unreadable (limit "
+                        f"{limit}); a systemic read failure? nothing recorded. First: "
+                        f"{', '.join(unreadable[:10])}")
+                # Quarantine first: a crash between the two appends errs on the safe side.
+                self._append_staged(self.quarantine_path, stage_q)
+                self._append_staged(self.records_path, stage_r)
+        finally:
+            for d in made_dirs:                           # deepest first
                 try:
-                    points = partition_points(part)
-                except Exception as e:  # noqa: BLE001 — any read failure quarantines it
-                    reason = unreadable_reason(e)
-                    _warn(f"QUARANTINE unreadable partition data/{feed}/{part.name} "
-                          f"(size={size} sha256={sha}): {reason}")
-                    unreadable.append(f"{feed}/{part.name}")
-                    new_q.append({"schema": QUARANTINE_SCHEMA, "kind": "unreadable",
-                                  "feed": feed, "partition": part.name,
-                                  "partition_sha256": sha, "size": int(size),
-                                  "reason": reason, "quarantined_ts": now_ts})
-                    q_versions[(feed, part.name, sha)] = "unreadable"
-                    q_names.add((feed, part.name))
-                    continue
-                have = known.setdefault(feed, set())
-                fresh = sorted(set(points) - have)
-                have.update(fresh)
-                if (feed, part.name) in q_names:
-                    # A quarantined partition readable again: its unknown
-                    # points are blocked forever, never first-seen now.
-                    _warn(f"quarantined partition data/{feed}/{part.name} is readable again "
-                          f"(size={size} sha256={sha}); {len(fresh)} unseen point(s) blocked "
-                          f"from lane D, not recorded as first seen")
-                    n_blocked += len(fresh)
-                    new_q.append({"schema": QUARANTINE_SCHEMA, "kind": "blocked",
-                                  "feed": feed, "partition": part.name,
-                                  "partition_sha256": sha, "size": int(size),
-                                  "quarantined_ts": now_ts,
-                                  "points": [[pj, int(t)] for pj, t in fresh]})
-                    q_versions[(feed, part.name, sha)] = "blocked"
-                    continue
-                n_points += len(fresh)
-                new.append({
-                    "schema": LOG_SCHEMA, "feed": feed, "partition": part.name,
-                    "partition_sha256": sha, "seen_ts": now_ts, "period_start": p,
-                    "baseline": feed not in logged_feeds,
-                    "points": [[pj, int(t)] for pj, t in fresh],
-                })
-        limit = unreadable_limit(n_parts, max_files=max_unreadable_files,
-                                 max_frac=max_unreadable_frac)
-        if len(unreadable) > limit:
-            raise FirstSeenError(
-                "too_many_unreadable",
-                f"{len(unreadable)} of {n_parts} partitions are unreadable (limit {limit}); "
-                f"a systemic read failure? nothing recorded. First: "
-                f"{', '.join(unreadable[:10])}")
-        # Quarantine first: a crash between the two appends errs on the safe side.
-        self._append(self.quarantine_path, new_q)
-        self._append(self.records_path, new)
-        out = {"records": len(new), "points": n_points}
-        n_q = sum(1 for e in new_q if e["kind"] == "unreadable")
+                    d.rmdir()                             # only succeeds when nothing was written
+                except OSError:
+                    break
+        out = {"records": n_records, "points": n_points}
         if n_q:
             out["quarantined"] = n_q
-        if n_blocked or any(e["kind"] == "blocked" for e in new_q):
+        if n_blocked or any_blocked:
             out["blocked"] = n_blocked
         if unreadable:
             out["unreadable"] = len(unreadable)
@@ -429,21 +546,27 @@ class FirstSeenLog:
                   f"{', '.join(unreadable[:20])}")
         return out
 
+    def _feed_state_freed(self, feed: str) -> None:
+        """Hook called after a feed's per-feed state is dropped (tests)."""
+
     def commit(self, *, now_ts: int) -> list[dict]:
-        """Commit a root for every ended period that has records and no root."""
+        """Commit a root for every ended period that has records and no root.
+
+        Streams ``records.jsonl``: only the 32-byte leaf hashes of the periods
+        to commit are kept, never the records themselves."""
         now_ts = int(now_ts)
         roots = self.roots()
-        by_period: dict[int, list[dict]] = {}
-        for r in self.records():
-            by_period.setdefault(int(r["period_start"]), []).append(r)
-        added = []
-        for p in sorted(by_period):
-            if p in roots or p + PERIOD_SECONDS > now_ts:
+        by_period: dict[int, list[bytes]] = {}
+        for _off, _n, r in self._scan(self.records_path):
+            pr = int(r["period_start"])
+            if pr in roots or pr + PERIOD_SECONDS > now_ts:
                 continue
-            recs = by_period[p]
-            added.append({"period_start": p,
-                          "root": merkle_root([canonical_json(r) for r in recs]),
-                          "n_records": len(recs), "committed_ts": now_ts})
+            by_period.setdefault(pr, []).append(_leaf_hash(canonical_json(r)))
+        added = []
+        for pr in sorted(by_period):
+            hashes = by_period[pr]
+            added.append({"period_start": pr, "root": _merkle_root_of_hashes(hashes),
+                          "n_records": len(hashes), "committed_ts": now_ts})
         self._append(self.roots_path, added)
         return added
 
