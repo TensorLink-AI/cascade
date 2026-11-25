@@ -24,6 +24,10 @@ tests/unit/test_replay_known_unstamped.py
 cascade/trainer/image_epoch.py
 cascade/trainer/loop.py
 cascade/trainer/leg_pins.py
+# #934: the era king pointer is fixed for its seed epoch — a restart onto a
+# new image/contract never drops or retrains the king the validators hold
+# (EraState king_image / king_pointer_published; the boundary hold).
+cascade/trainer/rolling.py
 cascade/trainer/marketcast_runner.py
 # Lanes B, C: the image recorded per leg in the signed records.
 cascade/shared/expert_manifest.py

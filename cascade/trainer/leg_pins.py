@@ -111,7 +111,8 @@ def leg_round_view(runner):
     return round_pins_at(cfg, image_after_from(cfg))
 
 
-def proven_runtime_terms(cfg, contract, digest: str) -> tuple[str, str] | None:
+def proven_runtime_terms(cfg, contract, digest: str,
+                         extra_images=()) -> tuple[str, str] | None:
     """DEC-CA-0067: the PROVEN ``(train_image_digest, continuation_protocol)``
     of a leg that recorded the full ``digest`` against ``contract``, else
     None (:func:`cascade.shared.manifest.prove_runtime_terms`). Tried: the
@@ -123,6 +124,9 @@ def proven_runtime_terms(cfg, contract, digest: str) -> tuple[str, str] | None:
     base = getattr(cfg.training, "v2_contract", None)
     if base is not None and getattr(base, "train_image_digest_after", ""):
         priors = (*priors, str(base.train_image_digest))
+    # #934: images the caller recorded for this leg (the era king's own pin) —
+    # a proof, never a trust: the digest must still hash to the contract
+    priors = (*priors, *(str(i) for i in extra_images if i))
     return prove_runtime_terms(contract, str(digest or ""), priors)
 
 
