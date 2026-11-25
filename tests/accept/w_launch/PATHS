@@ -29,3 +29,9 @@ tests/unit/test_validator_bench_budget.py
 tests/unit/test_validator_bench_liveness.py
 docs/MARKETCAST.md
 docs/AGENT_MINING.md
+# #933: the trainer's lane A king comes from signed receipts, then the
+# persisted era king, else HOLD — never the top-incentive hotkey (another
+# lane's payee once B/C/D take emissions). Docstrings in the promotion path.
+cascade/trainer/rolling.py
+cascade/trainer/runner_promotion.py
+cascade/trainer/promotion.py
