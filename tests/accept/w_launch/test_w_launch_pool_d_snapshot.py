@@ -83,7 +83,10 @@ def test_index_sha_mismatch_is_refused(world, tmp_path, capsys):
 
 def test_replay_mode_stays_opt_in_and_strict(world, tmp_path, capsys):
     lane_a, _sha = _snapshot(world, tmp_path, drift=True)
-    rc = _main(world, tmp_path, lane_a, out_name="replay",
-               extra=("--lane-a-selection", "replay", "--max-panel-series-per-feed", "5"))
+    try:
+        rc = _main(world, tmp_path, lane_a, out_name="replay",
+                   extra=("--lane-a-selection", "replay", "--max-panel-series-per-feed", "5"))
+    except SystemExit as e:     # a base without --lane-a-selection: argparse exits 2
+        rc = e.code
     assert rc == 3
     assert "lane_a_replay_mismatch" in capsys.readouterr().err
