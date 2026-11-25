@@ -251,7 +251,8 @@ def _driver(tmp_path, ready, monkeypatch):
     return drv, ops
 
 
-def test_settlement_queues_every_candidate_then_fails_closed(tmp_path, monkeypatch):
+def test_settlement_queues_every_candidate_then_fails_closed_then_publishes(tmp_path,
+                                                                          monkeypatch):
     drv, ops = _driver(tmp_path, {KING_DIR}, monkeypatch)
     with pytest.raises(OSError, match="candidate public benchmarks unavailable"):
         drv.settle(round_id="r1", block=20, era_index=0, king_pointer=KING,
@@ -262,30 +263,24 @@ def test_settlement_queues_every_candidate_then_fails_closed(tmp_path, monkeypat
     assert ops.published == []
     assert [f["leg_pointer"] for f in drv.st.finished] == ["leg-alice", "leg-bob"]
     assert "r1" not in drv.st.settled
-
-
-def test_settlement_without_king_rows_raises_before_any_candidate(tmp_path, monkeypatch):
-    drv, ops = _driver(tmp_path, set(), monkeypatch)
-    with pytest.raises(OSError, match="king public benchmarks unavailable"):
-        drv.settle(round_id="r1", block=20, era_index=0, king_pointer=KING,
-                   work_dir=tmp_path / "w")
-    assert ops.asked == [KING_DIR] and ops.published == []
-
-
-def test_settlement_publishes_once_every_row_is_benched(tmp_path, monkeypatch):
-    drv, ops = _driver(tmp_path, {KING_DIR, "rebased-r1-alice-energy",
-                                  "rebased-r1-bob-web"}, monkeypatch)
-    drv.settle(round_id="r1", block=20, era_index=0, king_pointer=KING,
+    # the worker benched both: the next settlement publishes them
+    ops.ready |= {"rebased-r2-alice-energy", "rebased-r2-bob-web"}
+    drv.settle(round_id="r2", block=40, era_index=0, king_pointer=KING,
                work_dir=tmp_path / "w")
     assert len(ops.published) == 1
     entries = ops.published[0].entries
     assert [e.public_rows["candidate"] == e.public_rows["king"] for e in entries] == [True, True]
 
 
-def test_tick_prebenches_the_king_only_while_legs_are_finished(tmp_path, monkeypatch):
+def test_tick_prebenches_the_king_and_a_settlement_without_it_fails_fast(tmp_path,
+                                                                        monkeypatch):
     drv, ops = _driver(tmp_path, set(), monkeypatch)
     drv.tick(20, 0, KING)
     assert ops.prebenched == [KING]
+    with pytest.raises(OSError, match="king public benchmarks unavailable"):
+        drv.settle(round_id="r1", block=20, era_index=0, king_pointer=KING,
+                   work_dir=tmp_path / "w")
+    assert ops.asked == [KING_DIR] and ops.published == []      # no candidate benched
     drv.st.finished = []
     drv.tick(21, 0, KING)
-    assert ops.prebenched == [KING]
+    assert ops.prebenched == [KING]          # nothing finished: no prebench
