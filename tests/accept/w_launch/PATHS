@@ -56,3 +56,11 @@ cascade/shared/config/loader.py
 cascade/funding/lane_ends.py
 cascade/funding/intake.py
 cascade/funding/main.py
+
+# Provisioner orphan scope (mainnet 2026-11-25 07:50: the MarketCast offload
+# provisioner reaped a pod it never rented). The reaper terminates only pods
+# matching a write-ahead rent intent of THIS instance, for its enabled stages;
+# other provisioner-shaped pods are logged and left alone.
+cascade/provision/loop.py
+cascade/provision/state.py
+tests/unit/test_provision_loop.py
