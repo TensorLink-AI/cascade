@@ -31,6 +31,9 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8791
 DEFAULT_REQUEST_TIMEOUT_S = 30.0
 LOCK_FILENAME = "lane_d_intake.lock"
+# #931: the intake's own read-only netconfig state (never the trainer's)
+NETCONFIG_STATE_FILENAME = "lane_d_intake_netconfig_state.json"
+_VIEW_POLL_SECONDS = 12.0   # one block
 
 log = logging.getLogger("cascade.lane_d.main")
 
@@ -83,6 +86,31 @@ def _handler_class(timeout_s: float):
     return _QuietHandler
 
 
+class LaneDView:
+    """#931: ``head -> [lane_d]`` IN FORCE — the base config with the adopted
+    owner-signed overlay (DEC-CA-0057) at ``head``, resolved read-only with
+    the same :class:`~cascade.shared.netconfig.NetConfigResolver` the
+    trainer, the validators and the funding intake use (``signal=False``:
+    never signals). The resolver is ticked at most every ``poll_seconds``;
+    an overlay setting ``[lane_d] until_block`` (the lane D kill switch,
+    ``cascade.laned.overlay``) then closes the intake at that block with no
+    restart. ``config_at`` may raise (persistence pending): the intake then
+    keeps the static ``[lane_d]``."""
+
+    def __init__(self, base, resolver, client, *, poll_seconds: float = _VIEW_POLL_SECONDS,
+                 clock=time.monotonic) -> None:
+        self.base, self.resolver, self.client = base, resolver, client
+        self.poll_seconds, self.clock = float(poll_seconds), clock
+        self._polled = float("-inf")
+
+    def __call__(self, block: int):
+        now = self.clock()
+        if now - self._polled >= self.poll_seconds:
+            self._polled = now
+            self.resolver.tick(self.base, self.client, now_block=int(block))
+        return self.resolver.config_at(self.base, int(block)).lane_d
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     logging.basicConfig(level=args.log_level, stream=sys.stderr,
@@ -112,10 +140,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     reads = ChainLaneDReads(client, vault_prefix=ops.vault_prefix,
                             published_weights=PublishedWeightsFile(published_path))
     vault = VaultClient(VaultEndpoint.from_storage(cfg.storage, bucket=ops.vault_bucket))
+    cfg_at = None
+    if cfg.netconfig.enabled:
+        from ..shared.hippius import open_manifest_store
+        from ..shared.netconfig import NetConfigResolver
+
+        cfg_at = LaneDView(cfg, NetConfigResolver(
+            cfg, state_path=state_dir / NETCONFIG_STATE_FILENAME,
+            store=lambda: open_manifest_store(cfg.storage), signal=False), client)
     app = LaneDIntake(storage=S3VaultStorage(vault), reads=reads,
                       minter=HippiusMultipartMinter(vault), cfg=cfg.lane_d, ops=ops,
                       state_dir=state_dir, now=time.time, per_ip_rpm=args.per_ip_rpm,
-                      per_hotkey_rpm=args.per_hotkey_rpm)
+                      per_hotkey_rpm=args.per_hotkey_rpm, cfg_at=cfg_at)
     # #842: refresh once at startup, then every queue_poll_seconds, so
     # reveals and TTL expiries reach the queue file without traffic.
     app.tick()
@@ -139,4 +175,4 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
-__all__ = ["DEFAULT_HOST", "DEFAULT_PORT", "SERVICE", "build_arg_parser", "main"]
+__all__ = ["DEFAULT_HOST", "DEFAULT_PORT", "SERVICE", "LaneDView", "build_arg_parser", "main"]

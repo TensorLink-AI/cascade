@@ -403,6 +403,7 @@ class EffectiveLanes:
         else:
             intake.lane_c_queue = None
         intake.lane_b_cfg = lb
+        intake.lane_c_cfg = lc          # #931: the kill switches in force
         if view is not None and self.gpus is not None:
             intake.lane_b_gpus = self.gpus(view)[1]
         if self._on(self.lane_b_mode, lane_b_armed(view)):
@@ -458,6 +459,26 @@ class EffectiveLanes:
                 self.apply(intake, view, block)
         finally:
             self._lock.release()
+
+
+class CachedHead:
+    """#931: ``() -> chain head`` for the intake's kill-switch checks, one
+    chain read per ``ttl_seconds`` (a block is ~12 s; the end check is at
+    block granularity, so a few seconds stale is exact enough). A failed
+    read raises (the intake then admits, as before)."""
+
+    def __init__(self, read: Callable[[], int], *, ttl_seconds: float = 6.0,
+                 clock: Callable[[], float] = time.monotonic) -> None:
+        self.read, self.ttl, self.clock = read, float(ttl_seconds), clock
+        self._at, self._head = float("-inf"), None
+        self._lock = threading.Lock()
+
+    def __call__(self) -> int:
+        with self._lock:
+            now = self.clock()
+            if self._head is None or now - self._at >= self.ttl:
+                self._head, self._at = int(self.read()), now
+            return self._head
 
 
 class ChainLaunchAdmission:
@@ -673,6 +694,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             except Exception:  # noqa: BLE001
                 return None
             return competition_closed(lanes.lane_c, target, block)
+    head_block = None
+    if cfg is not None and not args.trust_refs:
+        head_block = CachedHead(client.current_block)
     # --lane-b/--lane-c: the lanes the config IN FORCE arms — chain.toml plus
     # the adopted owner-signed overlay at the current block (DEC-CA-0057,
     # resolved read-only like the trainer; inert while [netconfig]
@@ -776,6 +800,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         resolve_lane_c_reveal=lane_c_resolver,
         mkt_suites=(tuple(cfg.marketcast.target_suites) if cfg is not None else ()),
         lane_c_closed=lane_c_closed,
+        lane_c_cfg=lanes.lane_c,
+        head_block=head_block,
         gpu_catalog=gpu_catalog,
         lane_b_gpus=lane_b_gpus,
         mkt_gpu_catalog=mkt_gpu_catalog,

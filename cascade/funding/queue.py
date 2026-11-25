@@ -1291,6 +1291,32 @@ class FundedQueue:
             self._save(entries)
             return True
 
+    def release_unstarted(self, why: Callable[[FundedEntry], tuple[str, str] | None]) -> list[str]:
+        """#931: terminally fail every entry that has NOT started (``queued``,
+        ``pending_reveal`` or parked, and in no live leg phase) for which
+        ``why(entry)`` returns ``(error, error_class)`` — its lane or
+        competition ended, so it can never be judged. No pod was rented and
+        no attempt is consumed. Decided under the queue lock, so an entry the
+        trainer started meanwhile is never touched. Returns the hotkeys."""
+        out: list[str] = []
+        with self._locked() as entries:
+            for hk in sorted(entries):
+                e = entries[hk]
+                if (e.status not in ("queued", "pending_reveal", *_PARKED)
+                        or (e.phase or "") in LIVE_LEG_PHASES):
+                    continue
+                reason = why(e)
+                if not reason:
+                    continue
+                error, error_class = reason
+                entries[hk] = _phase(replace(
+                    e, status="failed", last_error=str(error)[:500],
+                    last_error_class=str(error_class)), "failed", self.clock())
+                out.append(hk)
+            if out:
+                self._save(entries)
+        return out
+
     # ── transparency feed ────────────────────────────────────────────────────
 
     def _spend_view(self) -> dict:
