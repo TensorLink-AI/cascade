@@ -667,9 +667,11 @@ def cmd_datacompare(args) -> int:
     workers = max(1, int(getattr(args, "workers", 1) or 1))
     pool = None
     if workers > 1:
+        import gc
         import multiprocessing as mp
         from concurrent.futures import ProcessPoolExecutor
 
+        gc.freeze()          # forked workers never touch (copy) the parent's hash maps
         pool = ProcessPoolExecutor(workers, mp_context=mp.get_context("fork"),
                                    initializer=_pool_init, initargs=(all_c, k, mod, emax))
 
