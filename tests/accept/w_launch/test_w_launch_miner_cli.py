@@ -88,7 +88,11 @@ def test_lane_a_deploy_refuses_past_the_cutoff_before_upload(chain, tmp_path, ca
 def test_allow_closed_lane_a_overrides(chain, tmp_path, capsys):
     from cascade.miner import cli
 
-    assert cli.main([*_deploy(tmp_path), "--allow-closed-lane-a"]) == 0
+    try:
+        rc = cli.main([*_deploy(tmp_path), "--allow-closed-lane-a"])
+    except SystemExit as e:      # a CLI without the flag: argparse usage error
+        rc = e.code
+    assert rc == 0
     assert len(chain["commits"]) == 1 and "will not be seated" in _said(capsys)
 
 

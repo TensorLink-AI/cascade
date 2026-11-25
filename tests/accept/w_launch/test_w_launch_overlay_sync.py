@@ -26,7 +26,7 @@ STEP1_DIGEST = "961291bc"
     "deploy/overlays/lane-d-step2.mainnet.toml",
 ])
 def test_mainnet_launch_overlays_freeze_lane_a(rel):
-    assert overrides(rel)["v2"] == {"reign_warm_start_blocks": 0}
+    assert overrides(rel).get("v2") == {"reign_warm_start_blocks": 0}
 
 
 def test_step1_body_is_the_published_one():
