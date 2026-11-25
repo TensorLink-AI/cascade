@@ -676,15 +676,16 @@ def cand_file_hashes(path, sample_series: int, max_points: int, k: int, mod: int
     offs = np.concatenate([[0], np.cumsum([g.size for g in groups])]).tolist()
     hs = []
     take = pa.array(sel)
-    for b0 in range(0, len(cols), 32):                        # wide tables: 32 columns a read
-        part = pf.read(columns=cols[b0:b0 + 32])
-        vs = [part.column(c).take(take).cast(pa.float64()).to_numpy(zero_copy_only=False)
-              for c in cols[b0:b0 + 32]]
+    # a read holds <= ~512 MB of float64 (rows x columns): wide tables read many
+    # columns at once (each read is cheap), very long ones one column at a time
+    per = max(1, min(len(cols) or 1, (64 << 20) // max(1, pf.metadata.num_rows)))
+    for b0 in range(0, len(cols), per):
+        part = pf.read(columns=cols[b0:b0 + per])
+        for c in cols[b0:b0 + per]:
+            v = part.column(c).take(take).cast(pa.float64()).to_numpy(zero_copy_only=False)
+            for j in range(len(groups)):
+                hs.append(kgram_hashes(v[offs[j]:offs[j + 1]], k, mod))
         del part
-        # every (column, series) segment at once: the union of kgram_hashes
-        # over the segments (no window crosses a segment boundary)
-        lens = [offs[j + 1] - offs[j] for j in range(len(groups))] * len(vs)
-        hs.append(_hits_of(np.concatenate(vs), lens, k, mod, None, 1 << 62))
     h = np.unique(np.concatenate(hs)) if hs else np.empty(0, dtype=np.uint64)
     return len(uniq), h
 
