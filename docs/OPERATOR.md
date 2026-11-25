@@ -935,9 +935,15 @@ orchestrator SSH keypair — never the wallet. Each cycle it:
   own shapes (`cascade-<provider>-<8 hex>-g<n>` lanes, or
   `cascade-<digits>-(heat|final|eval)…` on the provider), or it is treated as
   the provisioner's and dropped or reaped.
-* **Orphan reconcile.** Terminates live provider pods tagged with its own
-  name shape that its ledger does not own, so a crash between launch and
-  ledger-save never leaks a billing box.
+* **Orphan reconcile.** Each launch writes a rent intent (provider, name
+  prefix, stage) to the ledger before the provider call. The reconciler
+  terminates a live pod only when it matches one of THIS instance's intents,
+  for a stage the instance has enabled, and the ledger does not own it. So a
+  crash between launch and ledger-save never leaks a billing box. Other pods
+  in the provisioner's name shape belong to another renter, for example a
+  second provisioner such as the MarketCast offload instance on the same
+  account. They are logged once at WARNING and left alone. A pod leaked
+  before this change has no intent, so terminate it by hand.
 * **TTL backstop.** Every pod it rents dies one epoch after rent no matter
   what; `max_spend_per_round` caps the worst case before anything is rented.
 * **Adopted-pod re-gate.** After a restart, pods adopted from the ledger are

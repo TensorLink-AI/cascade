@@ -57,6 +57,13 @@ cascade/funding/lane_ends.py
 cascade/funding/intake.py
 cascade/funding/main.py
 
+# Provisioner orphan scope (mainnet 2026-11-25 07:50: the MarketCast offload
+# provisioner reaped a pod it never rented). The reaper terminates only pods
+# matching a write-ahead rent intent of THIS instance, for its enabled stages;
+# other provisioner-shaped pods are logged and left alone.
+cascade/provision/loop.py
+cascade/provision/state.py
+tests/unit/test_provision_loop.py
 # Launch miner docs + CLI (owner 2026-11-25): lane A closed to new challengers
 # from 9586800 in every miner-facing guide and the CLI help; `cascade deploy` /
 # `submit` refuse a lane A entry past the cutoff before any upload or commit

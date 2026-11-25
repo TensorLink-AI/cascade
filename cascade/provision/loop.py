@@ -6,9 +6,11 @@ One cycle of the machine (each ``poll_seconds``, ~30s):
     RE-GATE  ledger pods adopted on restart re-run the health gate against
              the config loaded at THIS startup (a previous run's pass is not
              trusted);
-    RECONCILE live pods named in this service's scheme that the ledger does
-             not own are terminated (a crash between launch and ledger-save
-             must not leak a billing box);
+    RECONCILE live pods matching a write-ahead rent intent of THIS instance
+             (recorded before the provider call) that the ledger does not
+             own are terminated (a crash between launch and ledger-save must
+             not leak a billing box); other provisioner-shaped pods are
+             another renter's and are left alone;
     TEARDOWN an eval pod dies when its round's receipt lands or a newer
              manifest supersedes it; every pod dies at its TTL;
     ACTIVATE the DEC-CA-0045 grid switch is learned in-loop (no restart);
@@ -65,13 +67,15 @@ from .policy import (
 )
 from .state import (
     PodInstance,
+    RentIntent,
     RoundState,
     add_instance,
+    add_intent,
     drop_instances,
+    drop_intent,
     instances_for_stage,
     load_state,
     owned_ids,
-    reconcile,
     save_state,
 )
 
@@ -82,15 +86,16 @@ POD_TAG = "cascade-"                       # every rented pod's name starts with
 # The FULL naming scheme of pods this service rents: cascade-<round_id>-<stage>
 # (+ optional -rN replacement / -gN lane suffixes; funded pods live under the
 # trainer's own cascade-n<netuid>-<round_id>-funded-<slug> scheme, NOT this
-# one). The orphan reaper matches on
-# this — never on the bare POD_TAG prefix, which operators' hand-rented pods
+# one). The orphan reaper pre-filters on
+# this (and then reaps only names matching THIS instance's recorded rent
+# intents, for its enabled stages) — never on the bare POD_TAG prefix, which operators' hand-rented pods
 # (cascade-worker, cascade-final-b, cascade-heat-2) legitimately share.
 # NEVER add "funded" here: funded pods (payer legs AND the trainer's JIT
 # operator king) are the TRAINER's, ledgered in funded_pods.json and named
 # under the deployment-scoped cascade-n<netuid>-… scheme — a provisioner that
 # matched them would reap the live king mid-leg (it can't see the trainer's
-# ledger). heat/final stay in the pattern so a ledger leftover of the retired
-# per-round fleet is still reaped.
+# ledger). heat/final stay in the pattern for the retired per-round fleet's
+# names; no current config enables those stages, so the reaper never touches them.
 _PROVISIONER_POD_RE = re.compile(r"^cascade-\d+-(heat|final|eval|mkt)(-|$)")
 # The exact lane-name shape render_hosts_toml gives THIS service's pods
 # (``cascade-<round>-<stage>-<i>-g<g>``, integer slot). A hosts.toml entry of
@@ -126,6 +131,28 @@ def lane_pod_name(provider: str, instance_id: str) -> str:
 # pod, while a deterministic mismatch (wrong digest) fails every attempt.
 ADOPT_REGATE_ATTEMPTS = 3
 ADOPT_REGATE_RETRY_S = 30.0
+
+
+# How long a write-ahead rent intent stays proof of ownership. An intent is
+# dropped the moment its launch returns, so a surviving one marks a crash (or a
+# launch that raised mid-create); the reconciler reaps its pods on the next
+# cycle after restart. Two days covers a provisioner left down over a weekend.
+RENT_INTENT_TTL_S = 48 * 3600.0
+
+
+def _live_named(prov: object, prefix: str) -> dict[str, str] | None:
+    """``{pod_id: pod_name}`` of the provider's live pods named ``prefix…``.
+
+    ``list_named`` (Shadeform: terminate takes an opaque UUID, the name is the
+    account's label) wins; otherwise ``list_tagged`` ids ARE names (Lium).
+    ``None`` = the provider cannot list."""
+    named = getattr(prov, "list_named", None)
+    if named is not None:
+        return {str(k): str(v) for k, v in named(prefix).items()}
+    lister = getattr(prov, "list_tagged", None)
+    if lister is None:
+        return None
+    return {str(p): str(p) for p in lister(prefix)}
 
 
 def is_provisioner_pod_name(name: str) -> bool:
@@ -296,6 +323,8 @@ class ProvisionerLoop:
     _retired_ips: set = field(default_factory=set, init=False, repr=False)
     # Operator lanes already announced as preserved (log once per name).
     _foreign_logged: set = field(default_factory=set, init=False, repr=False)
+    # Another renter's provisioner-shaped pods already warned about (log once).
+    _foreign_pods_logged: set = field(default_factory=set, init=False, repr=False)
     # Ledger-adopted pods awaiting their re-gate against the CURRENT config
     # (see _maybe_regate_adopted): set on resume, cleared when the re-gate
     # worker is spawned on the first cycle.
@@ -522,19 +551,10 @@ class ProvisionerLoop:
             gpus_per_pod=cand.gpus_per_pod,
         )
         try:
-            pod_ids = prov.launch(spec)
+            pod_ids = self._launch_ledgered(prov, spec, stage, cand)
         except Exception as e:  # noqa: BLE001 — a failed stage is a smaller fleet
             log.error("round %s %s: launch on %s failed: %s", round_id, stage, prov.name, e)
             return []
-        # Write-ahead: the ledger owns these ids BEFORE we do anything else
-        # with them — a crash from here on still tears them down on restart.
-        # Locked: the teardown sweep on the loop thread mutates the same
-        # state while a rent worker runs.
-        with self._state_lock:
-            for pid in pod_ids:
-                self._state = add_instance(self._state,
-                                           self._instance(prov, pid, stage, cand))
-            self._save()
 
         healthy: list[tuple[PodInstance, PodAddress]] = []
         for i, pid in enumerate(pod_ids):
@@ -573,12 +593,10 @@ class ProvisionerLoop:
                             exclude_regions=spec.exclude_regions
                             + ((bad_region,) if bad_region else ()))
             try:
-                rid = prov.launch(rspec)[0]
+                rid = self._launch_ledgered(prov, rspec, stage, cand)[0]
             except Exception as e:  # noqa: BLE001
                 log.error("round %s %s: replacement launch failed: %s", round_id, stage, e)
                 continue
-            self._state = add_instance(self._state, self._instance(prov, rid, stage, cand))
-            self._save()
             raddr = self._boot_and_gate(prov, rid, stage, cand)
             if raddr is not None:
                 healthy.append((self._find_instance(rid), raddr))
@@ -588,6 +606,38 @@ class ProvisionerLoop:
                 self._gate_failures.pop(rid, None)
                 self._terminate_and_drop(prov, rid)
         return healthy
+
+    def _launch_ledgered(self, prov: object, spec: LaunchSpec, stage: str,
+                         cand=None) -> list[str]:
+        """``prov.launch(spec)`` bracketed by the two-phase write-ahead.
+
+        1. INTENT first: ``(provider, name_prefix, stage)`` hits the ledger
+           BEFORE the provider call, so a crash anywhere after the provider
+           creates pods leaves on disk the proof that they are OURS — the
+           reconciler may reap exactly those names and nothing else.
+        2. On return, the pod ids replace the intent in ONE atomic save (the
+           ledger owns them before anything else happens to them).
+
+        A launch that RAISES keeps its intent: the provider may have created
+        some pods before failing, and the intent is what lets the reconciler
+        reap them. Intents expire after :data:`RENT_INTENT_TTL_S`.
+        Locked: the teardown sweep on the loop thread mutates the same state
+        while a rent worker runs.
+        """
+        intent = RentIntent(provider=prov.name, name_prefix=spec.name_prefix, stage=stage,
+                            at_iso=datetime.fromtimestamp(self.clock(), tz=UTC).isoformat())
+        with self._state_lock:
+            if self._state is None:
+                self._state = RoundState(round_id="")
+            self._state = add_intent(self._state, intent)
+            self._save()
+        pod_ids = list(prov.launch(spec))
+        with self._state_lock:
+            for pid in pod_ids:
+                self._state = add_instance(self._state, self._instance(prov, pid, stage, cand))
+            self._state = drop_intent(self._state, prov.name, spec.name_prefix)
+            self._save()
+        return pod_ids
 
     def _boot_and_gate(self, prov: object, pid: str, stage: str,
                        cand=None) -> PodAddress | None:
@@ -1233,47 +1283,91 @@ class ProvisionerLoop:
     # ── RECONCILE ────────────────────────────────────────────────────────────
 
     def _reconcile_orphans(self) -> None:
-        """Kill live pods the provisioner RENTED but the ledger does not own.
+        """Kill live pods THIS instance provably rented but the ledger does not own.
 
         Runs EVERY cycle (not just at startup): the hole it closes — a crash
         between a provider's create call and the ledger save — can open at any
         time, and an orphan bills until someone notices.
 
-        Only names matching the provisioner's own scheme
-        (``cascade-<round_id>-<stage>…``) are candidates: an operator's
-        hand-rented pods legitimately share the ``cascade-`` prefix
-        (``cascade-worker``, ``cascade-final-b``) and must NEVER be reaped —
-        the reaper's mandate is strictly "pods this service created and then
-        lost track of," not "pods that look cascade-related." And like every
-        provider mutation, termination is gated on ``dry_run``.
+        Ownership is PROVEN, never inferred from a name: a pod is reaped only
+        when its name matches a write-ahead :class:`RentIntent` in THIS
+        instance's ledger (recorded before the provider call, see
+        :meth:`_launch_ledgered`) for a stage this instance has ENABLED. A
+        pod in the provisioner's name shape (``cascade-<n>-<stage>…``) that
+        matches no intent belongs to another renter on the same account — a
+        second provisioner (the MarketCast offload instance vs the eval
+        fleet, 2026-11-25: one reaped the other's ``cascade-<n>-mkt-0``) —
+        and is logged once at WARNING and left alone. Operators' hand-rented
+        ``cascade-worker``/``cascade-final-b`` pods never match the shape at
+        all. Like every provider mutation, termination is gated on
+        ``dry_run``.
         """
         if self._eval_inflight or self._mkt_inflight:
             # A rent worker is between a provider's create call and its
-            # ledger write-ahead at unpredictable moments — reaping now could
-            # kill a pod that is owned but not yet recorded. Skipping a tick
-            # is free; the reaper runs every cycle.
+            # ledger write at unpredictable moments. The intent already makes
+            # this safe; skipping a tick is free belt-and-braces.
             return
-        owned = owned_ids(self._state) if self._state is not None else set()
+        state = self._state
+        owned = owned_ids(state) if state is not None else set()
+        intents = state.rent_intents if state is not None else ()
+        stages = self._reconcile_stages()
         for name, prov in self.providers.items():
-            lister = getattr(prov, "list_tagged", None)
-            if lister is None:
-                continue
             try:
-                live = {p for p in lister(POD_TAG) if is_provisioner_pod_name(p)}
+                live = _live_named(prov, POD_TAG)
             except Exception as e:  # noqa: BLE001 — a down adapter reconciles next cycle
                 log.warning("provider %s list_tagged failed (%s); skipping reconcile", name, e)
                 continue
-            for orphan in reconcile(owned, live):
+            if live is None:
+                continue
+            for pod_id, pod_name in sorted(live.items()):
+                m = _PROVISIONER_POD_RE.match(pod_name)
+                if m is None or pod_id in owned or pod_name in owned:
+                    continue
+                stage = m.group(1)
+                ours = stage in stages and any(
+                    it.stage == stage and it.matches(name, pod_name) for it in intents)
+                if not ours:
+                    key = (name, pod_id)
+                    if stage in stages and key not in self._foreign_pods_logged:
+                        self._foreign_pods_logged.add(key)
+                        log.warning("reconcile: leaving %s pod %s on %s alone — "
+                                    "provisioner-named but neither ledgered nor a recorded "
+                                    "rent intent of THIS instance (another renter's)",
+                                    stage, pod_name, name)
+                    continue
                 if self.dry_run:
                     log.info("[dry-run] reconcile: WOULD terminate orphan pod %s on %s",
-                             orphan, name)
+                             pod_name, name)
                     continue
                 log.warning("reconcile: terminating ORPHAN pod %s on %s "
-                            "(provisioner-named but not in the ledger)", orphan, name)
+                            "(this instance's recorded rent intent, not in the ledger)",
+                            pod_name, name)
                 try:
-                    prov.terminate(orphan)
+                    prov.terminate(pod_id)
                 except Exception as e:  # noqa: BLE001
-                    log.error("orphan terminate %s failed: %s", orphan, e)
+                    log.error("orphan terminate %s failed: %s", pod_name, e)
+        self._expire_intents()
+
+    def _reconcile_stages(self) -> set[str]:
+        """The stages this instance rents — the only ones its reaper may touch."""
+        stages: set[str] = set()
+        if self._eval_enabled:
+            stages.add("eval")
+        if self._mkt_enabled:
+            stages.add("mkt")
+        return stages
+
+    def _expire_intents(self) -> None:
+        """Drop rent intents older than :data:`RENT_INTENT_TTL_S` (never in dry-run)."""
+        if self.dry_run or self._state is None or not self._state.rent_intents:
+            return
+        now = self.clock()
+        with self._state_lock:
+            keep = tuple(it for it in self._state.rent_intents
+                         if now - _iso_ts(it.at_iso) < RENT_INTENT_TTL_S)
+            if len(keep) != len(self._state.rent_intents):
+                self._state = replace(self._state, rent_intents=keep)
+                self._save()
 
     # ── small helpers ────────────────────────────────────────────────────────
 

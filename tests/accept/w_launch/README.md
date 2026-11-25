@@ -83,6 +83,24 @@ reads it. From that block:
 
 `test_w_launch_lane_a_cutoff.py` pins it.
 
+Provisioner orphan scope (mainnet 2026-11-25 07:50): the dedicated MarketCast
+offload provisioner (`provision.mkt.toml`, eval off, mkt on) reaped
+`cascade-1795592862-mkt-0`, a Lium pod it never rented, because the reaper
+treated every `cascade-<n>-<stage>` name missing from its own ledger as an
+orphan. Two changes fix this:
+- Every launch first writes a `RentIntent` (provider, name prefix, stage) to
+  the ledger, before the provider call. When the launch returns, the intent is
+  replaced by the pod ids in one atomic save.
+- The reaper terminates a pod only when it matches a recorded intent of THIS
+  instance for a stage the instance has enabled. Other provisioner-named pods
+  get one WARNING and are left alone.
+
+`test_w_launch_mkt_orphan_scope.py` pins:
+- a foreign mkt pod is left alone;
+- an mkt pod with this instance's intent is reaped;
+- heat, final and eval pods are never touched by an mkt-only instance;
+- the intent is on disk before `launch` is called, and a crash after create
+  is reaped on restart.
 Launch miner docs + CLI (owner 2026-11-25). Every miner-facing guide states
 that lane A is closed to new challengers from 9586800, the step 1 / step 2
 splits (A 50 / B 35 / C 15, then A 0 / B 35 / C 15 / D 50 once lane D is
