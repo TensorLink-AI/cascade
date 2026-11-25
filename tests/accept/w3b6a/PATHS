@@ -12,3 +12,5 @@ cascade/validator/lane_d_bench_host.py
 # The optional `bench_hosts` key of the --lane-d-inputs TOML, and the
 # source handing the bench host each digest's effective context.
 cascade/validator/lane_d_inputs.py
+# #903: the offloaded sweep's remote command resolves uv on the host.
+cascade/validator/eval_offload.py
