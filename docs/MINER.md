@@ -1552,6 +1552,26 @@ candidates can still pass. A later candidate for a target already accepted
 in the same batch waits for another warm start. Mainnet enables this acceptance rule with v2; testnet keeps its older
 rule until separately activated. See the [reward tables](#rewards-allocation-burn-and-progression).
 
+### Domain tags (display only)
+
+After a settlement, every judged lane B generator is tagged with the slots it
+actually improved. The tags come from the validator's signed verdict rows, and
+nothing is evaluated again. A slot is **improved** when it was conclusive and
+cleared the gain test in step 1: CRPS or MASE family LCB at or above the bar
+(`gain_margin` for a declared target, `undeclared_gain_margin` for any other
+slot), with a positive point gain and the other metric non-inferior. A guard
+failure blocks payment, but the slot still counts as improved; its tag then
+shows `claimed: false`. Each slot also records its status (`improved`,
+`not_improved`, `inconclusive` or `not_evaluated`), whether you declared it,
+the bar, the LCB, and `margin` = LCB − bar.
+
+You can read the tags in three places: the `lane_b_domains` column of
+`receipts/index.json`, `lanes.b.domain_tags` in `cascade status --json` (from
+the latest receipt), and the `lane B domains` rows of `cascade round`. In the
+human output, `*` marks an undeclared slot. The tags are records only. They are
+not signed and are left out of every digest. They never affect weights,
+verdicts, merge acceptance or pay. Older feeds do not carry them.
+
 ### Lane B track settings
 
 These `[lane_b]` keys control suite targets, declared expert rows, the

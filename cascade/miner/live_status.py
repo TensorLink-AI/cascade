@@ -148,6 +148,19 @@ def status_snapshot(docs: dict, *, now: datetime, max_age: float) -> dict:
     }
 
 
+def lane_b_domain_info(snapshot: dict, hotkey: str | None = None) -> list[str]:
+    """Human lines for the latest settlement's lane B domain tags
+    (``lanes.b.domain_tags``, display only — owner 2026-11-25), filtered to
+    ``hotkey`` when given. Absent tags (older feeds) print nothing."""
+    from ..shared.lane_b_domains import tags_line
+
+    lb = (snapshot.get("lanes") or {}).get("b")
+    tags = lb.get("domain_tags") if isinstance(lb, dict) else None
+    return [f"Lane B domains {g.get('hotkey')}: {tags_line(g)}"
+            for g in (tags if isinstance(tags, list) else [])
+            if isinstance(g, dict) and (not hotkey or g.get("hotkey") == hotkey)]
+
+
 def fetch_snapshot(cfg, *, timeout=10.0, max_age=180.0):
     """One anonymous snapshot, shared by status, preflight and release checks."""
     from .dashboard import fetch_public_json
@@ -237,6 +250,9 @@ def cmd_status(args: argparse.Namespace) -> int:
                 snapshot["requested_submission_fresh"] = queue_ok
             out.result(**snapshot)
             out.info(f"Competition status: {'fresh' if snapshot['fresh'] else 'stale or unavailable'}")
+            if args.lane == "b":
+                for line in lane_b_domain_info(snapshot, hotkey):
+                    out.info(line)
             if not hotkey:
                 out.info(f"Warm start: {snapshot['warm_start'].get('pointer') or snapshot['warm_start'].get('mode', 'unavailable')}")
                 seed = snapshot.get("seed") or {}

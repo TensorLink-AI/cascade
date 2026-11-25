@@ -32,3 +32,10 @@ tests/unit/test_config.py
 tests/unit/test_lane_b_multi_target.py
 tests/unit/test_v2_golive.py
 tests/unit/test_satellite_replay.py
+# Lane B domain tags (owner 2026-11-25): which slots each judged generator
+# improved, derived from the signed verdict rows; display only (index column,
+# status/v2.json, cascade status, cascade round), never signed or digested.
+cascade/shared/lane_b_domains.py
+cascade/miner/dashboard.py
+cascade/miner/live_status.py
+docs/MINER.md
