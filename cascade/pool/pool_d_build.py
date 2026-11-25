@@ -26,6 +26,14 @@ so the snapshot sha256 is a content address anyone can re-derive. Lane A's
 
 W2e note: ``[lane_d] embargo_hours`` is read from the parsed ``[lane_d]``
 table when it carries the key, else the plan default 48 (rev6.10 (a)).
+
+Unreadable partitions: a partition the W6fs quarantine lists (by name, at
+``as_of_ts``) is never read, even once it is readable again (its old points
+must never count as fresh); any other partition that fails to read is skipped
+and logged loudly to stderr. Both lists go into the signed metadata
+(``quarantine``, ``unreadable_partitions``) only when non-empty, so a build
+without them stays byte-identical. More unreadable partitions than the W6fs
+``unreadable_limit`` aborts the build (a systemic read failure).
 """
 
 from __future__ import annotations
@@ -104,6 +112,9 @@ class PoolDBuildConfig:
     max_missing_frac: float = 0.2
     min_std: float = 1e-8
     embargo_hours: float = DEFAULT_EMBARGO_HOURS
+    # The systemic-read-failure guard (W6fs unreadable_limit defaults).
+    max_unreadable_files: int = 50
+    max_unreadable_frac: float = 0.001
 
     @classmethod
     def from_lane_d(cls, lane_d_cfg) -> PoolDBuildConfig:
@@ -119,6 +130,8 @@ class PoolDSummary:
     n_feeds: int
     out_dir: str
     refused: dict = field(default_factory=dict)
+    quarantine: list = field(default_factory=list)
+    unreadable: list = field(default_factory=list)
 
 
 # ── deterministic files ─────────────────────────────────────────────────────
@@ -225,6 +238,30 @@ def _series_invariant_refusal(target_ts: Sequence[int], first_seen_ts: Sequence[
     return None
 
 
+def _load_frame_logged(pd, pq, files: Sequence[Path], feed: str, unreadable: list):
+    """``TsbenchForgeSource._load_frame`` (same concat + per-panel dedup, so
+    the frame is identical), except that each unreadable partition is logged
+    loudly and appended to ``unreadable`` as ``[feed, name, reason]``."""
+    from .first_seen import unreadable_reason
+
+    frames = []
+    for p in files:
+        try:
+            frames.append(pq.read_table(p).to_pandas())
+        except Exception as e:  # noqa: BLE001 — one corrupt partition must not kill the build
+            reason = unreadable_reason(e)
+            print(f"pool_d: WARNING skipping unreadable partition data/{feed}/{p.name}: "
+                  f"{reason}", file=sys.stderr, flush=True)
+            unreadable.append([feed, p.name, reason])
+    if not frames:
+        return None
+    df = pd.concat(frames, ignore_index=True)
+    if "timestamp" in df.columns:
+        keys = ["timestamp", *[c for c in df.columns if c.startswith("_panel_")]]
+        df = df.drop_duplicates(subset=keys, keep="last")
+    return df
+
+
 def _prior_frontiers(prior_dirs: Sequence[Path | str], as_of_ts: int) -> dict[str, list]:
     out: dict[str, list] = {}
     for d in prior_dirs:
@@ -251,7 +288,14 @@ def build_pool_d(*, forge_dir: Path | str, selection, first_seen_dir: Path | str
     pd, pq, yaml = TsbenchForgeSource._require_deps()
     catalog_bytes = (forge / "sources.yaml").read_bytes()
     entries = {str(e["id"]): e for e in (yaml.safe_load(catalog_bytes) or []) if e.get("id")}
-    index = FirstSeenLog(first_seen_dir).index(until_ts=as_of_ts)
+    from .first_seen import unreadable_limit
+
+    fs_log = FirstSeenLog(first_seen_dir)
+    index = fs_log.index(until_ts=as_of_ts)
+    quarantined = fs_log.quarantined(until_ts=as_of_ts)
+    quarantine_report = fs_log.quarantine_report(until_ts=as_of_ts)
+    unreadable: list[list[str]] = []
+    n_files_read = 0
     lags = index.feed_lag()
     frontiers = _prior_frontiers(prior_dirs, as_of_ts)
     reader = TsbenchForgeSource(forge)
@@ -293,8 +337,10 @@ def build_pool_d(*, forge_dir: Path | str, selection, first_seen_dir: Path | str
             refused.update({s.pool_d_series_id: "bad_forecast_product" for s in sels})
             continue
         freq, seasonal = mapped
-        files = reader._snapshot_files(forge / "data" / feed, as_of=as_of_day)
-        df = reader._load_frame(pd, pq, files) if files else None
+        files = [f for f in reader._snapshot_files(forge / "data" / feed, as_of=as_of_day)
+                 if (feed, f.name) not in quarantined]
+        n_files_read += len(files)
+        df = _load_frame_logged(pd, pq, files, feed, unreadable) if files else None
         if df is None or df.empty or "timestamp" not in df.columns:
             refused.update({s.pool_d_series_id: "not_in_forge" for s in sels})
             continue
@@ -385,6 +431,13 @@ def build_pool_d(*, forge_dir: Path | str, selection, first_seen_dir: Path | str
             if base not in found:
                 refused.update({s.pool_d_series_id: "not_in_forge" for s in sel_list})
 
+    limit = unreadable_limit(n_files_read, max_files=cfg.max_unreadable_files,
+                             max_frac=cfg.max_unreadable_frac)
+    if len(unreadable) > limit:
+        raise ValueError(f"too_many_unreadable: {len(unreadable)} of {n_files_read} partitions "
+                         f"unreadable (limit {limit}); a systemic read failure? First: "
+                         + ", ".join(f"{f}/{n}" for f, n, _r in unreadable[:10]))
+    unreadable.sort()
     series_out.sort(key=lambda s: s["series_id"])
     meta = {
         "schema": POOL_D_SCHEMA, "snapshot": f"pool_d-{as_of_ts}", "as_of_ts": as_of_ts,
@@ -398,6 +451,11 @@ def build_pool_d(*, forge_dir: Path | str, selection, first_seen_dir: Path | str
         "series": series_out,
         "refused": sorted([sid, reason] for sid, reason in refused.items()),
     }
+    # Audit trail for skipped partitions; absent when empty (byte-identical).
+    if quarantine_report:
+        meta["quarantine"] = quarantine_report
+    if unreadable:
+        meta["unreadable_partitions"] = unreadable
     if not series_out:
         raise ValueError("refusing to write an empty pool_d snapshot")
     dest = Path(out_dir)
@@ -415,7 +473,8 @@ def build_pool_d(*, forge_dir: Path | str, selection, first_seen_dir: Path | str
         raise ValueError("invalid pool_d snapshot: " + "; ".join(problems[:10]))
     return PoolDSummary(snapshot=meta["snapshot"], sha256=snapshot_sha256(dest),
                         n_series=len(series_out), n_feeds=len(feeds_out), out_dir=str(dest),
-                        refused=dict(sorted(refused.items())))
+                        refused=dict(sorted(refused.items())),
+                        quarantine=quarantine_report, unreadable=unreadable)
 
 
 # ── validation ──────────────────────────────────────────────────────────────
@@ -586,6 +645,10 @@ def main(argv: list[str] | None = None) -> int:
                          "the loader's default chain.toml)")
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--evidence-out", type=Path, default=None)
+    ap.add_argument("--max-unreadable-files", type=int, default=None,
+                    help="systemic-read-failure guard (default 50)")
+    ap.add_argument("--max-unreadable-frac", type=float, default=None,
+                    help="systemic-read-failure guard (default 0.001)")
     args = ap.parse_args(argv)
 
     from ..shared.config import load_chain_config
@@ -594,6 +657,13 @@ def main(argv: list[str] | None = None) -> int:
     # named file, else the loader's default chain.toml (item 7: the builder
     # never falls back to a hard-coded embargo).
     cfg = PoolDBuildConfig.from_lane_d(load_chain_config(args.chain_toml).lane_d)
+    guard = {k: v for k, v in (("max_unreadable_files", args.max_unreadable_files),
+                               ("max_unreadable_frac", args.max_unreadable_frac))
+             if v is not None}
+    if guard:
+        import dataclasses
+
+        cfg = dataclasses.replace(cfg, **guard)
     print(f"pool_d: [lane_d] embargo_hours={cfg.embargo_hours:g} horizon={cfg.horizon} from "
           f"{args.chain_toml or 'the default chain.toml'}", file=sys.stderr)
     selection, mismatches = replay_lane_a(
@@ -612,7 +682,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: pool_d build failed: {e}", file=sys.stderr)
         return 2
     print(f"pool_d {summary.snapshot} sha256={summary.sha256} series={summary.n_series} "
-          f"feeds={summary.n_feeds} refused={len(summary.refused)}")
+          f"feeds={summary.n_feeds} refused={len(summary.refused)}"
+          + (f" quarantined={len(summary.quarantine)}" if summary.quarantine else "")
+          + (f" unreadable={len(summary.unreadable)}" if summary.unreadable else ""))
     if args.evidence_out is not None:
         meta = json.loads((args.out / "metadata.json").read_text(encoding="utf-8"))
         doc = {
@@ -628,6 +700,10 @@ def main(argv: list[str] | None = None) -> int:
             "catalog_sha256": meta["catalog_sha256"],
             "refused": dict(sorted(Counter(summary.refused.values()).items())),
         }
+        if summary.quarantine:
+            doc["quarantine"] = summary.quarantine
+        if summary.unreadable:
+            doc["unreadable_partitions"] = summary.unreadable
         doc["digest"] = hashlib.sha256(_canonical(doc)).hexdigest()
         args.evidence_out.parent.mkdir(parents=True, exist_ok=True)
         args.evidence_out.write_text(json.dumps(doc, indent=2, sort_keys=True) + "\n",
