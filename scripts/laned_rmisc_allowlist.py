@@ -691,8 +691,22 @@ def cand_file_hashes(path, sample_series: int, max_points: int, k: int, mod: int
 
 
 def _cand_job(job):
-    name, f, sample_series, max_points, k, mod = job
+    import numpy as np
+
+    name, f, sample_series, max_points, k, mod, cache = job
+    cp = None
+    if cache:
+        st = Path(f).stat()
+        tag = f"{f}|{st.st_size}|{st.st_mtime_ns}|{sample_series}|{max_points}|{k}|{mod}"
+        cp = Path(cache) / (hashlib.sha256(tag.encode()).hexdigest() + ".npz")
+        if cp.is_file():
+            z = np.load(cp)
+            return name, f, int(z["n"]), z["h"]
     n, h = cand_file_hashes(f, sample_series, max_points, k, mod)
+    if cp is not None:
+        tmp = cp.with_suffix(".tmp.npz")
+        np.savez(tmp, n=np.asarray(n), h=h)
+        tmp.replace(cp)
     return name, f, n, h
 
 
@@ -712,11 +726,12 @@ def cmd_datacompare(args) -> int:
     if missing:
         raise SystemExit(f"--exclude-root missing for {missing} (every source is compared)")
     folders = []
-    owner: dict[int, set[str]] = {}
-    per_folder: dict[str, np.ndarray] = {}
     jobs = [(c["name"], str(f)) for c in cands["candidates"]
             for f in sorted((Path(args.rmisc_root) / c["name"]).glob("*.parquet"))]
-    cargs = (int(args.sample_series), int(args.max_points), k, mod)
+    cache = getattr(args, "candidate_cache", None)
+    if cache:
+        Path(cache).mkdir(parents=True, exist_ok=True)
+    cargs = (int(args.sample_series), int(args.max_points), k, mod, cache)
     cw = max(1, min(int(getattr(args, "workers", 1) or 1), int(args.candidate_workers)))
     if cw > 1:
         import multiprocessing as mp
@@ -730,17 +745,28 @@ def cmd_datacompare(args) -> int:
     for name, f, n, h in done:
         by.setdefault(name, []).append((n, h))
         print(f"hashed {name}: {f} series={n} hashes={h.size}", flush=True)
-    for c in cands["candidates"]:
-        got = by.get(c["name"], [])
+    del done
+    # (hash, folder) pairs sorted by hash: numpy, never a Python map (the
+    # candidate side is ~1e9 hashes on the real RMISC set)
+    ph, pfo = [], []
+    for i, c in enumerate(cands["candidates"]):
+        got = by.pop(c["name"], [])
         hs = [h for _, h in got]
         n_series = sum(n for n, _ in got)
         arr = np.unique(np.concatenate(hs)) if hs else np.empty(0, dtype=np.uint64)
-        per_folder[c["name"]] = arr
-        for x in arr.tolist():
-            owner.setdefault(x, set()).add(c["name"])
+        del hs, got
+        ph.append(arr)
+        pfo.append(np.full(arr.size, i, dtype=np.int32))
         folders.append({"name": c["name"], "n_series_sampled": n_series, "n_hashes": int(arr.size)})
-    all_c = np.asarray(sorted(owner), dtype=np.uint64)
-    hits = {f["name"]: {s: set() for s in EXCLUSION_SOURCES} for f in folders}
+    ph = np.concatenate(ph) if ph else np.empty(0, dtype=np.uint64)
+    pfo = np.concatenate(pfo) if pfo else np.empty(0, dtype=np.int32)
+    order = np.argsort(ph, kind="stable")
+    ph, pfo = ph[order], pfo[order]
+    del order
+    all_c = np.unique(ph)
+    print(f"candidates: {len(folders)} folders, {ph.size} (hash, folder) pairs, "
+          f"{all_c.size} distinct hashes", flush=True)
+    hit_parts: dict[str, list] = {s: [] for s in EXCLUSION_SOURCES}
     emax = int(args.exclude_max_points)
     workers = max(1, int(getattr(args, "workers", 1) or 1))
     pool = None
@@ -759,9 +785,8 @@ def cmd_datacompare(args) -> int:
         else:
             res = pool.map(_pool_file, [str(f) for f in files], chunksize=1)
         for f, h in res:
-            for x in h.tolist():
-                for name in owner[x]:
-                    hits[name][key].add(x)
+            if h.size:
+                hit_parts[key].append(h)
             print(f"compared {key}: {f}", flush=True)
 
     import shutil
@@ -778,10 +803,20 @@ def cmd_datacompare(args) -> int:
             scan(key, data_files(Path(roots[key])))
     if pool is not None:
         pool.shutdown()
-    for f in folders:
-        n = max(1, f["n_hashes"])
-        f["hits"] = {s: len(v) for s, v in sorted(hits[f["name"]].items())}
-        f["max_hit_fraction"] = max(f["hits"].values()) / n if f["n_hashes"] else 0.0
+    counts = {}
+    for key in sorted(EXCLUSION_SOURCES):
+        hh = np.unique(np.concatenate(hit_parts[key])) if hit_parts[key] \
+            else np.empty(0, dtype=np.uint64)
+        if hh.size and ph.size:
+            p = np.searchsorted(hh, ph)
+            p[p >= hh.size] = 0
+            counts[key] = np.bincount(pfo[hh[p] == ph], minlength=len(folders))
+        else:
+            counts[key] = np.zeros(len(folders), dtype=np.int64)
+    for i, f in enumerate(folders):
+        f["hits"] = {s: int(counts[s][i]) for s in sorted(EXCLUSION_SOURCES)}
+        f["max_hit_fraction"] = (max(f["hits"].values()) / f["n_hashes"]
+                                 if f["n_hashes"] else 0.0)
         f["verdict"] = ("no_data" if not f["n_hashes"] else
                         "duplicate" if f["max_hit_fraction"] >= float(args.dup_threshold)
                         else "pass")
@@ -879,6 +914,8 @@ def main(argv=None) -> int:
                         "download batches (hash, then delete) instead of --exclude-root")
     p.add_argument("--stream-dir", help="scratch dir for --stream batches")
     p.add_argument("--stream-batch-gib", type=float, default=64.0)
+    p.add_argument("--candidate-cache", help="dir caching each candidate file's hashes "
+                   "(keyed by path, size, mtime and the hash params): a rerun skips them")
     p.add_argument("--candidate-workers", type=int, default=12,
                    help="cap on processes hashing candidate files (each reads a file whole)")
     p.set_defaults(fn=cmd_datacompare)

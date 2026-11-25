@@ -195,6 +195,12 @@ def test_datacompare_compares_data_not_names(tmp_path, capsys):
     assert a.main(args) == 0
     doc = json.loads(out.read_text())
     assert doc["schema"] == a.DATACOMPARE_SCHEMA
+    # W-LAUNCH: the process pools and the candidate cache change nothing
+    out2 = tmp_path / "dc2.json"
+    fast = [x if x != str(out) else str(out2) for x in args] + [
+        "--workers", "2", "--candidate-workers", "2", "--candidate-cache", str(tmp_path / "cc")]
+    assert a.main(fast) == 0 and a.main(fast) == 0          # second run: cache hits
+    assert json.loads(out2.read_text())["folders"] == doc["folders"]
     v = {f["name"]: f for f in doc["folders"]}
     assert v["Renamed"]["verdict"] == "duplicate" and v["Renamed"]["hits"]["gift_eval_pretrain"]
     assert v["Fresh"]["verdict"] == "pass"
