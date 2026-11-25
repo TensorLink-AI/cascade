@@ -63,6 +63,33 @@ the log, its root is not committed with `committed_ts <= as_of_ts`, its root is
 not listed in `first_seen_roots`, or the log no longer matches its committed
 roots (a rewritten record).
 
+### Unreadable partitions: the quarantine (2026-11-25)
+
+Two forge objects with no parquet footer aborted every `record`. Now
+(`test_w6fs_quarantine.py`):
+
+* `record` skips a partition that fails to read, logs it to stderr
+  (`QUARANTINE ...`) and appends to `quarantine.jsonl` (append-only, next to
+  `records.jsonl`; restored/pushed with the rest of the log by R13
+  `state-pull`/`state-push`) `{"schema": QUARANTINE_SCHEMA, "kind":
+  "unreadable", "feed", "partition", "partition_sha256", "size", "reason",
+  "quarantined_ts"}`. The same bytes are never re-read or re-logged.
+* A quarantined partition NAME stays quarantined forever. When a later version
+  of it reads, its points not already known are appended as `{"kind":
+  "blocked", ..., "points"}` -- never to `records.jsonl` -- and are never
+  recorded as first seen afterwards from any partition (a repaired object's
+  old points can never count as fresh). Points recorded from other partitions
+  before the quarantine keep their genuine first-seen time.
+* `.index(until_ts)` also drops any record of a quarantined name with
+  `seen_ts >= quarantined_ts` (written by a quarantine-unaware release).
+* More than `unreadable_limit(n_partitions, max_files=50, max_frac=0.001)` =
+  `min(max_files, max(1, floor(max_frac * n)))` unreadable partitions in one run
+  (new ones plus quarantined bytes still present) raises
+  `FirstSeenError("too_many_unreadable")` before anything is written (CLI
+  `--max-unreadable-files` / `--max-unreadable-frac`, exit 2).
+* `record` returns `{"records", "points"}` plus `quarantined` / `blocked` /
+  `unreadable` counts only when non-zero.
+
 ## Evidence (`evidence/w6fs.json`)
 
 `python -P -m cascade.pool.first_seen evidence --forge-dir D --log-dir L

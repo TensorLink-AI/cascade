@@ -120,6 +120,22 @@ true, "lane_a_pool_sha256", "catalog_sha256", "refused": {reason: count},
 of the canonical JSON (sorted keys, `(",", ":")` separators) of the document
 without `digest`.
 
+### Unreadable partitions (2026-11-25, `test_w6b_quarantine.py`)
+
+A partition the W6fs quarantine names at `as_of_ts` is never read, even once
+it is readable again; any other partition that fails to read is skipped and
+logged to stderr. The metadata gains `quarantine` (the W6fs
+`quarantine_report(until_ts=as_of_ts)`: `kind`, `feed`, `partition`,
+`partition_sha256`, `size`, `quarantined_ts`, plus `reason` or
+`n_blocked_points`) and `unreadable_partitions` (`[[feed, partition,
+reason], ...]`, sorted) ONLY when non-empty, so a build without them is
+byte-identical to before; the evidence document carries the same two keys
+under the same rule. More unreadable partitions than the W6fs
+`unreadable_limit` over the files read (`PoolDBuildConfig.max_unreadable_files`
+/ `max_unreadable_frac`, CLI `--max-unreadable-*`) aborts with
+`too_many_unreadable`. Validators ignore both keys (`load_pool` reads named
+fields only).
+
 ## What is pinned
 
 | Row text | Test |

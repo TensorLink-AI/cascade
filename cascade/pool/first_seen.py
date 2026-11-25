@@ -22,6 +22,20 @@ reads it on both clocks (``first_seen(p) > b`` and the rev6.10 release time
 The release time is never stored (``release_ts`` derives it from the signed
 record and the snapshot's pinned ``e``). Producer side only: validators read
 the pinned ``pool_d`` snapshot, never this log. Needs the ``pool-forge`` extra.
+
+Unreadable partitions (2026-11-25: two forge objects with no parquet footer
+aborted every release) are skipped, logged loudly to stderr and appended to
+``quarantine.jsonl`` (append-only, keyed by feed, partition name, size and
+sha256). A quarantined partition NAME stays quarantined forever: when a later
+version of it becomes readable, its points not already known are written to
+the quarantine as ``blocked`` (never to ``records.jsonl``) and are never
+recorded as first seen afterwards, from any partition; the index also drops
+any record of a quarantined name seen after its quarantine (an older release
+that did not know the file). Old (e.g. July) points of a repaired object can
+therefore never count as fresh in lane D. Points already recorded from other
+partitions before the quarantine keep their genuine first-seen time. More
+than :func:`unreadable_limit` unreadable partitions in one run (a systemic
+read failure) aborts as before (``too_many_unreadable``), writing nothing.
 """
 
 from __future__ import annotations
@@ -29,6 +43,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import socket
 import statistics
@@ -44,7 +59,14 @@ LOG_SCHEMA = "pool-d-first-seen/1"
 EVIDENCE_SCHEMA = "laned-evidence/w6fs/1"
 RECORDS_FILE = "records.jsonl"
 ROOTS_FILE = "roots.jsonl"
+QUARANTINE_FILE = "quarantine.jsonl"
+QUARANTINE_SCHEMA = "pool-d-first-seen-quarantine/1"
 DEFAULT_LOG_DIRNAME = "first_seen"
+# The systemic-read-failure guard: more unreadable partitions than
+# unreadable_limit(...) in one run aborts (nothing written).
+DEFAULT_MAX_UNREADABLE_FILES = 50
+DEFAULT_MAX_UNREADABLE_FRAC = 0.001
+_REASON_MAX = 300
 
 
 class FirstSeenError(ValueError):
@@ -91,6 +113,24 @@ def merkle_root(leaves: Sequence[bytes]) -> str:
 def release_ts(first_seen_ts: int, embargo_hours: float) -> int:
     """rev6.10 ``release(p) = first_seen(p) + e`` (derived, never stored)."""
     return int(first_seen_ts) + round(float(embargo_hours) * 3600)
+
+
+def unreadable_limit(n_partitions: int, *, max_files: int = DEFAULT_MAX_UNREADABLE_FILES,
+                     max_frac: float = DEFAULT_MAX_UNREADABLE_FRAC) -> int:
+    """How many unreadable partitions one run tolerates: ``max_files``, or
+    ``max_frac`` of the partitions when that is smaller (never below 1)."""
+    by_frac = max(1, math.floor(float(max_frac) * max(0, int(n_partitions))))
+    return max(0, min(int(max_files), by_frac))
+
+
+def unreadable_reason(exc: BaseException) -> str:
+    """A short, stable reason string for a partition that failed to read."""
+    msg = " ".join(str(exc).split())
+    return f"{type(exc).__name__}: {msg}"[:_REASON_MAX]
+
+
+def _warn(msg: str) -> None:
+    print(f"first_seen: WARNING {msg}", file=sys.stderr, flush=True)
 
 
 def _file_sha(path: Path) -> str:
@@ -199,6 +239,10 @@ class FirstSeenLog:
     def roots_path(self) -> Path:
         return self.log_dir / ROOTS_FILE
 
+    @property
+    def quarantine_path(self) -> Path:
+        return self.log_dir / QUARANTINE_FILE
+
     # ── reading ─────────────────────────────────────────────────────────────
 
     @staticmethod
@@ -217,6 +261,41 @@ class FirstSeenLog:
 
     def records(self) -> list[dict]:
         return self._lines(self.records_path)
+
+    def quarantine(self) -> list[dict]:
+        """Every quarantine entry (``kind`` ``unreadable`` or ``blocked``)."""
+        return self._lines(self.quarantine_path)
+
+    def quarantined(self, *, until_ts: int | None = None) -> dict[tuple[str, str], int]:
+        """``{(feed, partition name): first quarantined_ts}`` of the names
+        quarantined (unreadable) at or before ``until_ts`` (all when None)."""
+        out: dict[tuple[str, str], int] = {}
+        for e in self.quarantine():
+            if e.get("kind") != "unreadable":
+                continue
+            qts = int(e["quarantined_ts"])
+            if until_ts is not None and qts > int(until_ts):
+                continue
+            key = (str(e["feed"]), str(e["partition"]))
+            out[key] = min(qts, out.get(key, qts))
+        return out
+
+    def quarantine_report(self, *, until_ts: int) -> list[dict]:
+        """The quarantine entries in effect at ``until_ts``, for the signed
+        ``pool_d`` metadata (``blocked`` entries carry a point count only)."""
+        out = []
+        for e in self.quarantine():
+            if int(e["quarantined_ts"]) > int(until_ts):
+                continue
+            row = {k: e[k] for k in ("kind", "feed", "partition", "partition_sha256", "size",
+                                     "quarantined_ts")}
+            if e.get("kind") == "unreadable":
+                row["reason"] = str(e.get("reason", ""))
+            else:
+                row["n_blocked_points"] = len(e.get("points") or [])
+            out.append(row)
+        return sorted(out, key=lambda r: (r["feed"], r["partition"], r["quarantined_ts"],
+                                          r["kind"], r["partition_sha256"]))
 
     def roots(self) -> dict[int, dict]:
         out: dict[int, dict] = {}
@@ -239,32 +318,87 @@ class FirstSeenLog:
             f.flush()
             os.fsync(f.fileno())
 
-    def record(self, forge_dir: Path | str, *, now_ts: int) -> dict:
-        """Log every new point of the forge mirror's partitions at ``now_ts``."""
+    def record(self, forge_dir: Path | str, *, now_ts: int,
+               max_unreadable_files: int = DEFAULT_MAX_UNREADABLE_FILES,
+               max_unreadable_frac: float = DEFAULT_MAX_UNREADABLE_FRAC) -> dict:
+        """Log every new point of the forge mirror's partitions at ``now_ts``.
+
+        An unreadable partition is skipped and quarantined (module docstring);
+        more than :func:`unreadable_limit` unreadable partitions (new ones plus
+        quarantined versions still present) raises ``too_many_unreadable``
+        before anything is written. The result gains ``quarantined`` /
+        ``blocked`` / ``unreadable`` only when non-zero."""
         now_ts = int(now_ts)
         p = period_start(now_ts)
         if p in self.roots():
             raise FirstSeenError("period_committed",
                                  f"period {p} already has a committed root; now_ts={now_ts}")
         existing = self.records()
+        quarantine = self.quarantine()
         seen_parts = {(r["feed"], r["partition"], r["partition_sha256"]) for r in existing}
         known: dict[str, set] = {}
         for r in existing:
             known.setdefault(r["feed"], set()).update((pj, int(t)) for pj, t in r["points"])
+        q_names = {(str(e["feed"]), str(e["partition"])) for e in quarantine
+                   if e.get("kind") == "unreadable"}
+        q_versions = {(str(e["feed"]), str(e["partition"]), str(e["partition_sha256"])):
+                      e.get("kind") for e in quarantine}
+        for e in quarantine:
+            if e.get("kind") == "blocked":
+                known.setdefault(str(e["feed"]), set()).update(
+                    (pj, int(t)) for pj, t in e.get("points") or [])
         logged_feeds = {r["feed"] for r in existing}
         data = Path(forge_dir) / "data"
         new: list[dict] = []
-        n_points = 0
+        new_q: list[dict] = []
+        unreadable: list[str] = []
+        n_points = n_blocked = n_parts = 0
         feed_dirs = sorted(d for d in data.iterdir() if d.is_dir()) if data.is_dir() else []
         for feed_dir in feed_dirs:
             feed = feed_dir.name
             for part in sorted(feed_dir.glob("*.parquet")):
+                n_parts += 1
                 sha = _file_sha(part)
                 if (feed, part.name, sha) in seen_parts:
                     continue
+                kind = q_versions.get((feed, part.name, sha))
+                if kind == "unreadable":                 # the same corrupt bytes
+                    unreadable.append(f"{feed}/{part.name}")
+                    continue
+                if kind == "blocked":                    # already blocked
+                    continue
+                size = part.stat().st_size
+                try:
+                    points = partition_points(part)
+                except Exception as e:  # noqa: BLE001 — any read failure quarantines it
+                    reason = unreadable_reason(e)
+                    _warn(f"QUARANTINE unreadable partition data/{feed}/{part.name} "
+                          f"(size={size} sha256={sha}): {reason}")
+                    unreadable.append(f"{feed}/{part.name}")
+                    new_q.append({"schema": QUARANTINE_SCHEMA, "kind": "unreadable",
+                                  "feed": feed, "partition": part.name,
+                                  "partition_sha256": sha, "size": int(size),
+                                  "reason": reason, "quarantined_ts": now_ts})
+                    q_versions[(feed, part.name, sha)] = "unreadable"
+                    q_names.add((feed, part.name))
+                    continue
                 have = known.setdefault(feed, set())
-                fresh = sorted(set(partition_points(part)) - have)
+                fresh = sorted(set(points) - have)
                 have.update(fresh)
+                if (feed, part.name) in q_names:
+                    # A quarantined partition readable again: its unknown
+                    # points are blocked forever, never first-seen now.
+                    _warn(f"quarantined partition data/{feed}/{part.name} is readable again "
+                          f"(size={size} sha256={sha}); {len(fresh)} unseen point(s) blocked "
+                          f"from lane D, not recorded as first seen")
+                    n_blocked += len(fresh)
+                    new_q.append({"schema": QUARANTINE_SCHEMA, "kind": "blocked",
+                                  "feed": feed, "partition": part.name,
+                                  "partition_sha256": sha, "size": int(size),
+                                  "quarantined_ts": now_ts,
+                                  "points": [[pj, int(t)] for pj, t in fresh]})
+                    q_versions[(feed, part.name, sha)] = "blocked"
+                    continue
                 n_points += len(fresh)
                 new.append({
                     "schema": LOG_SCHEMA, "feed": feed, "partition": part.name,
@@ -272,8 +406,28 @@ class FirstSeenLog:
                     "baseline": feed not in logged_feeds,
                     "points": [[pj, int(t)] for pj, t in fresh],
                 })
+        limit = unreadable_limit(n_parts, max_files=max_unreadable_files,
+                                 max_frac=max_unreadable_frac)
+        if len(unreadable) > limit:
+            raise FirstSeenError(
+                "too_many_unreadable",
+                f"{len(unreadable)} of {n_parts} partitions are unreadable (limit {limit}); "
+                f"a systemic read failure? nothing recorded. First: "
+                f"{', '.join(unreadable[:10])}")
+        # Quarantine first: a crash between the two appends errs on the safe side.
+        self._append(self.quarantine_path, new_q)
         self._append(self.records_path, new)
-        return {"records": len(new), "points": n_points}
+        out = {"records": len(new), "points": n_points}
+        n_q = sum(1 for e in new_q if e["kind"] == "unreadable")
+        if n_q:
+            out["quarantined"] = n_q
+        if n_blocked or any(e["kind"] == "blocked" for e in new_q):
+            out["blocked"] = n_blocked
+        if unreadable:
+            out["unreadable"] = len(unreadable)
+            _warn(f"{len(unreadable)} unreadable partition(s) skipped (limit {limit}): "
+                  f"{', '.join(unreadable[:20])}")
+        return out
 
     def commit(self, *, now_ts: int) -> list[dict]:
         """Commit a root for every ended period that has records and no root."""
@@ -314,12 +468,18 @@ class FirstSeenLog:
                 raise FirstSeenError("root_mismatch",
                                      f"period {p}: log no longer matches its committed root")
         usable = {p: e["root"] for p, e in roots.items() if int(e["committed_ts"]) <= until_ts}
+        quarantined = self.quarantined(until_ts=until_ts)
         entries: dict = {}
         for r in records:
             p = int(r["period_start"])
             if p not in usable:
                 continue
             seen = int(r["seen_ts"])
+            q_ts = quarantined.get((str(r["feed"]), str(r["partition"])))
+            if q_ts is not None and seen >= q_ts:
+                # A quarantined name recorded at/after its quarantine (e.g. by
+                # a release that did not know quarantine.jsonl): never fresh.
+                continue
             for pj, t in r["points"]:
                 key = (str(r["feed"]), str(pj), int(t))
                 if key not in entries or seen < entries[key][0]:
@@ -388,6 +548,11 @@ def main(argv: list[str] | None = None) -> int:
         p = sub.add_parser(name)
         if name != "commit":
             p.add_argument("--forge-dir", type=Path, required=True)
+        if name == "record":
+            p.add_argument("--max-unreadable-files", type=int,
+                           default=DEFAULT_MAX_UNREADABLE_FILES)
+            p.add_argument("--max-unreadable-frac", type=float,
+                           default=DEFAULT_MAX_UNREADABLE_FRAC)
         p.add_argument("--log-dir", type=Path, default=None,
                        help="default: <forge-dir>/first_seen")
         p.add_argument("--now-ts", type=int, default=None, help="default: the wall clock")
@@ -403,7 +568,10 @@ def main(argv: list[str] | None = None) -> int:
     log = FirstSeenLog(log_dir)
     try:
         if args.cmd == "record":
-            print(json.dumps(log.record(args.forge_dir, now_ts=now), sort_keys=True))
+            print(json.dumps(log.record(args.forge_dir, now_ts=now,
+                                        max_unreadable_files=args.max_unreadable_files,
+                                        max_unreadable_frac=args.max_unreadable_frac),
+                             sort_keys=True))
         elif args.cmd == "commit":
             print(json.dumps(log.commit(now_ts=now), sort_keys=True))
         else:
@@ -423,9 +591,13 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "DEFAULT_MAX_UNREADABLE_FILES",
+    "DEFAULT_MAX_UNREADABLE_FRAC",
     "EVIDENCE_SCHEMA",
     "LOG_SCHEMA",
     "PERIOD_SECONDS",
+    "QUARANTINE_FILE",
+    "QUARANTINE_SCHEMA",
     "FirstSeenError",
     "FirstSeenIndex",
     "FirstSeenLog",
@@ -436,5 +608,7 @@ __all__ = [
     "partition_points",
     "period_start",
     "release_ts",
+    "unreadable_limit",
+    "unreadable_reason",
     "verify_snapshot",
 ]

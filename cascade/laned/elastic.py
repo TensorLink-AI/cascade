@@ -1177,7 +1177,9 @@ def eval_shard_plan(cfg: ElasticConfig, *, block_hash: str, entry_ids: Sequence[
 # ── builder-side state on object storage (runs ON the builder) ─────────────
 
 
-FIRST_SEEN_FILES = ("records.jsonl", "roots.jsonl")
+# quarantine.jsonl (W6fs unreadable partitions) is newer than the first HEADs:
+# a HEAD that does not name it restores it as empty (append-only from there).
+FIRST_SEEN_FILES = ("records.jsonl", "roots.jsonl", "quarantine.jsonl")
 PULLED_MARK = ".elastic_pulled.json"
 
 
@@ -1202,11 +1204,16 @@ def state_pull(store, *, prefix: str, log_dir: Path, prior_root: Path) -> dict:
         try:
             data = store.get_bytes(_state_key(prefix, "first_seen", name))
         except ObjectNotFound:
-            if head is not None:
+            if head is not None and name in head:
                 raise ElasticError("state_conflict",
                                    f"HEAD names {name} but it is missing") from None
             data = b""
-        if head is not None and hashlib.sha256(data).hexdigest() != head.get(name):
+        if head is not None and name not in head:
+            # A HEAD older than this file: only an empty copy is consistent.
+            if data:
+                raise ElasticError("state_conflict", f"{name} is in the bucket but HEAD.json "
+                                                     f"does not name it")
+        elif head is not None and hashlib.sha256(data).hexdigest() != head.get(name):
             raise ElasticError("state_conflict", f"{name} does not match HEAD.json")
         if local.is_file() and not data.startswith(local.read_bytes()):
             raise ElasticError("state_conflict", f"local {name} is not a prefix of the bucket "
