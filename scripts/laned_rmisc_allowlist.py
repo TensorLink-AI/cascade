@@ -645,12 +645,13 @@ def cand_file_hashes(path, sample_series: int, max_points: int, k: int, mod: int
         return len(uniq), h
     # Memory-bounded: the name column first, then one numeric column at a time,
     # taking only the sampled rows (a wide table is never materialised whole).
-    schema = pq.read_schema(str(path))
+    pf = pq.ParquetFile(str(path))                            # the footer is parsed once
+    schema = pf.schema_arrow
     cols = [f.name for f in schema if f.name != RMISC_SERIES_COLUMN
             and (pa.types.is_integer(f.type) or pa.types.is_floating(f.type))]
     has = RMISC_SERIES_COLUMN in schema.names
     if has:
-        col = pq.read_table(str(path), columns=[RMISC_SERIES_COLUMN]).column(RMISC_SERIES_COLUMN)
+        col = pf.read(columns=[RMISC_SERIES_COLUMN]).column(RMISC_SERIES_COLUMN)
         if pa.types.is_dictionary(col.type):
             col = col.cast(col.type.value_type)               # RMISC: dictionary<string>
         if pa.types.is_string(col.type) or pa.types.is_large_string(col.type):
@@ -664,18 +665,21 @@ def cand_file_hashes(path, sample_series: int, max_points: int, k: int, mod: int
             uniq = sorted(set(arr_names.tolist()), key=key)[:sample_series]
             groups = [np.flatnonzero(arr_names == s) for s in uniq]
     else:
-        n = pq.ParquetFile(str(path)).metadata.num_rows
+        n = pf.metadata.num_rows
         uniq = ["_all"]
         groups = [np.arange(n)]
     groups = [g[:max_points] for g in groups]                 # vals[idx][:m] == vals[idx[:m]]
     sel = np.concatenate(groups) if groups else np.empty(0, dtype=np.int64)
     offs = np.concatenate([[0], np.cumsum([g.size for g in groups])]).tolist()
     hs = []
-    for c in cols:
-        v = pq.read_table(str(path), columns=[c]).column(c).take(pa.array(sel)) \
-            .cast(pa.float64()).to_numpy(zero_copy_only=False)
-        for j in range(len(groups)):
-            hs.append(kgram_hashes(v[offs[j]:offs[j + 1]], k, mod))
+    take = pa.array(sel)
+    for b0 in range(0, len(cols), 32):                        # wide tables: 32 columns a read
+        part = pf.read(columns=cols[b0:b0 + 32])
+        for c in cols[b0:b0 + 32]:
+            v = part.column(c).take(take).cast(pa.float64()).to_numpy(zero_copy_only=False)
+            for j in range(len(groups)):
+                hs.append(kgram_hashes(v[offs[j]:offs[j + 1]], k, mod))
+        del part
     h = np.unique(np.concatenate(hs)) if hs else np.empty(0, dtype=np.uint64)
     return len(uniq), h
 
