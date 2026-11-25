@@ -851,7 +851,7 @@ class MktSnapshotSource:
         self.signer, self.verify = str(signer_hotkey or ""), bool(verify_signature)
         # DEC-CA-0075: the competition spec's pool schema, series filter and
         # channel map
-        self.schema, self.select = str(schema or ""), dict(select or {})
+        self.schema, self.select_spec = str(schema or ""), dict(select or {})
         self.channels = dict(channels or {})
         self.cache_dir = Path(cache_dir) / self.prefix
         self._cache: dict[str, MktSnapshot] = {}
@@ -874,7 +874,7 @@ class MktSnapshotSource:
             dest = self.cache_dir / f"snapshot-{meta.effective_block}-{meta.sha256[:12]}"
             fetch_pool_snapshot(self.store, meta, dest)
             hit = load_snapshot(dest, signer_hotkey=self.signer, verify_signature=self.verify,
-                                schema=self.schema, select=self.select,
+                                schema=self.schema, select=self.select_spec,
                                 channels=self.channels)
             if len(self._cache) >= 4:
                 self._cache.pop(next(iter(self._cache)))
