@@ -93,7 +93,15 @@ def _add_verify(sub: argparse._SubParsersAction) -> None:
 
 
 def _add_deploy(sub: argparse._SubParsersAction) -> None:
-    p = sub.add_parser("deploy", help="Upload your generator to Hippius and commit it on-chain.")
+    p = sub.add_parser(
+        "deploy",
+        description=LANE_A_CLOSED_NOTE,
+        help="Upload your generator to Hippius and commit it on-chain (lane A, or lane B with "
+             "--expert-domain). Lane A is closed to new challengers from block 9586800: a lane A "
+             "deploy refuses past it unless --allow-closed-lane-a.")
+    p.add_argument("--allow-closed-lane-a", action="store_true",
+                   help="Go ahead with a lane A deploy although lane A takes no new "
+                        "challengers from block 9586800 (the entry will not be seated).")
     p.add_argument("repo_dir", type=Path, help="Path to your prepared generator repo (local dir).")
     p.add_argument("--chain-toml", type=Path, default=None, help="Override chain.toml path.")
     p.add_argument("--network", default="finney", help="Bittensor network (finney/test/local).")
@@ -481,6 +489,60 @@ def _live_cfg(cfg, client):
         return startup_activation(cfg, client, store_path=None)
     except Exception:  # noqa: BLE001 — a CLI convenience must never fail a command
         return cfg
+
+
+# W-LAUNCH lane A shutdown (owner 2026-11-25, #941): lane A takes no new
+# challengers from the launch era start. The operator's DEPLOYED chain.toml
+# types ``[round] lane_a_until_block``; the checked-in copy a miner loads keeps
+# it at 0 (trainer + intake policy, not an overlay key), so the published
+# cutoff per netuid is the fallback. Client-side courtesy only: the intake
+# (409 ``lane_ended``) and the trainer enforce it.
+LANE_A_CLOSED_FROM = {91: 9586800}
+LANE_A_CLOSED_NOTE = ("Lane A is closed to new challengers from block 9586800 "
+                      "(mainnet launch, 2026-11-25); compete in lanes B, C and D.")
+
+
+def lane_a_closed_from(cfg) -> int:
+    """The block lane A stops taking new challengers on ``cfg``'s network (0 = open)."""
+    typed = int(getattr(getattr(cfg, "round", None), "lane_a_until_block", 0) or 0)
+    if typed > 0:
+        return typed
+    return int(LANE_A_CLOSED_FROM.get(int(getattr(cfg, "netuid", 0) or 0), 0))
+
+
+def _lane_a_gate(args: argparse.Namespace, cfg, out, *, what: str) -> int | None:
+    """Refuse a lane A ``what`` (deploy / submit) BEFORE any upload or chain
+    write once the head has reached lane A's cutoff; ``--allow-closed-lane-a``
+    overrides. None = go ahead. An unreadable head only warns: the later
+    commit needs the same chain and fails loudly there."""
+    until = lane_a_closed_from(cfg)
+    if until <= 0:
+        return None
+    if getattr(args, "allow_closed_lane_a", False):
+        out.info(f"warning: lane A takes no new challengers from block {until}; "
+                 f"--allow-closed-lane-a set, so this {what} goes ahead and will not be seated.")
+        return None
+    from ..shared.chain import ChainClient, ChainError
+
+    try:
+        head = ChainClient.from_config(
+            cfg, network=args.network, wallet_name=args.wallet_name,
+            wallet_hotkey=args.wallet_hotkey, wallet_path=args.wallet_path,
+        ).current_block()
+    except ChainError as e:
+        out.info(f"warning: could not read the chain head ({e}); lane A takes no new "
+                 f"challengers from block {until}.")
+        return None
+    if head < until:
+        out.info(f"note: lane A takes no new challengers from block {until} "
+                 f"({until - head} blocks from head {head}); an entry not seated by then never trains.")
+        return None
+    return out.fail(
+        "lane_a_closed",
+        f"refusing to {what}: lane A takes no new challengers from block {until} "
+        f"(head {head}). Nothing was uploaded or committed. Compete in lanes B, C or D "
+        f"(`cascade rules b|c|d`), or pass --allow-closed-lane-a to {what} anyway.",
+        REJECTED, until_block=until, head_block=head)
 
 
 def _cmd_round(args: argparse.Namespace) -> int:
@@ -1006,14 +1068,19 @@ def _cmd_deploy(args: argparse.Namespace) -> int:
         out.info(f"fresh submission repo: {args.hub_repo}")
 
     ref = args.ref
+    if ref is None and not args.hub_repo:
+        return out.fail(
+            "missing_hub_repo",
+            "error: --hub-repo or --hub-namespace (Hippius Hub) is required to "
+            "upload — the Hub is always tried first. --hf-repo is only a fallback "
+            "for when the Hub push fails; pass it alongside one of them. Or use "
+            "--ref to commit an already-uploaded ref.", USAGE)
+    if not expert_domain:
+        # W-LAUNCH: a lane A entry past lane A's cutoff stops before any upload or commit
+        refused = _lane_a_gate(args, cfg, out, what="deploy")
+        if refused is not None:
+            return refused
     if ref is None:
-        if not args.hub_repo:
-            return out.fail(
-                "missing_hub_repo",
-                "error: --hub-repo or --hub-namespace (Hippius Hub) is required to "
-                "upload — the Hub is always tried first. --hf-repo is only a fallback "
-                "for when the Hub push fails; pass it alongside one of them. Or use "
-                "--ref to commit an already-uploaded ref.", USAGE)
         # Verify locally (cheaper than burning a chain commit), then upload.
         if not args.skip_verify:
             report = verify_repo(args.repo_dir, cfg, skip_runtime=False, across_launch=True)
@@ -1090,10 +1157,16 @@ def _cmd_deploy(args: argparse.Namespace) -> int:
 def _add_submit(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser(
         "submit",
-        help="Verify, ZIP, and submit your generator DIRECTLY to the operator's "
+        description=LANE_A_CLOSED_NOTE,
+        help="Verify, ZIP, and submit your lane A generator DIRECTLY to the operator's "
              "intake — private until it takes the throne — then commit the "
-             "returned vault ref on-chain.",
+             "returned vault ref on-chain. Lane A is closed to new challengers from block "
+             "9586800: past it this refuses (the intake answers 409 lane_ended to a funded "
+             "submit) unless --no-fund --no-commit (store only) or --allow-closed-lane-a.",
     )
+    p.add_argument("--allow-closed-lane-a", action="store_true",
+                   help="Go ahead with a lane A submit although lane A takes no new "
+                        "challengers from block 9586800 (the entry will not be seated).")
     p.add_argument("repo_dir", type=Path, help="Path to your prepared generator repo.")
     p.add_argument("intake_url", help="Operator intake base URL (https://…).")
     p.add_argument("--chain-toml", type=Path, default=None)
@@ -1248,6 +1321,11 @@ def _cmd_submit(args: argparse.Namespace) -> int:
             if refused is not None:
                 return refused
     cfg = load_chain_config(args.chain_toml)
+    if api_key or not args.no_commit:
+        # store only (--no-fund --no-commit) stays open: lane B legs may name a vault ref
+        refused = _lane_a_gate(args, cfg, out, what="submit")
+        if refused is not None:
+            return refused
     if api_key:
         from .live_status import LiveStateUnavailable
         from .training_context import live_context
@@ -1358,7 +1436,10 @@ def _cmd_submit(args: argparse.Namespace) -> int:
 def _add_fund(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser(
         "fund",
-        help="Fund your revealed submission's training leg with YOUR Lium API key.",
+        description=LANE_A_CLOSED_NOTE,
+        help="Fund your revealed lane A submission's training leg with YOUR Lium API key. "
+             "Lane A is closed to new challengers from block 9586800: the intake refuses a "
+             "new fund with 409 lane_ended (nothing charged).",
     )
     p.add_argument("intake_url",
                    help="Operator intake base URL (https://…; TLS protects the key in transit).")
@@ -1685,7 +1766,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cascade", description="cascade subnet miner CLI: lane A generators, lane B experts, "
                                     "lane C MarketCast, lane D open weights (`cascade rules <lane>` "
-                                    "prints each lane's rules).",
+                                    "prints each lane's rules). " + LANE_A_CLOSED_NOTE,
         epilog="--json on any command prints one machine-readable result. Exit codes: 0 ok, "
                "1 rejected, 2 usage, 3 network, 4 registry, 5 needs --yes. See AGENTS.md.")
     sub = parser.add_subparsers(dest="cmd", required=True)

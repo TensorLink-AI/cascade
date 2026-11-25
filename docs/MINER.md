@@ -6,10 +6,10 @@ on your compute account. Local training experiments need suitable compute too.
 
 | Lane | You submit | You compete for | Instructions |
 |---|---|---|---|
-| A | A deterministic Python generator of synthetic time series | Beat the current king with a fully trained model | [Steps 1–7](#1-install) |
+| A | A deterministic Python generator of synthetic time series | **Closed to new challengers from block 9586800**; the king (uid 164) is frozen as the reference for lanes B and D | [Steps 1–7](#1-install) |
 | B | A generator and up to the allowed number of targets | Improve selected experts, then pass merge acceptance when enabled | [Lane B](#13-cascade-v2-and-domain-experts-lane-b) |
 | C | An eligible MarketCast fine-tuning recipe, optionally with a generator | Beat the pinned application base on future data, then confirm and take a slot | [Lane C](#what-you-submit) |
-| D | A trained cascade_pyramid checkpoint (BF16 weights you trained anywhere) | Beat both the lane D king and the lane A king on forward-only private windows; crowned at the first verdict | [Lane D](LANE_D.md) |
+| D | A trained cascade_pyramid checkpoint (BF16 weights you trained anywhere) | Beat both the lane D king and the lane A king on forward-only private windows; crowned at the first verdict. Until the first crown, D's 50% stays with the lane A king | [Lane D](LANE_D.md) |
 
 **One competition brief per lane** (intent, scoring and pay numbers with a
 worked example, strategies, costs, refusals, FAQ):
@@ -152,7 +152,16 @@ Before you fund:
 
 ## 1. Install
 
-V2 has been live on mainnet since **30 October 2026**: paid Lane A entries
+**Lane A is closed to new challengers from block 9,586,800** (mainnet
+launch, about 2026-11-25 22:28 UTC). The intake refuses a new lane A fund or
+funded submit with `409 lane_ended` (nothing charged), and `cascade deploy` /
+`cascade submit` refuse a lane A entry past the cutoff before uploading or
+committing (`--allow-closed-lane-a` overrides; the entry is still not seated).
+King checks and promotions stop, so the lane A king (uid 164) is frozen as the
+reference for lanes B and D. Steps 1–7 below describe lane A as it ran; the
+install, provider-key and tracking steps still apply to lanes B and C.
+
+V2 ran on mainnet from **30 October 2026**: paid Lane A entries
 opened at 09:00 UTC and the first v2 era started at the first era boundary
 after 12:00 UTC (block 9,399,600). The paid Lane A intake refuses
 commitments revealed before the 09:00 UTC opening; make a fresh one. A queued
@@ -902,8 +911,10 @@ estimated improvement used for the pass/fail test.
   use the [reward schedule below](#rewards-allocation-burn-and-progression).
 - **Warm-start lineage.** Under v2 `king_ladder`, a passing king check can
   promote the king into a scheduled shared init, optionally with accepted B
-  deltas. The historical top-k mixture of king and challenger checkpoints
-  does not govern this regime. `cascade score --warm-start live` resolves the
+  deltas. From block 9,586,800 king checks are off
+  (`[v2] reign_warm_start_blocks = 0`): no promotion happens, so the init
+  stays the frozen lane A king's and no B delta is merged. The historical
+  top-k mixture of king and challenger checkpoints does not govern this regime. `cascade score --warm-start live` resolves the
   current effective init; an announced future promotion is not today's base.
 
 ### Rewards: allocation, burn and progression
@@ -915,12 +926,14 @@ records determine the actual rules. Testnet retains older economics and must
 not be used to infer mainnet payments. Percentages below refer to the validator's
 competition reward vector, not a fixed TAO/day or dollar payment.
 
-**Mainnet launch split (block 9586800).** The signed launch overlay
-(`deploy/overlays/launch-20261125.mainnet.toml`, owner proposal plan rev6.24)
-replaces the template shares below with **A 0% / B 35% / C 15% / D 50%**
-once lane D is armed. Under it a B slot is 35% / 10 = 3.5% of emissions, the
-MarketCast slot is 15%, and lane D pays its court (80/15/5) from 50%; lane A's
-king earns nothing directly but is the house in lane D. The per-lane guides
+**Mainnet launch split (block 9586800).** The signed step 1 launch overlay
+(`deploy/overlays/launch-20261125.pre.mainnet.toml`) replaces the template
+shares below with **A 50% / B 35% / C 15%**, and the step 2 overlay
+(`launch-20261125.mainnet.toml`) arms lane D for **A 0% / B 35% / C 15% /
+D 50%**. Under them a B slot is 35% / 10 = 3.5% of emissions and the
+MarketCast slot is 15%. Lane D's 50% stays with the frozen lane A king (the
+house) until the first miner is crowned lane D king; then D pays its court
+(80/15/5). No lane B slot is paid under the launch config (see Lane B below). The per-lane guides
 ([A](MINER_LANE_A.md), [B](MINER_LANE_B.md), [C](MINER_LANE_C_MARKETCAST.md),
 [D](MINER_LANE_D.md)) work examples at this split. The tables below are the
 checked-in template and the scripted documentation check computes them.
@@ -936,7 +949,8 @@ checked-in template and the scripted documentation check computes them.
 | A + B + C | 50% | 25% | 25% |
 <!-- cascade:rewards:allocation:end -->
 
-C takes its 25% from A in the mainnet policy; B stays at 25%. Before B or C
+In the template C takes its 25% from A and B stays at 25%; at the launch
+split C takes 15% from A and B is 35%. Before B or C
 launches, it has no reserved allocation. Once a lane launches, an empty pool
 or empty target slot burns rather than being reassigned to another miner.
 Mainnet uses `remainder = "burn"`; do not import the optional older
@@ -995,7 +1009,11 @@ See [key recovery](#as-the-v2-king-keep-your-key-funded-dec-ca-0055).
 individual qualification and waiting for a warm start earn nothing by
 themselves. Committed warm-start acceptance starts the slot's pay.
 There are currently **10 targets** (seven domains plus three horizons), so
-under the template each slot is **25% / 10 = 2.5% of total emissions**.
+under the template each slot is **25% / 10 = 2.5% of total emissions**, and
+at the launch split **35% / 10 = 3.5%**. Under the launch config no B slot is
+paid: committed acceptance needs a new shared init, which opens only at a
+lane A promotion, and promotions are off from block 9,586,800. Qualified
+updates wait as pending.
 A miner can hold several slots. A rejected
 update neither merges nor earns; a deferred update waits unpaid. Existing
 holders keep their remaining eligible pay while replacements are pending.
@@ -1005,7 +1023,8 @@ is unpaid. A later confirmation must win the target slot; passing below the
 holder's required bound does not earn that slot. C splits its pool by each
 competition's weight over **all configured competition weights**, then equally
 over that competition's target slots. With only MarketCast and its one composite
-target (`mkt:market`), its full-pay slot reserves **all 25% of total emissions**.
+target (`mkt:market`), its full-pay slot reserves **all of C's pool**: 25% of
+total emissions in the template, 15% at the launch split.
 That is a slot maximum, not a promise of paying an unfilled slot. Pending,
 unstarted or ended competitions do not donate their allocation to active ones.
 
@@ -1036,7 +1055,7 @@ holder stops the old holder earlier. At approximately 12 hours per mainnet
 era, 10 eras is approximately 5 days; blocks, not wall-clock estimates, govern.
 
 <!-- cascade:rewards:slot-decay:start -->
-B: a held slot pays 100% of its slot (2.5% of total emissions) every settlement, with no decay and no expiry, until a newer leg's merge passes acceptance on that slot. C has no decay: its slot pays 100% for its recorded full-pay duration, then ends.
+B (live launch split): a held slot pays 100% of its slot (3.5% of total emissions) every settlement, with no decay and no expiry, until a newer leg's merge passes acceptance on that slot. C has no decay: its slot pays 100% for its recorded full-pay duration, then ends.
 <!-- cascade:rewards:slot-decay:end -->
 
 **B slots pay until replaced.** A B slot holder is paid **100% of its slot
@@ -1074,8 +1093,8 @@ and `cascade lane-c commit` refuses new entries. The status page and
 `cascade round` expose each competition's weight, share, lifecycle state and
 start/end blocks; use these alongside the reward records.
 
-**Worked allocation example, not a measured payout.** All three lanes have
-launched; A's king has a 60%-of-A ladder share, its immediate former king is
+**Worked allocation example at the step 1 launch split (A 50 / B 35 / C 15),
+not a measured payout.** A's king has a 60%-of-A ladder share, its immediate former king is
 eligible, one B target and the MarketCast target (`mkt:market`) have full-pay
 holders, and all other B slots are empty:
 
@@ -1084,9 +1103,9 @@ holders, and all other B slots are empty:
 |---|---:|
 | A king | 30% |
 | Eligible immediate former king | 2.5% |
-| One full-pay B holder | 2.5% |
-| One full-pay C holder (mkt:market) | 25% |
-| Burn | 40% |
+| One full-pay B holder | 3.5% |
+| One full-pay C holder (mkt:market) | 15% |
+| Burn | 49% |
 <!-- cascade:rewards:worked-example:end -->
 
 The total is 100%. Burns combine A's unused ladder share, B's unused slots,

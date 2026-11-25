@@ -71,8 +71,9 @@ def add_lane_d_test(lsub) -> None:
                         "exported entry or the trained checkpoint).")
     t.add_argument("--king", type=Path, required=True,
                    help="The bar's checkpoint directory: the current KING_D, or before the "
-                        "first lane D crown the house (the lane A king). Kings are public "
-                        "(HF mirror tensorlink-dev/cascade-lane-d-kings).")
+                        "first lane D crown the house (the lane A king, BF16). Kings are public "
+                        "after a crown (HF mirror tensorlink-dev/cascade-lane-d-kings); the "
+                        "house is not published, and no command downloads either.")
     t.add_argument("--context", type=int, required=True,
                    help="Your declared context (one of [lane_d] contexts).")
     t.add_argument("--king-context", type=int, default=None,
@@ -84,7 +85,8 @@ def add_lane_d_test(lsub) -> None:
     src = t.add_argument_group("windows (one of)")
     src.add_argument("--pool-dir", type=Path, action="append", default=[],
                      help="A pool_d/1 snapshot directory (metadata.json, hist.npz, tgt.npz); "
-                          "repeat for older snapshots, newest last.")
+                          "repeat for older snapshots, newest last. No pool_d snapshot is "
+                          "published for miners: use --series for your own data.")
     src.add_argument("--series", type=Path, default=None,
                      help="Your own series: an .npz of 1-D (L,) or 2-D (C, L) arrays; the key "
                           "prefix before '/' is the source (the bootstrap cluster).")

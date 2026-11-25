@@ -66,6 +66,20 @@ cascade lane-d test ./my-trained-ckpt --king ./king --context 4096 \
 The result is directional. Your local windows are not the private live
 pool, and the bench gate, caps and queue run only live.
 
+**Where `--king` and `--pool-dir` come from.** No `cascade` command downloads either
+yet. Before the first lane D crown the bar is the house, a BF16 cast of the
+frozen lane A king (uid 164) that the operator builds and does not publish.
+After a crown, each king's checkpoint is published (HF dataset
+`tensorlink-dev/cascade-lane-d-kings`, indexed in the signed
+`champions/lane_d/index.json`). No `pool_d` snapshot is published for miners;
+preview on your own data with `--series S.npz`.
+
+**Scoring environments.** Validators score lane D only on an environment
+listed as `qualified` in `deploy/laned/scoring_envs.toml` and past its
+`from_block` (GPU model, torch build, driver range). Check it before you rely
+on a GPU or context; declarable contexts are `[lane_d] contexts` in
+`chain.toml`, each armed per settlement.
+
 ```bash
 cascade lane-d export ./my-trained-ckpt --out ./entry
 cascade lane-d verify ./entry
@@ -88,8 +102,9 @@ blocks, about 24 h) of `submit`, or the entry expires (`ready_expired`).
   one-sided lower confidence bound (LCB) at `alpha` = 0.05.
 - **Live windows.** Forward windows from the private live pool. A window is
   *fresh* when all its target data arrived after your entry, or *embargo*
-  when it was held back up to 48 h (`embargo_hours`) and released after your
-  entry. At least 20% of live windows are fresh (`min_fresh_window_share`).
+  when it was held back up to `embargo_hours` and released after your entry.
+  The launch overlay sets `embargo_hours` to 24 h (the template is 48 h; a
+  later overlay restores 48). At least 20% of live windows are fresh (`min_fresh_window_share`).
   Nobody, the operator included, had those targets when you submitted.
 - **Public windows (off at launch).** When an overlay raises
   `public_weight` above 0, each settlement also draws 5000 windows from each
