@@ -98,3 +98,12 @@ tests/unit/test_first_seen_record_memory.py
 # --mv-pack --max-panel-series-per-feed 20 (pinned against publish-pool.yml).
 cascade/laned/elastic.py
 deploy/laned/elastic.toml
+
+# Owner 2026-11-25 22:40 (option a): pool_d takes lane A's selection from the
+# sha-verified snapshot (--lane-a-selection snapshot, default); the replay is
+# opt-in. lane-a-pool keeps the verified tar + index ref for that check.
+cascade/pool/pool_d_select.py
+cascade/pool/pool_d_build.py
+cascade/laned/elastic.py
+tests/unit/test_pool_d_snapshot_selection.py
+docs/EVAL_POOL.md

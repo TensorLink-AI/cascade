@@ -327,7 +327,10 @@ def _cli(world, tmp_path, lane_a, out_name="cli"):
                  "--first-seen-dir", str(world["root"] / "first_seen"),
                  "--lane-a-pool", str(lane_a), "--out", str(tmp_path / out_name),
                  "--as-of-ts", str(AS2), "--prior-dir", str(world["d1"]),
-                 "--max-panel-series-per-feed", "5", "--evidence-out", str(ev)])
+                 "--max-panel-series-per-feed", "5", "--evidence-out", str(ev),
+                 # the replay guard; the W-LAUNCH default (snapshot) is pinned in
+                 # tests/accept/w_launch/test_w_launch_pool_d_snapshot.py
+                 "--lane-a-selection", "replay"])
     return rc, ev
 
 
