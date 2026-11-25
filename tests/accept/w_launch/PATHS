@@ -45,3 +45,14 @@ cascade/trainer/main.py
 cascade/trainer/rolling.py
 cascade/trainer/runner_promotion.py
 cascade/trainer/promotion.py
+
+# W-LAUNCH lane A shutdown (owner 2026-11-25, "lane A should shut down when
+# the other lanes start"): [round] lane_a_until_block (trainer + intake only,
+# never an overlay key, never a digest input). The intake refuses new lane A
+# funds 409 lane_ended and releases unstarted entries; the trainer seats no new
+# lane A challenger (in-flight legs, king leg, king-only settlements continue).
+cascade/shared/config/rounds.py
+cascade/shared/config/loader.py
+cascade/funding/lane_ends.py
+cascade/funding/intake.py
+cascade/funding/main.py

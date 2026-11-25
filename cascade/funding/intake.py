@@ -506,6 +506,7 @@ class FundingIntake:
         lane_b_hashset: object = _UNWIRED,        # WB13: the pinned WB11 hash set
         fetch_lane_b_repo: object = _UNWIRED,     # WB13: ref -> submitted tree
         lane_a_admission: Callable[[int | None], tuple[int, dict] | None] | None = None,
+        lane_a_until_block: int = 0,              # W-LAUNCH [round] lane_a_until_block
         pod_live: Callable[[str], bool] | None = None,
         on_withdrawn: Callable[[str], None] | None = None,
         lane_refresh: Callable[[FundingIntake], None] | None = None,
@@ -533,6 +534,15 @@ class FundingIntake:
         self.pod_live = pod_live
         self.direct_intake = direct_intake
         self.lane_a_admission = lane_a_admission
+        # W-LAUNCH lane A shutdown (``[round] lane_a_until_block``; 0 = off):
+        # once ``head_block()`` reaches it a new lane A fund (``/v1/fund``, a
+        # ``/v1/submit`` carrying a payer key) is refused 409 ``lane_ended``
+        # before the key is vaulted, and not yet started lane A entries are
+        # released (nothing charged; the vaulted key is left to its TTL — the
+        # king's own-key leg may share it). A plain ``/v1/submit`` (store
+        # only, no key) stays open: lane B legs may name a vault ref. The key
+        # rotation ``/v1/credentials`` (the king's own leg) is untouched.
+        self.lane_a_until_block = max(0, int(lane_a_until_block or 0))
         # DEC-CA-0059 item 8 lane B: the domain-expert funding queue + its
         # reveal oracle ``(hotkey, targets, ref) -> reveal block | None`` (the
         # hotkey's revealed ``metro-v1:expert:`` commitment must declare
@@ -650,6 +660,7 @@ class FundingIntake:
             self.vault.purge_expired()
         except Exception:  # noqa: BLE001 — purge is best-effort housekeeping
             log.exception("vault TTL purge failed (will retry next request)")
+        self._release_lane_a()
         try:
             def eligible(hotkey, ref):
                 block = self.resolve_reveal(hotkey, ref)
@@ -659,6 +670,41 @@ class FundingIntake:
         except Exception:  # noqa: BLE001 — sweep is best-effort by design
             log.exception("pending-reveal sweep failed (will retry next request)")
             return 0
+
+    def _lane_a_head(self) -> int | None:
+        """The chain head for the lane A cutoff, or None when no cutoff is set
+        (no chain read) or the head is unknown (admit)."""
+        return self._head() if self.lane_a_until_block > 0 else None
+
+    def _lane_a_ended(self) -> tuple[int, dict] | None:
+        """W-LAUNCH: the typed ``409 lane_ended`` refusing a new lane A fund
+        once ``[round] lane_a_until_block`` is reached, else None."""
+        from .lane_ends import lane_a_refusal
+
+        body = lane_a_refusal(self.lane_a_until_block, self._lane_a_head())
+        if body is None:
+            return None
+        log.info("lane-A fund refused: %s", body["message"])
+        return 409, body
+
+    def _release_lane_a(self) -> None:
+        """W-LAUNCH: release (fail, nothing charged) every not yet started
+        lane A entry once the cutoff is in force. In-flight legs are never
+        touched; keys stay vaulted until their TTL. Never raises."""
+        if self.lane_a_until_block <= 0:
+            return
+        from .lane_ends import lane_a_released_why
+
+        try:
+            head = self._lane_a_head()
+            why = lane_a_released_why(self.lane_a_until_block, head)
+            if why is None:
+                return
+            for hk in self.queue.release_unstarted(why):
+                log.warning("lane-A entry %s released at block %d: lane A ended at %d "
+                            "(not trained, nothing charged)", hk, head, self.lane_a_until_block)
+        except Exception:  # noqa: BLE001 — housekeeping never fails a request
+            log.exception("lane-A ended-lane release failed (retried next request)")
 
     # ── request handling (returns (http_status, body_dict)) ──────────────────
 
@@ -792,9 +838,14 @@ class FundingIntake:
         from .providers import header_credentials
 
         try:
-            header_credentials(headers)
+            funded = bool(header_credentials(headers))
         except ValueError as exc:
             return 400, {"code": "bad_provider_credentials", "message": str(exc)}
+        if funded:
+            # W-LAUNCH: a submit carrying a payer key funds a lane A leg
+            ended = self._lane_a_ended()
+            if ended is not None:
+                return ended
         hotkey = (headers.get("X-Miner-Hotkey") or "").strip()
         if not hotkey:
             return 400, {"code": "missing_hotkey",
@@ -944,6 +995,9 @@ class FundingIntake:
         from .gpu_choice import join_segments, parse_budget_header
 
         self.sweep_pending()
+        ended = self._lane_a_ended()      # W-LAUNCH: before the key is vaulted
+        if ended is not None:
+            return ended
         choice, segment, gpu_err = self._gpu_choice(headers)
         if gpu_err is not None:
             return 400, gpu_err

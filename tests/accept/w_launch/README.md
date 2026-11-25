@@ -66,3 +66,19 @@ read stays as a log-only cross-check. `test_w_launch_lane_a_king.py` pins:
 - first run, no receipt and no state: hold + alert;
 - receipt names the king: the king whatever the incentive says, and a run whose
   later receipts name no king publishes byte-identical manifests.
+
+Lane A shutdown (owner 2026-11-25, "lane A should shut down when the other
+lanes start"): `[round] lane_a_until_block` (0 = off; 9586800 on the
+operator's deployed chain.toml). It is trainer + intake policy only: it is not
+an overlay key, not in `_UNTIL_KEYS` and not a digest input, and no validator
+reads it. From that block:
+- the intake refuses a new lane A `/v1/fund` and a `/v1/submit` carrying a
+  payer key with `409 lane_ended` (`lane` = `"a"`) before the key is vaulted;
+- a plain `/v1/submit` (store only) stays open, because lane B legs may name a
+  vault ref;
+- not yet started lane A entries are released, with nothing charged; their keys
+  are left to the vault TTL;
+- the trainer seats no new lane A challenger. In-flight legs, the king leg and
+  king-only settlements continue.
+
+`test_w_launch_lane_a_cutoff.py` pins it.

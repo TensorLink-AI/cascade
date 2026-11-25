@@ -785,6 +785,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     lane_a_admission = None
     if cfg is not None and not args.trust_refs:
         lane_a_admission = ChainLaunchAdmission(cfg, client)
+    # W-LAUNCH lane A shutdown: [round] lane_a_until_block (0 = off). Needs
+    # the chain head (head_block): under --trust-refs there is none and the
+    # cutoff is inert (logged).
+    lane_a_until = int(getattr(cfg.round, "lane_a_until_block", 0) or 0) if cfg is not None else 0
+    if lane_a_until > 0:
+        log.info("lane A cutoff: from block %d new lane A funds (/v1/fund, funded "
+                 "/v1/submit) are refused 409 lane_ended ([round] lane_a_until_block)%s",
+                 lane_a_until, "" if head_block is not None
+                 else " — INERT: no chain head under --trust-refs")
 
     intake = FundingIntake(
         # Entry TTL tracks the key TTL by construction here; the trainer's
@@ -814,6 +823,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         lane_b_hashset=lane_b_hashset,
         fetch_lane_b_repo=fetch_lane_b_repo,
         lane_a_admission=lane_a_admission,
+        lane_a_until_block=lane_a_until,
         pod_live=ledger_pod_live(Path(args.queue_path).parent / "funded_pods.json"),
         on_withdrawn=withdrawn_clears_approvals(Path(args.queue_path)),
         lane_refresh=lanes,
