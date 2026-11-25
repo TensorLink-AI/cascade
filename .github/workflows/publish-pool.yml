@@ -24,9 +24,11 @@
 #   HF_TOKEN                                        HF write token for HF_EVAL_REPO's org
 #   (repo var HF_EVAL_REPO, default Tensor-Link/cascade-eval-pool) — RETIRED
 #   snapshot tars are mirrored here byte-identically (sha256-verified against
-#   pool/index.json, the same hash round receipts pin). Only snapshots already
-#   superseded by a newer active one are revealed (~48h lag), so a revealed
-#   pool can never be selected by a current or future round. Unset HF_TOKEN =>
+#   pool/index.json, the same hash round receipts pin). Only snapshots built
+#   at least [lane_d] embargo_hours (48 h) before the reveal are revealed
+#   (--keep-newest 20, see the reveal step), so a revealed pool can never be
+#   selected by a current or future round and never exposes forge points lane
+#   D still scores as embargoed. Unset HF_TOKEN =>
 #   the reveal step is skipped and only the private publish runs.
 # OPTIONAL repo variables:
 #   TSFORGE_BUCKET        forge raw-data bucket   (default: tsbench-forge-sources)
@@ -286,7 +288,7 @@ jobs:
       # block-8740800 = 3,356 series vs its rebuild = 3,442). The newest two
       # snapshots are withheld (pending + possibly-active), so a revealed pool
       # can never be selected by a current or future round. With hourly publishes
-      # and --round-buffer 2 the newest THREE are withheld (see --keep-newest).
+      # the newest TWENTY are withheld: lane D's 48 h embargo (see --keep-newest).
       # One snapshot per day (--newest-only), uploaded as ONE commit of the
       # exact tar + POOL_SHA256 + small sidecars — not thousands of per-series
       # .npy, whose presigned LFS URLs expired mid-commit (900 s) and failed
@@ -314,15 +316,27 @@ jobs:
           fi
           TOML=chain.toml
           [ "$NETWORK" = "testnet" ] && TOML=chain.testnet.toml
-          # --keep-newest 3: with --round-buffer 2 the index holds TWO pending
-          #   entries (next epoch, the one after) above the active one, so the
-          #   default 2 would reveal the snapshot being scored right now.
+          # --keep-newest 20 (2026-11-25; was 3 from #880): the reveal delay
+          #   must stay >= [lane_d] embargo_hours (48 h). Lane D scores forge
+          #   points first-seen inside the last 48 h as "embargoed" (not yet
+          #   public), and its series ARE lane A's (W6a join), so a lane A tar
+          #   revealed sooner hands miners those targets. Hourly publishes
+          #   fill every epoch boundary (900 blocks, at most one entry each),
+          #   so withholding K entries means: the revealed tar's effective
+          #   block E <= N - K*900, its bytes were built at head <= E, and the
+          #   reveal runs at head >= N - round_buffer*900 (N = newest entry).
+          #   Delay >= (K - round_buffer) * 900 blocks; 48 h = 14,400 blocks
+          #   => K >= 18. 20 keeps two epochs (6 h) of slack for block-time
+          #   drift. With 3 the delay was ~6-9 h (block 9579600, built ~19:30
+          #   UTC 11-24, went public 03:xx UTC 11-25). It also covers the
+          #   active + two pending entries (the old reason for 3). The
+          #   pinned bound is tests/unit/test_pool_publish_workflow.py.
           # --newest-only --max-reveal 1 (owner 2026-11-24, option b): reveal
           #   ONE snapshot per day — the newest retired one — so HF grows at
           #   the old daily rate. The other ~7 retirees of the day stay in the
           #   pool bucket only and are never backfilled.
           cascade-pool reveal --chain-toml "$TOML" --hf-repo "$HF_EVAL_REPO" \
-            --keep-newest 3 --newest-only --max-reveal 1
+            --keep-newest 20 --newest-only --max-reveal 1
           # DEC-CA-0056: the lane-C pool's retired snapshots, under pool_c/ in
           # the same dataset (inert until [lane_c] from_block is typed)
           if python -c "import sys; from cascade.shared.config import load_chain_config as l; sys.exit(0 if l('$TOML').lane_c.from_block else 1)"; then
