@@ -44,6 +44,13 @@ host (never the validator box); ``size`` reads Hugging Face metadata only.
         validator box); resumable (rerun the same command) and idempotent.
         Prints ``SHARD`` / ``DONE`` lines per folder and the ``INDEX`` line.
         Write keys by env NAME: ``HIPPIUS_S3_*`` / ``BACKUP_S3_*``.
+        Builder setup + run (pyarrow is in ``pool-forge``; huggingface_hub
+        and boto3 are in ``hippius``; unbuffered so the log is live):
+
+            uv sync --frozen --extra pool-forge --extra hippius
+            PYTHONUNBUFFERED=1 nohup .venv/bin/python -P \\
+                scripts/laned_public_mirror.py build --source S --work-dir DIR \\
+                --index-dir DIR --workers N > build.log 2>&1 &
 
     estimate --source S --work-dir DIR [--datasets a,b | --sample N] [--listing FILE]
         Builds sample folders WITHOUT uploading and prints ``ESTIMATE`` (the

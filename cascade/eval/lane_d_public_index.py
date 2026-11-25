@@ -331,12 +331,38 @@ def _open_arrow(path: Path):
 
 def _list_shape(col) -> tuple[np.ndarray, np.ndarray]:
     """Per row ``(n_channels, length)`` of a ``target`` column: list<float>
-    (one channel) or list<list<float>> (``C`` channels of equal length)."""
+    (one channel) or list<list<float>> (``C`` channels of equal length).
+
+    A chunked column is measured chunk by chunk and the per-chunk arrays
+    concatenated: ``combine_chunks()`` on the whole column overflows the
+    int32 list offsets of a large multivariate folder (GiftEvalPretrain
+    ``cmip6_1850``: C=53, 8192 series, L=7300 > 2**31 inner values), while
+    each record batch fits. The output is the same as measuring the
+    combined column, so the index bytes do not change."""
+    import pyarrow as pa
+
+    if not isinstance(col, pa.ChunkedArray):
+        return _list_shape_one(col, 0)
+    if col.num_chunks == 0:
+        return _list_shape_one(col.combine_chunks(), 0)
+    outs, lens, base = [], [], 0
+    for chunk in col.chunks:
+        o, n = _list_shape_one(chunk, base)
+        outs.append(o)
+        lens.append(n)
+        base += len(chunk)
+    return np.concatenate(outs), np.concatenate(lens)
+
+
+def _list_shape_one(col, row0: int) -> tuple[np.ndarray, np.ndarray]:
+    """:func:`_list_shape` of one (non-chunked) array; ``row0`` is its first
+    row's index in the whole column (error messages only)."""
     import pyarrow as pa
     import pyarrow.compute as pc
 
-    col = col.combine_chunks() if isinstance(col, pa.ChunkedArray) else col
     outer = pc.list_value_length(col).to_numpy(zero_copy_only=False).astype(np.int64)
+    if outer.size == 0:  # an empty record batch adds no rows
+        return outer, outer.copy()
     if not pa.types.is_list(col.type.value_type) and not pa.types.is_large_list(
             col.type.value_type):
         return np.ones_like(outer), outer
@@ -349,7 +375,7 @@ def _list_shape(col) -> tuple[np.ndarray, np.ndarray]:
             continue
         seg = inner[s:s + c]
         if seg.min() != seg.max():
-            raise ValueError(f"row {i}: channels of unequal length {sorted(set(seg.tolist()))}")
+            raise ValueError(f"row {row0 + i}: channels of unequal length {sorted(set(seg.tolist()))}")
         lengths[i] = seg[0]
     return outer, lengths
 

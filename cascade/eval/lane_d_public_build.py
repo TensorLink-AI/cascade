@@ -51,6 +51,14 @@ SCRATCH_DIR = "scratch"
 SHARD_WORK_DIR = "shards"
 
 
+def echo_line(*args, **kw) -> None:
+    """The builder's progress printer: ``print`` flushed per line, so a
+    ``nohup … > build.log`` log shows ``SHARD`` / ``DONE`` lines as they
+    happen instead of at exit (stdout to a file is block-buffered)."""
+    kw.setdefault("flush", True)
+    print(*args, **kw)
+
+
 # ---------------------------------------------------------------------------
 # Series extraction (what read_series returns, one file at a time)
 # ---------------------------------------------------------------------------
@@ -313,7 +321,7 @@ class Builder:
     def __init__(self, *, source: str, listing: Sequence[Mapping], work_dir, stores: Sequence,
                  fetch: Callable[[str, Path], None], prefix: str = pm.DEFAULT_PREFIX,
                  shard_target: int = pm.SHARD_TARGET_BYTES,
-                 rg_target: int = pm.ROW_GROUP_TARGET_BYTES, echo: Callable = print):
+                 rg_target: int = pm.ROW_GROUP_TARGET_BYTES, echo: Callable = echo_line):
         self.source = source
         self.listing = list(listing)
         self.work = Path(work_dir)

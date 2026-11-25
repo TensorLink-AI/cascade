@@ -98,7 +98,15 @@ change**: the streaming build writes the very `index.jsonl.gz` /
   `values_sha256`, its `series_id` and the index length.
 - Builder: per folder download → W6p index + file hashes → shards → upload
   → journal; resumable by shard, idempotent (`scripts/laned_public_mirror.py
-  build|estimate|fetch-index`).
+  build|estimate|fetch-index`). Builder venv: `uv sync --frozen --extra
+  pool-forge --extra hippius` (pyarrow; huggingface_hub + boto3); run with
+  `PYTHONUNBUFFERED=1` (progress lines are also flushed per line).
+- Large multivariate folders (GiftEvalPretrain `cmip6_1850`: C=53, 8192
+  series, L=7300) hold more than 2**31 inner values: the `target` column is
+  measured per record batch (never `combine_chunks()` on the whole column,
+  which overflows the int32 list offsets), with output identical to the
+  whole-column measure (`test_list_shape_survives_int32_offset_overflow`,
+  `test_list_shape_matches_the_whole_column_measure`).
 
 | Item | Test |
 |---|---|
