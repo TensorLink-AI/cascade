@@ -198,7 +198,7 @@ def test_w_launch_lane_d_embargo_is_24h_inside_the_bound(net):
     from cascade.shared.netconfig_bounds import BOUNDS
 
     base, b1, b2, _ = bodies(net)
-    assert overrides(PAIRS[net][2])["lane_d"]["embargo_hours"] == 24.0
+    assert overrides(PAIRS[net][2])["lane_d"].get("embargo_hours") == 24.0
     assert "lane_d" not in b1["overrides"]
     bound = BOUNDS[("lane_d", "embargo_hours")]
     assert bound.lo <= 24.0 <= bound.hi
