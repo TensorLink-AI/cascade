@@ -84,6 +84,16 @@ def _restart(cfg, tmp_path, ops, clock, *, challenger="", block=0):
     return sched
 
 
+def _pub(era) -> str:
+    """The king pointer the trainer recorded as published (#934 field)."""
+    return str(getattr(era, "king_pointer_published", None) or "")
+
+
+def _img(era) -> str:
+    """The image the era king leg was dispatched under (#934 field)."""
+    return str(getattr(era, "king_image", None) or "")
+
+
 def _walk(clock, ops, sched, client, last, n):
     """Tick ``n`` settlement intervals, a few ticks per interval."""
     from tests.unit.test_dec55_trainer_epochs import _join
@@ -100,12 +110,12 @@ def test_published_king_records_its_pointer_and_dispatch_image(tmp_path):
     sched, ops, clock, client, cfg, v2_block, _ = _setup(tmp_path)
     king, _ = _first_settlement(sched, ops, clock, client, v2_block)
     cur = sched.state.current
-    assert cur.king_pointer_published == king.trained_pointer
-    assert cur.king_image == IMG_X
+    assert _pub(cur) == king.trained_pointer
+    assert _img(cur) == IMG_X
     # persisted: a restart reads both back
     again = _restart(cfg, tmp_path, ops, clock)
-    assert again.state.current.king_pointer_published == king.trained_pointer
-    assert again.state.current.king_image == IMG_X
+    assert _pub(again.state.current) == king.trained_pointer
+    assert _img(again.state.current) == IMG_X
 
 
 def test_restart_mid_epoch_with_a_new_image_keeps_the_era_king_pointer(tmp_path):
@@ -173,7 +183,7 @@ def test_contract_change_takes_effect_at_the_next_seed_epoch(tmp_path):
     assert cur.index == first + 3 and cur.epoch_start == first + 3
     assert len(ops.king_calls) == kings + 1                      # one leg, new epoch
     assert cur.king().trained_pointer != king.trained_pointer
-    assert cur.king_image == IMG_Y                               # under the new pin
+    assert _img(cur) == IMG_Y                               # under the new pin
 
 
 def test_normal_rollover_carries_the_king_and_its_published_pointer(tmp_path):
@@ -188,8 +198,8 @@ def test_normal_rollover_carries_the_king_and_its_published_pointer(tmp_path):
         cur = sched.state.current
         assert cur.index == first + k
         assert cur.king().trained_pointer == king.trained_pointer
-        assert cur.king_pointer_published == king.trained_pointer
-        assert cur.king_image == IMG_X
+        assert _pub(cur) == king.trained_pointer
+        assert _img(cur) == IMG_X
     assert len(ops.king_calls) == kings
 
 
@@ -205,6 +215,8 @@ def test_unpublished_first_era_king_still_retrains_on_a_repin(tmp_path):
 
     _join(sched)
     cur = sched.state.current
-    assert cur.king() is not None and not cur.king_pointer_published
+    assert cur.king() is not None and not _pub(cur)
     assert not RollingScheduler._in_epoch_tail(cur)
-    assert not sched._era_king_fixed(cur, cur.king())
+    fixed = getattr(sched, "_era_king_fixed", None)
+    assert fixed is not None, "the #934 fixed-pointer predicate exists"
+    assert not fixed(cur, cur.king())
