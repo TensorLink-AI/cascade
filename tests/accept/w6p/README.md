@@ -105,8 +105,8 @@ change**: the streaming build writes the very `index.jsonl.gz` /
   series, L=7300) hold more than 2**31 inner values: the `target` column is
   measured per record batch (never `combine_chunks()` on the whole column,
   which overflows the int32 list offsets), with output identical to the
-  whole-column measure (`test_list_shape_survives_int32_offset_overflow`,
-  `test_list_shape_matches_the_whole_column_measure`).
+  whole-column measure (`test_list_shape_is_per_chunk_and_matches_the_whole_column_measure`,
+  `test_gift_index_is_overflow_safe_and_byte_identical`).
 
 | Item | Test |
 |---|---|

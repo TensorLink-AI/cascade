@@ -57,14 +57,17 @@ def _null_chunk(n_series: int, channels: int, length: int):
     return pa.FixedSizeListArray.from_arrays(inner, channels)
 
 
-def test_list_shape_survives_int32_offset_overflow():
+def _assert_overflow_column_measures():
+    """A column whose TOTAL inner values exceed int32 while each chunk fits:
+    ``combine_chunks()`` overflows (the pre-fix failure, reproduced); the
+    per-chunk measure must not."""
     C, L = 53, 7300
     n = 2**31 // (C * L) // 2 + 1          # > 2**30 inner values per chunk
     col = pa.chunked_array([_null_chunk(n, C, L), _null_chunk(n, C, L),
                             _null_chunk(3, C, 10)])
     assert sum(len(c.values.values) for c in col.chunks) > 2**31 - 1
     with pytest.raises(pa.ArrowInvalid, match="offset overflow"):
-        col.combine_chunks()                 # the pre-fix failure, reproduced
+        col.combine_chunks()
     try:
         ch, ln = _idx()._list_shape(col)
     except pa.ArrowInvalid as e:
@@ -83,7 +86,7 @@ def _chunked(values, ty, sizes):
     return pa.chunked_array(out, type=ty)
 
 
-@pytest.mark.parametrize("ty,values", [
+_CASES = [
     (pa.list_(pa.float32()), [[1.0] * k for k in (3, 0, 5, 2, 7, 1, 4)]),
     (pa.list_(pa.list_(pa.float32())),
      [[[1.0] * 4] * 3, [], [[2.0] * 6] * 2, [[0.5] * 1] * 5, [[1.0] * 9], [[3.0] * 2] * 2,
@@ -91,31 +94,34 @@ def _chunked(values, ty, sizes):
     (pa.list_(pa.list_(pa.float32()), 2),
      [[[1.0] * 4] * 2, [[2.0] * 6] * 2, [[0.5]] * 2, [[1.0] * 9] * 2, [[3.0] * 2] * 2,
       [[1.0] * 3] * 2, [[]] * 2]),
-])
-@pytest.mark.parametrize("sizes", [(7,), (3, 4), (1, 0, 2, 4), (0, 7, 0)])
-def test_list_shape_matches_the_whole_column_measure(ty, values, sizes):
+]
+_SIZES = [(7,), (3, 4), (1, 0, 2, 4), (0, 7, 0)]
+
+
+def test_list_shape_is_per_chunk_and_matches_the_whole_column_measure():
+    """Overflow-safe, and the same arrays as the pre-fix whole-column measure
+    on uni/multivariate/fixed-size columns over several chunkings (empty
+    batches included); a row error names the row in the whole column."""
+    _assert_overflow_column_measures()
     idx = _idx()
-    col = _chunked(values, ty, sizes)
-    want = _whole_column_shape(col)
-    got = idx._list_shape(col)
-    for w, g in zip(want, got, strict=True):
-        assert g.dtype == w.dtype and g.tolist() == w.tolist()
-    flat = idx._list_shape(col.combine_chunks())
-    for w, g in zip(want, flat, strict=True):
-        assert g.tolist() == w.tolist()
-
-
-def test_list_shape_reports_the_column_row_of_unequal_channels():
+    for ty, values in _CASES:
+        for sizes in _SIZES:
+            col = _chunked(values, ty, sizes)
+            want = _whole_column_shape(col)
+            for got in (idx._list_shape(col), idx._list_shape(col.combine_chunks())):
+                for w, g in zip(want, got, strict=True):
+                    assert g.dtype == w.dtype and g.tolist() == w.tolist(), (ty, sizes)
     ty = pa.list_(pa.list_(pa.float32()))
     col = _chunked([[[1.0] * 2] * 2, [[1.0] * 2] * 2, [[1.0], [1.0, 2.0]]], ty, (2, 1))
     with pytest.raises(ValueError, match=r"row 2: channels of unequal length \[1, 2\]"):
-        _idx()._list_shape(col)
+        idx._list_shape(col)
 
 
-def test_gift_index_bytes_match_the_whole_column_build(tmp_path, monkeypatch):
-    """The fixture mirror (arrow files of several record batches, uni- and
-    multivariate) indexes to the same bytes with the per-chunk measure as
-    with the pre-fix one."""
+def test_gift_index_is_overflow_safe_and_byte_identical(tmp_path, monkeypatch):
+    """The fix moves no index byte: the fixture mirror (arrow files of
+    several record batches, uni- and multivariate) indexes to the same
+    index + manifest bytes as with the pre-fix measure."""
+    _assert_overflow_column_measures()
     idx = _idx()
     root, ds = fx.gift_mirror(tmp_path)
     t = idx._open_arrow(root / "multi_traffic" / "data-00000-of-00001.arrow")
