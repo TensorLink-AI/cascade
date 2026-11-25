@@ -1,0 +1,41 @@
+# FALLBACK for lane D step 2. MAINNET (netuid 91). Owner 2026-11-24 22:30:
+# lane D goes live AT LAUNCH. Its step 2 is launch-20261125.mainnet.toml
+# ([lane_d] from_block = 9586800), published after step 1 and both at least
+# one era before 9586800. Use this file only if that step 2 cannot be
+# published in time (for example, the 2/3 upgrade gate is not met). It then
+# arms lane D at the next era instead.
+#
+# The body is launch-20261125.mainnet.toml's, with one difference: lane D's
+# from_block is the placeholder "next-era". The owner's publish tool resolves
+# it to the first era start at least one era past the head, and the validator
+# command receives the resolved file. Step 1's lane B / C keys are restated
+# byte-identically (the R3 lint's `non-lane-d` rule). Overlays are SNAPSHOTS,
+# so every later overlay must restate all of these keys, including the
+# resolved [lane_d] from_block.
+#
+# Dry run, with step 1 as the body in force (Approve-tier). The tool refuses it
+# below 2/3 of stake unless --force-upgrade-threshold is passed:
+#
+#   cascade-laned overlay publish --config chain.toml \
+#     --overrides deploy/overlays/lane-d-step2.mainnet.toml \
+#     --effective-block next-era --head-block <head> --previous <step 1 body.json> \
+#     --upgrade-metagraph <metagraph.json> --upgrade-notes <notes.json> \
+#     --upgrade-feature <release readiness segment>
+#
+# The expected plan shows LANE D: OFF -> ON and LANE A SHARE: 0.5 -> 0.0
+# (A 0 / B 35 / C 15 / D 50, lane D carved from lane A).
+
+[lane_b]
+from_block = 9586800
+share      = 0.35
+
+[lane_c]
+share      = 0.15
+takes_from = "lane_a"
+
+[lane_d]
+from_block    = "next-era"
+share         = 0.5
+takes_from    = "lane_a"
+# #894: lane D launches LIVE-ONLY (the verdict is the live half alone).
+public_weight = 0.0

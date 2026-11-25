@@ -3424,9 +3424,34 @@ that prefix (the trainer's Hippius S3 pair works).
    ```
 
    It prints the next `seq` / `prev`, the digest and its `cfg-<8 hex>` note
-   segment, the merged diff against `chain.toml`, and every check a
-   validator runs (allow-list, merged load checks, era start,
-   retroactivity), then `VALID` or `INVALID`.
+   segment, the overlay it is judged against (`judged against the config in
+   force`), every key whose effective value changes against that config,
+   lane on/off and share moves (`LANE D: ON -> OFF`, `LANE B SHARE: …`), the
+   merged diff against `chain.toml`, and every check a validator runs
+   (allow-list, merged load checks, era start, retroactivity), then `VALID`
+   or `INVALID`.
+
+   **The restate rule (#911).** Read the "changes vs the config in force"
+   block, not the `chain.toml` diff: an overlay replaces the one in force
+   whole, so a key it forgets reverts to `chain.toml`, and the `chain.toml`
+   diff does not show that. Such a line is marked `DROPPED`. After launch
+   step 2, every overlay must restate `[lane_d] from_block` (and the
+   `share` / `takes_from` of each lane you keep), including a lane B or lane C
+   kill. The tool refuses an overlay that turns off a lane the config in
+   force arms without setting one of that lane's switch keys (`from_block`,
+   `until_block`, `share`). To turn a lane off deliberately, set its
+   `until_block` (the kill switch), or pass `--netconfig-allow-lane-off`
+   (wrapper: `--allow-lane-off`).
+
+   **After a refused overlay.** Nodes keep the newest overlay that validates
+   in force. The next overlay still takes `seq` / `prev` from the latest
+   published body (a reused seq is refused as a fork), but its checks are
+   judged against the body in force. By default this is the newest published
+   body that validates on this `chain.toml`, and each newer body that was
+   skipped is printed as a `WARNING`. To name the body in force explicitly,
+   pass `--netconfig-in-force-seq N` (`0` means `chain.toml` alone). Do that
+   when a body was adopted under an older release and this release refuses it
+   (#891).
 4. Publish with the owner wallet:
 
    ```bash
@@ -3447,6 +3472,56 @@ that prefix (the trainer's Hippius S3 pair works).
 The trainer runs the same resolver read-only (`netconfig_state.json` in its
 work root). It never signals, and it switches its rolling scheduler and
 promotion engine to the overlay at the same block.
+
+#### Mainnet launch runbook: lanes B, C and D live at 9586800
+
+Owner decision (2026-11-24, 22:30): lane D goes live at the launch block
+9586800, together with lanes B and C. Publish two overlays, both at least
+one era (3600 blocks) before 9586800:
+
+1. **Step 1: `deploy/overlays/launch-20261125.pre.mainnet.toml`.** This
+   overlay carries every non-lane-D key and splits emission
+   A 50 / B 35 / C 15.
+2. **Step 2: `deploy/overlays/launch-20261125.mainnet.toml`.** This overlay
+   restates step 1 and arms lane D: `from_block = 9586800`, share 0.5 taken
+   from lane A, `public_weight = 0.0`. The resulting split is
+   A 0 / B 35 / C 15 / D 50.
+
+   Before you publish step 2, check that at least 2/3 of eligible validator
+   stake signals the release with the #913 satellite fix in its readiness
+   note. Use the wrapper with step 1 as `--previous` (and as the overlay in
+   force):
+
+   ```bash
+   cascade-laned overlay publish --config chain.toml \
+       --overrides deploy/overlays/launch-20261125.mainnet.toml \
+       --effective-block 9586800 --head-block <head> --previous <step 1 body.json> \
+       --upgrade-metagraph <metagraph.json> --upgrade-notes <notes.json> \
+       --upgrade-feature <the #913 release's readiness segment>
+   ```
+
+   The plan must show `LANE D: OFF -> ON` and
+   `LANE A SHARE: 0.5 -> 0.0 (from settlement …)`. The `UPGRADE` line prints
+   the stake share (computed with `cascade.laned.upgrade_tracker`).
+
+   The tool refuses any overlay that arms lane D below 2/3. Without tracker
+   inputs the share is unknown, and the overlay is also refused.
+   `--force-upgrade-threshold` overrides the refusal. That override is an
+   owner decision, so record it in the OPSLOG.
+3. **Fallback if step 2 misses the launch** (gate not met, or less than one
+   era left): publish `deploy/overlays/lane-d-step2.mainnet.toml` once the
+   gate passes. It carries the same body with `[lane_d] from_block =
+   "next-era"`. With `--effective-block next-era --head-block <head>`, the
+   tool resolves that placeholder to the first era start at least one era
+   past the head. It writes the resolved overrides to `--resolved-out`, and
+   the printed validator command uses that file.
+4. Every later overlay restates `[lane_d] from_block`: `9586800`, or the
+   resolved fallback block. See the restate rule above.
+
+Testnet rehearses the same flow with `launch-20261125.{pre.,}testnet.toml`
+and the fallback `lane-d-step2.testnet.toml`. The gate exists only in this
+wrapper. `cascade-validator --netconfig-overlay` does not read the tracker,
+so always publish step 2 through the wrapper.
 
 #### `cascade-laned overlay`: lane D bring-up kit (S0c)
 
@@ -3469,8 +3544,17 @@ and a base whose `[round]` drifted from the grid is refused. Output goes to
 `--out` as `body.json` and `overrides.toml`.
 
 `publish` is the Approve-tier wrapper around step 4. By default it is a dry
-run. It prints the SEQ, PREV, DIGEST, NOTE, DIFF and CHECK lines, the exact
-validator publish command and a CONFIRM token. Show that output to the owner.
+run. It prints the SEQ, PREV, DIGEST, NOTE, IN_FORCE, CHANGE, LANE, DIFF and
+CHECK lines, the exact validator publish command and a CONFIRM token. CHANGE
+lines are effective changes against the body in force, and dropped
+restatements are marked `DROPPED`. LANE lines show lane on/off and share
+moves. DIFF lines are against `chain.toml` as typed. `--previous` is the
+latest published body. If nodes refused it, the plan is refused until you
+pass `--in-force` with the body they kept, which is the newest one that
+validates. `seq` / `prev` still follow `--previous`, and the printed command
+carries `--netconfig-in-force-seq`. An overlay that implicitly turns off a
+lane the body in force arms is refused unless you pass `--allow-lane-off`
+(see the restate rule above). Show that output to the owner.
 Only after approval, rerun with the same arguments plus `--execute` and
 `--confirm` set to that token. The wrapper then runs the printed command,
 and `cascade-validator` signs with the owner wallet. A refused plan gets no

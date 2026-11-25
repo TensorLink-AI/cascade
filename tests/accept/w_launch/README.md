@@ -24,3 +24,22 @@ the shipped files. On a base without this change they fail with
 it and that the lane D judge (`_public_half`) and inputs source (`_public`)
 need no public index, eval-host public scores or block hash at 0 (at 0.5 the
 same calls fail closed).
+
+Owner 2026-11-24 22:30: lane D goes live at launch. Step 1 and then step 2
+(`launch-20261125.*`, `[lane_d] from_block = 9586800`) are both published at
+least one era before the launch. Step 2 must clear a gate: at least 2/3 of
+stake signals the #913 release (`upgrade_tracker`). The gate is enforced by
+`cascade-laned overlay publish` whenever an overlay turns LANE D OFF -> ON,
+and `--force-upgrade-threshold` overrides it.
+
+`deploy/overlays/lane-d-step2.{mainnet,testnet}.toml` is the fallback for a
+step 2 that misses the launch. It is the same body with `[lane_d] from_block =
+"next-era"`, which `--effective-block next-era --head-block H` resolves to the
+first era start at least one era past H.
+
+`test_w_launch_deferred_step2.py` pins:
+- both bodies;
+- the gate on the launch step 2 and on the fallback;
+- the plan lines `LANE D: OFF -> ON` and `LANE A SHARE: 0.5 -> 0.0`;
+- the resolution;
+- the R3 lint on the resolved fallback.

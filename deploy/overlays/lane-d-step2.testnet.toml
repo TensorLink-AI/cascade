@@ -1,0 +1,23 @@
+# FALLBACK for lane D step 2. TESTNET (netuid 259); the rehearsal of
+# lane-d-step2.mainnet.toml. At the launch, step 2 is
+# launch-20261125.testnet.toml. Use this file only if that step 2 misses the
+# launch (for example, the 2/3 upgrade gate is not met). It then arms lane D
+# at the next era instead.
+#
+# The body is launch-20261125.testnet.toml's with [lane_d] from_block =
+# "next-era". `cascade-laned overlay publish --effective-block next-era
+# --head-block <head>` resolves it to the first era start at least one era
+# (600 blocks) past the head. Step 1's keys are restated byte-identically.
+
+[lane_b]
+share = 0.35
+
+[lane_c]
+share      = 0.15
+takes_from = "lane_a"
+
+[lane_d]
+from_block    = "next-era"
+share         = 0.5
+takes_from    = "lane_a"
+public_weight = 0.0
