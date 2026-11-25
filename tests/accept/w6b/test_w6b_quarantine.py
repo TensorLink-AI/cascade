@@ -131,8 +131,10 @@ def test_no_quarantine_keys_when_nothing_is_skipped(tmp_path):
     log.commit(now_ts=AS1)
     _summary, selection = sel.build_pool_with_selection(
         [forge_source(root)], tmp_path / "pool", CTX_A, LANE_A_CFG, fetch=no_fetch)
-    b.build_pool_d(forge_dir=root, selection=selection, first_seen_dir=root / "first_seen",
-                   as_of_ts=AS1, out_dir=tmp_path / "d1")
+    s = b.build_pool_d(forge_dir=root, selection=selection, first_seen_dir=root / "first_seen",
+                       as_of_ts=AS1, out_dir=tmp_path / "d1")
     m = meta(tmp_path / "d1")
     assert "quarantine" not in m and "unreadable_partitions" not in m
     assert by_id(m)
+    # the summary always reports both lists (empty here)
+    assert getattr(s, "quarantine", None) == [] and getattr(s, "unreadable", None) == []
