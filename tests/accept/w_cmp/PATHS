@@ -42,3 +42,5 @@ tests/unit/test_marketcast_trainer.py
 tests/unit/test_lane_c_config.py
 tests/unit/test_marketcast_paths.py
 tests/unit/test_marketcast_flex_recipe.py
+# #908: the offload lease heartbeat (the request stays fresh for the whole run).
+cascade/validator/mkt_offload.py

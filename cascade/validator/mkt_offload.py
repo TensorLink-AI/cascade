@@ -94,7 +94,9 @@ class MktLease:
         if not force and now - self._touched < TOUCH_EVERY_S:
             return
         self.request.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.request.with_name(self.request.name + f".tmp.{os.getpid()}")
+        # per thread: the #908 heartbeat thread and the round loop both touch
+        tmp = self.request.with_name(
+            self.request.name + f".tmp.{os.getpid()}.{threading.get_ident()}")
         tmp.write_text(f'{{"round_id": "{rid}", "pid": {os.getpid()}}}\n', encoding="utf-8")
         tmp.replace(self.request)
         self._touched = now
