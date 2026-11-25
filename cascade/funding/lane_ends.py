@@ -19,6 +19,11 @@ at chain head ``h`` settles at the earliest at the first boundary after
   ``weight``) is 0 in the config in force — a paused lane can resume — but
   says so in the reply (:func:`pay_warning`).
 
+W-LAUNCH adds lane A's own cutoff, ``[round] lane_a_until_block`` (trainer +
+intake policy, never an overlay key): :func:`lane_a_refusal` refuses a new
+lane A fund with the same ``409 lane_ended`` (``lane`` = ``"a"``) and
+:func:`lane_a_released_why` releases its not yet started entries.
+
 Pure functions of the config in force (``EffectiveLanes`` view) and the head
 block: no chain read, no consensus input. Nothing has ended (every
 ``until_block`` 0 or still ahead) ⇒ every function here is a no-op.
@@ -39,6 +44,43 @@ def end_block(cfg, head: int | None) -> int | None:
     if until > 0 and int(head) >= until:
         return until
     return None
+
+
+def lane_a_end_block(until_block: int | None, head: int | None) -> int | None:
+    """W-LAUNCH: ``[round] lane_a_until_block`` when it is set and ``head``
+    has reached it, else None (open, no cutoff, or the head unknown)."""
+    until = int(until_block or 0)
+    if until > 0 and head is not None and int(head) >= until:
+        return until
+    return None
+
+
+def lane_a_refusal(until_block: int | None, head: int | None) -> dict | None:
+    """W-LAUNCH (owner 2026-11-25, "lane A should shut down when the other
+    lanes start"): the typed 409 body refusing a new lane A fund (``/v1/fund``
+    or a funded ``/v1/submit``) once the head reached ``[round]
+    lane_a_until_block``, else None (admit). Same ``lane_ended`` shape as the
+    lane B / C kill switches, ``lane`` = ``"a"``. Trainer + intake policy: no
+    overlay key, no consensus input."""
+    until = lane_a_end_block(until_block, head)
+    if until is None:
+        return None
+    return {"code": LANE_ENDED, "lane": "a", "until_block": int(until), "block": int(head),  # type: ignore[arg-type]
+            "message": f"lane A ended at block {until} ([round] lane_a_until_block; head "
+                       f"{head}): no new lane A funds are admitted — nothing was queued, "
+                       "your key was not kept. Lanes B, C and D are open."}
+
+
+def lane_a_released_why(until_block: int | None, head: int | None):
+    """``why(entry)`` for :meth:`FundedQueue.release_unstarted`: every not yet
+    started lane A entry is released once the cutoff is in force (no pod was
+    rented, nothing charged), else None (keep it)."""
+    until = lane_a_end_block(until_block, head)
+    if until is None:
+        return None
+    reason = (f"lane A ended at block {until}: released before training — no pod "
+              "rented, nothing charged (not the miner's fault)", LANE_ENDED)
+    return lambda entry: reason
 
 
 def _lane_refusal(lane: str, until: int, head: int) -> dict:
@@ -133,5 +175,5 @@ def release_ended(lane: str, queue, cfg, head: int | None) -> list[str]:
     return queue.release_unstarted(lambda e: _released_why(lane, cfg, h, e))
 
 
-__all__ = ["COMPETITION_ENDED", "LANE_ENDED", "end_block", "fund_refusal", "pay_warning",
-           "release_ended"]
+__all__ = ["COMPETITION_ENDED", "LANE_ENDED", "end_block", "fund_refusal", "lane_a_end_block",
+           "lane_a_refusal", "lane_a_released_why", "pay_warning", "release_ended"]

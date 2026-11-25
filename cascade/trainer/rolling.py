@@ -916,6 +916,14 @@ class RollingScheduler:
         self.lane_b = getattr(runner, "lane_b_driver", None)
         # DEC-CA-0056 lane-C driver (None = lane C not wired in this process)
         self.lane_c = getattr(runner, "lane_c_driver", None)
+        # W-LAUNCH lane A shutdown ([round] lane_a_until_block): the block the
+        # cutoff was last logged in force at (one INFO line, not one per tick)
+        self._lane_a_ended_logged: int | None = None
+        until = int(getattr(self.cfg.round, "lane_a_until_block", 0) or 0)
+        if until > 0:
+            log.info("rolling: lane A cutoff configured — from block %d no new lane A "
+                     "challenger leg is seated ([round] lane_a_until_block); in-flight "
+                     "legs, the king leg and king-only settlements continue", until)
 
     # ── persistence ──────────────────────────────────────────────────────────
 
@@ -2476,6 +2484,12 @@ class RollingScheduler:
         if floor:
             queue.rebase_preopening_reveals(floor, lambda hk, ref: self._reveal_block(history, hk, ref, block))
         queue.expire_stale()
+        if self._lane_a_ended(block):
+            # W-LAUNCH: lane A is shut down — seat nothing new. In-flight legs
+            # (their threads, reattach, settlement) are never touched here, and
+            # pregen builds nothing for entries that will never train.
+            self._intake_history = None
+            return
         cap = int(self.cfg.round.funded_field_cap or 0) or max(1, int(self.cfg.round.finalist_cap))
         in_flight = len(queue.in_flight())
         burned = self.ops.burned(block)
@@ -2589,6 +2603,22 @@ class RollingScheduler:
             self._launch_leg(gen, era, block, adm.target_boundary, entry.label)
         if held:
             queue.touch(held)
+
+    def _lane_a_ended(self, block: int) -> bool:
+        """W-LAUNCH: whether ``[round] lane_a_until_block`` is reached at
+        ``block`` (no new lane A challenger is seated). Logs one INFO line the
+        first time the cutoff is seen in force (again after a config change)."""
+        rnd = self.cfg.round
+        until = rnd.lane_a_ended_at(block) if hasattr(rnd, "lane_a_ended_at") else None
+        if until is None:
+            return False
+        if self._lane_a_ended_logged != until:
+            self._lane_a_ended_logged = until
+            log.info("rolling: lane A cutoff IN FORCE at block %d ([round] "
+                     "lane_a_until_block = %d): no new lane A challenger is seated; "
+                     "in-flight legs run to their verdict, the king leg and king-only "
+                     "settlements continue", int(block), until)
+        return True
 
     # ── corpus pre-generation ────────────────────────────────────────────────
 

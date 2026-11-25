@@ -619,6 +619,7 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
             funded_bench_margin_seconds=max(0, int(r.get("funded_bench_margin_seconds", 0) or 0)),
             blocked_hotkeys=tuple(str(x) for x in r.get("blocked_hotkeys", ()) or ()),
             blocked_from_block=max(0, int(r.get("blocked_from_block", 0) or 0)),
+            lane_a_until_block=max(0, int(r.get("lane_a_until_block", 0) or 0)),
             one_submission_per_hotkey=bool(r.get("one_submission_per_hotkey", True)),
             commit_floor_block=int(r.get("commit_floor_block", 0)),
             submissions_db_path=str(r.get("submissions_db_path", "trainer_submissions.json")),

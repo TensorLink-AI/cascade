@@ -82,6 +82,15 @@ class RoundConfig:
     # (0 = immediately once the list is non-empty). Their legs never rent a pod.
     blocked_hotkeys: tuple[str, ...] = ()
     blocked_from_block: int = 0
+    # W-LAUNCH lane A shutdown (owner 2026-11-25, "lane A should shut down
+    # when the other lanes start"): from this block the trainer seats NO new
+    # lane A challenger leg and cascade-intake refuses new lane A funds
+    # (``/v1/fund``, a funded ``/v1/submit``) with a typed 409 ``lane_ended``.
+    # Legs already in flight run to their verdict; the era king's leg, the
+    # king-only settlements and every lane B / C / D path are untouched.
+    # Trainer + intake policy only: NOT overlay-settable, NOT in any digest,
+    # never read by a validator. 0 = off (no cutoff).
+    lane_a_until_block: int = 0
     # Anti-spam: 1 hotkey = 1 submission (lifetime). A hotkey whose leg
     # settled (or whose submission was refused for its own fault) must
     # re-register — a new UID, paying the registration cost — to resubmit, so
@@ -573,6 +582,15 @@ class RoundConfig:
         if gate > 0 and (block is None or int(block) < gate):
             return frozenset()
         return frozenset(self.blocked_hotkeys)
+
+    def lane_a_ended_at(self, block: int | None) -> int | None:
+        """``lane_a_until_block`` when it is set and ``block`` has reached it
+        (no new lane A challenger is seated or funded), else None (open, no
+        cutoff, or the block unknown)."""
+        until = int(self.lane_a_until_block or 0)
+        if until > 0 and block is not None and int(block) >= until:
+            return until
+        return None
 
 
 
