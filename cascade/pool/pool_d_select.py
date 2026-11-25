@@ -32,6 +32,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from collections import Counter
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
@@ -210,6 +211,97 @@ def select_pool_d(
     return PoolDSelection(series=tuple(chosen), refused=tuple(sorted(refused)))
 
 
+_SUFFIX = re.compile(r"^(?P<base>.+)-(?P<n>[0-9]+)$")
+
+
+def select_from_snapshot(pool_dir: Path | str) -> PoolDSelection:
+    """The joined selection read from an unpacked lane A snapshot itself
+    (``metadata.json`` + ``*.npy`` + ``provenance.json``), with no harvest.
+
+    Owner 2026-11-25 (W-LAUNCH): hourly lane A snapshots are built from a
+    same-day forge that keeps growing, so a byte-identical replay from a later
+    mirror is impossible; the sha-checked snapshot is the authority for WHICH
+    series lane A selected. Each record maps to the join key a replay of the
+    same snapshot would give it:
+
+    * feed = ``catalog_source`` (``source`` under ``cluster_by = "source"``);
+      none => ``no_source``;
+    * base = the emitted id minus ``collect_records``' collision suffix. A
+      suffix exists only when two SELECTED records shared a base, so every
+      member of such a group (``X``, ``X-2``, …) is ``key_collision``, as the
+      replay refuses it. A collision the snapshot cannot show (only one of
+      the colliding harvested series was selected) is refused by
+      :func:`~cascade.pool.pool_d_build.build_pool_d`, which sees every panel
+      row of the feed;
+    * ``ambiguous_record`` is a content-hash join artefact: the emitted id
+      names the identity lane A kept, so snapshot mode never needs it;
+    * ``id_collision`` exactly as :func:`select_pool_d`.
+
+    ``attrs`` carries only what the snapshot records (``dgp_class``,
+    ``source_family``), so ``selection.sha256()`` differs from a replay's.
+    """
+    import numpy as np
+
+    d = Path(pool_dir)
+    meta = json.loads((d / "metadata.json").read_text(encoding="utf-8"))
+    prov = json.loads((d / "provenance.json").read_text(encoding="utf-8"))
+    cluster_by = str((prov.get("config") or {}).get("cluster_by", "source"))
+    ids = set(meta)
+
+    def feed_of(md: dict) -> str:
+        feed = md.get("catalog_source")
+        if not feed and cluster_by == "source":
+            feed = md.get("source")
+        return str(feed or "")
+
+    base_of: dict[str, str] = {}
+    group: Counter = Counter()
+    for sid in sorted(ids):
+        m = _SUFFIX.match(sid)
+        base = sid
+        if m and int(m.group("n")) >= 2 and m.group("base") in ids \
+                and feed_of(meta[m.group("base")]) == feed_of(meta[sid]):
+            base = m.group("base")
+        base_of[sid] = base
+        group[(feed_of(meta[sid]), base)] += 1
+
+    chosen: list[SelectedSeries] = []
+    refused: list[tuple[str, str]] = []
+
+    def refuse(sid: str, reason: str, detail: str) -> None:
+        refused.append((sid, reason))
+        log.warning("pool_d_join_refused %s: %s (%s)", sid, reason, detail)
+
+    for sid in sorted(ids):
+        md = meta[sid]
+        feed = feed_of(md)
+        if not feed:
+            refuse(sid, "no_source", "the snapshot records no source for it")
+            continue
+        base = base_of[sid]
+        if group[(feed, base)] > 1:
+            refuse(sid, "key_collision",
+                   f"{group[(feed, base)]} series of source {feed!r} share key {base!r}")
+            continue
+        shape = np.load(d / f"{sid}.npy", mmap_mode="r", allow_pickle=False).shape
+        n_ch = int(shape[0]) if len(shape) == 2 else 1
+        attrs = {k: md[k] for k in ("dgp_class", "source_family") if md.get(k)}
+        for c in range(n_ch):
+            key = (feed, base, c)
+            chosen.append(SelectedSeries(
+                key=key, pool_series_id=sid, pool_d_series_id=pool_d_series_id(key),
+                feed=feed, cluster=str(md.get("source") or sid), channel=c, n_channels=n_ch,
+                freq=str(md.get("freq")), domain=str(md.get("domain")), attrs=attrs))
+
+    n_ids = Counter(s.pool_d_series_id for s in chosen)
+    clashing = {s.pool_series_id for s in chosen if n_ids[s.pool_d_series_id] > 1}
+    for sid in sorted(clashing):
+        refuse(sid, "id_collision", "its pool_d series id is not unique")
+    chosen = [s for s in chosen if s.pool_series_id not in clashing]
+    chosen.sort(key=lambda s: s.pool_d_series_id)
+    return PoolDSelection(series=tuple(chosen), refused=tuple(sorted(refused)))
+
+
 @dataclass
 class _Replay:
     """One source's already-harvested series, re-yielded in harvest order."""
@@ -266,5 +358,6 @@ __all__ = [
     "collect_with_selection",
     "join_key",
     "pool_d_series_id",
+    "select_from_snapshot",
     "select_pool_d",
 ]

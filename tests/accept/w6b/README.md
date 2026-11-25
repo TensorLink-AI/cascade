@@ -99,16 +99,41 @@ above `embargo_hours_global` or non-zero on a `publish_ahead` feed, a
 python -P -m cascade.pool.pool_d_build --forge-dir D --first-seen-dir L \
     --lane-a-pool P --out OUT --as-of-ts T [--prior-dir PRIOR ...] \
     [--max-panel-series-per-feed 5] [--mv-pack] [--chain-toml chain.toml] \
-    [--evidence-out evidence/w6b.json]
+    [--evidence-out evidence/w6b.json] [--lane-a-selection snapshot|replay] [--lane-a-ref REF]
 ```
 
 `--lane-a-pool` is an unpacked lane A snapshot (its `metadata.json`,
-`*.npy` and `provenance.json`). The CLI rebuilds lane A from the same forge
-mirror with that snapshot's recorded `PoolBuildConfig` (and `as_of`), using
-W6a's `collect_with_selection`, and refuses (exit 3, message contains
-`lane_a_replay_mismatch`) unless the rebuilt `metadata.json` and every
-`*.npy` are byte-identical to `--lane-a-pool`. Only then is the W6a selection
-used to build `pool_d`.
+`*.npy` and `provenance.json`). How the selection is taken from it is
+`--lane-a-selection`:
+
+- `snapshot` (the default since W-LAUNCH, owner 2026-11-25). Hourly lane A
+  snapshots are built from a same-day forge that keeps growing, so a later
+  mirror cannot rebuild them byte for byte. The live replay of 9587700
+  differed in 2902 files. Instead, `cascade-laned elastic lane-a-pool`
+  keeps the tar it verified against the index (`<pool>.tar`) and the entry
+  (`<pool>.ref.json`: `effective_block`, `sha256`, `key`, `tar`). The CLI
+  re-checks that the tar's sha256 equals the index sha256 and that the
+  unpacked files equal the tar's. It refuses (exit 3,
+  `lane_a_snapshot_refused`) on any mismatch, a missing ref or an
+  unreadable snapshot. `pool_d_select.select_from_snapshot` then selects
+  exactly the snapshot's records, with the join keys a replay would give
+  them: `key_collision` for collision-suffixed groups (`X`, `X-2`, …) and
+  `no_source`, `id_collision` as in W6a. `build_pool_d` also refuses
+  (`key_collision`) a base that two panel rows of one feed share. That is
+  the harvest-level collision the snapshot cannot show. `ambiguous_record`
+  is a content-hash join artefact that does not arise because the emitted
+  id names the kept identity. The pool_d `metadata.json` gains
+  `lane_a_selection: {"mode": "snapshot", "effective_block", "sha256"}`,
+  and `selection_sha256` differs from a replay's because `attrs` carries
+  only `dgp_class` / `source_family`. Pinned by
+  `tests/accept/w_launch/test_w_launch_pool_d_snapshot.py` and
+  `tests/unit/test_pool_d_snapshot_selection.py`.
+- `replay` (opt in). The CLI rebuilds lane A from the forge mirror with the
+  snapshot's recorded `PoolBuildConfig` (and `as_of`) plus the publish flags
+  that `provenance.json` does not record (`--mv-pack`,
+  `--max-panel-series-per-feed`), using W6a's `collect_with_selection`. It
+  refuses (exit 3, `lane_a_replay_mismatch`) unless the rebuilt
+  `metadata.json` and every `*.npy` are byte-identical to `--lane-a-pool`.
 
 `--evidence-out` writes `{"schema": "laned-evidence/w6b/1", "wp": "W6b",
 "source": "builder", "generated_by": "cascade.pool.pool_d_build", "host",

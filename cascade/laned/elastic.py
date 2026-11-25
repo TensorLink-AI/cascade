@@ -1051,7 +1051,7 @@ def builder_run_script(b: BuilderConfig, *, as_of_ts: int, now_ts: int, started_
         "set -euo pipefail",
         f"cd {q(b.workdir)}",
         f"set -a; . {q(b.remote_env_file)}; set +a",
-        f"rm -rf -- {q(lanea)} {q(out)}",
+        f"rm -rf -- {q(lanea)} {q(lanea + '.tar')} {q(lanea + '.ref.json')} {q(out)}",
         f".venv/bin/cascade-laned elastic lane-a-pool --chain-toml chain.toml --out {q(lanea)}",
         f"{py} cascade.pool.first_seen record --forge-dir {q(b.forge_dir)} "
         f"--log-dir {q(fs)} --now-ts {int(now_ts)}",
@@ -1334,9 +1334,19 @@ def select_lane_a_snapshot(index: Sequence):
 
 
 def lane_a_pool(chain_toml: Path, out: Path) -> dict:
-    """Fetch the newest real lane A pool snapshot (sha-checked) for W6b's replay."""
+    """Fetch the newest real lane A pool snapshot (sha-checked against the
+    index) for W6b. Besides the unpacked ``out`` it keeps the verified tar
+    (``<out>.tar``) and the index entry it resolved (``<out>.ref.json``), which
+    ``pool_d_build``'s default snapshot mode re-verifies before it takes the
+    selection from the snapshot."""
     from ..shared.config import load_chain_config
-    from ..shared.hippius import fetch_pool_snapshot, pool_s3_store, read_pool_index
+    from ..shared.hippius import (
+        StorageError,
+        pool_s3_store,
+        read_pool_index,
+        tar_cid_digest,
+        unpack_tar_to_dir,
+    )
 
     cfg = load_chain_config(chain_toml)
     store = pool_s3_store(cfg.storage)
@@ -1344,7 +1354,18 @@ def lane_a_pool(chain_toml: Path, out: Path) -> dict:
     if not index:
         raise ElasticError("usage", "lane A pool index is empty")
     meta = select_lane_a_snapshot(index)
-    fetch_pool_snapshot(store, meta, out)
+    data = store.get_bytes(meta.key)
+    got = tar_cid_digest(data)
+    if got != meta.sha256:
+        raise StorageError(f"pool_snapshot_digest_mismatch: {got} != {meta.sha256}")
+    unpack_tar_to_dir(data, out)
+    out = Path(out)
+    tar = out.with_name(out.name + ".tar")
+    tar.write_bytes(data)
+    ref = {"effective_block": int(meta.effective_block), "sha256": meta.sha256,
+           "key": meta.key, "tar": tar.name}
+    out.with_name(out.name + ".ref.json").write_text(
+        json.dumps(ref, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return {"effective_block": meta.effective_block, "sha256": meta.sha256, "out": str(out)}
 
 
