@@ -34,6 +34,7 @@ import selectors
 import shlex
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -93,7 +94,9 @@ class MktLease:
         if not force and now - self._touched < TOUCH_EVERY_S:
             return
         self.request.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.request.with_name(self.request.name + f".tmp.{os.getpid()}")
+        # per thread: the #908 heartbeat thread and the round loop both touch
+        tmp = self.request.with_name(
+            self.request.name + f".tmp.{os.getpid()}.{threading.get_ident()}")
         tmp.write_text(f'{{"round_id": "{rid}", "pid": {os.getpid()}}}\n', encoding="utf-8")
         tmp.replace(self.request)
         self._touched = now
@@ -110,6 +113,27 @@ class MktLease:
                 return None
             self.touch(rid)
             self.sleep(poll_s)
+
+    @contextlib.contextmanager
+    def heartbeat(self, rid: str = "", *, every_s: float = TOUCH_EVERY_S):
+        """Keep the request fresh from a daemon thread while the body runs: a
+        single round can compute for longer than the provisioner's
+        ``mkt_request_stale_s``, and a lease touched only between rounds was
+        torn down mid-forecast (#908)."""
+        stop = threading.Event()
+
+        def beat() -> None:
+            while not stop.wait(float(every_s)):
+                with contextlib.suppress(OSError):
+                    self.touch(rid, force=True)
+
+        t = threading.Thread(target=beat, name="mkt-lease-heartbeat", daemon=True)
+        t.start()
+        try:
+            yield self
+        finally:
+            stop.set()
+            t.join(timeout=5.0)
 
     def release(self) -> None:
         with contextlib.suppress(FileNotFoundError):

@@ -63,6 +63,7 @@ lane C's (``resolve_outcomes`` / ``LaneCState``).
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 import re
@@ -1593,9 +1594,11 @@ class MarketCastMixin:
             try:
                 sess.start()
                 self.__dict__["_mkt_sess"] = sess
-                for item in need:
-                    lease.touch(str(item["round_id"]))
-                    published += bool(self._mkt_publish_round(item, holders=holders))
+                beat = getattr(lease, "heartbeat", None)
+                with (beat(rid0) if callable(beat) else contextlib.nullcontext()):
+                    for item in need:
+                        lease.touch(str(item["round_id"]))
+                        published += bool(self._mkt_publish_round(item, holders=holders))
             finally:
                 self.__dict__.pop("_mkt_sess", None)
                 sess.close()
