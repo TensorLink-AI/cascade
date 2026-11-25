@@ -1890,14 +1890,59 @@ class RollingScheduler:
             log.warning("rolling: king key TTL re-stamp failed (ignored): %s", e)
 
     def _king_hotkey(self, client) -> str | None:
-        """The king per the validators' receipts; the metagraph only cross-
-        checks (it lags a dethrone longer than a settlement)."""
+        """Lane A's king from SIGNED sources only (#933): the validators'
+        receipt trail (``receipt_king`` — the latest anchor-signed scored
+        receipt, walked back past rejected ones, sticky in memory), else the
+        trainer's own persisted era king (the last king it knew), else None —
+        HOLD: no king change, logged at ERROR and raised as an operator alert.
+
+        Never the on-chain incentive: once lanes B/C/D take emissions (and
+        lane A's share can be 0) the top-incentive hotkey is another lane's
+        payee, and adopting it restarted the king leg for lane D's king on
+        testnet 2026-11-25. The metagraph is read for a log-only cross-check."""
         receipt = self.ops.receipt_king()
-        chain = self.ops.metagraph_king(client)
-        if receipt and chain and receipt != chain:
-            log.info("rolling: receipt king %s != metagraph king %s (incentive lag; "
-                     "the receipt decides)", receipt[:12], chain[:12])
-        return receipt or chain
+        if receipt:
+            self._king_hold_noted = None
+            self._clear_king_alert()
+            chain = self.ops.metagraph_king(client)
+            if chain and receipt != chain:
+                log.info("rolling: receipt king %s != top-incentive hotkey %s (incentive "
+                         "lag or another lane's payee; the receipt decides)",
+                         receipt[:12], chain[:12])
+            return receipt
+        cur = self.state.current
+        known = (cur.king_hotkey if cur is not None else "") or ""
+        if known:
+            if getattr(self, "_king_hold_noted", None) != known:   # once per held king
+                self._king_hold_noted = known
+                log.warning("rolling: no signed receipt names a lane A king — holding the "
+                            "persisted era king %s (never the top-incentive hotkey)",
+                            known[:12])
+            return known
+        msg = ("no signed receipt names a lane A king and no persisted era king — HOLD: "
+               "no king leg until a signed receipt names one (the top-incentive hotkey is "
+               "never adopted)")
+        if getattr(self, "_king_hold_noted", None) != "":
+            self._king_hold_noted = ""
+            log.error("rolling: %s", msg)
+        self._raise_king_alert(msg)
+        return None
+
+    def _raise_king_alert(self, msg: str) -> None:
+        try:
+            from .money_guard import alert
+
+            alert(self.r, "lane_a_king_unresolved", "lane_a", msg, severity="critical")
+        except Exception as e:  # noqa: BLE001 — the ERROR line above is the record
+            log.debug("rolling: king alert not raised (%s)", e)
+
+    def _clear_king_alert(self) -> None:
+        try:
+            from .money_guard import clear_alert
+
+            clear_alert(self.r, "lane_a_king_unresolved", "lane_a")
+        except Exception:  # noqa: BLE001
+            pass
 
     # ── king legs ────────────────────────────────────────────────────────────
 

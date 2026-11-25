@@ -53,3 +53,16 @@ four-suite sweep is ~1 h, past `LANE_B_SETTLE_MAX_SECONDS`), queues every
 missing candidate in one pass and fails closed (legs kept, nothing published).
 No pod-side lock: assumes lane A sweeps are quiet after launch; add a lock if
 lane A resumes. `test_w_launch_laneb_bench.py` pins it with fakes.
+
+#933 (launch-critical): with lane A at 0 % after the launch, the top-incentive
+hotkey is a lane B/C/D payee, so the trainer must never take lane A's king from
+the on-chain incentive. `RollingScheduler._king_hotkey` resolves from signed
+sources only: the receipt trail's king, then the trainer's persisted era king,
+else HOLD (no king, no king leg, ERROR log + a `lane_a_king_unresolved`
+critical operator alert, cleared once a receipt names a king). The metagraph
+read stays as a log-only cross-check. `test_w_launch_lane_a_king.py` pins:
+- no receipt: the persisted king is kept through settlements and the era roll;
+- a lane D payee with top incentive is never chosen;
+- first run, no receipt and no state: hold + alert;
+- receipt names the king: the king whatever the incentive says, and a run whose
+  later receipts name no king publishes byte-identical manifests.

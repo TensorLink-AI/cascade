@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 
 import pytest
@@ -79,6 +80,38 @@ def test_tampered_bucket_copy_is_refused_on_pull(tmp_path):
     (a / "records.jsonl").write_text('{"r":1}\n')
     m.state_push(store, prefix="pool_d", log_dir=a, pool_d=None)
     store.put_bytes("pool_d/_builder/first_seen/records.jsonl", b'{"r":"x"}\n')
+    with pytest.raises(m.ElasticError) as ei:
+        m.state_pull(store, prefix="pool_d", log_dir=tmp_path / "c" / "first_seen",
+                     prior_root=tmp_path / "pc")
+    assert ei.value.code == "state_conflict"
+
+
+def test_quarantine_round_trips_and_old_head_pulls_empty(tmp_path):
+    """W6fs quarantine.jsonl rides the same append-only state; a HEAD written
+    before it existed restores it as empty, and a bucket copy HEAD does not
+    name is refused."""
+    m = mod()
+    assert "quarantine.jsonl" in m.FIRST_SEEN_FILES
+    store = _store(tmp_path)
+    # a HEAD from before the quarantine file existed
+    store.put_bytes("pool_d/_builder/first_seen/records.jsonl", b'{"r":1}\n')
+    store.put_bytes("pool_d/_builder/first_seen/roots.jsonl", b"")
+    store.put_bytes("pool_d/_builder/first_seen/HEAD.json", json.dumps({
+        "records.jsonl": hashlib.sha256(b'{"r":1}\n').hexdigest(),
+        "roots.jsonl": hashlib.sha256(b"").hexdigest()}, sort_keys=True).encode())
+    a = tmp_path / "a" / "first_seen"
+    m.state_pull(store, prefix="pool_d", log_dir=a, prior_root=tmp_path / "pa")
+    assert (a / "quarantine.jsonl").read_bytes() == b""
+    (a / "quarantine.jsonl").write_text('{"q":1}\n')
+    m.state_push(store, prefix="pool_d", log_dir=a, pool_d=None)
+    assert store.get_bytes("pool_d/_builder/first_seen/quarantine.jsonl") == b'{"q":1}\n'
+    b = tmp_path / "b" / "first_seen"
+    m.state_pull(store, prefix="pool_d", log_dir=b, prior_root=tmp_path / "pb")
+    assert (b / "quarantine.jsonl").read_text() == '{"q":1}\n'
+    # a quarantine copy the HEAD does not name
+    store.put_bytes("pool_d/_builder/first_seen/HEAD.json", json.dumps({
+        "records.jsonl": hashlib.sha256(b'{"r":1}\n').hexdigest(),
+        "roots.jsonl": hashlib.sha256(b"").hexdigest()}, sort_keys=True).encode())
     with pytest.raises(m.ElasticError) as ei:
         m.state_pull(store, prefix="pool_d", log_dir=tmp_path / "c" / "first_seen",
                      prior_root=tmp_path / "pc")
