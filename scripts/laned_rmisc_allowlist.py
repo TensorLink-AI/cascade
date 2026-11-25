@@ -614,9 +614,60 @@ def data_files(root: Path) -> list[Path]:
                   and p.suffix.lower() in (".arrow", ".parquet", ".csv"))
 
 
+def cand_file_hashes(path, sample_series: int, max_points: int, k: int, mod: int,
+                     *, reference: bool = False):
+    """``(n_series, hashes)`` of one RMISC candidate parquet file: the
+    ``sample_series`` series with the smallest sha256(name), each numeric
+    column of each truncated to ``max_points``, K-gram hashed. ``reference``
+    is the original per-row Python path; the default does the same in Arrow
+    (``index_in`` instead of an object-array compare per series)."""
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    from cascade.eval.lane_d_public_index import RMISC_SERIES_COLUMN
+
+    t = pq.read_table(str(path))
+    cols = [x for x in t.column_names if x != RMISC_SERIES_COLUMN
+            and (pa.types.is_integer(t.column(x).type) or pa.types.is_floating(t.column(x).type))]
+    vals = {x: t.column(x).cast(pa.float64()).to_numpy(zero_copy_only=False) for x in cols}
+    key = lambda s: hashlib.sha256(s.encode()).hexdigest()  # noqa: E731
+    has = RMISC_SERIES_COLUMN in t.column_names
+    col = t.column(RMISC_SERIES_COLUMN) if has else None
+    if has and pa.types.is_dictionary(col.type) and (pa.types.is_string(col.type.value_type)
+                                                     or pa.types.is_large_string(
+                                                         col.type.value_type)):
+        col = col.cast(col.type.value_type)               # RMISC: dictionary<string>
+    fast = (not reference and has
+            and (pa.types.is_string(col.type) or pa.types.is_large_string(col.type)))
+    hs = []
+    if fast:
+        col = pc.fill_null(col, "None")                   # str(None), as the reference
+        uniq = sorted(pc.unique(col).to_pylist(), key=key)[:sample_series]
+        pos = pc.fill_null(pc.index_in(col, value_set=pa.array(uniq, type=col.type)), -1)
+        pos = np.asarray(pos.to_numpy(zero_copy_only=False))
+        groups = [np.flatnonzero(pos == j) for j in range(len(uniq))]
+    else:
+        names = list(map(str, col.to_pylist())) if has else ["_all"] * t.num_rows
+        uniq = sorted(set(names), key=key)[:sample_series]
+        arr_names = np.asarray(names, dtype=object)
+        groups = [np.flatnonzero(arr_names == s) for s in uniq]
+    for idx in groups:
+        for c in cols:
+            hs.append(kgram_hashes(vals[c][idx][:max_points], k, mod))
+    h = np.unique(np.concatenate(hs)) if hs else np.empty(0, dtype=np.uint64)
+    return len(uniq), h
+
+
+def _cand_job(job):
+    name, f, sample_series, max_points, k, mod = job
+    n, h = cand_file_hashes(f, sample_series, max_points, k, mod)
+    return name, f, n, h
+
+
 def cmd_datacompare(args) -> int:
     import numpy as np
-    from cascade.eval.lane_d_public_index import RMISC_SERIES_COLUMN
 
     cands = json.loads(Path(args.candidates).read_text(encoding="utf-8"))
     if cands.get("schema") != CANDIDATES_SCHEMA:
@@ -633,29 +684,26 @@ def cmd_datacompare(args) -> int:
     folders = []
     owner: dict[int, set[str]] = {}
     per_folder: dict[str, np.ndarray] = {}
-    for c in cands["candidates"]:
-        base = Path(args.rmisc_root) / c["name"]
-        import pyarrow as pa
-        import pyarrow.parquet as pq
+    jobs = [(c["name"], str(f)) for c in cands["candidates"]
+            for f in sorted((Path(args.rmisc_root) / c["name"]).glob("*.parquet"))]
+    cargs = (int(args.sample_series), int(args.max_points), k, mod)
+    cw = max(1, min(int(getattr(args, "workers", 1) or 1), int(args.candidate_workers)))
+    if cw > 1:
+        import multiprocessing as mp
+        from concurrent.futures import ProcessPoolExecutor
 
-        hs, n_series = [], 0
-        for f in sorted(base.glob("*.parquet")):
-            t = pq.read_table(str(f))
-            names = list(map(str, t.column(RMISC_SERIES_COLUMN).to_pylist())) \
-                if RMISC_SERIES_COLUMN in t.column_names else ["_all"] * t.num_rows
-            # A deterministic sample: the series with the smallest sha256(name).
-            uniq = sorted(set(names),
-                          key=lambda s: hashlib.sha256(s.encode()).hexdigest())[:args.sample_series]
-            n_series += len(uniq)
-            cols = [x for x in t.column_names if x != RMISC_SERIES_COLUMN
-                    and (pa.types.is_integer(t.column(x).type)
-                         or pa.types.is_floating(t.column(x).type))]
-            vals = {x: t.column(x).cast(pa.float64()).to_numpy(zero_copy_only=False) for x in cols}
-            arr_names = np.asarray(names, dtype=object)
-            for s in uniq:
-                idx = np.flatnonzero(arr_names == s)
-                for col in cols:
-                    hs.append(kgram_hashes(vals[col][idx][:args.max_points], k, mod))
+        with ProcessPoolExecutor(cw, mp_context=mp.get_context("fork")) as cpool:
+            done = list(cpool.map(_cand_job, [(n, f, *cargs) for n, f in jobs], chunksize=1))
+    else:
+        done = [_cand_job((n, f, *cargs)) for n, f in jobs]
+    by: dict[str, list] = {}
+    for name, f, n, h in done:
+        by.setdefault(name, []).append((n, h))
+        print(f"hashed {name}: {f} series={n} hashes={h.size}", flush=True)
+    for c in cands["candidates"]:
+        got = by.get(c["name"], [])
+        hs = [h for _, h in got]
+        n_series = sum(n for n, _ in got)
         arr = np.unique(np.concatenate(hs)) if hs else np.empty(0, dtype=np.uint64)
         per_folder[c["name"]] = arr
         for x in arr.tolist():
@@ -801,6 +849,8 @@ def main(argv=None) -> int:
                         "download batches (hash, then delete) instead of --exclude-root")
     p.add_argument("--stream-dir", help="scratch dir for --stream batches")
     p.add_argument("--stream-batch-gib", type=float, default=64.0)
+    p.add_argument("--candidate-workers", type=int, default=12,
+                   help="cap on processes hashing candidate files (each reads a file whole)")
     p.set_defaults(fn=cmd_datacompare)
     p = sub.add_parser("finalize")
     p.add_argument("--candidates", required=True)
