@@ -18,9 +18,11 @@ Pinned here (each fails on the base):
 
 from __future__ import annotations
 
-import contextlib
 import logging
+import os
 from datetime import UTC, datetime
+
+import pytest
 
 from cascade.provision.core import PodAddress
 from cascade.provision.policy import ProvisionPolicy, StagePolicy
@@ -103,21 +105,33 @@ class _CrashAfterCreate(FakeProvider):
         raise SystemExit("crash between create and ledger save")
 
 
+def _rent_once(loop):
+    """One tick with a live MarketCast request (the real rent path), worker joined."""
+    from cascade.validator.mkt_offload import request_path_for
+
+    req = request_path_for(loop.mkt_hosts_path)
+    req.write_text("{}", encoding="utf-8")
+    os.utime(req, (loop.clock(), loop.clock()))                  # fresh on the loop's clock
+    loop.run_once()
+    t = getattr(loop, "_mkt_thread", None)
+    if t is not None:
+        t.join(timeout=30)
+    req.unlink()
+
+
+# the simulated crash (SystemExit in the rent worker) is the point of the test
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
 def test_intent_hits_the_ledger_before_the_rent_and_survives_a_crash(tmp_path):
     prov = _CrashAfterCreate("lium", tmp_path / "state.json")
     loop = _mkt_only_loop(tmp_path, prov)
-    from cascade.provision.core import LaunchSpec
-
-    spec = LaunchSpec(sku="RTX 3090", count=1, image="img", ssh_pubkey="k", ssh_port=22,
-                      name_prefix=f"cascade-{int(T0)}-mkt", gpus_per_pod=1)
-    with contextlib.suppress(SystemExit):
-        loop._launch_ledgered(prov, spec, "mkt", None)
+    _rent_once(loop)
+    live = f"cascade-{int(T0)}-mkt-0"
+    assert live in prov.live                                     # created, never ledgered
     pre = prov.ledger_at_launch
-    assert pre is not None and [(r.stage, r.name_prefix) for r in pre.rent_intents] == [
+    intents = getattr(pre, "rent_intents", None)
+    assert intents is not None and [(r.stage, r.name_prefix) for r in intents] == [
         ("mkt", f"cascade-{int(T0)}-mkt")]                         # written BEFORE launch
     assert pre.instances == ()
-    live = f"cascade-{int(T0)}-mkt-0"
-    assert live in prov.live
 
     # Restart: a fresh instance from the on-disk ledger reaps exactly that pod.
     prov2 = FakeProvider("lium")
@@ -130,11 +144,8 @@ def test_intent_hits_the_ledger_before_the_rent_and_survives_a_crash(tmp_path):
 def test_a_clean_rent_leaves_no_intent_behind(tmp_path):
     prov = FakeProvider("lium", price=0.2)
     loop = _mkt_only_loop(tmp_path, prov)
-    from cascade.provision.core import LaunchSpec
-
-    spec = LaunchSpec(sku="RTX 3090", count=1, image="img", ssh_pubkey="k", ssh_port=22,
-                      name_prefix=f"cascade-{int(T0)}-mkt", gpus_per_pod=1)
-    ids = loop._launch_ledgered(prov, spec, "mkt", None)
+    _rent_once(loop)
+    assert prov.launched == [f"cascade-{int(T0)}-mkt-0"]
     st = load_state(tmp_path / "state.json")
-    assert st.rent_intents == ()
-    assert [i.instance_id for i in st.instances] == ids
+    assert [i.instance_id for i in st.instances] == prov.launched
+    assert getattr(st, "rent_intents", None) == ()
