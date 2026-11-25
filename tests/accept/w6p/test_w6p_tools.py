@@ -196,6 +196,8 @@ def test_datacompare_compares_data_not_names(tmp_path, capsys):
     doc = json.loads(out.read_text())
     assert doc["schema"] == a.DATACOMPARE_SCHEMA
     # W-LAUNCH: the process pools and the candidate cache change nothing
+    import sys
+    sys.modules[a.__name__] = a           # pool jobs pickle by module name (as __main__ does)
     out2 = tmp_path / "dc2.json"
     fast = [x if x != str(out) else str(out2) for x in args] + [
         "--workers", "2", "--candidate-workers", "2", "--candidate-cache", str(tmp_path / "cc")]
