@@ -32,3 +32,9 @@ docs/MARKETCAST.md
 # step-2 embargo_hours = 24 line and its restore-to-48 reminder.
 docs/OPERATOR.md
 docs/AGENT_MINING.md
+# cascade#909 (owner 2026-11-25): lane B's public rows are benched on an EVAL
+# POD (--lane-b-bench-hosts, launch: targon-eval.toml), never on the trainer box;
+# off the settlement path (content-keyed cache, background worker); fail closed.
+cascade/trainer/lane_b_bench.py
+cascade/trainer/lane_b_driver.py
+cascade/trainer/main.py

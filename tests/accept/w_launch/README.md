@@ -43,3 +43,13 @@ first era start at least one era past H.
 - the plan lines `LANE D: OFF -> ON` and `LANE A SHARE: 0.5 -> 0.0`;
 - the resolution;
 - the R3 lint on the resolved fallback.
+
+cascade#909 (owner 2026-11-25): lane B's king / candidate / anchor public rows
+are benched on an EVAL POD named by `cascade-trainer --lane-b-bench-hosts`
+(launch: `targon-eval.toml`, lane A's bench pod), never on the CPU-only trainer
+box. `cascade/trainer/lane_b_bench.py` caches rows by checkpoint content and
+benches on one background worker; a settlement never benches inline (a full
+four-suite sweep is ~1 h, past `LANE_B_SETTLE_MAX_SECONDS`), queues every
+missing candidate in one pass and fails closed (legs kept, nothing published).
+No pod-side lock: assumes lane A sweeps are quiet after launch; add a lock if
+lane A resumes. `test_w_launch_laneb_bench.py` pins it with fakes.
