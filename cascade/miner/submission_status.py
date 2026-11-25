@@ -61,6 +61,7 @@ ERROR_TEXT = {
     "spent": "This commitment has already consumed its judged submission.",
     "duplicate": "Admission rejected the entry as a duplicate.",
     "competition_ended": "The competition closed before this entry could train.",
+    "lane_ended": "The lane closed (its until_block passed) before this entry could train; it was released: nothing was rented or charged.",
 }
 
 EVALUATION_TEXT = {

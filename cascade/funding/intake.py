@@ -91,7 +91,15 @@ transfers):
     → 400 missing_target / bad_target / unknown_target / missing_lium_api_key /
           stale_timestamp / bad_signature | 403 not_revealed / not_registered |
           409 replayed_timestamp | 409 competition_ended (its until_block
-          passed: nothing new is admitted) | 503 lane_c_disabled
+          passed: nothing new is admitted) | 409 lane_ended (#931: the
+          lane-wide [lane_c] until_block in force passed; body carries
+          until_block; nothing queued, no key kept) | 503 lane_c_disabled
+      #931: a 202/200 into a lane whose share (or competition whose weight)
+      is 0 in the config in force carries "pay_warning" (accepted: a paused
+      lane can resume). Queued entries of an ended lane / competition are
+      released on the next lane request: status "failed", last_error_class
+      "lane_ended" / "competition_ended", nothing charged, the key forgotten
+      unless another live entry or pod still needs it.
       The entry queues into the LANE-C queue (``lane_c_queue.json`` beside the
       challenger queue — never the challenger queue) and the key lands in the
       shared payer vault (one key per hotkey). It consumes NO lane-A lifetime
@@ -128,6 +136,7 @@ transfers):
           declared_rows_count / declared_rows_malformed /
           missing_lium_api_key / stale_timestamp / bad_signature |
           403 not_revealed / not_registered | 409 replayed_timestamp |
+          409 lane_ended (#931, as lane C: [lane_b] until_block) |
           503 lane_b_disabled
       WB13 / LB1, only while ``[lane_b] contamination_hashset`` is pinned
       (unpinned: none of this, the reply is unchanged): after the identity
@@ -482,6 +491,8 @@ class FundingIntake:
         lane_c_targets: tuple[str, ...] | None = None,
         mkt_suites: tuple[str, ...] = (),
         lane_c_closed: Callable[[str], str | None] | None = None,
+        lane_c_cfg: object | None = None,         # [lane_c] in force (LaneCConfig)
+        head_block: Callable[[], int | None] | None = None,   # #931: chain head
         gpu_catalog: GpuCatalog | None = None,
         lane_b_gpus: object | None = None,        # WB22 LaneBGpus; None = lane A's catalog
         mkt_gpu_catalog: GpuCatalog | None = None,  # MarketCast GPUs; None = lane A's catalog
@@ -597,6 +608,16 @@ class FundingIntake:
         # None`` at the current chain block — a competition past its
         # ``until_block`` admits nothing new (None = no end check: dev)
         self.lane_c_closed = lane_c_closed
+        # #931 kill switches: the ``[lane_c]`` in force (``EffectiveLanes``
+        # re-points it with ``lane_b_cfg``) and ``head_block() -> int | None``
+        # (the chain head; None / raising = unknown: admit, the trainer never
+        # dispatches an ended lane). With both, a lane (or lane-C
+        # competition) whose ``until_block`` the head reached refuses new
+        # funds 409 ``lane_ended`` / ``competition_ended`` before the key is
+        # vaulted, and its not yet started entries are released (nothing
+        # charged). None = no kill-switch check (unit construction / dev).
+        self.lane_c_cfg = lane_c_cfg
+        self.head_block = head_block
         # marketplace → PayerKeyVault for direct-MoE gangs (Lium shares ``vault``).
         self.compute_vaults = compute_vaults or {}
         self.queue = queue
@@ -1106,15 +1127,95 @@ class FundingIntake:
             log.warning("withdraw %s: funded ledger unreadable (%s) — key retained", hotkey, e)
             return True
 
-    def _refresh_lanes(self) -> None:
-        """Run the ``lane_refresh`` hook; it never fails a request."""
+    def _refresh_lanes(self) -> int | None:
+        """Run the ``lane_refresh`` hook, then release the not yet started
+        entries of an ended lane (#931). Returns the chain head (None =
+        unknown or unwired). Never fails a request."""
         hook = self.lane_refresh
-        if hook is None:
-            return
+        if hook is not None:
+            try:
+                hook(self)
+            except Exception:  # noqa: BLE001 — a config view read never fails a request
+                log.exception("lane config refresh failed; keeping the lanes as they are")
+        head = self._head()
+        if head is not None:
+            self._release_ended(head)
+        return head
+
+    def _head(self) -> int | None:
+        """The chain head for the kill-switch checks; None when unwired or
+        the read failed (admit: the trainer never dispatches an ended lane)."""
+        if self.head_block is None:
+            return None
         try:
-            hook(self)
-        except Exception:  # noqa: BLE001 — a config view read never fails a request
-            log.exception("lane config refresh failed; keeping the lanes as they are")
+            head = self.head_block()
+        except Exception as e:  # noqa: BLE001 — a chain flake never fails a request
+            log.warning("lane end check: chain head read failed (%s); admitting", e)
+            return None
+        return None if head is None else int(head)
+
+    def _release_ended(self, head: int) -> None:
+        """#931: release (fail, nothing charged) the queued entries of a lane
+        B / lane C (or lane-C competition) that ended at ``head`` and forget
+        the released payers' keys when nothing else still needs them."""
+        from .lane_ends import release_ended
+
+        for lane, q, cfg in (("b", self.lane_b_queue, self.lane_b_cfg),
+                             ("c", self.lane_c_queue, self.lane_c_cfg)):
+            try:
+                released = release_ended(lane, q, cfg, head)
+            except Exception:  # noqa: BLE001 — housekeeping never fails a request
+                log.exception("lane-%s ended-lane release failed (retried next request)",
+                              lane.upper())
+                continue
+            for hk in released:
+                kept = self._forget_released_key(hk)
+                log.warning("lane-%s entry %s released at block %d: its lane / competition "
+                            "ended (not trained, nothing charged); key %s", lane.upper(), hk,
+                            head, "retained (another live claim)" if kept else "forgotten")
+
+    def _forget_released_key(self, hotkey: str) -> bool:
+        """Forget ``hotkey``'s vaulted key after a release unless something
+        still needs it: a live entry in any lane's queue, a pod on the
+        funded ledger, or direct-MoE funding (it shares the Lium vault).
+        Returns True when the key was retained."""
+        if self.direct_intake is not None:
+            return True
+        for q in (self.queue, self.lane_b_queue, self.lane_c_queue):
+            if q is None:
+                continue
+            try:
+                e = q.get(hotkey)
+            except Exception:  # noqa: BLE001 — unreadable queue: custody fails closed
+                return True
+            if e is not None and (e.status not in ("done", "failed", "withdrawn")
+                                  or (e.phase or "") in LIVE_LEG_PHASES):
+                return True
+        if self._pod_live(hotkey):
+            return True
+        self.vault.remove(hotkey)
+        return False
+
+    def _lane_ended(self, lane: str, head: int | None, *, target: str | None = None,
+                    ) -> tuple[int, dict] | None:
+        """The typed ``409`` refusing a new lane-``lane`` fund at ``head``
+        (``lane_ended`` / ``competition_ended``, with the end block), else
+        None."""
+        from .lane_ends import fund_refusal
+
+        cfg = self.lane_b_cfg if lane == "b" else self.lane_c_cfg
+        body = fund_refusal(lane, cfg, head, target=target)
+        if body is None:
+            return None
+        log.info("lane-%s fund refused: %s", lane.upper(), body["message"])
+        return 409, body
+
+    def _pay_warning(self, lane: str, body: dict, *, target: str | None = None) -> dict:
+        from .lane_ends import pay_warning
+
+        warn = pay_warning(lane, self.lane_b_cfg if lane == "b" else self.lane_c_cfg,
+                           target=target)
+        return {**body, "pay_warning": warn} if warn else body
 
     # ── lane C (DEC-CA-0056) ─────────────────────────────────────────────────
 
@@ -1147,6 +1248,10 @@ class FundingIntake:
             return 400, {"code": "unknown_target",
                          "message": f"{target!r} is not a lane-C target; choose one of "
                                     + ", ".join(self.lane_c_targets)}
+        if action == "lane-c-fund":
+            ended = self._lane_ended("c", self._head(), target=target)
+            if ended is not None:
+                return ended
         if action == "lane-c-fund" and self.lane_c_closed is not None:
             why = self.lane_c_closed(target)
             if why:
@@ -1170,12 +1275,16 @@ class FundingIntake:
         queue) and vaults the key in the shared payer vault — the same key a
         hotkey's other legs rent on (one key per hotkey, rotated by
         ``/v1/credentials``). Consumes NO lane-A lifetime submission."""
-        self._refresh_lanes()
+        head = self._refresh_lanes()
         try:
             if self.lane_c_queue is not None:     # off: the gate below answers 503
                 self.lane_c_queue.expire_stale()
         except Exception:  # noqa: BLE001 — housekeeping never fails a request
             log.exception("lane-C queue TTL sweep failed")
+        if self.lane_c_queue is not None:
+            ended = self._lane_ended("c", head)    # lane-wide end: before anything else
+            if ended is not None:
+                return ended
         choice, segment, gpu_err, own_risk_warn = self._lane_c_gpu_choice(headers)
         if gpu_err is not None:
             return 400, gpu_err
@@ -1215,9 +1324,11 @@ class FundingIntake:
         if outcome == "already-queued":
             body = self._gpu_reply(
                 {"status": "already-queued", "lane": "c", "target": target}, choice)
+            body = self._pay_warning("c", body, target=target)
             return 200, ({**body, "warning": own_risk_warn, "gpu_own_risk": True}
                          if own_risk_warn else body)
         body = self._gpu_reply({"status": outcome, "lane": "c", "target": target}, choice)
+        body = self._pay_warning("c", body, target=target)
         return 202, ({**body, "warning": own_risk_warn, "gpu_own_risk": True}
                      if own_risk_warn else body)
 
@@ -1377,12 +1488,17 @@ class FundingIntake:
         this ref. Queues into the lane-B queue (never the challenger queue)
         and vaults the key in the shared payer vault — the same key a
         hotkey's other legs rent on. Consumes NO lane-A lifetime submission."""
-        self._refresh_lanes()
+        head = self._refresh_lanes()
         try:
             if self.lane_b_queue is not None:     # off: the gate below answers 503
                 self.lane_b_queue.expire_stale()
         except Exception:  # noqa: BLE001 — housekeeping never fails a request
             log.exception("lane-B queue TTL sweep failed")
+        if self.lane_b_queue is not None:
+            # #931: an ended lane refuses before any parse, queue or vault
+            ended = self._lane_ended("b", head)
+            if ended is not None:
+                return ended
         lb_gpus = self.lane_b_gpus
         if lb_gpus is None:
             choice, segment, gpu_err = self._gpu_choice(headers)
@@ -1457,7 +1573,8 @@ class FundingIntake:
                  ",".join(targets), reveal_block, f", gpu={choice.gpu}" if choice.chosen else "",
                  "" if rows is None else ", declared rows "
                  + ",".join(f"{k}:{len(v)}" for k, v in rows.items()))
-        body = {"status": outcome, "lane": "b", "targets": list(targets), **receipt_kw}
+        body = self._pay_warning(
+            "b", {"status": outcome, "lane": "b", "targets": list(targets), **receipt_kw})
         if lb_gpus is not None:
             # lane B's reply: the choice and its measured step rate (lane A's
             # full-budget wall warning does not apply to an expert leg)

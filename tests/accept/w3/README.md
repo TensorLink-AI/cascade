@@ -289,6 +289,20 @@ entry. A failed `reveal_block` read never expires an entry; the answer is
   loop). `main()` ticks once at startup, then starts the timer.
   Tests: `test_w3_refresh_timer.py`.
 
+## Kill switch (#931)
+
+`[lane_d] until_block` in the config IN FORCE at the chain head (the static
+`[lane_d]`, or `cfg_at(head)`: `cascade.lane_d.main.LaneDView` over the
+read-only `NetConfigResolver`, so an adopted overlay kill applies with no
+restart) closes the intake once the head reaches it. A new submit, and a
+ready that would open an entry, answer `409 lane_ended` with `until_block`;
+nothing is stored and no grant is minted. Rows already in the queue are not
+rewritten: the validator reads the queue file. Before the end, or with no
+end, nothing changes. An unreadable view keeps the static `[lane_d]`.
+
+Tests: `test_w3_lane_ended.py` (on main they fail on the missing
+`lane_ended` refusal code or the missing `LaneDView`).
+
 ## Secrets
 
 Grants (presigned URLs, signatures, relay tickets) appear **only** in the

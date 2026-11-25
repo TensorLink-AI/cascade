@@ -21,6 +21,16 @@ Every refusal is a typed ``{"code", "message"}`` with a code from
 queue is one JSON file written atomically, persisted before any accepted
 submit or ready answers, and a corrupt file refuses to start.
 
+Kill switch (#931): ``[lane_d] until_block`` in the config IN FORCE at the
+chain head (``cfg_at(head)`` — the adopted owner-signed overlay, resolved
+read-only by :mod:`cascade.lane_d.main`; the static ``cfg`` without one)
+refuses a new submit, and a ready that would open an entry, with ``409
+lane_ended`` carrying ``until_block`` once the head reached it: the
+settlement AT ``until_block`` is lane D's last judged one, so nothing
+readied at or after it could be judged. Entries already in the queue are
+NOT rewritten (the validator reads this file); lane D holds no provider key
+and charges nothing.
+
 Grants (presigned URLs) appear only in the submit response: never in a log
 record, a file under the state dir, or the queue view.
 
@@ -122,6 +132,8 @@ REFUSAL_CODES = (
     "upload_incomplete", "coldkey_cap_open", "queue_full", "ready_expired", "entry_closed",
     # ready: the whole config.json pinned (cascade.lane_d.entry_config)
     "config_unreadable", "config_key_not_allowed", "config_value_not_allowed",
+    # #931: [lane_d] until_block in force reached
+    "lane_ended",
     # fail closed
     "storage_unavailable", "chain_unavailable", "grants_unavailable", "dedup_unavailable",
     "state_unavailable", "internal_error",
@@ -336,7 +348,8 @@ class LaneDIntake:
     def __init__(self, *, storage: LaneDStorage, reads: LaneDReads, minter: GrantMinter, cfg,
                  ops, state_dir, now: Callable[[], float],
                  per_ip_rpm: int = DEFAULT_PER_IP_RPM,
-                 per_hotkey_rpm: int = DEFAULT_PER_HOTKEY_RPM):
+                 per_hotkey_rpm: int = DEFAULT_PER_HOTKEY_RPM,
+                 cfg_at: Callable[[int], object] | None = None):
         if not isinstance(minter, GrantMinter):
             raise TypeError(f"minter must be a GrantMinter; got {type(minter).__name__}")
         if getattr(minter, "upload_path", None) != UPLOAD_PATH:
@@ -353,6 +366,8 @@ class LaneDIntake:
         self.reads = reads
         self.minter = minter
         self.cfg = cfg
+        # #931: ``head -> [lane_d] in force`` (None = the static ``cfg``)
+        self.cfg_at = cfg_at
         self.ops = ops
         self.state_dir = Path(state_dir)
         self.queue_path = self.state_dir / QUEUE_FILENAME
@@ -451,6 +466,31 @@ class LaneDIntake:
         :data:`RATE_LIMIT_MAX_KEYS`)."""
         with self._lock:
             return len(self._limiter)
+
+    # ── the kill switch (#931) ───────────────────────────────────────────────
+
+    def _cfg_in_force(self, block: int):
+        """The ``[lane_d]`` in force at ``block``: ``cfg_at(block)``, the
+        static ``cfg`` when unwired or the view is unavailable (logged)."""
+        if self.cfg_at is None:
+            return self.cfg
+        try:
+            view = self.cfg_at(int(block))
+        except Exception as e:  # noqa: BLE001 — an unreadable view keeps the static config
+            log.warning("lane_d_intake_unavailable config view at block %d failed (%s); "
+                        "using the static [lane_d]", int(block), type(e).__name__)
+            return self.cfg
+        return self.cfg if view is None else view
+
+    def _refuse_if_ended(self, block: int) -> None:
+        """409 ``lane_ended`` once the head reached ``[lane_d] until_block``
+        in force (0 = no end)."""
+        until = int(getattr(self._cfg_in_force(block), "until_block", 0) or 0)
+        if until > 0 and int(block) >= until:
+            raise _Refusal(409, "lane_ended",
+                           f"lane D ended at block {until} ([lane_d] until_block in force; "
+                           f"head {int(block)}): no new entries are admitted",
+                           extra={"lane": "d", "until_block": until, "block": int(block)})
 
     # ── chain reads (fail closed) ────────────────────────────────────────────
 
@@ -660,7 +700,7 @@ class LaneDIntake:
                            f"context {context} is not in {list(self.cfg.contexts)}")
         if self._chain(self.reads.coldkey_of, hotkey) is None:
             raise _Refusal(403, "not_registered", "the hotkey is not registered on the netuid")
-        self._refresh()
+        self._refuse_if_ended(self._refresh())
         if self._owner_of(digest, hotkey) is not None:
             raise _Refusal(409, "digest_owned", "another hotkey already submitted this digest")
         own = self._entries.get(hotkey)
@@ -734,6 +774,7 @@ class LaneDIntake:
             raise _Refusal(409, "entry_closed", "the entry is closed")
         if int(context) != int(rec["context"]):
             raise _Refusal(400, "context_mismatch", "the context differs from the submit's")
+        self._refuse_if_ended(block)
         if rec["weights"] in self._published() or self._open_weights_elsewhere(rec["weights"],
                                                                                hotkey):
             raise _Refusal(409, "duplicate_weights",
