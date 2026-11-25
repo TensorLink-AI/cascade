@@ -3517,6 +3517,11 @@ one era (3600 blocks) before 9586800:
    the printed validator command uses that file.
 4. Every later overlay restates `[lane_d] from_block`: `9586800`, or the
    resolved fallback block. See the restate rule above.
+5. Step 2 and its fallback set `[lane_d] embargo_hours = 24` (the shipped
+   value is 48). Owner decision 2026-11-25: lane A pool data up to snapshot
+   block 9579600 is already public on HF, and a 48 h embargo window would
+   overlap it. Restore `[lane_d] embargo_hours = 48` by overlay after
+   2026-11-27, once cascade#935 is in force.
 
 Testnet rehearses the same flow with `launch-20261125.{pre.,}testnet.toml`
 and the fallback `lane-d-step2.testnet.toml`. The gate exists only in this

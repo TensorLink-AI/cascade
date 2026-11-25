@@ -102,7 +102,10 @@ def test_deferred_step2_file_is_the_launch_step2_with_a_next_era_start(net):
     assert step2["lane_d"].pop("from_block") == "next-era"
     want["lane_d"].pop("from_block")
     assert step2 == want                                 # same body otherwise
-    assert step2["lane_d"] == {"share": 0.5, "takes_from": "lane_a", "public_weight": 0.0}
+    # tests-correction (owner 2026-11-25, leak mitigation / cascade#935): step 2
+    # also carries [lane_d] embargo_hours = 24 (from the shipped 48).
+    assert step2["lane_d"] == {"share": 0.5, "takes_from": "lane_a", "public_weight": 0.0,
+                               "embargo_hours": 24.0}
     # step 1's keys restated byte-identically (R3 `non-lane-d`)
     assert {k: v for k, v in step2.items() if k != "lane_d"} == overrides(pre)
     # the launch step 2 is live again (owner 2026-11-24 22:30): lane D at launch
