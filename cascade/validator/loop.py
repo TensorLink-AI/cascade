@@ -47,6 +47,8 @@ from ..shared.emission import crown_units
 from ..shared.era import (
     bench_gate_mode_at,
     bench_gate_rule_at,
+    crowned_post_gate,
+    crowning_anchor_active,
     legacy_king_anchor,
     settlement_contract_block,
     tenure_blocks_active,
@@ -80,6 +82,7 @@ from .manifest_chain import (  # noqa: F401 — re-exported for callers of casca
     ref_as_of,
 )
 from .marketcast import MarketCastMixin
+from .offthread_worker import LaneDWorker
 from .promotion_gate import PromotionGateMixin
 from .receipts import ReceiptMixin
 from .state import ChampionState, StateTransition
@@ -293,6 +296,9 @@ class ValidatorRunner(
     _merged_init_ok: set = field(default_factory=set, repr=False)
     # the pool lane-B catch-up / on-demand judging re-draws windows from
     _lane_b_window_source: object = field(default=None, repr=False)
+    # W-S2: the chain client lane B reads a settlement era's §16 sentinel
+    # block hash through (catch-up / on-demand settlements; only when armed)
+    _lane_b_chain: object = field(default=None, repr=False)
     # the payout record of the last vector _apply_weights set (None = the
     # legacy lane-A vector) — stamped on that round's receipt
     _last_lane_b_pay: dict | None = field(default=None, repr=False)
@@ -303,6 +309,10 @@ class ValidatorRunner(
     _king_eval: tuple | None = field(default=None, repr=False)
     _settlement_ladder: tuple | None = field(default=None, repr=False)
     _settlement_king_check: tuple | None = field(default=None, repr=False)
+    # LANE_D_PLAN §16: this settlement's sentinel draw ``(round_id, record)``
+    # — set only while ``[v2] sentinel_from_block`` arms the settlement's era
+    # (None otherwise: the gate, king check and receipt then run unarmed).
+    _settlement_sentinel: tuple | None = field(default=None, repr=False)
     # Lane C (DEC-CA-0056): the per-target slot state (``<state_db>.lane_c.json``),
     # the store its manifests are read from (None = the lane-B / manifest
     # store), the settlement block of the last judged manifest (the payout
@@ -349,6 +359,13 @@ class ValidatorRunner(
     # one being judged — where the trainer's record of its validator bench
     # report (``validator_bench_reports``) is looked up.
     _vbench_later_raw: list = field(default_factory=list, repr=False)
+    # W19 (LANE_D_PLAN invariant 6): the lane D settlement step, called with
+    # the armed settlement boundary on a LaneDWorker daemon thread, never on
+    # this (weight/poll) thread. The step receives only the boundary: it must
+    # open its own chain access, never share the poll thread's client.
+    # None ⇒ no lane D work at all (the poll loop is unchanged).
+    lane_d_step: Callable[[int], object] | None = None
+    _lane_d_worker: LaneDWorker | None = field(default=None, repr=False)
 
     def process_round(
         self,
@@ -441,9 +458,9 @@ class ValidatorRunner(
         epoch_block = self._epoch_start_block(manifest)
         base_params = self.cfg.koth_params(block=epoch_block)
         # Score the shared warm-start init when either consumer needs it: the
-        # increment margin (DEC-CA-0027) or the init-baseline floor
-        # ([scoring] init_gate_mode). The increment fallback mutates only the
-        # JUDGED params — the receipt keeps recording the unmodified config
+        # increment margin (DEC-CA-0027) or the legacy shadow init floor
+        # (before [scoring] init_gate_retired_from_block). The increment
+        # fallback mutates only the JUDGED params — the receipt keeps recording the unmodified config
         # params (check_koth_params compares them against chain.toml) — and
         # the audit re-derives the judged margin rule as "params say
         # increment AND baseline rows exist" (rows alone do not imply
@@ -563,17 +580,6 @@ class ValidatorRunner(
                 break
             judged.append((hk, by_size[paired_sizes[0]], result))
             cohort_scores.append((hk, chal_scores))
-            if result.init_floor_passed is not None:
-                log.info(
-                    "round=%s init-baseline floor (%s) %s: chal=%.5f vs "
-                    "init=%.5f (tol=%.3f) — %s%s",
-                    manifest.round_id, base_params.init_gate_mode, hk,
-                    result.chal_geomean, result.baseline_geomean,
-                    base_params.init_gate_tolerance,
-                    "passes" if result.init_floor_passed else "WORSE THAN INIT",
-                    ("" if base_params.init_gate_mode == "enforce"
-                     or result.init_floor_passed else " (shadow: not gating)"),
-                )
 
         # Cohort family-wise correction (DEC-CA-0038): replace each judged
         # challenger's solo lcb with its joint max-T bound — one shared
@@ -856,6 +862,15 @@ class ValidatorRunner(
         gate = int(self.cfg.scoring.tenure_blocks_from_block)
         if state.tenure_anchor_gate == gate:
             return state                         # anchored once at this gate already
+        if (crowning_anchor_active(self.cfg.scoring, block)
+                and crowned_post_gate(self.cfg.scoring, state.king_since_block)):
+            # A king crowned after the gate (a dethrone resets
+            # tenure_anchor_gate): its recorded crowning block is already the
+            # value every validator holds — keep it. Re-anchoring it from its
+            # 0-round counter moved the anchor to this settlement's block.
+            log.info("tenure: king %s… crowned at block %d (post-gate); kept as its anchor",
+                     state.king_hotkey[:8], int(state.king_since_block))
+            return replace(state, tenure_anchor_gate=gate)
         # EVERY validator re-anchors from the counter at the gate — a
         # crowning block recorded before the gate (a validator that upgraded
         # before that king's crowning) is discarded, or two upgraded
@@ -873,6 +888,42 @@ class ValidatorRunner(
                  "settlement %d, gate %d); persisted as king_since_block",
                  state.king_hotkey[:8], anchor, state.tenure_rounds, int(block), gate)
         return replace(state, king_since_block=anchor, tenure_anchor_gate=gate)
+
+    def _draw_settlement_sentinel(self, client: object,
+                                  manifest: TrainingManifest) -> tuple | None:
+        """LANE_D_PLAN §16: ``(round_id, record)`` of the sentinel the
+        settlement's era holds out (:func:`cascade.shared.sentinel.
+        sentinel_record` from the era-boundary block hash), or None while
+        ``[v2] sentinel_from_block`` does not arm that era — then the chain
+        is not read at all. Raises ``ChainError`` / ``ValueError`` when the
+        hash cannot be read or is malformed (the caller holds)."""
+        from ..shared.sentinel import sentinel_armed, sentinel_record, settlement_era_start
+
+        era_start = settlement_era_start(self.cfg, self._epoch_start_block(manifest))
+        if not sentinel_armed(self.cfg, era_start):
+            return None
+        record = sentinel_record(self.cfg, era_start,
+                                 str(client.block_hash(era_start)))  # type: ignore[attr-defined]
+        log.info("round=%s sentinel %s held out (era %d, drawn from block hash %s)",
+                 manifest.round_id, record["suite"], era_start, record["block_hash"])
+        return (str(manifest.round_id), record)
+
+    def _sentinel_for(self, round_id: str) -> dict | None:
+        """This settlement's sentinel record (None = unarmed)."""
+        rec = getattr(self, "_settlement_sentinel", None)
+        return rec[1] if rec is not None and rec[0] == str(round_id) else None
+
+    def _sentinel_gate_kw(self, round_id: str, rule: str) -> dict:
+        """The sentinel keywords of the lane-A bench gate / king check for
+        ``round_id`` (``{}`` unarmed, or outside DEC-CA-0061 rule v2 — the
+        call is then byte-identical to the unarmed one)."""
+        from ..shared.era import BENCH_RULE_V2
+        from ..shared.sentinel import sentinel_gate_kw
+
+        rec = self._sentinel_for(round_id)
+        if rec is None or rule != BENCH_RULE_V2:
+            return {}
+        return sentinel_gate_kw(self.cfg, rec["suite"])
 
     def _epoch_start_block(self, manifest: TrainingManifest) -> int:
         """The round's epoch-boundary block: ``created_block`` floored to the
@@ -977,6 +1028,7 @@ class ValidatorRunner(
         store = open_manifest_store(self.cfg.storage)
         self._lane_b_store = store         # DEC-CA-0050 expert manifests live beside
         self._lane_b_window_source = window_source   # lane-B catch-up re-draws its windows
+        self._lane_b_chain = client        # W-S2: a settlement era's sentinel hash
         if self.bench_report_store is None:
             # Bench reports live in the same bucket — reuse this store (and its
             # R2/HF fallbacks) instead of lazily building a second client.
@@ -1056,8 +1108,41 @@ class ValidatorRunner(
                 self._reassert_weights_at_head(client)
             except Exception as e:  # noqa: BLE001
                 log.warning("weight re-assert check failed: %s", e)
+            self._lane_d_tick(client)
             self._vbench_lease_tick()
             time.sleep(poll)
+
+    def _lane_d_tick(self, client: object) -> None:
+        """W19 (invariant 6): submit the armed lane D settlement to the
+        off-thread worker and return at once; weights never wait on lane D.
+        No step wired, or ``[lane_d]`` unarmed for the current boundary ⇒
+        nothing is read, submitted or started. Never raises."""
+        step = self.lane_d_step
+        if step is None:
+            return
+        lane_d = getattr(self.cfg, "lane_d", None)
+        nc_ = getattr(self, "netconfig", None)
+        # containment (owner 2026-11-24): an adopted overlay may arm lane D
+        # while the startup config leaves it off; with neither, nothing is read
+        overlaid = bool(nc_ is not None and getattr(nc_, "enabled", False)
+                        and getattr(getattr(nc_, "state", None), "history", None))
+        if (lane_d is None or int(getattr(lane_d, "from_block", 0) or 0) <= 0) and not overlaid:
+            return
+        try:
+            boundary = self._reassert_boundary(int(client.current_block()))  # type: ignore[attr-defined]
+            if overlaid:
+                lane_d = getattr(self.cfg_at(boundary), "lane_d", None)
+            if lane_d is None or not lane_d.active(boundary):
+                return
+            worker = self._lane_d_worker
+            if worker is None or worker.step is not step:
+                if worker is not None and worker.running:
+                    return
+                worker = LaneDWorker(step)
+                self._lane_d_worker = worker
+            worker.submit(boundary)
+        except Exception as e:  # noqa: BLE001 — lane D must never reach the weight loop
+            log.warning("lane D tick failed: %s", e)
 
     def _reassert_weights_at_head(self, client: object) -> None:
         """The freshness re-assert, under the config in force at the head
@@ -1090,6 +1175,10 @@ class ValidatorRunner(
         # of the manifests, so a lock-in seen this poll governs the settlement
         # judged this poll.
         self._activation_tick(client)
+        # Lane C (owner 2026-11-24): snapshot the slot holders' registrations
+        # as of the boundary − 1 while that block is fresh (no-op unless lane
+        # C is active), so eviction never needs chain history.
+        self._lane_c_registration_tick(client)
         from ..shared.calendar_launch import resolve_calendar_launch
 
         base = self._base_cfg()
@@ -1213,6 +1302,7 @@ class ValidatorRunner(
         self._capture_settlement_prior(rid)
         self._settlement_ladder = None
         self._settlement_king_check = None
+        self._settlement_sentinel = None
 
         def _not_recorded() -> bool:
             if rollback is not None:
@@ -1257,6 +1347,7 @@ class ValidatorRunner(
         lane_b_rounds = None
         if reason is None:
             self._lane_b_block = self._epoch_start_block(manifest)
+            self._lane_b_chain = client
             lb_key = f"{rid}|lane_b"
             try:
                 lane_b_rounds = self._lane_b_prepare(manifest)
@@ -1351,6 +1442,17 @@ class ValidatorRunner(
             except StorageError as e:
                 self._hold_read_failure(vb_key, e, gate="validator_bench_unpublished")
                 return _not_recorded()
+            # LANE_D_PLAN §16: an armed era's sentinel is drawn from its
+            # boundary block hash before anything is judged; an unreadable
+            # hash HOLDS the settlement (never a verdict). Unarmed: no read.
+            sn_key = f"{rid}|sentinel"
+            try:
+                self._settlement_sentinel = self._draw_settlement_sentinel(client, manifest)
+            except (ChainError, ValueError, TypeError) as e:
+                self._hold_read_failure(sn_key, e, gate="sentinel_unverifiable")
+                return _not_recorded()
+            if self._settlement_sentinel is not None:
+                self._clear_read_hold(sn_key)
             vb_point = self._rollback_point()
             try:
                 outcome = self.process_settlement(manifest, windows, base_seed)

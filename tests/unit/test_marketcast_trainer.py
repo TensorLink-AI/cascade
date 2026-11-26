@@ -165,7 +165,7 @@ def test_export_checkpoint_and_harvest_check(tmp_path):
     # review 2026-10-19: marketcast_meta.json is validated at harvest (a bad
     # covariate name / a missing field / a foreign base is the miner's fault)
     meta_p = tmp_path / "ft" / TA.META_FILE
-    for bad_meta, why in (({**meta, "covariates": ["open_interest"]}, "not allowed"),
+    for bad_meta, why in (({**meta, "covariates": ["sentiment"]}, "not allowed"),
                           ({**meta, "covariates": ["funding", "funding"]}, "repeat"),
                           ({k: v for k, v in meta.items() if k != "data_digest"}, "lacks"),
                           ({**meta, "base_sha256": "0" * 64}, "pinned")):
@@ -608,9 +608,12 @@ def test_driver_dispatches_mkt_legs_only_while_active_and_never_expires_them(tmp
     assert digest
     m = load_lane_c_manifest(published[-1][1])
     # review 2026-10-19: the trainer stamps the dispatch time (the forward-only
-    # clock) into the signed record, next to train_block
+    # clock) into the signed record, next to train_block; DEC-CA-0075: and
+    # the embargo in force at the dispatch
     assert [(e.target, e.marketcast) for e in m.entries] == [
-        ("mkt:returns", {**mkt, "train_time": 1_234_567.0})]
+        ("mkt:returns", {**mkt, "train_time": 1_234_567.0,
+                         "embargo_days": int(cfg.marketcast.embargo_days),
+                         "embargo_eval_days": int(cfg.marketcast.embargo_eval_days)})]
 
 
 def test_lane_c_entry_and_commit_grammar_for_mkt():
@@ -756,3 +759,35 @@ def test_marketcast_continuation_preserves_optimizer_sampler_and_ema(tmp_path):
     assert actual.final_loss == expected.final_loss
     for key, tensor in baseline.state_dict().items():
         assert torch.equal(tensor, recovered.state_dict()[key]), key
+
+
+def test_micro_batches_accumulate_to_the_full_batch_gradient(tmp_path):
+    # micro_batch_tokens: one optimizer step per recipe batch whatever the
+    # split; with no coverage penalty (the only cross-sample term) the
+    # accumulated gradient is the full batch's, so the weights match
+    from dataclasses import replace
+
+    snap = _train_snap(tmp_path)
+    rc = parse_marketcast_recipe(_recipe(objective={"suite_weights": {"returns": 1.0},
+                                                    "coverage_penalty": 0.0},
+                                         trainable={"scope": "full"}), MC)
+    out, calls = [], []
+    for mbt in (10**9, 128, 2 * 128):                       # one chunk, 4 chunks, 2 chunks
+        torch.manual_seed(0)
+        m = _Toy()
+        mc = replace(MC, micro_batch_tokens=mbt)
+        t = iter(range(10**6))
+        n = [0]
+
+        def fwd(ctx, steps, past, known, m=m, n=n):
+            n[0] += 1
+            return m(ctx, steps)
+
+        L.finetune(m, fwd, L.MktSampler(rc, mc, snap, seed=1), rc,
+                   levels=TIMESTRAL_KNOTS, max_seconds=1e9, clock=lambda t=t: float(next(t)))
+        out.append({k: v.detach().clone() for k, v in m.state_dict().items()})
+        calls.append(n[0])
+    assert calls == [6, 24, 12]
+    for split in out[1:]:
+        for k, v in out[0].items():
+            torch.testing.assert_close(split[k], v, rtol=1e-4, atol=1e-6)

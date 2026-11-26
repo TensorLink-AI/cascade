@@ -935,7 +935,8 @@ def _child_stream(repo: str, seed: str, cfg_json: str, n_upper: str) -> int:
         cfg = resolve_real_corpus(cfg)
         gen = _load_generator(Path(repo), int(seed),
                               interface_version=cfg.interface_version,
-                              real_corpus_dir=cfg.real_corpus_dir)
+                              real_corpus_dir=cfg.real_corpus_dir,
+                              curriculum_stage=getattr(cfg, "curriculum_stage", ""))
         for i, item in enumerate(gen.generate(int(n_upper))):
             element = validator.process(item, i)
             if isinstance(element, dict):

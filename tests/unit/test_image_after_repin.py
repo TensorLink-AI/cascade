@@ -94,7 +94,10 @@ def _with(tmp_path, **kv):
 
 
 def test_round_trips_and_binds_the_schedule(tmp_path):
-    cfg = load_chain_config(_with(tmp_path, **AFTER))
+    # the shipped [round] carries the measured-wall gate (S0a B9), so the
+    # after release names its measured image too
+    cfg = load_chain_config(_with(tmp_path, **AFTER,
+                                  funded_sku_wall_measured_image_after=WALL16))
     assert cfg.v2.funded_pod_image_after == RC16_REF
     c = cfg.training.v2_contract
     assert c.train_image_digest_after == RC16
@@ -103,8 +106,12 @@ def test_round_trips_and_binds_the_schedule(tmp_path):
 
 def test_measured_wall_gate_needs_its_after_image(tmp_path):
     text = _with(tmp_path, **AFTER).read_text()
-    text = re.sub(r"(?m)^funded_pod_image = ", f'funded_sku_wall_measured_image = "{WALL16}"\n'
-                  "funded_pod_image = ", text, count=1)
+    # the shipped [round] gates rents since S0a B9; type it if a file lacks it
+    if not re.search(r"(?m)^funded_sku_wall_measured_image = ", text):
+        text = re.sub(r"(?m)^funded_pod_image = ",
+                      f'funded_sku_wall_measured_image = "{WALL16}"\n'
+                      "funded_pod_image = ", text, count=1)
+    assert re.search(r"(?m)^funded_sku_wall_measured_image = \"sha256:", text)
     p = tmp_path / "gated.toml"
     p.write_text(text)
     with pytest.raises(ValueError, match="funded_sku_wall_measured_image_after"):
@@ -612,6 +619,10 @@ def test_receipt_of_a_reattached_old_image_leg_is_accepted(acfg):
 def test_marketcast_post_switch_leg_carries_its_contract_block(acfg):
     from cascade.trainer.marketcast_runner import mkt_contract_block_kw
 
+    # on the FLEET image ([marketcast] pod_image unset; a set one: its own
+    # release, test_marketcast_pod_image.py)
+    acfg = replace(acfg, marketcast=replace(acfg.marketcast, pod_image="",
+                                            worker_code_fingerprint=""))
     armed = A.apply_image_decoupled_activation(acfg, SW)
     assert mkt_contract_block_kw(armed, SimpleNamespace(start_block=SW)) == {"contract_block": SW}
     assert mkt_contract_block_kw(armed, SimpleNamespace(start_block=SW - 3600)) == {}

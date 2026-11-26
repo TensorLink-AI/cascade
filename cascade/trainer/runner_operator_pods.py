@@ -235,6 +235,9 @@ class _OperatorPodMixin:
                 log.error("king rent: %s", unmeasured)
                 self._ledger_remove(f"{name_prefix}-0")
                 raise ProvisionError(unmeasured)
+            from .cost_guards import note_unmeasured_wall
+
+            note_unmeasured_wall(self, rnd, "king rent")
             attempt = 0
             while True:
                 _check_king_cancel(self)
@@ -682,6 +685,9 @@ class _OperatorPodMixin:
         if unmeasured:
             log.error("operator leg %s: %s", gen.hotkey[:12], unmeasured)
             _skip(unmeasured, "operator_blocked")
+        from .cost_guards import note_unmeasured_wall
+
+        note_unmeasured_wall(self, rnd, f"operator leg {gen.hotkey[:12]}")
         # Disk guard (+ box-health halt + canary): a NEW leg pod only (the
         # adopt path returned above); a king backup (``name_prefix``) is held
         # only by a disk halt.

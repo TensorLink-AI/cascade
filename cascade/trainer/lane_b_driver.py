@@ -5,8 +5,14 @@ domain-expert competition, hooked into the rolling scheduler at three points:
                  (``metro-v1:expert:<domain>:hippius:<ref>``) into the queue,
                  measure routing saturation (previous era's king vs the
                  current one), check the opening gate (a one-way latch), plan
-                 an ESFT selection on the CURRENT era king and dispatch at
-                 most ``legs_per_domain`` per domain;
+                 the declared-row entries first (WB15: their own rows, in
+                 reveal order; an overlap with held rows is deferred
+                 uncharged, ``deferred: rows_held``) — a suite-target entry
+                 on the era's §16 sentinel is deferred uncharged instead
+                 (WB18, D35: ``deferred: sentinel_target``, at most
+                 ``sentinel_max_defer_eras`` eras) — then an ESFT selection
+                 on the CURRENT era king excluding every held row, and
+                 dispatch at most ``legs_per_domain`` per domain;
 * ``settle``   — after each settlement manifest is published: drop legs that
                  are era-stale or ``routing_stale`` (the current king routes
                  their domain to different experts than their base king),
@@ -52,17 +58,33 @@ from typing import Protocol
 import numpy as np
 
 from ..shared.atomic import read_text_with_backup, write_text_atomic
+from ..shared.era import image_record_at
 from . import expert_lane as _tel
 from .expert_lane import (
+    GATE_TOKENS_SHORT,
+    OPEN_RULE_COGATE,
     LaneBQueue,
     LaneBSubmission,
     OpenLeg,
     RoutingProbe,
     gate_open,
+    needs_king_check,
+    open_rule_verdict,
     routing_metrics,
     routing_stale_union,
     settle_leg,
     union_selection,
+)
+from .row_claims import (
+    SENTINEL_HOLD,
+    claim_key,
+    deferred_row,
+    first_overlap,
+    has_capacity,
+    leg_holder,
+    merge_holder,
+    normalise_rows,
+    target_load,
 )
 from .runner_generation import leg_corpus
 
@@ -73,20 +95,49 @@ FUNDED_REQUEUED, FUNDED_MINER_FAULT = "requeued", "miner_fault"
 
 
 class LaneBOps(Protocol):
-    def commitments(self) -> list: ...                       # chain Commitment rows
-    def contexts(self, domain: str, block: int) -> list: ...  # affinity slice
-    def fetch(self, pointer: str) -> Path: ...
-    def upload(self, ckpt_dir: Path, repo: str) -> str: ...  # -> trained pointer
-    def dispatch_leg(self, leg: OpenLeg, era_index: int, block: int, done) -> None: ...
-    def bench_rows(self, ckpt_dir: Path) -> dict | None: ...
-    def publish_expert_manifest(self, manifest) -> None: ...
-    def judge(self, manifest, round_id: str, block: int) -> list: ...  # ExpertJudgement list
-    def merge_scores(self, pointer: str, block: int) -> list: ...  # held-out acceptance scores
+    def commitments(self) -> list:
+        """The chain's Commitment rows."""
+
+    def contexts(self, domain: str, block: int) -> list:
+        """The domain's affinity slice."""
+
+    def fetch(self, pointer: str) -> Path:
+        """A local directory holding the checkpoint at ``pointer``."""
+
+    def upload(self, ckpt_dir: Path, repo: str) -> str:
+        """Upload ``ckpt_dir``; returns the trained pointer."""
+
+    def dispatch_leg(self, leg: OpenLeg, era_index: int, block: int, done) -> None:
+        """Run ``leg`` on a pod; ``done`` is called when it returns."""
+
+    def bench_rows(self, ckpt_dir: Path) -> dict | None:
+        """The checkpoint's public-benchmark rows (None = unavailable)."""
+
+    def publish_expert_manifest(self, manifest) -> None:
+        """Sign and publish the expert manifest."""
+
+    def judge(self, manifest, round_id: str, block: int, sentinel: str | None = None,
+              anchor_pointer: str | None = None) -> list:
+        """The manifest's ExpertJudgement list; ``sentinel`` (W-S2) is the
+        settlement era's §16 suite, passed only while armed; ``anchor_pointer``
+        (WB26) the era's anchor king, passed only when the settling legs
+        carry anchor rows (suite slots configured)."""
+
+    def merge_scores(self, pointer: str, block: int) -> list:
+        """The held-out acceptance scores of ``pointer``."""
+
+    def block_hash(self, block: int) -> str:
+        """The chain's ``0x`` hash of ``block`` (read only while the §16
+        sentinel and suite targets are armed: the era-start draw, WB18)."""
+
     # DEC-CA-0059 item 8 (optional: an ops without them dispatches unfunded,
     # the pre-funding behaviour the unit fakes keep):
     #   miner_funded: bool                       — legs need a funded entry
     #   def funded_queue(self): ...              — funding LaneBQueue | None
     #   def hotkey_busy(self, hotkey) -> bool: ...  — a lane-A / lane-C leg runs
+    # WB17 (D41 a; optional: absent reads as no readable check):
+    #   def king_check(self) -> dict | None: ...  — the latest lane A king check
+    #     of the validators' signed receipt (DEC-CA-0055), read only
 
 
 @dataclass
@@ -96,6 +147,10 @@ class FinishedExpertLeg:
     corpus_digest: str
     train_block: int
     gpu_name: str = ""
+    # WB22 / WB25: GPUs the leg trained on (the rented layout); 0 = not recorded
+    gpu_n: int = 0
+    # W-IMG: the worker image digest the leg ran ("" = not recorded)
+    train_image_digest: str = ""
 
 
 @dataclass
@@ -140,16 +195,105 @@ class LaneBDriverState:
     # re-closes — in-flight legs anchor on the king's routing, and later
     # drift is caught per leg by the rebase ``routing_stale`` check
     gate_opened_block: int = 0
+    # WB17 (D41 / LB4): the ``[lane_b] open_rule`` the gate opened under and
+    # the facts that satisfied it (strict JSON: lineage_tokens, open_tokens,
+    # and the passing receipt king_check under ``tokens_king_check``). Written
+    # once, at opening, and never rewritten (the latch above); "" / {} while
+    # closed and for a state file that latched before WB17
+    gate_rule: str = ""
+    gate_evidence: dict = field(default_factory=dict)
+    # while closed under a token rule: "tokens_short" | "king_check_not_passed"
+    # | "king_check_unavailable" (the co-gate records "tokens_short" when the
+    # lineage is short, else "" with its free-text reason in ``routing``)
+    gate_closed_reason: str = ""
     # legs dropped at settlement without a verdict: {round_id, hotkey, uid,
     # domain, gen_ref, leg_pointer, base_king_ref, king_pointer, outcome
     # ("stale" | "routing_stale" | "merge_refused"), detail}
     outcomes: list[dict] = field(default_factory=list)
+    # WB18 (D35 (a), TB20): submission key -> the distinct eras the entry was
+    # deferred in because its suite target was that era's sentinel. Durable,
+    # so a restart never resets the ``sentinel_max_defer_eras`` bound; pruned
+    # to the submissions still pending or open
+    sentinel_deferrals: dict[str, list[int]] = field(default_factory=dict)
 
 
 SETTLED_KEEP = 256
+SENTINELS_KEEP = 8
+# a sentinel draw the chain read could not produce this tick: every
+# suite-target entry waits (uncounted) until the era's block hash is readable
+SENTINEL_UNREADABLE = "?"
 KINGS_KEEP = 16
 HISTORY_KEEP = 512
 OUTCOMES_KEEP = 256
+
+
+LEG_LENGTH_HOLD = "leg_length"
+# Wall the manifest needs after a leg ends (runner_capacity's
+# FUNDED_PUBLISH_MARGIN_SECONDS); the default when no runner is wired.
+_LEG_LENGTH_MARGIN_SECONDS = 1800.0
+
+
+def _era_seconds(round_cfg, block: int) -> float:
+    """Wall seconds of the era containing ``block`` (12 s blocks); 0 unknown."""
+    try:
+        from ..shared.era import era_length_blocks
+
+        return float(era_length_blocks(round_cfg, int(block))) * 12.0
+    except Exception:  # noqa: BLE001 — a stub round config: no long-leg rule
+        return 0.0
+
+
+def leg_length_admission(round_cfg, *, block_now: int, now: float, guard_seconds: int,
+                         margin_seconds: float, current_era: int):
+    """WB23 (TB26): the cross-era admission (``rolling.admit``) of a lane B leg
+    whose wall is its ``train_hours`` guard. ``cross_era`` = it cannot land in
+    the current era and waits for the next era's pre-train window."""
+    from .rolling import admit
+
+    return admit(round_cfg, block_now=int(block_now), now=float(now),
+                 wall_seconds=float(guard_seconds), margin_seconds=float(margin_seconds),
+                 current_era=int(current_era))
+
+
+def _leg_spec(lb, funding: dict, block: int) -> dict:
+    """WB27: the lane B leg spec the trainer and the worker derive the leg
+    contract from (``lane_b_levers.lane_b_leg_contract``): the WB23 length
+    and the levers effective at the dispatch ``block``. Sets
+    ``funding["levers"]`` (what the expert entry records; absent = every
+    default). ``{}`` = today's leg (no ``--recipe-json``)."""
+    from ..shared.lane_b_levers import effective_levers, levers_from_dict
+
+    spec: dict = {}
+    if float(funding.get("train_hours", 0.0) or 0.0) > 0:
+        spec.update(train_hours=float(funding["train_hours"]),
+                    leg_steps=int(funding.get("leg_steps", 0) or 0),
+                    leg_guard_seconds=int(funding.get("leg_guard_seconds", 0) or 0))
+        if int(funding.get("train_tokens", 0) or 0) > 0:
+            spec["train_tokens"] = int(funding["train_tokens"])
+        if funding.get("gpu_measured") is False:
+            spec["gpu_measured"] = False
+    raw = funding.get("funded_levers") or {}
+    levers = effective_levers(lb, levers_from_dict(dict(raw), lb) if raw else None, block)
+    if levers.is_default:
+        funding.pop("levers", None)
+    else:
+        funding["levers"] = levers.as_dict()
+        spec["levers"] = levers.as_dict()
+    return spec
+
+
+def _funded_leg_length(funding: dict, base):
+    """WB23: the funding record's ``LegLength`` (steps clamped to the base
+    contract's reference steps, the consensus cap), or None for a leg funded
+    without ``train_hours`` (today's ``for_hours`` contract)."""
+    from ..shared.lane_b_leg import LegLength, reference_steps
+
+    hours = float((funding or {}).get("train_hours", 0.0) or 0.0)
+    if hours <= 0:
+        return None
+    steps = min(int(funding.get("leg_steps", 0) or 0), reference_steps(base, hours))
+    return LegLength(train_hours=hours, steps=max(1, steps),
+                     guard_seconds=int(funding.get("leg_guard_seconds", 0) or 0))
 
 
 def _slice_digest(contexts: list) -> str:
@@ -167,6 +311,8 @@ class LaneBDriver:
         self.ops = ops
         self.path = Path(state_path)
         self._lock = threading.Lock()
+        # WB26: the anchor king's public bench rows, swept once per anchor
+        self._anchor_rows: dict[str, dict] = {}
         self.st = self._load()
         self.queue = LaneBQueue.from_json(self.st.queue)
         # Routing probes (one king forward over one domain's affinity slice:
@@ -187,6 +333,13 @@ class LaneBDriver:
         # Scientific expiry is not physical termination: a stale worker can
         # still own the hotkey's pod and harvest directory until its callback.
         self._running: dict[int, OpenLeg] = {}
+        # WB15: the declared claims the latest tick deferred (``deferred:
+        # rows_held`` rows of ``status/lane_b.json``); re-derived every tick
+        self._deferred: list[dict] = []
+        # WB18: era-start block -> the era's sentinel suite (one chain read per
+        # era), and the (submission, era) pairs whose past-bound start is logged
+        self._sentinels: OrderedDict[int, str] = OrderedDict()
+        self._bound_logged: set[tuple[str, int]] = set()
 
     # ── persistence ──────────────────────────────────────────────────────────
 
@@ -356,6 +509,302 @@ class LaneBDriver:
                 out.setdefault(int(li), set()).update(int(r) for r in rows)
         return out
 
+    # ── row claims (WB15, LB2 "Overlaps") ────────────────────────────────────
+
+    def _declared_of(self, funded: dict) -> dict[str, dict[int, list[int]]]:
+        """hotkey -> the non-empty declared rows of its startable funded entry
+        (WB14 ``declared_rows``). Caller holds the lock."""
+        out = {}
+        for hk, e in funded.items():
+            rows = normalise_rows(getattr(e, "declared_rows", None))
+            if rows:
+                out[hk] = rows
+        return out
+
+    def _row_holders(self, era_index: int) -> list:
+        """Every current holder of expert rows, in a fixed order: open legs
+        (start order), finished-but-unsettled legs, pending merges. Caller
+        holds the lock."""
+        from ..funding.queue import lane_b_entry_ref
+
+        lb = self.cfg.lane_b
+        age = int(lb.max_base_age_eras)
+        out = []
+        for leg in self.queue.open:
+            ref = str(leg.funding.get("entry_ref") or "") or lane_b_entry_ref(
+                leg.sub.declared, leg.sub.gen_ref)
+            out.append(leg_holder(leg.sub.hotkey, ref, leg.selection, leg.base_era,
+                                  era_index, age))
+        for f in self.st.finished:
+            leg = f["leg"]
+            sub = leg["sub"]
+            declared = tuple(sub.get("targets") or (sub["domain"],))
+            ref = str((leg.get("funding") or {}).get("entry_ref") or "") or lane_b_entry_ref(
+                declared, sub["gen_ref"])
+            out.append(leg_holder(sub["hotkey"], ref, leg["selection"], int(leg["base_era"]),
+                                  era_index, age))
+        by_pointer = {r.get("leg_pointer"): r for r in self.st.submission_results
+                      if r.get("leg_pointer")}
+        for m in self.st.pending_merges:
+            src = by_pointer.get(m.get("rebased_pointer"), {})
+            hk, ref = str(src.get("hotkey") or ""), ""
+            if src.get("gen_ref"):
+                ref = lane_b_entry_ref(tuple(src.get("targets") or (src.get("domain"),)),
+                                       src["gen_ref"])
+            out.append(merge_holder(hk, ref, m.get("selection") or {}, era_index))
+        return out
+
+    # ── sentinel targets (WB18; §12b.5 LB5, D35) ─────────────────────────────
+
+    def _sentinel_target(self, block: int) -> str | None:
+        """The slot name of the era's sentinel suite (``suite:<suite>``), read
+        only while suite targets are armed and the era starting at or before
+        ``block`` holds a sentinel (``sentinel_armed``): W-S1's draw over the
+        era-start block hash (``ops.block_hash``, one chain read per era).
+        ``None`` = no sentinel this era; :data:`SENTINEL_UNREADABLE` = the
+        hash could not be read this tick. Never under ``_lock``."""
+        from ..shared.config.v2 import SUITE_TARGET_PREFIX
+        from ..shared.era import era_start_block
+        from ..shared.sentinel import sentinel_armed, sentinel_from_block
+
+        if not getattr(self.cfg.lane_b, "suite_targets", False) or sentinel_from_block(
+                self.cfg) <= 0:
+            return None
+        start = int(era_start_block(self.cfg.round, int(block)))
+        if not sentinel_armed(self.cfg, start):
+            return None
+        try:
+            suite = self._era_sentinel(start)
+        except Exception as e:  # noqa: BLE001 — a chain read failure holds, never raises
+            log.warning("lane B: era-start block %d hash unreadable (%s) — suite-target "
+                        "entries wait for the era's sentinel draw", start, e)
+            return SENTINEL_UNREADABLE
+        return SUITE_TARGET_PREFIX + suite
+
+    def _era_sentinel(self, start: int) -> str:
+        """W-S1's draw for the era starting at ``start`` (cached; one
+        ``ops.block_hash`` read per era). Raises on a chain read failure or a
+        malformed hash. Never under ``_lock``."""
+        from ..shared.sentinel import sentinel_for_era
+
+        with self._cache_lock:
+            suite = self._sentinels.get(int(start))
+        if suite is None:
+            suite = sentinel_for_era(self.ops.block_hash(int(start)),
+                                     self.cfg.v2.sentinel_suites)
+            with self._cache_lock:
+                self._sentinels[int(start)] = suite
+                while len(self._sentinels) > SENTINELS_KEEP:
+                    self._sentinels.popitem(last=False)
+        return suite
+
+    def _settlement_sentinel(self, block: int) -> str | None:
+        """W-S2 (§16 rule 2, D35): the §16 sentinel of the era the settlement
+        at boundary ``block`` belongs to (``settlement_era_start``) — the
+        same draw the validators record for that settlement — or ``None``
+        when ``[v2] sentinel_from_block`` does not arm that era (no chain
+        read). Read whenever armed, with or without ``[lane_b]
+        suite_targets``. An unreadable hash raises ``OSError``: the
+        settlement holds (its legs stay finished), never judged with a
+        guessed sentinel. Never under ``_lock``."""
+        from ..shared.sentinel import sentinel_armed, sentinel_from_block, settlement_era_start
+
+        if sentinel_from_block(self.cfg) <= 0:
+            return None
+        start = settlement_era_start(self.cfg, int(block))
+        if not sentinel_armed(self.cfg, start):
+            return None
+        try:
+            return self._era_sentinel(start)
+        except Exception as e:  # noqa: BLE001 — any read failure holds the settlement
+            raise OSError(f"lane-B settlement sentinel unreadable (era-start block {start}): "
+                          f"{type(e).__name__}: {e}") from e
+
+    def _leg_length_holds(self, funded: dict, block: int, era_index: int) -> list[dict]:
+        """WB23 (TB26): the public rows of funded ``train_hours`` entries whose
+        guard cannot land in this era (``deferred: leg_length``, with the
+        expected ``target_boundary``). They stay queued and uncharged; an entry
+        without train_hours is never held here. Caller holds the lock."""
+        rows: list[dict] = []
+        if not funded:
+            return rows
+        margin = float(getattr(getattr(self.ops, "r", None), "FUNDED_PUBLISH_MARGIN_SECONDS",
+                               _LEG_LENGTH_MARGIN_SECONDS) or _LEG_LENGTH_MARGIN_SECONDS)
+        now = time.time()
+        era_seconds = _era_seconds(getattr(self.cfg, "round", None), int(block))
+        for hk, e in sorted(funded.items()):
+            guard = int(getattr(e, "leg_guard_seconds", 0) or 0)
+            hours = float(getattr(e, "train_hours", 0.0) or 0.0)
+            if hours <= 0 or guard <= 0:
+                continue
+            try:
+                adm = leg_length_admission(self.cfg.round, block_now=block, now=now,
+                                           guard_seconds=guard, margin_seconds=margin,
+                                           current_era=era_index)
+            except Exception as ex:  # noqa: BLE001 — an unreadable timing never starts it
+                log.warning("lane B: leg-length admission for %s failed (%s) — held",
+                            hk[:8], ex)
+                adm = None
+            if adm is not None and not adm.cross_era:
+                continue
+            if adm is not None and era_seconds and guard + margin > era_seconds:
+                # owner 2026-11-24: a leg longer than an era (12 h legs: guard
+                # 15 h + overhead) can never land inside one — waiting would
+                # hold it forever. It starts now and settles at the boundary
+                # after its wall, rebased onto that king (max_base_age_eras)
+                continue
+            rows.append({"hotkey": str(hk), "entry_ref": str(getattr(e, "ref", "")),
+                         "deferred": LEG_LENGTH_HOLD,
+                         "train_hours": float(e.train_hours), "guard_seconds": guard,
+                         "target_boundary": int(adm.target_boundary) if adm else 0,
+                         "era_index": int(adm.era_index) if adm else 0})
+        return rows
+
+    def _sentinel_holds(self, sentinel: str | None, era_index: int,
+                        eligible) -> dict[str, tuple[LaneBSubmission, str]]:
+        """hotkey -> (pending submission, D35 decision) for every eligible
+        pending entry on the era's sentinel target: ``hold`` (deferred,
+        uncharged) or ``past_bound`` (deferred in ``sentinel_max_defer_eras``
+        eras already: judged on its target). An unreadable draw holds every
+        suite-target entry. Pure over the driver state; caller holds the lock."""
+        from ..shared.config.v2 import SUITE_TARGET_PREFIX
+        from .expert_lane import submission_key
+        from .row_claims import sentinel_decision, sentinel_hit
+
+        if sentinel is None:
+            return {}
+        bound = int(self.cfg.lane_b.sentinel_max_defer_eras)
+        out: dict[str, tuple[LaneBSubmission, str]] = {}
+        for sub in sorted(self.queue.pending, key=lambda s: (s.commit_block, s.hotkey)):
+            if eligible is not None and not eligible(sub):
+                continue
+            if sentinel == SENTINEL_UNREADABLE:
+                if any(str(t).startswith(SUITE_TARGET_PREFIX) for t in sub.declared):
+                    out[sub.hotkey] = (sub, SENTINEL_HOLD)
+                continue
+            if sentinel_hit(sub.declared, sentinel):
+                eras = self.st.sentinel_deferrals.get(submission_key(sub), [])
+                out[sub.hotkey] = (sub, sentinel_decision(eras, era_index, bound))
+        return out
+
+    def _record_sentinel(self, holds: dict, sentinel: str | None, funded: dict,
+                         era_index: int) -> list[dict]:
+        """Count this era for every held entry (once per distinct era), log
+        each past-bound start (TB20), prune the counts to live submissions and
+        return the ``deferred: sentinel_target`` status rows. Caller holds the
+        lock."""
+        from ..funding.queue import lane_b_entry_ref
+        from ..shared.config.v2 import SUITE_TARGET_PREFIX
+        from .expert_lane import submission_key
+        from .row_claims import sentinel_row
+
+        bound = int(self.cfg.lane_b.sentinel_max_defer_eras)
+        suite = "" if sentinel in (None, SENTINEL_UNREADABLE) else str(sentinel)[
+            len(SUITE_TARGET_PREFIX):]
+        rows: list[dict] = []
+        for hk, (sub, decision) in holds.items():
+            key = submission_key(sub)
+            eras = self.st.sentinel_deferrals.get(key, [])
+            if decision != SENTINEL_HOLD:
+                if (key, int(era_index)) not in self._bound_logged:
+                    self._bound_logged.add((key, int(era_index)))
+                    log.info("lane B: %s/%s deferred in %d era(s) %s = sentinel_max_defer_eras "
+                             "— judged on its target %s although it is era %d's sentinel",
+                             hk[:8], sub.domain, len(eras), sorted(eras), sentinel,
+                             int(era_index))
+                continue
+            if sentinel != SENTINEL_UNREADABLE and int(era_index) not in eras:
+                eras = sorted({*eras, int(era_index)})
+                self.st.sentinel_deferrals[key] = eras
+                log.info("lane B: %s/%s targets era %d's sentinel %s — deferred uncharged "
+                         "(%d of sentinel_max_defer_eras=%d)", hk[:8], sub.domain,
+                         int(era_index), sentinel, len(eras), bound)
+            e = funded.get(hk)
+            ref = e.ref if e is not None else lane_b_entry_ref(sub.declared, sub.gen_ref)
+            rows.append(sentinel_row(hk, ref, suite, eras, bound, int(era_index)))
+        live = {submission_key(s) for s in self.queue.pending}
+        live |= {submission_key(leg.sub) for leg in self.queue.open}
+        for key in [k for k in self.st.sentinel_deferrals if k not in live]:
+            del self.st.sentinel_deferrals[key]
+        self._bound_logged = {p for p in self._bound_logged if p[0] in live}
+        return rows
+
+    def _mark_funded(self, fq, funded: dict, sub: LaneBSubmission, era_index: int,
+                     block: int) -> dict | None:
+        """Move ``sub``'s funded entry in flight; the leg's ``funding`` record,
+        or None when the queue refused. Caller holds the lock."""
+        e = funded[sub.hotkey]
+        if not fq.mark_in_flight(sub.hotkey, e.ref, target_boundary=0,
+                                 era_index=int(era_index), started_block=int(block)):
+            return None
+        from .progress import funded_attempt_id
+
+        return {"entry_ref": e.ref, "started_block": int(block),
+                "attempt_id": funded_attempt_id(fq, sub.hotkey, e.ref, int(block)),
+                **({"gpu": str(e.gpu),
+                    "gpu_allow_fallback": bool(e.gpu_allow_fallback),
+                    "gpu_max_price_per_hour": float(e.gpu_max_price_per_hour)}
+                   if getattr(e, "gpu", "") else {}),
+                # WB23: the leg length fixed at the fund (absent = today's leg)
+                **({"train_hours": float(e.train_hours), "leg_steps": int(e.leg_steps),
+                    "leg_guard_seconds": int(e.leg_guard_seconds)}
+                   if float(getattr(e, "train_hours", 0.0) or 0.0) > 0 else {}),
+                # owner 2026-11-24: the token limit and an own-risk GPU
+                **({"train_tokens": int(e.train_tokens)}
+                   if int(getattr(e, "train_tokens", 0) or 0) > 0 else {}),
+                **({"gpu_measured": False}
+                   if getattr(e, "gpu_measured", True) is False else {}),
+                # WB27: the levers funded (absent = every default); the levers
+                # the leg trains are fixed at dispatch ("levers")
+                **({"funded_levers": dict(e.levers)} if getattr(e, "levers", None) else {})}
+
+    def _start_declared(self, fq, funded: dict, declared: dict, eligible, *, block: int,
+                        era_index: int, king_pointer: str) -> tuple[list[OpenLeg], list[dict]]:
+        """Plan the declared claims FIRST, in claim order (funded entry's
+        reveal block, then hotkey): each trains exactly its declared rows
+        unless a holder (open leg, finished-but-unsettled leg, pending merge —
+        either mode) owns one of them, in which case it is deferred: left
+        pending and queued, uncharged, and reported ``rows_held``. A deferred
+        claim holds nothing. Returns ``(started, deferred rows)``. Caller
+        holds the lock."""
+        lb = self.cfg.lane_b
+        subs = sorted((s for s in self.queue.pending
+                       if s.hotkey in declared and (eligible is None or eligible(s))),
+                      key=lambda s: claim_key(funded[s.hotkey].reveal_block, s.hotkey))
+        busy = target_load(self.queue.open)
+        started: list[OpenLeg] = []
+        deferred: list[dict] = []
+        for sub in subs:
+            if not has_capacity(sub.declared, busy, lb.legs_per_domain):
+                continue
+            rows = declared[sub.hotkey]
+            holder = first_overlap(rows, self._row_holders(era_index))
+            if holder is not None:
+                deferred.append(deferred_row(sub.hotkey, funded[sub.hotkey].ref, holder, rows))
+                log.info("lane B: %s/%s declared rows held by %s (%s) — deferred until its "
+                         "%s (era %d)", sub.hotkey[:8], sub.domain, holder.hotkey[:8],
+                         holder.entry_ref, holder.kind, holder.era)
+                continue
+            held = self._held_rows()
+            exclude = self.queue.owned_rows()
+            for li, r in held.items():
+                exclude.setdefault(li, set()).update(r)
+            funding = self._mark_funded(fq, funded, sub, era_index, block)
+            if funding is None:
+                continue
+            try:
+                leg = self.queue.start(sub, rows, king_pointer, era_index, exclude=exclude,
+                                       held=held, funding=funding)
+            except ValueError as err:
+                fq.requeue(sub.hotkey, error=f"lane-B rows unavailable ({err})",
+                           error_class="no_capacity", burn_attempt=False)
+                log.warning("lane B: %s/%s not started: %s", sub.hotkey[:8], sub.domain, err)
+                continue
+            for t in sub.declared:
+                busy[t] = busy.get(t, 0) + 1
+            started.append(leg)
+        return started, deferred
+
     def abandon(self, round_id: str) -> str:
         """The scheduler stopped waiting for ``round_id``'s settlement: from
         now on :meth:`settle` commits nothing for it (its legs stay finished
@@ -426,11 +875,22 @@ class LaneBDriver:
         self.reconcile_lineage()
         lb = self.cfg.lane_b
         if not lb.active(block) or not king_pointer:
+            self._deferred = []
             return []
+        # #909: a finished leg settles against the king's public rows — queue
+        # the king's eval-pod bench now, not at the settlement
+        pre = getattr(self.ops, "prebench", None)
+        if self.st.finished and lb.require_public and callable(pre):
+            try:
+                pre(king_pointer)
+            except Exception as e:  # noqa: BLE001 — a prebench never fails the tick
+                log.warning("lane B: king prebench not queued: %s", e)
         miner = self._miner_funded()
         fq = self._funded_queue() if miner else None
         if fq is not None:
             fq.expire_stale()
+        # WB18 (D35): the era's sentinel suite target (None unless armed)
+        sentinel = self._sentinel_target(int(block))
         with self._lock:
             self._recover_orphans(fq)
             for leg in [x for x in self.queue.open
@@ -484,8 +944,41 @@ class LaneBDriver:
             latched = self.st.gate_opened_block > 0
             funded = self._funded_entries(fq, rows) if miner else {}
             eligible = self._eligible(miner, funded)
-            want = {t for s in self.queue.next_dispatchable(lb, eligible) for t in s.declared}
+            # WB18 (D35, TB19/TS4): an entry on the era's sentinel target is
+            # held back from both passes (uncharged) until the bound lifts it
+            holds = self._sentinel_holds(sentinel, int(era_index), eligible)
+            held_back = {hk for hk, (_, d) in holds.items() if d == SENTINEL_HOLD}
+            if held_back:
+                base_eligible = eligible
+
+                def eligible(sub: LaneBSubmission) -> bool:
+                    return sub.hotkey not in held_back and (
+                        base_eligible is None or base_eligible(sub))
+            # WB23 (TB26): a train_hours leg that cannot land in this era waits
+            # (queued, uncharged) for the next era's pre-train window
+            length_rows = self._leg_length_holds(funded, int(block), int(era_index))
+            length_held = {r["hotkey"] for r in length_rows}
+            if length_held:
+                inner_eligible = eligible
+
+                def eligible(sub: LaneBSubmission) -> bool:
+                    return sub.hotkey not in length_held and (
+                        inner_eligible is None or inner_eligible(sub))
+            # WB15: entries with declared rows are planned first (their own
+            # rows, never ESFT); the ESFT pass sees only the rest. With none
+            # declared the ESFT pass is exactly the pre-WB15 queue.
+            declared = self._declared_of(funded)
+            esft_eligible = eligible
+            if declared:
+                def esft_eligible(sub: LaneBSubmission) -> bool:
+                    return sub.hotkey not in declared and eligible(sub)
+            want = {t for s in self.queue.next_dispatchable(lb, esft_eligible)
+                    for t in s.declared}
             self.save()
+        # WB17 (D41 / LB4): the configured opening rule; the co-gate is the
+        # default and runs exactly as before
+        rule = str(getattr(lb, "open_rule", OPEN_RULE_COGATE) or OPEN_RULE_COGATE)
+        cogate = rule == OPEN_RULE_COGATE
         # ── routing saturation + current-king probes: OUTSIDE the lock ──
         routing: dict[str, dict] = {}
         if prev:
@@ -495,30 +988,75 @@ class LaneBDriver:
                                                  self._probe(king_pointer, king_pointer, d, block),
                                                  lb)
             except Exception as e:  # noqa: BLE001
-                if not latched:
-                    raise                # closed gate: surface it (the tick retries)
+                if not latched and cogate:
+                    raise                # closed co-gate: surface it (the tick retries)
+                # a latched gate, or a token rule (routing is telemetry there)
                 log.warning("lane B: routing-saturation measurement failed: %s", e)
                 routing = {}
+        # the lane A king check is a store read: OUTSIDE the lock, only while
+        # a closed tokens_king_check gate has its tokens met
+        check = None
+        if not latched and needs_king_check(rule) \
+                and self.st.lineage_tokens >= lb.open_tokens:
+            check = self._read_king_check()
+        if cogate:
+            may_open = bool(prev and self.st.lineage_tokens >= lb.open_tokens)
+        else:
+            may_open = open_rule_verdict(rule, self.st.lineage_tokens, lb, check)[0]
         probes: dict[str, RoutingProbe] = {}
-        if want and (latched or (prev and self.st.lineage_tokens >= lb.open_tokens)):
+        if want and (latched or may_open):
             for d in sorted(want):
                 probes[d] = self._probe(king_pointer, king_pointer, d, block)
         with self._lock:
             if routing:
                 self._record_routing(era_index, block, prev, king_pointer, routing)
             if not latched:
-                ok, why = gate_open(self.st.lineage_tokens, routing, lb)
-                self.st.routing["open"], self.st.routing["reason"] = ok, why
+                if cogate:
+                    ok, why = gate_open(self.st.lineage_tokens, routing, lb)
+                    self.st.routing["open"], self.st.routing["reason"] = ok, why
+                    reason = (GATE_TOKENS_SHORT if self.st.lineage_tokens < lb.open_tokens
+                              else "")
+                    evidence = {"lineage_tokens": int(self.st.lineage_tokens),
+                                "open_tokens": int(lb.open_tokens),
+                                "king": king_pointer, "prev_king": prev} if ok else {}
+                else:
+                    ok, reason, evidence = open_rule_verdict(
+                        rule, self.st.lineage_tokens, lb, check)
+                    why = reason or "open"
                 if not ok:
+                    self.st.gate_closed_reason = reason
+                    self._deferred = []
                     self.save()
-                    log.info("lane B: gate closed (%s)", why)
+                    log.info("lane B: gate closed under open_rule=%s (%s)", rule, why)
                     return []
                 self.st.gate_opened_block = int(block)
-                log.info("lane B: gate OPEN at block %d (era %d, king %s vs previous %s; "
-                         "lineage %.3g tokens) — latched", block, era_index, king_pointer,
-                         prev, self.st.lineage_tokens)
-            started = []
-            for sub in self.queue.next_dispatchable(lb, eligible):
+                self.st.gate_rule = rule
+                self.st.gate_evidence = {**evidence, "block": int(block),
+                                         "era": int(era_index)}
+                self.st.gate_closed_reason = ""
+                log.info("lane B: gate OPEN at block %d under open_rule=%s (era %d, king %s "
+                         "vs previous %s; lineage %.3g tokens; evidence %s) — latched", block,
+                         rule, era_index, king_pointer, prev, self.st.lineage_tokens,
+                         json.dumps(self.st.gate_evidence, sort_keys=True))
+            sentinel_rows = self._record_sentinel(holds, sentinel, funded, int(era_index))
+            started, deferred_rows = [], []
+            if declared:
+                started, deferred_rows = self._start_declared(
+                    fq, funded, declared, eligible, block=int(block), era_index=int(era_index),
+                    king_pointer=king_pointer)
+            self._deferred = sentinel_rows + deferred_rows + length_rows
+            if fq is not None:
+                # RV6 B4 (§12b.5 LB5): a deferral (``sentinel_target`` or
+                # ``rows_held``) is uncharged, so it must not run the funded
+                # entry's TTL either. Each deferring tick re-stamps the entry's
+                # liveness, as lane A's ``touch`` does for admission-held
+                # entries; once released it has a full TTL from this tick.
+                # A never-deferred entry is not in these rows: unchanged.
+                deferred_hks = sorted({str(r.get("hotkey")) for r in self._deferred
+                                       if r.get("hotkey") in funded})
+                if deferred_hks:
+                    fq.touch(deferred_hks)
+            for sub in self.queue.next_dispatchable(lb, esft_eligible):
                 tprobes = [probes.get(t) for t in sub.declared]
                 if any(pr is None for pr in tprobes):   # dispatchable mid-tick: next tick
                     continue
@@ -538,18 +1076,9 @@ class LaneBDriver:
                     continue
                 funding: dict = {}
                 if miner:
-                    e = funded[sub.hotkey]
-                    if not fq.mark_in_flight(sub.hotkey, e.ref, target_boundary=0,
-                                             era_index=int(era_index), started_block=int(block)):
+                    funding = self._mark_funded(fq, funded, sub, era_index, block)
+                    if funding is None:
                         continue
-                    from .progress import funded_attempt_id
-
-                    funding = {"entry_ref": e.ref, "started_block": int(block),
-                               "attempt_id": funded_attempt_id(fq, sub.hotkey, e.ref, int(block)),
-                               **({"gpu": str(e.gpu),
-                                   "gpu_allow_fallback": bool(e.gpu_allow_fallback),
-                                   "gpu_max_price_per_hour": float(e.gpu_max_price_per_hour)}
-                                  if getattr(e, "gpu", "") else {})}
                 try:
                     leg = self.queue.start(sub, sel, king_pointer, era_index, exclude=exclude,
                                            held=held, funding=funding)
@@ -575,6 +1104,21 @@ class LaneBDriver:
                     f"expert dispatch failed: {e}", miner_fault=False,
                     error_class="operator_transient", burn=False))
         return started
+
+    def _read_king_check(self) -> dict | None:
+        """The ops' latest lane A king check (WB17, D41 a), or ``None`` when
+        the ops has no such read, it returns no record, or the read fails (a
+        closed gate then records ``king_check_unavailable`` and retries next
+        tick)."""
+        read = getattr(self.ops, "king_check", None)
+        if not callable(read):
+            return None
+        try:
+            rec = read()
+        except Exception as e:  # noqa: BLE001 — an unreadable check keeps the gate closed
+            log.warning("lane B: lane A king check unreadable: %s", e)
+            return None
+        return dict(rec) if isinstance(rec, dict) else None
 
     def _prev_king(self, era_index: int, king_pointer: str) -> str | None:
         """The gate's reference: the latest king of an EARLIER era whose
@@ -646,7 +1190,8 @@ class LaneBDriver:
         return max(8, 3 * len(getattr(lb, "targets", None) or lb.domains))
 
     def _leg_done(self, leg: OpenLeg, leg_pointer: str | None, corpus_digest: str = "",
-                  train_block: int = 0, gpu_name: str = "", failure=None) -> None:
+                  train_block: int = 0, gpu_name: str = "", failure=None,
+                  gpu_n: int = 0, train_image_digest: str = "") -> None:
         """A leg returned. ``failure`` (a funded leg's
         :class:`~cascade.trainer.lane_c_driver.LegFailure`) decides its queue
         entry: a miner fault ends it; anything else requeues it — a capacity
@@ -665,7 +1210,8 @@ class LaneBDriver:
                 self.queue.finish(leg, ok=True)
                 self.st.finished.append(asdict(FinishedExpertLeg(
                     leg=asdict(leg), leg_pointer=leg_pointer, corpus_digest=corpus_digest,
-                    train_block=int(train_block), gpu_name=gpu_name)))
+                    train_block=int(train_block), gpu_name=gpu_name, gpu_n=int(gpu_n),
+                    train_image_digest=str(train_image_digest or ""))))
             elif leg.funding and not getattr(failure, "miner_fault", False):
                 msg = str(getattr(failure, "msg", "") or "leg produced no checkpoint")
                 cls = str(getattr(failure, "error_class", "") or "operator")
@@ -688,6 +1234,23 @@ class LaneBDriver:
                             " — entry ended (miner fault)" if leg.funding else "")
             self.save()
 
+    def _anchor_bench_rows(self, anchor_pointer: str, require: tuple[str, ...]) -> dict:
+        """WB26: the anchor king's public bench rows, swept once per anchor.
+        Unavailable or incomplete rows raise OSError (the settlement retries,
+        as for the king's and the candidates' rows)."""
+        from ..eval.public_guards import MissingPublicGuard, pair_public_rows
+
+        rows = self._anchor_rows.get(anchor_pointer)
+        if rows is None:
+            rows = self.ops.bench_rows(self.ops.fetch(anchor_pointer)) or {}
+            try:
+                pair_public_rows(rows, rows, require=require,
+                                 min_items=self.cfg.lane_b.min_public_items)
+            except MissingPublicGuard as e:
+                raise OSError(f"lane-B anchor public benchmarks unavailable: {e}") from e
+            self._anchor_rows = {anchor_pointer: rows}     # one anchor at a time
+        return rows
+
     def _funded_outcome(self, sub: LaneBSubmission, outcome: str, detail) -> None:
         self.st.outcomes.append({"round_id": "", "hotkey": sub.hotkey, "uid": int(sub.uid),
                                  "domain": sub.domain, "gen_ref": sub.gen_ref,
@@ -699,7 +1262,7 @@ class LaneBDriver:
     # ── settlement ───────────────────────────────────────────────────────────
 
     def settle(self, *, round_id: str, block: int, era_index: int, king_pointer: str,
-               work_dir: Path) -> list:
+               work_dir: Path, anchor_pointer: str | None = None) -> list:
         """Rebase every finished leg onto this settlement's king, publish the
         expert manifest, self-judge it, and queue the winners for merge.
 
@@ -708,7 +1271,15 @@ class LaneBDriver:
         settlement without its expert legs. Finished legs leave the queue only
         once the whole settlement succeeded — an I/O failure anywhere keeps
         them for the next settlement (and binds nothing this round).
-        Idempotent per ``round_id``."""
+        Idempotent per ``round_id``.
+
+        ``anchor_pointer`` (WB26, DEC-CA-0071 §3 guard 5): the era's anchor
+        king — the promotion member the validator derives from the signed
+        training manifest; the caller passes it only while suite slots are
+        configured. Every leg is tested on every suite slot (rev6.22), so
+        every settling leg carries the anchor's public rows as
+        ``public_rows["anchor"]`` (benched once per anchor), and the
+        self-judge is guarded against the same anchor."""
         from ..shared.expert_manifest import ExpertEntry, ExpertManifest, leg_label
         from .moe_model import MergeError
 
@@ -721,6 +1292,11 @@ class LaneBDriver:
                 return []
             todo = [dict(f) for f in self.st.finished]
         entries, used, dropped = [], [], []
+        # W-S2 (D35): the settlement era's §16 sentinel is no public guard nor
+        # requirement of lane B; None (unarmed) leaves every call as before
+        sentinel = self._settlement_sentinel(int(block)) if todo else None
+        require = (tuple(lb.require_public) if sentinel is None
+                   else tuple(b for b in lb.require_public if b != sentinel))
         king_dir = self.ops.fetch(king_pointer) if todo else None
         king_rows = (self.ops.bench_rows(king_dir)
                      if todo and lb.require_public else None)
@@ -728,10 +1304,16 @@ class LaneBDriver:
             from ..eval.public_guards import MissingPublicGuard, pair_public_rows
 
             try:
-                pair_public_rows(king_rows, king_rows, require=lb.require_public,
+                pair_public_rows(king_rows, king_rows, require=require,
                                  min_items=lb.min_public_items)
             except MissingPublicGuard as e:
                 raise OSError(f"lane-B king public benchmarks unavailable: {e}") from e
+        # #909: rows come from the eval pod's background bench (None = queued,
+        # the king's at tick time — RunnerLaneBOps.prebench); an unavailable
+        # candidate (or anchor) no longer stops the loop, so every candidate's
+        # bench is queued in the same settlement — the first such failure is
+        # raised after the loop, before anything is published or committed
+        bench_err: OSError | None = None
 
         def _drop(f: dict, outcome: str, detail) -> None:
             sub = f["leg"]["sub"]
@@ -765,9 +1347,25 @@ class LaneBDriver:
             declared = tuple(sub.get("targets") or (sub["domain"],))
             label = leg_label(declared)          # == the domain for a single target
             out = Path(work_dir) / f"rebased-{rid}-{sub['hotkey'][:12]}-{label}"
+            leg_dir = self.ops.fetch(f["leg_pointer"])
+            # WB27 (plan rev6.21): the levers the leg trained (recorded at
+            # dispatch; {} = every default) — the EMA choice picks the width
+            levers = dict((leg.get("funding") or {}).get("levers") or {})
+            fund = leg.get("funding") or {}
+            limits = (int(fund.get("train_tokens", 0) or 0) > 0
+                      or fund.get("gpu_measured") is False)
+            actual = leg_actuals(leg_dir) if limits else {}
+            if limits and not actual:
+                log.warning("lane B: %s/%s limits leg without its lane_b_leg record — dropped",
+                            sub["hotkey"][:8], sub["domain"])
+                _drop(f, "leg_record_missing", {"train_block": int(f["train_block"])})
+                continue
+            # plan rev6.20: the receipt check (receipt_contract_ok) bound the pod
+            # to the lane B EMA leg contract, so it scored its (chosen) EMA
+            scored = _scored_weights_for(lb, levers)
             try:
                 rebased = settle_leg(king_dir, self.ops.fetch(leg["base_king_ref"]),
-                                     self.ops.fetch(f["leg_pointer"]), sel, out,
+                                     leg_dir, sel, out,
                                      refuse_nonfinite=lb.merge_guard_at_settlement(block))
             except MergeError as e:
                 log.warning("lane B: %s/%s refused at settlement: %s", sub["hotkey"][:8],
@@ -780,10 +1378,16 @@ class LaneBDriver:
             if king_rows is not None:
                 rows = {"king": king_rows, "candidate": self.ops.bench_rows(rebased) or {}}
                 try:
-                    pair_public_rows(rows["king"], rows["candidate"], require=lb.require_public,
+                    pair_public_rows(rows["king"], rows["candidate"], require=require,
                                      min_items=lb.min_public_items)
                 except MissingPublicGuard as e:
-                    raise OSError(f"lane-B candidate public benchmarks unavailable: {e}") from e
+                    bench_err = bench_err or OSError(
+                        f"lane-B candidate public benchmarks unavailable: {e}")
+                if anchor_pointer:
+                    try:
+                        rows["anchor"] = self._anchor_bench_rows(anchor_pointer, require)
+                    except OSError as e:
+                        bench_err = bench_err or e
             entries.append(ExpertEntry(
                 miner_hotkey=sub["hotkey"], miner_uid=int(sub["uid"]), gen_ref=sub["gen_ref"],
                 domain=sub["domain"], selection=sel,
@@ -793,8 +1397,25 @@ class LaneBDriver:
                 base_king_pointer=leg["base_king_ref"], rebased_pointer=ptr,
                 corpus_digest=f["corpus_digest"], train_block=int(f["train_block"]),
                 commit_block=int(sub["commit_block"]), gpu_name=f.get("gpu_name", ""),
-                public_rows=rows, targets=declared if len(declared) > 1 else ()))
+                gpu_n=int(f.get("gpu_n", 0) or 0), public_rows=rows, targets=declared if len(declared) > 1 else (),
+                scored_weights=scored,
+                # W-IMG: logged, never enforced; absent before the activation
+                train_image_digest=(str(f.get("train_image_digest", "") or "")
+                                    if image_record_at(self.cfg, int(block)) else ""),
+                # WB23: the signed leg length (0s = no train_hours: today's bytes)
+                train_hours=float((leg.get("funding") or {}).get("train_hours", 0.0) or 0.0),
+                leg_steps=int((leg.get("funding") or {}).get("leg_steps", 0) or 0),
+                leg_guard_seconds=int((leg.get("funding") or {}).get("leg_guard_seconds", 0)
+                                      or 0),
+                levers=levers,
+                train_tokens=int(fund.get("train_tokens", 0) or 0),
+                gpu_measured=fund.get("gpu_measured") is not False,
+                trained_steps=int(actual.get("steps", 0) or 0),
+                trained_tokens=int(actual.get("tokens", 0) or 0),
+                stop=str(actual.get("stop", "") or "")))
             used.append((ptr, f, sel))
+        if bench_err is not None:
+            raise bench_err
         judgements: list = []
         digest = ""
         if entries:
@@ -803,7 +1424,10 @@ class LaneBDriver:
                                       lineage_tokens=self.st.lineage_tokens,
                                       entries=tuple(entries))
             self.ops.publish_expert_manifest(manifest)
-            judgements = self.ops.judge(manifest, rid, int(block))
+            judge_kw = {} if sentinel is None else {"sentinel": sentinel}
+            if anchor_pointer and any("anchor" in (e.public_rows or {}) for e in entries):
+                judge_kw["anchor_pointer"] = anchor_pointer     # WB26
+            judgements = self.ops.judge(manifest, rid, int(block), **judge_kw)
             digest = manifest.digest()
         # DEC-CA-0059: a leg that took at least one slot merges ONCE, however
         # many of its targets won (keyed by its judged checkpoint)
@@ -815,8 +1439,7 @@ class LaneBDriver:
             from ..validator.expert_lane import apply_judgements
 
             for w in apply_judgements(LaneBState(), judgements, round_id=rid,
-                                      settle_block=block, tiers=lb.full_pay_tiers,
-                                      qualify_only=True):
+                                      settle_block=block, qualify_only=True):
                 qualified.setdefault(w.rebased_pointer, []).append(asdict(w))
         with self._lock:
             if rid in self._abandoned:
@@ -926,6 +1549,9 @@ class LaneBDriver:
                 "leg_hours": float(lb.leg_hours),
                 "legs_per_domain": int(lb.legs_per_domain),
                 "gate_opened_block": int(self.st.gate_opened_block),
+                "open_rule": str(getattr(lb, "open_rule", OPEN_RULE_COGATE)),
+                "gate_rule": str(self.st.gate_rule),
+                "gate_closed_reason": str(self.st.gate_closed_reason),
                 "queue": queue,
                 "pending": len(self.queue.pending),
                 "open": [{"hotkey": leg.sub.hotkey, "uid": int(leg.sub.uid),
@@ -933,11 +1559,17 @@ class LaneBDriver:
                           "base_era": int(leg.base_era),
                           "experts": sum(len(v) for v in leg.selection.values()),
                           "gpu": str(leg.funding.get("gpu", "") or ""),
+                          # WB23: the leg length fixed at the fund (0 = not set)
+                          "train_hours": float(leg.funding.get("train_hours", 0.0) or 0.0),
+                          "steps": int(leg.funding.get("leg_steps", 0) or 0),
+                          "guard_seconds": int(leg.funding.get("leg_guard_seconds", 0) or 0),
                           "funded": bool(leg.funding)} for leg in self.queue.open],
                 "finished": len(self.st.finished),
                 "pending_merges": len(self.st.pending_merges),
                 "submission_progress": lane_b_progress(self.st),
                 "outcomes": list(self.st.outcomes[-16:]),
+                # WB15: declared claims waiting on held rows (``rows_held``)
+                "deferred": [dict(r) for r in self._deferred],
             }
 
     def expert_manifest_digest(self, round_id: str) -> str:
@@ -1175,6 +1807,34 @@ class LaneBDriver:
         return ptr, chosen
 
 
+def _scored_weights_for(lb, levers: dict) -> str:
+    """The ``scored_weights`` of a lane B leg: rev6.20's EMA at the WB27 chosen
+    width (``"ema010"`` by default); ``"?"`` for levers that no longer parse."""
+    from ..shared.lane_b_levers import LeversError, lane_b_scored_weights_for, levers_from_dict
+
+    try:
+        parsed = levers_from_dict(levers, lb) if levers else None
+    except LeversError:
+        return "?"
+    return lane_b_scored_weights_for(lb, None, parsed)
+
+
+def leg_actuals(leg_dir) -> dict:
+    """owner 2026-11-24: a limits leg's ``config.json`` ``lane_b_leg`` record
+    ({steps, tokens, stop}: what it trained and the limit that stopped it),
+    ``{}`` when absent or unreadable."""
+    try:
+        meta = json.loads((Path(leg_dir) / "config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    rec = meta.get("lane_b_leg") if isinstance(meta, dict) else None
+    if not isinstance(rec, dict):
+        return {}
+    try:
+        return {"steps": int(rec["steps"]), "tokens": int(rec["tokens"]),
+                "stop": str(rec["stop"])}
+    except (KeyError, TypeError, ValueError):
+        return {}
 def _latest_commitments(rows) -> dict:
     """hotkey -> its LATEST commitment row (highest ``commit_block``)."""
     out: dict = {}
@@ -1208,8 +1868,11 @@ class RunnerLaneBOps:
     sidecar, and the rolling dispatcher (or a local train when the trainer
     runs without remote hosts)."""
 
-    def __init__(self, runner, client, window_source, *, device: str = "cpu"):
+    def __init__(self, runner, client, window_source, *, device: str = "cpu", bench=None):
         self.r, self.client, self.source, self.device = runner, client, window_source, device
+        # #909: the eval-pod lane-B bench (cascade.trainer.lane_b_bench.LaneBBench);
+        # None = no --lane-b-bench-hosts: lane B fails closed, never benches here
+        self.bench = bench
 
     # ── funding (DEC-CA-0059 item 8) ─────────────────────────────────────────
 
@@ -1254,6 +1917,18 @@ class RunnerLaneBOps:
                         float(getattr(r, "chain_read_timeout_s", 60.0) or 60.0)))
                 if callable(wd) else list(self.client.poll_commitments()))
         return remember_owners(r, rows)
+
+    def king_check(self) -> dict | None:
+        """The latest lane A king check (DEC-CA-0055 ``king_check`` record)
+        of the validators' signed receipt, through the runner's verified
+        receipt read (WB17, D41 a); ``None`` when none is readable. Read only."""
+        got = self.r._receipt_king_check()
+        return None if got is None else dict(got[0])
+
+    def block_hash(self, block: int) -> str:
+        """The chain's hash of ``block`` (read-only): the era-start hash the
+        validators draw the same §16 sentinel from (WB18, D35)."""
+        return str(self.client.block_hash(int(block)))
 
     def contexts(self, domain: str, block: int) -> list:
         from ..validator.expert_lane import affinity_contexts
@@ -1303,6 +1978,8 @@ class RunnerLaneBOps:
         shared operator pool; absent capacity requeues without charging the
         miner again. Other failures are classified like a lane-A funded leg."""
         from ..funding.gpu_choice import GpuChoice
+        from ..funding.lane_b_gpus import lane_b_gpus_from_env, rent_scope
+        from ..provision.layout import layout_gpus
         from ..shared.expert_manifest import leg_label
         from .faults import _FundedOperatorFallback
         from .lane_c_driver import LegFailure
@@ -1316,29 +1993,62 @@ class RunnerLaneBOps:
                 if seeds is None or era is None:
                     raise LegFailure("no era state yet", miner_fault=False,
                                      error_class="no_capacity", burn=False)
-                contract = self.r.cfg.throne_contracts_at(int(era.start_block))[0].for_hours(
-                    self.r.cfg.lane_b.leg_hours,
-                    guard_factor=self.r.cfg.round.heat_guard_factor,
-                    guard_floor_seconds=self.r.cfg.round.heat_guard_floor_seconds)
+                base = self.r.cfg.throne_contracts_at(int(era.start_block))[0]
+                f = leg.funding
+                length = _funded_leg_length(f, base)
+                if length is not None:
+                    # WB23 (D42b): steps fixed at the fund, the lane B guard;
+                    # the record carries what this leg trains (clamped steps)
+                    f["leg_steps"] = int(length.steps)
+                # WB27 (plan rev6.21): the levers this leg trains, fixed at its
+                # dispatch block
+                spec = _leg_spec(self.r.cfg.lane_b, f, int(block))
+                # the same three steps the worker makes on the same spec:
+                # WB23 length, rev6.20 schedule, WB27 levers
+                from ..shared.lane_b_levers import apply_spec_levers, leg_length_contract
+
+                contract = leg_length_contract(self.r.cfg, base, spec)
+                # plan rev6.20: the worker derives the same leg contract
+                # (every lane B leg: EMA, no cooldown), then the WB27 levers
+                from ..shared.config.lane_b import lane_b_leg_contract
+
+                contract = lane_b_leg_contract(contract)
+                contract = apply_spec_levers(self.r.cfg.lane_b, contract, spec, int(block))
                 label = leg_label(leg.sub.declared)   # the domain for a single target
                 gen = ResolvedGenerator(hotkey=leg.sub.hotkey, uid=leg.sub.uid,
                                         ref=leg.sub.gen_ref)
-                f = leg.funding
+                # WB22 (D42): lane B rents only its own measured GPU types
+                gpus = lane_b_gpus_from_env(self.r.cfg, block=int(era.start_block))
+                # owner 2026-11-24: an own-risk GPU (no WB19 rate) rents exactly
+                # the type the miner chose, nothing else
+                own_risk = ((str(f.get("gpu", "") or ""),)
+                            if f.get("gpu_measured") is False and f.get("gpu") else ())
+                if not gpus.rent_skus() and not own_risk:
+                    raise LegFailure("no [lane_b] funded_pod_skus type has a measured "
+                                     "step rate (WB19) on the pinned image — not rented",
+                                     miner_fault=False, error_class="no_capacity", burn=False)
                 self.r._funded_leg_failures.pop(gen.hotkey, None)
+                loc = self.r.__dict__.setdefault("_leg_local_obj", threading.local())
+                loc.funded_pod_sku = ""
+                # DEC-CA-0060: the lane-B entry's own choice, never lane A's
+                choice = GpuChoice(
+                    gpu=str(f.get("gpu", "") or ""),
+                    allow_fallback=bool(f.get("gpu_allow_fallback", False)),
+                    max_price_per_hour=float(f.get("gpu_max_price_per_hour", 0.0) or 0.0))
                 try:
-                    entry = self.r._run_funded_leg(
-                        self.r._dispatcher(), gen, seeds, int(block), contract,
-                        f"-x{label}-u{leg.sub.uid}", warm_start_ref=leg.base_king_ref,
-                        contract_block=self.r._era_contract_block(era), era_index=era.index,
-                        role="expert", bench=False, domain=label,
-                        expert_selection=leg.selection,
-                        funded_queue=self.funded_queue(),
-                        # DEC-CA-0060: the lane-B entry's own choice, never lane A's
-                        gpu_choice=GpuChoice(
-                            gpu=str(f.get("gpu", "") or ""),
-                            allow_fallback=bool(f.get("gpu_allow_fallback", False)),
-                            max_price_per_hour=float(f.get("gpu_max_price_per_hour", 0.0)
-                                                     or 0.0)))
+                    with rent_scope(self.r, gpus, only=own_risk):
+                        entry = self.r._run_funded_leg(
+                            self.r._dispatcher(), gen, seeds, int(block), contract,
+                            f"-x{label}-u{leg.sub.uid}", warm_start_ref=leg.base_king_ref,
+                            contract_block=self.r._era_contract_block(era),
+                            era_index=era.index, role="expert", bench=False, domain=label,
+                            expert_selection=leg.selection,
+                            funded_queue=self.funded_queue(), gpu_choice=choice,
+                            # the leg spec the worker derives its contract from
+                            # (None = today's argv, byte-identical)
+                            **({"finetune_recipe": json.dumps(spec, sort_keys=True,
+                                                              separators=(",", ":"))}
+                               if spec else {}))
                 except _FundedOperatorFallback as e:   # incl. _FundedOperatorRent
                     q = self.funded_queue()
                     recovery = q.get(gen.hotkey) if q is not None else None
@@ -1355,6 +2065,13 @@ class RunnerLaneBOps:
                     breaker = lane_breaker_failure(e)
                     if verdict is None and breaker:
                         raise breaker["failure"] from e
+                    if verdict is None and own_risk:
+                        # owner 2026-11-24: an own-risk GPU (no WB19 rate) that
+                        # OOMs, cannot boot or crashes — the miner's shot, spent,
+                        # no requeue / refund (its key paid the rented hours)
+                        raise LegFailure(f"lane-B leg failed on own-risk GPU {own_risk[0]}: {e}",
+                                         miner_fault=True, error_class="own_risk_gpu_failed",
+                                         burn=False) from e
                     if verdict is None:
                         raise LegFailure(f"lane-B leg failed (operator side): {e}",
                                          miner_fault=False, error_class="operator_transient",
@@ -1362,8 +2079,17 @@ class RunnerLaneBOps:
                     msg, miner_fault, error_class, burn = verdict
                     raise LegFailure(msg or str(e), miner_fault=miner_fault,
                                      error_class=error_class, burn=burn) from e
+                # WB22 / WB25: the leg's GPU count is the rented layout's (every
+                # GPU of it trains); 0 = not known (no rent recorded)
+                sku = str(getattr(loc, "funded_pod_sku", "") or "")
+                from ..shared.config import image_digest
+
                 done(leg, entry.trained_pointer, entry.corpus_digest, entry.train_block,
-                     getattr(entry, "gpu_name", ""))
+                     getattr(entry, "gpu_name", ""), gpu_n=layout_gpus(sku) if sku else 0,
+                     # W-IMG: the image the leg ran (its contract's pin, which
+                     # the worker's FINAL image check enforced on the pod)
+                     train_image_digest=image_digest(str(
+                         getattr(contract, "train_image_digest", "") or "")))
             except LegFailure as f:
                 done(leg, None, failure=f)
             except Exception as e:  # noqa: BLE001 — an unclassified failure is ours
@@ -1424,6 +2150,9 @@ class RunnerLaneBOps:
                         self.r.cfg.lane_b.leg_hours,
                         guard_factor=self.r.cfg.round.heat_guard_factor,
                         guard_floor_seconds=self.r.cfg.round.heat_guard_floor_seconds)
+                    from ..shared.config.lane_b import lane_b_leg_contract
+
+                    lc = lane_b_leg_contract(lc)
                     entry = self.r.train_one(
                         gen, "challenger", seeds, block, contract=lc,
                         token_budget=lc.train_tokens, repo_suffix=suffix,
@@ -1438,11 +2167,18 @@ class RunnerLaneBOps:
         threading.Thread(target=_run, name=f"laneb-{label}", daemon=True).start()
 
     def bench_rows(self, ckpt_dir: Path) -> dict | None:
-        from ..eval.benchmarks import run_item_rows
+        """#909: the rows of ckpt_dir benched on the eval pod (cached by
+        content), or None (queued / no bench host) — NEVER the trainer box."""
+        if self.bench is None:
+            log.error("lane B bench: no --lane-b-bench-hosts configured — lane-B public rows "
+                      "are never benched on the trainer box; settlement fails closed")
+            return None
+        return self.bench.rows(Path(ckpt_dir))
 
-        ec = self.r.cfg.eval
-        return run_item_rows(ckpt_dir, project_dir=ec.benchmark_project_dir,
-                             max_series=ec.cascade_bench_max_series, device=self.device)
+    def prebench(self, pointer: str) -> None:
+        """#909: queue pointer's eval-pod bench ahead of the settlement."""
+        if self.bench is not None:
+            self.bench.prebench(pointer)
 
     def publish_expert_manifest(self, manifest) -> None:
         from ..shared.expert_manifest import expert_manifest_key, sign_expert_manifest
@@ -1454,7 +2190,8 @@ class RunnerLaneBOps:
         self.r.manifest_store().put_text(expert_manifest_key(manifest.round_id),
                                          manifest.to_json(), content_type="application/json")
 
-    def judge(self, manifest, round_id: str, block: int) -> list:
+    def judge(self, manifest, round_id: str, block: int, sentinel: str | None = None,
+              anchor_pointer: str | None = None) -> list:
         from ..validator.evaluator import evaluate_checkpoint
         from ..validator.expert_lane import judge_manifest, verdict_windows
 
@@ -1483,7 +2220,9 @@ class RunnerLaneBOps:
         return judge_manifest(manifest, king_pointer=manifest.king_pointer,
                               king_scores=_eval(manifest.king_pointer), evaluate=_eval,
                               fetch_dir=self.fetch, cfg=cfg.lane_b, seed=str(round_id),
-                              strict=cfg.lane_b.merge_guard_at_settlement(int(block)))
+                              strict=cfg.lane_b.merge_guard_at_settlement(int(block)),
+                              sentinel=sentinel,
+                              **({"anchor_pointer": anchor_pointer} if anchor_pointer else {}))
 
     def merge_scores(self, pointer: str, block: int) -> list:
         from ..validator.evaluator import evaluate_checkpoint

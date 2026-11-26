@@ -1,0 +1,5 @@
+# W3b1: the lane D gate-suite draw from the settlement boundary's block hash
+# (plan §1.3b "The draw", §16 rule 2 lane D, T7b first clause). New module:
+# gate_suite_for (the weighted, sentinel-excluding, domain-separated draw) and
+# gate_record (the {suite, block, block_hash} record for the lane D report).
+cascade/validator/lane_d_gate.py

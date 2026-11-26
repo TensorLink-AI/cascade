@@ -18,6 +18,9 @@ the pins follow it:
 
 Nothing here runs while ``[v2] train_image_digest_after`` is empty: every pin,
 file and dispatch is byte-identical to the release without it.
+
+A MarketCast leg (:func:`mkt_leg_scope`) with ``[marketcast] pod_image`` set
+rents and code-checks on that image instead — lane A never sees it.
 """
 
 from __future__ import annotations
@@ -32,7 +35,13 @@ import tomllib
 from pathlib import Path
 
 from ..shared.config import image_digest
-from ..shared.era import image_after_armed, image_decoupled_era, round_pins_at
+from ..shared.era import (
+    image_after_armed,
+    image_after_from,
+    image_decoupled_era,
+    image_epoch_from,
+    round_pins_at,
+)
 from .faults import _OperatorFault
 
 log = logging.getLogger(__name__)
@@ -74,13 +83,36 @@ def leg_round(runner):
     is ever rented on an unqualified image (and never on the old one for a
     post-switch leg)."""
     cfg = runner.cfg
+    mc = getattr(cfg, "marketcast", None)
+    if getattr(_local(runner), "mkt_leg", False) and getattr(mc, "pod_image", ""):
+        # a MarketCast leg on its own release ([marketcast] pod_image): the SKU
+        # wall table was measured for lane-A training, so its gate stays off
+        from dataclasses import replace
+
+        return replace(cfg.round, funded_pod_image=mc.pod_image,
+                       worker_code_fingerprint=mc.worker_code_fingerprint,
+                       funded_sku_wall_measured_image="")
     if not contract_runs_after(cfg, leg_contract(runner)):
         return cfg.round
     require_after_qualified(cfg, "rent")
-    return round_pins_at(cfg, int(cfg.v2.image_decoupled_from_block))
+    return round_pins_at(cfg, image_after_from(cfg))
 
 
-def proven_runtime_terms(cfg, contract, digest: str) -> tuple[str, str] | None:
+def leg_round_view(runner):
+    """:func:`leg_round` for PLANNING only (the leg wall estimate): the same
+    pins, without the qualification refusal (no log, never raises for it —
+    the rent itself still goes through :func:`leg_round`)."""
+    cfg = runner.cfg
+    mc = getattr(cfg, "marketcast", None)
+    if getattr(_local(runner), "mkt_leg", False) and getattr(mc, "pod_image", ""):
+        return leg_round(runner)
+    if not contract_runs_after(cfg, leg_contract(runner)):
+        return cfg.round
+    return round_pins_at(cfg, image_after_from(cfg))
+
+
+def proven_runtime_terms(cfg, contract, digest: str,
+                         extra_images=()) -> tuple[str, str] | None:
     """DEC-CA-0067: the PROVEN ``(train_image_digest, continuation_protocol)``
     of a leg that recorded the full ``digest`` against ``contract``, else
     None (:func:`cascade.shared.manifest.prove_runtime_terms`). Tried: the
@@ -92,6 +124,9 @@ def proven_runtime_terms(cfg, contract, digest: str) -> tuple[str, str] | None:
     base = getattr(cfg.training, "v2_contract", None)
     if base is not None and getattr(base, "train_image_digest_after", ""):
         priors = (*priors, str(base.train_image_digest))
+    # #934: images the caller recorded for this leg (the era king's own pin) —
+    # a proof, never a trust: the digest must still hash to the contract
+    priors = (*priors, *(str(i) for i in extra_images if i))
     return prove_runtime_terms(contract, str(digest or ""), priors)
 
 
@@ -135,6 +170,19 @@ def require_after_qualified(cfg, what: str) -> None:
                   "emergency only, set [v2] image_after_unqualified_override = true",
                   what, str(cfg.v2.train_image_digest_after)[:19], why)
         raise ImageAfterUnqualified(f"after image not qualified ({what}): {why}")
+
+
+@contextlib.contextmanager
+def mkt_leg_scope(runner):
+    """Mark the leg on this thread as a MarketCast leg for :func:`leg_round`
+    (its ``[marketcast] pod_image`` pins, when set)."""
+    loc = runner.__dict__.setdefault("_leg_local_obj", threading.local())
+    saved = getattr(loc, "mkt_leg", False)
+    loc.mkt_leg = True
+    try:
+        yield
+    finally:
+        loc.mkt_leg = saved
 
 
 @contextlib.contextmanager
@@ -227,17 +275,21 @@ def render_after_toml(text: str, cfg) -> str:
     worker of any release resolves the post-switch contract the orchestrator
     expects. Verified by re-parsing."""
     v2 = cfg.v2
-    rnd = round_pins_at(cfg, int(v2.image_decoupled_from_block))
+    rnd = round_pins_at(cfg, image_after_from(cfg))
     out = _set_keys(text, "v2.training", {"train_image_digest": str(v2.train_image_digest_after)})
     round_vals = {"funded_pod_image": rnd.funded_pod_image,
                   "worker_code_fingerprint": rnd.worker_code_fingerprint}
     if rnd.funded_sku_wall_measured_image:
         round_vals["funded_sku_wall_measured_image"] = rnd.funded_sku_wall_measured_image
     out = _set_keys(out, "round", round_vals)
-    out = _set_keys(out, "v2", {"image_decoupled_from_block": int(v2.image_decoupled_from_block)})
+    v2_vals = {"image_decoupled_from_block": int(v2.image_decoupled_from_block)}
+    if image_epoch_from(cfg):
+        # W-IMG: the worker resolves the same epoch-bound release block
+        v2_vals["image_after_epoch_block"] = int(image_after_from(cfg))
+    out = _set_keys(out, "v2", v2_vals)
     raw = tomllib.loads(out)
     want = {("v2", "training", "train_image_digest"): str(v2.train_image_digest_after),
-            ("v2", "image_decoupled_from_block"): int(v2.image_decoupled_from_block),
+            **{("v2", k): v for k, v in v2_vals.items()},
             **{("round", k): v for k, v in round_vals.items()}}
     for path, value in want.items():
         node = raw

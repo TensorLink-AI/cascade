@@ -1,0 +1,12 @@
+# WB15: row claims + overlap deferral (LB2 "Overlaps"; TB16, TB21).
+# The driver's tick plans declared entries first (their stored WB14 rows, in
+# reveal order: reveal block, then hotkey), defers overlapping later claims
+# uncharged, then plans ESFT entries excluding every held row; its status()
+# block gains the `deferred` list published as status/lane_b.json.
+cascade/trainer/lane_b_driver.py
+# The trainer-side queue: a submission/leg carrying declared rows, start()
+# on a declared selection, the held-row view.
+cascade/trainer/expert_lane.py
+# Optional pure planning module (claim order, holders, expected release),
+# torch-free, if the builder splits the planning out of the driver.
+cascade/trainer/row_claims.py

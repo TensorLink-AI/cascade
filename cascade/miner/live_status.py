@@ -20,7 +20,13 @@ SOURCES = {
     "lane_a_queue": "funded/latest.json",
     "lane_b_queue": "status/lane_b.json",
     "lane_c_queue": "status/lane_c.json",
+    # W17's lane D producer (cascade/validator/lane_d_status.LANE_D_STATUS_KEY);
+    # published per settlement and absent while lane D is unarmed.
+    "lane_d_queue": "status/lane_d.json",
 }
+
+# The lane D document restated in ``lanes["d"]`` (W17 schema lane-d-status/1).
+LANE_D_SUMMARY_FIELDS = ("lane", "schema", "block", "era", "boundary", "king", "house", "floors")
 
 
 class LiveStateUnavailable(RuntimeError):
@@ -66,13 +72,39 @@ def freshness(doc: dict | None, *, now: datetime, max_age: float) -> dict:
             "fresh": -30 <= age <= max_age}
 
 
+def block_freshness(doc: dict | None, *, chain: dict) -> dict:
+    """Freshness on the block clock for documents with no wall-clock stamp.
+
+    Fresh iff the document's ``block`` is at most one era (``era_blocks``)
+    behind ``status/chain.json``'s ``current_block``; a future-dated document
+    is never fresh.
+    """
+    doc = doc if isinstance(doc, dict) else None
+    block = doc.get("block") if doc else None
+    head, era_blocks = chain.get("current_block"), chain.get("era_blocks")
+    age = head - block if type(head) is int and type(block) is int else None
+    fresh = (doc is not None and age is not None and type(era_blocks) is int
+             and 0 <= age <= era_blocks)
+    return {"available": doc is not None, "block": block, "age_blocks": age, "fresh": fresh}
+
+
+def lane_d_summary(doc: dict | None) -> dict | None:
+    if not isinstance(doc, dict):
+        return None
+    summary = {"active": doc.get("lane") == "open"}
+    summary.update({key: doc.get(key) for key in LANE_D_SUMMARY_FIELDS})
+    return summary
+
+
 def status_snapshot(docs: dict, *, now: datetime, max_age: float) -> dict:
     docs = {name: value if isinstance(value, dict) else None for name, value in docs.items()}
     chain = docs.get("chain") or {}
     comp = docs.get("competition") or {}
     if isinstance(comp.get("lane_a_queue"), dict):
         docs["lane_a_queue"] = comp["lane_a_queue"]
-    clocks = {name: freshness(docs.get(name), now=now, max_age=max_age) for name in SOURCES}
+    clocks = {name: freshness(docs.get(name), now=now, max_age=max_age)
+              for name in SOURCES if name != "lane_d_queue"}
+    clocks["lane_d_queue"] = block_freshness(docs.get("lane_d_queue"), chain=chain)
     fresh = all(clocks[name]["fresh"] for name in ("chain", "competition"))
     warm_doc = comp.get("warm_start")
     warm = dict(warm_doc) if isinstance(warm_doc, dict) else {}
@@ -110,9 +142,23 @@ def status_snapshot(docs: dict, *, now: datetime, max_age: float) -> dict:
         "king": comp.get("king"),
         "admission": comp.get("admission"),
         "policy": comp.get("policy"),
-        "lanes": {"a": comp.get("lane_a"), "b": comp.get("lane_b"), "c": comp.get("lane_c")},
-        "queues": {lane: docs.get(f"lane_{lane}_queue") for lane in ("a", "b", "c")},
+        "lanes": {"a": comp.get("lane_a"), "b": comp.get("lane_b"), "c": comp.get("lane_c"),
+                  "d": lane_d_summary(docs.get("lane_d_queue"))},
+        "queues": {lane: docs.get(f"lane_{lane}_queue") for lane in ("a", "b", "c", "d")},
     }
+
+
+def lane_b_domain_info(snapshot: dict, hotkey: str | None = None) -> list[str]:
+    """Human lines for the latest settlement's lane B domain tags
+    (``lanes.b.domain_tags``, display only — owner 2026-11-25), filtered to
+    ``hotkey`` when given. Absent tags (older feeds) print nothing."""
+    from ..shared.lane_b_domains import tags_line
+
+    lb = (snapshot.get("lanes") or {}).get("b")
+    tags = lb.get("domain_tags") if isinstance(lb, dict) else None
+    return [f"Lane B domains {g.get('hotkey')}: {tags_line(g)}"
+            for g in (tags if isinstance(tags, list) else [])
+            if isinstance(g, dict) and (not hotkey or g.get("hotkey") == hotkey)]
 
 
 def fetch_snapshot(cfg, *, timeout=10.0, max_age=180.0):
@@ -204,6 +250,9 @@ def cmd_status(args: argparse.Namespace) -> int:
                 snapshot["requested_submission_fresh"] = queue_ok
             out.result(**snapshot)
             out.info(f"Competition status: {'fresh' if snapshot['fresh'] else 'stale or unavailable'}")
+            if args.lane == "b":
+                for line in lane_b_domain_info(snapshot, hotkey):
+                    out.info(line)
             if not hotkey:
                 out.info(f"Warm start: {snapshot['warm_start'].get('pointer') or snapshot['warm_start'].get('mode', 'unavailable')}")
                 seed = snapshot.get("seed") or {}

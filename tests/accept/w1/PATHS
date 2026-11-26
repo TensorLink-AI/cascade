@@ -1,0 +1,7 @@
+# W1 measurement (plan §3.0 W1 row; rev6.12 (a)/(b), rev6.14 forward clock).
+# W1 is a builder-run measurement: its implementation is the measurement
+# script, its unit tests and the read-only CI workflow that runs it with the
+# forge mirror synced down. README.md has the contract.
+scripts/laned_w1_measure.py
+tests/unit/test_laned_w1_measure.py
+.github/workflows/laned-w1-measure.yml

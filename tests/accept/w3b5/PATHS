@@ -1,0 +1,18 @@
+# W3b5 REMOVED (plan rev6.18 A7, owner 2026-11-23; F4): the A10 low-frequency
+# check's code, report schema block, audit rule and config key are deleted.
+# README.md has the contract.
+# settle_lane_d: no A10 slice, no lowfreq block, no lowfreq_regression.
+cascade/validator/lane_d.py
+# The deleted module (kept listed so the removal is in scope).
+cascade/validator/lane_d_lowfreq.py
+# The report validator and schema file: no verdicts[].lowfreq, no reason.
+cascade/validator/lane_d_report.py
+cascade/validator/schemas/lane_d_report_1.json
+# The audit: no _lowfreq_problem, no chain-mode lowfreq rule.
+cascade/audit/lane_d.py
+cascade/audit/lane_d_chain.py
+# The config key: lowfreq_freqs retired (RETIRED_KEYS["lane_d"]).
+cascade/shared/config/lane_d.py
+cascade/shared/config/loader.py
+chain.toml
+chain.testnet.toml

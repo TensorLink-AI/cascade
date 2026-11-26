@@ -1,0 +1,23 @@
+# Coupled implementation batches (accept --help, COUPLED rule; status, L2).
+#
+# LEGACY since plan rev6.17 (owner 2026-11-23, one PR per feature): the
+# FEATURE rule lets any laned:* PR carry any number of WPs with overlapping
+# PATHS, so check-pr no longer reads this file and nothing new is declared
+# here. `accept` (built_on, CROSS) and `status` still read it, harmlessly, so
+# the squash merge of a set listed below stays each member's L2 commit by the
+# git-only rule. The text below is the original declaration.
+#
+# One set per line: WP ids separated by blanks; `#` starts a comment. Only the
+# EXACT set on a line may be one implementation PR despite overlapping PATHS
+# and more than 3 WPs; every member still runs its full Accept, ledger row and
+# CROSS, and any other overlap is refused as before. `accept` and `status`
+# read this file at the base / board ref, never from the PR, and only a W0c PR
+# may edit scripts/laned/, so a PR can never declare its own WPs coupled.
+#
+# Lane D rev6.10-rev6.12 (orchestrator decision 2026-11-23): embargo-aware
+# eligibility (W5a), the fresh-first per-bin draw (W5j), the signed per-window
+# embargo / draw records (W7a), and their independent re-derivation in the
+# replay (W7d) and the audit (W9). All five touch cascade/validator/lane_d.py
+# or must change with it; split, each intermediate main is red (the replay and
+# audit cannot re-derive the per-feed embargo before W7a signs it).
+W5a W5j W7a W7d W9

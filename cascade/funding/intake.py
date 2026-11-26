@@ -91,7 +91,15 @@ transfers):
     → 400 missing_target / bad_target / unknown_target / missing_lium_api_key /
           stale_timestamp / bad_signature | 403 not_revealed / not_registered |
           409 replayed_timestamp | 409 competition_ended (its until_block
-          passed: nothing new is admitted) | 503 lane_c_disabled
+          passed: nothing new is admitted) | 409 lane_ended (#931: the
+          lane-wide [lane_c] until_block in force passed; body carries
+          until_block; nothing queued, no key kept) | 503 lane_c_disabled
+      #931: a 202/200 into a lane whose share (or competition whose weight)
+      is 0 in the config in force carries "pay_warning" (accepted: a paused
+      lane can resume). Queued entries of an ended lane / competition are
+      released on the next lane request: status "failed", last_error_class
+      "lane_ended" / "competition_ended", nothing charged, the key forgotten
+      unless another live entry or pod still needs it.
       The entry queues into the LANE-C queue (``lane_c_queue.json`` beside the
       challenger queue — never the challenger queue) and the key lands in the
       shared payer vault (one key per hotkey). It consumes NO lane-A lifetime
@@ -114,12 +122,34 @@ transfers):
                          hotkey, "<targets as sent>|<ref>", ts, sha256(key))
         X-Submission-Label, X-Gpu-Type / X-Gpu-Allow-Fallback /
                          X-Gpu-Max-Price (optional, as /v1/fund)
+        X-Lane-B-Declared-Rows (optional, WB14 / LB2): the expert rows the
+                         leg trains, a JSON object keyed by MoE ordinal
+                         (``{"0": [3, 17, 40, 90], "4": [...]}``), each layer
+                         with rows inside the ``[lane_b]`` per-layer clamp;
+                         when sent, the signed ref field gains
+                         ``|rows=<sha256 of the canonical rows>`` (see
+                         :func:`lane_b_signed_ref`). Absent = the trainer picks.
     → 202 {"status": "queued" | "replaced" | "queued-behind", "lane": "b",
            "targets": […]} | 200 "already-queued"
     → 400 missing_targets / bad_targets / unknown_target / too_many_targets /
+          declared_rows_out_of_range / declared_rows_bad_layer /
+          declared_rows_count / declared_rows_malformed /
           missing_lium_api_key / stale_timestamp / bad_signature |
           403 not_revealed / not_registered | 409 replayed_timestamp |
+          409 lane_ended (#931, as lane C: [lane_b] until_block) |
           503 lane_b_disabled
+      WB13 / LB1, only while ``[lane_b] contamination_hashset`` is pinned
+      (unpinned: none of this, the reply is unchanged): after the identity
+      gate the committed tree is fetched and statically scanned (never run)
+      against the pinned hash set; the 202/200 reply and the queue entry
+      carry ``"contamination": {hashset_version, result, suite, window_id}``.
+    → 400 benchmark_series_embedded (+ "contamination") |
+      413 repo_too_large (D38: a ``suite:*`` tree over
+          ``[lane_b] suite_target_max_repo_mb``) |
+      413 contamination_budget_exceeded (+ "contamination"; the bounded
+          scan ran past its window budget or deadline; uncharged) |
+      503 contamination_hashset_unavailable / repo_unavailable /
+          contamination_scan_failed (fail closed; nothing queued or vaulted)
       Queues into the LANE-B queue (``lane_b_queue.json`` beside the
       challenger queue); the key lands in the shared payer vault. No lane-A
       lifetime submission is consumed; infra faults requeue without burning,
@@ -151,6 +181,7 @@ requeues without burning.
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import json
 import logging
@@ -158,7 +189,9 @@ import threading
 import time
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
+from ..shared.lane_b_leg import TRAIN_HOURS_HEADER
 from .gpu_choice import GpuCatalog, GpuChoice, parse_gpu_headers, wall_warning
 from .queue import LIVE_LEG_PHASES, FundedQueue
 from .vault import PayerKeyVault
@@ -166,12 +199,36 @@ from .vault import PayerKeyVault
 __all__ = [
     "FRESHNESS_WINDOW_SECONDS",
     "FundingIntake",
+    "LANE_B_DECLARED_ROWS_HEADER",
     "canonical_fund_message",
     "header_key_digest",
     "verify_hotkey_signature",
 ]
 
 log = logging.getLogger("cascade.funding.intake")
+
+# FundingIntake's default for the WB13 keywords: "not wired" (distinct from
+# an explicit None, which a wired, pinned intake answers 503).
+_UNWIRED = object()
+# RV6 B6: scan receipts an intake remembers (by content-pinned ref + pin).
+_LANE_B_SCAN_CACHE_SIZE = 4096
+
+
+def _hashset_pin(hashset: object) -> str | None:
+    """The ``[lane_b] contamination_hashset`` pin a loaded hash set answers
+    for. The bounded lookup ``load_pinned_hashset`` returns carries the pin
+    ``load_lookup`` verified (``.pin``; RV7 B3), so it is never serialised.
+    A plain dict artefact (embedders, tests) is digested with WB11
+    ``artefact_sha256``. Anything else has no known pin (``None``: the
+    pinned intake fails closed, 503)."""
+    pin = getattr(hashset, "pin", None)
+    if isinstance(pin, str) and pin:
+        return pin
+    if isinstance(hashset, dict):
+        from ..eval.contamination import artefact_sha256
+
+        return artefact_sha256(hashset)
+    return None
 
 # Replay bound on the signed timestamp. Funding is idempotent, so the only
 # replay of consequence is re-queueing after a withdraw — a five-minute
@@ -186,6 +243,10 @@ _ACTIONS = ("fund", "withdraw", "submit", "credentials",
 
 LANE_C_TARGET_HEADER = "X-Lane-C-Target"
 LANE_B_TARGETS_HEADER = "X-Lane-B-Targets"
+# WB14 / LB2: the optional miner-declared expert rows of a lane B fund, a
+# JSON object keyed by MoE ordinal (``{"0": [3, 17, ...], "4": [...]}``).
+LANE_B_DECLARED_ROWS_HEADER = "X-Lane-B-Declared-Rows"
+_DECLARED_ROWS_SIGNED_TAG = "rows="
 
 
 def lane_b_targets(header_value: str) -> tuple[str, ...]:
@@ -194,14 +255,53 @@ def lane_b_targets(header_value: str) -> tuple[str, ...]:
     return tuple(t.strip() for t in str(header_value or "").split(",") if t.strip())
 
 
-def lane_b_signed_ref(targets, ref: str) -> str:
+def lane_b_signed_ref(targets, ref: str, declared_rows=None, *, train_hours: str = "",
+                      levers: str = "", train_tokens: str = "") -> str:
     """The ``ref`` field a lane-B request signs: ``"<t1>,<t2>|<ref>"`` with
     the targets EXACTLY as the request lists them — the signature binds the
     declared targets and the ref (and, through the canonical message, the key
-    digest). The queue stores them in the ``[lane_b]`` slot order."""
+    digest). The queue stores them in the ``[lane_b]`` slot order.
+
+    With declared rows (WB14, the parsed ``X-Lane-B-Declared-Rows``) the field
+    is ``"<targets>|<ref>|rows=<sha256 of the canonical rows JSON>"``
+    (:func:`cascade.trainer.declared_rows.declared_rows_digest`), so the
+    signature binds the rows too; without them it is today's field byte for
+    byte. A ref never contains ``|``, so the two forms cannot collide.
+
+    With ``train_hours`` (WB23, the ``X-Lane-B-Train-Hours`` value as sent)
+    ``"|hours=<value>"`` is appended after everything else, so the signature
+    binds the leg length; without it the field is unchanged.
+
+    With ``levers`` (WB27, the ``X-Lane-B-Levers`` value as sent)
+    ``"|levers=<sha256 of it>"`` is appended last; without it the field is
+    unchanged."""
+    from ..shared.lane_b_leg import train_hours_tag
     from .queue import lane_b_entry_ref
 
-    return lane_b_entry_ref(targets, ref)
+    signed = lane_b_entry_ref(targets, ref)
+    if declared_rows is not None:
+        from ..trainer.declared_rows import declared_rows_digest
+
+        signed = f"{signed}|{_DECLARED_ROWS_SIGNED_TAG}{declared_rows_digest(declared_rows)}"
+    tag = train_hours_tag(train_hours)
+    signed = f"{signed}|{tag}" if tag else signed
+    # owner 2026-11-24: the token limit as sent, after the hours
+    from ..shared.lane_b_leg import train_tokens_tag
+
+    ttag = train_tokens_tag(train_tokens)
+    signed = f"{signed}|{ttag}" if ttag else signed
+    from ..shared.lane_b_levers import levers_tag
+
+    ltag = levers_tag(levers)
+    return f"{signed}|{ltag}" if ltag else signed
+
+
+def _replace_catalog(cat, sku: str):
+    """``cat`` with ``sku`` added (an own-risk lane B type, owner 2026-11-24)."""
+    from dataclasses import replace as _r
+
+    skus = tuple(cat.skus or ())
+    return _r(cat, skus=skus if any(s.lower() == sku.lower() for s in skus) else (*skus, sku))
 
 
 def lane_c_signed_ref(target: str, ref: str) -> str:
@@ -391,15 +491,37 @@ class FundingIntake:
         lane_c_targets: tuple[str, ...] | None = None,
         mkt_suites: tuple[str, ...] = (),
         lane_c_closed: Callable[[str], str | None] | None = None,
+        lane_c_cfg: object | None = None,         # [lane_c] in force (LaneCConfig)
+        head_block: Callable[[], int | None] | None = None,   # #931: chain head
         gpu_catalog: GpuCatalog | None = None,
+        lane_b_gpus: object | None = None,        # WB22 LaneBGpus; None = lane A's catalog
+        mkt_gpu_catalog: GpuCatalog | None = None,  # MarketCast GPUs; None = lane A's catalog
+        lane_b_landing: Callable[[int], dict | None] | None = None,  # WB23 landing estimate
+        lane_b_contract: object | None = None,    # WB23 base contract (steps cap); None = no cap
         lane_b_queue: object | None = None,       # funding LaneBQueue; None = lane B off
         resolve_lane_b_reveal: Callable[[str, tuple, str], int | None] | None = None,
         lane_b_targets: tuple[str, ...] | None = None,
         lane_b_max_targets: int | None = None,
+        lane_b_cfg: object | None = None,         # loaded [lane_b] (LaneBConfig)
+        lane_b_hashset: object = _UNWIRED,        # WB13: the pinned WB11 hash set
+        fetch_lane_b_repo: object = _UNWIRED,     # WB13: ref -> submitted tree
         lane_a_admission: Callable[[int | None], tuple[int, dict] | None] | None = None,
+        lane_a_until_block: int = 0,              # W-LAUNCH [round] lane_a_until_block
         pod_live: Callable[[str], bool] | None = None,
         on_withdrawn: Callable[[str], None] | None = None,
+        lane_refresh: Callable[[FundingIntake], None] | None = None,
+        # DEC-CA-0075 (item 3): (pin, key) -> the verified hash set, called
+        # when the [lane_b] pin in force (an adopted overlay) is not the one
+        # loaded; raises on a missing / mismatched artefact (fail closed)
+        load_lane_b_hashset: Callable[[str, str], object] | None = None,
     ) -> None:
+        # ``lane_refresh(intake)``: called at every lane-B / lane-C entry point
+        # before the lane's on/off check. The production intake (main.py) passes
+        # an ``EffectiveLanes`` that re-points the lane attributes below at the
+        # config in force at the current block (the adopted DEC-CA-0057
+        # overlay, read-only) so ``--lane-b/--lane-c auto`` open and close with
+        # no restart. None = the lanes are fixed at construction.
+        self.lane_refresh = lane_refresh
         # ``on_withdrawn(hotkey)``: the entry left the queue by the miner's
         # hand — any operator make-good request still parked for it is moot
         # (2026-11-04: a withdrawn 5GhPUmHV kept a pending $89 request alive).
@@ -412,6 +534,15 @@ class FundingIntake:
         self.pod_live = pod_live
         self.direct_intake = direct_intake
         self.lane_a_admission = lane_a_admission
+        # W-LAUNCH lane A shutdown (``[round] lane_a_until_block``; 0 = off):
+        # once ``head_block()`` reaches it a new lane A fund (``/v1/fund``, a
+        # ``/v1/submit`` carrying a payer key) is refused 409 ``lane_ended``
+        # before the key is vaulted, and not yet started lane A entries are
+        # released (nothing charged; the vaulted key is left to its TTL — the
+        # king's own-key leg may share it). A plain ``/v1/submit`` (store
+        # only, no key) stays open: lane B legs may name a vault ref. The key
+        # rotation ``/v1/credentials`` (the king's own leg) is untouched.
+        self.lane_a_until_block = max(0, int(lane_a_until_block or 0))
         # DEC-CA-0059 item 8 lane B: the domain-expert funding queue + its
         # reveal oracle ``(hotkey, targets, ref) -> reveal block | None`` (the
         # hotkey's revealed ``metro-v1:expert:`` commitment must declare
@@ -423,10 +554,55 @@ class FundingIntake:
         self.lane_b_targets = tuple(lane_b_targets) if lane_b_targets is not None else None
         self.lane_b_max_targets = (int(lane_b_max_targets) if lane_b_max_targets is not None
                                    else None)
+        # WB14 / LB2: the loaded ``[lane_b]`` config whose ``min_experts_frac``
+        # / ``max_experts_frac`` clamp a declared-rows header. None (dev, no
+        # chain config) = the config's shipped defaults.
+        self.lane_b_cfg = lane_b_cfg
+        # WB13 / LB1: while ``[lane_b] contamination_hashset`` is pinned every
+        # lane B fund is scanned (never executed) against ``lane_b_hashset``,
+        # the artefact that pin names, on the tree ``fetch_lane_b_repo(ref)``
+        # materialises (a path or None; it may raise). Unpinned, neither is
+        # used. The artefact's digest is computed once, here. An intake built
+        # with NEITHER keyword (embedders that predate WB13) does not run the
+        # check; one given either runs it and fails closed on a missing
+        # artefact or fetch (None). The production intake (main.py) always
+        # passes both.
+        self._lane_b_check_wired = not (lane_b_hashset is _UNWIRED
+                                        and fetch_lane_b_repo is _UNWIRED)
+        self.lane_b_hashset = None if lane_b_hashset is _UNWIRED else lane_b_hashset
+        self.fetch_lane_b_repo = None if fetch_lane_b_repo is _UNWIRED else fetch_lane_b_repo
+        self._lane_b_hashset_sha: str | None = None
+        self.load_lane_b_hashset = load_lane_b_hashset
+        # RV6 B6: scan receipts by (content-pinned ref, hash-set pin), per
+        # intake, bounded (oldest evicted first).
+        self._lane_b_scan_lock = threading.Lock()
+        self._lane_b_scan_cache: collections.OrderedDict = collections.OrderedDict()
+        if not self._lane_b_check_wired and self._lane_b_pin():
+            log.warning("lane-B intake built without lane_b_hashset / fetch_lane_b_repo: "
+                        "the contamination check is NOT run although [lane_b] "
+                        "contamination_hashset is pinned")
+        if self.lane_b_hashset is not None:
+            self._lane_b_hashset_sha = _hashset_pin(self.lane_b_hashset)
         # DEC-CA-0060: the SKUs a fund request may choose (``[round]
         # funded_pod_skus``) and the walls behind the fund-time warning. None
         # = no chain config (dev): any well-formed SKU, no warning.
         self.gpu_catalog = gpu_catalog
+        # WB22 (D42): lane B's OWN GPU list (``[lane_b] funded_pod_skus``) and
+        # the WB19 step-rate gate (``lane_b_gpus.LaneBGpus``). None = lane B
+        # funds read ``gpu_catalog`` with no rate gate (unit construction only;
+        # the production intake always wires it, main.gpu_catalogs).
+        self.lane_b_gpus = lane_b_gpus
+        # owner 2026-11-24: a MarketCast (mkt family) lane-C fund's GPU list
+        # (``mkt_gpus.mkt_catalog``: [marketcast] funded_pod_skus recommended,
+        # any other Lium type at the miner's own risk). None = lane A's catalog
+        # (unit construction; the production intake wires it, main.gpu_catalogs).
+        self.mkt_gpu_catalog = mkt_gpu_catalog
+        # WB23: ``lane_b_landing(guard_seconds) -> {target_boundary, era_index,
+        # cross_era} | None`` (the miner sees where a leg of that wall lands;
+        # it never fails a fund) and the contract a lane B leg derives from
+        # (its reference steps cap the steps fixed at the fund)
+        self.lane_b_landing = lane_b_landing
+        self.lane_b_contract = lane_b_contract
         # DEC-CA-0056 lane C: the fine-tune queue + its reveal oracle
         # ``(hotkey, target, ref) -> reveal block | None`` (the hotkey's
         # revealed ``metro-v1:ft:`` commitment must name exactly them), and
@@ -442,6 +618,16 @@ class FundingIntake:
         # None`` at the current chain block — a competition past its
         # ``until_block`` admits nothing new (None = no end check: dev)
         self.lane_c_closed = lane_c_closed
+        # #931 kill switches: the ``[lane_c]`` in force (``EffectiveLanes``
+        # re-points it with ``lane_b_cfg``) and ``head_block() -> int | None``
+        # (the chain head; None / raising = unknown: admit, the trainer never
+        # dispatches an ended lane). With both, a lane (or lane-C
+        # competition) whose ``until_block`` the head reached refuses new
+        # funds 409 ``lane_ended`` / ``competition_ended`` before the key is
+        # vaulted, and its not yet started entries are released (nothing
+        # charged). None = no kill-switch check (unit construction / dev).
+        self.lane_c_cfg = lane_c_cfg
+        self.head_block = head_block
         # marketplace → PayerKeyVault for direct-MoE gangs (Lium shares ``vault``).
         self.compute_vaults = compute_vaults or {}
         self.queue = queue
@@ -474,6 +660,7 @@ class FundingIntake:
             self.vault.purge_expired()
         except Exception:  # noqa: BLE001 — purge is best-effort housekeeping
             log.exception("vault TTL purge failed (will retry next request)")
+        self._release_lane_a()
         try:
             def eligible(hotkey, ref):
                 block = self.resolve_reveal(hotkey, ref)
@@ -483,6 +670,41 @@ class FundingIntake:
         except Exception:  # noqa: BLE001 — sweep is best-effort by design
             log.exception("pending-reveal sweep failed (will retry next request)")
             return 0
+
+    def _lane_a_head(self) -> int | None:
+        """The chain head for the lane A cutoff, or None when no cutoff is set
+        (no chain read) or the head is unknown (admit)."""
+        return self._head() if self.lane_a_until_block > 0 else None
+
+    def _lane_a_ended(self) -> tuple[int, dict] | None:
+        """W-LAUNCH: the typed ``409 lane_ended`` refusing a new lane A fund
+        once ``[round] lane_a_until_block`` is reached, else None."""
+        from .lane_ends import lane_a_refusal
+
+        body = lane_a_refusal(self.lane_a_until_block, self._lane_a_head())
+        if body is None:
+            return None
+        log.info("lane-A fund refused: %s", body["message"])
+        return 409, body
+
+    def _release_lane_a(self) -> None:
+        """W-LAUNCH: release (fail, nothing charged) every not yet started
+        lane A entry once the cutoff is in force. In-flight legs are never
+        touched; keys stay vaulted until their TTL. Never raises."""
+        if self.lane_a_until_block <= 0:
+            return
+        from .lane_ends import lane_a_released_why
+
+        try:
+            head = self._lane_a_head()
+            why = lane_a_released_why(self.lane_a_until_block, head)
+            if why is None:
+                return
+            for hk in self.queue.release_unstarted(why):
+                log.warning("lane-A entry %s released at block %d: lane A ended at %d "
+                            "(not trained, nothing charged)", hk, head, self.lane_a_until_block)
+        except Exception:  # noqa: BLE001 — housekeeping never fails a request
+            log.exception("lane-A ended-lane release failed (retried next request)")
 
     # ── request handling (returns (http_status, body_dict)) ──────────────────
 
@@ -616,9 +838,14 @@ class FundingIntake:
         from .providers import header_credentials
 
         try:
-            header_credentials(headers)
+            funded = bool(header_credentials(headers))
         except ValueError as exc:
             return 400, {"code": "bad_provider_credentials", "message": str(exc)}
+        if funded:
+            # W-LAUNCH: a submit carrying a payer key funds a lane A leg
+            ended = self._lane_a_ended()
+            if ended is not None:
+                return ended
         hotkey = (headers.get("X-Miner-Hotkey") or "").strip()
         if not hotkey:
             return 400, {"code": "missing_hotkey",
@@ -768,6 +995,9 @@ class FundingIntake:
         from .gpu_choice import join_segments, parse_budget_header
 
         self.sweep_pending()
+        ended = self._lane_a_ended()      # W-LAUNCH: before the key is vaulted
+        if ended is not None:
+            return ended
         choice, segment, gpu_err = self._gpu_choice(headers)
         if gpu_err is not None:
             return 400, gpu_err
@@ -951,6 +1181,96 @@ class FundingIntake:
             log.warning("withdraw %s: funded ledger unreadable (%s) — key retained", hotkey, e)
             return True
 
+    def _refresh_lanes(self) -> int | None:
+        """Run the ``lane_refresh`` hook, then release the not yet started
+        entries of an ended lane (#931). Returns the chain head (None =
+        unknown or unwired). Never fails a request."""
+        hook = self.lane_refresh
+        if hook is not None:
+            try:
+                hook(self)
+            except Exception:  # noqa: BLE001 — a config view read never fails a request
+                log.exception("lane config refresh failed; keeping the lanes as they are")
+        head = self._head()
+        if head is not None:
+            self._release_ended(head)
+        return head
+
+    def _head(self) -> int | None:
+        """The chain head for the kill-switch checks; None when unwired or
+        the read failed (admit: the trainer never dispatches an ended lane)."""
+        if self.head_block is None:
+            return None
+        try:
+            head = self.head_block()
+        except Exception as e:  # noqa: BLE001 — a chain flake never fails a request
+            log.warning("lane end check: chain head read failed (%s); admitting", e)
+            return None
+        return None if head is None else int(head)
+
+    def _release_ended(self, head: int) -> None:
+        """#931: release (fail, nothing charged) the queued entries of a lane
+        B / lane C (or lane-C competition) that ended at ``head`` and forget
+        the released payers' keys when nothing else still needs them."""
+        from .lane_ends import release_ended
+
+        for lane, q, cfg in (("b", self.lane_b_queue, self.lane_b_cfg),
+                             ("c", self.lane_c_queue, self.lane_c_cfg)):
+            try:
+                released = release_ended(lane, q, cfg, head)
+            except Exception:  # noqa: BLE001 — housekeeping never fails a request
+                log.exception("lane-%s ended-lane release failed (retried next request)",
+                              lane.upper())
+                continue
+            for hk in released:
+                kept = self._forget_released_key(hk)
+                log.warning("lane-%s entry %s released at block %d: its lane / competition "
+                            "ended (not trained, nothing charged); key %s", lane.upper(), hk,
+                            head, "retained (another live claim)" if kept else "forgotten")
+
+    def _forget_released_key(self, hotkey: str) -> bool:
+        """Forget ``hotkey``'s vaulted key after a release unless something
+        still needs it: a live entry in any lane's queue, a pod on the
+        funded ledger, or direct-MoE funding (it shares the Lium vault).
+        Returns True when the key was retained."""
+        if self.direct_intake is not None:
+            return True
+        for q in (self.queue, self.lane_b_queue, self.lane_c_queue):
+            if q is None:
+                continue
+            try:
+                e = q.get(hotkey)
+            except Exception:  # noqa: BLE001 — unreadable queue: custody fails closed
+                return True
+            if e is not None and (e.status not in ("done", "failed", "withdrawn")
+                                  or (e.phase or "") in LIVE_LEG_PHASES):
+                return True
+        if self._pod_live(hotkey):
+            return True
+        self.vault.remove(hotkey)
+        return False
+
+    def _lane_ended(self, lane: str, head: int | None, *, target: str | None = None,
+                    ) -> tuple[int, dict] | None:
+        """The typed ``409`` refusing a new lane-``lane`` fund at ``head``
+        (``lane_ended`` / ``competition_ended``, with the end block), else
+        None."""
+        from .lane_ends import fund_refusal
+
+        cfg = self.lane_b_cfg if lane == "b" else self.lane_c_cfg
+        body = fund_refusal(lane, cfg, head, target=target)
+        if body is None:
+            return None
+        log.info("lane-%s fund refused: %s", lane.upper(), body["message"])
+        return 409, body
+
+    def _pay_warning(self, lane: str, body: dict, *, target: str | None = None) -> dict:
+        from .lane_ends import pay_warning
+
+        warn = pay_warning(lane, self.lane_b_cfg if lane == "b" else self.lane_c_cfg,
+                           target=target)
+        return {**body, "pay_warning": warn} if warn else body
+
     # ── lane C (DEC-CA-0056) ─────────────────────────────────────────────────
 
     def _lane_c_request(self, action: str, headers, gpu_segment: str = "",
@@ -982,6 +1302,10 @@ class FundingIntake:
             return 400, {"code": "unknown_target",
                          "message": f"{target!r} is not a lane-C target; choose one of "
                                     + ", ".join(self.lane_c_targets)}
+        if action == "lane-c-fund":
+            ended = self._lane_ended("c", self._head(), target=target)
+            if ended is not None:
+                return ended
         if action == "lane-c-fund" and self.lane_c_closed is not None:
             why = self.lane_c_closed(target)
             if why:
@@ -1005,11 +1329,17 @@ class FundingIntake:
         queue) and vaults the key in the shared payer vault — the same key a
         hotkey's other legs rent on (one key per hotkey, rotated by
         ``/v1/credentials``). Consumes NO lane-A lifetime submission."""
+        head = self._refresh_lanes()
         try:
-            self.lane_c_queue.expire_stale()      # type: ignore[union-attr]
+            if self.lane_c_queue is not None:     # off: the gate below answers 503
+                self.lane_c_queue.expire_stale()
         except Exception:  # noqa: BLE001 — housekeeping never fails a request
             log.exception("lane-C queue TTL sweep failed")
-        choice, segment, gpu_err = self._gpu_choice(headers)
+        if self.lane_c_queue is not None:
+            ended = self._lane_ended("c", head)    # lane-wide end: before anything else
+            if ended is not None:
+                return ended
+        choice, segment, gpu_err, own_risk_warn = self._lane_c_gpu_choice(headers)
         if gpu_err is not None:
             return 400, gpu_err
         status, ctx = self._lane_c_request("lane-c-fund", headers, gpu_segment=segment)
@@ -1046,14 +1376,62 @@ class FundingIntake:
         log.info("lane-C fund %s: %s target=%s (reveal_block=%d%s)", hotkey, outcome, target,
                  reveal_block, f", gpu={choice.gpu}" if choice.chosen else "")
         if outcome == "already-queued":
-            return 200, self._gpu_reply(
+            body = self._gpu_reply(
                 {"status": "already-queued", "lane": "c", "target": target}, choice)
-        return 202, self._gpu_reply({"status": outcome, "lane": "c", "target": target}, choice)
+            body = self._pay_warning("c", body, target=target)
+            return 200, ({**body, "warning": own_risk_warn, "gpu_own_risk": True}
+                         if own_risk_warn else body)
+        body = self._gpu_reply({"status": outcome, "lane": "c", "target": target}, choice)
+        body = self._pay_warning("c", body, target=target)
+        return 202, ({**body, "warning": own_risk_warn, "gpu_own_risk": True}
+                     if own_risk_warn else body)
+
+    def _lane_c_gpu_choice(self, headers) -> tuple[GpuChoice, str, dict | None, str]:
+        """``(choice, signed_segment, error, own_risk_warning)`` of a lane-C
+        fund. A MarketCast (``mkt`` family) target checks the choice against
+        the MarketCast list (owner 2026-11-24: ``[marketcast] funded_pod_skus``
+        recommended, ANY other well-formed Lium type at the miner's own risk,
+        Shadeform never); any other lane-C target keeps ``[round]`` lane A's
+        catalog. Header-only, before the signature."""
+        cat = self.mkt_gpu_catalog
+        target = (headers.get(LANE_C_TARGET_HEADER) or "").strip()
+        try:
+            from ..shared.config.lane_c import is_mkt_family
+
+            mkt = is_mkt_family(target)
+        except ImportError:   # pragma: no cover — shared lane-C config not shipped
+            mkt = False
+        if cat is None or not mkt:
+            return (*self._gpu_choice(headers), "")
+        from .gpu_choice import GPU_HEADER
+        from .mkt_gpus import own_risk_gpu, own_risk_warning, with_own_risk
+        from .providers import CREDENTIALS_HEADER
+
+        gpu = (headers.get(GPU_HEADER) or "").strip()
+        bundle = bool((headers.get(CREDENTIALS_HEADER) or "").strip())
+        own = own_risk_gpu(gpu, cat, bundle=bundle)
+        choice, segment, err = parse_gpu_headers(headers, with_own_risk(cat, own) if own else cat)
+        if err is not None and err.get("code") == "unknown_gpu" and gpu and bundle:
+            from .mkt_gpus import LIUM_ONLY
+
+            err = {"code": LIUM_ONLY,
+                   "message": f"{gpu!r} is not on the recommended MarketCast GPU list "
+                              f"({', '.join(cat.skus or ()) or 'none'}); another type is "
+                              "accepted at your own risk only with a plain Lium key "
+                              "(X-Lium-Api-Key) — MarketCast GPUs rent on Lium only"}
+        if err is not None:
+            return GpuChoice(), "", err, ""
+        warn = own_risk_warning(choice.gpu, cat) if own and choice.chosen else ""
+        if warn:
+            log.warning("lane-C fund: own-risk MarketCast GPU %s (not in [marketcast] "
+                        "funded_pod_skus)", choice.gpu)
+        return choice, segment, None, warn
 
     def lane_c_withdraw(self, headers) -> tuple[int, dict]:
         """Withdraw a still-queued lane-C entry (``POST /v1/lane-c/withdraw``).
         The vaulted key is NOT forgotten here: it is shared with the hotkey's
         other legs (use ``/v1/withdraw`` to forget it)."""
+        self._refresh_lanes()
         status, ctx = self._lane_c_request("lane-c-withdraw", headers)
         if status is not None:
             return status, ctx
@@ -1096,8 +1474,28 @@ class FundingIntake:
             return 400, {"code": "too_many_targets",
                          "message": f"{len(sent)} targets > [lane_b] max_domains_per_leg = "
                                     f"{self.lane_b_max_targets}"}
+        declared_rows = None
+        if action == "lane-b-fund":
+            status, parsed = self._declared_rows(headers)
+            if status is not None:
+                return status, parsed
+            declared_rows = parsed.get("rows")
+        # WB23: the fund's train_hours header, as sent, is bound by the signature
+        hours_raw = ((headers.get(TRAIN_HOURS_HEADER) or "").strip()
+                     if action == "lane-b-fund" else "")
+        # WB27: the fund's levers header, as sent, is bound by the signature
+        from ..shared.lane_b_levers import LEVERS_HEADER
+
+        levers_raw = ((headers.get(LEVERS_HEADER) or "").strip()
+                      if action == "lane-b-fund" else "")
+        from ..shared.lane_b_leg import TRAIN_TOKENS_HEADER
+
+        tokens_raw = ((headers.get(TRAIN_TOKENS_HEADER) or "").strip()
+                      if action == "lane-b-fund" else "")
         try:
-            signed = lane_b_signed_ref(sent, ref) if ref else None
+            signed = (lane_b_signed_ref(sent, ref, declared_rows, train_hours=hours_raw,
+                                        levers=levers_raw, train_tokens=tokens_raw)
+                      if ref else None)
         except ValueError as e:
             return 400, {"code": "bad_ref", "message": str(e)}
         status, ctx = self._auth(action, headers, signed_ref=signed, gpu_segment=gpu_segment)
@@ -1105,7 +1503,36 @@ class FundingIntake:
             return status, ctx
         order = self.lane_b_targets
         ctx["targets"] = (tuple(t for t in order if t in sent) if order is not None else sent)
+        ctx["declared_rows"] = declared_rows
         return None, ctx
+
+    def _declared_rows(self, headers) -> tuple[int, dict] | tuple[None, dict]:
+        """WB14 / LB2: the optional ``X-Lane-B-Declared-Rows`` of a lane-B
+        fund, parsed against the model's ``experts_per_layer`` under the
+        ``[lane_b]`` clamp fractions. ``(None, {"rows": None})`` when absent
+        (the trainer picks: ESFT), ``(None, {"rows": parsed})`` when valid,
+        else a typed 400 (``declared_rows_*``)."""
+        raw = headers.get(LANE_B_DECLARED_ROWS_HEADER)
+        if raw is None:
+            return None, {"rows": None}
+        from ..trainer.declared_rows import (
+            DeclaredRowsError,
+            model_experts_per_layer,
+            parse_declared_rows,
+        )
+
+        cfg = self.lane_b_cfg
+        if cfg is None:
+            from ..shared.config import LaneBConfig
+
+            cfg = LaneBConfig()
+        try:
+            rows = parse_declared_rows(
+                raw, experts_per_layer=model_experts_per_layer(),
+                min_frac=float(cfg.min_experts_frac), max_frac=float(cfg.max_experts_frac))
+        except DeclaredRowsError as e:
+            return 400, {"code": e.code, "message": f"{LANE_B_DECLARED_ROWS_HEADER}: {e}"}
+        return None, {"rows": rows}
 
     def lane_b_fund(self, headers) -> tuple[int, dict]:
         """Fund one lane-B domain-expert leg (``POST /v1/lane-b/fund``): the
@@ -1115,13 +1542,46 @@ class FundingIntake:
         this ref. Queues into the lane-B queue (never the challenger queue)
         and vaults the key in the shared payer vault — the same key a
         hotkey's other legs rent on. Consumes NO lane-A lifetime submission."""
+        head = self._refresh_lanes()
         try:
-            self.lane_b_queue.expire_stale()      # type: ignore[union-attr]
+            if self.lane_b_queue is not None:     # off: the gate below answers 503
+                self.lane_b_queue.expire_stale()
         except Exception:  # noqa: BLE001 — housekeeping never fails a request
             log.exception("lane-B queue TTL sweep failed")
-        choice, segment, gpu_err = self._gpu_choice(headers)
+        if self.lane_b_queue is not None:
+            # #931: an ended lane refuses before any parse, queue or vault
+            ended = self._lane_ended("b", head)
+            if ended is not None:
+                return ended
+        lb_gpus = self.lane_b_gpus
+        if lb_gpus is None:
+            choice, segment, gpu_err = self._gpu_choice(headers)
+        else:
+            # WB22 (D42): lane B's own list; a type with no measured step rate
+            # (WB19) is refused before anything is queued or vaulted (TB24)
+            choice, segment, gpu_err = parse_gpu_headers(headers, lb_gpus.catalog)
+            own_risk = self._lane_b_own_risk_gpu(headers)
+            if own_risk:
+                # owner 2026-11-24: any GPU type at the miner's own risk when
+                # the leg has a token or hour limit
+                choice, segment, gpu_err = parse_gpu_headers(
+                    headers, _replace_catalog(lb_gpus.catalog, own_risk))
+            elif gpu_err is None:
+                gpu_err = lb_gpus.refusal(choice)
         if gpu_err is not None:
             return 400, gpu_err
+        # WB23 (D42, D42b): the miner-chosen leg length, refused before
+        # anything is queued or vaulted (nothing charged, TB25)
+        # WB27 (plan rev6.21): the miner-chosen levers, refused with typed
+        # codes before anything is queued or vaulted (nothing charged); the
+        # context lever sets the tokens per step of the leg length below
+        levers, levers_err = self._lane_b_levers(headers, choice)
+        if levers_err is not None:
+            return 400, levers_err
+        length, length_err = self._lane_b_leg_length(
+            headers, choice, context=(levers.context_length if levers is not None else 4096))
+        if length_err is not None:
+            return 400, length_err
         status, ctx = self._lane_b_request("lane-b-fund", headers, gpu_segment=segment)
         if status is not None:
             return status, ctx
@@ -1150,20 +1610,308 @@ class FundingIntake:
                                     "this hotkey declares these targets and X-Commit-Ref — "
                                     "commit with `cascade deploy --expert-domain`, wait for "
                                     "the reveal, then fund"}
+        receipt_kw: dict = {}
+        if self._lane_b_check_wired and self._lane_b_pin():
+            status, checked = self._lane_b_contamination(ref, targets)
+            if status is not None:
+                return status, checked
+            receipt_kw = {"contamination": checked}
         outcome = self.lane_b_queue.add_lane_b(  # type: ignore[union-attr]
-            hotkey, targets, ref, int(reveal_block), label=label, gpu_choice=choice)
+            hotkey, targets, ref, int(reveal_block), label=label, gpu_choice=choice,
+            declared_rows=ctx["declared_rows"], leg_length=length,
+            levers=(levers.as_dict() if levers is not None and not levers.is_default
+                    else None), **receipt_kw)
         self.vault.insert(hotkey, api_key)
-        log.info("lane-B fund %s: %s targets=%s (reveal_block=%d%s)", hotkey, outcome,
-                 ",".join(targets), reveal_block, f", gpu={choice.gpu}" if choice.chosen else "")
-        body = {"status": outcome, "lane": "b", "targets": list(targets)}
+        rows = ctx["declared_rows"]
+        log.info("lane-B fund %s: %s targets=%s (reveal_block=%d%s%s)", hotkey, outcome,
+                 ",".join(targets), reveal_block, f", gpu={choice.gpu}" if choice.chosen else "",
+                 "" if rows is None else ", declared rows "
+                 + ",".join(f"{k}:{len(v)}" for k, v in rows.items()))
+        body = self._pay_warning(
+            "b", {"status": outcome, "lane": "b", "targets": list(targets), **receipt_kw})
+        if lb_gpus is not None:
+            # lane B's reply: the choice and its measured step rate (lane A's
+            # full-budget wall warning does not apply to an expert leg)
+            if choice.chosen:
+                body.update(choice.as_dict())
+                rate = lb_gpus.rate(choice.gpu)
+                if rate is not None:
+                    body["steps_per_s"] = float(rate.steps_per_s)
+            if levers is not None and not levers.is_default:
+                body["levers"] = levers.as_dict()     # WB27: what the leg will train
+            if length is not None:
+                body.update(length.as_dict())
+                landing = self._lane_b_landing_estimate(length.guard_seconds)
+                if landing is not None:
+                    body["landing"] = landing
+            return (200 if outcome == "already-queued" else 202), body
         if outcome == "already-queued":
             return 200, self._gpu_reply(body, choice)
         return 202, self._gpu_reply(body, choice)
+
+    def _lane_b_leg_length(self, headers, choice, *,
+                           context: int = 4096) -> tuple[object | None, dict | None]:
+        """WB23: ``(LegLength | None, None)`` or ``(None, refusal)``. No
+        ``X-Lane-B-Train-Hours`` / ``X-Lane-B-Train-Tokens`` header is
+        ``(None, None)``: today's leg.
+
+        owner 2026-11-24 (rev6.21), the default lane B behaviour: hours up to 12, a token limit (``train_tokens``) and/or an hour limit
+        — the leg stops at whichever comes first — and any GPU type at the
+        miner's own risk (no WB19 rate: ``gpu_measured = False``, steps from
+        the limits, no refund if it OOMs, cannot boot or crashes). Hours only
+        on a measured type is WB23's leg, byte for byte."""
+        from ..shared import lane_b_leg as lbl
+
+        raw = (headers.get(lbl.TRAIN_HOURS_HEADER) or "").strip()
+        raw_t = (headers.get(lbl.TRAIN_TOKENS_HEADER) or "").strip()
+        if not raw and not raw_t:
+            return None, None
+        lb_gpus, cfg = self.lane_b_gpus, self.lane_b_cfg
+        if lb_gpus is None or cfg is None:
+            return None, {"code": lbl.UNAVAILABLE,
+                          "message": f"this intake has no lane B GPU list wired — fund "
+                                     f"without {lbl.TRAIN_HOURS_HEADER}"}
+        try:
+            hours = (lbl.parse_train_hours(raw, max_leg_hours=lbl.leg_caps(cfg)[0])
+                     if raw else None)
+            tokens = lbl.parse_train_tokens(raw_t) if raw_t else None
+        except lbl.LegLengthError as e:
+            return None, {"code": e.code, "message": e.message}
+        if not getattr(choice, "chosen", False):
+            return None, {"code": lbl.NEEDS_GPU,
+                          "message": f"{lbl.TRAIN_HOURS_HEADER} is wall hours on the GPU you "
+                                     "choose (D42b): send X-Gpu-Type with a measured type"}
+        if bool(getattr(choice, "allow_fallback", False)):
+            return None, {"code": lbl.WITH_FALLBACK,
+                          "message": f"{lbl.TRAIN_HOURS_HEADER} fixes the steps on the chosen "
+                                     "GPU; a fallback type would train them at another rate — "
+                                     "drop X-Gpu-Allow-Fallback"}
+        rate = lb_gpus.rate(choice.gpu)
+        measured = lb_gpus.measured(choice.gpu)
+        contract = self.lane_b_contract
+        if int(context) != 4096:
+            from dataclasses import replace as _r
+
+            # WB27 context lever: each step consumes context/4096 x the points,
+            # so the measured (4096) rate and the tokens per step scale with it
+            if rate is not None:
+                rate = _r(rate, steps_per_s=float(rate.steps_per_s) * 4096 / int(context))
+            if contract is not None:
+                contract = _r(contract, context_length=int(context))
+        try:
+            if tokens is None and measured:
+                if contract is not None:
+                    length = lbl.admit_leg_length(cfg, rate, hours, contract=contract)
+                else:
+                    length = lbl.LegLength(
+                        train_hours=hours,
+                        steps=lbl.leg_steps(hours, rate.steps_per_s, cap=10 ** 12),
+                        guard_seconds=lbl.leg_guard_seconds(
+                            hours, guard_factor=float(cfg.guard_factor),
+                            overhead_seconds=float(rate.overhead_seconds),
+                            max_leg_seconds=lbl.leg_caps(cfg)[1]))
+            else:
+                if contract is None:
+                    return None, {"code": lbl.UNAVAILABLE,
+                                  "message": "this intake has no lane B base contract wired"}
+                length = lbl.admit_leg_limits(cfg, rate, train_hours=hours, train_tokens=tokens,
+                                              contract=contract)
+                if not measured:
+                    from dataclasses import replace as _replace
+
+                    length = _replace(length, gpu_measured=False)
+        except lbl.LegLengthError as e:
+            return None, {"code": e.code, "message": e.message}
+        except (AttributeError, TypeError, ValueError) as e:
+            return None, {"code": lbl.BAD_TRAIN_HOURS,
+                          "message": f"{raw or raw_t} on {choice.gpu} is not a trainable leg ({e})"}
+        return length, None
+
+    def _lane_b_own_risk_gpu(self, headers) -> str:
+        """owner 2026-11-24: the chosen GPU type when it may be rented at the
+        miner's own risk (not measured, or not in ``[lane_b] funded_pod_skus``):
+        a token or hour limit sent, a valid
+        layout SKU (``<n>x<model>``), no fallback; else ``""``."""
+        from ..funding.gpu_choice import GPU_FALLBACK_HEADER, GPU_HEADER
+        from ..shared import lane_b_leg as lbl
+
+        cfg, lb_gpus = self.lane_b_cfg, self.lane_b_gpus
+        gpu = str(headers.get(GPU_HEADER) or "").strip()
+        if not gpu or cfg is None or lb_gpus is None:
+            return ""
+        if not ((headers.get(lbl.TRAIN_TOKENS_HEADER) or "").strip()
+                or (headers.get(lbl.TRAIN_HOURS_HEADER) or "").strip()):
+            return ""
+        if str(headers.get(GPU_FALLBACK_HEADER) or "").strip().lower() in ("1", "true", "yes"):
+            return ""
+        if lb_gpus.rate(gpu) is not None:
+            return ""                             # measured: the WB22 path
+        from .providers import CREDENTIALS_HEADER
+
+        if (headers.get(CREDENTIALS_HEADER) or "").strip():
+            return ""                             # the own-risk rule is Lium only
+        try:
+            from ..provision.layout import layout_gpus
+
+            if layout_gpus(gpu) < 1:
+                return ""
+        except Exception:  # noqa: BLE001 — not a layout SKU: the catalog refuses it
+            return ""
+        return gpu
+
+    def _lane_b_levers(self, headers, choice) -> tuple[object | None, dict | None]:
+        """WB27: ``(LegLevers | None, None)`` or ``(None, refusal)``. No
+        ``X-Lane-B-Levers`` header is ``(None, None)``: every lever at its
+        default. A context above 4096 additionally needs the chosen GPU's
+        measured memory to fit (``context_length_unfit``) once trainable."""
+        from ..shared import lane_b_levers as lv
+
+        raw = (headers.get(lv.LEVERS_HEADER) or "").strip()
+        if not raw:
+            return None, None
+        cfg = self.lane_b_cfg
+        if cfg is None:
+            return None, {"code": lv.BAD_LEVERS,
+                          "message": f"this intake has no lane B config — fund without "
+                                     f"{lv.LEVERS_HEADER}"}
+        try:
+            levers = lv.parse_levers(raw, cfg)
+        except lv.LeversError as e:
+            return None, {"code": e.code, "message": e.message}
+        if levers is not None and levers.context_length != lv.DEFAULT_CONTEXT:
+            # a measured GPU must fit the context in its measured memory; an
+            # own-risk (unmeasured) GPU runs it at the miner's own risk
+            chosen = self.lane_b_gpus is not None and getattr(choice, "chosen", False)
+            rate = self.lane_b_gpus.rate(choice.gpu) if chosen else None
+            own_risk = chosen and rate is None and bool(self._lane_b_own_risk_gpu(headers))
+            if not own_risk and (rate is None or not lv.context_fits(rate, levers.context_length)):
+                return None, {"code": lv.CONTEXT_UNFIT,
+                              "message": f"context_length {levers.context_length} does not fit "
+                                         "the chosen GPU's measured memory (choose a GPU)"}
+        return levers, None
+
+    def _lane_b_landing_estimate(self, guard_seconds: int) -> dict | None:
+        """WB23 (TB26): where a leg of that wall is expected to land; never
+        fails the fund."""
+        fn = self.lane_b_landing
+        if fn is None:
+            return None
+        try:
+            got = fn(int(guard_seconds))
+        except Exception as e:  # noqa: BLE001 — an estimate never fails a fund
+            log.warning("lane-B landing estimate failed: %s", e)
+            return None
+        return dict(got) if isinstance(got, dict) else None
+
+    def _lane_b_pin(self) -> str:
+        """The ``[lane_b] contamination_hashset`` pin ("" = unpinned: the
+        check is off and the fund is today's, byte for byte)."""
+        cfg = self.lane_b_cfg
+        return str(getattr(cfg, "contamination_hashset", "") or "") if cfg is not None else ""
+
+    def _lane_b_contamination(self, ref: str, targets) -> tuple[int, dict] | tuple[None, dict]:
+        """WB13 / LB1: the intake contamination check of a pinned lane B fund,
+        after the identity gate and before anything is queued or vaulted.
+        ``(None, receipt)`` when the submitted tree is clean; a typed refusal
+        otherwise. Fails closed (503) while the pinned artefact or the tree
+        is unavailable; D38 caps a ``suite:*`` entry's tree at
+        ``suite_target_max_repo_mb``."""
+        from ..interface import contamination_scan
+        from ..interface.contamination_scan import RESULT_EMBEDDED
+        from ..interface.validation import check_repo_size
+
+        cfg = self.lane_b_cfg
+        pin = self._lane_b_pin()
+        if ((self.lane_b_hashset is None or self._lane_b_hashset_sha != pin)
+                and self.load_lane_b_hashset is not None):
+            # DEC-CA-0075: an overlay named a new pin (+ key): fetch, verify
+            # the sha256 against the pin, then use it; any failure fails closed
+            try:
+                hs = self.load_lane_b_hashset(
+                    pin, str(getattr(cfg, "contamination_hashset_key", "") or ""))
+            except Exception:  # noqa: BLE001 — missing / mismatched: 503 below
+                log.exception("lane-B contamination hash set %s could not be loaded", pin)
+            else:
+                if hs is not None and _hashset_pin(hs) == pin:
+                    self.lane_b_hashset, self._lane_b_hashset_sha = hs, pin
+        if self.lane_b_hashset is None or self._lane_b_hashset_sha != pin:
+            log.error("lane-B fund refused: contamination hash set %s is not loaded "
+                      "(loaded: %s)", pin, self._lane_b_hashset_sha or "none")
+            return 503, {"code": "contamination_hashset_unavailable",
+                         "message": "the pinned contamination hash set is not loaded on this "
+                                    "intake; lane-B funding is closed until it is — retry later"}
+        fetch = self.fetch_lane_b_repo
+        tree = None
+        if fetch is not None:
+            try:
+                tree = fetch(ref)
+            except Exception:  # noqa: BLE001 — any fetch failure fails closed
+                log.exception("lane-B fund: fetch of %s for the contamination check failed", ref)
+                tree = None
+        if tree is None or not Path(tree).is_dir():
+            return 503, {"code": "repo_unavailable",
+                         "message": "the submitted generator could not be fetched for the "
+                                    "intake contamination check — retry later"}
+        tree = Path(tree)
+        if any(str(t).startswith("suite:") for t in targets):
+            cap_mb = int(cfg.suite_target_max_repo_mb)
+            size = check_repo_size(tree, cap_mb)
+            if not size.ok:
+                return 413, {"code": size.reason or "repo_too_large",
+                             "message": f"a suite-target generator must be at most {cap_mb} MiB "
+                                        "([lane_b] suite_target_max_repo_mb)",
+                             **(size.details or {})}
+        # RV6 B6: the result cache. A vault / Hub ref is content-pinned, so
+        # (ref, pin) names the scanned content; a re-fund is never re-scanned.
+        # The scan itself is bounded by contamination_scan.SCAN_DEADLINE_S.
+        key = (str(ref), pin)
+        with self._lane_b_scan_lock:
+            receipt = self._lane_b_scan_cache.get(key)
+            if receipt is not None:
+                self._lane_b_scan_cache.move_to_end(key)
+        if receipt is None:
+            try:
+                receipt = contamination_scan.scan_repo(tree, self.lane_b_hashset,
+                                                       min_hits=cfg.contamination_min_hits)
+            except Exception:  # noqa: BLE001 — an unscannable tree fails closed
+                log.exception("lane-B fund: contamination scan of %s failed", ref)
+                return 503, {"code": "contamination_scan_failed",
+                             "message": "the intake contamination check could not complete — "
+                                        "retry later"}
+            # RV7 note 9: a deadline-driven budget_exceeded depends on load,
+            # not on the tree, so it is refused now but never cached (a
+            # re-fund is scanned again). Every other result is cached.
+            load_dependent = bool(getattr(receipt, "load_dependent", False))
+            receipt = dict(receipt)
+            if not load_dependent:
+                with self._lane_b_scan_lock:
+                    self._lane_b_scan_cache[key] = receipt
+                    while len(self._lane_b_scan_cache) > _LANE_B_SCAN_CACHE_SIZE:
+                        self._lane_b_scan_cache.popitem(last=False)
+        receipt = dict(receipt)
+        if receipt["result"] == contamination_scan.RESULT_BUDGET_EXCEEDED:
+            log.warning("lane-B fund refused: the contamination scan of %s ran past its "
+                        "budget", ref)
+            return 413, {"code": "contamination_budget_exceeded",
+                         "message": "the submitted generator carries more numeric data than "
+                                    "the intake contamination check scans; ship less bulk "
+                                    "data (no data files, no numbers in config.json)",
+                         "contamination": receipt}
+        if receipt["result"] == RESULT_EMBEDDED:
+            log.warning("lane-B fund refused: %s embeds benchmark window %s (%s)", ref,
+                        receipt["window_id"], receipt["suite"])
+            return 400, {"code": "benchmark_series_embedded",
+                         "message": f"the generator embeds a {receipt['suite']} benchmark test "
+                                    f"window ({receipt['window_id']}); submissions may not ship "
+                                    "public benchmark series",
+                         "contamination": receipt}
+        return None, receipt
 
     def lane_b_withdraw(self, headers) -> tuple[int, dict]:
         """Withdraw a still-queued lane-B entry (``POST /v1/lane-b/withdraw``).
         The vaulted key is NOT forgotten here: it is shared with the hotkey's
         other legs (use ``/v1/withdraw`` to forget it)."""
+        self._refresh_lanes()
         status, ctx = self._lane_b_request("lane-b-withdraw", headers)
         if status is not None:
             return status, ctx
@@ -1175,11 +1923,13 @@ class FundingIntake:
                                 "runs to its end)"}
 
     def lane_b_queue_view(self) -> tuple[int, dict]:
+        self._refresh_lanes()
         if self.lane_b_queue is None:
             return 503, {"code": "lane_b_disabled"}
         return 200, self.lane_b_queue.public_view()  # type: ignore[union-attr]
 
     def lane_c_queue_view(self) -> tuple[int, dict]:
+        self._refresh_lanes()
         if self.lane_c_queue is None:
             return 503, {"code": "lane_c_disabled"}
         return 200, self.lane_c_queue.public_view()  # type: ignore[union-attr]

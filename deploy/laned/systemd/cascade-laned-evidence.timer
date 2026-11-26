@@ -1,0 +1,13 @@
+# TEMPLATE (validator host): every 3 h, offset from the builder's measure so a
+# freshly staged readiness document is picked up the same cycle.
+
+[Unit]
+Description=cascade lane D readiness/T7 evidence install, every 3 h
+
+[Timer]
+OnBootSec=50min
+OnUnitActiveSec=3h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

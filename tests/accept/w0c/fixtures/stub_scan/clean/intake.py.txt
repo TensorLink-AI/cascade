@@ -1,0 +1,26 @@
+import json
+import logging
+
+log = logging.getLogger(__name__)
+
+
+class IntakeQueue:
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.items: list[dict] = []
+
+    def push(self, entry: dict) -> bool:
+        if len(self.items) >= self.limit:
+            return False
+        self.items.append(entry)
+        return True
+
+    def dump(self) -> str:
+        return json.dumps(self.items, sort_keys=True)
+
+
+def parse_hotkey(raw: str) -> str:
+    hotkey = raw.strip()
+    if not hotkey.startswith("5"):
+        raise ValueError("not an ss58 hotkey")
+    return hotkey

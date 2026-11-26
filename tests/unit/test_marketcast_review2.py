@@ -177,8 +177,11 @@ def test_coverage_gate_is_per_horizon_and_two_sided():
     mc = parse_marketcast({})                       # gate 50/80 %, tol 0.05 under, 0.10 over
 
     def rows(h, ins, tail=(5, 5)):                  # ins = inside counts for (50, 80, 98)
-        return [_row("crypto", "BTC", h, T0 + 60 * i, 1.0, 1.0, ins, 100, tail)
-                for i in range(3)]
+        # 100 one-step windows (the slack counts windows, not path steps)
+        return [_row("crypto", "BTC", h, T0 + 60 * i, 1.0, 1.0,
+                     tuple(int(i % 100 < k) for k in ins), 1,
+                     tuple(int(i % 100 < k) for k in tail))
+                for i in range(300)]
 
     good = rows("1h", (50, 80, 98)) + rows("1d", (50, 80, 98))
     assert calibration_gate(good, mc, mc.coverage_levels).passed

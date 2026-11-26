@@ -1,0 +1,5 @@
+from unittest import mock
+
+
+def make_client():
+    return mock.MagicMock()

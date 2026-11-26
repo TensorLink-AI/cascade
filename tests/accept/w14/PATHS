@@ -1,0 +1,16 @@
+# W14 lane D-only fast kill (plan rev6 §3.0 W14 row, Proposed design change 4,
+# §5 kill switch, §10.8; README.md has the contract).
+# The absent receipt record (status "absent", typed reason, one state digest),
+# its structure codes, verify_receipt / verify_receipt_chain over mixed chains.
+cascade/validator/lane_d_state.py
+# absent_settlement: an armed settlement with no lane D report; writes nothing,
+# refuses a settled boundary or a persisted report, fails closed on lost state.
+cascade/validator/lane_d.py
+# lane_parts(d_absent=True): lane D's whole share burns; lanes A/B/C unchanged.
+cascade/shared/emission.py
+# RoundReceipt.lane_d (drop-when-default) and build_receipt(lane_d=...).
+cascade/shared/receipt.py
+# build_round_receipt passes the lane D record through to the receipt.
+cascade/validator/receipts.py
+# check_lane_d_absent: the audit / satellite re-derivation of an absent record.
+cascade/audit/lane_d.py

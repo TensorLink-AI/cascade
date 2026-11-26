@@ -271,13 +271,46 @@ def main(argv: list[str] | None = None) -> int:
             guard_floor_seconds=cfg.round.heat_guard_floor_seconds,
         )
     elif expert_hours is not None:
-        # the lane-B leg budget scales the token budget AND the wall guard
-        # exactly like a reduced leg, without the heat label
-        contract = contract.for_hours(
-            expert_hours,
-            guard_factor=cfg.round.heat_guard_factor,
-            guard_floor_seconds=cfg.round.heat_guard_floor_seconds,
-        )
+        # WB27 (plan rev6.21): the trainer's lane B leg spec (WB23 length +
+        # the levers) rides --recipe-json on the expert role; absent = today's
+        # leg (no spec)
+        lane_b_spec = None
+        if args.recipe_json:
+            try:
+                lane_b_spec = json.loads(args.recipe_json)
+                if not isinstance(lane_b_spec, dict):
+                    raise ValueError("the lane B leg spec must be a JSON object")
+            except ValueError as e:
+                log.error("lane-B leg spec (--recipe-json) unreadable: %s", e)
+                return 2
+        if lane_b_spec and (float(lane_b_spec.get("train_hours", 0.0) or 0.0) > 0):
+            # WB23: the steps fixed at admission and the lane B guard
+            from ..shared.lane_b_levers import leg_length_contract
+
+            contract = leg_length_contract(cfg, contract, lane_b_spec)
+        else:
+            # the lane-B leg budget scales the token budget AND the wall guard
+            # exactly like a reduced leg, without the heat label
+            contract = contract.for_hours(
+                expert_hours,
+                guard_factor=cfg.round.heat_guard_factor,
+                guard_floor_seconds=cfg.round.heat_guard_floor_seconds,
+            )
+        # plan rev6.20: every lane B leg trains with no cooldown and scores its
+        # power EMA — the same rule the trainer applies to the contract whose
+        # digest it expects back
+        from ..shared.config.lane_b import lane_b_leg_contract
+
+        contract = lane_b_leg_contract(contract)
+        if lane_b_spec:
+            # WB27: the miner's levers, the same step the trainer applies
+            from ..shared.lane_b_levers import apply_spec_levers
+
+            try:
+                contract = apply_spec_levers(cfg.lane_b, contract, lane_b_spec, int(args.block))
+            except ValueError as e:
+                log.error("lane-B leg levers refused: %s", e)
+                return 2
     if args.anneal:
         contract = anneal_recipe(contract)
     if args.router_slow:
@@ -353,7 +386,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def run_mkt_worker(args, cfg, log, *, post=None, get=None, synthetic_fn=None,
-                   base_loader=None) -> int:
+                   base_loader=None, init_fetch=None) -> int:
     """``--role mkt_finetune`` (DEC-CA-0064): fine-tune the PINNED Timestral
     base from the miner's MarketCast recipe on this credential-free pod and
     print a ``--local-only`` receipt (the orchestrator harvests). rc 2 =
@@ -361,9 +394,34 @@ def run_mkt_worker(args, cfg, log, *, post=None, get=None, synthetic_fn=None,
     fault), 1 = anything else. ``post`` / ``get`` / ``synthetic_fn`` /
     ``base_loader`` are injectable (tests)."""
     from ..shared.marketcast_recipe import parse_marketcast_recipe
-    from .marketcast_leg import MktLegError, build_training_snapshot, run_mkt_leg
+    from .marketcast_leg import (
+        MktDataUnavailable,
+        MktLegError,
+        build_training_snapshot,
+        run_mkt_leg,
+    )
 
     mc = cfg.marketcast
+    instance = None
+    try:
+        instance = (json.loads(args.recipe_json) or {}).get("instance") if args.recipe_json \
+            else None
+    except (ValueError, TypeError, AttributeError):
+        instance = None
+    if instance:
+        # W-CMP2 (DEC-CA-0075): a spec instance's leg trains under the
+        # instance's compiled table the trainer relayed (its pool, metrics,
+        # bounds; the same pinned base), on its standard pool
+        from dataclasses import replace as _replace
+
+        from ..shared.config.marketcast import parse_marketcast
+
+        try:
+            mc = _replace(parse_marketcast(dict(instance["table"]), open_classes=True),
+                          from_block=max(1, int(cfg.marketcast.from_block or 1)))
+        except (ValueError, KeyError, TypeError) as e:
+            log.error("--role mkt_finetune: the relayed competition table is invalid: %s", e)
+            return 2
     if not args.local_only or not args.recipe_json or not args.warm_start_ref:
         log.error("--role mkt_finetune requires --local-only, --recipe-json and "
                   "--warm-start-ref")
@@ -404,17 +462,53 @@ def run_mkt_worker(args, cfg, log, *, post=None, get=None, synthetic_fn=None,
         from .continuation import PROTOCOL, restore_marketcast_data, worker_context
         if getattr(args, "continuation_root", None) and mc.continuation_protocol != PROTOCOL:
             raise ValueError("continuation requires an explicitly activated MarketCast contract")
-        max_s = float(cfg.lane_c.leg_hours) * 3600.0
+        from .marketcast_runner import mkt_leg_hours
+        max_s = mkt_leg_hours(cfg, recipe.leg_hours) * 3600.0
         binding = {"backend": "marketcast", "base": mc.base_ref,
             "base_sha256": mc.base_sha256, "recipe": {k: v for k, v in wrap.items() if k != "train_time"},
             "continuation_protocol": mc.continuation_protocol,
             "seed": int(args.base_seed), "gen_ref": args.gen_ref, "hotkey": args.hotkey,
             "max_seconds": max_s}
-        if not restore_marketcast_data(args, cfg, binding, work / "_mkt_train"):
+        if instance and not restore_marketcast_data(args, cfg, binding, work / "_mkt_train"):
+            # W-CMP2: the instance's standard pool, clipped to the recipe's range
+            from .marketcast_leg import build_instance_training_snapshot
+
+            try:
+                build_instance_training_snapshot(work / "_mkt_train", mc, recipe,
+                                                 corpus_dir=getattr(args, "corpus_dir", None),
+                                                 work=work, not_after=train_time)
+            except OSError as e:
+                raise MktDataUnavailable(f"competition pool relay failed: {e}") from e
+        elif not restore_marketcast_data(args, cfg, binding, work / "_mkt_train"):
+            from ..pool.marketcast_relay import fetch_relay, read_relay_file
+
+            # the trainer's relay of the bar recording (sub-hour candles the
+            # API no longer serves for an embargoed range); absent → the API
+            plan = read_relay_file(getattr(args, "corpus_dir", None))
+            try:
+                store = fetch_relay(plan, work / "_mkt_bars") if plan is not None else None
+            except OSError as e:
+                raise MktDataUnavailable(f"bar recording relay failed: {e}") from e
             build_training_snapshot(work / "_mkt_train", mc, recipe, post=post or http_post_json,
-                                    get=get or http_get_json, not_after=train_time)
+                                    get=get or http_get_json, not_after=train_time, store=store)
         snap = load_snapshot(work / "_mkt_train", verify_signature=False)
         out_dir = work / f"mkt-{args.hotkey[:12]}-{int(args.block)}"
+        init_ptr = str(wrap.get("init_pointer", "") or "")
+        if init_ptr:
+            # owner 2026-11-18: warm-start from the trainer-resolved checkpoint
+            from ..shared.manifest import parse_trained_pointer
+            from .marketcast_leg import load_init_weights
+
+            init_dir = work / "_mkt_init"
+            if init_fetch is not None:
+                init_fetch(init_ptr, init_dir)
+            else:  # pragma: no cover — the Hub on a pod
+                from ..shared.hippius import HubConfig, fetch_from_hub
+
+                fetch_from_hub(parse_trained_pointer(init_ptr), init_dir,
+                               HubConfig.from_storage(cfg.storage))
+            load_init_weights(getattr(base, "inner", base).model, init_dir, base_dir=base_dir,
+                              sha256=str(wrap.get("init_sha256", "")))
         continuation = worker_context(args, cfg, {**binding, "data": snap.digest})
 
         def _run(synthetic):
@@ -422,7 +516,8 @@ def run_mkt_worker(args, cfg, log, *, post=None, get=None, synthetic_fn=None,
                                base_fc_inner=getattr(base, "inner", base), train_snap=snap,
                                out_dir=out_dir, seed=int(args.base_seed), max_seconds=max_s,
                                synthetic=synthetic,
-                               meta_extra={"hotkey": args.hotkey, "gen_ref": args.gen_ref},
+                               meta_extra={"hotkey": args.hotkey, "gen_ref": args.gen_ref,
+                                           **({"init_pointer": init_ptr} if init_ptr else {})},
                                **({"continuation": continuation} if continuation is not None else {}))
 
         if recipe.synthetic_fraction > 0:

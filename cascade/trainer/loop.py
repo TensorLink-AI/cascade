@@ -82,6 +82,7 @@ from .faults import (  # noqa: F401
     classify_funded_worker_failure,
 )
 from .host_probe import host_snapshot, host_summary_line
+from .image_epoch import ImageEpochMixin
 from .lane_pool import (  # noqa: F401
     _FinalLanePool,
     _lium_provider,
@@ -280,7 +281,7 @@ def upload_harvested_checkpoint(runner, record: dict, *, base_seed) -> TrainedEn
 
 @dataclass
 class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _FundedLegMixin,
-                    _PromotionMixin, _RollingMixin, _GenerationMixin):
+                    _PromotionMixin, _RollingMixin, _GenerationMixin, ImageEpochMixin):
     """Owner-operated trainer. ``base_trainer`` is the GPU backend (Protocol).
 
     Storage is Hippius: generators + checkpoints on the Hub registry (by
@@ -652,6 +653,7 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
 
         base = self._base_cfg()
         if not getattr(base, "activation", None) or not base.activation.enabled:
+            self._image_epoch_tick(block)     # W-IMG needs no vote (never raises)
             return
         try:
             rec = self._activation
@@ -673,6 +675,7 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
                 self.apply_activation_block(rec.activation_block)
             self._forfeit_tick(client, block)
             self._image_decoupled_tick(client, block)
+            self._image_epoch_tick(block)
             self._shared_ladder_tick(client, block)
         except Exception as e:  # noqa: BLE001 — activation must never sink a tick
             log.warning("activation step failed (%s); retrying next poll", e)
@@ -1301,6 +1304,8 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
             budget_denomination=getattr(contract, "budget_denomination", "points"),
             corpus_epochs=int(getattr(contract, "corpus_epochs", 0) or 0),
             **({"continuation_protocol": contract.continuation_protocol} if getattr(contract, "continuation_protocol", "") else {}),
+            # WB27: a lane B curriculum leg reads its stage corpora in order
+            **({"curriculum": tuple(contract.curriculum)} if getattr(contract, "curriculum", ()) else {}),
         ) as rs:
             result = self.base_trainer.train(
                 rs.series(),

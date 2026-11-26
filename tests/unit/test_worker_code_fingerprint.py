@@ -136,7 +136,8 @@ def test_worker_code_fingerprint_round_trips_through_the_loader(tmp_path):
     src = tmp_path / "chain.toml"
     base = Path("chain.toml").read_text(encoding="utf-8")
     assert 'worker_code_fingerprint = "' in base
-    src.write_text(base.replace('worker_code_fingerprint = "', 'worker_code_fingerprint = " ABC'),
+    # the first pin is [round]'s ([marketcast] names MarketCast's own release)
+    src.write_text(base.replace('worker_code_fingerprint = "', 'worker_code_fingerprint = " ABC', 1),
                    encoding="utf-8")
     cfg = load_chain_config(str(src))
     assert cfg.round.worker_code_fingerprint.startswith("abc")   # parsed, stripped, lower-cased

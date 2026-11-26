@@ -10,6 +10,7 @@ from ..shared.era import (
     era_king_active,
     era_length_blocks,
     image_decoupled_at,
+    image_epoch_rule_at,
     member_index_for_era,
     min_effective_era,
     settlement_era,
@@ -132,6 +133,10 @@ class EraGateMixin:
                 return (f"era_entry_out_of_window: {e.role} uid{e.miner_uid} trained at "
                         f"block {e.train_block}, outside era {era.index}'s window "
                         f"[{era.seed_block}, {window_end})")
+        if decoupled and image_epoch_rule_at(self.cfg, block, era):
+            image_reason = self._check_epoch_image(manifest, era)
+            if image_reason is not None:
+                return image_reason
         last = self.state.last_handled_round_id
         if (last is not None and manifest.prev_round_id != last
                 and str(manifest.round_id) != last):
@@ -158,6 +163,45 @@ class EraGateMixin:
         local contract the strict gate compared against."""
         return (manifest.contract_body if manifest.contract_body is not None
                 else self._training_for(manifest))
+
+    def _epoch_image(self, manifest: TrainingManifest) -> str:
+        """W-IMG: the settlement's ONE worker image — the bare digest of its
+        declared contract's ``train_image_digest`` ("" when it names none)."""
+        from ..shared.config import image_digest
+        from ..shared.manifest import contract_payload
+
+        payload = contract_payload(self._era_contract_source(manifest))
+        return image_digest(str(payload.get("train_image_digest", "") or ""))
+
+    def _check_epoch_image(self, manifest: TrainingManifest, era: EraSpec) -> str | None:
+        """W-IMG (plan rev6.24 (e), owner 2026-11-24): every leg of a v2 seed
+        epoch — the king and every challenger — ran ONE worker image, and it
+        changes only at a seed-epoch boundary. No fixed pin: the image is the
+        settlement's own declared contract image (the trainer picks it per
+        seed epoch); each entry's published image (proven into its
+        ``training_contract_digest`` by the DEC-CA-0067 check above) must be
+        it, and it must be the image this validator recorded at the epoch's
+        first handled settlement (:meth:`_adopt_era_king`)."""
+        from ..shared.config import image_digest
+
+        image = self._epoch_image(manifest)
+        if not image:
+            return ("era_image_missing: the settlement's contract names no train_image_digest "
+                    "(required from [v2] image_epoch_from_block)")
+        for e in manifest.entries:
+            got = image_digest(str(e.train_image_digest or ""))
+            if got != image:
+                return (f"era_image_mixed: {e.role} uid{e.miner_uid} ran image "
+                        f"{(got or '<none>')[:19]}…, the seed epoch's is {image[:19]}… "
+                        "(one image per seed epoch)")
+        epoch = self._init_epoch_start(era)
+        ei = self.state.epoch_init
+        if (epoch is not None and ei and int(ei.get("epoch", -1)) == int(epoch)
+                and ei.get("image") and ei.get("image") != image):
+            return (f"era_image_changed: seed epoch from era {epoch} ran image "
+                    f"{str(ei.get('image'))[:19]}…, this settlement declares {image[:19]}… "
+                    "(the image changes only at a seed-epoch boundary)")
+        return None
 
     def _check_numerics_digest(self, manifest: TrainingManifest) -> str | None:
         """DEC-CA-0067: the manifest-level ``numerics_contract_digest`` exists
@@ -430,6 +474,16 @@ class EraGateMixin:
             # (keyed by the INIT epoch, which a DEC-CA-0067 v2b switch keeps)
             self.state = replace(self.state, epoch_init={
                 "epoch": int(epoch), "init": str(manifest.warm_start_ckpt or "")})
+        if (epoch is not None and self.state.epoch_init
+                and int(self.state.epoch_init.get("epoch", -1)) == epoch
+                and not self.state.epoch_init.get("image")
+                and image_epoch_rule_at(self.cfg, self._epoch_start_block(manifest), era)):
+            # W-IMG: the seed epoch's one image, recorded at its first handled
+            # settlement under the rule (absent before it: state bytes unchanged)
+            image = self._epoch_image(manifest)
+            if image and self._check_epoch_image(manifest, era) is None:
+                self.state = replace(self.state, epoch_init={
+                    **self.state.epoch_init, "image": image})
 
     def _pointer_era(self, era: EraSpec) -> int:
         """The era the king pointer is held for: the seed epoch's first era

@@ -1,0 +1,7 @@
+import logging
+
+log = logging.getLogger(__name__)
+
+
+def crown(hotkey: str) -> None:
+    log.info("crowned %s", hotkey)

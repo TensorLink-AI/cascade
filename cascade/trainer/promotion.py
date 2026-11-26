@@ -477,7 +477,7 @@ class TrainerPromotion:
 
     def note_round(self, king_hotkey: str | None, *, epoch_block: int) -> None:
         """Track the reign at each round boundary: a king change (the trainer's
-        view — on-chain highest incentive, the same hotkey it trains as king)
+        view — the signed receipt king, the same hotkey it trains as king)
         resets the clock and clears the candidate log; an unanchored clock is
         anchored here. The live member set carries over either way — a
         promotion outlives the reign that produced it."""

@@ -1,11 +1,11 @@
 # Cascade MoE Base: model and training recipe
 
-**Cascade MoE Base - 1.23B** is the v2 candidate, with 1.234B total
+**Cascade MoE Base - 1.23B** is the lane A model on mainnet v2 (live since
+2026-10-30; `[v2.training] arch_preset = "cascade-moe-v2-120m"`,
+`base_arch = "cascade_pyramid"` in `chain.toml`), with 1.234B total
 parameters and 112.07M active per token. Smaller variants share its structure so
-miners can test generators with less local compute. Architecture availability
-and deployment readiness are separate: consult fresh `cascade status --json`.
-The worker image, CPU generation image, initial generator and GPU behavior need
-qualification before this candidate can run live.
+miners can test generators with less local compute. The effective contract of a
+given era is the signed one: consult fresh `cascade status --json`.
 
 ## Sizes
 

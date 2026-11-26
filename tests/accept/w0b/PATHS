@@ -1,0 +1,5 @@
+# W0b context-equivalence (plan rev6 §3.0 W0b row, §1.1; README.md has the
+# contract). W0b is a verification WP: W5d's scorer is expected to satisfy it.
+# If it did not, the change would land here: the lane D scorer's model build
+# (context set scorer-side, strict load) and its no-pad quantile-head forward.
+cascade/eval/lane_d_scorer.py

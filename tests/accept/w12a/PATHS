@@ -1,0 +1,34 @@
+# W12a: lane D docs and agent surfaces (plan rev6.4 §3.0 W12a row, §11.2;
+# README.md has the contract). Docs only: no code, config or test changes.
+docs/LANE_D.md
+docs/INTERFACE.md
+docs/MINER.md
+docs/AGENT_MINING.md
+docs/VALIDATOR.md
+docs/OPERATOR.md
+docs/ARCHITECTURE.md
+AGENTS.md
+agent.md
+llms.txt
+README.md
+CHANGES.md
+# the website surfaces (§11.2 "llms.txt (repo + website)", "website")
+cascade/website/llms.txt
+cascade/website/index.html
+# One miner guide per competition (owner 2026-11-24): intent, scoring, pay,
+# strategies, costs, refusals, FAQ; linked from MINER.md and llms.txt.
+docs/MINER_LANE_A.md
+docs/MINER_LANE_B.md
+docs/MINER_LANE_C_MARKETCAST.md
+docs/MINER_LANE_D.md
+# Stale MarketCast examples (owner 2026-11-24: fix with the lane guides).
+docs/MARKETCAST.md
+# Docs cleanup (owner 2026-11-24): start-here map, archive of superseded
+# docs, and the current docs whose links/status the cleanup touched.
+docs/README.md
+docs/MODEL.md
+docs/V2_DIRECT_MOE.md
+docs/archive/README.md
+docs/archive/MINER_V2_INCENTIVE_INTRO.md
+docs/archive/V2_FAQ.md
+docs/archive/TESTNET_E2E_CHECKLIST.md

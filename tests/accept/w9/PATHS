@@ -1,0 +1,28 @@
+# W9: the audit's lane D re-derivation (plan rev6 §3.0 W9 row, §1.2 caps,
+# §1.3 both clocks and the confirmation duel, §1.5 rows_sha256 and
+# "checks.derive_weights and check_lane_d re-derive the lane D weights",
+# invariants 2, 4 and 12; README.md has the contract).
+# check_lane_d: the judged set and skip reasons (coldkey caps, FIFO, the
+# block-clock entry rules), mirror lag and the king's T, the canonical row
+# order, the chain-mode continuity rules, and (rev6.1) window_refusal plus
+# check_lane_d(..., pool_dirs=...) against the judged snapshots.
+cascade/audit/lane_d.py
+# derive_weights (and LANE_D_WEIGHT_ERRORS): lane D's pay re-derived from the
+# signed report and the W7c receipt record, without the producer's lane D
+# emission functions.
+cascade/audit/checks.py
+# rev6.18 B5/B7 (F5): check_lane_d checks report.host against the
+# scoring environment list at the boundary (host_problem; audit/lane_d.py
+# is listed above).
+cascade/shared/config/lane_d.py
+# rev6.18 B1/B3: the lane D refusal codes (REFUSAL_CODES, lane_d_findings),
+# lane D's burn scoped to its share (derive_weights, lane_d_pay, the lane_d
+# tier-0 row) and the audit's fetch of the lane D record (audit_receipt).
+cascade/audit/main.py
+# rev6.18 A3 (F4): the chain-mode replay re-derives the combined rule too, and
+# the generic two-part statistic both share.
+cascade/audit/lane_d_chain.py
+cascade/eval/bootstrap.py
+# rev6.22: the slot-row tests drive the every-slot judge and its verdict rows.
+cascade/eval/expert_lane.py
+cascade/validator/expert_lane.py

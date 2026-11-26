@@ -101,8 +101,28 @@ poll_seconds  = 30
 # market_sku   = "L40S"
 # gpus_per_pod = 1
 # max_pods     = 1
-# providers    = ["lium", "shadeform"]
+# providers    = ["lium"]          # GPUs are Lium only; Shadeform is CPU only (2026-11-24)
 # max_price_hr = 1.20
+
+# ── MarketCast pod (DEC-CA-0064; the MAIN validator only) ─────────────────────
+# A cheap GPU the main validator's MarketCast forecasts run on. The validator
+# (--mkt-eval-hosts <mkt_hosts_path>) touches <mkt_hosts_path>.request while it
+# needs rows; the pod is rented then, published to mkt_hosts_path, and torn
+# down once the request is gone (or at mkt_lease_hours). Timestral-28M fits any
+# 16 GB+ card; the worker image must carry the `marketcast` extra.
+# mkt_hosts_path  = "/root/cascade/mkt_hosts.toml"
+# mkt_lease_hours = 3.0
+# [provisioner.mkt]
+# sku          = "NVIDIA GeForce RTX 3090"
+# market_sku   = "RTX 3090"
+# gpus_per_pod = 1
+# max_pods     = 1
+# providers    = ["lium"]
+# max_price_hr = 0.40
+# [[provisioner.mkt.candidate]]
+# sku          = "NVIDIA GeForce RTX 4090"
+# market_sku   = "RTX 4090"
+# max_price_hr = 0.60
 
 # ── per-provider pod paths (bootstrap mode) ──────────────────────────────────
 # Providers boot different base users: lium pods are root, shadeform VMs land

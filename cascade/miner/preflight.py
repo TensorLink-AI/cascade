@@ -39,7 +39,7 @@ def identity_check(cfg, hotkey, network, ref):
     payload = str(match.payload) if match else ""
     a = parse_commit(payload)
     b = parse_expert_targets(payload, cfg.lane_b.targets, max_targets=cfg.lane_b.max_domains_per_leg)
-    c = parse_finetune_commit(payload, mkt_suites=tuple(cfg.marketcast.suites))
+    c = parse_finetune_commit(payload, mkt_suites=tuple(cfg.marketcast.target_names))
     revealed_ref = a.ref if a else b[1] if b else c[1] if c else None
     lane = "a" if a else "b" if b else "c" if c else None
     targets = b[0] if b else (c[0],) if c else ()

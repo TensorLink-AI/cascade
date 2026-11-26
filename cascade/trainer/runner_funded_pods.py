@@ -351,6 +351,10 @@ class _FundedPodMixin:
             payload = {"contract_digest": contract_digest(contract),
                        "warm_start_ckpt": str(warm_start_ckpt or ""),
                        "entry": dataclasses.asdict(entry)}
+            walls = getattr(self.__dict__.get("_leg_local_obj"), "wall_record", None)
+            if walls:
+                # W-IMG: rented on an image without measured walls, under the cap
+                payload.update(dict(walls))
             if funded_by:
                 # DEC-CA-0055: who paid for a v2 king leg ("king" / "operator")
                 payload["funded_by"] = str(funded_by)
@@ -435,12 +439,14 @@ class _FundedPodMixin:
             return host
         from .remote import build_scp_argv, build_ssh_argv
 
+        src, profile = worker_config_for_pod(self, src, dest_name)
         dest = f"{host.workdir}/{dest_name}"
         runner = getattr(self, "_scp_runner", None) or (
             lambda argv: subprocess.run(argv, check=True, capture_output=True, timeout=120))
         runner(build_ssh_argv(host, f"mkdir -p {shlex.quote(host.workdir)}"))
         runner(build_scp_argv(host, str(src), dest))
-        log.info("pushed deployed chain.toml → %s:%s", host.name, dest)
+        log.info("pushed deployed chain.toml → %s:%s%s", host.name, dest,
+                 f" (worker config for {profile})" if profile else "")
         return dc_replace(host, chain_toml=dest)
 
     def _funded_pod_profile(self):
@@ -1282,6 +1288,11 @@ class _FundedPodMixin:
             self._record_funded_failure(gen.hotkey, why, miner_fault=False,
                                         error_class=OPERATOR_BLOCKED_CLASS, burn=False)
             raise _FundedLegSkip(gen.hotkey)
+        if not prior_alloc:
+            from .cost_guards import note_unmeasured_wall
+
+            # W-IMG: an unmeasured image rents under the 5 h wall cap (recorded)
+            note_unmeasured_wall(self, rnd, f"funded leg {gen.hotkey[:12]}")
         # No blind retrain (2026-11-02: every ENOSPC harvest re-rented on the
         # MINER's key and retrained, ~$640 lost). A leg an our-side fault hit
         # AFTER it trained either re-harvests its KEPT pod (adopted below,
@@ -1375,6 +1386,22 @@ class _FundedPodMixin:
             raise _FundedLegSkip(gen.hotkey)
         api_key = vault.get(gen.hotkey)
         local = self.__dict__.get('_leg_local_obj')
+        if api_key and getattr(local, "mkt_rent_skus", None) is not None:
+            # owner 2026-11-24: a MarketCast leg's GPU rents on Lium only —
+            # never Shadeform (or another provider) from a multi-provider bundle
+            from ..funding.mkt_gpus import lium_only_key
+
+            try:
+                lium_key = lium_only_key(api_key)
+            except ValueError:
+                lium_key = ""
+            if not lium_key:
+                self._record_funded_failure(
+                    gen.hotkey, "a MarketCast leg rents its GPU on Lium only and the vaulted "
+                    "payer credentials carry no Lium key — re-fund with your Lium key",
+                    miner_fault=True, error_class="auth", burn=False)
+                raise _FundedLegSkip(gen.hotkey)
+            api_key = lium_key
         if local is not None and getattr(local, 'funded_is_king', False):
             import hashlib
             local.funded_key_digest = hashlib.sha256(api_key.encode()).hexdigest() if api_key else ''
@@ -2345,6 +2372,38 @@ class _FundedPodMixin:
                 log.error("funded pod %s is gone but its ledger row could not be "
                           "removed (%s) — the startup sweep settles it",
                           pod.instance_id, e)
+
+
+def worker_config_for_pod(runner, src, dest_name: str):
+    """``(path, profile name)`` of the config a pod of the CURRENT leg's
+    image loads: the deployed file cut to what that release parses
+    (:mod:`cascade.shared.worker_config`), or ``src`` itself (profile "") for
+    a release without a legacy profile. The image is the one the leg rents /
+    is code-checked on (:func:`cascade.trainer.leg_pins.leg_round`: ``[round]
+    funded_pod_image``, a MarketCast leg's ``[marketcast] pod_image``, a
+    post-switch leg's after pin). A failed derivation raises — the push (and
+    so the leg) fails as an operator fault, never a silent run on a config
+    its worker cannot load."""
+    from pathlib import Path
+
+    from ..shared.atomic import write_text_atomic
+    from ..shared.worker_config import worker_toml_for_image
+    from .leg_pins import leg_round
+
+    try:
+        image = str(getattr(leg_round(runner), "funded_pod_image", "") or "")
+    except Exception as e:  # noqa: BLE001 — unknown image: the deployed file as before
+        log.warning("worker config: leg image unresolved (%s); pushing the deployed "
+                    "chain.toml unchanged", e)
+        return src, ""
+    text, profile = worker_toml_for_image(Path(src).read_text(encoding="utf-8"), image)
+    if not profile:
+        return src, ""
+    local = (Path(getattr(runner, "work_root", ".")) / "_deployed" / "worker_config"
+             / profile / dest_name)
+    local.parent.mkdir(parents=True, exist_ok=True)
+    write_text_atomic(local, text)
+    return local, profile
 
 
 def funded_pod_comm_failure(runner, result, profile) -> str:

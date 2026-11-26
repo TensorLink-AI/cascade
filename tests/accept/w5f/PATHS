@@ -1,0 +1,35 @@
+# W5f house entry and refresh (plan rev6 §3.0 W5f row, §1.4 "The house",
+# §2 items 1-2, §1.5 "State", T10; README.md has the contract).
+# NEW: the signed house pointer (sign / verify / load, LaneDHouseError and its
+# codes) and the validation of the house record settle_lane_d takes.
+cascade/validator/lane_d_house.py
+# settle_lane_d: validate the house before anything is read or written; the
+# house entry as a challenger against a miner KING_D (first clear,
+# confirmation, retake); the retake moves the miner king into the court.
+cascade/validator/lane_d.py
+# refresh_house / genesis: the house record in state, the house entry's
+# record, and any state field the retake needs.
+cascade/validator/lane_d_state.py
+# report enums / schema, only if the house challenger's verdict or the retake
+# needs them; the schema file goes with them.
+cascade/validator/lane_d_report.py
+cascade/validator/schemas/lane_d_report_1.json
+# the satellites' re-derivation (check_lane_d) must accept a house verdict and
+# a house retake (king_after = the house, the miner king into the court).
+cascade/audit/lane_d.py
+# the gate wiring, only if the house challenger's gate needs a change there.
+cascade/validator/lane_d_gate.py
+cascade/validator/lane_d_bench.py
+# Lane D recurring jobs (ops tooling PR): the module of the w5f job these
+# tests pin (python -P -m cascade.lane_d.ops_jobs).
+cascade/lane_d/ops_jobs.py
+# Lane D ops gaps PR: the house source producer (D47 BF16 cast of KING_A as a
+# lane D entry, D46 reveal_ts from the lineage; pod side) whose documents the
+# w5f house-source job installs.
+cascade/lane_d/house_source.py
+# DEC-CA-0076 (owner 2026-11-24): the house is lane D's genesis bar only (no
+# second bar, no challenger, no retake after the first miner crown; genesis
+# pays lane D's takes_from lane). The decision record and the docs.
+decisions/DEC-CA-0076-lane-d-house-genesis-only.md
+docs/LANE_D.md
+docs/MINER_LANE_D.md

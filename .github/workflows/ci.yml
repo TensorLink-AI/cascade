@@ -3,10 +3,35 @@
 # broke ~23 round tests with nothing to catch it. Ruff is scoped to cascade/ +
 # tests/; the vendored base_generator/, benchmarks/, and scripts/ carry separate
 # pre-existing lint debt (out of scope for this gate).
+#
+# Unit-suite sharding (2026-11-22; the single job took 9-18 min per PR):
+#   pull_request -> the FULL tests/unit suite, split into 4 parallel `unit (k/4)`
+#                   jobs by scripts/ci_shard.py. The split is a deterministic
+#                   partition: every test file runs in exactly one shard, and
+#                   the `lint` job runs `ci_shard.py --verify` to check it. Nothing is
+#                   path-scoped: every PR, laned or not, runs every unit test.
+#   push (main, cascade-v2) -> one `unit (1/1)` job running
+#                   `pytest tests/unit` in a single process, exactly as
+#                   before. That run also catches cross-file ordering or
+#                   shared-state coupling that a shard split could hide.
+#   `test` is the required status check. It is an aggregator that needs `lint`
+#   and every `unit` shard. It runs with if: always() and fails unless every
+#   dependency reports success. A skipped or cancelled shard therefore fails
+#   `test` and can never pass as skipped. `receipt-replay` is unchanged.
+#   Tuning: refresh WEIGHTS in scripts/ci_shard.py from a PR run's
+#   `--durations` output when the shards drift out of balance.
+#
+# Merge queue (2026-11-23): `merge_group` runs exactly what a PR runs, on the
+# queue's combined ref (base + every PR ahead of it in the group): `lint`, the
+# FULL unit suite in 4 shards, the `test` aggregator and `receipt-replay`. No
+# job is conditioned away on merge_group, so both required checks always
+# report there. The single-process `unit (1/1)` run stays on push only.
 name: CI
 
 on:
   pull_request:
+  merge_group:
+    types: [checks_requested]
   push:
     branches: [main, cascade-v2]
 
@@ -15,9 +40,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
+  lint:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -47,9 +72,82 @@ jobs:
       - name: Documentation interfaces and links
         run: uv run python scripts/check_docs.py
 
+      # One rule per incident a pattern could have caught (docs/INCIDENT_RULES.md).
+      # Stdlib only, no cascade imports, well under a second.
+      - name: Incident rules
+        run: uv run python scripts/check_incident_rules.py
+
+      - name: Unit shard plan is a partition of tests/unit
+        run: python3 scripts/ci_shard.py --verify --of 4
+
+  unit:
+    name: unit (${{ matrix.shard }}/${{ github.event_name != 'push' && 4 || 1 }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        # pull_request and merge_group: 4 shards; push: one process
+        shard: ${{ fromJSON(github.event_name != 'push' && '[1, 2, 3, 4]' || '[1]') }}
+    env:
+      SHARD: ${{ matrix.shard }}
+      SHARDS: ${{ github.event_name != 'push' && 4 || 1 }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare isolated TLS trust for the CI job
+        run: python3 scripts/prepare_ci_tls.py "$RUNNER_TEMP/cascade-ca" >> "$GITHUB_ENV"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.13.4"
+          enable-cache: true
+
+      - name: Check system TLS trust before Git dependency fetches
+        run: uv run --no-project --python 3.11 python scripts/check_tls_trust.py --system-only
+
+      # --frozen: install exactly the pinned lock (the reproducibility contract);
+      # --all-extras pulls torch so the full suite runs (torch tests otherwise skip).
+      - name: Sync (frozen, all extras)
+        run: uv sync --frozen --all-extras
+
+      - name: Check TLS trust
+        run: uv run --frozen python scripts/check_tls_trust.py
+
       - name: Unit tests
         # Passed tests need no retained checkpoint trees; keep failed fixtures.
-        run: uv run --frozen pytest tests/unit -q --maxfail=1 -o tmp_path_retention_policy=failed -o tmp_path_retention_count=1
+        # Push: the whole suite in one process, exactly as before sharding.
+        # PR: this shard's files from the deterministic plan. The list goes
+        # through a file (pytest @argsfile), so a planner failure fails the step
+        # instead of falling back to pytest's default testpaths.
+        run: |
+          opts=(-q --maxfail=1 -o tmp_path_retention_policy=failed -o tmp_path_retention_count=1)
+          if [ "$SHARDS" = "1" ]; then
+            uv run --frozen pytest tests/unit "${opts[@]}"
+          else
+            list="$RUNNER_TEMP/unit-shard.txt"
+            python3 scripts/ci_shard.py --shard "$SHARD" --of "$SHARDS" > "$list"
+            echo "shard $SHARD/$SHARDS: $(wc -l < "$list") test files"
+            uv run --frozen pytest "@$list" "${opts[@]}" --durations=40 --durations-min=2
+          fi
+
+  # The required status check. It aggregates `lint` and every `unit` shard, and
+  # runs even when a dependency failed or was cancelled, so it can never be
+  # skipped.
+  test:
+    if: always()
+    needs: [lint, unit]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every lint and unit-shard job succeeded
+        env:
+          LINT: ${{ needs.lint.result }}
+          UNIT: ${{ needs.unit.result }}
+        run: |
+          echo "lint=$LINT unit=$UNIT"
+          [ "$LINT" = "success" ] && [ "$UNIT" = "success" ]
 
   # Fork detector (2026-11-16 deploy review): replay the latest mainnet receipts
   # through THIS PR's satellite/audit code. A FAIL means the change alters what

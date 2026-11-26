@@ -1,0 +1,10 @@
+# W3a: the owner's live Hippius storage probe (plan §1.2 "Storage", §3.0 W3a
+# row, §17.1 L4). W3a is an owner WP: its Accept is the evidence verifier in
+# this directory, run with
+# `scripts/laned/accept W3a --evidence evidence/w3a_probe.json`.
+# cascade/laned/__init__.py already exists on main (shared with other WPs);
+# the builder keeps it and every other WP's file intact.
+cascade/laned/storage_probe.py
+# The storage decision record. The builder ships it as a template; the owner
+# fills "Chosen path" and "Evidence sha256" from the live run (README.md).
+decisions/STORAGE-LANE-D.md

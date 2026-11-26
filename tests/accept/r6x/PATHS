@@ -1,0 +1,28 @@
+# R6x S0a main PR: the release chain.toml typed with the main-class drift,
+# plus the unit tests that anchor on the old shipped values.
+chain.toml
+tests/unit/test_money_safety.py
+tests/unit/test_money_safety_2.py
+tests/unit/test_operator_lane_billing.py
+tests/unit/test_image_qualification.py
+tests/unit/test_funded_operator_fallback.py
+# F6 (plan rev6.18 B9 main side, B12): the release chain.toml types the
+# main <- deployed values and both owner keys; the deployed-file edits note;
+# the DEC-CA-0034 init gate retired behind [scoring] init_gate_retired_from_block.
+docs/notes/S0A_DEPLOYED_EDITS.md
+cascade/shared/config/rounds.py
+cascade/shared/config/scoring.py
+cascade/shared/config/chain_config.py
+cascade/shared/config/__init__.py
+cascade/shared/config/loader.py
+cascade/eval/koth.py
+cascade/validator/loop.py
+tests/unit/test_open_market_rent.py
+tests/unit/test_init_baseline_gate.py
+tests/unit/test_sandbox_policy.py
+tests/unit/test_miner_cost_protections.py
+tests/unit/test_packed_source_reject.py
+tests/unit/test_contract_block_gate.py
+tests/unit/test_rolling.py
+tests/unit/test_image_after_repin.py
+tests/unit/test_v2_golive.py

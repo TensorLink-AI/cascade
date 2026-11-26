@@ -1,0 +1,12 @@
+# Lane D intake route, imported by the box's site block:
+#     import /root/cascade/deploy/caddy/lane-d-intake.caddy
+# Only /v1/lane-d/* reaches cascade-laned-intake (deploy/cascade-laned-intake.service).
+# Bodies are signed manifests and licence attestations, never checkpoint
+# bytes (those go straight to the vault through presigned UploadPart URLs),
+# so the cap equals the app's MAX_BODY_BYTES (16 KiB).
+handle /v1/lane-d/* {
+	request_body {
+		max_size 16KiB
+	}
+	reverse_proxy 127.0.0.1:8791
+}

@@ -26,17 +26,35 @@ SUITES = ("returns", "vol")
 ROOT = Path(__file__).resolve().parents[2]
 
 
+# testnet: TESTNET-FAST (owner 2026-11-24, option A) arms lane C at 8515800
+SHIPPED_FROM = {"chain.toml": 9586800, "chain.testnet.toml": 8515800}
+
+
 def test_shipped_configs_are_inert_with_the_defaults():
     for f in ("chain.toml", "chain.testnet.toml"):
         lc = load_chain_config(ROOT / f).lane_c
-        assert lc.from_block == 0 and not lc.active(10**12)
+        # owner 2026-11-24: mainnet arms lane C at 9586800 (an era boundary);
+        # testnet at 8515800 (TESTNET-FAST, owner 2026-11-24 option A)
+        fb = SHIPPED_FROM[f]
+        assert lc.from_block == fb and lc.active(10**12) == bool(fb)
+        if fb:
+            assert not lc.active(fb - 1) and not lc.active(fb) and lc.active(fb + 1)
         assert lc.share == 0.25 and lc.remainder == "burn"
         assert lc.takes_from == ("lane_a" if f == "chain.toml" else "lane_b")
-        assert lc.targets == DEFAULT_TARGETS == ("mkt:returns", "mkt:vol")
-        assert (lc.full_pay_tiers, lc.half_life_rounds, lc.floor, lc.win_ttl_eras) == (
-            ((0.05, 10), (0.02, 5), (0.01, 2)), 1.0, 0.1, 28)
+        # owner 2026-11-10: the shipped lane C is ONE composite MarketCast slot;
+        # the code-level default keeps the per-suite shape
+        assert lc.targets == ("mkt:market",)
+        assert DEFAULT_TARGETS == ("mkt:returns", "mkt:vol")
+        # DEC-CA-0073: the gain-scaled full-pay duration (5 .. 20 days); the
+        # TESTNET-FAST profile (owner 2026-11-24) scales it to 6 h .. 24 h and
+        # lane C's own window counts down
+        fast = f == "chain.testnet.toml"
+        assert (lc.full_pay_min_days, lc.full_pay_max_days, lc.full_pay_max_gain) == (
+            (0.25, 1.0, 0.05) if fast else (5.0, 20.0, 0.05))
+        assert not hasattr(lc, "win_ttl_eras") and not hasattr(lc, "full_pay_tiers")
         assert (lc.alpha, lc.bootstrap_B, lc.gain_margin, lc.min_target_windows) == \
-            (0.05, 10_000, 0.01, 100)
+            (0.05, 10_000, 0.01, 30 if fast else 100)
+        assert lc.n_windows == (100 if fast else 1000)
         assert lc.guard_public == () and lc.tau_public == 0.01
         assert (lc.leg_hours, lc.legs_per_target, lc.max_base_age_eras) == (1.0, 2, 2)
         assert (lc.max_lr_scale, lc.max_steps_fraction) == (1.0, 1.0)
@@ -57,15 +75,22 @@ def test_c_from_a_cannot_overallocate_the_remaining_pool():
     assert mainnet.lane_c.share == 0.25 and mainnet.lane_c.takes_from == "lane_a"
 
 
-def test_shipped_configs_load_with_marketcast_off_and_zero_active_slots():
-    """MarketCast off (from_block 0): the shipped mkt: targets load, count no
-    active slot at any block, so an armed lane C would burn its whole share."""
+def test_shipped_configs_count_no_active_slot_before_marketcast_arms():
+    """Before [marketcast] from_block (mainnet 9586800, owner 2026-11-24;
+    testnet 8515800, TESTNET-FAST) the shipped mkt: targets load and count no active slot, so
+    lane C would burn its whole share; from it, the one composite slot."""
     for f in ("chain.toml", "chain.testnet.toml"):
         cfg = load_chain_config(ROOT / f)
-        assert cfg.marketcast.from_block == 0
-        assert tuple(cfg.marketcast.suites) == SUITES
-        for block in (0, 7201, 10**9):
+        fb = SHIPPED_FROM[f]
+        assert cfg.marketcast.from_block == fb
+        from cascade.shared.config.marketcast import COMPOSITE_LAUNCH_SUITES
+
+        assert tuple(cfg.marketcast.suites) == COMPOSITE_LAUNCH_SUITES
+        assert cfg.marketcast.composite
+        for block in (0, 7201, *((fb - 1,) if fb else (10**9,))):
             assert active_targets(cfg.lane_c, block, cfg.marketcast) == ()
+        if fb:
+            assert active_targets(cfg.lane_c, fb, cfg.marketcast) == ("mkt:market",)
 
 
 def test_target_specs():
@@ -107,8 +132,8 @@ def test_competition_registry():
     ({"targets": "mkt:returns"}, "list"),
     ({"targets": ["domain:energy"]}, "forward-only eval"),
     ({"gain_margin": 0.0}, "gain_margin"),
-    ({"floor": 0.0}, "floor"),
-    ({"win_ttl_eras": 3}, "win_ttl_eras"),
+    ({"full_pay_min_days": 30.0}, "full_pay_min_days"),       # DEC-CA-0073
+    ({"full_pay_max_gain": 0.005}, "gain_margin"),
     ({"n_windows": 50}, "min_target_windows"),
     ({"max_steps_fraction": 1.5}, "max_steps_fraction"),
     ({"pool_prefix": "pool_c"}, "pool_prefix is retired"),
@@ -157,6 +182,7 @@ def test_loader_arms_lane_c_on_an_era_boundary(tmp_path):
     # Lane C takes its allocation from B, which now launches independently.
     raw["lane_b"]["from_block"] = v2
     raw["lane_c"]["from_block"] = v2 + era
+    raw["marketcast"]["from_block"] = 0             # lane C's own gate, MarketCast off
     armed = parse_chain_config(raw)
     assert armed.lane_c.from_block == v2 + era
     # The raw launch boundary is aligned; the effective B gate excludes

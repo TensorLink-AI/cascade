@@ -1,0 +1,10 @@
+# W7c lane D state file + receipt prior/posterior digest binding (plan rev6
+# §3.0 W7c row, §1.5 "State", §3.2 invariant 5, T11; README.md has the
+# contract).
+# canonical state bytes, state_digest, strict load (duplicate keys, canonical
+# bytes, schema, expected digest), atomic save, report_path / load_report_file,
+# the lane D receipt record and its verifiers, the typed error classes.
+cascade/validator/lane_d_state.py
+# settle_lane_d: the receipt on LaneDSettlement, report-then-state writes,
+# crash recovery and the already-settled re-call (T11).
+cascade/validator/lane_d.py

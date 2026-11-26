@@ -46,16 +46,67 @@ The asset lists are the universe Hyperliquid listed on 2026-10-19
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
+from datetime import datetime
 
-from .v2 import FULL_PAY_TIERS, parse_full_pay_tiers
+_log = logging.getLogger("cascade.config.marketcast")
 
-# The six suites (DEC-CA-0064 §Suites). A suite is the lane-C target
-# ``mkt:<suite>``.
-SUITES: tuple[str, ...] = ("returns", "vol", "range", "funding", "liquidity", "alpha")
-# Recommended launch set (research 2026-10-19): returns + vol.
+# The suites (DEC-CA-0064 §Suites; ``ohlcv`` / ``high`` / ``low`` added
+# 2026-11-10, owner). With ``composite = false`` a suite is its own lane-C
+# target ``mkt:<suite>``; with ``composite = true`` the ONE target
+# ``mkt:market`` (:data:`COMPOSITE_TARGET`) is judged over every enabled suite.
+SUITES: tuple[str, ...] = ("returns", "vol", "range", "funding", "liquidity", "alpha",
+                           "ohlcv", "high", "low")
+# The code-level (absent-table) default: the original launch set. The
+# SHIPPED chain.toml enables the 2026-11-10 composite launch set instead
+# (:data:`COMPOSITE_LAUNCH_SUITES`).
 DEFAULT_SUITES: tuple[str, ...] = ("returns", "vol")
+# Owner 2026-11-10 ("a model good at forecasting markets"): one composite
+# target over these suites; funding stays off (its next rate is published).
+COMPOSITE_LAUNCH_SUITES: tuple[str, ...] = ("ohlcv", "returns", "vol", "high", "low", "range",
+                                            "liquidity")
+COMPOSITE_TARGET = "market"
+# The composite's suite weights (owner 2026-11-18, "a balance that produces a
+# model good at forecasting"): each of four properties of a market forecast
+# counts once instead of once per suite that re-measures it — location
+# (returns + ohlcv.c) 0.30, dispersion (vol + range) 0.30, extremes (high +
+# low + ohlcv.h / ohlcv.l) 0.25, activity (liquidity + ohlcv.v) 0.15; ohlcv's
+# 0.20 is its four scored fields at 0.05 each. Renormalised over the enabled
+# suites; funding / alpha (off at launch) weigh like a single-property suite.
+COMPOSITE_SUITE_WEIGHTS: dict[str, float] = {
+    "returns": 0.25, "vol": 0.18, "range": 0.12, "high": 0.075, "low": 0.075,
+    "liquidity": 0.10, "ohlcv": 0.20, "funding": 0.10, "alpha": 0.10,
+}
+# No-regression guards on the composite (owner 2026-11-18): CRPS stays the one
+# score; each guard is a second proper loss on the same windows that the
+# fine-tune may not be CONFIDENTLY worse than the base on (UCB >= -guard_floor), so a CRPS
+# win bought by reshaping the bands at the cost of the point forecast, the
+# variance forecast or the tails fails.
+#   mase  — |median - y| / the window's CRPS scale (the seasonal-naive MAE:
+#           exactly MASE), on the level-like suites (a returns median is ~0);
+#   qlike — Patton's QLIKE of the quantile-implied mean variance on vol (the
+#           loss that ranks vol forecasts right on a noisy realised proxy);
+#   tail  — 2 x mean pinball at TAIL_SCORE_LEVELS / scale, the quantile
+#           (VaR) score of the tails, on the calibration-gated suites.
+GUARD_METRICS: tuple[str, ...] = ("mase", "qlike", "tail")
+GUARD_SUITES: dict[str, tuple[str, ...]] = {
+    "mase": ("ohlcv", "vol", "range", "high", "low", "liquidity"),
+    "qlike": ("vol",),
+    "tail": ("returns", "vol"),
+}
+TAIL_SCORE_LEVELS: tuple[float, ...] = (0.01, 0.05, 0.95, 0.99)
+# ``ohlcv`` forecasts the actual next-bar levels of these fields, one series
+# each (window suite label ``ohlcv.<field>``), scored with scale-normalised
+# CRPS; ``o`` is carried with ``ohlcv_open_weight`` (default 0 = not scored:
+# a Hyperliquid perp's open is the previous close).
+OHLCV_FIELDS: tuple[str, ...] = ("o", "h", "l", "c", "v")
+OHLCV_FIELD_NAMES: dict[str, str] = {"o": "open", "h": "high", "l": "low", "c": "close",
+                                     "v": "volume"}
+# Native Hyperliquid candle intervals a snapshot may carry as their own bank
+# besides the 1-minute bars and the hourly (coarse) bank.
+NATIVE_INTERVALS: tuple[str, ...] = ("5m", "15m")
 # Calibration is a GATE (AND-ed into the verdict) on these suites only: the
 # central-interval coverage gate and the tail hit-rate gate (red-team F1b,
 # 2026-10-20 — vol was ungated, so collapsed log-RV quantiles passed).
@@ -81,6 +132,24 @@ TIMESTRAL_KNOTS: tuple[float, ...] = (
     0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 0.99,
 )
 TIMESTRAL_MAX_CONTEXT = 32768
+# a recipe's leg_hours ceiling: a week (the cap a recipe may ask for is
+# [marketcast] max_leg_hours; the verdict never waits on the leg's length)
+MAX_LEG_HOURS_CEILING = 168.0
+# Owner 2026-11-24: a MarketCast leg fine-tunes Timestral-28M on ONE GPU (the
+# worker is one process on cuda:0), so a miner may rent ANY Lium GPU type.
+# ``[marketcast] funded_pod_skus`` is the RECOMMENDED list (no warning; the
+# default leg rents the cheapest fitting one); any other well-formed type is
+# accepted at the miner's own risk (cascade.funding.mkt_gpus). Trainer and
+# intake policy only: no validator, satellite or audit path reads it.
+_SKU_RE = re.compile(r"^(?:[1-9]\d?x)?[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$")
+CRPS_SCALES = ("level", "seasonal_naive")
+# Owner 2026-11-24 (DEC-CA-0074): a verdict within 13 hours of submission,
+# judged on windows drawn from the embargo. Code bounds of its overlay knobs.
+VERDICT_MAX_HOURS = 13
+VERDICT_WAIT_MAX_BLOCKS = 3900            # 13 h of 12 s blocks
+BACKTEST_WINDOWS_PER_CELL_MAX = 256
+EMBARGO_RULE = "embargo-v1"               # the signed draw rule name (rows + receipts)
+DEFAULT_FORWARD_HORIZONS = ("1mx60", "5mx36")
 TIMESTRAL_MAX_HORIZON = 1024      # per forward pass; longer autoregresses on the median
 TIMESTRAL_PATCH = 32
 
@@ -108,6 +177,7 @@ PERP_CLASSES: tuple[str, ...] = ("crypto", "fx", "metals", "commodities", "equit
 SUITE_CLASSES: dict[str, tuple[str, ...]] = {
     "returns": PERP_CLASSES, "vol": PERP_CLASSES, "range": PERP_CLASSES,
     "funding": PERP_CLASSES, "liquidity": PERP_CLASSES, "alpha": ("alpha",),
+    "ohlcv": PERP_CLASSES, "high": PERP_CLASSES, "low": PERP_CLASSES,
 }
 # Series sampling intervals per suite (what the base sees as one step).
 DEFAULT_FREQUENCIES: dict[str, tuple[str, ...]] = {
@@ -117,6 +187,9 @@ DEFAULT_FREQUENCIES: dict[str, tuple[str, ...]] = {
     "funding": ("8h",),
     "liquidity": ("1h", "1d"),
     "alpha": ("1h", "1d"),
+    "ohlcv": ("5m", "1h", "1d"),
+    "high": ("1h", "4h", "1d"),
+    "low": ("1h", "4h", "1d"),
 }
 # Forecast horizons per suite (durations). ``5d`` was dropped from returns
 # (review 2026-10-19): a 6-day verdict wait cannot hold two aligned 5-day
@@ -129,12 +202,18 @@ DEFAULT_HORIZONS: dict[str, tuple[str, ...]] = {
     "funding": ("8h",),
     "liquidity": ("1h", "1d"),
     "alpha": ("1h", "1d"),
+    "ohlcv": ("5m", "1h", "4h", "1d"),
+    "high": ("1h", "4h", "1d"),
+    "low": ("1h", "4h", "1d"),
 }
 # Recipe allow-lists. Covariates are INPUTS, never targets (DEC-CA-0064
 # §Covariates); each has a builder in :func:`cascade.eval.marketcast.
 # build_covariates`. ``open_interest`` and ``macro_events`` are NOT allowed:
 # Hyperliquid serves no historical OI and no event calendar is pinned.
-DEFAULT_COVARIATES: tuple[str, ...] = ("cross_asset", "funding", "volume", "calendar", "session")
+DEFAULT_COVARIATES: tuple[str, ...] = ("cross_asset", "funding", "volume", "calendar", "session",
+                                       # owner 2026-11-18: cross markets, order flow, events
+                                       "cross_eth", "cross_equity", "cross_gold", "cross_fx",
+                                       "open_interest", "spread", "events")
 # Each has a pure seeded transform in :mod:`cascade.trainer.marketcast_leg`.
 DEFAULT_AUGMENTATIONS: tuple[str, ...] = ("scale", "jitter", "crop", "time_warp", "mixup")
 TRAINABLE_SCOPES: tuple[str, ...] = ("full", "last_n_blocks", "frozen_embeddings", "lora")
@@ -168,17 +247,25 @@ BLOCK_SECONDS = 12.0
 # The fewest finite context steps a window needs (:func:`cascade.eval.
 # marketcast.cut_windows`).
 MIN_CONTEXT = 32
-# Coarse bank (review 2026-10-19): series at >= 1h frequencies are cut from
-# hourly bars kept for ``coarse_history_days`` (Hyperliquid serves only the
-# most recent ~5000 candles per interval — measured 2026-10-19: 1m ~3.6 days,
-# 5m ~17 days, 15m ~52 days, 1h ~208 days, 4h ~833 days), so a daily series
-# has enough history to be scored. Realized vol needs >= 2 returns inside a
-# block, so it reads the coarse bank only at >= 1d (24 hourly returns a day).
+# Banks (review 2026-10-19; native intervals 2026-11-10). Hyperliquid serves
+# only the most recent ~5000 candles per interval (measured 2026-10-19: 1m
+# ~3.6 days, 5m ~17 days, 15m ~52 days, 1h ~208 days, 4h ~833 days). A series
+# at frequency ``f`` is cut from the COARSEST bank whose bar interval divides
+# ``f`` (:meth:`MarketCastConfig.bank_minutes`): the 1-minute bars
+# (``snapshot_days``), a native bank of ``native_intervals`` (5m / 15m,
+# ``native_history_days``) or the hourly coarse bank (``coarse_history_days``).
+# Every suite value is a function of the block's OHLCV candle (open = first
+# bar's open, high / low = max / min, close = last bar's close, volume = sum),
+# so cutting it from a finer bank gives the same value — the bank is only a
+# history-depth choice. Realized vol is Garman–Klass on that candle (2026-11-10,
+# owner: computable from native candles, so no 1-minute history is needed).
 COARSE_BAR_MINUTES = 60
 COARSE_MIN_FREQ_MINUTES = 60
-COARSE_MIN_FREQ_MINUTES_VOL = 1440
 
 _DUR_RE = re.compile(r"^([1-9][0-9]{0,4})(m|h|d)$")
+# a multi-step horizon ``<bar>x<steps>`` (owner 2026-11-18): ``steps`` bars of
+# ``<bar>`` ahead, e.g. ``1mx60`` = 60 one-minute bars, ``1dx7`` = a week of days
+_PATH_RE = re.compile(r"^([1-9][0-9]{0,4}[mhd])x([1-9][0-9]{0,3})$")
 _DUR_MIN = {"m": 1, "h": 60, "d": 1440}
 _LABEL_RE = re.compile(r"^[a-z0-9_\-]{1,32}$")
 _ASSET_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,24}$")
@@ -188,8 +275,19 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 RESERVED_POOL_PREFIXES = ("pool", "pool_c", "pool_d")
 
 
+def horizon_path(spec: str) -> tuple[str, int] | None:
+    """``"1mx60"`` → ``("1m", 60)``: a multi-step horizon's bar and step
+    count; None for a plain duration horizon."""
+    m = _PATH_RE.match(str(spec))
+    return (m.group(1), int(m.group(2))) if m else None
+
+
 def duration_minutes(spec: str) -> int:
-    """``"5m"`` / ``"4h"`` / ``"1d"`` → minutes. Raises ``ValueError``."""
+    """``"5m"`` / ``"4h"`` / ``"1d"`` → minutes; a multi-step horizon
+    ``"<bar>x<steps>"`` → ``bar × steps`` minutes. Raises ``ValueError``."""
+    p = horizon_path(spec)
+    if p is not None:
+        return duration_minutes(p[0]) * p[1]
     m = _DUR_RE.match(str(spec))
     if not m:
         raise ValueError(f"duration {spec!r} must be <int><m|h|d>, e.g. '5m', '4h', '1d'")
@@ -198,9 +296,17 @@ def duration_minutes(spec: str) -> int:
 
 def coarse_frequency(suite: str, freq_minutes: int) -> bool:
     """Whether ``suite`` at ``freq_minutes`` is cut from the snapshot's
-    coarse (hourly) bank rather than its 1-minute bars."""
-    lo = COARSE_MIN_FREQ_MINUTES_VOL if suite == "vol" else COARSE_MIN_FREQ_MINUTES
-    return int(freq_minutes) >= lo
+    coarse (hourly) bank: every whole-hour frequency (``suite`` is kept for
+    the call sites; since the Garman–Klass vol of 2026-11-10 no suite needs
+    finer bars inside a block)."""
+    f = int(freq_minutes)
+    return f >= COARSE_MIN_FREQ_MINUTES and f % COARSE_MIN_FREQ_MINUTES == 0
+
+
+def base_suite(label: str) -> str:
+    """A window's suite label → its configured suite (``"ohlcv.c"`` →
+    ``"ohlcv"``)."""
+    return str(label).split(".", 1)[0]
 
 
 def split_base_ref(ref: str) -> tuple[str, str]:
@@ -226,6 +332,10 @@ class MarketCastConfig:
     continuation_protocol: str = ""
 
     from_block: int = 0
+    # Containment kill switch (owner 2026-11-24): DERIVED, never a
+    # [marketcast] key — the loader copies ``[lane_c] until_block`` here so a
+    # closed lane C also stops MarketCast judging (0 = no end).
+    until_block: int = 0
     # The pinned base (release-only: a new architecture).
     base_ref: str = TIMESTRAL_PINNED_REF
     base_sha256: str = TIMESTRAL_SHA256
@@ -248,15 +358,8 @@ class MarketCastConfig:
     alpha: float = 0.05
     bootstrap_B: int = 10_000
     gain_margin: float = 0.01
-    # Gain-tiered full-pay period of an ``mkt:`` win (owner 2026-10-20), on
-    # lane C's slot TTL and decay: the ``full_eras`` of the highest threshold
-    # its confirmed gain LCB meets. Its OWN tiers, not [lane_c]'s: the
-    # MarketCast LCB is a horizon-equal clustered geomean gain on one suite's
-    # loss (CRPS-bp / QLIKE / log range …) vs the pinned base, not lane C's
-    # cluster-bootstrapped sqrt(WQL · MASE) gain vs the king — the same number
-    # is not the same evidence. Release-only like the rest of [marketcast].
-    # Uncalibrated placeholders (lane B / C's defaults).
-    full_pay_tiers: tuple[tuple[float, int], ...] = FULL_PAY_TIERS
+    # (``full_pay_tiers`` is retired, DEC-CA-0073: an mkt: win's full-pay
+    # duration is lane C's gain-scaled rule, ramped from this gain_margin.)
     # review M10 (2026-10-19): clusters are asset class × time block, so the
     # floors count independent evidence, not windows of one regime
     min_windows: int = 200
@@ -268,16 +371,21 @@ class MarketCastConfig:
     covariates: tuple[str, ...] = DEFAULT_COVARIATES
     augmentations: tuple[str, ...] = DEFAULT_AUGMENTATIONS
     embargo_days: int = 30          # training data must end this long before submission
-    max_synthetic_fraction: float = 0.5
+    # owner 2026-11-16: a recipe may train on the generator alone (1.0) or on
+    # real data alone (0.0); at 1.0 its data.assets may be empty
+    max_synthetic_fraction: float = 1.0
+    # owner 2026-11-16: the recipe's own leg_hours (wall of its fine-tune leg,
+    # miner-paid) is capped here; a recipe without it trains [lane_c] leg_hours
+    max_leg_hours: float = 12.0
     max_lr: float = 1e-3
     max_steps: int = 100_000
     max_batch: int = 512
     max_lora_rank: int = 64
     # Window cutting / verdict timing (validator + audit).
     eval_context_length: int = 4096       # context steps both base and fine-tune see
-    windows_per_cell: int = 48            # windows per (asset, horizon), spread evenly
-    start_margin_seconds: int = 3600      # windows start this long after the train block
-    verdict_wait_blocks: int = 43_200     # an entry waits for windows this long (6 days)
+    windows_per_cell: int = 48            # FORWARD windows per (asset, horizon), spread evenly
+    start_margin_seconds: int = 3600      # forward windows start this long after dispatch
+    verdict_wait_blocks: int = 3900       # an inconclusive entry waits this long (<= 13 h)
     snapshot_days: int = 21               # realized bars an eval snapshot carries
     # Review fixes 2026-10-19 (DEC-CA-0064 §Review fixes):
     coarse_history_days: int = 180        # hourly bars kept for >= 1h series (HL serves ~208 d)
@@ -289,6 +397,27 @@ class MarketCastConfig:
     min_bar_coverage: float = 0.8         # share of live bars in the 24 h before a window
     min_dollar_volume_24h: float = 1_000_000.0   # USD traded in the 24 h before (0 = off)
     coverage_tolerance_over: float = 0.10  # gated levels also fail ABOVE nominal + this
+    # per-window CRPS divisor (owner 2026-11-17, "do gift eval style"):
+    # "level" = ohlcv ÷ last price, other suites in their units;
+    # "seasonal_naive" = every window ÷ the GIFT-Eval/MASE seasonal-naive error of
+    # its own context, and the training loss on the same scale (the default)
+    crps_scale: str = "seasonal_naive"
+    # trainer-side relay of the bar recording to training pods (release-only):
+    # "<bucket>/<prefix>/" on the [storage] S3 endpoint, read with the
+    # HIPPIUS_S3_* credentials; "" = off (the pod fetches the API itself)
+    bar_relay: str = ""
+    # the worker image MarketCast legs boot (trainer-only, release-only): a
+    # "<repo>:<tag>@sha256:<64 hex>" ref with its worker_code_fingerprint
+    # (scripts/worker_code_fingerprint.py), both or neither. Set, every
+    # MarketCast leg rents and code-checks on these pins while every other leg
+    # keeps [round] funded_pod_image / worker_code_fingerprint; "" = the fleet's.
+    pod_image: str = ""
+    worker_code_fingerprint: str = ""
+    # the leg splits each recipe batch into micro-batches of at most this many
+    # context steps (batch x context_length) and accumulates their gradients
+    # (release-only): any recipe the bounds admit fits a 16 GB card (measured
+    # 2026-11-17: full fine-tune 2^19 steps ≈ 9-12 GiB on an RTX 3060)
+    micro_batch_tokens: int = 524_288
     coverage_gate_levels: tuple[float, ...] = (0.5, 0.8)   # 98 % is report-only
     # Red-team fixes 2026-10-20 (DEC-CA-0064 §Red-team fixes):
     # F1 — the gain is a geomean over (asset class × horizon) of the ratio of
@@ -313,10 +442,84 @@ class MarketCastConfig:
     near_dup_tol: float = 0.02
     # F6 — trainer policy: open MarketCast legs per coldkey.
     max_open_legs_per_coldkey: int = 1
+    # Owner 2026-11-24: the RECOMMENDED GPU types a MarketCast leg rents (the
+    # default leg: cheapest fitting of these; any other Lium type is the
+    # miner's own risk). () = [round] funded_pod_skus (pre-2026-11-24).
+    funded_pod_skus: tuple[str, ...] = ()
+    # Owner 2026-11-10 — one composite target (``mkt:market``) over every
+    # enabled suite: the gain is the geomean over suites of each suite's
+    # (class × horizon)-balanced gain, one cluster bootstrap for all; an entry
+    # that is CONFIDENTLY worse on ANY suite (its UCB below ``-composite_suite_floor``) fails
+    # (no-regression floor). ``false`` = the per-suite ``mkt:<suite>`` slots.
+    composite: bool = False
+    composite_suite_floor: float = 0.0
+    # ohlcv: the scoring weight of the open field (the other fields weigh 1)
+    ohlcv_open_weight: float = 0.0
+    # the composite's per-suite weights (COMPOSITE_SUITE_WEIGHTS) and its
+    # no-regression guards (GUARD_METRICS; () = none)
+    composite_suite_weights: tuple[tuple[str, float], ...] = tuple(
+        sorted(COMPOSITE_SUITE_WEIGHTS.items()))
+    guards: tuple[str, ...] = GUARD_METRICS
+    guard_floor: float = 0.0
+    # Owner 2026-11-18: the composite must also beat the strong simple
+    # baselines (cascade.eval.marketcast_baselines: random walk + EWMA / FHS,
+    # seasonal AR(1)) — composite LCB >= 0, no suite confidently worse
+    baseline_gate: bool = True
+    # Owner 2026-11-18: the pinned SCHEDULED-event calendar the ``events``
+    # covariate reads (unix instants of high-impact releases: FOMC, CPI,
+    # NFP, …; known in advance, so a known-future input). Maintained in the
+    # chain config from the official calendars; empty = the rows are 0 / 1.
+    event_times: tuple[float, ...] = ()
+    # Native candle banks (owner 2026-11-10) and the days each carries; empty =
+    # the 1-minute + hourly banks only (the pre-2026-11-10 layout).
+    native_intervals: tuple[str, ...] = ()
+    native_history_days: tuple[tuple[str, int], ...] = (("15m", 50), ("5m", 21))
+    # Owner 2026-11-24 (DEC-CA-0074): every horizon is judged on windows
+    # DRAWN from the embargo — the ``embargo_eval_days`` before the leg's
+    # dispatch, which no training leg reads (a recipe's data ends >=
+    # ``embargo_days`` before its commit) — ``backtest_windows_per_cell`` per
+    # (asset, series, horizon), ranked by the round block's hash (unknown
+    # while the leg trains); judge and confirm draw from the two halves of a
+    # fixed public window partition. The ``forward_horizons`` also take up to
+    # ``windows_per_cell`` forward windows already closed in the snapshot
+    # (start > dispatch + start_margin_seconds, end <= dispatch +
+    # verdict_wait_blocks), never waited for.
+    embargo_eval_days: int = 28
+    backtest_windows_per_cell: int = 48
+    forward_horizons: tuple[str, ...] = ()   # parse default: DEFAULT_FORWARD_HORIZONS enabled
+    # DEC-CA-0075 (W-CMP): MarketCast as a declarative lane-C competition
+    # spec (``[lane_c.specs.mkt]``, :mod:`cascade.shared.competition_spec`).
+    # The pool's signer ("" / "owner" = the main validator's hotkey, today's
+    # rule), its schema ("" = legacy snapshot OR standard pool, today; a
+    # standard-pool version = that version only), the standard-pool tags a
+    # series must carry ({} = every series), the rule menu picks, and the
+    # typed refusal of the spec ("" = accepted; set ⇒ MarketCast is inert at
+    # every block and its share burns).
+    pool_signer: str = ""
+    pool_schema: str = ""
+    pool_select: tuple[tuple[str, str], ...] = ()
+    # W-CMP2: metric channel name -> the pool's channel name ({} = same names)
+    pool_channels: tuple[tuple[str, str], ...] = ()
+    test_family: str = "bonferroni"
+    pay_curve: str = "fixed_term"
+    refused: str = ""
+    # DEC-CA-0075 (W-CMP2): a lane-C spec INSTANCE on the marketcast runner —
+    # its classes are its standard pool's ``class`` tags and every enabled
+    # suite reads every class (no market feed, no SUITE_CLASSES table)
+    open_classes: bool = False
 
     def active(self, block: int | None) -> bool:
-        """Whether MarketCast judges a settlement at ``block``."""
-        return bool(self.from_block > 0 and block is not None and int(block) >= self.from_block)
+        """Whether MarketCast judges a settlement at ``block`` (never while
+        its competition spec is refused, DEC-CA-0075)."""
+        return bool(self.from_block > 0 and block is not None and int(block) >= self.from_block
+                    and (self.until_block <= 0 or int(block) <= self.until_block)
+                    and not self.refused)
+
+    @property
+    def wait_blocks(self) -> int:
+        """The inconclusive wait in force: ``verdict_wait_blocks`` capped at
+        :data:`VERDICT_WAIT_MAX_BLOCKS` (owner 2026-11-24: <= 13 h)."""
+        return min(int(self.verdict_wait_blocks), VERDICT_WAIT_MAX_BLOCKS)
 
     @property
     def base_pointer(self) -> str:
@@ -327,14 +530,78 @@ class MarketCastConfig:
         return mkt_base_pointer(self)
 
     @property
+    def target_names(self) -> tuple[str, ...]:
+        """The ``mkt:<name>`` lane-C target names this config defines:
+        ``("market",)`` when ``composite``, else one per suite."""
+        return (COMPOSITE_TARGET,) if self.composite else tuple(self.suites)
+
+    @property
     def target_suites(self) -> tuple[str, ...]:
-        """The suites whose ``mkt:<suite>`` lane-C targets are admitted —
-        none while MarketCast is inert."""
-        return tuple(self.suites) if self.from_block > 0 else ()
+        """The target names whose ``mkt:<name>`` lane-C targets are admitted
+        — none while MarketCast is inert."""
+        return self.target_names if self.from_block > 0 else ()
 
     @property
     def targets(self) -> tuple[str, ...]:
-        return tuple(f"mkt:{s}" for s in self.suites)
+        return tuple(f"mkt:{s}" for s in self.target_names)
+
+    def suites_of(self, name: str) -> tuple[str, ...]:
+        """The suites a target name is judged over (the composite: every
+        enabled suite)."""
+        return tuple(self.suites) if name == COMPOSITE_TARGET else (str(name),)
+
+    def series_labels(self, suite: str) -> tuple[str, ...]:
+        """The window suite labels of one suite: ``ohlcv`` → one per scored
+        field (``ohlcv.<field>``; the open only with ``ohlcv_open_weight``
+        > 0), every other suite itself."""
+        if suite != "ohlcv":
+            return (suite,)
+        return tuple(f"ohlcv.{f}" for f in OHLCV_FIELDS
+                     if f != "o" or float(self.ohlcv_open_weight) > 0)
+
+    @property
+    def suite_weight_map(self) -> dict[str, float]:
+        """The composite's weight of each ENABLED suite, summing to 1."""
+        w = dict(self.composite_suite_weights)
+        tot = sum(w[s] for s in self.suites)
+        return {s: w[s] / tot for s in self.suites}
+
+    def guards_of(self, label: str) -> tuple[str, ...]:
+        """The composite guards a window of suite label ``label`` carries."""
+        if not self.composite:
+            return ()
+        s = base_suite(label)
+        return tuple(g for g in self.guards if s in GUARD_SUITES[g])
+
+    @property
+    def native_history_map(self) -> dict[str, int]:
+        return dict(self.native_history_days)
+
+    def bank_minutes(self, freq_minutes: int) -> int:
+        """The bar interval (minutes) a series at ``freq_minutes`` is cut
+        from: the coarsest of 1m, the ``native_intervals`` and the hourly
+        bank that divides it."""
+        f = int(freq_minutes)
+        if coarse_frequency("", f):
+            return COARSE_BAR_MINUTES
+        best = 1
+        for iv in self.native_intervals:
+            m = duration_minutes(iv)
+            if f % m == 0 and m > best:
+                best = m
+        return best
+
+    def bank_days(self, bar_minutes: int) -> int:
+        """Days of history the bank of ``bar_minutes`` carries."""
+        bm = int(bar_minutes)
+        if bm == COARSE_BAR_MINUTES:
+            return int(self.coarse_history_days)
+        if bm == 1:
+            return int(self.snapshot_days)
+        for iv, d in self.native_history_days:
+            if duration_minutes(iv) == bm:
+                return int(d)
+        return int(self.snapshot_days)
 
     @property
     def assets_map(self) -> dict[str, tuple[str, ...]]:
@@ -356,16 +623,23 @@ class MarketCastConfig:
         """The class's source ids, primary first ("" ⇒ ``()``)."""
         return split_sources(self.data_sources_map.get(cls, ""))
 
+    def suite_classes(self, suite: str) -> tuple[str, ...]:
+        """The asset classes ``suite`` reads (:data:`SUITE_CLASSES`; a spec
+        instance, ``open_classes``: every configured class)."""
+        if self.open_classes:
+            return tuple(c for c, _a in self.assets)
+        return tuple(SUITE_CLASSES.get(suite, ()))
+
     def suite_assets(self, suite: str) -> list[tuple[str, str]]:
         """``[(class, symbol), ...]`` a suite is judged over (sorted)."""
         am = self.assets_map
-        return sorted((c, a) for c in SUITE_CLASSES.get(suite, ()) for a in am.get(c, ()))
+        return sorted((c, a) for c in self.suite_classes(suite) for a in am.get(c, ()))
 
     @property
     def armed_classes(self) -> tuple[str, ...]:
         """The classes an enabled suite reads that list at least one asset."""
         am = self.assets_map
-        return tuple(sorted({c for s in self.suites for c in SUITE_CLASSES.get(s, ())
+        return tuple(sorted({c for s in self.suites for c in self.suite_classes(s)
                              if am.get(c)}))
 
 
@@ -396,7 +670,7 @@ def arming_problems(mc: MarketCastConfig) -> list[str]:
         unbuilt = [x for x in srcs if x not in IMPLEMENTED_SOURCES]
         if unbuilt:
             out.append(f"data_sources.{cls} names {unbuilt}: no adapter in this release")
-    return out
+    return out + draw_problems(mc)
 
 
 def scorability_problems(mc: MarketCastConfig) -> list[str]:
@@ -404,18 +678,15 @@ def scorability_problems(mc: MarketCastConfig) -> list[str]:
     every one is scorable). Per enabled suite and horizon, at the frequency
     it is forecast at (:func:`cascade.eval.marketcast.window_geometry`):
 
-    * the snapshot's history at that frequency — ``coarse_history_days``
-      for a coarse-bank series, else ``snapshot_days`` — holds at least
-      ``MIN_CONTEXT + steps`` blocks;
-    * the forward wait ``verdict_wait_blocks × BLOCK_SECONDS −
-      start_margin_seconds`` holds at least TWO non-overlapping windows at
-      the worst grid alignment (window origins sit on the absolute UTC grid,
-      so the first may start up to one horizon after ``after``: ``wait ≥ 3 ×
-      horizon``)."""
+    * the history of the bank the series is cut from
+      (:meth:`MarketCastConfig.bank_days`) holds at least ``MIN_CONTEXT +
+      steps`` blocks.
+
+    Whether the DEC-CA-0074 embargo draw can hold the windows is an arming
+    check (:func:`draw_problems`)."""
     from ...eval.marketcast import window_geometry
 
     out: list[str] = []
-    wait_s = int(mc.verdict_wait_blocks) * BLOCK_SECONDS - int(mc.start_margin_seconds)
     fm, hm = mc.frequencies_map, mc.horizons_map
     for s in mc.suites:
         for h in hm.get(s, ()):
@@ -424,19 +695,43 @@ def scorability_problems(mc: MarketCastConfig) -> list[str]:
             except ValueError as e:
                 out.append(f"{s}/{h}: {e}")
                 continue
-            days = mc.coarse_history_days if coarse_frequency(s, f) else mc.snapshot_days
+            days = mc.bank_days(mc.bank_minutes(f))
             blocks = int(days) * 1440 // int(f)
             if blocks < MIN_CONTEXT + steps:
                 out.append(f"{s}/{h} at {f}m: {days} days of history hold {blocks} blocks < "
                            f"{MIN_CONTEXT} context + {steps} target")
+    return out
+
+
+def draw_problems(mc: MarketCastConfig) -> list[str]:
+    """DEC-CA-0074: why the embargo draw could never judge (empty = it can;
+    an ARMING check, :func:`arming_problems`): an embargo of >= 2 days (the
+    draw reads only days no leg reads); per enabled (suite, horizon) the
+    ``embargo_eval_days`` span holds an aligned window (window origins sit
+    on the absolute UTC grid, so the first may start up to one horizon after
+    the span opens: ``span >= 2 x horizon``) and a ``forward_horizons``
+    horizon one in the forward span (``verdict_wait_blocks`` (capped) x
+    BLOCK_SECONDS - start_margin_seconds); the span holds ``min_time_blocks``
+    distinct cluster blocks."""
+    out: list[str] = []
+    if int(mc.embargo_days) < 2:
+        out.append(f"embargo_days={mc.embargo_days}: the embargo draw needs >= 2 days no leg "
+                   f"reads")
+    span = int(mc.embargo_eval_days) * 86400
+    fwd = int(mc.wait_blocks) * BLOCK_SECONDS - int(mc.start_margin_seconds)
+    for s in mc.suites:
+        for h in mc.horizons_map.get(s, ()):
             hs = 60 * duration_minutes(h)
-            if wait_s < 3 * hs:
-                out.append(f"{s}/{h}: the forward wait ({wait_s:.0f}s = verdict_wait_blocks × "
-                           f"{BLOCK_SECONDS:g} − start_margin_seconds) holds fewer than 2 aligned "
-                           f"windows (needs >= {3 * hs}s)")
+            if span < 2 * hs:
+                out.append(f"{s}/{h}: the {mc.embargo_eval_days}-day embargo eval span holds "
+                           f"no aligned window (needs >= {2 * hs}s)")
+            if h in tuple(mc.forward_horizons) and fwd < 2 * hs:
+                out.append(f"{s}/{h}: a forward horizon must fit the forward span ({fwd:.0f}s "
+                           f"= verdict_wait_blocks × {BLOCK_SECONDS:g} − start_margin_seconds; "
+                           f"needs >= {2 * hs}s)")
     tb_s = int(mc.min_time_blocks) * int(mc.cluster_block_hours) * 3600
-    if wait_s < tb_s:
-        out.append(f"the forward wait ({wait_s:.0f}s) is shorter than min_time_blocks × "
+    if span < tb_s:
+        out.append(f"the embargo eval span ({span}s) is shorter than min_time_blocks × "
                    f"cluster_block_hours ({tb_s}s): no verdict could ever conclude")
     return out
 
@@ -476,7 +771,67 @@ def _per_suite(raw, name: str, default: dict, suites: tuple[str, ...]):
     return out
 
 
-def parse_marketcast(raw: object) -> MarketCastConfig:
+def _funded_pod_skus(v: object) -> tuple[str, ...]:
+    """``[marketcast] funded_pod_skus``: a list of unique GPU types (``"H100"``
+    or a layout ``"<n>x<model>"``, n 1..99); ``[]`` / absent = ``()`` (the
+    trainer then rents from ``[round] funded_pod_skus``)."""
+    if v is None or v == () or v == []:
+        return ()
+    if isinstance(v, (str, bytes)) or not isinstance(v, (list, tuple)):
+        raise ValueError(f"[marketcast] funded_pod_skus must be a list of GPU types; got {v!r}")
+    out: list[str] = []
+    for x in v:
+        if not isinstance(x, str) or not _SKU_RE.match(x.strip()):
+            raise ValueError(f"[marketcast] funded_pod_skus entry {x!r} is not a GPU type "
+                             "('H100' or '<n>x<model>', letters/digits/._-)")
+        out.append(x.strip())
+    if len({s.lower() for s in out}) != len(out):
+        raise ValueError(f"[marketcast] funded_pod_skus must be unique; got {v!r}")
+    return tuple(out)
+
+
+def is_gpu_type(sku: object) -> bool:
+    """Whether ``sku`` is a well-formed GPU type (``"H100"``, ``"1xRTX4090"``)."""
+    return isinstance(sku, str) and bool(_SKU_RE.match(sku.strip()))
+
+
+def _parse_spec_fields(mc: dict) -> dict:
+    """DEC-CA-0075: the spec-compiled keys (``pool_signer``, ``pool_schema``,
+    ``pool_select``, ``test_family``, ``pay_curve``, ``refused``); absent =
+    today's rule."""
+    from ..competition_spec import POOL_SCHEMAS
+    from ..rules_menu import check_choice
+
+    out: dict = {}
+    for k in ("pool_signer", "pool_schema", "refused"):
+        v = mc.get(k, "")
+        if not isinstance(v, str):
+            raise ValueError(f"[marketcast] {k} must be a string; got {v!r}")
+        out[k] = "" if (k == "pool_signer" and v == "owner") else v
+    if out["pool_schema"] not in POOL_SCHEMAS:
+        raise ValueError(f"[marketcast] pool_schema must be one of {POOL_SCHEMAS}; "
+                         f"got {out['pool_schema']!r}")
+    sel = mc.get("pool_select", {})
+    if not isinstance(sel, dict) or not all(isinstance(a, str) and isinstance(b, str) and b
+                                            for a, b in sel.items()):
+        raise ValueError(f"[marketcast] pool_select must be a table tag -> value; got {sel!r}")
+    out["pool_select"] = tuple(sorted(sel.items()))
+    chn = mc.get("pool_channels", {})
+    if not isinstance(chn, dict) or not all(isinstance(a, str) and isinstance(b, str) and b
+                                            for a, b in chn.items()):
+        raise ValueError(f"[marketcast] pool_channels must be a table channel -> pool "
+                         f"channel; got {chn!r}")
+    out["pool_channels"] = tuple(sorted(chn.items()))
+    out["test_family"], out["pay_curve"] = check_choice(
+        "lane_c", test_family=mc.get("test_family", "bonferroni"),
+        pay_curve=mc.get("pay_curve", "fixed_term"))
+    return out
+
+
+_OPEN_CLASS_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+
+
+def parse_marketcast(raw: object, *, open_classes: bool = False) -> MarketCastConfig:
     """Parse + validate ``[marketcast]`` (absent ⇒ the inert defaults).
     Refuses arming (``from_block`` > 0) and malformed placeholders."""
     mc = dict(raw) if isinstance(raw, dict) else {}
@@ -510,7 +865,12 @@ def parse_marketcast(raw: object) -> MarketCastConfig:
                          f"got {assets_raw!r}")
     assets: dict[str, tuple[str, ...]] = {}
     for cls, syms in assets_raw.items():
-        if cls not in ASSET_CLASSES:
+        if open_classes:
+            # DEC-CA-0075 (W-CMP2): a spec instance's classes are the standard
+            # pool's ``class`` tags (any lower-case label); no feed reads them
+            if not isinstance(cls, str) or not _OPEN_CLASS_RE.match(cls):
+                raise ValueError(f"[marketcast] assets class {cls!r} must be [a-z][a-z0-9_]{{0,31}}")
+        elif cls not in ASSET_CLASSES:
             raise ValueError(f"[marketcast] assets names unknown class {cls!r}; classes are "
                              f"{ASSET_CLASSES}")
         ss = _str_list(syms, f"assets.{cls}")
@@ -521,6 +881,9 @@ def parse_marketcast(raw: object) -> MarketCastConfig:
     freqs = _per_suite(mc.get("frequencies", DEFAULT_FREQUENCIES), "frequencies",
                        DEFAULT_FREQUENCIES, suites)
     hzs = _per_suite(mc.get("horizons", DEFAULT_HORIZONS), "horizons", DEFAULT_HORIZONS, suites)
+    paths = sorted({f for fs in freqs.values() for f in fs if horizon_path(f) is not None})
+    if paths:
+        raise ValueError(f"[marketcast] frequencies {paths} must be bars, not <bar>x<steps> paths")
     for s in suites:
         lo = min(duration_minutes(f) for f in freqs[s])
         short = [h for h in hzs[s] if duration_minutes(h) < lo]
@@ -533,7 +896,7 @@ def parse_marketcast(raw: object) -> MarketCastConfig:
         raise ValueError(f"[marketcast] data_sources must be a table class -> source; "
                          f"got {src_raw!r}")
     bad = [k for k in src_raw if k not in ASSET_CLASSES]
-    if bad:
+    if bad and not open_classes:
         raise ValueError(f"[marketcast] data_sources names unknown classes {bad}")
     sources = {**DEFAULT_DATA_SOURCES, **src_raw}
     for cls, spec in sources.items():
@@ -573,9 +936,6 @@ def parse_marketcast(raw: object) -> MarketCastConfig:
     if not 0.0 < margin < 1.0:
         raise ValueError(f"[marketcast] gain_margin must be in (0, 1) — a zero bar lets an "
                          f"untouched base win ~alpha of the time; got {margin}")
-    # the TTL bound (lane C's win_ttl_eras) is checked by the loader
-    fpt = parse_full_pay_tiers(mc.get("full_pay_tiers", FULL_PAY_TIERS), section="marketcast",
-                               win_ttl_eras=0)
     mw = _num(mc.get("min_windows", 200), "min_windows", integer=True)
     mcl = _num(mc.get("min_clusters", 8), "min_clusters", integer=True)
     if mw < 1 or not 1 <= mcl <= mw:
@@ -598,9 +958,13 @@ def parse_marketcast(raw: object) -> MarketCastConfig:
     emb = _num(mc.get("embargo_days", 30), "embargo_days", integer=True)
     if emb < 0:
         raise ValueError(f"[marketcast] embargo_days must be >= 0; got {emb}")
-    syn = _num(mc.get("max_synthetic_fraction", 0.5), "max_synthetic_fraction")
+    syn = _num(mc.get("max_synthetic_fraction", 1.0), "max_synthetic_fraction")
     if not 0.0 <= syn <= 1.0:
         raise ValueError(f"[marketcast] max_synthetic_fraction must be in [0, 1]; got {syn}")
+    mlh = _num(mc.get("max_leg_hours", 12.0), "max_leg_hours")
+    if not 0.0 < mlh <= MAX_LEG_HOURS_CEILING:
+        raise ValueError(f"[marketcast] max_leg_hours must be in (0, {MAX_LEG_HOURS_CEILING:g}]; "
+                         f"got {mlh}")
     mlr = _num(mc.get("max_lr", 1e-3), "max_lr")
     msteps = _num(mc.get("max_steps", 100_000), "max_steps", integer=True)
     mbatch = _num(mc.get("max_batch", 512), "max_batch", integer=True)
@@ -614,11 +978,16 @@ def parse_marketcast(raw: object) -> MarketCastConfig:
                          f"max_context_length]; got {ectx}")
     wpc = _num(mc.get("windows_per_cell", 48), "windows_per_cell", integer=True)
     marg = _num(mc.get("start_margin_seconds", 3600), "start_margin_seconds", integer=True)
-    wait = _num(mc.get("verdict_wait_blocks", 43_200), "verdict_wait_blocks", integer=True)
+    wait = _num(mc.get("verdict_wait_blocks", 3900), "verdict_wait_blocks", integer=True)
     sdays = _num(mc.get("snapshot_days", 21), "snapshot_days", integer=True)
     if wpc < 1 or marg < 0 or wait < 0 or sdays < 1:
         raise ValueError("[marketcast] need windows_per_cell >= 1, start_margin_seconds >= 0, "
                          "verdict_wait_blocks >= 0 and snapshot_days >= 1")
+    if wait > VERDICT_WAIT_MAX_BLOCKS:
+        # owner 2026-11-24 (DEC-CA-0074): a verdict within 13 h — a larger
+        # value (an older deployed file, an overlay) is capped in code
+        _log.warning("[marketcast] verdict_wait_blocks=%d is capped at %d (a verdict within "
+                     "%d h, DEC-CA-0074)", wait, VERDICT_WAIT_MAX_BLOCKS, VERDICT_MAX_HOURS)
     cdays = _num(mc.get("coarse_history_days", 180), "coarse_history_days", integer=True)
     rto = _num(mc.get("report_timeout_settlements", 8), "report_timeout_settlements",
                integer=True)
@@ -641,6 +1010,25 @@ def parse_marketcast(raw: object) -> MarketCastConfig:
         raise ValueError("[marketcast] need min_bar_coverage in [0, 1] and "
                          "min_dollar_volume_24h >= 0")
     tov = _num(mc.get("coverage_tolerance_over", 0.10), "coverage_tolerance_over")
+    crps_scale = str(mc.get("crps_scale", "seasonal_naive"))
+    bar_relay = str(mc.get("bar_relay", "") or "")
+    mbt = _num(mc.get("micro_batch_tokens", 524_288), "micro_batch_tokens", integer=True)
+    if mbt < 1:
+        raise ValueError(f"[marketcast] micro_batch_tokens must be >= 1; got {mbt}")
+    pod_image = str(mc.get("pod_image", "") or "")
+    wcf = str(mc.get("worker_code_fingerprint", "") or "").lower()
+    if bool(pod_image) != bool(wcf):
+        raise ValueError("[marketcast] pod_image and worker_code_fingerprint are set together "
+                         "(both or neither)")
+    if pod_image and not re.search(r"@sha256:[0-9a-f]{64}$", pod_image):
+        raise ValueError(f"[marketcast] pod_image must be pinned by digest "
+                         f"('<repo>:<tag>@sha256:<64 hex>'); got {pod_image!r}")
+    if wcf and not re.fullmatch(r"[0-9a-f]{64}", wcf):
+        raise ValueError(f"[marketcast] worker_code_fingerprint must be 64 hex; got {wcf!r}")
+    if bar_relay and ("/" not in bar_relay.strip("/") or not bar_relay.endswith("/")):
+        raise ValueError(f"[marketcast] bar_relay must be '<bucket>/<prefix>/'; got {bar_relay!r}")
+    if crps_scale not in CRPS_SCALES:
+        raise ValueError(f"[marketcast] crps_scale must be one of {CRPS_SCALES}; got {crps_scale!r}")
     if not 0.0 < tov < 0.5:
         raise ValueError(f"[marketcast] coverage_tolerance_over must be in (0, 0.5); got {tov}")
     cgl_raw = mc.get("coverage_gate_levels", (0.5, 0.8))
@@ -672,11 +1060,103 @@ def parse_marketcast(raw: object) -> MarketCastConfig:
                 integer=True)
     if molc < 1:
         raise ValueError("[marketcast] max_open_legs_per_coldkey must be >= 1")
+    mkt_skus = _funded_pod_skus(mc.get("funded_pod_skus", ()))
+    comp = mc.get("composite", False)
+    if not isinstance(comp, bool):
+        raise ValueError(f"[marketcast] composite must be true or false; got {comp!r}")
+    floor = _num(mc.get("composite_suite_floor", 0.0), "composite_suite_floor")
+    if not 0.0 <= floor < 1.0:
+        raise ValueError(f"[marketcast] composite_suite_floor must be in [0, 1); got {floor}")
+    ow = _num(mc.get("ohlcv_open_weight", 0.0), "ohlcv_open_weight")
+    if not 0.0 <= ow <= 1.0:
+        raise ValueError(f"[marketcast] ohlcv_open_weight must be in [0, 1]; got {ow}")
+    sw_raw = mc.get("composite_suite_weights", COMPOSITE_SUITE_WEIGHTS)
+    if not isinstance(sw_raw, dict):
+        raise ValueError(f"[marketcast] composite_suite_weights must be a table suite -> "
+                         f"weight; got {sw_raw!r}")
+    sw = dict(COMPOSITE_SUITE_WEIGHTS)
+    for s_, w_ in sw_raw.items():
+        if s_ not in SUITES:
+            raise ValueError(f"[marketcast] composite_suite_weights names unknown suite {s_!r}")
+        sw[s_] = _num(w_, f"composite_suite_weights.{s_}")
+        if not sw[s_] > 0:
+            raise ValueError(f"[marketcast] composite_suite_weights.{s_} must be > 0")
+    gd = _str_list(mc.get("guards", GUARD_METRICS), "guards")
+    if len(set(gd)) != len(gd) or not set(gd) <= set(GUARD_METRICS):
+        raise ValueError(f"[marketcast] guards must be unique members of {GUARD_METRICS}; "
+                         f"got {list(gd)}")
+    if mc.get("gap_horizons"):
+        # retired (owner 2026-11-24, DEC-CA-0074): every horizon is drawn from
+        # the embargo; an older file still naming it loads, the key does nothing
+        _log.warning("[marketcast] gap_horizons is retired (DEC-CA-0074): every horizon is "
+                     "drawn from the embargo; the key is ignored")
+    fed = _num(mc.get("embargo_eval_days", min(28, max(1, emb - 1))), "embargo_eval_days",
+               integer=True)
+    bwpc = _num(mc.get("backtest_windows_per_cell", 48), "backtest_windows_per_cell",
+                integer=True)
+    if not 1 <= fed <= max(1, emb - 1):
+        raise ValueError(f"[marketcast] embargo_eval_days must be in [1, embargo_days - 1] "
+                         f"(the draw stays inside the embargo no leg reads); got {fed}")
+    if not 1 <= bwpc <= BACKTEST_WINDOWS_PER_CELL_MAX:
+        raise ValueError(f"[marketcast] backtest_windows_per_cell must be in "
+                         f"[1, {BACKTEST_WINDOWS_PER_CELL_MAX}]; got {bwpc}")
+    # absent = the default short paths this config enables (owner 2026-11-24:
+    # 1m and 5m fit the 13 h without a wait); listed = exactly those
+    fh = (_str_list(mc["forward_horizons"], "forward_horizons") if "forward_horizons" in mc
+          else tuple(h_ for h_ in DEFAULT_FORWARD_HORIZONS
+                     if any(h_ in hzs.get(s_, ()) for s_ in suites)))
+    if len(set(fh)) != len(fh):
+        raise ValueError(f"[marketcast] forward_horizons must be unique; got {list(fh)}")
+    for h_ in fh:
+        if not any(h_ in hzs.get(s_, ()) for s_ in suites):
+            raise ValueError(f"[marketcast] forward_horizons {h_!r} is no enabled suite's "
+                             f"horizon")
+    ev_raw = mc.get("event_times", ())
+    if not isinstance(ev_raw, (list, tuple)):
+        raise ValueError(f"[marketcast] event_times must be a list of ISO UTC instants; got "
+                         f"{ev_raw!r}")
+    evs = []
+    for x in ev_raw:
+        try:
+            dt = datetime.fromisoformat(str(x).replace("Z", "+00:00"))
+        except ValueError as e:
+            raise ValueError(f"[marketcast] event_times {x!r} is not an ISO instant") from e
+        if dt.tzinfo is None:
+            raise ValueError(f"[marketcast] event_times {x!r} needs a UTC offset (…Z)")
+        evs.append(dt.timestamp())
+    bgate = mc.get("baseline_gate", True)
+    if not isinstance(bgate, bool):
+        raise ValueError(f"[marketcast] baseline_gate must be true or false; got {bgate!r}")
+    gfl = _num(mc.get("guard_floor", 0.0), "guard_floor")
+    if not 0.0 <= gfl < 1.0:
+        raise ValueError(f"[marketcast] guard_floor must be in [0, 1); got {gfl}")
+    if "tail" in gd and not set(TAIL_SCORE_LEVELS) <= set(knots):
+        raise ValueError(f"[marketcast] the tail guard needs {list(TAIL_SCORE_LEVELS)} among "
+                         f"quantile_knots")
+    nat = _str_list(mc.get("native_intervals", ()), "native_intervals")
+    if len(set(nat)) != len(nat) or not set(nat) <= set(NATIVE_INTERVALS):
+        raise ValueError(f"[marketcast] native_intervals must be unique members of "
+                         f"{NATIVE_INTERVALS}; got {list(nat)}")
+    nhd_raw = mc.get("native_history_days", {"5m": 21, "15m": 50})
+    if not isinstance(nhd_raw, dict):
+        raise ValueError(f"[marketcast] native_history_days must be a table interval -> days; "
+                         f"got {nhd_raw!r}")
+    nhd = {"5m": 21, "15m": 50}
+    for iv, d in nhd_raw.items():
+        if iv not in NATIVE_INTERVALS:
+            raise ValueError(f"[marketcast] native_history_days names {iv!r}; intervals are "
+                             f"{NATIVE_INTERVALS}")
+        nhd[iv] = _num(d, f"native_history_days.{iv}", integer=True)
+        if nhd[iv] < 1:
+            raise ValueError(f"[marketcast] native_history_days.{iv} must be >= 1")
+    if comp and len(suites) < 2:
+        raise ValueError("[marketcast] composite needs at least two suites (one suite is its "
+                         "own mkt:<suite> target)")
     from .training import _continuation_protocol
     cfg_out = MarketCastConfig(
         continuation_protocol=_continuation_protocol(mc.get("continuation_protocol", "")),
         max_context_length=mcl_ctx, covariates=covs, augmentations=augs, embargo_days=emb,
-        max_synthetic_fraction=syn, max_lr=mlr, max_steps=msteps, max_batch=mbatch,
+        max_synthetic_fraction=syn, max_leg_hours=mlh, max_lr=mlr, max_steps=msteps, max_batch=mbatch,
         max_lora_rank=mrank,
         from_block=fb, base_ref=base_ref, base_sha256=sha, base_arch=arch,
         quantile_knots=knots, suites=suites,
@@ -685,15 +1165,23 @@ def parse_marketcast(raw: object) -> MarketCastConfig:
         horizons=tuple(sorted(hzs.items())),
         data_sources=tuple(sorted(sources.items())),
         coverage_levels=cov, coverage_tolerance=tol, alpha=alpha, bootstrap_B=B,
-        gain_margin=margin, full_pay_tiers=fpt, min_windows=mw, min_clusters=mcl, pool_prefix=pp,
+        gain_margin=margin, min_windows=mw, min_clusters=mcl, pool_prefix=pp,
         eval_context_length=ectx, windows_per_cell=wpc, start_margin_seconds=marg,
         verdict_wait_blocks=wait, snapshot_days=sdays, coarse_history_days=cdays,
         report_timeout_settlements=rto, max_infra_deferrals=mid,
         cluster_block_hours=cbh, min_time_blocks=mtb,
-        min_bar_coverage=mbc, min_dollar_volume_24h=mdv, coverage_tolerance_over=tov,
+        min_bar_coverage=mbc, min_dollar_volume_24h=mdv, coverage_tolerance_over=tov, crps_scale=crps_scale, bar_relay=bar_relay,
+        pod_image=pod_image, worker_code_fingerprint=wcf,
+        micro_batch_tokens=mbt,
         coverage_gate_levels=cgl, zero_scale_frac=zsf, cell_ratio_cap=cap, tail_levels=tls,
         tail_tolerance=ttol, calibration_z=cz, near_dup_tol=ndt,
-        max_open_legs_per_coldkey=molc,
+        max_open_legs_per_coldkey=molc, funded_pod_skus=mkt_skus,
+        composite=comp, composite_suite_floor=floor, ohlcv_open_weight=ow,
+        composite_suite_weights=tuple(sorted(sw.items())), guards=gd, guard_floor=gfl,
+        baseline_gate=bgate, event_times=tuple(sorted(evs)),
+        native_intervals=nat, native_history_days=tuple(sorted(nhd.items())),
+        embargo_eval_days=fed, backtest_windows_per_cell=bwpc, forward_horizons=fh,
+        **_parse_spec_fields(mc), open_classes=bool(open_classes),
     )
     unscorable = scorability_problems(cfg_out)
     if unscorable:
@@ -744,5 +1232,8 @@ __all__ = [
     "IMPLEMENTED_SOURCES", "PERP_CLASSES", "SUITE_CLASSES", "TIMESTRAL_PINNED_REF",
     "TIMESTRAL_REVISION", "TIMESTRAL_SHA256", "arming_problems", "check_marketcast_arming",
     "split_sources", "COARSE_BAR_MINUTES", "MIN_CONTEXT", "coarse_frequency",
-    "mkt_base_pointer", "scorability_problems",
+    "mkt_base_pointer", "scorability_problems", "COMPOSITE_LAUNCH_SUITES", "COMPOSITE_TARGET",
+    "NATIVE_INTERVALS", "OHLCV_FIELDS", "OHLCV_FIELD_NAMES", "base_suite",
+    "horizon_path", "COMPOSITE_SUITE_WEIGHTS", "GUARD_METRICS", "GUARD_SUITES", "TAIL_SCORE_LEVELS",
+    "BACKTEST_WINDOWS_PER_CELL_MAX", "draw_problems", "is_gpu_type", "EMBARGO_RULE", "VERDICT_MAX_HOURS", "VERDICT_WAIT_MAX_BLOCKS",
 ]

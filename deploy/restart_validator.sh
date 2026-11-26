@@ -108,7 +108,7 @@ echo "verified: the only running $SERVICE is the new pid $NEW_PID (no strays)"
 # older code left the trainer unable to verify new receipts — it held the
 # deposed king for 20 min. Warn (never act) when shared code changed after
 # the running trainer started: restart_trainer.sh too.
-TRAINER_PID="$(pgrep -f 'cascade-trainer' | head -1)"
+TRAINER_PID="$(pgrep -f 'cascade[-]trainer' | head -1)"   # [-]: never self-match (IR003)
 if [ -n "$TRAINER_PID" ]; then
   T_START="$(ps -o lstart= -p "$TRAINER_PID" 2>/dev/null)"
   if [ -n "$T_START" ]; then

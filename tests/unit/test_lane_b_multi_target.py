@@ -1,6 +1,8 @@
 """DEC-CA-0059: multi-target lane-B legs (up to ``max_domains_per_leg``
-declared targets: domains and horizon slots), judged per target at alpha/k
-with the guards run once, paid per slot, merged once."""
+declared targets: domains and horizon slots), paid per slot, merged once.
+``judge_expert_targets`` (alpha/k, guards once) is still the guard engine;
+since LANE_D_PLAN rev6.22 a judged leg is tested on EVERY slot by
+``judge_expert_slots`` (declared and undeclared max-T families)."""
 
 from __future__ import annotations
 
@@ -18,6 +20,7 @@ import pytest
 from cascade.eval.expert_lane import (
     ExpertLaneParams,
     judge_expert_leg,
+    judge_expert_slots,
     judge_expert_targets,
 )
 from cascade.shared.config import load_chain_config, parse_lane_b
@@ -50,7 +53,7 @@ from cascade.validator import expert_lane as vel
 
 ROOT = Path(__file__).resolve().parents[2]
 GEN = "alice/metro-gen@sha256:" + "a" * 64
-P = ExpertLaneParams(B=400, min_target_windows=20, min_guard_windows=20)
+P = ExpertLaneParams(B=400, min_target_windows=20, min_guard_windows=20, gain_margin=0.01)
 
 
 def _ptr(tag: str) -> str:
@@ -109,6 +112,14 @@ def test_single_domain_commit_and_manifest_bytes_unchanged():
     old.pop("signature")
     for x in old["entries"]:
         x.pop("targets")
+        x.pop("gpu_n", None)   # WB22: 0 = not recorded, dropped from the body
+        x.pop("train_image_digest", None)   # W-IMG: "" = not recorded, dropped too
+
+        for k in ("train_hours", "leg_steps", "leg_guard_seconds"):
+            x.pop(k, None)     # WB23: no leg length, dropped from the body
+        for k in ("levers", "train_tokens", "gpu_measured", "trained_steps",
+                  "trained_tokens", "stop"):
+            x.pop(k, None)     # WB27: defaults, dropped from the body
         x["selection"] = {str(k): sorted(v) for k, v in sorted(x["selection"].items())}
         x["exclude"] = {}
     assert m.canonical_body() == json.dumps(old, sort_keys=True,
@@ -149,7 +160,7 @@ def test_testnet_has_no_horizon_targets_and_mainnet_has_ten_slots():
     assert tn.horizons == () and tn.targets == tn.domains and lane_b_slots(tn) == tn.domains
     mn = load_chain_config(ROOT / "chain.toml").lane_b
     assert mn.horizon_target_names == ("horizon:64", "horizon:256", "horizon:720")
-    assert len(mn.targets) == 10 and mn.max_domains_per_leg == 3
+    assert len(mn.targets) == 10 and mn.max_domains_per_leg == 4
     off = parse_lane_b({"domains": ["energy"], "horizon_targets": False}, horizons=(64,))
     assert off.targets == ("energy",)
     # testnet weight vector: the slot count is the domain count (share / 7)
@@ -351,10 +362,14 @@ def _multi_judgement(effect, hotkey="alice", commit_block=4, tag="r"):
                     selection={0: [1, 2, 3]}, exclude={}, base_king_pointer=_ptr("k"),
                     rebased_pointer=_ptr(tag), corpus_digest="c", train_block=5,
                     commit_block=commit_block, targets=("energy", "web"))
-    tv = judge_expert_targets(targets=e.declared, params=P, seed="s", **_arrays(d))
+    tv = judge_expert_slots(slots=SLOTS, declared=e.declared, params=P, seed="s",
+                            **_arrays(d))
     v = tv.verdicts["energy"]
     return vel.ExpertJudgement(e, bool(tv.won), "verdict", "x", v, king_pointer=_ptr("k"),
                                targets=tv)
+
+
+SLOTS = ("energy", "web", "sales")
 
 
 def test_two_won_slots_record_two_wins_and_one_merge():
@@ -374,36 +389,36 @@ def test_two_won_slots_record_two_wins_and_one_merge():
 
     assert _winning_legs([j]) == {_ptr("r")}
     # a better single-target leg on web takes that slot only
-    from cascade.eval.expert_lane import judge_expert_leg as jl
-
     d = _data({"web": 0.8})
-    sv = jl(target_domain="web", params=P, seed="s", **_arrays(d))
+    stv = judge_expert_slots(slots=SLOTS, declared=("web",), params=P, seed="s",
+                             **_arrays(d))
+    sv = stv.verdicts["web"]
     se = dataclasses.replace(j.entry, miner_hotkey="bob", domain="web", targets=(),
                              rebased_pointer=_ptr("b"))
-    sj = vel.ExpertJudgement(se, sv.passed, "verdict", sv.reason, sv, king_pointer=_ptr("k"))
+    sj = vel.ExpertJudgement(se, sv.passed, "verdict", sv.reason, sv, king_pointer=_ptr("k"),
+                             targets=stv)
     st2 = LaneBState()
     wins = vel.apply_judgements(st2, [j, sj], round_id="r1", settle_block=1000)
     assert {w.domain: w.hotkey for w in wins} == {"energy": "alice", "web": "bob"}
     assert _winning_legs([j, sj]) == {_ptr("r"), _ptr("b")}
 
 
-def test_won_slots_decay_independently():
-    lb = parse_lane_b({"from_block": 1, "domains": ["energy", "web"],
-                       "full_pay_tiers": [[0.01, 1]],
-                       "half_life_rounds": 1.0, "floor": 0.1, "win_ttl_eras": 0})
+def test_won_slots_age_independently_and_pay_in_full():
+    """rev6.22: each won slot keeps its own age clock; both pay in full."""
+    lb = parse_lane_b({"from_block": 1, "domains": ["energy", "web"]})
     st = LaneBState()
     j = _multi_judgement({"energy": 0.9, "web": 0.9})
-    vel.apply_judgements(st, [j], round_id="r1", settle_block=100, tiers=lb.full_pay_tiers)
+    vel.apply_judgements(st, [j], round_id="r1", settle_block=100)
     pays = lane_b_payouts(st, block=100 + 2 * 10, era_blocks=10, cfg=lb, n_uids=16)
     assert [(p["domain"], p["age"]) for p in pays] == [("energy", 2), ("web", 2)]
     # a newer win on web restarts ONLY web's clock
     st.record(DomainWin(domain="web", hotkey="bob", uid=8, round_id="r2", merge_block=120,
                         rebased_pointer=_ptr("b"), king_pointer=_ptr("k2"),
-                        selection={"0": [9]}, target_lcb=0.03, tier=0.01, full_eras=1))
+                        selection={"0": [9]}, target_lcb=0.03))
     pays = {p["domain"]: p for p in lane_b_payouts(st, block=130, era_blocks=10, cfg=lb,
                                                    n_uids=16)}
     assert pays["energy"]["age"] == 3 and pays["web"]["age"] == 1
-    assert pays["energy"]["multiplier"] < pays["web"]["multiplier"]
+    assert pays["energy"]["multiplier"] == pays["web"]["multiplier"] == 1.0
     assert pays["energy"]["uid"] == 7 and pays["web"]["uid"] == 8
 
 
@@ -471,8 +486,8 @@ def test_catch_up_fold_of_a_multi_target_settlement_converges(cfg, tmp_path, mon
                 continue
             if e.targets:
                 d = _data({"energy": 0.9, "web": 0.9})
-                tv = judge_expert_targets(targets=e.declared, params=P, seed="s",
-                                          **_arrays(d))
+                tv = judge_expert_slots(slots=SLOTS, declared=e.declared, params=P,
+                                        seed="s", **_arrays(d))
                 out.append(vel.ExpertJudgement(e, bool(tv.won), "verdict", "x",
                                                tv.verdicts[e.domain],
                                                king_pointer=kw["king_pointer"], targets=tv))
@@ -646,12 +661,12 @@ def _audit_world(cfg):
     good = _multi_judgement({"energy": 0.9, "web": 0.9})
     rows = vel.judgements_record([good])
     eb = era_length_blocks(c.round, block)
-    from cascade.eval.expert_lane import full_pay
+    from cascade.shared.era import era_index_of
 
     lcb = {x["domain"]: x["target_lcb"] for x in rows}
     pay = {"block": block, "era_blocks": eb, "wins": [
         {"domain": d, "hotkey": "alice", "uid": 7, "merge_block": block, "age": 0,
-         "multiplier": 1.0, **full_pay(lcb[d], lb.full_pay_tiers).record()}
+         "since_era": era_index_of(c.round, block), "multiplier": 1.0, "gain_lcb": lcb[d]}
         for d in ("energy", "web")]}
     merge = {"rebased_pointer": _ptr("r"), "king_pointer": _ptr("k"),
              "selection": {"0": [1, 2, 3]}, "round_id": "r1"}
@@ -676,36 +691,39 @@ def test_audit_rederives_multi_target_verdicts_and_fails_tampering(cfg):
         return check_lane_b(t, c)
 
     cases = {
-        "alpha": lambda t: t.lane_b[0].update(alpha=c.lane_b.alpha),          # not alpha/k
+        "alpha": lambda t: t.lane_b[0].update(alpha=c.lane_b.alpha / 2),      # family level
+        "gain_bar": lambda t: t.lane_b[2].update(gain_bar=c.lane_b.gain_margin),        # undeclared bar
         "flip": lambda t: t.lane_b[1].update(passed=False),                   # re-derived True
-        "gain": lambda t: t.lane_b[0].update(target_gain=-0.01),              # passed, no gain
+        "gain": lambda t: t.lane_b[0].update(metric_gains={"crps": -0.01, "mase": -0.01}),
         "guards-once": lambda t: t.lane_b[1].update(
             guard_lcbs={k: v + 0.001 for k, v in t.lane_b[1]["guard_lcbs"].items()}),
         "guard-blocks": lambda t: [x.update(guard_lcbs={**x["guard_lcbs"], "sales": -0.5},
                                             guard_reason="regression on domain sales")
                                    for x in t.lane_b],
-        "declared-guard": lambda t: [x.update(guard_lcbs={**x["guard_lcbs"], "web": 0.0})
-                                     for x in t.lane_b],
         "coverage": lambda t: t.lane_b.pop(),
-        "cap": lambda t: [x.update(targets=["energy", "web", "sales", "nature"])
+        "cap": lambda t: [x.update(targets=["energy", "web", "sales", "nature", "x"])
                           for x in t.lane_b],
         "merge-twice": lambda t: t.manifest["warm_start_merges"].append(
             dict(t.manifest["warm_start_merges"][0])),
         "slot-thief": lambda t: t.lane_b_pay["wins"][1].update(hotkey="mallory"),
         "stale-slot": lambda t: t.lane_b_pay["wins"][1].update(merge_block=0),
         "unknown-target": lambda t: t.lane_b[0].update(domain="crypto"),
-        # gain-tiered full-pay (owner 2026-10-20): per target, from its own row
-        "forged-tier": lambda t: t.lane_b_pay["wins"][1].update(full_eras=99),
         "foreign-lcb": lambda t: t.lane_b_pay["wins"][1].update(
             gain_lcb=t.lane_b_pay["wins"][1]["gain_lcb"] + 0.5),
     }
     for name, fn in cases.items():
         res = _tamper(fn)
         assert res.status == FAIL, (name, res.detail)
+    # rev6.22: a held slot pays in full; the payout replay refuses a decayed one
+    decayed = json.loads(json.dumps(rec.lane_b_pay))
+    decayed["wins"][1]["multiplier"] = 0.5
+    assert "multiplier" in _lane_b_paid_wins(
+        SimpleNamespace(**{**rec.__dict__, "lane_b_pay": decayed}), c, 16)[1]
     # a guard failure that blocks both targets (honest rows) is consistent
     ok = _tamper(lambda t: [x.update(guard_lcbs={**x["guard_lcbs"], "sales": -0.5},
                                      guard_reason="regression on domain sales",
-                                     passed=False, reason="regression on domain sales")
+                                     passed=False, gain_metric="",
+                                     reason="regression on domain sales")
                             for x in t.lane_b] and t.lane_b_pay.update(wins=[]))
     assert ok.status == PASS, ok.detail
 
@@ -717,10 +735,12 @@ def test_audit_pays_horizon_slots_at_share_over_ten(cfg):
     lb = dataclasses.replace(load_chain_config(ROOT / "chain.toml").lane_b, from_block=1)
     c = dataclasses.replace(cfg, lane_b=lb)
     block = 10 * era_length_blocks(c.round, 10**6)
+    from cascade.shared.era import era_index_of
+
     pay = {"block": block, "era_blocks": era_length_blocks(c.round, block), "wins": [
         {"domain": "horizon:720", "hotkey": "h", "uid": 5, "merge_block": block - 1,
-         "age": 0, "multiplier": 1.0, "gain_lcb": 0.03, "tier": 0.02, "full_eras": 5,
-         "below_floor": False}]}
+         "age": 0, "since_era": era_index_of(c.round, block - 1), "multiplier": 1.0,
+         "gain_lcb": 0.03}]}
     rec = SimpleNamespace(epoch_start_block=block, lane_b=[], lane_b_pay=pay, manifest={})
     wins, why = _lane_b_paid_wins(rec, c, 16)
     assert why is None and [w.domain for w in wins] == ["horizon:720"]

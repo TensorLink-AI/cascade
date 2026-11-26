@@ -201,7 +201,7 @@ def test_check_bench_source_refusals():
     check_bench_source(v2=V2Config(), owner_hotkey="", era_blocks=3600)
 
 
-def test_mainnet_arms_validator_source_with_v2_testnet_stays_trainer(tmp_path):
+def test_mainnet_arms_validator_source_with_v2_testnet_at_its_fast_block(tmp_path):
     from pathlib import Path
 
     root = Path(__file__).resolve().parents[2]
@@ -213,7 +213,10 @@ def test_mainnet_arms_validator_source_with_v2_testnet_stays_trainer(tmp_path):
     assert pre.v2.bench_source == "validator"
     assert pre.v2.bench_source_from_block == 0           # "v2" while from_block = 0
     test = load_chain_config(root / "chain.testnet.toml")
-    assert test.v2.bench_source == "trainer" and test.v2.bench_source_from_block == 0
+    # TESTNET-FAST (owner 2026-11-24, option A): testnet benches on the main
+    # validator from 8515800, with the king ladder it needs
+    assert test.v2.bench_source == "validator" and test.v2.bench_source_from_block == 8515800
+    assert test.v2.king_ladder and test.v2.bench_source_from_block >= test.v2.from_block
 
 
 def test_loader_refuses_v2_go_live_without_a_main_validator(tmp_path):
@@ -230,6 +233,8 @@ def test_loader_refuses_v2_go_live_without_a_main_validator(tmp_path):
     # loader's "precedes [v2] from_block" check does not fire before the one under test
     text = re.sub(r"(?m)^image_decoupled_from_block\s*=\s*\d+", "image_decoupled_from_block = 0", text)
     text = text.replace(f'owner_hotkey = "{cfg.netconfig.owner_hotkey}"', 'owner_hotkey = ""', 1)
+    # the shipped lane C / MarketCast block (9586800) would precede this v2 gate
+    text = re.sub(r"(?m)^from_block(\s*)=\s*9586800", r"from_block\g<1>= 0", text)
     p = tmp_path / "chain.toml"
     p.write_text(text, encoding="utf-8")
     with pytest.raises(ValueError, match="owner_hotkey"):

@@ -1,0 +1,41 @@
+# WB10: [lane_b] config keys (parse, defaults, validation, drop-when-default),
+# the release-only contamination_hashset and ALLOWED["lane_b"] coverage.
+# The lane B parser lives in v2.py today; a split into lane_b.py is allowed.
+cascade/shared/config/v2.py
+cascade/shared/config/lane_b.py
+cascade/shared/config/__init__.py
+cascade/shared/config/loader.py
+cascade/shared/netconfig.py
+# rev6.22 indefinite lane B pay (behind [lane_b] indefinite_pay_from_block):
+# the payout rows and the validator's signed pay record.
+cascade/shared/lane_b.py
+cascade/validator/lane_b.py
+# [lane_b] defaults only; nothing armed (from_block and share unchanged).
+chain.toml
+chain.testnet.toml
+# rev6.22 lane B slot rule: every-slot judging in two max-T families
+# (judge_expert_slots), its verdict rows, merge acceptance on the same rule,
+# the trainer self-judge call, the status payout terms and the unit tests
+# that pinned the retired decay / TTL rule.
+cascade/eval/expert_lane.py
+cascade/validator/expert_lane.py
+cascade/validator/merge_acceptance.py
+cascade/trainer/lane_b_driver.py
+cascade/shared/v2_status.py
+tests/unit/test_lane_b_state.py
+tests/unit/test_validator_lane_b_weights.py
+tests/unit/test_validator_lane_b_convergence.py
+tests/unit/test_full_pay_tiers.py
+tests/unit/test_audit_lane_b_config.py
+tests/unit/test_v2_status.py
+tests/unit/test_config.py
+tests/unit/test_lane_b_multi_target.py
+tests/unit/test_v2_golive.py
+tests/unit/test_satellite_replay.py
+# Lane B domain tags (owner 2026-11-25): which slots each judged generator
+# improved, derived from the signed verdict rows; display only (index column,
+# status/v2.json, cascade status, cascade round), never signed or digested.
+cascade/shared/lane_b_domains.py
+cascade/miner/dashboard.py
+cascade/miner/live_status.py
+docs/MINER.md

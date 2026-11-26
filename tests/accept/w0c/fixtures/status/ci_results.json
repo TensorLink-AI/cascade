@@ -1,0 +1,23 @@
+{
+  "_comment": "GitHub Actions results fed to scripts/laned/status --ci-results. '@<label>' in head_sha is replaced by the fixture commit's sha at runtime; '@pr' marks a PR head that is not on main.",
+  "runs": [
+    {"workflow": "laned-accept", "event": "pull_request", "mode": "expect-fail", "wp": "W0c", "head_sha": "@pr", "conclusion": "success", "created_at": "2026-11-21T01:00:00Z"},
+    {"workflow": "laned-accept", "event": "pull_request", "mode": "expect-fail", "wp": "W0", "head_sha": "@pr", "conclusion": "success", "created_at": "2026-11-21T01:01:00Z"},
+    {"workflow": "laned-accept", "event": "pull_request", "mode": "expect-fail", "wp": "W1", "head_sha": "@pr", "conclusion": "success", "created_at": "2026-11-21T01:02:00Z"},
+    {"workflow": "laned-accept", "event": "pull_request", "mode": "expect-fail", "wp": "W2", "head_sha": "@pr", "conclusion": "success", "created_at": "2026-11-21T01:03:00Z"},
+    {"workflow": "laned-accept", "event": "pull_request", "mode": "expect-fail", "wp": "W3", "head_sha": "@pr", "conclusion": "failure", "created_at": "2026-11-21T01:04:00Z"},
+    {"workflow": "laned-accept", "event": "pull_request", "mode": "expect-fail", "wp": "W4", "head_sha": "@pr", "conclusion": "success", "created_at": "2026-11-21T01:05:00Z"},
+    {"workflow": "laned-accept", "event": "pull_request", "mode": "expect-fail", "wp": "W7", "head_sha": "@pr", "conclusion": "success", "created_at": "2026-11-21T01:06:00Z"},
+    {"workflow": "laned-accept", "event": "pull_request", "mode": "expect-fail", "wp": "R6x", "head_sha": "@pr", "conclusion": "success", "created_at": "2026-11-21T01:07:00Z"},
+    {"workflow": "laned-accept", "event": "pull_request", "mode": "expect-fail", "wp": "R2x", "head_sha": "@pr", "conclusion": "success", "created_at": "2026-11-21T01:08:00Z"},
+    {"workflow": "laned-accept", "event": "push", "mode": "accept", "wp": "W0c", "head_sha": "@tests_w0c", "conclusion": "failure", "created_at": "2026-11-21T02:00:00Z"},
+    {"workflow": "laned-accept", "event": "push", "mode": "accept", "wp": "W1", "head_sha": "@impl_w1", "conclusion": "success", "created_at": "2026-11-21T03:00:00Z"},
+    {"workflow": "laned-accept", "event": "push", "mode": "accept", "wp": "W0c", "head_sha": "@evidence", "conclusion": "success", "created_at": "2026-11-21T04:00:00Z"},
+    {"workflow": "laned-accept", "event": "push", "mode": "accept", "wp": "W0", "head_sha": "@evidence", "conclusion": "success", "created_at": "2026-11-21T04:00:01Z"},
+    {"workflow": "laned-accept", "event": "push", "mode": "accept", "wp": "W1", "head_sha": "@evidence", "conclusion": "success", "created_at": "2026-11-21T04:00:02Z"},
+    {"workflow": "laned-accept", "event": "push", "mode": "accept", "wp": "R6x", "head_sha": "@evidence", "conclusion": "success", "created_at": "2026-11-21T04:00:03Z"},
+    {"workflow": "laned-accept", "event": "push", "mode": "accept", "wp": "R2x", "head_sha": "@evidence", "conclusion": "success", "created_at": "2026-11-21T04:00:04Z"},
+    {"workflow": "laned-accept", "event": "push", "mode": "accept", "wp": "W0c", "head_sha": "@docs", "conclusion": "success", "created_at": "2026-11-21T05:00:00Z"},
+    {"workflow": "laned-accept", "event": "push", "mode": "accept", "wp": "W1", "head_sha": "@docs", "conclusion": "failure", "created_at": "2026-11-21T05:00:01Z"}
+  ]
+}

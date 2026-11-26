@@ -1,0 +1,17 @@
+# WB24: lane B miner CLI (plan §3.0 lane B track, rev6.3).
+# `cascade lane-b fund` gains --declared-rows <file> (WB14 header + signed
+# rows= tag, local refusal with DECLARED_ROWS_CODES), --target suite:<s>
+# (WB18) and --train-hours (WB23: refused locally until WB23 is built);
+# `cascade lane-b status` shows the status/lane_b.json reasons; new
+# `cascade lane-b verify-repo <dir>` (WB13 scan_repo, local, never executed).
+cascade/miner/lane_b.py
+# The shared lane status view (lane_queue_status / render_submission), where
+# `lane-b status` reads the intake queue today.
+cascade/miner/submission_status.py
+# The shared signing and pre-send checks (build_intake_headers,
+# prepare_funding_request), if the rows header or the key redaction lands there.
+cascade/miner/funding.py
+# `cascade lane-b test` (owner 2026-11-24 miner CLI refresh): the local preview
+# calls the validators' judge_expert_slots (+ WB26 anchor guard via --anchor)
+# and prints every slot in plain English (judge_slots_preview / describe_slots).
+cascade/miner/lane_tests.py

@@ -189,6 +189,18 @@ python scripts/check_tls_trust.py   # same interpreter as the CLI
 # restart cascade-validator the way you normally run it
 ```
 
+- **Always repeat the `--extra` flags.** `uv sync --frozen` makes the venv
+  match the lock exactly. Without the extras, it **uninstalls** them,
+  bittensor included. Running processes keep working until their next
+  restart or lazy import, then fail with `No module named 'bittensor'`.
+  Satellites: `pip install -e '.[satellite]'` again, or `uv sync --frozen
+  --extra hippius --extra chain`.
+- **Don't skip the sync, even for a "small" release.** A release can move
+  pinned dependencies. The 2026-11-25 launch release moves bittensor from
+  10.5 to 11.3.0, and the validator refuses to start on 10.5 (error: "bittensor
+  10.5.0 is installed but … needs the 11.x SDK"). `git pull` plus
+  restart without the sync is never a valid upgrade.
+
 - **Keep your state.** Restart from the same directory, so the validator
   finds its state files (`validator_state.db`, `cascade_state.json`,
   `warm_start_init.json`, `activation_*.json`). They carry your activation
@@ -304,7 +316,9 @@ boundary. Supported numeric/rule settings can use
 installed release supports them; adoption checks and durable history govern
 the effective block. Manually diverging `[scoring]`, `[eval]` or the cascade
 envelope can still produce different verdicts and weights. For a release,
-pull, `uv sync --frozen`, and restart before the announced activation block.
+follow [Upgrade an existing validator](#upgrade-an-existing-validator) (pull,
+`uv sync --frozen --extra train --extra hippius --extra chain` with the
+extras, restart) before the announced activation block.
 For a supported overlay, follow its adoption/effective-block evidence without
 manually changing constants. Confirm the applied config identity and next
 settlement's vector agree with the expected network state.
@@ -486,6 +500,28 @@ can select another validator's receipt from the shared pointer. Investigate
 FAILs and read WARNs for missing evidence. See
 [`AUDIT.md`](AUDIT.md).
 
+### No archive node needed
+
+Reads AS OF a past block go to your `--network` node first. When it has
+pruned that block (the default `finney` endpoint is a lite node), the read is
+retried once on `--history-network` (default `archive`, the SDK's public
+archive endpoint), after a genesis-hash check that both are the same chain.
+Writes and head reads never use it; `--history-network none` turns it off.
+The same flag exists on `cascade-satellite` and `cascade-audit`.
+
+Lane C's slot-holder deregistration check does not need history at all: each
+validator snapshots the netuid's `hotkey → uid` live at every lane-C boundary
+− 1, and the receipt records the holders it judged
+(`lane_c_registrations`: `block`, `rows` of `{target, hotkey, uid}`,
+`sha256`). Satellites and `cascade-audit` replay that record from the
+signed receipt (`lane_c_registrations` row: digest, block, and that a
+deregistered holder no longer holds its slot while every remaining holder
+has a row). A validator catching up late takes the registrations from the
+main validator's signed record, and reads the chain only if no record
+exists. The stake-weighted activation tally and the audit's
+`block-hash-onchain` check still read past blocks; they use the history
+fallback.
+
 ## What can go wrong
 
 | symptom | cause |
@@ -503,10 +539,12 @@ FAILs and read WARNs for missing evidence. See
 | INFO `bittensor.transport: Connection to wss://… lost (…no response… in 60.0s); reconnecting` every few minutes | expected with SDK 11.3: it drops and reopens an idle chain connection. Harmless while `weights set:` lines keep appearing |
 | every pool read `SignatureDoesNotMatch` | you set `POOL_S3_*` with the default endpoint — unset them |
 | gift gate / bench slow | those want a GPU — `--eval-hosts`, or pin `gift_gate_data_dir` on a CUDA box |
-| audit WARNs on `block-hash-onchain` | lite node without history — use an archive node for zero WARNs |
-| `activation: as-of read at boundary B failed …` repeating | your endpoint pruned the boundary block; it retries while the boundary is under 300 blocks old, then skips it unless a note names a lock-in there — an archive endpoint avoids it |
-| `lane_c_unverifiable: … registration of slot holder … as of block B unreadable` holding | MarketCast deregistration eviction reads the metagraph AS OF the settlement boundary (historical state): your endpoint pruned it — the settlement holds (retried every poll) until it reads; an archive endpoint is required while lane C has slot holders |
-| `marketcast round=R: the chain client has no uid_for_hotkey_at_block hook` | this client build cannot read historical registrations: a deregistered holder keeps its slot on this validator (verdicts unchanged, expiry still evicts) — run the current release against an archive endpoint |
+| WARNING `chain read at block N pruned on finney (…); serving it from history endpoint archive (logged once per reason)` | expected on a lite node: a read AS OF a past block (block hash, as-of stakes / notes, a registration) was pruned there and was retried once on `--history-network` (default the SDK's `archive`, wss://archive.chain.opentensor.ai:443). Same chain state, same result; writes and head reads never go there. Nothing to do — no archive node of your own is needed |
+| WARNING `chain history endpoint … is another chain …; history fallback disabled` | your `--network` is a testnet / local node and the history endpoint is mainnet's (genesis hashes differ): the fallback stays off. Pass `--history-network <that chain's archive>` or `none` |
+| audit WARNs on `block-hash-onchain` | both the node and the history endpoint failed the read (or `--history-network none`): the check is a warning only — retry later or pass `--history-network <archive>` |
+| `activation: as-of read at boundary B failed …` repeating | both your endpoint and the history endpoint failed the boundary read (the as-of tally reads the history endpoint automatically when your node pruned the block); it retries while the boundary is under 300 blocks old, then skips it unless a note names a lock-in there. Check that the history endpoint is reachable (or not `none`) |
+| `lane_c_unverifiable: … registration of slot holder … as of block B unreadable` holding | rare now: eviction reads come from the boundary snapshot this node takes live at every lane-C boundary − 1 (`<state_db>.lane_c_registrations.json`), else — catching up late — from the MAIN validator's signed receipt record (`lane_c_registrations`), and only without either from the chain (with the archive fallback). Holding means all three failed: the node was down at the boundary, the main's receipt is not published yet, and the history endpoint is unreachable — it retries every poll |
+| `marketcast round=R: the chain client has no uid_for_hotkey_at_block hook` | this client build cannot read historical registrations: a deregistered holder keeps its slot on this validator (verdicts unchanged, expiry still evicts) — run the current release |
 
 **Emergency: stop endorsing without going dark.** If something looks wrong —
 a suspect manifest, a scoring result you don't trust, a possibly-compromised
@@ -525,25 +563,22 @@ own payout constants. Historical settlements retain the older geometric court
 rule. For mainnet v2:
 
 <!-- cascade:rewards:summary:start -->
-These are the checked-in mainnet v2 rules. Check live activation and signed policy before submitting.
-Percentages are shares of the competition reward vector. A lane's pool is its budget; miners receive only the shares they earn.
+These are the live mainnet rules from the launch at block 9,586,800 (about 2026-11-25 22:27 UTC): the checked-in `chain.toml` plus the launch overlays `deploy/overlays/launch-20261125.pre.mainnet.toml` (step 1) and `launch-20261125.mainnet.toml` (step 2). A later signed overlay can change them; check `cascade status --json` and the signed reward records before submitting.
+Percentages are shares of total emissions. A lane's pool is its budget; miners receive only the shares they earn, and the rest burns.
 
-| Launched lanes | A pool | B pool | C pool |
-|---|---:|---:|---:|
-| A | 100% | 0% | 0% |
-| A + C | 75% | 0% | 25% |
-| A + B | 75% | 25% | 0% |
-| A + B + C | 50% | 25% | 25% |
+| From block 9,586,800 | A pool | B pool | C pool | D pool |
+|---|---:|---:|---:|---:|
+| Step 1 (overlay cfg-961291bc, lanes B and C) | 50% | 35% | 15% | 0% |
+| Step 2 (second overlay, lane D armed) | 0% | 35% | 15% | 50% |
 
-- **At launch:** a separately activated pre-v2 policy burns 95%. Until the first v2 winner is crowned, the inherited king/court receives at most 5% of total emissions; the rest of A burns.
-- **A winner:** a random-init or other level-unit win starts at 50% of A. Increment-unit wins use the duel's lower confidence bound (LCB): LCB ≥ 0.5 → 80%; LCB ≥ 0.25 → 65%; LCB ≥ 0.1 → 50%; LCB ≥ 0.01 → 25%. These are the duel's increment units, not percentages of absolute forecast-error reduction.
-- **A progression:** each passed scheduled king check adds 10 percentage points of A, up to 95%. Failure sets 10%; a deferred check holds the share. Time alone does not increase it.
-- **Former king:** only the immediate former king can receive 5% of A for 36,000 blocks, while eligible. A qualifying compute-key lapse reduces the current king's payout to 1% of A, without reducing separately earned B/C rewards.
-- **B winner:** with merge acceptance enabled, qualification is unpaid. Acceptance into a scheduled shared starting checkpoint starts payment. The 10 targets each reserve 2.5% of total emissions at full pay.
-- **C winner:** an initial test pass is unpaid. A later confirmation must win the target slot. C's pool is divided by competition weight, then target count. The current sole competition, MarketCast, has 2 targets: each full-pay slot is 12.5% of total emissions.
-- **Full-pay duration:** B: LCB ≥ 0.05 → 10 eras, LCB ≥ 0.02 → 5 eras, LCB ≥ 0.01 → 2 eras; MarketCast C: LCB ≥ 0.05 → 10 eras, LCB ≥ 0.02 → 5 eras, LCB ≥ 0.01 → 2 eras. B uses accepted marginal gain; C uses confirmed gain. Each win keeps its recorded tier.
-- **B/C progression:** after full pay, B's per-era slot multipliers are 50% → 25% → 12.5%, then a 10% floor. Payment ends at age 28 eras, including the full-pay period. C has its own policy (currently a 10% floor and age 28 expiry). Age starts at B acceptance or C confirmation. A new holder stops the old holder's pay.
-- **Burn:** unpaid A, empty/decayed/expired slots in launched lanes and inactive competition allocations go to `burn_uid`; they are not shared among other miners. An unlaunched lane has no reserved pool.
+- **Lane A is closed to new challengers from block 9,586,800.** The intake refuses a new lane A fund or funded submit (`409 lane_ended`) and the trainer seats no new challenger. King checks and promotions are off (`[v2] reign_warm_start_blocks = 0`), so the lane A king is frozen as the reference model for lanes B and D. In step 1, A's pool pays that king its ladder share, which no longer changes; the rest of A burns.
+- **Lane D:** step 2 arms lane D at 9,586,800 if its overlay locks in by then, otherwise at a later era start. D takes its 50% from lane A. At lane D genesis the house entry (the frozen lane A king) holds the lane D throne and D's share stays with the lane A king until the first miner is crowned lane D king. Then D's pool pays its court 80/15/5 (king, then the two previous kings). The crown bar is a 3% LCB falling linearly to 1% over 32 settlements. The embargo is 24 h at launch and the public-half weight is set by overlay (currently 0, live-only: no public index is scored).
+- **B winner:** the 10 slots each pay 3.5% of total emissions to their holder every settlement, with no decay or expiry, until a newer leg's accepted merge takes the slot. Qualification is unpaid: pay starts only when a qualified expert is accepted into a shared era init, and the code opens a new init only at a lane A promotion. With lane A promotions off, **no lane B slot is paid under the launch config**; qualified experts wait as pending until the owner changes this. Every leg is tested on every slot: up to 4 declared targets clear at a 1% gain LCB, any other slot at 2%; one miner may hold every slot.
+- **B timing:** a finished leg typically settles about one settlement (3 h) after it finishes: its public bench is queued at the first settlement and the leg is judged once the bench rows exist.
+- **C winner:** an initial test pass is unpaid. A later confirmation must win the target slot. C's pool is divided by competition weight, then target count. The current sole competition, MarketCast, has 1 target: each full-pay slot is 15% of total emissions.
+- **C full-pay duration:** MarketCast C: 5 days (10 eras) at LCB 0.01, rising linearly to 20 days (40 eras) at LCB ≥ 0.05. C uses confirmed gain; each win keeps its recorded duration. B has no tiers.
+- **C progression:** C has no decay: its slot ends when the full-pay duration ends. Age starts at C confirmation. A new holder stops the old holder's pay.
+- **Burn:** unpaid A, empty B slots, empty/ended C slots and inactive competition allocations go to `burn_uid`; they are not shared among other miners. An unlaunched lane has no reserved pool.
 - **Check payment:** read signed reward records and on-chain weights. Queue completion, qualification and pending confirmation are not paid wins. Public status reports `reward_status=not_verified` because it does not verify payment.
 <!-- cascade:rewards:summary:end -->
 
@@ -594,11 +629,12 @@ validator can judge the same settlement under different rules.
     B reserves 25% when launched: A/B split 75/25 while C is off, and
     A/B/C split 50/25/25 while C is on. B's share has one slot per
     `[lane_b]` domain plus one per `[eval]
-    scored_horizons` rung (mainnet 7 + 3 = 10; testnet 7), each win paid
-    100 % for the `full_eras` of the highest `[lane_b] full_pay_tiers`
-    threshold its gain LCB meets (fixed at the win), then halving per era to
-    a 10 % floor, and nothing after 28 eras; the unpaid remainder burns.
-    `replay_settlements` defaults to cover that window. With `[lane_c]`
+    scored_horizons` rung (mainnet 7 + 3 = 10; testnet 7), each holder
+    paid 100 % of its slot every settlement until a newer accepted merge
+    takes it (LANE_D_PLAN rev6.22: no decay, no TTL); empty slots burn.
+    Every judged leg is tested on every slot (declared targets at
+    `gain_margin`, the rest at `undeclared_gain_margin`, two max-T
+    families). Under merge acceptance recovery walks the complete ledger. With `[lane_c]`
     armed, mainnet C takes its share from A (A 50 / B 25 / C 25). The
     explicit `takes_from = "lane_b"` retains the existing testnet split.
     Lane-C recovery replays back to its saved boundary, or activation for
@@ -673,6 +709,144 @@ keeping `chain.toml` current.
   needs the release supporting these keys once; later supported changes
   need neither a restart nor an update. An overlay cannot install new code.
 
+## Lane B track: what validators check
+
+The lane B track adds suite targets, miner-declared expert rows, a choice of
+opening rule and the sentinel interaction. The checked-in templates ship it
+unarmed: `[lane_b] suite_targets = false`, `[lane_b] contamination_hashset = ""`
+and `open_rule = "cogate"`. At those defaults no consensus surface reads the
+track keys, so no contract, verdict or receipt digest moves. You configure
+nothing beyond keeping `chain.toml` current.
+
+**The hash-set pin is a content hash (DEC-CA-0075).**
+`[lane_b] contamination_hashset` pins the benchmark hash set the funding
+intake scans submissions against (`sha256:<64 hex>`, or `""` for none). It is no longer
+release-only: an owner-signed overlay may set it, together with
+`contamination_hashset_key` (the storage key holding the bytes). A reader
+first looks for a `benchmarks/contamination/hashset-v<n>.json` artefact of
+the release at the pin, else fetches the key and verifies the bytes'
+sha256 against the pin before parsing them. On any mismatch or missing
+artefact the intake fails closed and funds nothing.
+
+**Contamination receipt.** While the pin is set, every lane B fund the intake
+accepts carries a `contamination` receipt, stored on the queue entry:
+`{hashset_version, result, suite, window_id}`. `hashset_version` is the version of
+the pinned artefact, and `result` is `clean` for an accepted entry. An
+`embedded` or `budget_exceeded` tree is refused at intake and never reaches
+a leg, so nothing reaches you to judge.
+
+**Declared rows.** A miner may name the expert rows a leg trains
+(`declared_rows`, keyed by MoE ordinal). The intake checks them against the
+per-layer clamp (`min_experts_frac` / `max_experts_frac`) and binds them to
+the hotkey signature. Declared rows change only which rows the leg trains.
+The leg is judged by the same qualification and merge-acceptance code as a
+leg whose rows the trainer picked.
+
+**The sentinel is neither a guard nor a target for its era.** With the
+cross-lane sentinel armed (`[v2] sentinel_from_block`), the era's sentinel
+suite is left out of the lane B public guards and is not required that era.
+A suite-target entry aimed at it is deferred by the trainer
+(`deferred: sentinel_target`), so it is never judged on that suite in that
+era. Every other suite pairs exactly as when the sentinel is unarmed, and an
+unarmed sentinel leaves the judgement byte-identical.
+
+**The opening rule and the gate record.** `open_rule` selects how lane B
+opens. `cogate` (the default) needs the lineage's `open_tokens` and stable
+routing against the previous king. `tokens` needs only the tokens.
+`tokens_king_check` needs the tokens and a passing lane A king check in your
+signed receipts. The trainer latches the gate once and records:
+
+| Field | Meaning |
+|---|---|
+| `gate_rule` | The `open_rule` the gate opened under; empty while closed. |
+| `gate_evidence` | The facts that satisfied it: `lineage_tokens`, `open_tokens`, the block and era and, under `tokens_king_check`, the receipt's `king_check` record. |
+| `gate_closed_reason` | While closed: `tokens_short`, `king_check_not_passed` or `king_check_unavailable`. |
+
+`status/lane_b.json` publishes `open_rule`, `gate_rule`,
+`gate_closed_reason` and `gate_opened_block`. Under `tokens_king_check`, the
+`king_check` in `gate_evidence` comes from the validators' own receipt, so
+you can compare it with your receipt for the same round.
+
+## Lane D: what satellites verify
+
+Lane D (open weights, [LANE_D.md](LANE_D.md)) ships unarmed:
+`[lane_d] from_block = 0` means no settlement judges it and no consensus
+surface reads the table. It is armed by a signed overlay at an era boundary
+and stopped by the kill switch `[lane_d] until_block`. You need no new
+hardware: the main validator's eval host computes the forecasts, and the box
+scores them against the private targets.
+
+Each settlement the main validator signs a `lane-d-report/1` report
+(`cascade/validator/schemas/lane_d_report_1.json`; every object is closed and
+the open `extensions` map is never consensus). The satellite replay
+(`cascade/satellite/lane_d_replay.py`) and the audit (`check_lane_d` in
+`cascade/audit/lane_d.py`) re-derive it without a pool, weights or torch.
+The fields added for lane D replay:
+
+| Field | Where | What is checked |
+|---|---|---|
+| `rows_sha256` | top level | The sha256 of the canonical `rows` (sorted keys, compact separators, no NaN) is re-derived; a mismatch is refused |
+| `judged` | top level | The digests judged this settlement; must equal the verdicts, with the per-settlement caps walked FIFO by `(reveal_ts, digest)` |
+| `skipped` | top level | One typed skip reason per digest; must match `entries[].reason`, and no open entry may be silently omitted |
+| `coldkey` | `entries[]` | The coldkey recorded at `ready` (null while unresolved); replayed at the same trust level as the rows, so no archive node is needed |
+| `confirmation` | `verdicts[]` | Stage, rule, first-clear set and the king at the first clear; the confirmation set must be disjoint from the first |
+| `halves` | `verdicts[]` | rev6.18 A3/A8: the live (forward) and public half point gains with their window counts; with `sources` (live, GiftEvalPretrain, RMISC) and `domains` (bootstrap clusters) re-derived from the signed rows, as are the combined `lcb` / `gain` and the clear (`LCB ≥ d_margin` and both halves' gains > 0) |
+| `rows` / `rows_sha256` | `public` | rev6.18 A3: every judged model's score on every kept public window (drawn minus dropped); the digest is re-derived (burn class `ld_rows_sha256`) and the rows feed the verdict re-derivation |
+| `min_target_ts` | `windows[]` | The data-time clock: the earliest target point's timestamp, which must be after max(T) plus `forward_margin_hours` |
+| `min_first_seen_ts` | `windows[]` | The first-seen clock: the earliest first-seen time over the target points, which must be after the same bound |
+| `mirror_lag_hours` | `windows[]` | The feed's measured mirror lag, checked against `max_mirror_lag_hours` |
+
+Per settlement the replay checks the pinned signer's sr25519 signature over
+the canonical body, that the stated `params` equal the `[lane_d]` config in
+force, the seed, the forward-only bound on both clocks, the floors, one
+finite row per window and scored model, the max-T LCBs, gains and clears from
+the signed rows, the gate draw from the boundary block hash, the crown, the
+court and its decayed shares, and the receipt links. Once a settlement does
+not match, every later one is unverifiable (`prior_unverified`).
+
+What satellites cannot verify: satellites hold no pool and `pool_d` is
+private, so they cannot re-derive the targets, the window histories or the
+forecasts; they trust the signed rows and clocks. A loser's rows are not
+reproducible either, because its weights stay private. Crowned kings are
+public, so their rows become re-scorable once a `pool_d` snapshot is
+revealed. This trust level is lower than lane A's bench numbers and is
+accepted explicitly (D17).
+
+A settlement with no lane D report is re-derived from its absent receipt
+record (`check_lane_d_absent`); on a pass a satellite burns lane D's share,
+and only lane D's.
+
+**Lane D payees at the push (#913).** When lane D pays its signed court
+(KING_D, then prior kings, at the `[lane_d] court_weights` in force at the
+settlement), the court's `uid -> hotkey` slots join the satellite's
+`reward-uid` attribution. If the satellite's own metagraph registers a lane D
+court uid to a different hotkey, lane D's share (and only lane D's) burns to
+`burn_uid`; lanes A/B/C are set as derived (log tag `lane_d_check_burn …
+reward-uid`). A lane A/B/C payee mismatch still burns the whole vector.
+
+### Lane D: rebuilt from empty state (#910)
+
+Lane D's state (`lane_d_state.json` and `lane_d_state_reports/`, next to the
+validator state DB) lives only on the main validator, which produces the
+settlements. It is not rebuilt from the published reports. The rules:
+
+- A node that cannot settle a boundary itself pays the court of the signed
+  published settlement at that boundary (`lane-d/reports/…`,
+  `lane-d/receipts/…`) when the audit's lane D checker verifies it, exactly
+  as a satellite does. This covers a main validator restarted with a lost
+  state and a full validator that does not produce lane D (no
+  `--lane-d-inputs`). Otherwise lane D's share burns, and lanes A/B/C are
+  unchanged. A rebuilt node never starts from genesis: it stops at
+  `state_digest_mismatch` / `state_missing`.
+- To produce new settlements after a state loss, the main validator needs
+  its state restored from a backup whose digest equals the last published
+  receipt's `posterior_state_sha256` (`restore_state`). Until then lane D's
+  share burns everywhere, per lane. Keep both paths in the main
+  validator's backup set before lane D arms.
+- Satellites hold no lane D state. A satellite rebuilt from empty state
+  replays lane D from the published records and anchors continuity at its
+  first receipt.
+
 ## Satellite validators (DEC-CA-0058)
 
 A satellite does not evaluate anything. It replays the main validator's
@@ -689,6 +863,11 @@ pip install -e '.[satellite]'          # == .[hippius,chain]: boto3, hippius-hub
 export HIPPIUS_S3_ACCESS_KEY=...       # READ access on the manifest bucket
 export HIPPIUS_S3_SECRET_KEY=...       # (manifests/, receipts/, benchmarks/, bench_v/, marketcast/, config/network/)
 ```
+
+**Upgrade:** `git pull`, then `pip install -e '.[satellite]'` again (or
+`uv sync --frozen --extra hippius --extra chain`, with the extras: a bare
+`uv sync --frozen` uninstalls bittensor). Then restart `cascade-satellite`.
+Keep the state dir.
 
 **Run:**
 

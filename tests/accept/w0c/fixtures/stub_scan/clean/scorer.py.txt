@@ -1,0 +1,35 @@
+"""Lane D window scoring helpers.
+
+For example, a window with fewer samples than the horizon is skipped.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import math
+from dataclasses import dataclass
+
+REASONS = ("pending", "hold", "burn")
+
+
+@dataclass(frozen=True)
+class Window:
+    source: str
+    values: tuple[float, ...]
+
+    def digest(self) -> str:
+        payload = ",".join(f"{v:.6f}" for v in self.values).encode()
+        return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+def mean_abs_error(target: list[float], forecast: list[float]) -> float:
+    if len(target) != len(forecast):
+        raise ValueError("length mismatch")
+    if not target:
+        return math.nan
+    return sum(abs(t - f) for t, f in zip(target, forecast)) / len(target)
+
+
+def eligible(window: Window, horizon: int) -> bool:
+    n_samples = len(window.values)
+    return n_samples > horizon

@@ -119,6 +119,11 @@ class GeneratorConfig:
     # into the child via this dataclass's JSON. Empty while real_corpus_ref is
     # armed is a loud error at generator load, never a silent no-corpus run.
     real_corpus_dir: str = ""
+    # WB27 (plan rev6.21): RUNTIME-only, never read from chain.toml — the lane
+    # B curriculum stage this corpus is (the CPU-tier generation CLI's
+    # --curriculum-stage). Non-empty: the generator is constructed with
+    # ``curriculum_stage=<name>`` and must declare that keyword. "" = today.
+    curriculum_stage: str = ""
     # Per-series cap on the masked fraction when "mask" is accepted
     # (DEC-CA-0023's gate): a mostly-missing series is mostly filler bytes
     # bought at full freight. Meaningless while accepted_fields is empty.

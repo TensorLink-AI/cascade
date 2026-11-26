@@ -87,8 +87,8 @@ class _PromotionMixin:
         last king a receipt named when none is readable right now (``None``
         only before any receipt was ever read). This is the prompt dethrone
         signal the reign clock needs: validators reset their clocks at the
-        dethrone verdict, while the on-chain incentive (the caller's fallback
-        king source) lags it 1-2 epochs. The last-known value is STICKY across
+        dethrone verdict (the caller falls back to its persisted era king,
+        never the on-chain incentive — #933). The last-known value is STICKY across
         transient fetch failures — during the lag window a blip that fell back
         to the stale incentive king would flap the engine's king view and
         reset the reign clock twice. Best-effort; never raises.
@@ -333,8 +333,8 @@ class _PromotionMixin:
         fire a promotion BEFORE anything trains, so the signed record is
         published (and fetchable by validators) before any manifest pins a
         new-generation member. The reign clock keys off the signed receipt
-        trail's verdict king when available — the on-chain incentive lags a
-        dethrone by 1-2 epochs — falling back to the incentive king.
+        trail's verdict king when available, falling back to the era's
+        persisted king (never the on-chain incentive — #933).
         Guarded: promotion must never sink a round. ``effective_era``
         (DEC-CA-0043) stamps a fired record with the era it takes effect."""
         if self.promotion is None:

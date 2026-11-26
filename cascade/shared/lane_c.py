@@ -8,15 +8,16 @@ Pure and deterministic — every validator derives the same state from the same
 settlements, and ``cascade-audit`` replays the payouts. Mirrors
 :mod:`cascade.shared.lane_b`: payout age is counted in ERAS (``era_blocks``
 = the grid in force × ``era_settlements``) from the settlement that judged the
-win (age 0 = the first era-length after it); a win pays in full for its
-RECORDED ``full_eras`` eras, then decays to ``floor``, and stops paying at
-``win_ttl_eras`` (its slot burns). Gain-tiered full-pay period (owner
-2026-10-20): ``full_eras`` is chosen at the confirmed win from its gain LCB by
-``[lane_c] full_pay_tiers`` — ``[marketcast] full_pay_tiers`` for an ``mkt:``
-target (:func:`target_full_pay`) — and recorded on the :class:`TargetWin`
-(``tier`` / ``full_eras`` / ``below_floor``), never re-evaluated. A confirmed win takes a target's slot
+win (age 0 = the first era-length after it). Gain-scaled full-pay duration
+(owner 2026-11-24, DEC-CA-0073): a confirmed win pays its slot IN FULL for
+``full_eras`` eras — 5 days at the competition's gain margin up to 20 days at
+``[lane_c] full_pay_max_gain`` (:func:`duration_full_pay`), chosen at the win
+from its gain LCB and recorded on the :class:`TargetWin` (``tier`` /
+``full_eras`` / ``below_floor``), never re-evaluated — then its slot ENDS
+(burns): no decay tail, no TTL. A confirmed win takes a target's slot
 per :func:`win_beats` (a strictly higher gain LCB on the same king, or any
-win on a newer king). A winning fine-tune is published and paid but NEVER becomes the
+win on a newer king); a holder whose duration ran out is evicted first, so
+any confirmed win then takes the empty slot. A winning fine-tune is published and paid but NEVER becomes the
 pretraining init — lane A's lineage is untouched.
 
 A win is CONFIRMED, never immediate: a target's best passer at one
@@ -68,9 +69,8 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import Any, NamedTuple
 
-from ..eval.expert_lane import FullPay, full_pay, reward_multiplier
 from .config.lane_c import (
     COMPETITION_KINDS,
     COMPETITION_STATES,
@@ -161,36 +161,138 @@ class TargetWin:
     recipe_ref: str = ""
     base_pointer: str = ""
     gain_lcb: float = 0.0
-    # gain-tiered full-pay period, fixed at the confirmed win from
-    # ``gain_lcb`` (:func:`target_full_pay`); None = untiered (refused by the
-    # payout — every recorded win carries its tier)
+    # gain-scaled full-pay duration, fixed at the confirmed win from
+    # ``gain_lcb`` (:func:`target_full_pay_record`): ``tier`` = the clamped
+    # gain it was derived from; None = untiered (refused by the payout)
     tier: float | None = None
     full_eras: int | None = None
     below_floor: bool = False
+    # owner 2026-11-18 (MarketCast): the slot holder this win was PAIRED
+    # against on the same windows, and whether it beat it there
+    holder_pointer: str = ""
+    beats_holder: bool = False
+    # DEC-CA-0075: the pay curve the win was confirmed under ("" = lane C's
+    # legacy fixed_term; recorded so a later overlay never changes it)
+    curve: str = ""
 
     def full_pay_record(self) -> dict:
-        """``{gain_lcb, tier, full_eras, below_floor}`` — what the payout
-        record and the settlement state stamp."""
+        """``{gain_lcb, tier, full_eras, below_floor}`` (+ ``curve`` when not
+        the legacy one) — what the payout record and the settlement state
+        stamp."""
         return {"gain_lcb": float(self.gain_lcb), "tier": self.tier,
-                "full_eras": self.full_eras, "below_floor": bool(self.below_floor)}
+                "full_eras": self.full_eras, "below_floor": bool(self.below_floor),
+                **({"curve": self.curve} if self.curve else {})}
 
 
-def full_pay_tiers_for(target: str, cfg, mc=None) -> tuple:
-    """The full-pay tiers a win on ``target`` is tiered by: ``[marketcast]
-    full_pay_tiers`` (``mc``) for an ``mkt:`` target, else ``[lane_c]``'s
-    (``cfg``)."""
+def _win_dict(w: TargetWin) -> dict:
+    """A win as the state file stores it (``curve`` only when recorded, so a
+    legacy win's bytes are unchanged)."""
+    d = asdict(w)
+    if not d.get("curve"):
+        d.pop("curve", None)
+    return d
+
+
+def gain_margin_for(target: str, cfg, mc=None) -> float:
+    """The verdict margin a win on ``target`` cleared — the bottom of the
+    pay-duration ramp: ``[marketcast] gain_margin`` (``mc``) for an ``mkt:``
+    target, else ``[lane_c]``'s (``cfg``)."""
     if is_mkt_target(target):
         if mc is None:
-            raise ValueError(f"an {target!r} win needs [marketcast] for its full-pay tiers")
-        return tuple(mc.full_pay_tiers)
-    return tuple(cfg.full_pay_tiers)
+            raise ValueError(f"an {target!r} win needs [marketcast] for its gain margin")
+        return float(mc.gain_margin)
+    inst = _instance_mc(cfg, target)
+    if inst is not None:
+        # W-CMP2: a spec instance's own margin
+        return float(inst.gain_margin)
+    return float(cfg.gain_margin)
 
 
-def target_full_pay(target: str, gain_lcb: float | None, cfg, mc=None) -> FullPay:
-    """CONSENSUS: the full-pay period of a confirmed win on ``target`` with
-    gain LCB ``gain_lcb`` (:func:`cascade.eval.expert_lane.full_pay` over
-    :func:`full_pay_tiers_for`)."""
-    return full_pay(gain_lcb, full_pay_tiers_for(target, cfg, mc))
+def _instance_mc(cfg, target: str):
+    """W-CMP2: the compiled spec instance judging ``target`` (None = not one)."""
+    from .config.lane_c import SPEC_KINDS, kind_of
+
+    k = kind_of(target)
+    if k not in SPEC_KINDS or not hasattr(cfg, "instance_mc"):
+        return None
+    return cfg.instance_mc(k)
+
+
+def duration_full_pay(gain_lcb: float | None, *, margin: float, min_days: float,
+                      max_days: float, max_gain: float, era_blocks: int) -> dict:
+    """CONSENSUS (pure, exact rational arithmetic; owner 2026-11-24,
+    DEC-CA-0073): the full-pay record of a win with gain LCB ``gain_lcb``::
+
+        frac      = clamp((gain_lcb - margin) / (max_gain - margin), 0, 1)
+        days      = min_days + (max_days - min_days) * frac
+        full_eras = ceil(days * 86400 / (BLOCK_SECONDS * era_blocks))
+
+    ``ceil``: never shorter than the owner's duration (12 h eras: 10 … 40 eras
+    for 5 … 20 days). ``tier`` records the clamped gain the duration was
+    derived from; ``below_floor`` an LCB under ``margin`` or a non-finite one
+    (paid the minimum). After ``full_eras`` the slot ends."""
+    from fractions import Fraction
+
+    from .config import BLOCK_SECONDS
+
+    if int(era_blocks) <= 0:
+        raise ValueError("era_blocks must be > 0")
+    m, top = Fraction(float(margin)), Fraction(float(max_gain))
+    if not m < top:
+        raise ValueError(f"gain margin {margin} must be < max gain {max_gain}")
+    x = None if gain_lcb is None or not math.isfinite(float(gain_lcb)) else float(gain_lcb)
+    g = m if x is None else min(max(Fraction(x), m), top)
+    lo, hi = Fraction(float(min_days)), Fraction(float(max_days))
+    days = lo + (hi - lo) * (g - m) / (top - m)
+    n = math.ceil(days * 86400 / Fraction(BLOCK_SECONDS) / int(era_blocks))
+    return {"gain_lcb": x, "tier": float(g), "full_eras": int(max(1, n)),
+            "below_floor": bool(x is None or Fraction(x) < m)}
+
+
+def pay_curve_for(target: str, cfg, mc=None) -> str:
+    """DEC-CA-0075: the pay curve a NEW win on ``target`` is confirmed under —
+    the MarketCast spec's (``[marketcast] pay_curve``) for an ``mkt:`` target,
+    else ``[lane_c] pay_curve``."""
+    if is_mkt_target(target) and mc is not None:
+        return str(getattr(mc, "pay_curve", "fixed_term") or "fixed_term")
+    inst = _instance_mc(cfg, target)
+    if inst is not None:
+        return str(getattr(inst, "pay_curve", "fixed_term") or "fixed_term")
+    return str(getattr(cfg, "pay_curve", "fixed_term") or "fixed_term")
+
+
+def target_full_pay_record(target: str, gain_lcb: float | None, cfg, mc=None, *,
+                           era_blocks: int) -> dict:
+    """CONSENSUS: the full-pay record of a confirmed win on ``target``
+    (:func:`duration_full_pay` on ``[lane_c]``'s terms, ramped from
+    :func:`gain_margin_for`; ``era_blocks`` = the era length in force at the
+    confirming settlement), plus ``curve`` when the win's pay curve
+    (:func:`pay_curve_for`) is not the legacy ``fixed_term``."""
+    from .rules_menu import curve_record
+
+    rec = duration_full_pay(
+        gain_lcb, margin=gain_margin_for(target, cfg, mc), min_days=cfg.full_pay_min_days,
+        max_days=cfg.full_pay_max_days, max_gain=cfg.full_pay_max_gain, era_blocks=era_blocks)
+    c = curve_record(pay_curve_for(target, cfg, mc), "lane_c")
+    return {**rec, "curve": c} if c else rec
+
+
+def full_pay_record_mismatch(rec: dict, target: str, cfg, mc=None, *,
+                             era_blocks: int) -> str | None:
+    """Why a recorded ``{gain_lcb, tier, full_eras, below_floor}`` is not
+    :func:`target_full_pay_record` of its own ``gain_lcb`` (None =
+    consistent) — the audit's forged-duration check."""
+    if not all(k in rec for k in ("gain_lcb", "tier", "full_eras")):
+        return "carries no gain_lcb / tier / full_eras"
+    want = target_full_pay_record(target, rec.get("gain_lcb"), cfg, mc, era_blocks=era_blocks)
+    if str(rec.get("curve", "") or "") != str(want.get("curve", "") or ""):
+        return f"curve {rec.get('curve')!r} != {want.get('curve')!r} in force at the win"
+    for k in ("tier", "full_eras", "below_floor"):
+        got = rec.get(k, False if k == "below_floor" else None)
+        if got != want[k] or isinstance(got, bool) != isinstance(want[k], bool):
+            return (f"{k} {got!r} != {want[k]!r} re-derived from gain_lcb "
+                    f"{rec.get('gain_lcb')!r}")
+    return None
 
 
 PENDING_KINDS = ("confirm", "deferred")
@@ -238,16 +340,22 @@ def win_beats(new: TargetWin, cur: TargetWin) -> bool:
       win — by ``(win_block, round_id)`` — holds; a holder trained on an older
       king no longer defends (kings only move forward, so the later win is the
       one on the current king);
-    * same ``base_pointer``: only a STRICTLY higher recorded ``gain_lcb`` vs
-      the king takes the slot (and so restarts the payout clock); on an exact
-      tie the EARLIER win holds. No special case for the holder's own hotkey.
+    * same ``base_pointer`` and ``new`` was PAIRED against ``cur`` (owner
+      2026-11-18, MarketCast: ``new.holder_pointer`` is ``cur``'s checkpoint
+      — both forecast the SAME windows): ``new`` takes the slot iff it beat
+      ``cur`` there (``beats_holder``: the paired gain LCB ≥ the margin);
+    * otherwise same ``base_pointer``: only a STRICTLY higher recorded
+      ``gain_lcb`` vs the king takes the slot (and so restarts the payout
+      clock); on an exact tie the EARLIER win holds. No special case for the
+      holder's own hotkey. Those LCBs come from different settlements'
+      windows: a conservative point comparison, not a paired test.
 
-    The LCBs compared come from different settlements' windows: a
-    conservative point comparison of recorded values, not a paired test.
-    Pure in the four fields, hence order-independent."""
+    Pure in the recorded fields, hence order-independent."""
     newer = (int(new.win_block), str(new.round_id)) > (int(cur.win_block), str(cur.round_id))
     if new.base_pointer != cur.base_pointer:
         return newer
+    if new.holder_pointer and new.holder_pointer == cur.trained_pointer:
+        return bool(new.beats_holder)
     if float(new.gain_lcb) != float(cur.gain_lcb):
         return float(new.gain_lcb) > float(cur.gain_lcb)
     return not newer and (int(new.win_block), str(new.round_id)) != (int(cur.win_block),
@@ -280,6 +388,9 @@ class LaneCState:
     # DEC-CA-0064 exact-identity dedup: checkpoint sha256 -> {"hotkey",
     # "pointer", "target", "commit_block", "train_block"} of the earliest commit
     mkt_seen: dict = field(default_factory=dict)
+    # any other competition's own state, {kind: {...}}
+    # (cascade.validator.lane_c_competitions; persisted only when non-empty)
+    comp: dict = field(default_factory=dict)
 
     def set_pending(self, pending: list[PendingEntry]) -> None:
         for p in pending:
@@ -321,8 +432,8 @@ class LaneCState:
         return max(0, (int(block) - int(win.win_block)) // int(era_blocks))
 
     def to_json(self) -> str:
-        d = {"slots": {t: asdict(w) for t, w in sorted(self.slots.items())},
-             "history": [asdict(w) for w in self.history],
+        d = {"slots": {t: _win_dict(w) for t, w in sorted(self.slots.items())},
+             "history": [_win_dict(w) for w in self.history],
              "applied": dict(sorted(self.applied.items())),
              "settled_block": self.settled_block,
              "last_round": self.last_round,
@@ -332,6 +443,8 @@ class LaneCState:
             d["mkt_backlog"] = self.mkt_backlog
         if self.mkt_seen:
             d["mkt_seen"] = self.mkt_seen
+        if self.comp:
+            d["comp"] = self.comp
         return json.dumps(d, sort_keys=True)
 
     @classmethod
@@ -350,7 +463,8 @@ class LaneCState:
                    pending=[PendingEntry(**p) for p in obj.get("pending") or ()],
                    last_rows=obj.get("last_rows"),
                    mkt_backlog=list(obj.get("mkt_backlog") or ()),
-                   mkt_seen=dict(obj.get("mkt_seen") or {}))
+                   mkt_seen=dict(obj.get("mkt_seen") or {}),
+                   comp=dict(obj.get("comp") or {}))
 
 
 def _pending_dict(p: PendingEntry) -> dict:
@@ -391,18 +505,20 @@ class LaneCWin:
     multiplier: float
 
 
-def win_expired(age_eras: int, cfg) -> bool:
-    ttl = int(getattr(cfg, "win_ttl_eras", 0) or 0)
-    return ttl > 0 and int(age_eras) >= ttl
+def win_expired(age_eras: int, win, cfg=None) -> bool:
+    """Whether a win of age ``age_eras`` has stopped paying (DEC-CA-0073):
+    its recorded full-pay duration ``full_eras`` has run out — the slot
+    burns and the holder is evicted. None ``full_eras`` = untiered: refused.
+    DEC-CA-0075: on the win's RECORDED pay curve (legacy = ``fixed_term``,
+    exactly the rule above); ``tiered_decay`` ends at ``[lane_c]
+    decay_ttl_eras`` (``cfg``), ``indefinite_until_beaten`` never."""
+    from .rules_menu import curve_expired, recorded_curve
 
-
-def target_multiplier(age_eras: int, cfg, full_eras: int | None) -> float:
-    """A lane-C win's multiplier at ``age_eras`` from its RECORDED
-    ``full_eras`` (None = an untiered win: refused) on ``[lane_c]``'s decay."""
-    if full_eras is None:
-        raise ValueError("lane-C win carries no full-pay tier (full_eras)")
-    return reward_multiplier(int(age_eras), full_eras=int(full_eras),
-                             half_life_rounds=cfg.half_life_rounds, floor=cfg.floor)
+    n = getattr(win, "full_eras", None)
+    if n is None:
+        raise ValueError("lane-C win carries no full-pay duration (full_eras)")
+    return curve_expired(recorded_curve(win, "lane_c"), int(age_eras), full_eras=int(n),
+                         ttl_eras=int(getattr(cfg, "decay_ttl_eras", 0) or 0))
 
 
 # ── concurrent competitions (owner 2026-10-20) ───────────────────────────────
@@ -504,7 +620,9 @@ def lane_c_split(cfg, block: int, era_blocks: int, mc=None) -> tuple[list[dict],
     burns). ``slot_frac``: ``{target: fraction of lane C's share}`` for every
     slot-bearing target. Its values sum to <= 1; the rest of the share burns."""
     comps = cfg.competition_list
-    total = sum(float(c.weight) for c in comps)
+    # DEC-CA-0075: a refused competition spec's weight stays in the total, so
+    # its part BURNS (0.0 = no refused spec: byte-identical)
+    total = sum(float(c.weight) for c in comps) + float(getattr(cfg, "refused_weight", 0.0))
     recs: list[dict] = []
     slot: dict[str, float] = {}
     for c in comps:
@@ -544,7 +662,7 @@ def lane_c_payouts(state: LaneCState, *, block: int, era_blocks: int, cfg, n_uid
         if uid is None or not 0 <= int(uid) < n_uids:
             continue
         age = state.eras_since(w, block, era_blocks)
-        if win_expired(age, cfg):
+        if win_expired(age, w, cfg):
             continue
         row = {"target": t, "hotkey": w.hotkey, "uid": int(uid),
                "win_block": int(w.win_block), "age": int(age)}
@@ -554,7 +672,14 @@ def lane_c_payouts(state: LaneCState, *, block: int, era_blocks: int, cfg, n_uid
             row["multiplier"] = 1.0
             row["wind_down"] = True
         else:
-            row["multiplier"] = target_multiplier(age, cfg, w.full_eras)
+            # full pay until the duration ends (DEC-CA-0075: on the win's
+            # recorded curve; legacy fixed_term = 1.0)
+            from .rules_menu import curve_multiplier, recorded_curve
+
+            row["multiplier"] = curve_multiplier(
+                recorded_curve(w, "lane_c"), int(age), full_eras=w.full_eras,
+                half_life_rounds=float(getattr(cfg, "decay_half_life_eras", 1.0)),
+                floor=float(getattr(cfg, "decay_floor", 0.1)))
         out.append({**row, **w.full_pay_record()})
     return out
 
@@ -565,12 +690,17 @@ def pay_wins(pay: dict | None) -> list[LaneCWin]:
                      multiplier=float(w["multiplier"])) for w in (pay or {}).get("wins", ())]
 
 
-def lane_pool_shares(lane_b_cfg, lane_c_cfg=None) -> tuple[float, float]:
-    """``(B, C)`` allocations; pass C only when it is active. A gets the rest.
+class LanePoolShares(NamedTuple):
+    """Lane B, C and D allocations, each a fraction of the total. Lane A's
+    pool is ``1 - b - c - d`` (before lane B's ``remainder = "lane_a"``
+    refund)."""
 
-    Mainnet takes C from A, preserving B's allocation. ``takes_from=lane_b``
-    retains the original split for existing configurations and receipts.
-    """
+    b: float
+    c: float
+    d: float
+
+
+def _lane_bc_shares(lane_b_cfg, lane_c_cfg) -> tuple[float, float]:
     share_b = float(getattr(lane_b_cfg, "share", 0.0) or 0.0) if lane_b_cfg is not None else 0.0
     if lane_c_cfg is None:
         return share_b, 0.0
@@ -582,11 +712,41 @@ def lane_pool_shares(lane_b_cfg, lane_c_cfg=None) -> tuple[float, float]:
     return share_b - share_c, share_c
 
 
+def lane_pool_shares(lane_b_cfg, lane_c_cfg=None, lane_d_cfg=None) -> LanePoolShares:
+    """``(b, c, d)`` allocations; pass C and D only when active. A gets the
+    rest, ``1 - b - c - d``.
+
+    Mainnet takes C from A, preserving B's allocation. ``takes_from=lane_b``
+    retains the original split for existing configurations and receipts.
+
+    Lane D (LANE_D_PLAN D1/D48, C3) is carved from its ``takes_from`` lane,
+    capped at what that lane holds: ``lane_a`` (mainnet) takes it from A's
+    pool so B and C are untouched; ``lane_b`` / ``lane_c`` lower that lane.
+    ``lane_d_cfg`` None = ``d == 0.0`` and ``(b, c)`` exactly as without it.
+    """
+    share_b, share_c = _lane_bc_shares(lane_b_cfg, lane_c_cfg)
+    if lane_d_cfg is None:
+        return LanePoolShares(share_b, share_c, 0.0)
+    want = max(0.0, float(lane_d_cfg.share))
+    src = str(lane_d_cfg.takes_from)
+    if src == "lane_a":
+        return LanePoolShares(share_b, share_c,
+                              min(want, max(0.0, 1.0 - share_b - share_c)))
+    if src == "lane_b":
+        share_d = min(want, max(0.0, share_b))
+        return LanePoolShares(share_b - share_d, share_c, share_d)
+    if src == "lane_c":
+        share_d = min(want, max(0.0, share_c))
+        return LanePoolShares(share_b, share_c - share_d, share_d)
+    raise ValueError(f"[lane_d] takes_from {src!r} is not a lane")
+
+
 def lane_c_shares(lane_b_cfg, lane_c_cfg, block: int | None) -> tuple[float, float]:
     """``(B, C)`` allocations at settlement ``block``; A receives the rest."""
     active_c = lane_c_cfg if lane_c_cfg is not None and lane_c_cfg.active(block) else None
     active_b = lane_b_cfg if lane_b_cfg is not None and lane_b_cfg.active(block) else None
-    return lane_pool_shares(active_b, active_c)
+    share_b, share_c, _ = lane_pool_shares(active_b, active_c)
+    return share_b, share_c
 
 
 def lane_c_vector(n_uids: int, *, cfg, wins: list[LaneCWin], burn_uid: int,
@@ -628,21 +788,24 @@ def lane_c_pay_record(state: LaneCState, *, block: int, era_blocks: int, cfg, n_
     comps, slot = lane_c_split(cfg, int(block), int(era_blocks), mc)
     paying = tuple(t for t in cfg.targets if t in slot)
     winding = frozenset(t for c in comps if c["state"] == "winding_down" for t in c["targets"])
-    return {"block": int(block), "era_blocks": int(era_blocks),
-            "share": float(cfg.share), "slots": len(paying),
-            "slot_frac": {t: slot[t] for t in paying}, "competitions": comps,
-            "wins": lane_c_payouts(state, block=block, era_blocks=era_blocks, cfg=cfg,
-                                   n_uids=n_uids, uid_of=uid_of, targets=paying,
-                                   winding=winding)}
+    rec = {"block": int(block), "era_blocks": int(era_blocks),
+           "share": float(cfg.share), "slots": len(paying),
+           "slot_frac": {t: slot[t] for t in paying}, "competitions": comps,
+           "wins": lane_c_payouts(state, block=block, era_blocks=era_blocks, cfg=cfg,
+                                  n_uids=n_uids, uid_of=uid_of, targets=paying,
+                                  winding=winding)}
+    return rec
 
 
 __all__ = [
-    "PENDING_KINDS", "LaneCState", "LaneCWin", "MAX_WARMUP_FRACTION", "PendingEntry",
+    "PENDING_KINDS", "LaneCState", "LaneCWin", "LanePoolShares", "MAX_WARMUP_FRACTION",
+    "PendingEntry",
     "RECIPE_FILE", "RECIPE_KEYS", "Recipe",
-    "TargetWin", "active_targets", "competition_closed", "competition_from_block",
-    "competition_past_end", "competition_started", "competition_state", "full_pay_tiers_for",
+    "TargetWin", "active_targets", "duration_full_pay", "full_pay_record_mismatch",
+    "gain_margin_for", "pay_curve_for", "competition_closed", "competition_from_block",
+    "competition_past_end", "competition_started", "competition_state",
     "lane_c_pay_record", "lane_c_payouts", "lane_c_shares", "lane_c_split", "lane_c_vector",
     "lane_pool_shares",
-    "load_state", "parse_recipe", "pay_wins", "save_state_atomic", "target_full_pay",
-    "target_multiplier", "wind_down_pays", "win_beats", "win_expired",
+    "load_state", "parse_recipe", "pay_wins", "save_state_atomic", "target_full_pay_record",
+    "wind_down_pays", "win_beats", "win_expired",
 ]

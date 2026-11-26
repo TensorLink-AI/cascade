@@ -1,0 +1,13 @@
+# W3b2: the lane D paired gate sweep vs KING_D and the house on one host
+# (plan §1.3b "Rule on the drawn suite" and "Faults", §4 T7b and T17; README.md
+# has the contract). New module: paired_gate (four paired LCBs on the drawn
+# suite, sentinel recorded never gating, checkpoint_fault vs bench_hold,
+# mixed_session refusal) and SweepSession (one paired host sweep per session,
+# rows cached only within the session).
+cascade/validator/lane_d_bench.py
+# RV5 (BLOCKING item 6): the owner's read-only live verify of the pod
+# evidence (chain block hash, gate_suite_for re-draw, KING_D / house pointers
+# at the block, registry resolution), writing a verified_live record bound to
+# the evidence body. cascade/laned/__init__.py already exists on main
+# (shared with other WPs); the builder keeps it and every other WP's file intact.
+cascade/laned/bench_evidence.py

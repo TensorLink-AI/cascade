@@ -1,0 +1,15 @@
+{
+  "_comment": "Exact level and side state per fixture WP on the fixture repo's main (D99 open). Why each value holds is in tests/accept/w0c/README.md.",
+  "W0c": {"level": "L7", "side_state": null},
+  "W0":  {"level": "L3", "side_state": null},
+  "W1":  {"level": "L2", "side_state": null},
+  "W2":  {"level": "L1", "side_state": "blocked:owner"},
+  "W3":  {"level": "L0", "side_state": null},
+  "W4":  {"level": "L1", "side_state": null},
+  "W5":  {"level": "L0", "side_state": "blocked:dependency"},
+  "W6":  {"level": "L0", "side_state": "blocked:D99"},
+  "W7":  {"level": "L1", "side_state": "blocked:external"},
+  "R6x": {"level": "L4", "side_state": null},
+  "R2x": {"level": "L3", "side_state": null},
+  "WB1": {"level": "L0", "side_state": "parked"}
+}

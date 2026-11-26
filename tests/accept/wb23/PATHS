@@ -1,0 +1,25 @@
+# WB23: miner-chosen lane B leg length (D42, D42b; TB25-TB27). README.md has the contract.
+#
+# New module (stdlib only, shared by the intake, the trainer and the validator):
+# the train_hours grid, steps fixed from the measured per-GPU rate, the guard,
+# the lane B leg contract and the consensus check of a recorded leg.
+cascade/shared/lane_b_leg.py
+# The intake: X-Lane-B-Train-Hours on POST /v1/lane-b/fund (signed tag,
+# refusals before anything is queued or vaulted, the reply).
+cascade/funding/intake.py
+# Production wiring of the intake's optional landing estimate.
+cascade/funding/main.py
+# FundedEntry train_hours / leg_steps / leg_guard_seconds; add_lane_b(leg_length=).
+cascade/funding/queue.py
+# The trainer: funding record keys, the lane B leg contract at dispatch, the
+# cross-era hold, status rows, the leg length into the expert manifest entry.
+cascade/trainer/lane_b_driver.py
+# ExpertEntry train_hours / leg_steps / leg_guard_seconds (dropped at 0).
+cascade/shared/expert_manifest.py
+# judge_entry / judge_manifest: the leg_length stage (TB27).
+cascade/validator/expert_lane.py
+# The validator passes the round's training contract into judge_manifest.
+cascade/validator/lane_b.py
+# The single-target bytes test rebuilds main's body from asdict(); it drops
+# the leg-length fields (0 = not recorded) the way canonical_body() does.
+tests/unit/test_lane_b_multi_target.py

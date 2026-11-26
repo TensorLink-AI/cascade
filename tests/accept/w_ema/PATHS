@@ -1,0 +1,20 @@
+# W-EMA: score the raw cooled endpoint on every leg, lanes A and B (plan rev5
+# §3.0 W-EMA row, §8 "WP W-EMA", §3.2 "Services touched" lane B bullet;
+# README.md has the contract).
+#
+# The image-only power EMA lives in one module: pyramid_trainer.py holds
+# POWER_EMA_SIGMA_RELS / POWER_EMA_EVAL, power_ema_active (the per-leg
+# "is the average scored?" gate, :156), save_checkpoint (the config.json
+# power_ema marker, :192) and train_pyramid's export (which file becomes
+# weights.safetensors and which averages ride along, :484-505). The fix is
+# that gate: warm-start legs (king, challenger, lane B expert legs on an
+# EMA-marked king) behave like random-init legs do today.
+cascade/trainer/pyramid_trainer.py
+# The unit suite pins today's rule (warm start => EMA scored:
+# test_activation_rule_follows_the_init_only, the warm-start-epoch tests);
+# the builder must update it to the new rule in the same PR.
+tests/unit/test_pyramid_power_ema.py
+# Plan rev6.20 (owner 2026-11-24, lane B only: EMA, no cooldown): the expert
+# role turns its for_hours leg contract into the lane B leg contract with
+# lane_b_leg_contract (cascade/shared/config/lane_b.py, WB10).
+cascade/trainer/worker.py

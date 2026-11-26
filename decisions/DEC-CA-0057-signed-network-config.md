@@ -19,6 +19,24 @@ by an overlay. A persisted node refuses sequence rollback; a fresh node still
 needs an authenticated deployment checkpoint/history to detect a stale latest
 pointer. A deployment label identifies the network; it is not a genesis proof.
 
+Envelope amendment (owner 2026-11-24, LANE_D_PLAN rev6.24, W-OV): "satellite
+validators do not need to update — we need the flexibility." On top of the
+loader, `cascade/shared/netconfig_bounds.py` refuses (1) an override outside
+its per-key envelope (`BOUNDS`: alphas <= 0.10, margins >= 0.002, bootstrap
+B <= 50000, window counts <= 20000, lane shares, ...), (2) release-only keys
+inside allowed tables (`RELEASE_ONLY_KEYS`: contract digest, fork-guard
+feature names, operator-local paths, external endpoints), (3) a data
+reference that is not `<repo>@<revision>` (`PINNED_REF_KEYS`) and (4) a lane
+share the carve would clamp. The envelope is code; no overlay changes it,
+the signature/trust rules or `[netconfig] owner_hotkey`. Lane C's eval DATA
+— `[marketcast] assets`, `frequencies`, `horizons`, `composite_suite_weights`,
+`windows_per_cell` — joins `ALLOWED["marketcast"]` (superseding "window
+construction remains release-only" below for those keys); the model pins,
+`from_block`, `suites`, `data_sources`, `pool_prefix`, the context lengths
+and `embargo_days` stay release-only. An older node lacks the envelope and
+accepts a superset; `plan_overlay` runs it, so a published overlay is one
+every node accepts.
+
 Owner (2026-10-19): every consensus constant a validator reads from its local
 `chain.toml` that is not code, a locked training term or a security root is
 changed by an owner-signed overlay instead of a fleet release, and goes live
@@ -154,6 +172,37 @@ key slash) is the `[v2] ladder_*` / `court_*` / `key_slash_bp` keys. All are
 on the allow-list; `lane_c.share <= lane_b.share` is load-checked even while
 lane C is dormant, and the lane-C pool opens on first use, so an overlay that
 arms lane C needs no restart.
+
+## Containment by overlay (owner 2026-11-24, launch release)
+
+The 2026-11-25 release is the one validator update; anything testnet finds
+in lanes B / C / D afterwards must be fixable or containable by overlay:
+
+- **Lane C / MarketCast launch is overlay-gated.** `[marketcast] from_block`
+  joins the allow-list. An overlay may move `[lane_c] from_block` and
+  `[marketcast] from_block` LATER than the typed value (or to 0), never
+  earlier (`start_refusals`), never before the apply block, and never once
+  the start has passed (`retroactive_changes`: end a running lane with
+  `until_block`). Moving `[lane_c] from_block` alone carries MarketCast's
+  start with it. The publish tool refuses a start less than one era past
+  the head.
+- **Kill switches.** `[lane_c] until_block` and `[lane_b] until_block` (0 =
+  no end; an era boundary after the start): the settlement AT it is the
+  lane's last, every later one is as if the lane were off. Lane C's also
+  closes MarketCast (derived, never a `[marketcast]` key). No kill switch
+  is ever moved to, or away from, a block before the apply block (lanes B,
+  C, D). Every block key has a W-OV bound (`netconfig_bounds`, u32).
+- **Satellite burns scoped per lane.** A lane B / lane C audit FAIL, or a
+  `weights` mismatch lying wholly inside lane B's / C's share, at a
+  settlement that lane pays burns that lane's share only; lane A and D are
+  set from the satellite's own derivation. Lane A rows, the sentinel (a lane
+  A gate) and the netconfig row still burn the whole vector.
+- **Lane D wiring.** The main validator always builds the lane D step and
+  inputs and judges each boundary under the config in force there, so an
+  overlay-armed lane D settles.
+- **Refresh.** A node signals the NEWEST overlay it can validate (the new
+  bodies newest first, then the one it already held): a refused newer body
+  never drops an older valid one still being signalled.
 
 ## Open
 

@@ -1,0 +1,17 @@
+# D11's launch eval host: valpriv-4090 (1x RTX 4090 24 GB) running the
+# release's pinned torch 2.4.1+cu124. Never a Blackwell: sm_120 cannot run the
+# pinned torch. It serves forecasts, not the bench, so it carries no suite
+# identities; its handshake is the W4 code handshake (worker hello vs the
+# release: git HEAD + cascade/ package hash).
+# disk: two checkpoints of headroom (9.2 GB) free on the release volume.
+schema = "laned_evalhost_profile/1"
+name = "launch_eval"
+gpu_model = "NVIDIA GeForce RTX 4090"
+min_vram_mib = 24000
+min_driver = "550.54.14"           # CUDA 12.4 (cu124 wheels) minimum driver
+disk_path = "/root"
+min_disk_free_bytes = 9200000000
+# The release's pinned torch 2.4.1+cu124 lives in pyproject's `train` extra:
+# the sync runs `uv sync --frozen --extra train` (#784: a plain sync left the
+# eval host without torch).
+uv_extras = ["train"]

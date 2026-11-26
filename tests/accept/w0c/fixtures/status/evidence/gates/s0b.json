@@ -1,0 +1,1 @@
+{"stage": "S0b", "passed": true, "checks": [{"name": "no_pending_segment_trimmed", "passed": false}]}

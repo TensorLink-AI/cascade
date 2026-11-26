@@ -1,0 +1,6 @@
+# command: grep -nE "cron|schedule" .github/workflows/publish-mkt-pool.yml
+# repo @ 3c67b64a8e97f4d2c00ad60cefba0185c6779d69
+34:  schedule:
+35:    - cron: "30 */6 * * *"       # every 6 h, as docs/OPERATOR.md's MarketCast cron
+84:      - name: Skip while MarketCast is off (scheduled runs only)
+92:          if [ "${{ github.event_name }}" = "schedule" ] && [ "$fb" = "0" ]; then

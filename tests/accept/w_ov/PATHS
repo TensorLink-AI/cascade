@@ -1,0 +1,36 @@
+# W-OV: the signed-overlay envelope (plan rev6.24, owner 2026-11-24:
+# "satellite validators do not need to update — we need the flexibility").
+# The envelope (bounds, release-only keys, content-addressed data refs,
+# no silent share clamp) lives in one new module.
+cascade/shared/netconfig_bounds.py
+# netconfig.py: check_overrides / build_config call the envelope;
+# ALLOWED["marketcast"] gains lane C's eval-data keys; overlay_policy()
+# publishes the envelope.
+cascade/shared/netconfig.py
+# DEC-CA-0057: amendment (lane C eval data overlay-settable; the envelope).
+decisions/DEC-CA-0057-signed-network-config.md
+# The owner's A 0 / B 35 / C 15 / D 50 split as ready-to-sign overlay
+# overrides (testnet, then mainnet); repo defaults unchanged.
+deploy/overlays/
+# Containment (owner 2026-11-24, launch release): lane C / MarketCast start
+# overlay-gated (later only) + [lane_c] / [lane_b] until_block kill switches
+cascade/shared/config/lane_c.py
+cascade/shared/config/marketcast.py
+cascade/shared/config/v2.py
+cascade/shared/config/loader.py
+# satellite: a lane B / lane C check failure burns that lane's share only
+cascade/validator/satellite.py
+cascade/audit/checks.py
+tests/unit/test_satellite_replay.py
+tests/unit/test_marketcast.py
+# the main validator's lane D step is always wired and follows the config
+# in force at each boundary (an overlay-armed lane D settles)
+cascade/validator/main.py
+cascade/validator/loop.py
+cascade/validator/lane_d_wiring.py
+cascade/validator/lane_d_inputs.py
+# #891: an IN-FORCE overlay out of this release's envelope resolves each such
+# key to the release value (netconfig.build_config in_force) instead of
+# failing every round; the audit row and the status docs list the keys
+cascade/audit/main.py
+cascade/validator/receipts.py

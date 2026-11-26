@@ -1,0 +1,5 @@
+# R5: previous-release worktrees + restart scripts (plan §3.0 R5, §10.8)
+deploy/laned/
+# Lane D recurring jobs: the runbook section for the job templates under
+# deploy/laned/systemd/ (### Lane D recurring jobs) and the v2 preflight note.
+docs/OPERATOR.md

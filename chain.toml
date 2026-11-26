@@ -168,6 +168,13 @@ batch_denomination          = "series"
 # worker image built from this release: an older worker parses no such key
 # and would bill C×L, stopping a wide leg C× early. Bit-identical at C=1.
 budget_denomination         = "series_points"
+# DEC-CA-0047 scheduled switch of the v1 contract (TrainingContractConfig.at_block;
+# never in contract_digest). Live on mainnet since 9165600; v2 (from 9399600)
+# carries its own contract, so this only shapes eras [9165600, 9399600) and
+# lets audit/replay re-derive the contract those v1 rounds trained under.
+# Typed from the deployed file (S0a B9, owner 2026-11-23).
+budget_denomination_after       = "points+mv20"
+budget_denomination_after_block = 9165600
 # optimiser (u-muP transfer: tune once on a small proxy width, pin the result)
 optimizer          = "normuon_adamw"
 base_lr            = 4e-3        # u-muP width-independent learning rate
@@ -389,7 +396,7 @@ funded_capacity_reserve = 1     # retired (ignored)
 # more and rent only when a miner names them (--gpu, own --max-price).
 # Blackwell (4xB200, 8xB200, 4xB300, 8xB300) waits on a torch cu12.8 image:
 # the pinned image is torch 2.4.1 cu124, which cannot run on B200/B300.
-funded_pod_skus = ["8xH200", "8xH100", "4xH200", "4xH100"]
+funded_pod_skus = ["8xH100", "8xH200"]
 # Never rent executors whose CPU model contains any of these (case-insensitive
 # substring of Lium's specs.cpu.model). 2026-09-13/14: four legs stalled —
 # zero series inside the 1800 s stall window — and all four sat on Xeon
@@ -443,7 +450,11 @@ funded_max_leg_cost_usd = 75.0
 # variates (the same 512 rows per step as v2's 16 × 32) scaled to v2's 23,841
 # steps (× 0.867). 8xH200, 8xH100, 4xH100 measured; 4xH200 and Blackwell
 # estimated. Re-measure on the pinned image.
-funded_sku_wall_seconds = { RTX4090 = 13500, L40S = 10200, L40 = 11400, H100 = 6000, "8xH200" = 8333, "8xH100" = 8801, "4xH200" = 12483, "4xH100" = 13201, "4xB200" = 10174, "8xB200" = 6866, "4xB300" = 10299, "8xB300" = 6866 }
+funded_sku_wall_seconds = { RTX4090 = 13500, L40S = 10200, L40 = 11400, H100 = 6000, "8xH200" = 12270, "8xH100" = 13600, "4xH200" = 12483, "4xH100" = 13201, "4xB200" = 10174, "8xB200" = 6866, "4xB300" = 10299, "8xB300" = 6866 }
+# 2026-10-31: 8xH200 / 8xH100 above MEASURED on rc15 (2.04 / 1.84 steps/s x 23,841 steps, x1.05).
+# Typed from the deployed file (S0a B9, owner 2026-11-23).
+# Measured-wall gate (#393): no funded/king rent unless the walls were measured on this image.
+funded_sku_wall_measured_image = "sha256:5d41d94bc0c0d3ae3dfd042b0cc7e4d900c7d1f48173808436c12bf764a67641"
 # King pod rents JIT at the round's SKU (operator-billed); retire the
 # provisioner's final stage — the trainer ledgers and sweeps these pods.
 funded_king_rent = true
@@ -462,7 +473,7 @@ dispatch_reattach_grace_seconds = 900
 # capacity takes an OPERATOR final lane from hosts.toml the moment one is on
 # file — operator-billed for that leg only; legs already running on their
 # payer's pod are untouched. false ⇒ funded legs never run on operator lanes.
-funded_operator_fallback = false
+funded_operator_fallback = true
 # Direct submissions + champion-only publication (DEC-CA-0036, second half;
 # SHIPPED INERT): code POSTs straight to cascade-intake (same request as the
 # Lium key), lives in the operator-private store below, and rides the chain as
@@ -495,9 +506,6 @@ dedup_max_tokens   = 50000       # retired (ignored)
 dedup_config_only_enforce = true
 dedup_config_only_from_block = 8992800
 dedup_phase_seconds = 900
-dedup_probe_mode   = "shadow"
-dedup_probe_series = 0
-dedup_probe_budget_seconds = 600
 
 # Retired (ignored): the boundary-round trainer's genesis baseline king.
 genesis_generator_ref = "cascade/genesis-baseline@sha256:56c68bdac31718db7c59708c9678b19347fe7ef2f8a696bdd5f3ad4548e17a65"
@@ -713,6 +721,9 @@ mv_score_from_block  = 9068400
 # settlement in a retry loop. CONSENSUS (changes verdicts) — arm lockstep at an
 # announced block. 0 = off (inert).
 entry_fault_from_block = 0
+# Post-gate kings keep their recorded crowning block (no legacy re-anchor
+# at a new king's first settlement). Release-then-activate. 0 = off.
+crowning_anchor_from_block = 0
 win_margin_end       = 0.005     # decayed floor (> 0!) — reached at margin_warmup_rounds
 margin_warmup_rounds = 8         # rounds of tenure to reach the floor (~4d at 12h rounds)
 # Dethrone bar v2 (DEC-CA-0049, owner 2026-10-01) — CONSENSUS. Since the
@@ -899,13 +910,15 @@ contract_from_block    = 9046800
 # ARMED 2026-08-27 (owner): live for rounds from r47's epoch, same boundary as
 # the recipe cut — one validator update before block 8942400 covers both.
 declared_contract_from_block = 8942400
-# Init-baseline duel gate (DEC-CA-0034) in SHADOW (armed 2026-08-27, owner):
-# the validator scores the warm-start init on the verdict windows and records
-# init_baseline_geomean / init_floor_passed in the receipt (drop-when-None —
-# archived signatures survive) but the verdict is UNCHANGED. Log-only, so
-# validators may enable it at their own pace; enforce is a later, separate
-# coordinated decision once the shadow verdicts calibrate init_gate_tolerance.
-init_gate_mode = "shadow"
+# Init-baseline duel gate (DEC-CA-0034) RETIRED (rev6.18 B12, owner
+# 2026-11-23). It ran in SHADOW from 2026-08-27 (init_baseline_geomean /
+# init_floor_passed on the receipt, verdict unchanged). A round whose epoch
+# boundary is before this block still runs that legacy shadow floor (and
+# archived receipts replay so); from it the floor is off. PLACEHOLDER: far
+# future until the owner types the real era boundary at the F6 release cut
+# (same value in the deployed file). 0 would mean "off at every block" and
+# break the koth-params replay of archived shadow-era receipts.
+init_gate_retired_from_block = 4294967295
 
 [dependencies]
 # Allowlist for a generator's requirements.txt. Generators are purely
@@ -949,6 +962,12 @@ blocked = [
     "cascade.validator",
     "cascade.shared.chain",
 ]
+# Python packed into string constants is refused at ADMISSION from 9169200
+# (live on mainnet; the per-leg sandbox preflight keeps "scan"). Typed from the
+# deployed file (S0a B9, owner 2026-11-23): main's default "scan" would relax
+# the static guard on the next deploy.
+packed_sources            = "reject"
+packed_sources_from_block = 9169200
 
 [storage]
 # Hippius storage layer: Hub OCI registry for models/checkpoints/generators
@@ -971,7 +990,7 @@ pool_s3_region   = ""
 # HuggingFace-Hub dataset used as a manifest/receipt fallback ONLY during a
 # Hippius S3 outage (cascade.shared.hippius.HFFallbackStore). Make it a public
 # dataset; auth via HF_TOKEN. Empty = no fallback.
-hf_backup_repo   = ""                               # e.g. "yourorg/cascade-manifests-mirror"
+hf_backup_repo   = "tensorlink-dev/cascade-backup"   # live since 2026-09-14 (S0a, typed from the deployed file)
 # S3-compatible BACKUP of the manifest/receipt bucket: dual-writes every object
 # and serves reads when Hippius S3 is down. Credentials via
 # BACKUP_S3_ACCESS_KEY / BACKUP_S3_SECRET_KEY.
@@ -1308,6 +1327,16 @@ margin_warmup_blocks = 18000
 # increment units, so 0.2 ≈ an LCB of 0.2 % relative improvement over the
 # init (the statistic is capped at 2). 0.0 = follow the dethrone bar.
 king_check_margin = 0.2
+# LANE_D_PLAN §16 cross-lane rotating held-out sentinel (D33/D34). OFF:
+# sentinel_from_block = 0. Arming is ONE signed overlay at an era boundary
+# (D45, no shadow), never an edit here. When armed, one suite of
+# sentinel_suites per era (drawn from the era-boundary block hash) is held out
+# of the lane-A bench gate and king check; with sentinel_ratchet the candidate
+# must not regress on it by more than sentinel_tau (ratio LCB <= 1 + tau).
+sentinel_from_block = 0
+sentinel_suites = ["gift", "boom", "time", "fev"]
+sentinel_ratchet = true
+sentinel_tau = 0.01
 
 [v2.training]
 # The supplied pyramid ladder replaces the earlier v2 candidate.
@@ -1378,33 +1407,21 @@ power_ema_scope = "leg"
 # Domain-expert lane (DEC-CA-0050), launched separately from lane A.
 # 0 = off: no B pool is reserved. To launch B, announce an era start at/after
 # [v2] from_block. A/B split 75/25 while C is off, A/B/C 50/25/25 while C is on.
-# CONSENSUS: from_block, share, decay,
-# TTL, remainder, domains, verdict params. Owner-tunable values marked.
+# CONSENSUS: from_block, share, remainder, domains, verdict params.
+# Owner-tunable values marked.
 from_block = 0
 share     = 0.25                   # owner-tunable: B keeps 25% when C launches
-remainder = "burn"                 # unpaid decay + empty domain slots burn
+remainder = "burn"                 # empty slots (and deregistered holders') burn
 # The tsbench-forge domain labels (TSBench-Forge src/sources/sources.yaml,
 # copied verbatim onto every pool window) — one emission slot each.
 domains = ["econ_fin", "energy", "healthcare", "nature", "sales", "transport", "web_cloudops"]
-# Payout schedule, counted in ERAS (era_settlements settlements): 100 % for
-# a GAIN-TIERED full period, then halving every half_life_rounds eras to
-# `floor`; payout STOPS at win_ttl_eras (merged weights stay in the king
-# forever). Gain-tiered full-pay period (owner 2026-10-20, CONSENSUS,
-# overlay-settable): full_pay_tiers = [[lcb_threshold, full_eras], ...],
-# thresholds strictly descending in (0, 1), full_eras non-increasing and
-# <= win_ttl_eras; a win pays in full for the full_eras of the HIGHEST
-# threshold its target gain LCB meets (a multi-target leg: per target, each
-# by its own LCB), fixed at the win and recorded on it (never re-evaluated).
-# Below the lowest threshold (cannot happen while it is <= gain_margin) pays
-# the lowest tier, flagged below_floor. UNCALIBRATED PLACEHOLDERS: lane-B
-# domain LCBs are noisy (few windows / sources per domain) — set the
-# thresholds from real win LCBs before arming.
-full_pay_tiers   = [[0.05, 10], [0.02, 5], [0.01, 2]]   # owner-tunable
-half_life_rounds = 1.0             # owner-tunable
-floor            = 0.1             # owner-tunable
-win_ttl_eras     = 28              # owner-tunable: 14 days of 12 h eras
-# replay_settlements: unset ⇒ (win_ttl_eras + 1) × era_settlements, so a
-# rebuilt validator's lane-B state holds every still-paying win.
+# Pay (LANE_D_PLAN rev6.22, owner 2026-11-24): a held slot pays its FULL slot
+# share (share / slots) every settlement — no decay, no TTL — until a newer
+# leg's merge passes acceptance on that slot, judged on top of the base that
+# already carries the holder (ties / inconclusive keep the holder). One leg
+# may target several slots (max_domains_per_leg) and hold each it wins. The
+# gain-tiered decay / TTL keys (full_pay_tiers, half_life_rounds, floor,
+# win_ttl_eras) are RETIRED (loader RETIRED_KEYS): an older file still loads.
 # Verdict (gain = superiority, guards = non-inferiority, all at alpha)
 alpha              = 0.05
 bootstrap_B        = 10000
@@ -1441,6 +1458,42 @@ acceptance_from_block = "v2"
 # miner's key via /v1/lane-b/fund (no operator fallback); "operator" = the
 # retired operator lane pool (dev / emergency only).
 leg_funding = "miner"
+# Lane B track (LANE_D_PLAN §12b, DEC-CA-0071; WB10). SHIPPED UNARMED: every key
+# at its default, so no digest moves. Arming is one signed overlay after the
+# capability release (D45), never an edit here. contamination_hashset is
+# RELEASE-ONLY (a data pin; overlays refuse it); every other key is overlay-settable.
+suite_targets            = false   # §12b.1: suite targets off
+contamination_hashset    = ""      # sha256:<64 hex> pin; none until WB11 (release-only)
+contamination_min_hits   = { exact = 1, normalised = 3 }   # sub-window hits that refuse a corpus
+suite_target_max_repo_mb = 8       # D38 (a): <= [generator] max_repo_mb
+min_experts_frac         = 0.03125     # D39: 8 / 256 experts per layer
+max_experts_frac         = 0.1484375   # D39: 38 / 256
+router_rows              = "frozen"    # D40 (a)
+traffic_steal_bound      = 0.02        # §12b.2
+open_rule                = "cogate"    # §12b.4: "tokens_king_check" (D41) by overlay after the release
+sentinel_target_rule     = "defer"     # D35 (a)
+sentinel_max_defer_eras  = 4           # §12b.5
+# D42 leg cost: lane B's own GPU list (editing it never opens a GPU to lane A),
+# the miner train_hours cap (0.5 h grid) and the leg guard train_hours x
+# guard_factor + overhead, capped at max_leg_seconds ([training]
+# max_train_seconds is never edited for it).
+# WB22 list (owner 2026-11-23): lane A's data-centre multi-GPU ladder ([round]
+# funded_pod_skus) plus 8xRTX4090, for lane B only. No single-GPU layout
+# (1xRTX4090 "too slow": WB19 measured 0.055 steps/s on one GPU; WB25 trains
+# an expert leg on every GPU of the layout). A type rents only once WB19 has
+# measured its step rate on the pinned image (evidence/wb19.json); until
+# then a lane B fund choosing it is refused gpu_rate_unmeasured.
+funded_pod_skus          = ["8xH200", "8xH100", "4xH200", "4xH100", "8xRTX4090"]
+# owner 2026-11-24 (rev6.21): up to 12 h legs (no activation block: lane B
+# is not rolled out). An unmeasured / unlisted type may be chosen at the
+# miner's own risk with a token or hour limit (WB27).
+max_leg_hours            = 12.0
+max_leg_seconds          = 54000       # 12 h x 1.25
+guard_factor             = 1.25
+# WB26 (DEC-CA-0071 §3 guards 4-5): a cleared suite slot must also be no
+# worse than the anchor king (the era's promotion member) at these tolerances.
+tau_anchor_public        = 0.0
+tau_anchor_domain        = 0.0
 
 
 [lane_c]
@@ -1455,28 +1508,32 @@ leg_funding = "miner"
 # one is MarketCast (DEC-CA-0064, mkt:<suite>); the generic domain: / freq: /
 # horizon: targets on the public-feed pool_c are refused at load (their
 # windows could be scraped and memorised). Lane C has no pool of its own.
-from_block = 0
+from_block = 9586800          # owner 2026-11-24: launch moved to era boundary ~ Wed 25 Nov 22:28 UTC (Thu 09:28 AEDT); was 9579600
 share      = 0.25                  # owner-tunable: taken from lane A ⇒ A 50 / B 25 / C 25
 takes_from = "lane_a"
 remainder  = "burn"                # unpaid decay + empty target slots burn
-# One emission slot each: "mkt:<suite>" for a [marketcast] suites member
-# (the list must match it). Listed but inactive while [marketcast]
+# Owner 2026-11-10: ONE composite slot, "mkt:market" — judged over every
+# [marketcast] suite at once ([marketcast] composite = true; per-suite slots
+# "mkt:<suite>" are the composite = false shape). Listed but inactive while [marketcast]
 # from_block = 0: zero active slots, lane C's whole share burns.
-targets = ["mkt:returns", "mkt:vol"]
-# Payout schedule in ERAS (lane B's rule): 100 % for a GAIN-TIERED full
-# period after the judging settlement, then halving every half_life_rounds
-# eras to floor; payout STOPS at win_ttl_eras. full_pay_tiers (owner
-# 2026-10-20, CONSENSUS, overlay-settable; same shape and checks as [lane_b]):
-# the confirmed win's gain LCB picks the full_eras of the highest threshold it
-# meets, fixed at the win. mkt: targets use [marketcast] full_pay_tiers.
-# UNCALIBRATED PLACEHOLDERS — set from real lane-C win LCBs before arming.
+targets = ["mkt:market"]
+# Payout (owner 2026-11-24, DEC-CA-0073; CONSENSUS, overlay-settable): a
+# confirmed win pays 100 % of its slot for
+#   days = full_pay_min_days + (full_pay_max_days - full_pay_min_days)
+#          * clamp((gain_lcb - gain_margin) / (full_pay_max_gain - gain_margin), 0, 1)
+# (gain_margin = [marketcast] gain_margin for an mkt: target), rounded UP to
+# whole eras on the grid in force at the win (12 h eras: 10 ... 40 eras),
+# fixed at the win; then the slot ENDS and burns unless a newer win replaced
+# it — no decay, no TTL. Loader-checked: 0 < full_pay_min_days <=
+# full_pay_max_days, gain_margin < full_pay_max_gain < 1. The gain-tiered
+# full_pay_tiers / half_life_rounds / floor / win_ttl_eras are RETIRED
+# (ignored at load, refused in overlays).
 # A confirmed win takes the slot only with a STRICTLY higher gain LCB than a
 # holder on the same king (else the slot and its clock stay); a holder
 # trained on an older king is replaced.
-full_pay_tiers   = [[0.05, 10], [0.02, 5], [0.01, 2]]   # owner-tunable
-half_life_rounds = 1.0             # owner-tunable
-floor            = 0.1             # owner-tunable
-win_ttl_eras     = 28              # owner-tunable: 14 days of 12 h eras
+full_pay_min_days = 5.0            # owner 2026-11-24: at the 1 % gain margin
+full_pay_max_days = 20.0           # owner 2026-11-24: at >= full_pay_max_gain
+full_pay_max_gain = 0.05
 # Verdict: an mkt: entry is judged by MarketCast ([marketcast] alpha /
 # gain_margin / min_windows ...), paired vs the pinned base on forward-only
 # windows. The keys below are lane C's own verdict defaults, kept for the
@@ -1579,31 +1636,73 @@ stale_after_blocks = 3600          # one era
 poll_seconds       = 60            # how often the main validator's receipts are re-read
 max_walk           = 64            # receipts walked back per poll to reach the last replayed one
 
-# ── Lane D: distillation / real data (DEC-CA-0062) — WIRED, NOT IMPLEMENTED ──
-# Placeholder table so config, overlays and dashboards have a home for it.
-# from_block > 0 is REFUSED at load until the DEC is filled in and the trainer
-# + validator halves ship. Owner fills in targets, teacher and real corpus.
+[lane_d_ops]
+# Lane D operator settings (LANE_D_PLAN §14.2, W2b) — NON-CONSENSUS. Read only
+# by the main validator and the lane D intake (cascade/shared/config/lane_d_ops.py);
+# satellites never read it; never in a receipt, digest or overlay (operator-only).
+# Names and locations only: credentials are env-only (secret-shaped keys refused).
+vault_bucket       = "cascade-lane-d-vault"   # dedicated private vault bucket (§1.2)
+vault_prefix       = "lane-d"                 # objects at lane-d/<hotkey>/<digest>/ (§11.1)
+pool_d_bucket      = "cascade-lane-d-pool"    # private pool_d snapshots (§1.7)
+pool_d_prefix      = "pool_d"
+eval_host          = ""                       # set on the deployment at the S4 bring-up (D11)
+queue_max_inflight = 1                        # forecast jobs in flight on the eval host
+queue_max_pending  = 64                       # intake backpressure (advisory; caps live in [lane_d])
+queue_poll_seconds = 60                       # ready-queue poll interval
+
+# ── Lane D: open weights (LANE_D_PLAN §1, §14.2; DEC-CA-0062) — SHIPPED OFF ──
+# from_block = 0: never active, no digest/receipt/weight moves (invariant 1).
+# Activation is a SIGNED OVERLAY setting from_block (an era boundary; D10/D45),
+# never an edit here and never a DEC-CA-0045 vote. Kill switch: an overlay
+# until_block or share = 0. Every key but remainder is overlay-settable.
 [lane_d]
-from_block      = 0              # refused > 0 until implemented
-share           = 0.0            # of the total, carved from takes_from
+from_block      = 0              # 0 = off; arm by signed overlay at an era boundary
+until_block     = 0              # 0 = no end; an era boundary after from_block closes the lane
+share           = 0.0            # of the total, carved from takes_from (D1: 0.25 from lane_a by overlay)
 takes_from      = "lane_b"       # lane_a | lane_b | lane_c
-targets         = []             # TBD
-teacher_ref     = ""             # TBD: the teacher to distil from
-teacher_api     = "ephemeris"    # owner: Ephemeris TS foundation-model API (validators never call it)
-teacher_mode    = "route"        # route | ensemble | explicit (explicit needs teacher_models)
-real_corpus_ref = ""             # TBD: owner-pinned real corpus (DEC-CA-0028 pattern)
-data_sources    = ["real", "prior_corpus"]  # miners SELECT data (no generator): real and/or prior training corpora
-augmentations   = []             # TBD: the allowed augmentation list
-expert_choice   = "miner"        # miner | affinity | all
-max_context_length = 32768       # longer-context legs, up to 32k
-pool_prefix     = "pool_d"
-gain_margin     = 0.01
+remainder       = "burn"         # release-only burn destination (D21)
+contexts        = [4096, 8192, 16384, 32768, 65536, 131072]  # D2 rev6.6: declarable from launch (cap 131072); each arms per settlement on its gates
+horizon         = 64             # points; <= 512 (§1.1)
+dtypes          = ["BF16"]       # D14: BF16 only
+forward_margin_hours = 0.0       # D5; rev6.14 (a): the eligibility / fresh boundary b = T + this (6 -> 0)
+eval_delay_hours = 6.0           # rev6.14 (a): judging start j = T + this ("delay eval by 6 hours"); >= forward_margin_hours
+min_windows     = 1000           # D5
+min_clusters    = 20             # D5: sources
+min_long_series = 300
+max_source_share = 0.25          # B14
+d_margin        = 0.01           # D5; rev6.23: the crown bar's END (floor)
+d_margin_start  = 0.03           # rev6.23 (owner 2026-11-24): the bar at KING_D's tenure 0; >= d_margin
+d_margin_warmup_settlements = 32 # rev6.23: settlements (32 x 3 h ~ 4 days) the bar falls linearly start -> d_margin
+alpha           = 0.05
+bootstrap_B     = 10000
+embargo_hours   = 48.0           # W2e rev6.10 (a)/rev6.12 (a): per-series embargo top-up, every cadence (0 = the rev3 rule)
+max_windows_per_settlement = 5000  # W2e rev6.11 (a): per-bin draw cap; >= min_windows
+min_fresh_window_share = 0.2     # W2e rev6.12 (b): fresh share of a frozen set (1 = fresh only); owner 2026-11-23: 0.2 (first verdict ~6 h)
+public_weight   = 0.5            # W2e rev6.18 A3: combined = (1 - w) live + w public (0 = public half off)
+window_ratio_floor = 0.5         # W2e rev6.18 A3: per-window ratio clamped to [floor, 1/floor]
+gate_suites     = ["gift", "boom", "time", "fev"]  # §16 names
+gate_weights    = { gift = 1.0, boom = 1.0, time = 1.0, fev = 1.0 }  # D2b: equal (absent = equal over gate_suites)
+tau_public      = 0.01
+reward_prior_kings = 2           # D7
+court_weights   = [0.80, 0.15, 0.05]  # D7 rev6.23 (owner 2026-11-24): KING_D, prior 1, prior 2; length 1 + reward_prior_kings, sum 1 (replaces the retired king_decay)
+max_entries_per_settlement = 8   # D3
+max_open_per_coldkey = 2         # D3
+max_judged_per_coldkey_per_settlement = 2  # A8
+max_coldkey_unresolved_settlements = 4     # A8
+max_reveal_delay_days = 14       # A9
+max_bench_holds = 4
+loser_ttl_eras  = 4              # D8
+max_mirror_lag_hours = 6.0       # A1
+ready_ttl_blocks = 7200          # B10: ~24 h at 12 s blocks
+# Retired (rev6.18 B11): confirm_on_king_change and the DEC-CA-0062 keys
+# (targets ... win_ttl_eras). The loader ignores them (RETIRED_KEYS["lane_d"]),
+# so a deployed file that still carries them loads unchanged.
 
 # ── MarketCast: lane-C fine-tune eval on Timestral-28M (DEC-CA-0064) — BUILT, SHIPPED OFF ──
 # Fine-tunes of a PINNED third-party base (mistralai/Timestral-28M, Modified
 # MIT licence with a USD 20M/month revenue restriction that extends to
 # derivatives — owner/legal open item) are judged paired vs the untouched base
-# on forward-only market windows, one lane-C slot per suite (target
+# on market windows drawn from the embargo no leg reads (DEC-CA-0074), one lane-C slot per suite (target
 # "mkt:<suite>", listed in [lane_c] targets). Arming (from_block > 0) is
 # load-checked: an era boundary >= [v2] from_block and >= [lane_c] from_block,
 # [v2] bench_source = "validator" in force (the main validator's GPU scores
@@ -1611,35 +1710,47 @@ gain_margin     = 0.01
 # source for every class that lists assets. Base, activation and data contract
 # are release-only; listed numeric verdict/payout/liveness controls allow overlays.
 [marketcast]
-from_block         = 0                          # off; an era-boundary block arms it
+from_block         = 9586800                    # owner 2026-11-24: launch moved to era boundary ~ Wed 25 Nov 22:28 UTC (Thu 09:28 AEDT); was 9579600
 base_ref           = "mistralai/Timestral-28M@180698bbf5a50dda3516aa6419798437fb03a430"
 base_sha256        = "dfc83c6220937ce5fc6687b35a4df94cd25e28a2cfe6fb92a23dad6301b2015d"  # model.safetensors (HF LFS oid)
 base_arch          = "timestral"
-suites             = ["returns", "vol"]         # launch set; also range | funding | liquidity | alpha
+suites             = ["ohlcv", "returns", "vol", "high", "low", "range", "liquidity"]  # owner 2026-11-10 launch set; funding | alpha off
 coverage_levels    = [0.5, 0.8, 0.98]           # calibration gate on mkt:returns AND mkt:vol
 coverage_tolerance = 0.05                       # owner-tunable: fail if empirical < nominal - tolerance
 alpha              = 0.05
 gain_margin        = 0.01                       # never 0
-# Gain-tiered full-pay period of an mkt: win (owner 2026-10-20), on lane C's
-# slot TTL and decay: [[lcb_threshold, full_eras], ...] like [lane_c]'s, but
-# its OWN table — the MarketCast LCB is a horizon-equal clustered geomean gain
-# on one suite's loss vs the pinned base, not lane C's sqrt(WQL*MASE) gain vs
-# the king, so one threshold is not the same evidence in both. Overlay-settable;
-# full_eras <= [lane_c] win_ttl_eras
-# (load-checked). UNCALIBRATED PLACEHOLDERS.
-full_pay_tiers     = [[0.05, 10], [0.02, 5], [0.01, 2]]
+# An mkt: win's full-pay duration is [lane_c]'s gain-scaled rule, ramped
+# from gain_margin (DEC-CA-0073; full_pay_tiers is retired).
 min_windows        = 200                        # spread over >= min_time_blocks (review M10)
 min_clusters       = 8                          # distinct (asset class, time block) clusters
 pool_prefix        = "pool_mkt"
 max_context_length = 32768
 embargo_days       = 30                         # recipe training data ends this long before submission
-max_synthetic_fraction = 0.5                    # miner generator share of the training mix
-eval_context_length = 4096                      # context steps the base and the fine-tune both see
-windows_per_cell   = 48                         # per (asset, horizon), spread evenly: 2 per 6 h block over 6 days
-start_margin_seconds = 3600                     # windows start >= 1 h after the train block
-verdict_wait_blocks = 43200                     # an entry waits up to 6 days for its windows to close
-snapshot_days      = 21                         # realized 1m bars per eval snapshot
-coarse_history_days = 180                       # hourly bars for >= 1h series (HL serves ~208 d of 1h)
+max_synthetic_fraction = 1.0                    # miner generator share of the training mix (1.0 = pure synthetic allowed)
+max_leg_hours      = 12.0                       # cap on a recipe's own leg_hours (miner-paid wall); no leg_hours = [lane_c] leg_hours
+# Owner 2026-11-24: a MarketCast leg fine-tunes Timestral-28M in ONE worker
+# process on one GPU, so a miner may rent ANY Lium GPU type. This is the
+# RECOMMENDED list (no warning; a fund with no --gpu rents the cheapest
+# fitting one). Any other well-formed Lium type is accepted at the miner's OWN
+# RISK (warned, still capped by max_leg_hours / the recipe's leg_hours, own
+# Lium key, no refund). Lium only, never Shadeform. Separate from [round]
+# funded_pod_skus (lane A, unchanged). Trainer + intake policy: no validator
+# reads it. Absent / [] = [round] funded_pod_skus.
+funded_pod_skus    = ["1xRTX4090", "1xA100", "1xH100", "8xH100"]
+eval_context_length = 32768                     # owner 2026-11-21: UP TO 32k context steps the base and the fine-tune both see (shorter while the bank's history is shorter)
+# Owner 2026-11-24 (DEC-CA-0074): a verdict within 13 h of submission. Every
+# horizon is judged on windows DRAWN from the embargo (the embargo_eval_days
+# before the leg's dispatch: bars no training leg reads), ranked by the round
+# block's hash; the 1m / 5m paths also take their forward windows already
+# closed in the snapshot. Nothing waits for windows to close.
+embargo_eval_days  = 28                         # overlay-settable, 1 .. embargo_days - 1
+backtest_windows_per_cell = 48                  # overlay-settable, 1 .. 256: drawn per (asset, series, horizon)
+forward_horizons   = ["1mx60", "5mx36"]         # also scored on closed forward windows (never waited for)
+windows_per_cell   = 48                         # forward windows per (asset, horizon), spread evenly
+start_margin_seconds = 3600                     # forward windows start >= 1 h after dispatch
+verdict_wait_blocks = 3900                      # overlay-settable, <= 3900: an inconclusive entry waits <= 13 h
+snapshot_days      = 30                         # 1m bank: 32768-step 1m context (22.8 d) + the 28-day embargo draw (recorder fills it forward)
+coarse_history_days = 1372                      # hourly bank: 32768 h (1365 d) + the wait; HL serves ~208 d of 1h, the recorder the rest as it accrues
 report_timeout_settlements = 8                  # trainer records a missing report "absent" after this
 max_infra_deferrals = 8                         # main-validator compute failures before an uncharged drop
 cluster_block_hours = 6                         # bootstrap clusters = asset class x 6 h block
@@ -1654,11 +1765,77 @@ coverage_gate_levels = [0.5, 0.8]               # per horizon, class-weighted li
 # quantiles against an oracle base). No filter reads the realised target.
 zero_scale_frac    = 0.001                      # cell masked (recorded) if base mean CRPS <= this x its horizon's median cell
 cell_ratio_cap     = 4.0                        # each cell's ft/base ratio clipped to [1/4, 4]
+crps_scale         = "seasonal_naive"           # per-window CRPS ÷ context seasonal-naive MAE (GIFT-Eval MASE denominator); "level" = old
+bar_relay          = "cascade-eval-pool/marketcast/bars/"   # owner 2026-11-21: the eval pool bucket (pool endpoint + POOL_S3_* creds; publish-mkt-pool.yml mirrors the recorder there); "" = pod fetches the API
+# Owner 2026-11-20: MarketCast legs boot their OWN worker image (trainer-only):
+# lane A / king legs keep [round] funded_pod_image. Both or neither; "" = the
+# fleet's. Re-derive the fingerprint with scripts/worker_code_fingerprint.py on
+# every re-pin, and point the main validator's [provisioner.mkt] image at it.
+pod_image          = "ghcr.io/tensorlink-ai/cascade-worker:worker-v2.1.0-mkt-rc2@sha256:0205f761fde14da71b9a90b4f1ecdc862d657f982accb11450e0ce22c61d2f12"   # built from 6c9cab9 (publish-worker run 44848132705), 2026-11-21
+worker_code_fingerprint = "37484df946cf1de8243e4570fad9ba325f766416f9d5d55dbbbd043ae9ab98ee"   # 303 files; registry walk = local 6c9cab9 source
 tail_levels        = [0.05, 0.95]               # tail gate: hit rate beyond q_l within tail_tolerance of 5 %
 tail_tolerance     = 0.025                      # per horizon AND pooled over horizons
 calibration_z      = 3.0                        # every calibration tolerance >= 3 standard errors (thin classes)
 near_dup_tol       = 0.02                       # mean |dq| / base 5-95 % width vs a senior entry below this => duplicate
 max_open_legs_per_coldkey = 1                   # trainer policy: open MarketCast legs per coldkey
+# Owner 2026-11-10 (DEC-CA-0064 addendum): one composite target over every
+# suite, native candle banks (no recording lead time), Garman–Klass vol.
+composite          = true                       # mkt:market = geomean of the suites' gains
+composite_suite_floor = 0.0                     # a suite CONFIDENTLY worse than the base (UCB < -this) fails the entry
+ohlcv_open_weight  = 0.0                        # HL perps: open = previous close
+# Owner 2026-11-18: the composite's balance. CRPS is the one score; each of four
+# forecast properties counts once — location (returns + ohlcv.c) 0.30, dispersion
+# (vol + range) 0.30, extremes (high + low + ohlcv.h/l) 0.25, activity
+# (liquidity + ohlcv.v) 0.15 (ohlcv's 0.20 = its 4 scored fields at 0.05).
+composite_suite_weights = { returns = 0.25, vol = 0.18, range = 0.12, high = 0.075, low = 0.075, liquidity = 0.10, ohlcv = 0.20 }
+guards             = ["mase", "qlike", "tail"]  # no-regression vs base: median (MASE), vol variance (QLIKE), 1/5/95/99 % quantile score
+guard_floor        = 0.0                        # a guard CONFIDENTLY worse than the base (UCB < -this) fails the entry
+# Owner 2026-11-18: every suite on every timeframe, each a multi-step PATH
+# (<bar>x<steps>): 1m x 60 (1 h), 5m x 36 (3 h), 15m x 96 (1 d), 1h x 48 (2 d),
+# 4h x 42 and 1d x 7 (7 d). Owner 2026-11-24 (DEC-CA-0074): every path is
+# drawn from the embargo (embargo_eval_days above); gap_horizons is gone.
+baseline_gate      = true                       # must beat random walk + EWMA/FHS and seasonal AR(1): composite LCB >= 0, no suite confidently worse
+# Owner 2026-11-19: the official calendars (federalreserve.gov FOMC calendar — statement 14:00 ET
+# on the meeting's last day, 2027 tentative; bls.gov CPI + Employment Situation, 08:30 ET),
+# converted to UTC with the US DST rule. Extend before 2028.
+event_times        = [
+    "2026-01-09T13:30:00Z", "2026-01-13T13:30:00Z", "2026-01-28T19:00:00Z", "2026-02-11T13:30:00Z",
+    "2026-02-13T13:30:00Z", "2026-03-06T13:30:00Z", "2026-03-11T12:30:00Z", "2026-03-18T18:00:00Z",
+    "2026-04-03T12:30:00Z", "2026-04-10T12:30:00Z", "2026-04-29T18:00:00Z", "2026-05-08T12:30:00Z",
+    "2026-05-12T12:30:00Z", "2026-06-05T12:30:00Z", "2026-06-10T12:30:00Z", "2026-06-17T18:00:00Z",
+    "2026-07-02T12:30:00Z", "2026-07-14T12:30:00Z", "2026-07-29T18:00:00Z", "2026-08-07T12:30:00Z",
+    "2026-08-12T12:30:00Z", "2026-09-04T12:30:00Z", "2026-09-11T12:30:00Z", "2026-09-16T18:00:00Z",
+    "2026-10-02T12:30:00Z", "2026-10-14T12:30:00Z", "2026-10-28T18:00:00Z", "2026-11-06T13:30:00Z",
+    "2026-11-10T13:30:00Z", "2026-12-04T13:30:00Z", "2026-12-09T19:00:00Z", "2026-12-10T13:30:00Z",
+    "2027-01-08T13:30:00Z", "2027-01-13T13:30:00Z", "2027-01-27T19:00:00Z", "2027-02-05T13:30:00Z",
+    "2027-02-11T13:30:00Z", "2027-03-05T13:30:00Z", "2027-03-10T13:30:00Z", "2027-03-17T18:00:00Z",
+    "2027-04-02T12:30:00Z", "2027-04-13T12:30:00Z", "2027-04-28T18:00:00Z", "2027-05-07T12:30:00Z",
+    "2027-05-12T12:30:00Z", "2027-06-04T12:30:00Z", "2027-06-09T18:00:00Z", "2027-06-10T12:30:00Z",
+    "2027-07-02T12:30:00Z", "2027-07-14T12:30:00Z", "2027-07-28T18:00:00Z", "2027-08-06T12:30:00Z",
+    "2027-08-11T12:30:00Z", "2027-09-03T12:30:00Z", "2027-09-14T12:30:00Z", "2027-09-15T18:00:00Z",
+    "2027-10-08T12:30:00Z", "2027-10-14T12:30:00Z", "2027-10-27T18:00:00Z", "2027-11-05T12:30:00Z",
+    "2027-11-10T13:30:00Z", "2027-11-17T19:00:00Z", "2027-12-03T13:30:00Z", "2027-12-10T13:30:00Z",
+]
+native_intervals   = ["5m", "15m"]              # native candle banks (+ 1m bars + 1h coarse)
+native_history_days = { "5m" = 121, "15m" = 348 } # 32768 steps + the wait; HL keeps ~17 d of 5m, ~52 d of 15m (recorder fills)
+
+[marketcast.frequencies]                        # the bars each suite is forecast on
+ohlcv     = ["1m", "5m", "15m", "1h", "4h", "1d"]
+returns   = ["1m", "5m", "15m", "1h", "4h", "1d"]
+vol       = ["1m", "5m", "15m", "1h", "4h", "1d"]
+high      = ["1m", "5m", "15m", "1h", "4h", "1d"]
+low       = ["1m", "5m", "15m", "1h", "4h", "1d"]
+range     = ["1m", "5m", "15m", "1h", "4h", "1d"]
+liquidity = ["1m", "5m", "15m", "1h", "4h", "1d"]
+
+[marketcast.horizons]                           # <bar>x<steps>: the path each timeframe forecasts
+ohlcv     = ["1mx60", "5mx36", "15mx96", "1hx48", "4hx42", "1dx7"]
+returns   = ["1mx60", "5mx36", "15mx96", "1hx48", "4hx42", "1dx7"]
+vol       = ["1mx60", "5mx36", "15mx96", "1hx48", "4hx42", "1dx7"]
+high      = ["1mx60", "5mx36", "15mx96", "1hx48", "4hx42", "1dx7"]
+low       = ["1mx60", "5mx36", "15mx96", "1hx48", "4hx42", "1dx7"]
+range     = ["1mx60", "5mx36", "15mx96", "1hx48", "4hx42", "1dx7"]
+liquidity = ["1mx60", "5mx36", "15mx96", "1hx48", "4hx42", "1dx7"]
 
 [marketcast.assets]                             # the Hyperliquid-listed universe (2026-10-19)
 crypto      = ["BTC", "ETH", "SOL", "XRP", "HYPE", "BNB", "DOGE", "ADA", "AVAX", "LINK",

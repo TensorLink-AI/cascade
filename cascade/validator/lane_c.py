@@ -82,10 +82,9 @@ class LaneCJudgement:
     # DEC-CA-0064 MarketCast entries only: the receipt row's "mkt" record
     # (report binding, after, origin_block, within_wait, coverage, …)
     mkt: dict = field(default_factory=dict)
-    # a PASSING judgement's gain-tiered full-pay period (owner 2026-10-20):
-    # :meth:`cascade.eval.expert_lane.FullPay.record` of ``gain_lcb`` under
-    # the target's tiers (:func:`cascade.shared.lane_c.target_full_pay`),
-    # computed at judge time; a confirmed win records it
+    # a PASSING judgement's gain-scaled full-pay duration (owner 2026-11-24,
+    # DEC-CA-0073): :func:`cascade.shared.lane_c.target_full_pay_record` of
+    # ``gain_lcb``, computed at judge time; a confirmed win records it
     full_pay: dict | None = None
 
 
@@ -111,24 +110,30 @@ def _holder_dict(w: TargetWin | None) -> dict | None:
     if w is None:
         return None
     return {"hotkey": w.hotkey, "gain_lcb": float(w.gain_lcb), "base_pointer": w.base_pointer,
-            "win_block": int(w.win_block), "round_id": str(w.round_id)}
+            "win_block": int(w.win_block), "round_id": str(w.round_id),
+            "trained_pointer": w.trained_pointer}
 
 
 def _confirmed_win(j: LaneCJudgement, *, round_id: str, settle_block: int,
                    era_index: int) -> TargetWin:
-    """The win a passing confirm judgement records — its full-pay tier is the
-    one computed at judge time (``j.full_pay``), fixed here for good."""
+    """The win a passing confirm judgement records — its full-pay duration
+    is the one computed at judge time (``j.full_pay``), fixed here for good."""
     fp = j.full_pay
     if not fp:
         raise ValueError(f"lane-C confirm of {j.entry.miner_hotkey!r} on {j.entry.target!r} "
                          "carries no full-pay tier")
+    vs = dict((j.mkt or {}).get("vs_holder") or {})
     return TargetWin(target=j.entry.target, hotkey=j.entry.miner_hotkey,
                      uid=int(j.entry.miner_uid), round_id=str(round_id),
                      win_block=int(settle_block), win_era=int(era_index),
                      trained_pointer=j.entry.trained_pointer, recipe_ref=j.entry.recipe_ref,
                      base_pointer=j.base_pointer, gain_lcb=float(j.gain_lcb or 0.0),
                      tier=float(fp["tier"]), full_eras=int(fp["full_eras"]),
-                     below_floor=bool(fp.get("below_floor", False)))
+                     below_floor=bool(fp.get("below_floor", False)),
+                     holder_pointer=str(vs.get("pointer", "") or ""),
+                     beats_holder=bool(vs.get("beats", False)),
+                     # DEC-CA-0075: the curve in force at the win, fixed here
+                     curve=str(fp.get("curve", "") or ""))
 
 
 def resolve_outcomes(state: LaneCState, judgements: list[LaneCJudgement], *, round_id: str,
@@ -265,6 +270,10 @@ class _LaneCRound:
     apply: bool = True
     consume_pending: bool = True     # False: no king — the pending set carries over
     mkt: object = None               # DEC-CA-0064 MktPlan (None = no MarketCast change)
+    plans: dict = field(default_factory=dict)   # every other competition's plan, by kind
+    # slot-holder registrations consulted (every competition's plan), for the
+    # receipt's ``lane_c_registrations`` record (owner 2026-11-24)
+    registrations: list = field(default_factory=list)
 
 
 class LaneCMixin:
@@ -320,7 +329,11 @@ class LaneCMixin:
         pay = getattr(self, "_last_lane_c_pay", None)
         if rows is None and pay is not None:
             rows = []
-        return {"lane_c": rows, "lane_c_pay": pay}
+        kw = {"lane_c": rows, "lane_c_pay": pay}
+        reg = self.__dict__.get("_last_lane_c_registrations")
+        if reg is not None and rows is not None:
+            kw["lane_c_registrations"] = reg
+        return kw
 
     def _lane_c_settle_block(self, client: object) -> int | None:
         """The block a lane-C vector is paid at: this session's last judged
@@ -411,18 +424,27 @@ class LaneCMixin:
                     log.warning("lane C: manifest for %s fails signature; ignored", rid)
                     rows.append({"error": "bad_signature"})
                     cm = None
-        # DEC-CA-0064: MarketCast first — its own pipeline, judged against the
-        # pinned base from reports a trainer-signed manifest arbitrates; it
-        # never holds this settlement and never needs a king
-        mplan, mjs = self._mkt_settle(manifest, cm, rid=rid, block=block, era_index=era_index,
-                                      st=st, commitments_fn=self._lane_c_commitments)
-        # MarketCast-only lane C (owner 2026-10-20): MarketCast is the only
-        # competition. A non-mkt entry cannot reach here — LaneCEntry refuses
-        # any target outside a forward-only competition, so such a manifest
-        # is ``lane_c_manifest_malformed`` above (the generic pool_c verdict
-        # is retired).
-        return _LaneCRound(rid, block, rows + judgements_record(mjs), mjs, era_index,
-                           mkt=mplan)
+        # every registered competition judges its own targets, MarketCast
+        # first (cascade.validator.lane_c_competitions): MarketCast against
+        # the pinned base from reports a trainer-signed manifest arbitrates —
+        # it never holds this settlement and never needs a king. A target of
+        # no registered kind cannot reach here: LaneCEntry refuses any target
+        # outside a forward-only competition (``lane_c_manifest_malformed``).
+        from .lane_c_competitions import judging_order
+
+        js: list = []
+        plans: dict = {}
+        for comp in judging_order():
+            plan, cjs = comp.judge(self, manifest, cm, rid=rid, block=block,
+                                   era_index=era_index, st=st,
+                                   commitments_fn=self._lane_c_commitments)
+            plans[comp.kind] = plan
+            js += list(cjs)
+        regs = [r for plan in plans.values()
+                for r in (getattr(plan, "registrations", None) or ())]
+        mplan = plans.pop("mkt", None)
+        return _LaneCRound(rid, block, rows + judgements_record(js), js, era_index,
+                           mkt=mplan, plans=plans, registrations=regs)
 
     @staticmethod
     def _lane_c_fold(st: LaneCState, r: _LaneCRound) -> list[TargetWin]:
@@ -431,12 +453,25 @@ class LaneCMixin:
         if not r.apply:
             return wins
         if r.round_id not in st.applied:
-            from .marketcast import fold_mkt_plan
+            from .lane_c_competitions import judging_order, validator_competition
 
-            js = [j for j in r.judgements if not is_mkt_target(j.entry.target)]
+            def generic(j) -> bool:
+                c = validator_competition(j.entry.target)
+                return c is None or c.generic_fold
+
+            # the generic pending → confirm fold of every kind that uses it,
+            # then each competition's own fold (MarketCast's backlog)
+            js = [j for j in r.judgements if generic(j)]
             wins = apply_lane_c(st, js, round_id=r.round_id, settle_block=r.block,
                                 era_index=r.era_index, consume_pending=r.consume_pending)
-            wins += fold_mkt_plan(st, r.mkt)   # DEC-CA-0064 (labels computed at judge time)
+            for comp in judging_order():
+                if comp.generic_fold:
+                    continue
+                plan = r.mkt if comp.kind == "mkt" else r.plans.get(comp.kind)
+                wins += comp.fold(st, plan, [j for j in r.judgements
+                                             if validator_competition(j.entry.target) is comp],
+                                  round_id=r.round_id, settle_block=r.block,
+                                  era_index=r.era_index)
             st.last_rows = list(r.rows)
         st.mark_applied(r.round_id, r.block)
         return wins
@@ -501,8 +536,14 @@ class LaneCMixin:
     def _lane_c_commit(self, rounds: list[_LaneCRound] | None) -> list[dict] | None:
         """Fold prepared rounds (idempotent per round id), persist atomically,
         and return the CURRENT round's receipt rows."""
+        from ..shared.lane_c_registrations import registration_record
+
         if rounds is None:
+            self.__dict__["_last_lane_c_registrations"] = None
             return None
+        cur = rounds[-1]
+        self.__dict__["_last_lane_c_registrations"] = registration_record(
+            max(0, int(cur.block) - 1), cur.registrations)
         st = self._lane_c()
         for r in rounds:
             for w in self._lane_c_fold(st, r):

@@ -1,0 +1,1202 @@
+#!/usr/bin/env python3
+"""Lane D status board (plan §17).
+
+    status --root R --ref REF --ci-results FILE --out DIR
+           [--release-tag-glob GLOB] [--push REMOTE] [--include SRC:DEST ...]
+
+Computes every WP's level (L0-L7) and side state, the stage and milestone
+state, the decision register, the owner inputs and the §17.3 counters. Every
+input is read from REF's tree (`git show REF:path`), never the working tree:
+the plan, tests/accept/*, evidence/* and the release tags. GitHub Actions
+results come from --ci-results ({"runs": [...]}, see tests/accept/w0c/README).
+
+Writes DIR/docs/plans/STATUS.md and DIR/status/laned_build.json. With
+--push REMOTE it commits them (plus any --include files) to branch
+laned/build-state on REMOTE, fast-forward only; main is never touched.
+Without --release-tag-glob no tag counts as a capability release (no L6).
+
+Levels follow §17.1 (tests/accept/w0c/README) with one addition for a
+VERIFICATION WP (accept --help, MODE verification), i.e. one listed in
+scripts/laned/verification_wps at REF (any other WP's verification runs are
+ignored, RV5): when the ledger has a green `verification` run for the WP, the first first-parent commit at or
+after the one adding its PATHS that changes only tests/accept/ files (some
+under tests/accept/<wp>/) and whose test dir tree equals the run's `tests_tree` (or whose sha is the run's
+`head_sha`) is the merge of that PR and counts as both L1 and L2; the L2
+commit is the earlier of it and the implementation commit. L3 and above
+follow from it as usual (the push-to-main Accept run on or after it).
+
+L1 comes from a green `expect-fail` run of the WP. A run that records
+`tests_tree` (every tests-only PR run) counts only through the commit it
+attributes to: the first first-parent commit at or after the one adding the
+WP's PATHS that changes only tests/accept/ files, some under tests/accept/<wp>/,
+with that tree (`l1_commit`). A batch tests-only squash merge (several WPs'
+test dirs, plan rev6.2 (h)) is thereby L1 for each WP via each WP's own
+tests_tree, and never an L2 implementation commit for any of them (a
+tests-only commit is not one); a verification WP in a batch takes its L2 from
+the same commit. Runs without the field (dispatch bootstrap, older entries)
+count as before.
+
+L2 is the WP's implementation commit (lanedlib.impl_commit_index). A batch
+implementation squash merge (plan rev6.3 (b), accept --help BATCH
+IMPLEMENTATION) is the L2 commit of each of its WPs: no tests/accept/ file,
+the WP's own PATHS and at most 2 other WPs' PATHS (at REF) match every file
+exactly once, each matching some (lanedlib.is_batch_impl_commit).
+
+FEATURE rule (plan rev6.17, accept --help): a PR may carry tests and code for
+any number of laned:<WP> labels. LABELLED L2 rule: its squash merge (subject
+`... (#N)`) is the L2 commit of a WP iff PR N carried laned:<WP> and the
+merge changes a non-test path the WP's PATHS match; a PR whose labels are
+known but lack the WP never is (lanedlib.impl_commit_index). Labels: the
+`gh pr list` file in $LANED_PR_LABELS plus the ledger's PR rows (field
+`pr`). A green `combined` row makes the merge that changes tests/accept/<wp>/
+the WP's L1 commit too (`combined_commit`). The git-only rules above apply
+only to commits with no PR number or unknown labels.
+
+RETIRED WPs (scripts/laned/retired_wps at REF, accept --help RETIRED rule):
+dropped by an owner decision, never built. Such a WP stays at L0 whatever its
+ledger rows or merges (so the push job never re-accepts it), its side state
+is `retired`, its JSON entry carries `retired` (the decision reference), it
+counts toward no stage, it blocks no dependant, and STATUS.md shows RETIRED in
+its Level column.
+
+Ci-only WPs pass L4 automatically (§17.1). L4 for external WPs and an
+execution-stage gate need the evidence blob at REF to
+have been verified by a green push/accept run (`accept <WP> --evidence F`,
+which exports LANED_EVIDENCE=F to the WP's own tests). Invariant coverage
+(§17.3) counts only test functions found by AST in
+tests/accept/<wp>/**/test_*.py.
+
+    status selftest     # offline check of both rules above
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import json
+import os
+import posixpath
+import re
+import subprocess
+import sys
+import tempfile
+from datetime import UTC, datetime
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # `python -P` drops the script dir
+import lanedlib  # noqa: E402
+
+PLAN = "docs/plans/LANE_D_PLAN.md"
+BUILD_STATE = "laned/build-state"
+EXTERNAL_WORDS = ("builder", "pod", "testnet", "owner")
+CLOSED_DECISION = ("decided", "withdrawn", "deferred-to-stage")
+N_INVARIANTS = 12
+STAGE_ORDER = ("S0", "S0a", "S0b", "S0c", "S1", "S2", "S2b", "S3", "S4", "S5", "S6",
+               "SB0", "SB1", "SB2", "SB3", "SB4", "SB5", "S7", "S8")
+# §5 row 12c: the SB1 build set and the SB0 decision set.
+SB1_WPS = ("WB10", "WB11", "WB12", "WB13", "WB14", "WB15", "WB16", "WB17", "WB18",
+           "WB22", "WB23", "WB26", "W-S1", "W-S2")
+SB0_DECISIONS = ("D35", "D36", "D37", "D38", "D39", "D40", "D41", "D42", "D42b")
+T_ROW = re.compile(r"^T\d+[a-z]?$")
+
+
+def clean(cell: str) -> str:
+    return cell.replace("**", "").replace("`", "").strip()
+
+
+def split_row(line: str) -> list[str]:
+    body = line.strip()
+    if body.startswith("|"):
+        body = body[1:]
+    if body.endswith("|"):
+        body = body[:-1]
+    return [c.strip() for c in body.split("|")]
+
+
+def lvl(n: int) -> str:
+    return f"L{n}"
+
+
+# ---------------------------------------------------------------------------
+# Inputs at REF
+# ---------------------------------------------------------------------------
+
+class RefTree:
+    def __init__(self, root: Path, ref: str):
+        self.root = root
+        self.ref = ref
+        self.commit = lanedlib.git(root, "rev-parse", f"{ref}^{{commit}}").stdout.strip()
+        self.files = set(lanedlib.git(root, "ls-tree", "-r", "--name-only", self.commit).stdout.split("\n"))
+        self.files.discard("")
+        self._cache: dict[str, str | None] = {}
+        self.history = lanedlib.first_parent_history(root, self.commit)
+        self.position = {sha: i for i, (sha, _) in enumerate(self.history)}
+
+    def show(self, path: str) -> str | None:
+        if path not in self._cache:
+            if path in self.files:
+                self._cache[path] = lanedlib.git(self.root, "show", f"{self.commit}:{path}").stdout
+            else:
+                self._cache[path] = None
+        return self._cache[path]
+
+    def blob(self, path: str, commit: str | None = None) -> str | None:
+        """Blob sha of ``path`` at ``commit`` (default REF), None when absent."""
+        commit = commit or self.commit
+        if commit == self.commit and path not in self.files:
+            return None
+        if not re.fullmatch(r"[0-9a-f]{7,64}", commit):
+            return None
+        proc = lanedlib.git(self.root, "rev-parse", "-q", "--verify", f"{commit}:{path}", check=False)
+        return proc.stdout.strip() if proc.returncode == 0 else None
+
+
+def evidence_path(info: dict, wp: str) -> str:
+    """The WP's evidence file: ``--evidence <file>`` in its Accept cell, else evidence/<wp>.json."""
+    return info["evidence"] or f"evidence/{lanedlib.wp_dir(wp)}.json"
+
+
+def run_verified_blob(tree: RefTree, run: dict, path: str, blob: str | None) -> tuple[bool, str]:
+    """Did the green ``run`` verify ``path`` with content ``blob``?
+
+    The push-to-main job runs ``accept <WP> --evidence <file>`` whenever the
+    evidence file exists at the pushed commit and records the file's blob sha
+    as ``evidence_sha``. A run that records ``evidence_sha`` verified exactly
+    that blob. A ledger entry without the field (fixtures; runs from before
+    the field existed) counts only when the file had the same blob at the
+    run's own commit, i.e. that push job ran with ``--evidence`` on it.
+    """
+    if blob is None:
+        return False, "evidence file missing"
+    if run.get("conclusion") != "success":
+        return False, "no green verifying run"
+    if "evidence_sha" in run:
+        if run.get("evidence_sha") == blob:
+            return True, f"ok (verified by the run at {str(run.get('head_sha'))[:12]})"
+        return False, (f"the latest green run verified {str(run.get('evidence_sha'))[:12]}, "
+                       f"not the current blob {blob[:12]}")
+    at_run = tree.blob(path, str(run.get("head_sha", "")))
+    if at_run == blob:
+        return True, f"ok (verified by the run at {str(run.get('head_sha'))[:12]})"
+    return False, f"no green run verified the current blob {blob[:12]}"
+
+
+INV_NAME = re.compile(r"^test_inv(\d+)_")
+
+
+def collected_tests(source: str) -> list[str]:
+    """Names of the test functions pytest collects from a test module, by AST.
+
+    Module-level ``def``s and methods of module-level ``Test*`` classes only.
+    String literals, nested functions and anything else never count (RV1).
+    """
+    try:
+        mod = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return []
+    names: list[str] = []
+    for node in mod.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            names.append(node.name)
+        elif isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
+            names.extend(n.name for n in node.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)))
+    return names
+
+
+def is_test_module(path: str) -> bool:
+    return path.endswith(".py") and posixpath.basename(path).startswith("test_")
+
+
+def invariants_in(sources: dict[str, str]) -> set[int]:
+    """§17.3: invariants n with a real ``test_inv<n>_*`` test in a test_*.py module."""
+    found: set[int] = set()
+    for path, text in sources.items():
+        if not is_test_module(path):
+            continue
+        for name in collected_tests(text):
+            m = INV_NAME.match(name)
+            if m and 1 <= int(m.group(1)) <= N_INVARIANTS:
+                found.add(int(m.group(1)))
+    return found
+
+
+def parse_plan(text: str) -> dict:
+    wps: dict[str, dict] = {}
+    decisions: dict[str, dict] = {}
+    owner_inputs: dict[str, dict] = {}
+    t_rows: list[str] = []
+    t_owners: dict[str, str] = {}
+    lines = text.splitlines()
+    heading = ""
+    group_label = ""
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith("## "):
+            heading, group_label = line, ""
+        elif line.startswith("**") and not line.startswith("|"):
+            group_label = line
+        if not line.lstrip().startswith("|"):
+            i += 1
+            continue
+        block = []
+        while i < len(lines) and lines[i].lstrip().startswith("|"):
+            block.append(lines[i])
+            i += 1
+        header = [clean(c) for c in split_row(block[0])]
+        rows = [split_row(r) for r in block[2:]] if len(block) > 2 else []
+        col = {name: k for k, name in enumerate(header)}
+
+        def cell(row: list[str], name: str, col: dict[str, int] = col) -> str:
+            k = col.get(name)
+            return row[k] if k is not None and k < len(row) else ""
+
+        if header and header[0] == "WP" and "Runs in" in col:
+            if "Stage" in col:
+                group = "execution"
+            elif "lane b" in group_label.lower():
+                group = "laneb"
+            elif "lane d core" in group_label.lower():
+                group = "laned_core"
+            else:
+                group = "build"
+            parked = "parked" in heading.lower()
+            for row in rows:
+                wp = clean(row[0])
+                if not wp or wp in wps:
+                    continue
+                accept = cell(row, "Accept")
+                m = re.search(r"--evidence\s+([^\s`)]+)", accept)
+                runs_in = clean(cell(row, "Runs in"))
+                wps[wp] = {
+                    "depends": clean(cell(row, "Depends")),
+                    "runs_in": runs_in,
+                    "external": any(re.search(rf"\b{w}\b", runs_in) for w in EXTERNAL_WORDS),
+                    "evidence": m.group(1) if m else None,
+                    "group": group,
+                    "parked": parked,
+                    "stage": clean(cell(row, "Stage")),
+                }
+        elif header[:5] == ["D", "Status", "Option chosen", "Class", "Decided"]:
+            for row in rows:
+                d = clean(row[0])
+                if d:
+                    decisions[d] = {"status": clean(cell(row, "Status")),
+                                    "option": clean(cell(row, "Option chosen")),
+                                    "class": clean(cell(row, "Class")),
+                                    "decided": clean(cell(row, "Decided"))}
+        elif header[:4] == ["OA", "Status", "Unblocks", "Evidence file"]:
+            for row in rows:
+                oa = clean(row[0])
+                if not oa:
+                    continue
+                ev_cell = cell(row, "Evidence file")
+                m = re.search(r"`([^`]+)`", ev_cell) or re.search(r"(evidence/\S+)", ev_cell)
+                owner_inputs[oa] = {"status": clean(cell(row, "Status")),
+                                    "unblocks": clean(cell(row, "Unblocks")),
+                                    "evidence": m.group(1) if m else None}
+        elif header[:3] == ["#", "Case", "Expected"]:
+            for row in rows:
+                t = clean(row[0])
+                if T_ROW.match(t) and t not in t_rows:
+                    t_rows.append(t)
+        elif header[:2] == ["Row", "WPs"]:
+            for row in rows:
+                t = clean(row[0])
+                if t:
+                    t_owners[t] = clean(cell(row, "WPs"))
+    return {"wps": wps, "decisions": decisions, "owner_inputs": owner_inputs,
+            "t_rows": t_rows, "t_owners": t_owners}
+
+
+# ---------------------------------------------------------------------------
+# Levels
+# ---------------------------------------------------------------------------
+
+class Board:
+    def __init__(self, tree: RefTree, plan: dict, runs: list[dict], tag_glob: str | None):
+        self.tree = tree
+        self.plan = plan
+        self.runs = [r for r in runs if r.get("workflow", "laned-accept") == "laned-accept"]
+        self.tags: list[str] = []
+        if tag_glob:
+            out = lanedlib.git(tree.root, "tag", "--list", tag_glob).stdout
+            self.tags = [t for t in out.split("\n") if t]
+        self.levels: dict[str, int] = {}
+        self.detail: dict[str, dict] = {}
+        self.verification_wps = lanedlib.parse_verification_wps(tree.show(lanedlib.VERIFICATION_WPS_PATH))
+        self.retired = lanedlib.parse_retired_wps(tree.show(lanedlib.RETIRED_WPS_PATH))
+        self._paths_sets: dict[str, list[str]] | None = None
+        self._subjects: dict[str, str] | None = None
+        self._pr_labels: dict[int, set[str]] | None = None
+        self.pr_labels_extra: dict[int, set[str]] = lanedlib.pr_labels_file()
+
+    # -- per-level conditions ------------------------------------------------
+    def subjects(self) -> dict[str, str]:
+        if self._subjects is None:
+            self._subjects = lanedlib.first_parent_subjects(self.tree.root, self.tree.commit)
+        return self._subjects
+
+    def l2_commit(self, wp: str, paths: list[str]) -> int | None:
+        # shared with `accept --check-pr` (tests-only vs tests-correction);
+        # with every other WP's PATHS a batch implementation squash merge
+        # (plan rev6.3 (b)) is the L2 commit of each of its WPs
+        # (and a declared coupled-set merge, scripts/laned/coupled_batches,
+        # the L2 commit of each member)
+        if self._paths_sets is None:
+            self._paths_sets = lanedlib.paths_sets_at(self.tree.root, self.tree.commit)
+            self._coupled = lanedlib.parse_coupled_batches(
+                self.tree.show(lanedlib.COUPLED_BATCHES_PATH))
+        if self._pr_labels is None:
+            # LABELLED rule (rev6.17): known PR labels from --pr-labels /
+            # $LANED_PR_LABELS (gh pr list) and the ledger's PR rows
+            self._pr_labels = lanedlib.merge_pr_labels(self.pr_labels_extra,
+                                                       lanedlib.pr_labels_from_runs(self.runs))
+        return lanedlib.impl_commit_index(self.tree.history, wp, paths,
+                                          lanedlib.other_paths(self._paths_sets, wp),
+                                          lanedlib.coupled_paths(self._coupled, self._paths_sets, wp),
+                                          self.subjects(), self._pr_labels)
+
+    def verification_commit(self, wp: str, runs: list[dict]) -> int | None:
+        """First-parent index of the merge of a green ``verification`` PR run:
+        the first tests-only commit touching tests/accept/<wp>/ whose test dir tree
+        is a run's ``tests_tree`` (or whose sha is a run's ``head_sha``)."""
+        if not runs:
+            return None
+        trees = {r["tests_tree"] for r in runs if isinstance(r.get("tests_tree"), str)}
+        shas = {r["head_sha"] for r in runs if isinstance(r.get("head_sha"), str)}
+        return lanedlib.verification_commit_index(self.tree.root, self.tree.history, wp, trees, shas)
+
+    def evidence_ok(self, wp: str, run: dict) -> tuple[bool, str]:
+        """L4 for an external WP: the evidence file at REF passes the field check
+        **and** ``run`` (the green push/accept run that gave L3) verified that
+        exact blob, i.e. the WP's own tests ran against it via ``--evidence``
+        (``LANED_EVIDENCE``). Field presence alone never gives L4 (RV1)."""
+        info = self.plan["wps"][wp]
+        if not info["external"]:
+            return True, "ci-only"
+        path = evidence_path(info, wp)
+        ok, why = lanedlib.check_evidence(self.tree.show(path), path, wp)
+        if not ok:
+            return False, f"{path}: {why}"
+        ok, why = run_verified_blob(self.tree, run, path, self.tree.blob(path))
+        return ok, f"{path}: {why}"
+
+    def reviewed(self, wp: str) -> str | None:
+        for path in sorted(self.tree.files):
+            if not re.match(r"^evidence/rv\d+\.md$", path):
+                continue
+            text = self.tree.show(path) or ""
+            covers = re.search(r"^Covers:(.*)$", text, re.M)
+            if not covers or not lanedlib.has_token(covers.group(1), wp):
+                continue
+            if any(lanedlib.has_token(item, wp) for item in lanedlib.open_blocking_items(text)):
+                continue
+            return path
+        return None
+
+    def released(self, sha: str) -> str | None:
+        for tag in self.tags:
+            proc = lanedlib.git(self.tree.root, "merge-base", "--is-ancestor", sha, f"refs/tags/{tag}",
+                                check=False)
+            if proc.returncode == 0:
+                return tag
+        return None
+
+    def live(self, wp: str) -> bool:
+        text = self.tree.show(f"evidence/l7/{lanedlib.wp_dir(wp)}.json")
+        if text is None:
+            return False
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            return False
+        if not isinstance(data, dict):
+            return False
+        block = data.get("activation_block")
+        era = data.get("era_range")
+        return (isinstance(block, int) and not isinstance(block, bool)
+                and data.get("monitor") == "green"
+                and isinstance(era, list) and len(era) == 2
+                and all(isinstance(e, int) and not isinstance(e, bool) for e in era)
+                and era[1] >= era[0])
+
+    def level(self, wp: str) -> int:
+        d = lanedlib.wp_dir(wp)
+        det: dict = {}
+        self.detail[wp] = det
+        if wp in self.retired:
+            # RETIRED rule: never built; no run or merge lifts it
+            det["retired"] = self.retired[wp]
+            return 0
+        paths_text = self.tree.show(f"tests/accept/{d}/PATHS")
+        xf_runs = [r for r in self.runs if r.get("wp") == wp and r.get("mode") == "expect-fail"
+                   and r.get("conclusion") == "success"]
+        # BATCH (plan rev6.2 (h)): a run that records the WP's tests_tree gives
+        # L1 only through the commit on REF's first-parent line it attributes
+        # to (tests_commit_index: a tests-only commit, batch squash merges
+        # included, whose tests/accept/<wp>/ tree is that tests_tree). A run
+        # without the field (dispatch bootstrap, older ledger entries) counts
+        # as before.
+        xf_trees = {r["tests_tree"] for r in xf_runs if isinstance(r.get("tests_tree"), str)}
+        l1 = lanedlib.tests_commit_index(self.tree.root, self.tree.history, wp, xf_trees, set()) \
+            if xf_trees and paths_text is not None else None
+        if l1 is not None:
+            det["l1_commit"] = self.tree.history[l1][0]
+        expect_fail_ok = l1 is not None or any("tests_tree" not in r for r in xf_runs)
+        verified = [r for r in self.runs if r.get("wp") == wp and r.get("mode") == "verification"
+                    and r.get("conclusion") == "success"]
+        if verified and wp not in self.verification_wps:
+            # RV5: only a declared verification WP (scripts/laned/verification_wps
+            # at REF) may take L1/L2 from a verification run; for any other WP
+            # such a run counts for nothing (expect-fail semantics: L1 needs a
+            # green expect-fail run, L2 an implementation commit).
+            det["verification_refused"] = f"{wp} not in {lanedlib.VERIFICATION_WPS_PATH}"
+            verified = []
+        det["paths"] = paths_text is not None
+        det["expect_fail_success"] = expect_fail_ok
+        if verified:
+            det["verification_success"] = True
+        if paths_text is None:
+            return 0
+        # Verification WP (accept --help, MODE verification): the merge of a
+        # green verification PR is both its L1 and its L2 commit.
+        vf = self.verification_commit(wp, verified)
+        paths = lanedlib.parse_paths(paths_text)
+        impl = self.l2_commit(wp, paths)
+        # FEATURE rule (rev6.17): L2 of a labelled squash merge (#N) comes
+        # from impl (LABELLED rule: the PR carried laned:<WP> and changed a
+        # non-test path in the WP's PATHS); a green `combined` row (tests +
+        # code) makes the merge that changes tests/accept/<wp>/ its L1 too.
+        comb = lanedlib.pr_merge_index(self.tree.history, self.subjects(), wp, paths,
+                                       lanedlib.green_pr_numbers(self.runs, wp, ("combined",)),
+                                       need_tests=True)
+        if comb is not None:
+            det["combined_commit"] = self.tree.history[comb][0]
+            det.setdefault("l1_commit", self.tree.history[comb][0])
+            det["expect_fail_success"] = True
+        if not expect_fail_ok and vf is None and comb is None:
+            return 0
+        if impl is None and vf is None:
+            return 1
+        l2 = min(i for i in (impl, vf) if i is not None)
+        l2_sha = self.tree.history[l2][0]
+        det["l2_commit"] = l2_sha
+        det["l2_via"] = "implementation" if l2 == impl else "verification"
+        relevant = [r for r in self.runs
+                    if r.get("wp") == wp and r.get("event") == "push" and r.get("mode") == "accept"
+                    and self.tree.position.get(r.get("head_sha", ""), -1) >= l2]
+        relevant.sort(key=lambda r: (self.tree.position[r["head_sha"]], r.get("created_at", "")))
+        if not relevant:
+            return 2
+        last = relevant[-1]
+        det["last_main_run"] = {"head_sha": last["head_sha"], "conclusion": last.get("conclusion")}
+        if last.get("conclusion") != "success":
+            return 2
+        ok, why = self.evidence_ok(wp, last)
+        det["evidence"] = why
+        det["evidence_verified"] = ok
+        if not ok:
+            return 3
+        review = self.reviewed(wp)
+        det["review"] = review
+        if review is None:
+            # §17.1: L4 is "n/a for ci-only WPs, which pass L4 automatically".
+            # evidence_ok() returns True for a ci-only WP, so an accepted,
+            # unreviewed WP is L4 whether it is external (evidence verified)
+            # or ci-only (RV1 item 3; pinned by the W0c fixture tests).
+            return 4
+        tag = self.released(l2_sha)
+        det["release_tag"] = tag
+        if tag is None:
+            return 5
+        if not self.live(wp):
+            return 6
+        return 7
+
+    # -- side states ---------------------------------------------------------
+    def side_state(self, wp: str) -> str | None:
+        info = self.plan["wps"][wp]
+        if wp in self.retired:
+            return "retired"
+        if info["parked"]:
+            return "parked"
+        blocked = self.tree.show(f"evidence/blocked/{lanedlib.wp_dir(wp)}.md")
+        if blocked is not None:
+            first = blocked.strip().split("\n", 1)[0] if blocked.strip() else ""
+            m = re.match(r"^Reason:\s*([A-Za-z0-9_-]+)", first)
+            return f"blocked:{m.group(1) if m else 'unspecified'}"
+        for did, dec in self.plan["decisions"].items():
+            if decision_blocking(dec) and lanedlib.has_token(info["depends"], did):
+                return f"blocked:{did}"
+        for oa in self.plan["owner_inputs"].values():
+            if (oa["status"].lower().startswith("open") and lanedlib.has_token(oa["unblocks"], wp)
+                    and (not oa["evidence"] or self.tree.show(oa["evidence"]) is None)):
+                return "blocked:owner"
+        if self.levels[wp] < 2:
+            for dep in self.plan["wps"]:
+                if dep != wp and dep not in self.retired and lanedlib.has_token(info["depends"], dep) \
+                        and self.levels[dep] < 2:
+                    return "blocked:dependency"
+        return None
+
+
+def gate_ok(tree: RefTree, runs: list[dict], stage: str, path: str) -> tuple[bool, str]:
+    """§17.2 gate file: the --gate check at REF and the latest push ``gate`` run
+    (``accept --gate <stage>`` in the push-to-main job) green on this blob.
+
+    The push-to-main job runs the gate check for every gate file present and
+    records it before the board is computed, so on main the run always exists.
+    A ledger with no gate run at all for the stage (fixture ledgers, runs from
+    before the gate step existed) falls back to the --gate check alone, and the
+    detail says so.
+    """
+    ok, why = lanedlib.check_gate(tree.show(path), stage)
+    if not ok:
+        return False, why
+    gate_runs = [r for r in runs if r.get("wp") == stage and r.get("mode") == "gate"
+                 and r.get("event") == "push" and r.get("head_sha") in tree.position]
+    if not gate_runs:
+        return True, "ok (--gate check at REF; no gate run recorded)"
+    gate_runs.sort(key=lambda r: (tree.position[r["head_sha"]], r.get("created_at", "")))
+    return run_verified_blob(tree, gate_runs[-1], path, tree.blob(path))
+
+
+def decision_closed(dec: dict) -> bool:
+    return dec["status"].lower().startswith(CLOSED_DECISION)
+
+
+def decision_blocking(dec: dict) -> bool:
+    return dec["status"].lower().startswith("open") and dec["class"].startswith("S")
+
+
+# ---------------------------------------------------------------------------
+# Stages, milestones, counters
+# ---------------------------------------------------------------------------
+
+def compute(tree: RefTree, plan: dict, runs: list[dict], tag_glob: str | None) -> dict:
+    board = Board(tree, plan, runs, tag_glob)
+    wps = plan["wps"]
+    for wp in wps:
+        board.levels[wp] = board.level(wp)
+    sides = {wp: board.side_state(wp) for wp in wps}
+    levels = board.levels
+
+    def at(names, n: int) -> tuple[bool, str]:
+        names = list(names)
+        low = [w for w in names if levels.get(w, -1) < n]
+        return (bool(names) and not low,
+                f"{', '.join(names) if len(names) <= 6 else str(len(names)) + ' WPs'} at >= L{n}"
+                + (f" (below: {', '.join(low)})" if low else ""))
+
+    group = lambda g: [w for w, i in wps.items()  # noqa: E731
+                       if i["group"] == g and not i["parked"] and w not in board.retired]
+    build = group("build") + group("laned_core")
+    exec_for = {}
+    for w, i in wps.items():
+        m = re.search(r"\b(S[0-9B]\w*)\b", i["stage"]) if i["group"] == "execution" else None
+        if m and m.group(1) not in exec_for:
+            exec_for[m.group(1)] = w
+
+    t_total = plan["t_rows"]
+    matrix_text = tree.show("evidence/s3_matrix.json")
+    passed_rows: set[str] = set()
+    if matrix_text:
+        try:
+            rows = json.loads(matrix_text).get("rows", {})
+            passed_rows = {t for t, v in rows.items() if isinstance(v, dict) and v.get("passed") is True}
+        except (json.JSONDecodeError, AttributeError):
+            passed_rows = set()
+    t_passed = [t for t in t_total if t in passed_rows]
+
+    decs = plan["decisions"]
+    all_closed = all(decision_closed(d) for d in decs.values())
+    sb0_closed = all(d in decs and decision_closed(decs[d]) for d in SB0_DECISIONS)
+
+    reqs: dict[str, list[tuple[bool, str]]] = {
+        "S0": [(all_closed, "every decision decided, withdrawn or deferred-to-stage"), at(["W0"], 3)],
+        "S0a": [at(["R6x"], 4)],
+        "S0b": [at(["R2x"], 4)],
+        "S0c": [at(["R7t", "R7m"], 4)],
+        "S1": [at(["W1", "W0b", "W3a", "R16"], 4)],
+        "S2": [at(build, 5)],
+        "S2b": [at(["R9"], 4)],
+        "S3": [at(["X3"], 4), (bool(t_total) and len(t_passed) == len(t_total), "every T-row passed")],
+        "S4": [at(["X4"], 4), at(build, 6)],
+        "S5": [at(["X5"], 4), at(build, 6)],
+        "S6": [at(["X6a"], 4), at(group("laned_core"), 7)],
+        "SB0": [(sb0_closed, "D35-D42 and D42b decided")],
+        "SB1": [at(SB1_WPS, 5)],
+        "SB2": [at(["WB19"], 4)],
+        "SB3": [],
+        "SB4": [],
+        "SB5": [at(group("laneb"), 7)],
+        "S7": [at(["X7"], 4)],
+        "S8": [at(["W6-S8"], 4)],
+    }
+    stages: dict[str, dict] = {}
+    for stage in STAGE_ORDER:
+        if stage in exec_for:
+            # The execution WP's evidence counts only as verified by its green
+            # push/accept --evidence run (the same rule as L4), never by fields.
+            w = exec_for[stage]
+            path = evidence_path(wps[w], w)
+            det = board.detail.get(w, {})
+            g_ok = bool(det.get("evidence_verified"))
+            g_why = det.get("evidence") or f"{w} has no green push/accept run (below L3)"
+        else:
+            path = lanedlib.gate_path(stage)
+            g_ok, g_why = gate_ok(tree, board.runs, stage, path)
+        checks = [{"check": why, "passed": ok} for ok, why in reqs[stage]]
+        if stage == "SB4":
+            checks.append({"check": "S5 complete (shared release)",
+                           "passed": stages["S5"]["state"] == "complete"})
+        complete = all(c["passed"] for c in checks) and g_ok
+        stages[stage] = {"state": "complete" if complete else "incomplete", "requirements": checks,
+                         "gate": {"evidence": path, "passed": g_ok, "detail": g_why}}
+
+    done = lambda *ss: all(stages[s]["state"] == "complete" for s in ss)  # noqa: E731
+    milestones = {
+        "Build-complete": done("S2"),
+        "Launch-ready": done("S0", "S0a", "S0b", "S0c", "S1", "S2", "S2b", "S3", "S4", "S5"),
+        "Live": done("S6", "SB5"),
+        "Done": done("S7"),
+    }
+    milestones = {k: "complete" if v else "incomplete" for k, v in milestones.items()}
+
+    covered: set[int] = set()
+    for wp in wps:
+        if levels[wp] < 3:
+            continue
+        prefix = f"tests/accept/{lanedlib.wp_dir(wp)}/"
+        covered |= invariants_in({p: tree.show(p) or "" for p in sorted(tree.files)
+                                  if p.startswith(prefix) and is_test_module(p)})
+
+    orphans = []
+    for t in t_total:
+        owners = plan["t_owners"].get(t)
+        if owners is None or not any(lanedlib.has_token(owners, w) for w in wps):
+            orphans.append(t)
+
+    blocked: dict[str, list[str]] = {}
+    for wp in wps:
+        s = sides[wp]
+        if s and s.startswith("blocked:"):
+            blocked.setdefault(s.split(":", 1)[1], []).append(wp)
+
+    oa_out = {}
+    for oa, info in plan["owner_inputs"].items():
+        ev = info["evidence"]
+        oa_out[oa] = {"status": info["status"], "unblocks": info["unblocks"], "evidence": ev,
+                      "present": bool(ev) and tree.show(ev) is not None}
+
+    return {
+        "schema": "laned_build/1",
+        "ref": tree.ref,
+        "commit": tree.commit,
+        "generated_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "wps": {wp: {"level": lvl(levels[wp]), "side_state": sides[wp],
+                     "runs_in": wps[wp]["runs_in"], "external": wps[wp]["external"],
+                     "evidence_file": evidence_path(wps[wp], wp) if wps[wp]["external"] else None,
+                     "group": wps[wp]["group"], **board.detail.get(wp, {})} for wp in wps},
+        "stages": stages,
+        "milestones": milestones,
+        "decisions": {d: {**info, "blocking": decision_blocking(info)} for d, info in decs.items()},
+        "owner_inputs": oa_out,
+        "counters": {
+            "t_rows": {"passed": len(t_passed), "total": len(t_total)},
+            "invariants": {"covered": sorted(covered), "total": N_INVARIANTS},
+            "orphans": orphans,
+            "blocked": [{"reason": r, "count": len(ws), "wps": sorted(ws)} for r, ws in blocked.items()],
+        },
+    }
+
+
+def render_md(data: dict) -> str:
+    c = data["counters"]
+    out = [
+        "# Lane D build status",
+        "",
+        f"Generated by `scripts/laned/status` at {data['generated_at']} from `{data['ref']}` "
+        f"(`{data['commit'][:12]}`). Do not edit by hand (plan §17).",
+        "",
+        "## Counters",
+        "",
+        f"- T-rows passed: {c['t_rows']['passed']}/{c['t_rows']['total']}",
+        f"- Invariants covered at L3+: {len(c['invariants']['covered'])}/{c['invariants']['total']} "
+        f"({', '.join(map(str, c['invariants']['covered'])) or 'none'})",
+        f"- Orphan T-rows: {', '.join(c['orphans']) or 'none'}",
+        "- Blocked: " + ("; ".join(f"{b['reason']} {b['count']} ({', '.join(b['wps'])})"
+                                   for b in c["blocked"]) or "none"),
+        "",
+        "## Milestones",
+        "",
+        "| Milestone | State |",
+        "|---|---|",
+        *[f"| {k} | {v} |" for k, v in data["milestones"].items()],
+        "",
+        "## Stages",
+        "",
+        "| Stage | State | Gate evidence |",
+        "|---|---|---|",
+        *[f"| {s} | {v['state']} | `{v['gate']['evidence']}`: {v['gate']['detail']} |"
+          for s, v in data["stages"].items()],
+        "",
+        "## Work packages",
+        "",
+        "| WP | Level | State |",
+        "|---|---|---|",
+        *[f"| {wp} | {'RETIRED' if v.get('retired') else v['level']} | "
+          f"{v['side_state'] + ': ' + v['retired'] if v.get('retired') else v['side_state'] or '-'} |"
+          for wp, v in data["wps"].items()],
+        "",
+        "## Open decisions and owner inputs",
+        "",
+    ]
+    open_d = [f"- {d}: {v['status']} (class {v['class']}{', blocking' if v['blocking'] else ''})"
+              for d, v in data["decisions"].items() if not v["status"].lower().startswith(CLOSED_DECISION)]
+    open_oa = [f"- {oa}: {v['status']}; evidence `{v['evidence']}` {'present' if v['present'] else 'absent'}"
+               for oa, v in data["owner_inputs"].items() if v["status"].lower().startswith("open")]
+    out.extend(open_d + open_oa or ["- none"])
+    out.append("")
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
+# Publishing to laned/build-state
+# ---------------------------------------------------------------------------
+
+def push(root: Path, remote: str, files: dict[str, Path], ref_commit: str) -> str:
+    branch = f"refs/heads/{BUILD_STATE}"
+    remote_head = lanedlib.git(root, "ls-remote", remote, branch).stdout.split()
+    parent = None
+    if remote_head:
+        lanedlib.git(root, "fetch", "--no-tags", "-q", remote, branch)
+        parent = lanedlib.git(root, "rev-parse", "FETCH_HEAD").stdout.strip()
+        if parent != remote_head[0]:
+            raise RuntimeError(f"fetched {parent} but {remote} has {remote_head[0]}")
+    with tempfile.TemporaryDirectory(prefix="laned-status-") as tmp:
+        env = dict(os.environ, GIT_INDEX_FILE=str(Path(tmp) / "index"))
+
+        def g(*args: str) -> str:
+            return lanedlib.git(root, *args, env=env).stdout.strip()
+
+        if parent:
+            g("read-tree", parent)
+        else:
+            g("read-tree", "--empty")
+        for dest, src in files.items():
+            blob = g("hash-object", "-w", str(src))
+            g("update-index", "--add", "--cacheinfo", f"100644,{blob},{dest}")
+        tree = g("write-tree")
+        args = ["commit-tree", tree, "-m", f"status: laned build board for {ref_commit[:12]}"]
+        if parent:
+            args[2:2] = ["-p", parent]
+        commit = g(*args)
+    lanedlib.git(root, "push", "-q", remote, f"{commit}:{branch}")
+    return commit
+
+
+# ---------------------------------------------------------------------------
+# selftest (offline; RV1 blocking items)
+# ---------------------------------------------------------------------------
+
+SELFTEST_PLAN = """# selftest plan
+
+## 3. Implementation
+
+| WP | What | Depends | Runs in | Accept |
+|---|---|---|---|---|
+| X1 | External probe | — | owner | `scripts/laned/accept X1 --evidence evidence/x1.json` |
+| C1 | ci-only tool | — | ci | `scripts/laned/accept C1` |
+"""
+
+# X1's own verifier: the evidence must carry a request id (a field the bare
+# {"wp", "passed"} shape lacks).
+SELFTEST_VERIFIER = """import json, os
+
+def test_inv2_evidence_has_request_id():
+    path = os.environ.get("LANED_EVIDENCE")
+    assert path, "accept did not export LANED_EVIDENCE"
+    data = json.load(open(path))
+    assert isinstance(data.get("request_id"), str) and data["request_id"]
+"""
+
+SELFTEST_HELPER = '''PLANTED = "def test_inv9_share_zero():\\n    assert True\\n"
+FIXTURE = """
+def test_inv1_unarmed():
+    assert True
+"""
+
+def test_inv4_in_a_helper_module():
+    pass
+'''
+
+
+def cmd_selftest() -> int:
+    failures: list[str] = []
+    # the fixture repo's `(#N)` subjects must never meet the real repo's PR
+    # labels (the workflow exports LANED_PR_LABELS)
+    os.environ.pop("LANED_PR_LABELS", None)
+
+    def expect(cond: bool, what: str) -> None:
+        if not cond:
+            failures.append(what)
+
+    # (1) the invariant counter counts AST test defs in test_*.py only.
+    got = invariants_in({
+        "tests/accept/x1/helpers.py": SELFTEST_HELPER,
+        "tests/accept/x1/test_strings.py": ("S = 'def test_inv9_x(): pass'\n"
+                                            "T = '''\ndef test_inv1_unarmed():\n    assert True\n'''\n"),
+        "tests/accept/x1/test_real.py": ("def test_inv10_pairing():\n    assert 1\n"
+                                         "class TestX:\n    def test_inv11_method(self):\n        assert 1\n"
+                                         "def outer():\n    def test_inv12_nested():\n        pass\n"),
+    })
+    expect(9 not in got, "a planted 'def test_inv9_' string literal counted as invariant 9")
+    expect(1 not in got, "a 'def test_inv1_' string in a fixture counted as invariant 1")
+    expect(4 not in got, "a test_inv4_ def in a non-test (helper) module counted")
+    expect(12 not in got, "a nested test_inv12_ function counted")
+    expect(got == {10, 11}, f"invariants {sorted(got)}, want [10, 11]")
+
+    accept = Path(__file__).resolve().parent / "accept"
+    with tempfile.TemporaryDirectory(prefix="laned-status-selftest-") as tmp:
+        root = Path(tmp) / "repo"
+        root.mkdir()
+        ident = ("-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false")
+
+        def put(rel: str, text: str) -> None:
+            (root / rel).parent.mkdir(parents=True, exist_ok=True)
+            (root / rel).write_text(text)
+
+        def commit(msg: str) -> str:
+            lanedlib.git(root, "add", "-A")
+            lanedlib.git(root, *ident, "commit", "-q", "-m", msg)
+            return lanedlib.git(root, "rev-parse", "HEAD").stdout.strip()
+
+        lanedlib.git(root, "init", "-q")
+        put(PLAN, SELFTEST_PLAN)
+        commit("plan")
+        put("tests/accept/x1/PATHS", "x1/\n")
+        put("tests/accept/x1/test_x1.py", SELFTEST_VERIFIER)
+        put("tests/accept/c1/PATHS", "c1/\n")
+        put("tests/accept/c1/test_c1.py", "def test_c1():\n    assert True\n")
+        commit("tests")
+        put("x1/probe.py", "VALUE = 1\n")
+        commit("x1 impl")
+        put("c1/tool.py", "VALUE = 1\n")
+        impl = commit("c1 impl")
+
+        env = dict(os.environ, LANED_PYTEST_CMD=f"{sys.executable} -m pytest -p no:cacheprovider")
+
+        def run_accept(ev: str) -> bool:
+            proc = subprocess.run([sys.executable, str(accept), "X1", "--evidence", ev, "--root", str(root)],
+                                  capture_output=True, text=True, env=env)
+            return proc.returncode == 0
+
+        def level(runs: list[dict], wp: str) -> tuple[str, dict]:
+            tree = RefTree(root, "HEAD")
+            data = compute(tree, parse_plan(tree.show(PLAN) or ""), runs, None)
+            return data["wps"][wp]["level"], data
+
+        def run(sha: str, wp: str, ok: bool, **extra: str) -> dict:
+            return {"workflow": "laned-accept", "event": "push", "mode": "accept", "wp": wp,
+                    "head_sha": sha, "conclusion": "success" if ok else "failure",
+                    "created_at": "2026-01-01T00:00:00Z", **extra}
+
+        xf = [{"workflow": "laned-accept", "event": "pull_request", "mode": "expect-fail", "wp": w,
+               "head_sha": impl, "conclusion": "success"} for w in ("X1", "C1")]
+
+        # (2) a bare {"wp", "passed": true} fails X1's own verifier, so the push
+        # run is red and X1 never reaches L4.
+        put("evidence/x1.json", json.dumps({"wp": "X1", "passed": True}))
+        bare = commit("bare evidence")
+        bare_blob = lanedlib.git(root, "rev-parse", f"{bare}:evidence/x1.json").stdout.strip()
+        ok = run_accept("evidence/x1.json")
+        expect(not ok, "accept X1 --evidence passed on a bare {wp, passed} file")
+        lv, _ = level(xf + [run(bare, "X1", ok, evidence_sha=bare_blob)], "X1")
+        expect(lv != "L4", f"bare evidence reached {lv}")
+        # ... and a green run that never saw the evidence does not give L4 either.
+        lv, _ = level(xf + [run(bare, "X1", True, evidence_sha="0" * 40)], "X1")
+        expect(lv == "L3", f"a run that verified another blob gave {lv}, want L3")
+
+        # Full evidence passes the verifier; L4 follows only from that green run.
+        put("evidence/x1.json", json.dumps({"wp": "X1", "passed": True, "request_id": "req-1"}))
+        full = commit("full evidence")
+        full_blob = lanedlib.git(root, "rev-parse", f"{full}:evidence/x1.json").stdout.strip()
+        ok = run_accept("evidence/x1.json")
+        expect(ok, "accept X1 --evidence failed on evidence its verifier accepts")
+        lv, data = level(xf + [run(full, "X1", ok, evidence_sha=full_blob), run(full, "C1", True)], "X1")
+        expect(lv == "L4", f"verified evidence gave {lv}, want L4")
+        expect(data["wps"]["C1"]["evidence_verified"] is True, "ci-only C1 did not pass L4's evidence rule")
+        expect(data["wps"]["C1"]["level"] == "L4",
+               f"accepted, unreviewed ci-only C1 gave {data['wps']['C1']['level']}, want L4 (§17.1)")
+
+        # A later edit to the evidence that no green run verified loses L4.
+        put("evidence/x1.json", json.dumps({"wp": "X1", "passed": True, "request_id": "req-2"}))
+        commit("unverified evidence edit")
+        lv, _ = level(xf + [run(full, "X1", True, evidence_sha=full_blob)], "X1")
+        expect(lv == "L3", f"evidence edited after the verifying run gave {lv}, want L3")
+
+        # (3) a verification WP: V1's PATHS name a file C1 already built. Its
+        # tests-only PR runs `accept --verification` (MODE verification) and is
+        # squash-merged; the merge commit is its L1 and L2 commit, the push run
+        # on it gives L3. A failing verification run never gives L2.
+        put(PLAN, SELFTEST_PLAN + "| V1 | Verification of C1 | C1 | ci | `scripts/laned/accept V1` |\n")
+        put(".gitignore", "__pycache__/\n")
+        put(lanedlib.VERIFICATION_WPS_PATH, "# verification WPs\nV1  # checks C1\n")
+        commit("plan V1")
+        pre = lanedlib.git(root, "rev-parse", "HEAD").stdout.strip()
+        lanedlib.git(root, "checkout", "-q", "-b", "pr-v1")
+        put("tests/accept/v1/PATHS", "c1/tool.py\n")
+        put("tests/accept/v1/test_v1.py", "def test_v1():\n    assert True\n")
+        pr_head = commit("v1 tests (PR head)")
+        proc = subprocess.run([sys.executable, str(accept), "V1", "--verification", "--base", pre,
+                               "--head", pr_head, "--root", str(root)], capture_output=True, text=True, env=env)
+        expect(proc.returncode == 0 and "MODE verification\n" in proc.stdout,
+               f"accept V1 --verification did not print MODE verification: {proc.stdout[-1500:]}")
+        m = re.search(r"^TESTS-TREE (\S+)$", proc.stdout, re.M)
+        tests_tree = m.group(1) if m else ""
+        lanedlib.git(root, "checkout", "-q", "-")
+        lanedlib.git(root, "merge", "-q", "--squash", "pr-v1")
+        squash = commit("v1 tests (#1)")
+        vrun = {"workflow": "laned-accept", "event": "pull_request", "mode": "verification", "wp": "V1",
+                "head_sha": pr_head, "conclusion": "success", "tests_tree": tests_tree}
+        lv, data = level([vrun], "V1")
+        expect(lv == "L2", f"a merged verification PR gave {lv}, want L2")
+        expect(data["wps"]["V1"].get("l2_commit") == squash and data["wps"]["V1"].get("l2_via") == "verification",
+               f"verification L2 commit {data['wps']['V1'].get('l2_commit')}, want the squash merge {squash}")
+        lv, _ = level([vrun, run(squash, "V1", True)], "V1")
+        expect(lv == "L4", f"verification WP with a green push run gave {lv}, want L4 (ci-only)")
+        lv, _ = level([dict(vrun, conclusion="failure")], "V1")
+        expect(lv == "L0", f"a failed verification run gave {lv}, want L0")
+        lv, _ = level([dict(vrun, tests_tree="0" * 40, head_sha="0" * 40)], "V1")
+        expect(lv == "L0", f"a verification run for another test tree gave {lv}, want L0")
+        # an ordinary expect-fail run (tests-only flow unchanged): L1, no L2
+        lv, _ = level([{"workflow": "laned-accept", "event": "pull_request", "mode": "expect-fail",
+                        "wp": "V1", "head_sha": pr_head, "conclusion": "success"}], "V1")
+        expect(lv == "L1", f"an expect-fail run on a verification WP gave {lv}, want L1")
+        # (4) RV5: the same green verification run for a WP that REF's
+        # scripts/laned/verification_wps does not list counts for nothing.
+        put(lanedlib.VERIFICATION_WPS_PATH, "# verification WPs\nW0b\n")
+        commit("V1 not declared")
+        lv, data = level([vrun, run(squash, "V1", True)], "V1")
+        expect(lv == "L0" and data["wps"]["V1"].get("l2_via") is None
+               and data["wps"]["V1"].get("verification_refused"),
+               f"an undeclared WP's verification run gave {lv} ({data['wps']['V1']}), want L0, refused")
+
+        # (5) BATCH (plan rev6.2 (h)): one tests-only PR for B1, B2, B3, each
+        # checked and run on its own (accept --check-pr --pr-wps, then
+        # --verification -> expect-fail with its own TESTS-TREE), squash-merged:
+        # the merge commit is L1 for all three, L2 for none.
+        put(PLAN, SELFTEST_PLAN + "| V1 | Verification of C1 | C1 | ci | `scripts/laned/accept V1` |\n"
+            + "".join(f"| {w} | batch {w} | — | ci | `scripts/laned/accept {w}` |\n"
+                      for w in ("B1", "B2", "B3", "B4", "V2")))
+        put(lanedlib.VERIFICATION_WPS_PATH, "# verification WPs\nV2  # checks C1\n")
+        commit("plan batch")
+
+        def batch_pr(name: str, files: dict[str, str], labels: list[str]) -> tuple[str, dict[str, dict]]:
+            """Branch ``name`` off HEAD with ``files``, run the PR job's per-WP
+            steps, squash-merge it; (squash sha, {WP: ledger entry})."""
+            start = lanedlib.git(root, "rev-parse", "HEAD").stdout.strip()
+            branch = lanedlib.git(root, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+            lanedlib.git(root, "checkout", "-q", "-b", name)
+            for rel, text in files.items():
+                put(rel, text)
+            head = commit(f"{name} (PR head)")
+            entries: dict[str, dict] = {}
+            for wp in labels:
+                proc = subprocess.run([sys.executable, str(accept), wp, "--check-pr", "--base", start,
+                                       "--head", head, "--pr-wps", ",".join(labels), "--root", str(root)],
+                                      capture_output=True, text=True, env=env)
+                expect(proc.returncode == 0 and "MODE tests-only\n" in proc.stdout,
+                       f"batch {name}: {wp} check-pr did not print MODE tests-only: {proc.stdout[-1500:]}")
+                proc = subprocess.run([sys.executable, str(accept), wp, "--verification", "--base", start,
+                                       "--head", head, "--root", str(root)], capture_output=True, text=True, env=env)
+                mode = re.findall(r"^LEDGER-MODE (\S+)$", proc.stdout, re.M)
+                tree_m = re.findall(r"^TESTS-TREE (\S+)$", proc.stdout, re.M)
+                expect(proc.returncode == 0 and mode and tree_m
+                       and tree_m[-1] == lanedlib.wp_tree_at(root, head, wp),
+                       f"batch {name}: {wp} --verification failed or printed no TESTS-TREE: {proc.stdout[-1500:]}")
+                entries[wp] = {"workflow": "laned-accept", "event": "pull_request",
+                               "mode": mode[-1] if mode else "expect-fail", "wp": wp, "head_sha": head,
+                               "conclusion": "success" if proc.returncode == 0 else "failure",
+                               "tests_tree": tree_m[-1] if tree_m else ""}
+            lanedlib.git(root, "checkout", "-q", branch)
+            lanedlib.git(root, "merge", "-q", "--squash", name)
+            return commit(f"{name} (#2)"), entries
+
+        three = {}
+        for n in (1, 2, 3):
+            three[f"tests/accept/b{n}/PATHS"] = f"b{n}/\n"
+            three[f"tests/accept/b{n}/test_b{n}.py"] = (f"import b{n}.mod\n\n\ndef test_b{n}():\n"
+                                                        f"    assert b{n}.mod.VALUE\n")
+        squash, entries = batch_pr("pr-batch", three, ["B1", "B2", "B3"])
+        _, data = level(list(entries.values()), "B1")
+        for wp in ("B1", "B2", "B3"):
+            det = data["wps"][wp]
+            expect(entries[wp]["mode"] == "expect-fail", f"batch {wp} ledger mode {entries[wp]['mode']}")
+            expect(det["level"] == "L1" and det.get("l1_commit") == squash and "l2_commit" not in det,
+                   f"batch {wp}: {det['level']} l1_commit={det.get('l1_commit')} l2={det.get('l2_commit')}, "
+                   f"want L1 at the squash merge {squash}, no L2")
+        trees = {entries[w]["tests_tree"] for w in entries}
+        expect(len(trees) == 3, f"batch WPs share a tests tree: {trees}")
+        # a run whose tests_tree is not on REF's first-parent line gives no L1;
+        # neither does another WP's tree
+        lv, _ = level([dict(entries["B1"], tests_tree="0" * 40)], "B1")
+        expect(lv == "L0", f"an expect-fail run for an unmerged tests tree gave {lv}, want L0")
+        lv, _ = level([dict(entries["B1"], tests_tree=entries["B2"]["tests_tree"])], "B1")
+        expect(lv == "L0", f"B1 took L1 from B2's tests tree: {lv}")
+        # a run without tests_tree (dispatch bootstrap) still gives L1 as before
+        lv, _ = level([{k: v for k, v in entries["B1"].items() if k != "tests_tree"}], "B1")
+        expect(lv == "L1", f"an expect-fail run without tests_tree gave {lv}, want L1")
+        # a batch with a declared verification WP: V2 (over C1's built file)
+        # takes L1 and L2 from the batch squash commit, B4 only L1
+        squash2, entries2 = batch_pr("pr-batch2", {
+            "tests/accept/b4/PATHS": "b4/\n",
+            "tests/accept/b4/test_b4.py": "import b4.mod\n\n\ndef test_b4():\n    assert b4.mod.VALUE\n",
+            "tests/accept/v2/PATHS": "c1/tool.py\n",
+            "tests/accept/v2/test_v2.py": "def test_v2():\n    assert True\n"}, ["B4", "V2"])
+        _, data = level(list(entries.values()) + list(entries2.values()), "V2")
+        v2, b4 = data["wps"]["V2"], data["wps"]["B4"]
+        expect(entries2["V2"]["mode"] == "verification" and v2["level"] == "L2"
+               and v2.get("l2_commit") == squash2 and v2.get("l2_via") == "verification",
+               f"batch V2: mode {entries2['V2']['mode']}, {v2}, want L2 via verification at {squash2}")
+        expect(b4["level"] == "L1" and b4.get("l1_commit") == squash2 and "l2_commit" not in b4,
+               f"batch B4: {b4}, want L1 at {squash2}")
+        expect(all(data["wps"][w]["level"] == "L1" for w in ("B1", "B2", "B3")),
+               "a later batch changed B1-B3's level")
+
+        # (6) BATCH IMPLEMENTATION (plan rev6.3 (b)): one squash merge
+        # implementing B1 and B2 (disjoint PATHS b1/, b2/) is the L2 commit of
+        # both; a merge with a file in no WP's PATHS is L2 for none (B3).
+        put("b1/mod.py", "VALUE = 1\n")
+        put("b2/mod.py", "VALUE = 1\n")
+        impl12 = commit("feat: B1 B2 (#3)")
+        put("b3/mod.py", "VALUE = 1\n")
+        put("README.md", "edited with B3\n")
+        commit("feat: B3 + a stray file (#4)")
+        _, data = level(list(entries.values()), "B1")
+        for wp in ("B1", "B2"):
+            det = data["wps"][wp]
+            expect(det["level"] == "L2" and det.get("l2_commit") == impl12
+                   and det.get("l2_via") == "implementation",
+                   f"batch impl {wp}: {det}, want L2 at {impl12}")
+        expect(data["wps"]["B3"]["level"] == "L1",
+               f"a merge with a stray file gave B3 {data['wps']['B3']['level']}, want L1")
+
+        # (7) FEATURE / LABELLED rules (rev6.17): one squash merge (#7)
+        # labelled F1 F2 carries F1's new tests, PATHS and code plus F2's code
+        # (overlapping PATHS fc/): F1's green `combined` row makes it F1's L1
+        # and L2, F2's label + f2/ change its L2. F3 (PATHS fc/ f3/, not
+        # labelled) gets nothing from #7 nor from #8, a merge labelled F1 that
+        # only changes fc/core.py (all inside F3's PATHS: the git-only rule
+        # would have said L2, the #817 / W5i case); #9, labelled F3 but
+        # changing only F3's tests, is no L2 either.
+        put(PLAN, (root / PLAN).read_text() + "".join(
+            f"| {w} | feature {w} | — | ci | `scripts/laned/accept {w}` |\n" for w in ("F1", "F2", "F3")))
+        put("tests/accept/f2/PATHS", "fc/\nf2/\n")
+        put("tests/accept/f2/test_f2.py", "def test_f2():\n    assert True\n")
+        put("tests/accept/f3/PATHS", "fc/\nf3/\n")
+        put("tests/accept/f3/test_f3.py", "def test_f3():\n    assert True\n")
+        f_tests = commit("tests F2 F3 (#6)")
+        put("tests/accept/f1/PATHS", "fc/\nf1/\n")
+        put("tests/accept/f1/test_f1.py", "def test_f1():\n    assert True\n")
+        put("fc/core.py", "VALUE = 1\n")
+        put("f1/mod.py", "VALUE = 1\n")
+        put("f2/mod.py", "VALUE = 1\n")
+        feat = commit("feat(laned): F1 F2 core (#7)")
+        put("fc/core.py", "VALUE = 2\n")
+        only_core = commit("fix(laned): F1 core (#8)")
+        put("tests/accept/f3/test_f3_more.py", "def test_more():\n    assert True\n")
+        commit("tests(laned): F3 more (#9)")
+
+        def pr_row(w: str, m: str, pr: int) -> dict:
+            return {"workflow": "laned-accept", "event": "pull_request", "wp": w, "mode": m, "pr": pr,
+                    "head_sha": "0" * 40, "conclusion": "success", "created_at": "2026-11-23T01:00:00Z"}
+
+        f_runs = [pr_row("F1", "combined", 7), pr_row("F2", "accept", 7), pr_row("F1", "accept", 8),
+                  pr_row("F3", "tests-correction", 9)]
+        f_runs += [{"workflow": "laned-accept", "event": "pull_request", "mode": "expect-fail", "wp": w,
+                    "head_sha": f_tests, "conclusion": "success"} for w in ("F2", "F3")]
+        _, data = level(f_runs, "F1")
+        f1, f2, f3 = (data["wps"][w] for w in ("F1", "F2", "F3"))
+        expect(f1["level"] == "L2" and f1.get("l1_commit") == feat and f1.get("l2_commit") == feat,
+               f"feature F1: {f1}, want L1 + L2 at {feat}")
+        expect(f2["level"] == "L2" and f2.get("l2_commit") == feat, f"feature F2: {f2}, want L2 at {feat}")
+        expect(f3["level"] == "L1" and "l2_commit" not in f3,
+               f"F3 (never labelled on a code merge): {f3}, want L1")
+        # without any label knowledge the git-only rule takes #8 as F3's L2
+        # (the old behaviour); a labels file saying #8 carried only laned:F1
+        # restores the LABELLED rule
+        legacy = [r for r in f_runs if "pr" not in r]
+        _, data = level(legacy, "F1")
+        expect(data["wps"]["F3"].get("l2_commit") == only_core,
+               f"legacy git-only rule: F3 {data['wps']['F3']}, want L2 at {only_core}")
+        labels_file = Path(tmp) / "pr_labels.json"
+        labels_file.write_text(json.dumps([{"number": n, "labels": [{"name": f"laned:{w}"} for w in ws]}
+                                           for n, ws in ((7, ("F1", "F2")), (8, ("F1",)), (9, ("F3",)))]))
+        saved_labels = os.environ.get("LANED_PR_LABELS")
+        os.environ["LANED_PR_LABELS"] = str(labels_file)
+        try:
+            _, data = level(legacy, "F1")
+        finally:
+            if saved_labels is None:
+                os.environ.pop("LANED_PR_LABELS", None)
+            else:
+                os.environ["LANED_PR_LABELS"] = saved_labels
+        expect(data["wps"]["F3"]["level"] == "L1" and data["wps"]["F2"].get("l2_commit") == feat,
+               f"labels file: F3 {data['wps']['F3']}, F2 {data['wps']['F2']}")
+    for f in failures:
+        print(f"status selftest: FAIL {f}", file=sys.stderr)
+    if failures:
+        return 1
+    print("status selftest: ok")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["selftest"]:
+        return cmd_selftest()
+    ap = argparse.ArgumentParser(prog="status", description=__doc__.split("\n\n")[0])
+    ap.add_argument("--root", default=".")
+    ap.add_argument("--ref", default="origin/main")
+    ap.add_argument("--ci-results", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--release-tag-glob")
+    ap.add_argument("--push", metavar="REMOTE")
+    ap.add_argument("--include", action="append", default=[], metavar="SRC:DEST",
+                    help="extra file committed to laned/build-state with --push")
+    args = ap.parse_args(argv)
+    root = Path(args.root).resolve()
+    tree = RefTree(root, args.ref)
+    plan_text = tree.show(PLAN)
+    if plan_text is None:
+        print(f"status: {PLAN} not found at {args.ref}", file=sys.stderr)
+        return 1
+    ci_path = lanedlib.resolve(root, args.ci_results)
+    runs = json.loads(ci_path.read_text()).get("runs", []) if ci_path.is_file() else []
+    data = compute(tree, parse_plan(plan_text), runs, args.release_tag_glob)
+    out = lanedlib.resolve(root, args.out)
+    md_path = out / "docs" / "plans" / "STATUS.md"
+    json_path = out / "status" / "laned_build.json"
+    md_path.parent.mkdir(parents=True, exist_ok=True)
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    json_path.write_text(json.dumps(data, indent=2, sort_keys=False) + "\n")
+    md_path.write_text(render_md(data))
+    summary = ", ".join(f"{wp} {v['level']}" for wp, v in data["wps"].items())
+    print(f"status: {len(data['wps'])} WP(s) at {tree.commit[:12]}: {summary}")
+    if args.push:
+        files = {"docs/plans/STATUS.md": md_path, "status/laned_build.json": json_path}
+        for spec in args.include:
+            src, _, dest = spec.partition(":")
+            if not dest:
+                ap.error(f"--include needs SRC:DEST, got {spec!r}")
+            files[dest] = lanedlib.resolve(root, src)
+        commit = push(root, args.push, files, tree.commit)
+        print(f"status: pushed {commit[:12]} to {args.push} {BUILD_STATE}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,10 @@
+# W7d (plan rev6 §3.0 W7d row, §14.3, §3.2 invariants 7 and 12; README.md
+# has the contract). rev6.18 B2 (owner 2026-11-23, "One lane D checker for
+# outside validators"): the satellite replay (cascade/satellite/, deleted) is
+# no longer a second checker; its rules live in the audit as the chain rules
+# of check_lane_d, which they never import (invariant 12).
+cascade/audit/lane_d_chain.py
+# check_lane_d(..., chain=, uid_of=): the chain rules' mismatch paths as B3
+# alert codes, and the per-report court / king_after rules ported from the
+# replay (burn codes).
+cascade/audit/lane_d.py

@@ -1,0 +1,7 @@
+# W7b report signing (plan rev6 §3.0 W7b row, §1.5, §14.3; README.md has the
+# contract).
+# SIGNATURE_SCHEME, SIGNATURE_PATTERN, pinned_report_signer, and the strict
+# sign_report / verify_report (validate first, canonical hex only, pinned signer).
+cascade/validator/lane_d_report.py
+# properties.signature.pattern: the published signature encoding.
+cascade/validator/schemas/lane_d_report_1.json

@@ -1,0 +1,200 @@
+# Publish the MarketCast eval snapshot (DEC-CA-0064) from the forge bar recording.
+#
+# The bars are recorded forward on the TSBench-Forge scrape host
+# (`cascade-pool mkt-record`, every 10 min: Hyperliquid 1m bars + funding, and
+# the native 5m / 15m / 1h banks once #453 lands) and mirrored hourly to the
+# forge bucket under `marketcast/bars/`, in MktBarStore's own layout. This job
+# syncs that prefix down and runs `cascade-pool publish --lane mkt --bar-store`,
+# which builds the snapshot, signs it with the main validator's hotkey and
+# publishes `pool_mkt/snapshots/block-<N>.tar` + `pool_mkt/index.json` to the
+# pool bucket. It is the CI form of docs/OPERATOR.md's
+# `30 */6 * * * cascade-pool publish --lane mkt ...` line.
+#
+# Same key scoping as publish-pool.yml: the FORGE READ key only on the sync,
+# the CASCADE / POOL / BACKUP keys only on the publish.
+#
+# REQUIRED repo secrets (in addition to publish-pool.yml's):
+#   MKT_SIGNER_HOTKEY   the main validator's HOTKEY file (the JSON bittensor
+#                       keeps at wallets/<name>/hotkeys/<hotkey>; never the
+#                       coldkey). Its ss58 must equal [netconfig] owner_hotkey
+#                       or the CLI refuses: validators reject any other signer.
+#
+# Inert while MarketCast is off: a SCHEDULED run exits 0 before building when
+# the chosen toml has [marketcast] from_block = 0. A dispatched run always
+# builds; its default effective_block is the same inert sentinel publish-pool.yml
+# uses (never selected by a validator), so a dispatch is a safe end-to-end test.
+#
+# Not covered here: dTAO alpha (`mkt-record-alpha` must sample the chain every
+# minute; no host records it yet, so the alpha class is published empty) and
+# the Binance crypto cross-check (api.binance.com answers HTTP 451 to US
+# runners; the builder reports, never gates, on it).
+name: Publish MarketCast pool
+
+on:
+  schedule:
+    - cron: "30 */6 * * *"       # every 6 h, as docs/OPERATOR.md's MarketCast cron
+  workflow_dispatch:
+    inputs:
+      network:
+        description: "Which chain config to publish"
+        type: choice
+        options: [mainnet, testnet]
+        default: mainnet
+      effective_block:
+        description: "effective_block: 999999999999 = inert test snapshot; a real future epoch block for production; 'auto' needs a trainer manifest"
+        required: false
+        default: "999999999999"
+
+concurrency:
+  group: publish-mkt-pool      # pool_mkt/index.json has one writer
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # Measured 2026-11-24 (run 45315434742): sync ~7 min, build ~47 min (the
+    # builder pages Hyperliquid's candle API per asset and bank and backs off
+    # on HTTP 429), then the relay mirror. 60 min cancelled the mirror after a
+    # completed publish; the mirror now has its own step budget below.
+    timeout-minutes: 150
+    env:
+      HIPPIUS_S3_ACCESS_KEY: ${{ secrets.CASCADE_S3_ACCESS_KEY }}
+      HIPPIUS_S3_SECRET_KEY: ${{ secrets.CASCADE_S3_SECRET_KEY }}
+      POOL_S3_ACCESS_KEY: ${{ secrets.POOL_S3_ACCESS_KEY }}
+      POOL_S3_SECRET_KEY: ${{ secrets.POOL_S3_SECRET_KEY }}
+      TSFORGE_BUCKET: ${{ vars.TSFORGE_BUCKET || 'tsbench-forge-sources' }}
+      S3_ENDPOINT: ${{ vars.HIPPIUS_S3_ENDPOINT || 'https://s3.hippius.com' }}
+      NETWORK: ${{ github.event.inputs.network || 'mainnet' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.13.4"
+
+      - name: Install cascade (hippius + chain extras)
+        run: |
+          python scripts/check_tls_trust.py --system-only
+          uv pip install --system --python "$(which python)" "pip==26.2.2" -e ".[hippius,chain]"
+          python scripts/check_tls_trust.py
+
+      - name: Skip while MarketCast is off (scheduled runs only)
+        id: gate
+        run: |
+          TOML=chain.toml
+          [ "$NETWORK" = "testnet" ] && TOML=chain.testnet.toml
+          echo "toml=$TOML" >> "$GITHUB_OUTPUT"
+          fb=$(python -c "from cascade.shared.config import load_chain_config as l; print(l('$TOML').marketcast.from_block)")
+          echo "[marketcast] from_block = $fb in $TOML"
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "$fb" = "0" ]; then
+            echo "MarketCast is off; nothing to publish."
+            echo "run=" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=1" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The recording's day files are rewritten for ~48 h after their day, so
+      # there is no cache here: the prefix is small (tens of MB) and a full
+      # sync (~90k small files, mostly the 1h bank) takes ~15 min at 64 wide.
+      - name: Sync the bar recording down  (FORGE READ key only)
+        if: steps.gate.outputs.run
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.TSFORGE_S3_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TSFORGE_S3_SECRET_KEY }}
+          AWS_MAX_ATTEMPTS: "10"
+          AWS_RETRY_MODE: adaptive
+        run: |
+          test -n "$AWS_ACCESS_KEY_ID" || { echo "::error::TSFORGE_S3_ACCESS_KEY not set"; exit 1; }
+          aws configure set default.s3.max_concurrent_requests 64
+          aws configure set default.s3.max_queue_size 20000
+          ok=""
+          for pass in 1 2 3; do
+            if aws s3 sync "s3://${TSFORGE_BUCKET}/marketcast/bars" ./mkt/bars \
+                 --endpoint-url "$S3_ENDPOINT" --exact-timestamps; then
+              ok=1; break
+            fi
+            echo "::warning::bar sync pass $pass failed; retrying the remainder"
+            sleep 30
+          done
+          test -n "$ok" || { echo "::error::bar sync failed after 3 passes"; exit 1; }
+          # freshness: the recorder runs every 10 min, so today's BTC day must exist
+          today=$(date -u +%F)
+          test -f "./mkt/bars/crypto/BTC/$today/close.npy" \
+            || { echo "::error::no bars for $today: the recorder or its mirror is down"; exit 1; }
+          echo "synced $(find ./mkt/bars -type f | wc -l) files"; du -sh ./mkt/bars
+
+      - name: Install the signer hotkey
+        if: steps.gate.outputs.run
+        env:
+          MKT_SIGNER_HOTKEY: ${{ secrets.MKT_SIGNER_HOTKEY }}
+        run: |
+          test -n "$MKT_SIGNER_HOTKEY" || { echo "::error::MKT_SIGNER_HOTKEY not set: an unsigned snapshot is refused by every validator"; exit 1; }
+          umask 077
+          mkdir -p "$RUNNER_TEMP/wallets/mkt/hotkeys"
+          printf '%s' "$MKT_SIGNER_HOTKEY" > "$RUNNER_TEMP/wallets/mkt/hotkeys/signer"
+
+      - name: Build + sign + publish  (CASCADE key)
+        if: steps.gate.outputs.run
+        env:
+          EFFECTIVE_BLOCK: ${{ github.event.inputs.effective_block || 'auto' }}
+          BACKUP_S3_ACCESS_KEY: ${{ secrets.BACKUP_S3_ACCESS_KEY }}
+          BACKUP_S3_SECRET_KEY: ${{ secrets.BACKUP_S3_SECRET_KEY }}
+        run: |
+          cascade-pool publish --lane mkt \
+            --chain-toml "${{ steps.gate.outputs.toml }}" \
+            --bar-store ./mkt/bars \
+            --wallet-name mkt --wallet-hotkey signer --wallet-path "$RUNNER_TEMP/wallets" \
+            --effective-block "$EFFECTIVE_BLOCK"
+
+      # Training pods read the RAW recording through the trainer's relay
+      # ([marketcast] bar_relay = "<pool bucket>/marketcast/bars/"), read with
+      # the pool keys like every pool reader. Mirror what was synced above into
+      # it. `sync` is a delta: a local file is uploaded only when its size
+      # differs or its mtime (the forge object's LastModified, set by the
+      # download above) is newer than the relay copy, so after the first full
+      # mirror each run sends only the day files rewritten since. An
+      # interrupted mirror is therefore resumable: the next run uploads only
+      # what is still missing. The step has its own budget so a slow mirror
+      # fails this step (visible, and the publish above has already landed)
+      # instead of hitting the job timeout.
+      - name: Mirror the recording into the pool bucket  (POOL key)
+        if: steps.gate.outputs.run
+        timeout-minutes: 60
+        env:
+          TOML: ${{ steps.gate.outputs.toml }}
+          AWS_MAX_ATTEMPTS: "10"
+          AWS_RETRY_MODE: adaptive
+        run: |
+          read -r RELAY ENDPOINT < <(python3 - "$TOML" <<'PY'
+          import sys, tomllib
+          c = tomllib.load(open(sys.argv[1], "rb"))
+          st, mc = c.get("storage", {}), c.get("marketcast", {})
+          print(mc.get("bar_relay", "") or "-",
+                st.get("pool_s3_endpoint") or st.get("s3_endpoint") or "https://s3.hippius.com")
+          PY
+          )
+          if [ "$RELAY" = "-" ]; then echo "bar_relay unset: nothing to mirror"; exit 0; fi
+          export AWS_ACCESS_KEY_ID="${POOL_S3_ACCESS_KEY:-$HIPPIUS_S3_ACCESS_KEY}"
+          export AWS_SECRET_ACCESS_KEY="${POOL_S3_SECRET_KEY:-$HIPPIUS_S3_SECRET_KEY}"
+          test -n "$AWS_ACCESS_KEY_ID" || { echo "::error::no POOL_S3 / CASCADE_S3 key to write the relay"; exit 1; }
+          ok=""
+          for pass in 1 2 3; do
+            if aws s3 sync ./mkt/bars "s3://${RELAY%/}" --endpoint-url "$ENDPOINT" --exact-timestamps; then
+              ok=1; break
+            fi
+            echo "::warning::relay mirror pass $pass failed; retrying the remainder"
+            sleep 30
+          done
+          test -n "$ok" || { echo "::error::relay mirror failed after 3 passes"; exit 1; }
+          echo "mirrored to s3://${RELAY%/} on $ENDPOINT"
+
+      - name: Remove the signer hotkey
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/wallets"

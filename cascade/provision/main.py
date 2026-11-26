@@ -46,6 +46,14 @@ log = logging.getLogger("cascade.provision.main")
 
 # ── config (pure parse + validation; tested) ─────────────────────────────────
 
+# Every [provisioner.<stage>] built here (eval, mkt) rents GPUs (gpus_per_pod
+# >= 1). Owner rule 2026-11-24: GPU = Lium only, Shadeform = CPU hosts only —
+# a GPU stage naming shadeform is refused at load, and the default is Lium.
+# (The retired heat/final tables are not built here: their providers stay
+# reachable through provider_names for ledger teardown only.)
+GPU_STAGE_PROVIDERS = ("lium",)
+CPU_ONLY_PROVIDERS = frozenset({"shadeform"})
+
 
 def build_stage_policy(raw: dict, stage: str) -> StagePolicy:
     """One ``[provisioner.<stage>]`` table → a validated :class:`StagePolicy`."""
@@ -63,9 +71,15 @@ def build_stage_policy(raw: dict, stage: str) -> StagePolicy:
     price = float(raw.get("max_price_hr", 0))
     if price <= 0:
         raise ProvisionError(f"[provisioner.{stage}] max_price_hr must be > 0; got {price}")
-    providers = tuple(str(p) for p in raw.get("providers", ("lium", "shadeform")))
+    providers = tuple(str(p) for p in raw.get("providers", GPU_STAGE_PROVIDERS))
     if not providers:
         raise ProvisionError(f"[provisioner.{stage}] providers must list at least one adapter")
+    gpu_only_off = [p for p in providers if p.strip().lower() in CPU_ONLY_PROVIDERS]
+    if gpu_only_off:
+        raise ProvisionError(
+            f"[provisioner.{stage}] providers lists {gpu_only_off} on a GPU stage — GPUs rent "
+            "on Lium only; Shadeform is CPU-only (owner rule 2026-11-24). Drop it from "
+            f"providers (e.g. providers = {list(GPU_STAGE_PROVIDERS)!r})")
     candidates = []
     for i, c in enumerate(raw.get("candidate", ())):
         csku = str(c.get("sku", "")).strip()
@@ -97,7 +111,12 @@ def build_policy(raw: dict) -> ProvisionPolicy:
     ttl_epochs = int(top.get("ttl_epochs", 1))
     if ttl_epochs < 1:
         raise ProvisionError(f"ttl_epochs must be >= 1; got {ttl_epochs}")
-    return ProvisionPolicy(max_spend_per_round=max_spend, ttl_epochs=ttl_epochs, eval=eval_sp)
+    mkt_sp = build_stage_policy(top["mkt"], "mkt") if "mkt" in top else None
+    lease = float(top.get("mkt_lease_hours", 3.0))
+    if not 0 < lease <= 24:
+        raise ProvisionError(f"mkt_lease_hours must be in (0, 24]; got {lease}")
+    return ProvisionPolicy(max_spend_per_round=max_spend, ttl_epochs=ttl_epochs, eval=eval_sp,
+                           mkt=mkt_sp, mkt_lease_hours=lease)
 
 
 def provider_names(raw: dict, policy: ProvisionPolicy) -> list[str]:
@@ -107,6 +126,7 @@ def provider_names(raw: dict, policy: ProvisionPolicy) -> list[str]:
     orphan reaper."""
     top = raw.get("provisioner", raw)
     names = list(policy.eval.providers) if policy.eval is not None else []
+    names += list(policy.mkt.providers) if policy.mkt is not None else []
     for stage in ("heat", "final"):
         names += [str(p) for p in (top.get(stage, {}) or {}).get("providers", ())]
     return list(dict.fromkeys(names))
@@ -154,7 +174,7 @@ def make_health_check(policy: ProvisionPolicy, render: RenderSettings, *,
               sku: str = "", gpus: int = 0, attested_digest: str = "",
               adopted: bool = False) -> HealthReport:
         prof = render.profile_for(provider)
-        sp = policy.eval if stage == "eval" else None
+        sp = {"eval": policy.eval, "mkt": policy.mkt}.get(stage)
         # The gate asserts what was ACTUALLY rented — with SKU fallback the
         # device can be any configured candidate, not just the primary. The
         # loop always passes the rented sku/gpus (adopted pods: the ledger's),
@@ -313,7 +333,8 @@ def digest_env_command(digest: str, *, user: str = "root") -> str:
 
 
 def make_config_push(render: RenderSettings, *, box_chain_toml: str,
-                     pod_user: str, image_digest: str = "") -> callable:
+                     pod_user: str, image_digest: str = "",
+                     stage_images: dict | None = None, work_dir: str = "") -> callable:
     """Post-health-gate hook: push the BOX's deployed chain.toml onto every
     freshly gated pod (all stages), replacing the image-baked copy — and pin
     ``CASCADE_TRAIN_IMAGE_DIGEST`` into the pod's ``/etc/environment`` +
@@ -333,10 +354,38 @@ def make_config_push(render: RenderSettings, *, box_chain_toml: str,
     digest before this hook could matter); the
     push keeps the OTHER sections honest without an image rotation.
     Best-effort: a failed push leaves the baked copy — exactly the pre-hook
-    behaviour."""
+    behaviour.
+
+    ``stage_images`` (stage → worker image ref, ``"*"`` = every other stage):
+    a pod whose release has a legacy profile gets the WORKER CONFIG its
+    loader parses (:mod:`cascade.shared.worker_config`; kept tables verbatim,
+    written under ``work_dir``) instead of the full file, which an older
+    loader refuses. No entry / no profile ⇒ the full deployed file."""
     import os
 
     pinned = _sha256_of(image_digest)
+    images = dict(stage_images or {})
+
+    def _source_for(stage: str) -> str:
+        image = str(images.get(stage, images.get("*", "")) or "")
+        if not image:
+            return box_chain_toml
+        from ..shared.atomic import write_text_atomic
+        from ..shared.worker_config import worker_toml_for_image
+
+        try:
+            text, profile = worker_toml_for_image(
+                Path(box_chain_toml).read_text(encoding="utf-8"), image)
+        except (OSError, ValueError) as e:
+            log.warning("worker config for %s pods not derived (%s); pushing the full "
+                        "chain.toml", stage, e)
+            return box_chain_toml
+        if not profile:
+            return box_chain_toml
+        local = Path(work_dir or ".") / "_worker_config" / profile / "chain.deployed.toml"
+        local.parent.mkdir(parents=True, exist_ok=True)
+        write_text_atomic(local, text)
+        return str(local)
 
     def _push_digest_env(addr, stage: str, user: str) -> None:
         """Best-effort env pin — a failure leaves the pod exactly pre-hook
@@ -369,7 +418,7 @@ def make_config_push(render: RenderSettings, *, box_chain_toml: str,
                 "-i", os.path.expanduser(render.key_path),
                 "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
                 "-o", "ConnectTimeout=15",
-                box_chain_toml, f"{user}@{addr.ip}:{dest}"]
+                _source_for(stage), f"{user}@{addr.ip}:{dest}"]
         try:
             proc = subprocess.run(argv, capture_output=True, text=True, timeout=30)
         except Exception as e:  # noqa: BLE001 — best-effort: never gate a healthy pod
@@ -601,6 +650,15 @@ def _run(args) -> int:
         raise ProvisionError("eval_hosts_path must differ from hosts_path — the "
                              "validator's eval file must never clobber the trainer's fleet")
 
+    # MarketCast pod (DEC-CA-0064): [provisioner.mkt] + mkt_hosts_path — the
+    # main validator's --mkt-eval-hosts file (its request file sits beside it).
+    mkt_hosts_path = Path(top["mkt_hosts_path"]) if top.get("mkt_hosts_path") else None
+    if policy.mkt is not None and policy.mkt.max_pods > 0 and mkt_hosts_path is None:
+        raise ProvisionError("[provisioner.mkt] is configured but mkt_hosts_path is not "
+                             "set — the marketcast pod would have nowhere to publish")
+    if mkt_hosts_path is not None and mkt_hosts_path in (hosts_path, eval_hosts_path):
+        raise ProvisionError("mkt_hosts_path must differ from hosts_path and eval_hosts_path")
+
     # Operator's static [[host]] entries (e.g. a long-lived operator lane) — appended
     # verbatim to every hosts.toml publish so provisioner activity never drops them.
     static_hosts_text = ""
@@ -657,6 +715,7 @@ def _run(args) -> int:
         manifest_store=manifest_store,
         eval_hosts_path=eval_hosts_path,
         receipt_prefix=receipt_prefix,
+        mkt_hosts_path=mkt_hosts_path,
         health_check=make_health_check(
             policy, render,
             image_digest=cfg.training.train_image_digest,
@@ -671,7 +730,14 @@ def _run(args) -> int:
         bootstrap=bootstrap,
         prewarm=make_config_push(render, box_chain_toml=str(args.chain_toml),
                                  pod_user=str(top.get("pod_user", "root")),
-                                 image_digest=cfg.training.train_image_digest),
+                                 image_digest=cfg.training.train_image_digest,
+                                 # the release each stage's pods run: the fleet
+                                 # image (the gate's code fingerprint), MarketCast
+                                 # pods their own (worker config per release)
+                                 stage_images={"*": cfg.round.funded_pod_image,
+                                               "mkt": cfg.marketcast.pod_image
+                                               or cfg.round.funded_pod_image},
+                                 work_dir=str(work_root)),
         static_hosts_text=static_hosts_text,
         static_hosts_path=static_path,
         ssh_probe=lambda ip, port: wait_ssh_reachable(ip, port, timeout=300.0),
@@ -683,8 +749,11 @@ def _run(args) -> int:
                  or eval_hosts_path is None
                  else f"{policy.eval.max_pods}×{policy.eval.sku}"
                       f"({policy.eval.gpus_per_pod}x)→{eval_hosts_path}")
-    log.info("provisioner up: eval=%s cap=$%.2f/rental ttl=%d epoch(s)%s",
-             eval_desc, policy.max_spend_per_round, policy.ttl_epochs,
+    mkt_desc = ("off" if policy.mkt is None or policy.mkt.max_pods == 0
+                or mkt_hosts_path is None
+                else f"{policy.mkt.sku}≤{policy.mkt_lease_hours:g}h→{mkt_hosts_path}")
+    log.info("provisioner up: eval=%s mkt=%s cap=$%.2f/rental ttl=%d epoch(s)%s",
+             eval_desc, mkt_desc, policy.max_spend_per_round, policy.ttl_epochs,
              " [DRY RUN]" if args.dry_run else "")
     if args.once:
         loop.run_once()

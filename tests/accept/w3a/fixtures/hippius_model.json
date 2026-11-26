@@ -1,0 +1,17 @@
+{
+  "schema": "laned_w3a_fixture/1",
+  "endpoint_host": "s3.hippius.com",
+  "region": "decentralized",
+  "prefix_object_count": 0,
+  "bucket_lock_enabled": true,
+  "default_retention": null,
+  "bucket_has_policy": false,
+  "presigned_upload_part": "supported",
+  "single_put_max_bytes": 5368709120,
+  "copy_object_max_bytes": 5368709120,
+  "upload_part_copy": "supported",
+  "lock_on_multipart": "applied",
+  "bucket_policy": "enforced",
+  "subtoken": "bucket_scoped",
+  "compliance": "unshortenable"
+}

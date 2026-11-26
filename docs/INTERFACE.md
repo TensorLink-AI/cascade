@@ -384,6 +384,129 @@ submissions (`cascade submit`) skip the Hub entirely: the ZIP goes to the
 operator's vault and the chain commit is a `vault/direct@sha256:…` ref — see
 [MINER.md §5](MINER.md#5-submit).
 
+## Lane B submissions: declared rows and the benchmark ban
+
+A lane B generator uses the same repo layout and contract as above. You fund
+it with `POST /v1/lane-b/fund` (or `cascade lane-b fund`), naming the
+declared targets in `X-Lane-B-Targets`. The CLI sends the declared rows
+header from `cascade lane-b fund --declared-rows rows.json`, and one suite
+target from `--target suite:gift`. This section covers the two
+additions to that request: optional declared expert rows, and the
+contamination check on the submitted tree. The settings and their defaults
+are listed in [MINER.md](MINER.md#lane-b-track-settings).
+
+### Lane B declared rows header
+
+Send `X-Lane-B-Declared-Rows` to choose which expert rows your leg trains.
+Leave it out and the trainer picks the rows (ESFT selection), exactly as
+before. The value is one JSON object on one line:
+
+```text
+X-Lane-B-Declared-Rows: {"0": [3, 17, 40, 90], "4": [5, 9, 12, 20, 33, 41, 57, 60, 71, 88, 102, 130, 166, 200, 301, 499]}
+X-Lane-B-Declared-Rows: {"2": [0, 1, 2, 3, 4, 5, 6, 7]}
+X-Lane-B-Declared-Rows: {"9": [1, 2, 3, 4]}       refused: declared_rows_bad_layer
+X-Lane-B-Declared-Rows: {"1": [7, 300]}           refused: declared_rows_out_of_range
+X-Lane-B-Declared-Rows: [1, 2, 3]                 refused: declared_rows_malformed
+```
+
+Keys are MoE ordinals 0..6, one per MoE layer in model order. They are not
+block indices. Keys may be integers or decimal strings. Each value is a list
+of expert indices `0..E-1` for that layer, where `E` is the layer's expert
+count. A layer with rows must hold between `ceil(min_experts_frac × E)` and
+`floor(max_experts_frac × E)` distinct rows. Under the defaults
+(`min_experts_frac` `0.03125`, `max_experts_frac` `0.1484375`) that gives:
+
+| MoE ordinals | Experts `E` | Rows per declared layer |
+|---|---|---|
+| 0 | 128 experts | 4..19 |
+| 1, 2 | 256 experts | 8..38 |
+| 3, 4, 5, 6 | 512 experts | 16..76 |
+
+You can leave a layer out or give it an empty list, but at least one row in
+total is required. Duplicate keys or rows are refused.
+
+The intake parses the header before it checks the signature. A refusal is a
+400 with one of these codes:
+
+- `declared_rows_malformed`: not a JSON object, or a layer's value is not a list.
+- `declared_rows_bad_layer`: a key is not an ordinal in `0..6`, or one appears twice.
+- `declared_rows_out_of_range`: a row is not an integer index `0..E-1` of its layer.
+- `declared_rows_count`: duplicate rows, a count outside the layer's limits, or no rows at all.
+
+**Signing.** Without the header, the signed ref field is
+`"<targets>|<ref>"`, unchanged from before. With the header it becomes
+`"<targets>|<ref>|rows=<sha256>"`, where `<sha256>` is the hex SHA-256 of
+the canonical rows JSON (`canonical_declared_rows`): string ordinal keys in
+order, sorted rows, empty layers dropped, no whitespace. The hotkey signature
+therefore binds the rows, and the queue entry stores them as
+`declared_rows`. Declared rows are exclusive: an overlap with rows another
+leg holds defers the entry (see
+[MINER.md](MINER.md#lane-b-declared-expert-rows)).
+
+### Lane B suite targets and the embedded-benchmark ban
+
+When `[lane_b] suite_targets` is on, each bench suite is a target. Its target
+name goes in `X-Lane-B-Targets`, and its short code goes in the commitment:
+`suite:gift` is committed as `s-gift`, `suite:boom` as `s-boom`, `suite:time`
+as `s-time` and `suite:fev` as `s-fev`.
+
+No lane B submission may ship public benchmark series. While
+`[lane_b] contamination_hashset` is pinned, the intake fetches the committed
+tree after the identity check and scans it statically. It never runs the
+tree. `.py` files are parsed for number constants, `.json` files for
+numbers, and other files are read as raw numeric arrays and one-column text.
+Every sequence is matched against the pinned hash set.
+`cascade lane-b verify-repo <dir>` runs the same scan locally, read-only and
+offline, and prints the same `contamination` receipt. A tree that declares
+a `suite:<suite>` target must also fit the size cap
+`suite_target_max_repo_mb` (default `8` MiB), or the request is refused with
+413 `repo_too_large` before the scan runs.
+
+Contamination refusals, returned before anything is queued or vaulted:
+
+| Code | HTTP | Meaning |
+|---|---|---|
+| `benchmark_series_embedded` | 400 | A sequence matches a benchmark test window. |
+| `repo_too_large` | 413 | A suite-target tree is over `suite_target_max_repo_mb`. |
+| `contamination_budget_exceeded` | 413 | The bounded scan hit its window, time or memory budget. Ship less bulk numeric data. |
+| `contamination_hashset_unavailable` | 503 | The pinned hash set is not loaded. |
+| `repo_unavailable` | 503 | The tree could not be fetched. |
+| `contamination_scan_failed` | 503 | The scan did not complete. |
+
+The 503 codes fail closed, so retry later. Accepted requests, and the
+`benchmark_series_embedded` and `contamination_budget_exceeded` refusals,
+carry a `contamination` receipt with these keys:
+
+| Key | Value |
+|---|---|
+| `hashset_version` | Version of the pinned hash set. |
+| `result` | `clean`, `embedded` or `budget_exceeded`. |
+| `suite` | Suite of the first matching window, else null. |
+| `window_id` | That window's id, else null. |
+
+When no hash set is pinned, none of this applies and the reply is unchanged.
+
+## Lane D checkpoint interface (open weights)
+
+Lane D entries are weights, not generators; nothing above about generator
+code applies to them. A lane D entry is a `cascade_pyramid` checkpoint
+directory with exactly these files (`cascade/lane_d/intake.py`
+`ALLOWED_FILES`), and any other file is refused (`file_not_allowed`):
+
+| File | Must be |
+|---|---|
+| `config.json` | the contract's config: its `"moe"` object equals the contract's |
+| `model.py` | byte-identical to `cascade/trainer/pyramid_model.py` |
+| `forecast_wrapper.py` | byte-identical to `cascade/trainer/pyramid_wrapper.py` |
+| `weights.safetensors` | BF16 only (`[lane_d] dtypes`), the contract's tensor names and shapes, every value finite; F32 is refused (`dtype_mismatch`) |
+
+The entry digest is the sha256 of the canonical file manifest
+(`{"files": {name: {"sha256", "size"}}}`, sorted keys, compact). Context is
+declared at `ready` from `[lane_d] contexts`, not stored in the checkpoint.
+Nothing in an entry is ever imported or executed. Build and check one with
+`cascade lane-d export` and `cascade lane-d verify`; the full guide is
+[LANE_D.md](LANE_D.md).
+
 ## What good data looks like
 
 You're optimising for **downstream forecast generalisation** of the effective

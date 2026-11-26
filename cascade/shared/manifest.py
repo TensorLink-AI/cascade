@@ -198,6 +198,11 @@ _DIGEST_DROP_WHEN_DEFAULT: dict[str, tuple] = {
     # DEC-CA-0053: long-series handling. "last" = keep the final window (every
     # deployed config); "crop" is the deliberate digest bump.
     "long_series": ("last",),
+    # WB27 (plan rev6.21): the lane B leg levers — set only on a lane B expert
+    # leg contract; every lane A contract keeps its digest.
+    "lane_b_lr_scale": (1.0, 1),
+    "curriculum": ((), []),
+    "lane_b_stop_record": (False,),
 }
 
 

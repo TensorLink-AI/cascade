@@ -48,6 +48,7 @@ for _k in (FAKE, FAKE2):
         register_competition_kind(_k, eval="test forward-only eval", forward_only=True,
                                   parse_value=lambda v: v)
 M, V = "mkt:returns", "mkt:vol"
+MKT = "mkt:market"   # the shipped composite target
 FA, FB, FC = f"{FAKE}:a", f"{FAKE}:b", f"{FAKE}:c"
 MC = parse_marketcast({"from_block": 2 * ERA})          # MarketCast starts at 2 eras
 
@@ -161,7 +162,8 @@ def test_wind_down_pays_full_through_full_pay_capped_then_stops():
     assert FA in p and FB in p
     p, _ = paid(10 * ERA)                     # "short" leaves its full-pay period: no decay tail
     assert FA not in p and p[FB] == (1.0, True)
-    assert p[M] == (0.5, False)               # an active competition still decays normally
+    # an active competition's win ends with its full-pay duration (DEC-CA-0073)
+    assert M not in p
     p, _ = paid(11 * ERA + 5400)
     assert FB in p
     p, rec = paid(12 * ERA)                   # wind_down_max_eras = 6 eras after the end
@@ -346,31 +348,40 @@ def test_loader_refuses_a_non_boundary_until_block(tmp_path):
 # ── the shipped tomls: MarketCast only, weight 1, exactly as before ──────────
 
 
+# testnet: TESTNET-FAST (owner 2026-11-24, option A) arms MarketCast at 8515800
+SHIPPED_MKT_FROM = {"chain.toml": 9586800, "chain.testnet.toml": 8515800}
+
+
 def test_shipped_tomls_are_marketcast_only_weight_one_and_unchanged():
     for f in ("chain.toml", "chain.testnet.toml"):
         c = load_chain_config(ROOT / f)
         lc = c.lane_c
         assert lc.competitions == (LaneCCompetition("mkt", weight=1.0),)
         assert lc.competition_list == replace(lc, competitions=()).competition_list
-        # armed, the single competition is exactly the old equal split
+        # armed, the single competition pays its single composite target the whole pool
+        assert lc.targets == (MKT,)
         mc = replace(c.marketcast, from_block=4 * ERA)
         armed = replace(lc, from_block=2 * ERA)
-        st = LaneCState(slots={M: _win(M, "a", 4 * ERA, 1)})
+        st = LaneCState(slots={MKT: _win(MKT, "a", 4 * ERA, 1)})
         for block in (0, 3 * ERA, 4 * ERA - 1, 4 * ERA, 5 * ERA, 40 * ERA, 10**9):
             rec = lane_c_pay_record(st, block=block, era_blocks=ERA, cfg=armed, n_uids=8,
                                     mc=mc)
             live = mc.active(block)
-            assert rec["slots"] == (2 if live else 0)
-            assert rec["slot_frac"] == ({M: 0.5, V: 0.5} if live else {})
+            assert rec["slots"] == (1 if live else 0)
+            assert rec["slot_frac"] == ({MKT: 1.0} if live else {})
             assert [x["state"] for x in rec["competitions"]] == [
                 "active" if live else "pending"]
             v = _vec(rec, armed, 8)
-            want = armed.share / 2 * (rec["wins"][0]["multiplier"] if rec["wins"] else 0.0)
+            want = armed.share * (rec["wins"][0]["multiplier"] if rec["wins"] else 0.0)
             assert bool(rec["wins"]) == (live and block < 4 * ERA + 28 * ERA)   # TTL
             assert v[1] == pytest.approx(want) and sum(v) == pytest.approx(armed.share)
-        # MarketCast off (the shipped state): nothing active at any block
-        for block in (0, 7201, 10**9):
+        # the shipped state: nothing active before [marketcast] from_block
+        # (owner 2026-11-24: mainnet arms at 9586800; testnet at 8515800, TESTNET-FAST)
+        fb = SHIPPED_MKT_FROM[f]
+        for block in (0, 7201, *((fb - 1,) if fb else ()), *(() if fb else (10**9,))):
             assert lane_c_split(lc, block, ERA, c.marketcast)[1] == {}
+        if fb:
+            assert lane_c_split(lc, fb, ERA, c.marketcast)[1] == {MKT: 1.0}
 
 
 # ── overlay (DEC-CA-0057) ────────────────────────────────────────────────────
@@ -421,3 +432,27 @@ def test_status_and_dashboard_show_competitions():
     v = _vec(rec, lc, 4)
     split = emission_split(v, [], {"wins": []}, lane_c_pay=rec)
     assert split["lane_c"] == pytest.approx(lc.share / 2 / 3, abs=1e-6)
+
+
+def test_a_long_recipe_is_rechecked_against_the_end_before_any_rent(tmp_path):
+    """The dispatch checks the [lane_c] default leg (1 h); a MarketCast recipe
+    may ask up to [marketcast] max_leg_hours — once fetched, a leg that would
+    outrun the end fails uncharged before anything is rented."""
+    from cascade.funding.queue import COMPETITION_ENDED_CLASS
+    from cascade.trainer.lane_c_driver import LaneCDriver
+    from cascade.trainer.marketcast_runner import MktLegRecipe
+
+    from .test_lane_c_trainer_driver import FROM, KING, REF, Clock, E, FakeOps, _cfg, _fund
+
+    base = _cfg()
+    until = FROM + 2 * ERA
+    lc = replace(base.lane_c, competitions=(LaneCCompetition("mkt", until_block=until),))
+    c = SimpleNamespace(lane_c=lc, marketcast=base.marketcast)
+    ops = FakeOps(tmp_path, Clock())
+    ops.recipes[REF["ALFA"]] = MktLegRecipe(E, json.dumps({"leg_hours": 12.0}), False)
+    drv = LaneCDriver(c, ops, tmp_path / "d.json")
+    _fund(ops, "ALFA", E)
+    assert [x["hotkey"] for x in drv.tick(until - 400, 10, KING, FROM)] == ["ALFA"]
+    e = ops.q.get("ALFA")
+    assert (e.status, e.last_error_class, e.attempts) == ("failed", COMPETITION_ENDED_CLASS, 0)
+    assert ops.trained == [] and drv.st.open == []

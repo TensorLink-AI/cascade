@@ -1,0 +1,13 @@
+# W2b: [lane_d_ops] non-consensus operator table (vault bucket, pool_d
+# location, eval host, queue policy), read only by the main validator and the
+# lane D intake; never in receipts, digests or overlays.
+# The new module. NOT re-exported from cascade/shared/config/__init__.py
+# (that would put it on the satellite's import path).
+cascade/shared/config/lane_d_ops.py
+# The loader may tolerate / document the table (it must not import the module).
+cascade/shared/config/loader.py
+# overlay_policy()["operator_only"] gains "lane_d_ops".
+cascade/shared/netconfig.py
+# [lane_d_ops] defaults only (no secrets, no live hosts).
+chain.toml
+chain.testnet.toml

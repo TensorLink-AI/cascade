@@ -1,0 +1,12 @@
+# W2: [lane_d] config keys, real LaneDConfig.active(), ALLOWED["lane_d"].
+cascade/shared/config/lane_d.py
+cascade/shared/config/loader.py
+cascade/shared/netconfig.py
+# [lane_d] defaults only; from_block stays 0 (nothing armed).
+chain.toml
+chain.testnet.toml
+# Existing unit test pinning the placeholder behaviour (arming refused).
+tests/unit/test_lane_d_placeholder.py
+# F6 (plan rev6.18 B11): the retired [lane_d] keys' loader property;
+# rev6.23: [lane_d] king_decay joins them.
+tests/unit/test_config.py

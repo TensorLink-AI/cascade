@@ -57,7 +57,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from .expert_lane import paired_geomean_lcb
 from .public_guards import METRICS, MissingPublicGuard, _index, _usable, pair_public_rows
@@ -76,6 +76,10 @@ SUITES_V2 = (*SUITES, "fev")
 # bench_gate_min_win_rate; CONSENSUS, drop-when-default in receipt params).
 DEFAULT_TOLERANCE = 0.01
 DEFAULT_MIN_WIN_RATE = 0.5
+# LANE_D_PLAN §16 / D34 sentinel ratchet defaults ([v2] sentinel_ratchet /
+# sentinel_tau; read only when a sentinel is passed).
+DEFAULT_SENTINEL_RATCHET = True
+DEFAULT_SENTINEL_TAU = 0.01
 # Item-row suite key → the prefix of its two suite-level numbers in BenchScores.
 SCORE_PREFIX = {"gift": "gifteval", "boom": "boom", "time": "time", "fev": "fev"}
 
@@ -104,6 +108,11 @@ class BenchGateResult:
     win_rate: float = float("nan")
     tolerance: float = DEFAULT_TOLERANCE
     min_win_rate: float = DEFAULT_MIN_WIN_RATE
+    # LANE_D_PLAN §16 (armed eras only; None = unarmed, detail bytes
+    # unchanged): the held-out suite ``{"suite", "ratchet", "tau"}`` plus,
+    # when the D34 ratchet judged it, its ``n`` / ``masked`` / ``ratio`` /
+    # ``ratio_lcb`` / ``win_rate``. ``suites`` then holds only the others.
+    sentinel: dict | None = None
 
     def detail(self) -> dict | None:
         """The receipt record of a DEC-CA-0061 judgement (``None`` under
@@ -128,7 +137,24 @@ class BenchGateResult:
             v = getattr(self, k)
             if math.isfinite(v):
                 out[k] = float(v)
+        if self.sentinel is not None:
+            out["sentinel"] = _sentinel_body(self.sentinel)
         return out
+
+
+def _sentinel_body(sen: Mapping) -> dict:
+    """The detail's ``sentinel`` record: name, ratchet and tau, and the
+    finite per-suite numbers (strict JSON, like ``suites``)."""
+    out: dict = {"suite": str(sen["suite"]), "ratchet": bool(sen["ratchet"]),
+                 "tau": float(sen["tau"])}
+    for k, v in sorted(sen.items()):
+        if k in out or isinstance(v, bool) or not isinstance(v, (int, float)):
+            continue
+        if k in ("n", "masked"):
+            out[k] = int(v)
+        elif math.isfinite(v):
+            out[k] = float(v)
+    return out
 
 
 def uncomputable_bench_gate(reason: str, *, rule: str = RULE_V1,
@@ -187,6 +213,9 @@ def evaluate_bench_gate(
     chal_revisions: Mapping[str, str] | None = None,
     tolerance: float = DEFAULT_TOLERANCE,
     min_win_rate: float = DEFAULT_MIN_WIN_RATE,
+    sentinel: str | None = None,
+    sentinel_ratchet: bool = DEFAULT_SENTINEL_RATCHET,
+    sentinel_tau: float = DEFAULT_SENTINEL_TAU,
 ) -> BenchGateResult:
     """Judge one challenger against the king under ``rule``.
 
@@ -202,16 +231,40 @@ def evaluate_bench_gate(
     both are given, a suite both name on different revisions makes the gate
     uncomputable (king and challenger must be judged on identical public
     data, the GIFT gate's rule). ``None`` / empty = unchecked (every
-    trainer-report caller, byte-identical)."""
+    trainer-report caller, byte-identical).
+
+    ``sentinel`` (LANE_D_PLAN §16, an armed era's drawn suite; ``None`` =
+    unarmed, today's rule whatever the other two say): under rule v2 the
+    suite is held out — the verdict uses the other three, recorded under
+    ``detail()["sentinel"]``. With ``sentinel_ratchet`` (D34) the candidate
+    is also blocked when the sentinel's ratio LCB exceeds ``1 +
+    sentinel_tau`` (missing sentinel rows are then uncomputable); without it
+    the sentinel never moves the verdict. An unknown suite, or a sentinel
+    under the DEC-CA-0054 rule, raises ``ValueError``."""
+    sen0: dict | None = None
+    if sentinel is not None:
+        if sentinel not in SUITES_V2:
+            raise ValueError(f"unknown sentinel suite {sentinel!r}; expected one of "
+                             f"{SUITES_V2}")
+        if rule != RULE_V2:
+            raise ValueError(f"a sentinel suite needs the {RULE_V2} rule; got {rule!r}")
+        sen0 = {"suite": str(sentinel), "ratchet": bool(sentinel_ratchet),
+                "tau": float(sentinel_tau)}
     if king_revisions and chal_revisions:
         diff = sorted(s for s in set(king_revisions) & set(chal_revisions)
                       if str(king_revisions[s]) != str(chal_revisions[s]))
         if diff:
-            return uncomputable_bench_gate(
+            out = uncomputable_bench_gate(
                 "data-revision mismatch on " + ", ".join(
                     f"{s} (king {king_revisions[s]} != chal {chal_revisions[s]})" for s in diff),
                 rule=rule, tolerance=tolerance, min_win_rate=min_win_rate)
+            return out if sen0 is None else replace(out, sentinel=sen0)
     if rule == RULE_V2:
+        if sen0 is not None:
+            return _evaluate_v2_sentinel(
+                king_rows, chal_rows, king_scores, chal_scores, alpha=alpha, B=B,
+                seed=seed, min_items=min_items, tolerance=float(tolerance),
+                min_win_rate=float(min_win_rate), sentinel=sen0)
         return _evaluate_v2(king_rows, chal_rows, king_scores, chal_scores,
                             alpha=alpha, B=B, seed=seed, min_items=min_items,
                             tolerance=float(tolerance), min_win_rate=float(min_win_rate))
@@ -335,6 +388,8 @@ def detail_verdict(detail: Mapping) -> bool | None:
     says uncomputable; ``False`` when it is malformed."""
     if not detail.get("computed"):
         return None
+    if detail.get("sentinel") is not None:
+        return _sentinel_detail_verdict(detail)
     suites = detail.get("suites") or {}
     try:
         if any(not {"ratio", "ratio_lcb", "win_rate"} <= set(suites.get(s) or {})
@@ -346,6 +401,35 @@ def detail_verdict(detail: Mapping) -> bool | None:
             if not math.isclose(float(detail[k]), v, rel_tol=1e-9, abs_tol=1e-12):
                 return False
     except (KeyError, TypeError, ValueError):
+        return False
+    return not reason
+
+
+def _sentinel_detail_verdict(detail: Mapping) -> bool:
+    """:func:`detail_verdict` of an armed-era detail (LANE_D_PLAN §16): the
+    recorded ``suites`` must be exactly the three non-sentinel suites, their
+    re-derived numbers must equal the recorded ones, the thresholds decide,
+    and with the ratchet on the recorded sentinel ratio LCB must hold
+    ``<= 1 + tau``. ``False`` when malformed."""
+    sen = detail.get("sentinel")
+    suites = detail.get("suites") or {}
+    try:
+        held = sen["suite"]
+        if held not in SUITES_V2 or not isinstance(sen.get("ratchet"), bool):
+            return False
+        rest = tuple(s for s in SUITES_V2 if s != held)
+        if set(suites) != set(rest) or any(
+                not {"ratio", "ratio_lcb", "win_rate"} <= set(suites[s] or {}) for s in rest):
+            return False
+        tol, mwr = float(detail["tolerance"]), float(detail["min_win_rate"])
+        avg, worst, win, reason = combine_suites(suites, tolerance=tol, min_win_rate=mwr)
+        for k, v in (("avg_ratio", avg), ("worst_lcb", worst), ("win_rate", win)):
+            if not math.isclose(float(detail[k]), v, rel_tol=1e-9, abs_tol=1e-12):
+                return False
+        if sen["ratchet"]:
+            why = sentinel_ratchet_reason(held, float(sen["ratio_lcb"]), float(sen["tau"]))
+            reason = "; ".join(r for r in (reason, why) if r)
+    except (KeyError, TypeError, ValueError, AttributeError):
         return False
     return not reason
 
@@ -413,6 +497,90 @@ def _evaluate_v2(king_rows, chal_rows, king_scores, chal_scores, *, alpha: float
                    ratio_lcb=1.0 - ucb[suite], win_rate=suite_win_rate(logs))
     avg, worst, win, reason = combine_suites(suites, tolerance=tolerance,
                                              min_win_rate=min_win_rate)
+    return BenchGateResult(computed=True, passed=not reason, reason=reason, suite_ucb=ucb,
+                           suite_n=ns, suites=suites, avg_ratio=avg, worst_lcb=worst,
+                           win_rate=win, **common)
+
+
+def sentinel_ratchet_reason(suite: str, ratio_lcb: float, tau: float) -> str:
+    """CONSENSUS: the D34 ratchet's failure reason (``""`` = holds): the
+    sentinel's ratio LCB may not exceed ``1 + tau``. Shared by the gate and
+    :func:`detail_verdict`."""
+    if float(ratio_lcb) > 1.0 + float(tau):
+        return (f"sentinel {suite} regressed (ratio LCB {float(ratio_lcb):.5f} > "
+                f"{1.0 + float(tau):.5f}, ratchet)")
+    return ""
+
+
+def _evaluate_v2_sentinel(king_rows, chal_rows, king_scores, chal_scores, *, alpha: float,
+                          B: int, seed: int | str, min_items: int, tolerance: float,
+                          min_win_rate: float, sentinel: dict) -> BenchGateResult:
+    """DEC-CA-0061 rule v2 in an era with a held-out sentinel (LANE_D_PLAN
+    §16): exactly :func:`_evaluate_v2` over the three other suites (same
+    per-suite bootstrap at ``alpha / 4`` and seed ``{seed}|bench|{suite}``,
+    the same masking and minimum-task holds), the sentinel's numbers kept
+    out of ``suites`` and out of the three headline numbers. Ratchet off:
+    the sentinel's rows are not read at all, so it never moves a verdict.
+    Ratchet on (D34): the sentinel is checked like a guard suite (partial /
+    missing / masked / too few tasks hold, a failed required task fails) and
+    its ratio LCB must not exceed ``1 + tau`` — it can only block."""
+    held, ratchet, tau = str(sentinel["suite"]), bool(sentinel["ratchet"]), float(sentinel["tau"])
+    gate_suites = tuple(s for s in SUITES_V2 if s != held)
+    judged = SUITES_V2 if ratchet else gate_suites
+    ks, cs = _six_score(king_scores), _six_score(chal_scores)
+    ks = float("nan") if ks is None else ks
+    cs = float("nan") if cs is None else cs
+    sen: dict = {"suite": held, "ratchet": ratchet, "tau": tau}
+    common = dict(rule=RULE_V2, king_score=ks, chal_score=cs, tolerance=tolerance,
+                  min_win_rate=min_win_rate, sentinel=sen)
+    for suite in judged:
+        kr, cr = (king_rows or {}).get(suite) or {}, (chal_rows or {}).get(suite) or {}
+        if kr.get("partial") or cr.get("partial"):
+            return BenchGateResult(computed=False, passed=None,
+                                   reason=f"{suite}: partial benchmark report", **common)
+        if kr.get("status") != "ok" or cr.get("status") != "ok":
+            continue
+        king_items, king_dup = _index(kr.get("rows") or [])
+        chal_items, chal_dup = _index(cr.get("rows") or [])
+        for item, row in king_items.items():
+            if item in king_dup or not all(_usable(row.get(m)) for m in METRICS):
+                continue
+            candidate = chal_items.get(item) or {}
+            if item in chal_dup or not all(_usable(candidate.get(m)) for m in METRICS):
+                return BenchGateResult(computed=True, passed=False,
+                                       reason=f"{suite}: challenger failed required task {item}",
+                                       **common)
+    try:
+        paired = pair_public_rows(king_rows, chal_rows, benchmarks=judged, require=judged)
+    except MissingPublicGuard as e:
+        return BenchGateResult(computed=False, passed=None, reason=str(e), **common)
+    suites: dict[str, dict[str, float]] = {}
+    ucb: dict[str, float] = {}
+    ns: dict[str, int] = {}
+    for suite in judged:
+        logs = task_log_ratios(paired, suite)
+        k, c = _item_scores(paired, suite)
+        union = len(paired.items[f"{suite}_crps"]) + int(paired.dropped[f"{suite}_crps"])
+        masked = union - len(logs)
+        ns[suite] = len(logs)
+        row: dict = sen if suite == held else suites.setdefault(suite, {})
+        row.update(n=len(logs), masked=masked)
+        if union and masked / union > 0.1:
+            return BenchGateResult(computed=False, passed=None, suites=suites, suite_n=ns,
+                                   reason=f"{suite}: more than 10% of tasks masked", **common)
+        if len(logs) < min_items:
+            return BenchGateResult(computed=False, passed=None, suites=suites, suite_n=ns,
+                                   reason=f"{suite}: {len(logs)} usable tasks < {min_items}"
+                                          f" ({masked} masked)", **common)
+        ucb[suite] = paired_geomean_lcb(k, c, alpha=1.0 - alpha / len(SUITES_V2), B=B,
+                                        seed=f"{seed}|bench|{suite}")
+        row.update(ratio=math.exp(math.fsum(logs) / len(logs)),
+                   ratio_lcb=1.0 - ucb[suite], win_rate=suite_win_rate(logs))
+    avg, worst, win, reason = combine_suites(suites, tolerance=tolerance,
+                                             min_win_rate=min_win_rate)
+    if ratchet:
+        why = sentinel_ratchet_reason(held, sen["ratio_lcb"], tau)
+        reason = "; ".join(r for r in (reason, why) if r)
     return BenchGateResult(computed=True, passed=not reason, reason=reason, suite_ucb=ucb,
                            suite_n=ns, suites=suites, avg_ratio=avg, worst_lcb=worst,
                            win_rate=win, **common)

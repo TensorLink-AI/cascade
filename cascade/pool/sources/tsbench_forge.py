@@ -18,10 +18,17 @@ Design notes:
 * **Freshness/determinism** — only parquet files dated ``<= ctx.as_of`` are
   read and rows stamped after ``as_of`` are dropped, so re-building for a past
   ``as_of`` against the same mirror is reproducible (the audit hook).
-* **Staleness guard** — a source whose newest snapshot is older than
-  ``max_stale_days`` before ``as_of`` is skipped; if *every* catalog source is
-  stale the harvest raises instead of silently republishing old data (the
+* **Staleness guard** — a daily-or-faster source is fresh iff its newest
+  snapshot file is at most ``max_stale_days`` before ``as_of`` (unchanged
+  file-date rule). Slower-than-daily cadences and every rollup series are
+  judged by their newest observation too, within ``max_stale_days ×
+  cadence`` (see :func:`is_fresh`). Stale sources are skipped, and if *every* catalog source
+  is stale the harvest raises instead of silently republishing old data (the
   decoupled-cron failure mode).
+* **Rollups** — a catalog entry tagged ``rollup: sum|mean|last`` additionally
+  yields that feed aggregated to UTC-day (``.rollup_D``) and Monday-start
+  UTC-week (``.rollup_W``) cadence; see :func:`rollup_buckets` for the
+  complete-bucket rule. Untagged entries are unaffected.
 * **Clustering** — each series carries ``source=<catalog id>`` so the pool
   metadata records the cluster key the KOTH cluster bootstrap resamples
   (panel siblings and windows from one feed are correlated, not independent).
@@ -131,12 +138,165 @@ def resolve_frequency(freq: str) -> tuple[str, int] | None:
 # larger than this multiple of the median sampling interval (mirrors the
 # forge serving layer's contiguity rule).
 GAP_FACTOR = 8.0
+# ...except a SHORT scrape gap on a regular grid, which is bridged with NaN
+# slots instead of splitting (see ``_bridged_segment``): at most this long in
+# wall-clock seconds, and missing at most this fraction of the bridged
+# segment's expected (gridded) length. Date-templated fast feeds miss 6-25 min
+# every UTC midnight; splitting there cut 10 s feeds to their last day.
+BRIDGE_MAX_SECONDS = 3600.0
+BRIDGE_MAX_FRAC = 0.02
+# "Regular grid": at least this share of positive spacings within
+# ±BRIDGE_GRID_TOL of the median. Irregular feeds are never bridged.
+BRIDGE_GRID_SHARE = 0.9
+BRIDGE_GRID_TOL = 0.25
 # Preferred minimum segment length: horizon + the builder's default min_context.
 MIN_CONTEXT = 256
 
 # Timestamp formats "mixed" inference can't get: wikimedia's YYYYMMDDHH and
 # NDBC's space-separated stamps.
 _TS_FALLBACK_FORMATS = ("%Y%m%d%H", "%Y %m %d %H %M", "%Y %m %d")
+
+# ── rollups (catalog tag ``rollup: sum|mean|last``) ─────────────────────────
+# Aggregations a catalog entry may request. Any other value is ignored with a
+# warning (the tag is a cross-repo contract; cascade never guesses one).
+ROLLUP_AGGS = ("sum", "mean", "last")
+# Target cadences: (series-id suffix, bucket seconds, pandas freq, seasonal
+# period). Days are calendar UTC days; weeks are Monday-start UTC weeks
+# (Mon 00:00 → next Mon 00:00), which pandas spells "W" (= W-SUN, the week
+# ENDING Sunday). Daily keeps the reader's weekly cycle (resolve_frequency
+# "P1D"); weekly uses the annual cycle, which fits the builder's min_length.
+# A target is emitted only when it is strictly slower than the raw cadence.
+ROLLUP_TARGETS: tuple[tuple[str, int, str, int], ...] = (
+    ("D", 86_400, "D", 7),
+    ("W", 604_800, "W", 52),
+)
+# A bucket is complete iff its finite raw observations number at least
+# (1 - this) × the bucket's expected count (bucket seconds / raw cadence).
+# Mirrors the builder's default PoolBuildConfig.max_missing_frac (0.2): the
+# same share of missing points the builder tolerates per series is tolerated
+# per bucket; beyond it the bucket is NaN, never a partial aggregate.
+ROLLUP_MAX_MISSING_FRAC = 0.2
+_EPOCH_DOW_TO_MONDAY = 3  # 1970-01-01 was a Thursday: (day + 3) // 7 = Monday-start week
+
+
+def rollup_agg(entry: dict) -> str | None:
+    """The catalog entry's ``rollup`` aggregation, or ``None`` when untagged
+    (or tagged with a value outside :data:`ROLLUP_AGGS`, which is logged)."""
+    tag = entry.get("rollup")
+    if tag is None:
+        return None
+    if tag not in ROLLUP_AGGS:
+        log.warning("tsbench_forge: ignoring %s rollup=%r (allowed: %s)",
+                    entry.get("id"), tag, "|".join(ROLLUP_AGGS))
+        return None
+    return str(tag)
+
+
+def rollup_buckets(
+    sec: np.ndarray, values: np.ndarray, *, agg: str, raw_sec: float, bucket_sec: int,
+    max_missing_frac: float = ROLLUP_MAX_MISSING_FRAC,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Aggregate one channel of raw observations into calendar UTC buckets.
+
+    ``sec``: int64 UTC epoch seconds, ascending; ``values``: float, same length.
+    Returns ``(bucket_start_sec, aggregated)`` over the CONTIGUOUS bucket grid
+    from the first to the last bucket holding an observation.
+
+    Complete-bucket rule (pinned by test): with ``expected = bucket_sec /
+    raw_sec`` raw points per bucket, a bucket whose finite observations number
+    fewer than ``(1 - max_missing_frac) × expected`` is NaN — including the
+    leading/trailing partial days of a feed. A complete bucket aggregates its
+    finite observations:
+
+    * ``mean`` — their mean;
+    * ``last`` — the latest-timestamped one;
+    * ``sum``  — their sum; if the bucket is complete but short of
+      ``expected`` points (within tolerance) the sum is pro-rated to the full
+      bucket (``mean × expected``) — the bucket-level analogue of the
+      builder's gap interpolation, so a tolerated gap is never a fake dip.
+    """
+    sec = np.asarray(sec, dtype=np.int64)
+    vals = np.asarray(values, dtype=np.float64)
+    day = sec // 86_400
+    if bucket_sec == 86_400:
+        key = day
+    elif bucket_sec == 604_800:
+        key = (day + _EPOCH_DOW_TO_MONDAY) // 7
+    else:  # pragma: no cover - only the two calendar targets exist
+        raise ValueError(f"unsupported rollup bucket {bucket_sec}s")
+    if not key.size:
+        return np.empty(0, dtype=np.int64), np.empty(0)
+    k0 = int(key.min())
+    n_buckets = int(key.max()) - k0 + 1
+    if bucket_sec == 86_400:
+        starts = (np.arange(n_buckets, dtype=np.int64) + k0) * 86_400
+    else:
+        starts = ((np.arange(n_buckets, dtype=np.int64) + k0) * 7 - _EPOCH_DOW_TO_MONDAY) * 86_400
+
+    fin = np.isfinite(vals)
+    kf, vf = key[fin] - k0, vals[fin]
+    counts = np.bincount(kf, minlength=n_buckets).astype(np.float64)
+    out = np.full(n_buckets, np.nan)
+    expected = float(bucket_sec) / float(raw_sec)
+    complete = counts >= (1.0 - max_missing_frac) * expected
+    if agg == "last":
+        # Observations are ascending, so the last occurrence of each key is
+        # the latest one: first occurrence in the reversed array.
+        uniq, first_rev = np.unique(kf[::-1], return_index=True)
+        last = np.full(n_buckets, np.nan)
+        last[uniq] = vf[::-1][first_rev]
+        agg_vals = last
+    else:
+        sums = np.bincount(kf, weights=vf, minlength=n_buckets)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            if agg == "mean":
+                agg_vals = sums / counts
+            elif agg == "sum":
+                agg_vals = np.where(counts < expected, sums / counts * expected, sums)
+            else:
+                raise ValueError(f"unknown rollup aggregation {agg!r}")
+    out[complete] = agg_vals[complete]
+    return starts, out
+
+
+def freshness_window(cadence_sec: float | None, max_stale_days: int) -> dt.timedelta:
+    """How far behind ``as_of`` a series' newest point may lag: ``max_stale_days``
+    missed scrape cycles, a cycle being the slower of one day (the scrape
+    cron) and the series' own cadence. Daily-and-faster: exactly
+    ``max_stale_days`` days (the historical rule); weekly: ``max_stale_days``
+    weeks; monthly: ``max_stale_days`` nominal months."""
+    cycle = max(86_400.0, float(cadence_sec or 0.0))
+    return dt.timedelta(seconds=max_stale_days * cycle)
+
+
+def observation_freshness_applies(cadence_sec: float | None) -> bool:
+    """True iff a series' newest OBSERVATION is checked (not only its file
+    date): cadences slower than daily, plus every rollup series (checked in
+    ``_rollup_values``). Daily-or-faster raw feeds keep the file-date-only rule
+    so publication-lagged feeds stay admitted (owner 2026-11-23)."""
+    return cadence_sec is not None and float(cadence_sec) > 86_400
+
+
+def is_fresh(
+    *, as_of: dt.date, cadence_sec: float | None, max_stale_days: int,
+    newest_file: dt.date | None, newest_obs: dt.datetime | None,
+) -> bool:
+    """Freshness by the newest OBSERVATION relative to cadence.
+
+    Fresh iff both the newest snapshot-file date and the newest observation
+    timestamp (UTC; ``None`` = unknown, e.g. no parseable timestamps) are at or
+    after ``as_of 00:00 UTC − freshness_window(cadence)``. Requiring the file
+    too keeps every stale-file skip of the old rule (an observation can't be
+    fresher than the scrape that delivered it). Callers pass ``newest_obs``
+    only where :func:`observation_freshness_applies` (slower than daily) and
+    for rollup series; daily-or-faster raw feeds pass ``None`` (file date
+    only, the historical rule)."""
+    floor = dt.datetime.combine(as_of, dt.time(), tzinfo=dt.UTC) - freshness_window(
+        cadence_sec, max_stale_days)
+    if newest_file is not None and dt.datetime.combine(
+            newest_file, dt.time(), tzinfo=dt.UTC) < floor:
+        return False
+    return newest_obs is None or newest_obs >= floor
 
 
 class TsbenchForgeSource:
@@ -201,7 +361,6 @@ class TsbenchForgeSource:
         from ..families import catalog_families
 
         families = catalog_families(catalog)
-        stale_cutoff = ctx.as_of - dt.timedelta(days=self.max_stale_days)
         emitted = 0
         usable_sources = 0
         for entry in catalog:
@@ -220,17 +379,38 @@ class TsbenchForgeSource:
                 continue
             freq, seasonal_period = mapped
 
+            raw_sec = _iso_duration_seconds(str(entry.get("frequency", "")))
+
             files = self._snapshot_files(data_dir / sid, as_of=ctx.as_of)
             if not files:
                 continue
-            newest = _stem_date(files[-1])
-            if newest is not None and newest < stale_cutoff:
+            newest_file = _stem_date(files[-1])
+            if not is_fresh(as_of=ctx.as_of, cadence_sec=raw_sec,
+                            max_stale_days=self.max_stale_days,
+                            newest_file=newest_file, newest_obs=None):
                 continue  # cron fell behind for this feed; don't serve stale data
-            usable_sources += 1
+            # Daily-or-faster feeds keep the historical file-date-only rule (owner
+            # 2026-11-23: publication-lagged feeds stay admitted). The newest-
+            # observation rule applies only to slower-than-daily cadences.
+            slow = observation_freshness_applies(raw_sec)
+            if not slow:
+                usable_sources += 1
 
             df = self._load_frame(pd, pq, files)
             if df is None or df.empty:
                 continue
+            if slow:
+                newest_obs = self._newest_observation(pd, df, ctx)
+                if not is_fresh(as_of=ctx.as_of, cadence_sec=raw_sec,
+                                max_stale_days=self.max_stale_days,
+                                newest_file=newest_file, newest_obs=newest_obs):
+                    log.warning("tsbench_forge: skipping %s — newest observation %s is "
+                                "stale for its cadence (as_of=%s)", sid, newest_obs, ctx.as_of)
+                    continue
+                usable_sources += 1
+
+            agg = rollup_agg(entry)
+            targets = [t for t in ROLLUP_TARGETS if agg and raw_sec and raw_sec < t[1]]
             domain = str(entry.get("domain", "unknown"))
             dgp_class = str(entry.get("dgp_class", ""))
             # DEC-CA-0041 mv_channels contract (docs/EVAL_POOL.md): an ordered
@@ -242,28 +422,49 @@ class TsbenchForgeSource:
                 columns = mvc if self.mv_pack else [mvc[0]]
             else:
                 columns = None
-            for panel_key, values in self._iter_panel_series(pd, df, ctx, columns=columns,
-                                                             feed=sid):
-                if emitted >= ctx.max_series:
-                    log.warning(
-                        "tsbench_forge: max_series=%d reached at catalog entry %s; "
-                        "later catalog entries are dropped (catalog-order bias) — "
-                        "raise HarvestContext.max_series to cover the full catalog",
-                        ctx.max_series, sid,
-                    )
-                    return
+            for panel_key, values, sub in self._iter_panel_series(
+                    pd, df, ctx, columns=columns, feed=sid, with_frame=True):
                 suffix = "__".join(f"{k}_{v}" for k, v in panel_key.items())
                 series_id = f"tsforge__{sid}" + (f"__{suffix}" if suffix else "")
-                yield HarvestedSeries(
+                attrs = {"dgp_class": dgp_class, **panel_key, "source_family": families[str(sid)]}
+                out = [HarvestedSeries(
                     series_id=series_id,
                     values=values,
                     freq=freq,
                     domain=domain,
                     seasonal_period=seasonal_period,
                     source=sid,
-                    attrs={"dgp_class": dgp_class, **panel_key, "source_family": families[str(sid)]},
-                )
-                emitted += 1
+                    attrs=attrs,
+                )]
+                for tag, bucket_sec, r_freq, r_period in targets:
+                    rolled = self._rollup_values(
+                        pd, sub, [c for c in sub.columns if c.startswith("_panel_")], ctx,
+                        columns=columns, agg=agg, raw_sec=raw_sec, bucket_sec=bucket_sec,
+                    )
+                    if rolled is None:
+                        continue
+                    # Same source/family: a rollup is the SAME feed at another
+                    # cadence, so it adds no cluster to the KOTH bootstrap.
+                    out.append(HarvestedSeries(
+                        series_id=f"{series_id}.rollup_{tag}",
+                        values=rolled,
+                        freq=r_freq,
+                        domain=domain,
+                        seasonal_period=r_period,
+                        source=sid,
+                        attrs={**attrs, "rollup": agg},
+                    ))
+                for hs in out:
+                    if emitted >= ctx.max_series:
+                        log.warning(
+                            "tsbench_forge: max_series=%d reached at catalog entry %s; "
+                            "later catalog entries are dropped (catalog-order bias) — "
+                            "raise HarvestContext.max_series to cover the full catalog",
+                            ctx.max_series, sid,
+                        )
+                        return
+                    yield hs
+                    emitted += 1
 
         if usable_sources == 0:
             raise HarvestError(
@@ -312,22 +513,29 @@ class TsbenchForgeSource:
 
     # ---------------------------------------------------------------- series
 
-    def _iter_panel_series(self, pd, df, ctx: HarvestContext, *, columns=None, feed: str = ""):
-        """Yield ``(panel_key, values)`` per panel row (or once when unpaneled).
+    def _iter_panel_series(self, pd, df, ctx: HarvestContext, *, columns=None, feed: str = "",
+                           with_frame: bool = False):
+        """Yield ``(panel_key, values)`` per panel row (or once when unpaneled);
+        ``(panel_key, values, row_frame)`` when ``with_frame`` (rollups re-read
+        the row's raw observations).
 
         ``columns`` (DEC-CA-0041): the specific value-columns to emit — a
         length-1 list projects to one univariate channel, a longer list packs an
         aligned ``(C, L)`` group. ``None`` keeps the densest-column default."""
+        def item(panel_key, values, sub):
+            return (panel_key, values, sub) if with_frame else (panel_key, values)
+
         panel_cols = [c for c in df.columns if c.startswith("_panel_")]
         if not panel_cols:
             values = self._extract_values(pd, df, panel_cols, ctx, columns=columns)
             if values is not None:
-                yield {}, values
+                yield item({}, values, df)
             return
         groups = df.groupby(panel_cols, sort=True)
         if self.panel_sample_seed is not None:
-            yield from self._iter_sampled_panel(pd, groups, panel_cols, ctx,
-                                                columns=columns, feed=feed)
+            for panel_key, values, sub in self._iter_sampled_panel(
+                    pd, groups, panel_cols, ctx, columns=columns, feed=feed):
+                yield item(panel_key, values, sub)
             return
         for n_done, (key, sub) in enumerate(groups):
             if n_done >= self.max_series_per_source:
@@ -338,7 +546,7 @@ class TsbenchForgeSource:
             }
             values = self._extract_values(pd, sub, panel_cols, ctx, columns=columns)
             if values is not None:
-                yield panel_key, values
+                yield item(panel_key, values, sub)
 
     def _iter_sampled_panel(self, pd, groups, panel_cols, ctx: HarvestContext, *,
                             columns=None, feed: str = ""):
@@ -361,21 +569,13 @@ class TsbenchForgeSource:
             values = self._extract_values(pd, sub, panel_cols, ctx, columns=columns)
             if values is not None:
                 kept += 1
-                yield panel_key, values
+                yield panel_key, values, sub
 
-    def _extract_values(self, pd, df, panel_cols: list[str], ctx: HarvestContext,
-                        *, columns=None):
-        """One panel row's frame → a clean-enough float array, or ``None``.
-
-        Sorts by parsed timestamp, drops post-``as_of`` rows, and keeps the
-        freshest contiguous segment. With ``columns=None`` it picks the densest
-        numeric value column and returns 1-D (categorical feeds skipped — rank
-        codes are meaningless under MASE/CRPS). With ``columns`` given
-        (DEC-CA-0041) it takes exactly those, aligned on the shared segment:
-        one column → 1-D, several → ``(C, L)``; a missing/non-numeric named
-        column drops the whole group (a tagged channel must be present).
-        NaN gaps are left in place; the builder interpolates or drops.
-        """
+    @staticmethod
+    def _sorted_frame(pd, df, ctx: HarvestContext):
+        """``(df, ts)`` sorted by parsed UTC timestamp with rows on/after
+        ``as_of + 1 day`` dropped; ``ts`` is ``None`` (``df`` untouched) when
+        the frame has no usable timestamps."""
         ts = None
         if "timestamp" in df.columns and len(df) > 1:
             ts = pd.to_datetime(df["timestamp"], errors="coerce", utc=True, format="mixed")
@@ -396,6 +596,62 @@ class TsbenchForgeSource:
                 df, ts = df[keep], ts[keep]
             else:
                 ts = None
+        return df, ts
+
+    @staticmethod
+    def _named_channels(df, columns, excluded):
+        """Exactly the named value-columns as float arrays, or ``None`` if any
+        is missing / non-numeric (a tagged channel must be present)."""
+        chans = []
+        for c in columns:
+            if c in excluded or c not in df.columns:
+                return None
+            try:
+                chans.append(df[c].astype(float).to_numpy())
+            except (TypeError, ValueError):
+                return None
+        return chans
+
+    @staticmethod
+    def _densest_column(df, excluded):
+        """``(finite_count, values)`` of the numeric column with the most finite
+        values (first wins ties), or ``(-1, None)``."""
+        best_finite, best = -1, None
+        for c in [c for c in df.columns if c not in excluded]:
+            try:
+                v = df[c].astype(float).to_numpy()
+            except (TypeError, ValueError):
+                continue
+            finite = int(np.isfinite(v).sum())
+            if finite > best_finite:
+                best_finite, best = finite, v
+        return best_finite, best
+
+    def _newest_observation(self, pd, df, ctx: HarvestContext) -> dt.datetime | None:
+        """Newest observation timestamp (UTC) at or before ``as_of`` across the
+        whole source frame, or ``None`` when timestamps are unusable."""
+        _, ts = self._sorted_frame(pd, df, ctx)
+        if ts is None or not len(ts):
+            return None
+        return ts.iloc[-1].to_pydatetime()
+
+    def _extract_values(self, pd, df, panel_cols: list[str], ctx: HarvestContext,
+                        *, columns=None):
+        """One panel row's frame → a clean-enough float array, or ``None``.
+
+        Sorts by parsed timestamp, drops post-``as_of`` rows, and keeps the
+        freshest contiguous segment. With ``columns=None`` it picks the densest
+        numeric value column and returns 1-D (categorical feeds skipped — rank
+        codes are meaningless under MASE/CRPS). With ``columns`` given
+        (DEC-CA-0041) it takes exactly those, aligned on the shared segment:
+        one column → 1-D, several → ``(C, L)``; a missing/non-numeric named
+        column drops the whole group (a tagged channel must be present).
+        NaN gaps are left in place; the builder interpolates or drops. Short
+        scrape gaps on a regular grid are bridged with NaN slots rather than
+        split at (:meth:`_bridged_segment`); the rollup path
+        (:meth:`_rollup_values`) keeps the plain :meth:`_freshest_segment`.
+        """
+        df, ts = self._sorted_frame(pd, df, ctx)
         if len(df) < 2:
             return None
 
@@ -405,41 +661,80 @@ class TsbenchForgeSource:
         if columns is not None:
             # DEC-CA-0041: pack exactly the named channels, aligned on ONE shared
             # freshest segment (they are columns of the same panel row).
-            chans = []
-            for c in columns:
-                if c in excluded or c not in df.columns:
-                    return None
-                try:
-                    chans.append(df[c].astype(float).to_numpy())
-                except (TypeError, ValueError):
-                    return None
+            chans = self._named_channels(df, columns, excluded)
+            if chans is None:
+                return None
             width = min(len(v) for v in chans)
             if width < 2:
                 return None
-            lo, hi = self._freshest_segment(
+            lo, hi, slots = self._bridged_segment(
                 ts_arr[:width] if ts_arr is not None else None, width,
                 min_len=ctx.horizon + MIN_CONTEXT,
             )
-            packed = np.stack([v[:width][lo:hi] for v in chans], axis=0)   # (C, L)
+            packed = np.stack([_on_grid(v[:width][lo:hi], slots) for v in chans],
+                              axis=0)   # (C, L)
             return packed[0] if packed.shape[0] == 1 else packed
 
-        candidates = [c for c in df.columns if c not in excluded]
-        best_finite, best = -1, None
-        for c in candidates:
-            try:
-                v = df[c].astype(float).to_numpy()
-            except (TypeError, ValueError):
-                continue
-            finite = int(np.isfinite(v).sum())
-            if finite > best_finite:
-                best_finite, best = finite, v
+        best_finite, best = self._densest_column(df, excluded)
         if best is None or best_finite < 2:
             return None
 
-        lo, hi = self._freshest_segment(
+        lo, hi, slots = self._bridged_segment(
             ts_arr, len(best), min_len=ctx.horizon + MIN_CONTEXT,
         )
-        return best[lo:hi]
+        return _on_grid(best[lo:hi], slots)
+
+    def _rollup_values(self, pd, df, panel_cols: list[str], ctx: HarvestContext, *,
+                       columns, agg: str, raw_sec: float, bucket_sec: int):
+        """One panel row's raw observations → its calendar-bucket rollup.
+
+        Same channel choice as :meth:`_extract_values` (named ``columns`` or the
+        densest column), bucketed by :func:`rollup_buckets` over the row's full
+        ``<= as_of`` history. The kept span is the freshest contiguous run of
+        COMPLETE buckets (all channels complete), by the same
+        :meth:`_freshest_segment` gap rule applied at the bucket cadence, from
+        its first to its last complete bucket: leading/trailing partial
+        buckets never enter, interior incomplete ones stay NaN for the
+        builder. ``None`` without usable timestamps, with < 2 complete
+        buckets, or when the newest complete bucket is stale for its cadence.
+        """
+        df, ts = self._sorted_frame(pd, df, ctx)
+        if ts is None or len(df) < 2:
+            return None
+        excluded = {"timestamp", *panel_cols}
+        if columns is not None:
+            chans = self._named_channels(df, columns, excluded)
+            if chans is None:
+                return None
+        else:
+            best_finite, best = self._densest_column(df, excluded)
+            if best is None or best_finite < 2:
+                return None
+            chans = [best]
+        epoch = pd.Timestamp("1970-01-01", tz="UTC")
+        sec = ((ts - epoch) // pd.Timedelta(seconds=1)).to_numpy(dtype=np.int64)
+
+        starts, rolled = None, []
+        for v in chans:
+            starts, r = rollup_buckets(sec, v, agg=agg, raw_sec=raw_sec, bucket_sec=bucket_sec)
+            rolled.append(r)
+        grid = np.stack(rolled, axis=0)                       # (C, n_buckets)
+        complete = np.flatnonzero(np.isfinite(grid).all(axis=0))
+        if complete.size < 2:
+            return None
+        lo, hi = self._freshest_segment(
+            starts[complete].astype("datetime64[s]"), int(complete.size),
+            min_len=ctx.horizon + MIN_CONTEXT,
+        )
+        g_lo, g_hi = int(complete[lo]), int(complete[hi - 1]) + 1
+        newest_end = dt.datetime.fromtimestamp(int(starts[g_hi - 1]) + bucket_sec,
+                                               tz=dt.UTC)
+        if not is_fresh(as_of=ctx.as_of, cadence_sec=bucket_sec,
+                        max_stale_days=self.max_stale_days,
+                        newest_file=None, newest_obs=newest_end):
+            return None
+        out = grid[:, g_lo:g_hi]
+        return out[0] if out.shape[0] == 1 else out
 
     @staticmethod
     def _freshest_segment(
@@ -462,6 +757,98 @@ class TsbenchForgeSource:
             if hi - lo >= min_len:
                 return lo, hi
         return max(segments, key=lambda p: p[1] - p[0])
+
+    @staticmethod
+    def _bridged_segment(
+        ts_arr: np.ndarray | None, n: int, *, min_len: int
+    ) -> tuple[int, int, np.ndarray | None]:
+        """:meth:`_freshest_segment` that BRIDGES short scrape gaps instead of
+        splitting at them. Returns ``(lo, hi, slots)``: rows ``lo:hi`` are the
+        chosen segment and ``slots`` (``None`` = no bridge inside it, output is
+        exactly ``values[lo:hi]``) gives each row's position on the series'
+        regular grid; :func:`_on_grid` puts NaN in the positions between.
+
+        A gap (> ``GAP_FACTOR`` x median spacing) is bridged only when the
+        series has a regular grid (``BRIDGE_GRID_SHARE`` of spacings within
+        ``BRIDGE_GRID_TOL`` of the median), the gap is <= ``BRIDGE_MAX_SECONDS``,
+        and its missing-slot count (``round(gap / median) - 1``) is <=
+        ``BRIDGE_MAX_FRAC`` of the bridged segment's expected length (its rows
+        plus every bridged slot in it). Anything else is a cut, exactly as
+        before; demoting a gap to a cut shrinks its segment, so the rule is
+        re-applied to a fixed point (monotone: cuts only get added).
+        Irregular series, and series with no bridgeable gap, return exactly
+        what :meth:`_freshest_segment` returns. Pure numpy, deterministic.
+
+        Why this still doesn't fabricate a level shift: the hazard the split
+        guards against is a window whose history and target sit on either side
+        of a long silent stretch, so the series appears to jump between two
+        adjacent points. Bridging never joins observations as neighbours — it
+        inserts NaN (never values) on the real time grid, so positions keep
+        their wall-clock meaning (the seasonal period stays aligned) and the
+        missing span stays visible as missing. Windows are cut by the builder,
+        not the reader; the builder fills NaN by linear interpolation across at
+        most ``BRIDGE_MAX_SECONDS`` and drops the whole series if more than its
+        ``max_missing_frac`` is missing, so a bridged span is at worst a short
+        straight line, never a step. Gaps longer than an hour (or > 2% of the
+        segment) still split.
+        """
+        if ts_arr is None or n < 3:
+            return 0, n, None
+        d = np.diff(ts_arr).astype("timedelta64[s]").astype(float)
+        pos = d[d > 0]
+        if not pos.size:
+            return 0, n, None
+        med = float(np.median(pos))
+        big = d > GAP_FACTOR * med
+        bridge = big & (d <= BRIDGE_MAX_SECONDS)
+        regular = float(np.mean(np.abs(pos - med) <= BRIDGE_GRID_TOL * med)) >= BRIDGE_GRID_SHARE
+        if not regular or not bridge.any():
+            lo, hi = TsbenchForgeSource._freshest_segment(ts_arr, n, min_len=min_len)
+            return lo, hi, None
+        missing = np.where(big, np.rint(d / med).astype(np.int64) - 1, 0)
+
+        def _segments():
+            bounds = [0, *(np.flatnonzero(big & ~bridge) + 1).tolist(), n]
+            return list(zip(bounds[:-1], bounds[1:], strict=False))
+
+        changed = True
+        while changed:
+            changed = False
+            for lo, hi in _segments():
+                g = np.flatnonzero(bridge[lo:hi - 1]) + lo     # gap index i: rows i, i+1
+                if not g.size:
+                    continue
+                expected = (hi - lo) + int(missing[g].sum())
+                bad = g[missing[g] > BRIDGE_MAX_FRAC * expected]
+                if bad.size:
+                    bridge[bad] = False
+                    changed = True
+
+        step = np.where(bridge, missing + 1, 1)
+        segments = _segments()
+        out_len = [1 + int(step[lo:hi - 1].sum()) for lo, hi in segments]
+        chosen = None
+        for k in range(len(segments) - 1, -1, -1):       # newest first
+            if out_len[k] >= min_len:
+                chosen = k
+                break
+        if chosen is None:
+            chosen = max(range(len(segments)), key=lambda k: out_len[k])
+        lo, hi = segments[chosen]
+        if not bridge[lo:hi - 1].any():
+            return lo, hi, None
+        slots = np.concatenate([[0], np.cumsum(step[lo:hi - 1])])
+        return lo, hi, slots
+
+
+def _on_grid(values: np.ndarray, slots: np.ndarray | None) -> np.ndarray:
+    """Place a segment's values at their grid ``slots`` with NaN between
+    (bridged scrape gaps); ``slots=None`` returns ``values`` unchanged."""
+    if slots is None:
+        return values
+    out = np.full(int(slots[-1]) + 1, np.nan, dtype=np.float64)
+    out[slots] = values
+    return out
 
 
 def _stem_date(p: Path) -> dt.date | None:

@@ -1346,6 +1346,12 @@ th, td, .stat .v, .tile .v, .gate-cell .v { font-variant-numeric:tabular-nums; }
     <div class="panel" id="la-ladder"></div>
   </div>
 
+  <!-- LANE_D_PLAN §16 rule 4 (W-S3): the era's sentinel numbers, non-gating -->
+  <div id="sentinel-wrap" hidden>
+    <div class="section-label"><span>Era sentinel (non-gating)</span><span id="sentinel-when" class="muted"></span></div>
+    <div class="panel" id="sentinel-board"></div>
+  </div>
+
   <div>
     <div class="section-label"><span id="verdict-title">Latest round</span><span class="muted"><span id="next-round"></span><span id="verdict-when"></span></span></div>
     <div class="verdict" id="verdict"></div>
@@ -1418,6 +1424,13 @@ th, td, .stat .v, .tile .v, .gate-cell .v { font-variant-numeric:tabular-nums; }
       <table><thead><tr><th>Round</th><th>Verdict</th><th>King</th><th>Challenger</th><th class="num">King error</th><th class="num">Chal error</th><th class="num">Win rate</th><th class="num">LCB</th><th class="num">Margin</th><th>When</th></tr></thead><tbody id="rounds"></tbody></table>
     </div></div>
   </div>
+
+  <details class="sec">
+    <summary class="section-label"><span>Lane D &middot; open weights</span><span class="muted">built, unarmed</span></summary>
+    <div class="panel">
+      <p>Lane D takes miner-trained BF16 weights for the fixed cascade_pyramid architecture, judged against the lane D king on forward-only private windows. It is armed only by a signed overlay at an era boundary; check <code>status/lane_d.json</code> and <code>cascade status --json</code> (<code>lanes.d</code>) for its live state. Guide: <a href="https://github.com/TensorLink-AI/cascade/blob/main/docs/LANE_D.md">docs/LANE_D.md</a>.</p>
+    </div>
+  </details>
 
   </div><!-- /page-main -->
 
@@ -2694,6 +2707,29 @@ function renderLaneALadder(){
   el.innerHTML='<div class="gate-row">'+cells+'</div>';
   when.textContent=kc&&kc.block?"check at block "+kc.block:"";
 }
+// status/v2.json sentinel: the era's held-out suite and each new lane D king's
+// published sentinel numbers (with the previous king's and the house's), as
+// published. Rows without a record show their state, never a number.
+function renderSentinel(){
+  var wrap=document.getElementById("sentinel-wrap"), el=document.getElementById("sentinel-board"), when=document.getElementById("sentinel-when"); if(!el) return;
+  var b=_v2&&_v2.sentinel;
+  if(!b||typeof b!=="object"){ wrap.hidden=true; return; }
+  wrap.hidden=false;
+  var era=b.era||{}, rows=b.kings||[];
+  var head='<p class="muted">'+esc(b.label||"non-gating")+'</p>'+
+    '<p>Suite this era: <b>'+esc(b.suite||"--")+'</b> &middot; drawn from '+esc((b.sentinel_suites||[]).join(", "))+'</p>';
+  if(!rows.length){ el.innerHTML=head+'<p class="muted">No new lane D king this era yet.</p>'; when.textContent=era.block!=null?"era block "+era.block:""; return; }
+  function nums(m){ return (m&&m.status==="ok")?fmt(m.crps,4)+' / '+fmt(m.mase,4):'<span class="muted">'+esc(m?m.status:"--")+'</span>'; }
+  var body=rows.map(function(r){
+    var st=String(r.state||""), cls=st==="ok"?"adv":(st==="fault"||st==="error"||st==="invalid"?"nofit":"wait"), m=r.models;
+    return '<tr><td><span title="'+esc(r.king_digest)+'">'+esc(shortHk(r.king_digest))+'</span></td>'+
+      '<td><span class="heat-pill '+cls+'"'+(r.reason?' title="'+esc(r.reason)+'"':'')+'>'+esc(st||"--")+'</span></td>'+
+      '<td class="num">'+(m?nums(m.king):'--')+'</td><td class="num">'+(m?nums(m.previous_king):'--')+'</td><td class="num">'+(m?nums(m.house):'--')+'</td>'+
+      '<td class="num">'+(r.boundary!=null?esc(r.boundary):'--')+'</td></tr>';
+  }).join("");
+  el.innerHTML=head+'<div class="scroll-box"><table><thead><tr><th>King</th><th>State</th><th class="num">King CRPS / MASE</th><th class="num">Previous king</th><th class="num">House</th><th class="num">Boundary</th></tr></thead><tbody>'+body+'</tbody></table></div>';
+  when.textContent=era.block!=null?"era block "+era.block:"";
+}
 function blockClockOr(b){ var cn=chainNow(); if(!cn) return "--"; var d=new Date(Date.now()+(b-cn.est)*cn.bt*1000); return d.toISOString().slice(0,16).replace("T"," ")+"Z"; }
 function v2ModelName(){ return v2IsLive()?cascadeMoEName(_v2.model):"toto2"; }
 
@@ -2880,6 +2916,16 @@ function renderLbDomains(){
 function renderLbPay(){
   var svg=document.getElementById("lb-pay-svg"), note=document.getElementById("lb-pay-note"), when=document.getElementById("lb-pay-when"); if(!svg) return;
   var p=lbPayout(), W=1000,H=330,PL=52,PR=16,PT=14,PB=30; svg.setAttribute("viewBox","0 0 "+W+" "+H);
+  if(p.rule==="indefinite"){
+    // LANE_D_PLAN rev6.22: a held slot pays its full slot share until replaced
+    var y1=PT+14;
+    svg.innerHTML='<line x1="'+PL+'" x2="'+(W-PR)+'" y1="'+y1+'" y2="'+y1+'" stroke="var(--good)" stroke-width="2.4"/>'+
+      '<text x="'+PL+'" y="'+(y1+24)+'" fill="var(--muted)" font-size="13">100% of the slot every settlement, no decay, no expiry, until a newer leg&rsquo;s merge passes on top of the holder</text>';
+    when.textContent=""; note.innerHTML="";
+    document.getElementById("lb-pay-title").innerHTML="Payout"+infoTip("Payout",
+      "A held slot pays 100% of its slot every settlement until a newer leg's merge passes acceptance on top of the holder. Empty slots "+(p.remainder==="lane_a"?"return to lane A.":"burn."));
+    return;
+  }
   if(!payTiers(p).length){ svg.innerHTML='<text x="'+(W/2)+'" y="'+(H/2)+'" text-anchor="middle" fill="var(--muted)" font-size="14">awaiting status/v2.json</text>'; note.textContent=""; when.textContent=""; return; }
   var unit=p.unit||"eras", ttl=Number(p.ttl)||0, maxA=ttl>0?ttl+2:Math.max(12,Number((payTiers(p)[0]||[0,0])[1])+8);
   function X(a){ return PL+a/maxA*(W-PL-PR); } function Y(v){ return PT+(1-v)*(H-PT-PB); }
@@ -3043,7 +3089,7 @@ function renderLcQueue(){
 }
 function renderLaneC(){ renderLcStatus(); renderLcTargets(); renderLcQueue(); }
 function renderLaneB(){ renderLbGate(); renderLbSat(); renderLbDomains(); renderLbPay(); renderLbEnter(); renderLbMoe(); }
-function renderV2(){ renderV2Strip(); renderHeader(); renderLaneALadder(); if(_page==="laneb") renderLaneB(); if(_page==="lanec") renderLaneC(); }
+function renderV2(){ renderV2Strip(); renderHeader(); renderLaneALadder(); renderSentinel(); if(_page==="laneb") renderLaneB(); if(_page==="lanec") renderLaneC(); }
 (function(){
   var bs=document.querySelectorAll("[data-satm]");
   for(var i=0;i<bs.length;i++) bs[i].addEventListener("click", function(){

@@ -3,8 +3,12 @@ miners): blast-radius classification and the timing / in-flight guards."""
 
 from __future__ import annotations
 
+import importlib.util
 import json
 from datetime import UTC, datetime
+from pathlib import Path
+
+import pytest
 
 from scripts import deploy_gate as g
 
@@ -89,3 +93,156 @@ def test_trainer_refused_while_work_holds_pods(tmp_path):
     assert [r for r, _ in _gate(tmp_path, vlines=CLOCK).refuse] == ["in_flight"]
     # the validator is not held by trainer legs
     assert not _gate(tmp_path, service="validator", vlines=CLOCK).refuse
+
+
+def test_new_services_scoring_and_notes(tmp_path):
+    scoring = CLOCK + [_vline("02:59:30", "new manifest round=42 entries=2 (king:uid1)")]
+    for svc in ("intake-laned", "eval-host"):
+        assert [r for r, _ in _gate(tmp_path, service=svc, vlines=scoring).refuse] == ["scoring"]
+        assert not _gate(tmp_path, service=svc, vlines=CLOCK).refuse
+    lane_d = _gate(tmp_path, service="trainer", paths=["cascade/lane_d/intake.py"], vlines=CLOCK)
+    assert any("intake-laned" in n for n in lane_d.notes)
+    own = _gate(tmp_path, service="intake-laned", paths=["cascade/lane_d/intake.py"], vlines=CLOCK)
+    assert not any("deploy the intake-laned" in n for n in own.notes)
+    ev = _gate(tmp_path, service="validator", paths=["cascade/validator/private_worker.py"],
+               vlines=CLOCK)
+    assert any("eval-host" in n for n in ev.notes)
+    # the eval-host sync is a validator-deploy step, not a trainer one
+    tr = _gate(tmp_path, service="trainer", paths=["cascade/validator/private_worker.py"],
+               vlines=CLOCK)
+    assert not any("eval-host" in n for n in tr.notes)
+
+
+def test_every_area_and_new_trees_classify():
+    a = g.classify(["cascade/lane_d/x.py", "cascade/laned/dedrift.py", "scripts/sync_king.py",
+                    "deploy/pod_bootstrap.sh", "benchmarks/Dockerfile", "base_generator/generator.py",
+                    "cascade/miner/cli.py", "cascade/pool/builder.py", "champions/king/x.json",
+                    ".github/workflows/ci.yml", "decided_votes.toml", ".python-version",
+                    ".dockerignore"])
+    assert a["lane_d_intake"] == ["cascade/lane_d/x.py"]
+    assert a["ops_tooling"] == ["cascade/laned/dedrift.py", "scripts/sync_king.py"]
+    assert a["deploy"] == ["deploy/pod_bootstrap.sh"] and a["benchmarks"] == ["benchmarks/Dockerfile"]
+    assert a["miner_kit"] == ["base_generator/generator.py", "cascade/miner/cli.py"]
+    assert a["pool"] == ["cascade/pool/builder.py"] and a["champions"] == ["champions/king/x.json"]
+    assert a["ci"] == [".github/workflows/ci.yml"] and a["chain_toml"] == ["decided_votes.toml"]
+    assert a["eval_host"] == ["cascade/miner/cli.py", "cascade/pool/builder.py", ".python-version"]
+    assert ".dockerignore" in a["worker_image"] and "cascade/lane_d/x.py" not in a["worker_image"]
+    # non-Python files under on-pod packages are not image code unless listed
+    assert "worker_image" not in g.classify(["cascade/website/index.html"])
+
+
+def test_evidence_only_diff_is_go_with_no_restart_notes(tmp_path):
+    paths = ["evidence/s0b_notes.json", "evidence/rv3.md", "evidence/w5.json"]
+    assert g.classify(paths) == {"evidence": paths}
+    for svc in g.SERVICES:
+        v = _gate(tmp_path, service=svc, paths=paths, vlines=CLOCK)
+        assert not v.refuse
+        assert [n for n in v.notes if not n.startswith("next settlement")] == []
+
+
+def _log(tmp_path, *lines):
+    p = tmp_path / "validator.log"
+    p.write_text("".join(f"{ln}\n" for ln in ("head",) + lines))
+    return p
+
+
+def test_verify_eval_host_from_validator_log(tmp_path):
+    since = datetime(2026, 11, 16, 2, 0, tzinfo=UTC)
+    up = _vline("02:30:00", "private eval: uploaded checkpoint abcd (0.1 GB) to valpriv in 9s")
+    hit = _vline("02:30:00", "private eval: checkpoint abcd already on valpriv (sha256 verified)")
+    old = _vline("01:30:00", "private eval: uploaded checkpoint abcd (0.1 GB) to valpriv in 9s")
+    bad = _vline("02:40:00", "private eval host valpriv runs code older than this validator")
+    assert g.verify("eval-host", tmp_path, _log(tmp_path, up), since=since) == []
+    assert g.verify("eval-host", tmp_path, _log(tmp_path, hit), since=since) == []
+    assert "not verified yet" in g.verify("eval-host", tmp_path, _log(tmp_path, old),
+                                          since=since)[0]
+    assert "failure" in g.verify("eval-host", tmp_path, _log(tmp_path, up, bad), since=since)[0]
+    assert g.verify("eval-host", tmp_path, tmp_path / "missing.log", since=since)
+
+
+def test_intake_process_match():
+    assert g._runs_module("intake-laned", [b"python", b"-P", b"-m", b"cascade.lane_d.intake"])
+    assert g._runs_module("intake-laned", [b"python", b"-m", b"cascade.lane_d"])
+    assert not g._runs_module("intake-laned", [b"python", b"-P", b"-m", b"cascade.lane_dx"])
+    assert not g._runs_module("intake-laned", [b"python", b"-P", b"-m"])
+    assert not g._runs_module("validator", [b"python", b"-P", b"-m", b"cascade.validator.main"])
+
+
+# ── the settlement grid comes from the chain config being deployed ───────────
+
+REPO = Path(__file__).resolve().parents[2]
+
+
+def test_grid_read_from_mainnet_and_testnet_configs():
+    main_grid = g.load_grid(REPO / "chain.toml")
+    test_grid = g.load_grid(REPO / "chain.testnet.toml")
+    assert main_grid.epoch_blocks == 900 and test_grid.epoch_blocks == 150
+    assert main_grid.boundaries(9516105) == (9515700, 9516600)
+    assert test_grid.boundaries(9516105) == (9516000, 9516150)
+
+
+def test_grid_switch_at_the_activation_block():
+    grid = g.Grid(150, epoch_blocks_prev=300, activation_block=600)
+    assert grid.boundaries(450) == (300, 600)
+    assert grid.boundaries(599) == (300, 600)
+    assert grid.boundaries(600) == (600, 750)
+    assert grid.boundaries(1000) == (900, 1050)
+    assert g.Grid(900).boundaries(9516105) == g.DEFAULT_GRID.boundaries(9516105)
+
+
+def test_gate_places_the_window_on_the_given_grid(tmp_path):
+    # block 9516140 at NOW: 10 blocks (2 min) before a 150-block boundary,
+    # inside testnet's scaled 3.3 min blackout (#787); 92 min before the next
+    # 900-block one.
+    testnet = g.load_grid(REPO / "chain.testnet.toml")
+    near = [_vline("02:59:00", "x block 9516135")]
+    v = g.gate(service="validator", areas={}, diff_text="", now=NOW, trainer_lines=[],
+               validator_lines=near, work=tmp_path, on_main=True, acks=set(), grid=testnet)
+    assert [r for r, _ in v.refuse] == ["settlement"]
+    v = g.gate(service="validator", areas={}, diff_text="", now=NOW, trainer_lines=[],
+               validator_lines=near, work=tmp_path, on_main=True, acks=set())
+    assert not v.refuse                                          # default 900 grid
+    assert not _gate(tmp_path, service="validator", vlines=CLOCK).refuse   # default 900 grid
+    mainnet = g.load_grid(REPO / "chain.toml")
+    v = g.gate(service="validator", areas={}, diff_text="", now=NOW, trainer_lines=[],
+               validator_lines=CLOCK, work=tmp_path, on_main=True, acks=set(), grid=mainnet)
+    assert not v.refuse
+
+
+def test_resolve_grid_order_and_default_note(tmp_path):
+    grid, note = g.resolve_grid(None, tmp_path)
+    assert grid == g.DEFAULT_GRID and "no chain config" in note and "900" in note
+    (tmp_path / "chain.toml").write_text("[round]\nepoch_blocks = 150\n")
+    grid, note = g.resolve_grid(None, tmp_path)
+    assert grid.epoch_blocks == 150 and str(tmp_path / "chain.toml") in note
+    grid, _ = g.resolve_grid(REPO / "chain.toml", tmp_path)          # --chain-toml wins
+    assert grid.epoch_blocks == 900
+    (tmp_path / "chain.toml").write_text("# no [round] table\n")
+    grid, note = g.resolve_grid(None, tmp_path)
+    assert grid == g.DEFAULT_GRID and "sets no [round] epoch_blocks" in note
+    (tmp_path / "bad.toml").write_text("[round]\nepoch_blocks = 0\n")
+    with pytest.raises(g.GridError):
+        g.resolve_grid(tmp_path / "bad.toml", tmp_path)
+
+
+def _window():
+    spec = importlib.util.spec_from_file_location("laned_window", REPO / "deploy/laned/window.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_window_uses_the_chain_config_grid(tmp_path, capsys):
+    w = _window()
+    # tail() drops the first line (it may be cut mid-line), so a header goes first
+    (tmp_path / "validator.log").write_text(_vline("02:58:00", "log opened") + "\n"
+                                            + CLOCK[0] + "\n")
+    now = "2026-11-16T03:00:00Z"
+    assert w.main(["--root", str(tmp_path), "--now", now]) == 0
+    out = capsys.readouterr().out
+    assert "NOTE no chain config" in out and "900" in out
+    assert w.main(["--root", str(tmp_path), "--now", now,
+                   "--chain-toml", str(REPO / "chain.testnet.toml")]) == 1
+    assert "REFUSE [settlement]" in capsys.readouterr().out
+    assert w.main(["--root", str(tmp_path), "--now", now,
+                   "--chain-toml", str(tmp_path / "missing.toml")]) == 2

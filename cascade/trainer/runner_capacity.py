@@ -43,6 +43,37 @@ def operator_lane_allowed(runner, hotkey: str | None, *, for_king: bool = False)
     return bool(refs) and str(getattr(entry, "ref", "") or "") in set(refs)
 
 
+def _lane_b_rent_skus(runner) -> tuple[str, ...] | None:
+    """WB22 (D42): lane B's measured ``[lane_b] funded_pod_skus`` while this
+    thread runs a lane B leg (``lane_b_gpus.rent_scope``), else None —
+    every lane A leg, whose rent path is unchanged. A module function, not a
+    method, so stub runners that borrow the mixin's methods keep working."""
+    skus = getattr(getattr(runner, "__dict__", {}).get("_leg_local_obj"),
+                   "lane_b_rent_skus", None)
+    return None if skus is None else tuple(skus)
+
+
+def _mkt_rent_skus(runner) -> tuple[str, ...] | None:
+    """Owner 2026-11-24: a MarketCast leg's GPU types (``[marketcast]
+    funded_pod_skus`` plus an own-risk chosen type) while this thread runs one
+    (``mkt_gpus.mkt_rent_scope``), else None."""
+    skus = getattr(getattr(runner, "__dict__", {}).get("_leg_local_obj"),
+                   "mkt_rent_skus", None)
+    return None if skus is None else tuple(skus)
+
+
+def _scoped_rent_skus(runner) -> tuple[tuple[str, ...], str] | None:
+    """``(skus, what)`` of the lane scope this thread rents under (lane B's
+    measured list, or a MarketCast leg's list), else None (lane A: unchanged)."""
+    lane_b = _lane_b_rent_skus(runner)
+    if lane_b is not None:
+        return lane_b, "lane B's measured [lane_b] funded_pod_skus"
+    mkt = _mkt_rent_skus(runner)
+    if mkt is not None:
+        return mkt, "the MarketCast GPU list ([marketcast] funded_pod_skus + own-risk choice)"
+    return None
+
+
 class _FundedCapacityMixin:
     """Marketplace capacity waits, per-SKU walls and rent deadlines (DEC-CA-0036)."""
 
@@ -50,7 +81,10 @@ class _FundedCapacityMixin:
         """``[round] funded_sku_per_leg``: every leg rents the cheapest listed
         GPU type that still fits instead of one locked type. Safe because
         rolling runs only past ``era_king_from_block``, where validators lift
-        the gpu_mismatch gate on mixed types."""
+        the gpu_mismatch gate on mixed types. A lane B leg (WB22 rent scope)
+        always picks per leg from lane B's own list, a MarketCast leg from its."""
+        if _scoped_rent_skus(self) is not None:
+            return True
         return bool(getattr(self.cfg.round, "funded_sku_per_leg", False))
 
     # Seconds between marketplace polls while a funded/king rent waits for a GPU.
@@ -106,11 +140,14 @@ class _FundedCapacityMixin:
             log.warning("%s: chosen GPU %s ignored — [round] funded_sku_per_leg is off "
                         "(one locked type)", who, gpu)
             return None
-        listed = tuple(getattr(self.cfg.round, "funded_pod_skus", ()) or ())
+        scoped = _scoped_rent_skus(self)
+        listed = (scoped[0] if scoped is not None
+                  else tuple(getattr(self.cfg.round, "funded_pod_skus", ()) or ()))
         sku = next((s for s in listed if s.lower() == gpu.lower()), None)
         if sku is None:
-            log.warning("%s: chosen GPU %s is no longer in [round] funded_pod_skus — "
-                        "renting the default (cheapest fitting) type", who, gpu)
+            log.warning("%s: chosen GPU %s is no longer in %s — renting the default "
+                        "(cheapest fitting) type", who, gpu,
+                        scoped[1] if scoped is not None else "[round] funded_pod_skus")
             return None
         caps = dict(self._funded_price_caps())
         caps["max_price_per_hour"] = float(getattr(choice, "max_price_per_hour", 0.0) or 0.0)
@@ -120,7 +157,11 @@ class _FundedCapacityMixin:
     def _funded_skus_for_rent(self) -> tuple[str, ...]:
         """GPU types a rent may pick: the locked ``funded_pod_sku``, or — with
         ``[round] funded_sku_per_leg`` (the open market) — every listed type,
-        cheapest fitting executor first."""
+        cheapest fitting executor first. A lane B leg (WB22) rents from lane
+        B's measured list only; a MarketCast leg from its own list."""
+        scoped = _scoped_rent_skus(self)
+        if scoped is not None:
+            return scoped[0]
         rnd = self.cfg.round
         if self._sku_per_leg_active():
             skus = tuple(getattr(rnd, "funded_pod_skus", ()) or ())
@@ -141,6 +182,18 @@ class _FundedCapacityMixin:
         contract = getattr(self.__dict__.get("_leg_local_obj"), "funded_contract", None)
         cap = (int(contract.max_train_seconds) if contract is not None else
                max(int(c.max_train_seconds) for c in self.cfg.throne_contracts()))
+        # W-IMG (owner 2026-11-24): the leg's image has no measured walls ⇒
+        # every SKU is planned at the unmeasured-image cap, never the table
+        from .cost_guards import unmeasured_wall_cap
+        from .leg_pins import leg_round_view
+
+        ucap = unmeasured_wall_cap(leg_round_view(self))
+        if ucap > 0:
+            return min(float(cap), ucap)
+        if _mkt_rent_skus(self) is not None:
+            # a MarketCast leg trains its recipe's wall (the contract's), on
+            # any GPU: lane A's full-budget wall table never applies to it
+            return float(cap)
         walls = tuple(getattr(rnd, "funded_sku_wall_seconds", ()) or ())
         if sku:
             return min(float(cap), funded_sku_wall_for(walls, sku, cap))

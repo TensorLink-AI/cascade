@@ -1,6 +1,7 @@
 """The release chain.toml as it shipped BEFORE 2026-11-13 typed the decided
 rollover and the resolved v2 launch: every DEC-CA-0043 rollover key back to
-its vote-open value and ``[v2] from_block`` / ``commit_from_block`` back to 0.
+its vote-open value and ``[v2] from_block`` / ``commit_from_block`` back to 0
+(and the 2026-11-20 ``[lane_c]`` / ``[marketcast] from_block``, which need it).
 
 Tests that exercise the on-chain rollover vote or the dated-launch resolution
 from a fresh node's point of view load this; tests about the shipped release
@@ -28,6 +29,10 @@ UNTYPED = (
     ("v2", "from_block", "0"),
     # absent before (the vote decided it): None = delete the typed line
     ("v2", "prelaunch_burn_from_block", None),
+    # owner 2026-11-20: MarketCast / lane C armed at an era boundary (fixtures
+    # untype it with the v2 launch it must follow)
+    ("lane_c", "from_block", "0"),
+    ("marketcast", "from_block", "0"),
 )
 
 

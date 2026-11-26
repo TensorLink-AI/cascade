@@ -62,7 +62,9 @@ KING = "5King"
 EB = 7200
 BLOCK = 20 * EB
 T0 = int(datetime(2026, 9, 1, tzinfo=UTC).timestamp())
-ANCHOR_T = T0 + 60_000                            # BLOCK ↔ T0 + 1000 minutes
+# BLOCK ↔ T0 + ~3333 minutes: 55 h of embargo history before the legs' dispatch
+# (DEC-CA-0074: the windows are drawn from it) and 27 h after
+ANCHOR_T = T0 + 200_000
 ASSETS = ("BTC", "ETH", "SOL", "XRP", "HYPE", "BNB")
 UIDS = {"alice": 7, "carol": 9, "dave": 10, "erin": 11}
 REF = {hk: f"{hk}/recipe@sha256:" + hashlib.sha256(hk.encode()).hexdigest() for hk in UIDS}
@@ -85,7 +87,13 @@ MC = parse_marketcast({
     "verdict_wait_blocks": 2 * EB, "max_infra_deferrals": 2,
     "min_time_blocks": 4, "min_dollar_volume_24h": 0.0,
     "coverage_tolerance": 0.1, "coverage_tolerance_over": 0.15,     # 180 windows a horizon
+    "forward_horizons": ["1m", "5m"],
 })
+
+
+def _bhash(block):
+    """A deterministic stand-in for a block's hash (the draw's seed)."""
+    return "0x" + hashlib.sha256(f"block-{block}".encode()).hexdigest()
 
 
 class _Fc:
@@ -163,7 +171,10 @@ def _entry(hk, *, train_block=BLOCK - 100, base_sha=None, ckpt=None, target="mkt
                                   "base_sha256": base_sha or MC.base_sha256,
                                   "checkpoint_sha256": ckpt or hashlib.sha256(
                                       hk.encode()).hexdigest(),
-                                  "train_time": _tt(train_block)})
+                                  "train_time": _tt(train_block),
+                                  # DEC-CA-0074: the trainer's pre-rent embargo scan
+                                  "embargo_scan": {"rule": "embargo-v1",
+                                                   "result": "no_generator"}})
 
 
 def _history(entries, blocks=None):
@@ -220,6 +231,7 @@ def _runner(cfg, tmp_path, store, snaps, *, history, main=True, mc=MC, verify=Fa
     r.mkt_forecaster_fn = lambda key: (calls[key], r._covs.get(key, ()))
     r.mkt_snapshot_fn = lambda block: (snaps(block), f"pool_mkt/snapshots/block-{block}.tar",
                                        "e" * 64)
+    r.mkt_block_hash_fn = _bhash
     r._calls = calls
     return r
 
@@ -266,7 +278,7 @@ def test_ineligible_holder_cannot_block_a_lower_lcb_confirmed_win(cfg, tmp_path,
 
     def holder(r):
         if reason == "expired":
-            r.cfg = replace(r.cfg, lane_c=replace(r.cfg.lane_c, win_ttl_eras=10))
+            pass       # DEC-CA-0073: its own 10-era duration has run out by BLOCK
         else:
             r.registration_at_block_fn = lambda hotkey, block: None if hotkey == "former" else 1
         old = TargetWin("mkt:returns", "former", 5, "old", 0 if reason == "expired" else BLOCK,
@@ -306,7 +318,19 @@ def test_register_record_judge_confirm_and_slot(cfg, tmp_path):
     assert not c["passed"] and c["outcome"] == "dropped"
     a3 = {(x["hotkey"], x["phase"]): x for x in rows3 if "error" not in x}[("alice", "confirm")]
     assert a3["outcome"] == "confirmed" and a3["mkt"]["fresh_after"] == float(f.s1.end)
-    assert all(w.start > f.s1.end for w in rep2.entries[0].windows)
+    # DEC-CA-0074: the judge drew from the embargo before the dispatch, by the
+    # registering round's hash; the confirm from the OTHER half (never a window
+    # its judge scored) plus forwards after the judge snapshot
+    d1, d2 = rep1.entries[0].draw, rep2.entries[0].draw
+    assert (d1["phase"], d1["half"], d1["block"], d1["block_hash"]) == (
+        "judge", 0, BLOCK, _bhash(BLOCK))
+    assert (d2["phase"], d2["half"], d2["block_hash"]) == ("confirm", 1, _bhash(BLOCK + EB))
+    jw, cw = rep1.entries[0].windows, rep2.entries[0].windows
+    assert jw and cw and not {w.wid for w in jw} & {w.wid for w in cw}
+    assert any(w.end <= d1["hi"] for w in jw) and any(w.start > d1["hi"] for w in jw)
+    assert all(w.end <= d2["hi"] or w.start > f.s1.end for w in cw)
+    assert set(a["mkt"]["kinds"]) == {"backtest", "forward"}
+    assert a["mkt"]["draw"]["block_hash"] == _bhash(BLOCK)
     slot = f.r._lane_c().slots["mkt:returns"]
     assert (slot.hotkey, slot.win_block, slot.base_pointer) == ("alice", BLOCK + 2 * EB,
                                                                MC.base_pointer)
@@ -322,7 +346,12 @@ def test_register_record_judge_confirm_and_slot(cfg, tmp_path):
     inputs = {"lane_c_manifests": {k.split("round-")[1][:-5]: v for k, v in f.store.objs.items()
                                    if k.startswith("lane_c/")},
               "quantiles": {k: v for k, v in f.store.objs.items() if k.endswith(".npy")},
-              "snapshots": {f.s1.digest: f.s1, f.s2.digest: f.s2}}
+              "snapshots": {f.s1.digest: f.s1, f.s2.digest: f.s2},
+              # DEC-CA-0074: the chain's hash of every draw's round block
+              "block_hashes": {b: _bhash(b) for b in (BLOCK, BLOCK + EB, BLOCK + 2 * EB)}}
+    bad = {**inputs, "block_hashes": {**inputs["block_hashes"], BLOCK: _bhash(1)}}
+    res = check_marketcast(rcs[1], f.r.cfg, reps, **bad)
+    assert res.status == "FAIL" and "block hash" in res.detail, res.detail
     for rc in rcs:
         res = check_marketcast(rc, f.r.cfg, reps, **inputs)
         assert res.status == "PASS", res.detail
@@ -545,7 +574,7 @@ def test_deterministic_meta_error_is_a_fault_never_a_hold(cfg, tmp_path):
     store = _Store()
     es = [_entry("alice"), _entry("dave")]
     r = _runner(cfg, tmp_path / "v", store, lambda b: s1, history=_history(es))
-    r._covs[_ptr("alice")] = ("open_interest",)      # not in the allow-list / no builder
+    r._covs[_ptr("alice")] = ("sentiment",)      # not in the allow-list / no builder
     orig = r.mkt_forecaster_fn
 
     def _fc(key):
@@ -558,7 +587,7 @@ def test_deterministic_meta_error_is_a_fault_never_a_hold(cfg, tmp_path):
     got = _judge(r, _settle(store, "1002", [], prev="1001", block=BLOCK + EB,
                             reports={"1001": _recorded(store, "1001")}))
     a, d = got[("alice", "judge", "")], got[("dave", "judge", "")]
-    assert a["stage"] == "fault" and "open_interest" in a["reason"]
+    assert a["stage"] == "fault" and "sentiment" in a["reason"]
     assert d["stage"] == "fault" and not d["passed"]
 
 
@@ -583,16 +612,23 @@ def test_prechecks_rejected_at_registration(cfg, tmp_path):
 
 
 def test_inconclusive_entries_wait_then_drop(cfg, tmp_path):
+    cfg = replace(cfg, round=replace(cfg.round, epoch_blocks=900))     # mainnet's 3 h grid
     s1 = _snapshot(tmp_path, 5000, "s1")
     store = _Store()
-    # trained right at the snapshot's end: no window has closed yet
-    late = _entry("dave", train_block=BLOCK + (5000 - 1000) * 5)
-    r = _runner(cfg, tmp_path / "v", store, lambda b: s1, history=_history([late]))
+    # dispatched 14 h before the snapshot starts: its embargo and its 13 h
+    # forward span both lie before the recorded bars, so it has no window
+    late = _entry("dave", train_block=BLOCK - (200_000 + 14 * 3600) // 12)
+    r = _runner(cfg, tmp_path / "v", store, lambda b: s1,
+                history=_history([late], {"dave": late.train_block - 100}))
     _rows(r, _settle(store, "1001", [late]))
     out = []
-    for rid, k in (("1002", 1), ("1003", 3), ("1004", 4)):
+    # DEC-CA-0074: an inconclusive entry waits at most verdict_wait_blocks,
+    # capped at 3900 (13 h) whatever the table says
+    assert MC.verdict_wait_blocks == 2 * EB and MC.wait_blocks == 3900
+    # each settlement judges the round the previous one registered (3 h grid)
+    for rid, k in (("1002", 900), ("1003", 4500), ("1004", 5400)):
         prev = str(int(rid) - 1)
-        got = _judge(r, _settle(store, rid, [], prev=prev, block=BLOCK + k * EB,
+        got = _judge(r, _settle(store, rid, [], prev=prev, block=BLOCK + k,
                                 reports={prev: _recorded(store, prev)}))
         out.append(got[("dave", "judge", "")])
     assert out[0]["outcome"] == "deferred" and out[0]["mkt"]["inconclusive"] == "windows"

@@ -13,17 +13,20 @@ Pure and deterministic, mirroring :func:`cascade.shared.lane_c.parse_recipe`
 
 Recipe keys (all required at the top level):
 
-* ``target``            ``mkt:<suite>`` — the lane-C slot the entry competes for;
+* ``target``            ``mkt:<suite>`` (or ``mkt:market``, the composite) — the
+                        lane-C slot the entry competes for;
 * ``data``              ``assets`` {class: [symbols ⊆ config]}, ``class_weights``
                         {class: w ≥ 0, sum > 0}, ``frequencies`` (⊆ the config's),
                         ``start`` / ``end`` ISO dates — ``end`` at least
                         ``embargo_days`` before the submission (forward-only eval);
 * ``context_length``    ``[patch, max_context_length]`` (≤ 32768);
-* ``horizon_mix``       {horizon: w ≥ 0, sum > 0}, horizons of the target suite;
+* ``horizon_mix``       {horizon: w ≥ 0, sum > 0}, horizons of the target suite
+                        (the composite: of any enabled suite);
 * ``covariates``        ⊆ ``[marketcast] covariates`` (inputs, never targets);
 * ``augmentations``     [{``name`` ∈ allow-list, ``p`` ∈ [0, 1], ``params``
                         {str: finite number}}], at most ``MAX_AUGMENTATIONS``;
-* ``objective``         ``suite_weights`` {suite: w ≥ 0; target's > 0},
+* ``objective``         ``suite_weights`` {suite: w ≥ 0; target's > 0 — the
+                        composite needs only a positive sum},
                         optional ``quantile_weights`` (one ≥ 0 per base knot,
                         sum > 0), optional ``coverage_penalty`` ∈ [0, 10];
 * ``optimizer``         ``lr`` (0, max_lr], ``schedule``, ``warmup_fraction``
@@ -32,7 +35,17 @@ Recipe keys (all required at the top level):
                         optional ``ema_decay`` 0 or [0.9, 1);
 * ``trainable``         ``scope`` full | last_n_blocks (+ ``n_blocks`` 1..12) |
                         frozen_embeddings | lora (+ ``lora_rank`` 1..max_lora_rank);
-* ``synthetic_fraction`` [0, max_synthetic_fraction].
+* ``synthetic_fraction`` [0, max_synthetic_fraction]; at 1 (pure synthetic) ``data.assets``
+                        and ``data.class_weights`` may be empty.
+Optional:
+* ``leg_hours``         (0, max_leg_hours] — the fine-tune leg's wall clock (the miner
+                        pays the pod for it); absent = ``[lane_c] leg_hours``.
+* ``synthetic_channels`` the row names of each generator ``(C, L)`` array, row 0
+                        ``"target"``, then any of the recipe's PAST covariates and
+                        ``"time"`` (unix seconds per step, for the known rows):
+                        each array is then ONE synthetic sample with its own
+                        covariate rows (DEC-CA-0064 open item 5). Absent = every
+                        row is a separate target series with NaN covariates.
 """
 
 from __future__ import annotations
@@ -48,7 +61,9 @@ from .config.marketcast import TIMESTRAL_BLOCKS, TIMESTRAL_PATCH, TRAINABLE_SCOP
 
 MARKETCAST_RECIPE_FILE = "marketcast.json"
 TOP_KEYS = ("target", "data", "context_length", "horizon_mix", "covariates", "augmentations",
-            "objective", "optimizer", "trainable", "synthetic_fraction")
+            "objective", "optimizer", "trainable", "synthetic_fraction", "leg_hours", "init",
+            "synthetic_channels")
+TOP_REQUIRED = TOP_KEYS[:-3]
 DATA_KEYS = ("assets", "class_weights", "frequencies", "start", "end")
 OBJECTIVE_KEYS = ("suite_weights", "quantile_weights", "coverage_penalty")
 OPTIMIZER_KEYS = ("lr", "schedule", "warmup_fraction", "steps", "batch", "weight_decay", "clip",
@@ -90,6 +105,14 @@ class MarketCastRecipe:
     n_blocks: int
     lora_rank: int
     synthetic_fraction: float
+    leg_hours: float = 0.0          # the leg's wall; 0 = [lane_c] leg_hours
+    # owner 2026-11-18: warm-start from an EARLIER MarketCast checkpoint (its
+    # trained pointer; "" = the pinned base) — the trainer accepts only one it
+    # produced from a leg dispatched before this submission
+    init: str = ""
+    # the row names of each generator (C, L) array: "target" first, then past
+    # covariates and "time"; () = rows are separate target series
+    synthetic_channels: tuple[str, ...] = ()
 
 
 def _obj(v: Any, where: str, keys: tuple[str, ...], required: tuple[str, ...]) -> dict:
@@ -172,21 +195,31 @@ def parse_marketcast_recipe(obj: Any, cfg: Any, *, target: str | None = None,
             obj = json.loads(obj)
         except Exception as e:  # noqa: BLE001
             raise ValueError(f"marketcast recipe is not valid JSON: {e}") from e
-    top = _obj(obj, "", TOP_KEYS, TOP_KEYS)
+    top = _obj(obj, "", TOP_KEYS, TOP_REQUIRED)
     suites = tuple(cfg.suites)
-    spec = check_target(str(top["target"]), mkt_suites=suites)
+    names = tuple(getattr(cfg, "target_names", suites))
+    spec = check_target(str(top["target"]), mkt_suites=names)
     if not spec.startswith("mkt:"):
         raise ValueError(f"marketcast recipe target {spec!r} must be mkt:<suite>")
     suite = spec.split(":", 1)[1]
-    if target is not None and check_target(str(target), mkt_suites=suites) != spec:
+    judged = cfg.suites_of(suite) if hasattr(cfg, "suites_of") else (suite,)
+    if target is not None and check_target(str(target), mkt_suites=names) != spec:
         raise ValueError(f"marketcast recipe target {spec!r} != committed target {target!r}")
 
     from .config.marketcast import duration_minutes
 
+    syn = _f(top["synthetic_fraction"], "synthetic_fraction", 0.0,
+             float(cfg.max_synthetic_fraction))
+    if syn > 0.0 and not has_generator:
+        raise ValueError("marketcast recipe synthetic_fraction > 0 needs a generator tree")
+    # owner 2026-11-16: a pure-synthetic recipe (synthetic_fraction 1) trains
+    # on its generator alone, so it may name no real assets
+    pure = syn >= 1.0
     data = _obj(top["data"], "data", DATA_KEYS, DATA_KEYS)
     cfg_assets = cfg.assets_map
-    if not isinstance(data["assets"], dict) or not data["assets"]:
-        raise ValueError("marketcast recipe data.assets must be a non-empty object")
+    if not isinstance(data["assets"], dict) or (not data["assets"] and not pure):
+        raise ValueError("marketcast recipe data.assets must be a non-empty object "
+                         "(empty only with synthetic_fraction 1)")
     assets: dict[str, tuple[str, ...]] = {}
     for cls, syms in data["assets"].items():
         if cls not in cfg_assets:
@@ -195,7 +228,8 @@ def parse_marketcast_recipe(obj: Any, cfg: Any, *, target: str | None = None,
         if not ss:
             raise ValueError(f"marketcast recipe data.assets.{cls} is empty")
         assets[cls] = ss
-    cw = _weights(data["class_weights"], "data.class_weights", tuple(assets))
+    cw = (_weights(data["class_weights"], "data.class_weights", tuple(assets))
+          if assets or data["class_weights"] else {})
     all_freqs = tuple(sorted({f for fs in cfg.frequencies_map.values() for f in fs},
                              key=duration_minutes))
     freqs = _labels(data["frequencies"], "data.frequencies", all_freqs)
@@ -213,7 +247,9 @@ def parse_marketcast_recipe(obj: Any, cfg: Any, *, target: str | None = None,
 
     ctx = _i(top["context_length"], "context_length", TIMESTRAL_PATCH,
              int(cfg.max_context_length))
-    hmix = _weights(top["horizon_mix"], "horizon_mix", tuple(cfg.horizons_map.get(suite, ())))
+    hz_ok = tuple(sorted({h for s in judged for h in cfg.horizons_map.get(s, ())},
+                         key=duration_minutes))
+    hmix = _weights(top["horizon_mix"], "horizon_mix", hz_ok)
     covs = _labels(top["covariates"], "covariates", tuple(cfg.covariates))
 
     augs_raw = top["augmentations"]
@@ -239,7 +275,7 @@ def parse_marketcast_recipe(obj: Any, cfg: Any, *, target: str | None = None,
 
     ob = _obj(top["objective"], "objective", OBJECTIVE_KEYS, ("suite_weights",))
     sw = _weights(ob["suite_weights"], "objective.suite_weights", suites)
-    if sw.get(suite, 0.0) <= 0.0:
+    if len(judged) == 1 and sw.get(suite, 0.0) <= 0.0:
         raise ValueError(f"marketcast recipe objective.suite_weights must weight the target "
                          f"suite {suite!r} > 0")
     knots = tuple(cfg.quantile_knots)
@@ -288,10 +324,27 @@ def parse_marketcast_recipe(obj: Any, cfg: Any, *, target: str | None = None,
     elif "lora_rank" in tr:
         raise ValueError("marketcast recipe trainable.lora_rank is only for lora")
 
-    syn = _f(top["synthetic_fraction"], "synthetic_fraction", 0.0,
-             float(cfg.max_synthetic_fraction))
-    if syn > 0.0 and not has_generator:
-        raise ValueError("marketcast recipe synthetic_fraction > 0 needs a generator tree")
+    init = ""
+    if top.get("init") not in (None, ""):
+        from .manifest import parse_trained_pointer
+
+        init = str(top["init"])
+        if parse_trained_pointer(init) is None:
+            raise ValueError(f"marketcast recipe init {init!r} is not a trained pointer")
+    chans: tuple[str, ...] = ()
+    if top.get("synthetic_channels") is not None:
+        from ..eval.marketcast import PAST_COVARIATES
+
+        if syn <= 0.0:
+            raise ValueError("marketcast recipe synthetic_channels needs synthetic_fraction > 0")
+        chans = _labels(top["synthetic_channels"], "synthetic_channels",
+                        ("target", "time", *(c for c in covs if c in PAST_COVARIATES)))
+        if not chans or chans[0] != "target":
+            raise ValueError('marketcast recipe synthetic_channels must start with "target"')
+    leg_hours = 0.0
+    if top.get("leg_hours") is not None:
+        leg_hours = _f(top["leg_hours"], "leg_hours", 0.0, float(cfg.max_leg_hours),
+                       lo_open=True)
 
     return MarketCastRecipe(
         target=spec, suite=suite, assets=tuple(sorted(assets.items())),
@@ -301,7 +354,8 @@ def parse_marketcast_recipe(obj: Any, cfg: Any, *, target: str | None = None,
         suite_weights=tuple(sorted(sw.items())), quantile_weights=qw, coverage_penalty=cpen,
         lr=lr, schedule=str(sched), warmup_fraction=wf, steps=steps, batch=batch,
         weight_decay=wd, clip=clip, ema_decay=ema, scope=str(scope), n_blocks=n_blocks,
-        lora_rank=lora_rank, synthetic_fraction=syn,
+        lora_rank=lora_rank, synthetic_fraction=syn, leg_hours=leg_hours, init=init,
+        synthetic_channels=chans,
     )
 
 
@@ -331,7 +385,8 @@ def meta_problem(meta: Any, cfg: Any, *, size: int | None = None) -> str:
             or str(meta["base_sha256"]).lower() != cfg.base_sha256):
         return "marketcast_meta.json names a base other than the pinned [marketcast] base"
     t = str(meta["target"])
-    if not t.startswith("mkt:") or t.split(":", 1)[1] not in tuple(cfg.suites):
+    if not t.startswith("mkt:") or t.split(":", 1)[1] not in tuple(
+            getattr(cfg, "target_names", cfg.suites)):
         return f"marketcast_meta.json target {t!r} is not an enabled MarketCast suite"
     return covariates_problem(meta["covariates"], cfg)
 

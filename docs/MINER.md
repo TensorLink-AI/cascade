@@ -6,9 +6,16 @@ on your compute account. Local training experiments need suitable compute too.
 
 | Lane | You submit | You compete for | Instructions |
 |---|---|---|---|
-| A | A deterministic Python generator of synthetic time series | Beat the current king with a fully trained model | [Steps 1–7](#1-install) |
+| A | A deterministic Python generator of synthetic time series | **Closed to new challengers from block 9586800**; the king (uid 164) is frozen as the reference for lanes B and D | [Steps 1–7](#1-install) |
 | B | A generator and up to the allowed number of targets | Improve selected experts, then pass merge acceptance when enabled | [Lane B](#13-cascade-v2-and-domain-experts-lane-b) |
 | C | An eligible MarketCast fine-tuning recipe, optionally with a generator | Beat the pinned application base on future data, then confirm and take a slot | [Lane C](#what-you-submit) |
+| D | A trained cascade_pyramid checkpoint (BF16 weights you trained anywhere) | Beat both the lane D king and the lane A king on forward-only private windows; crowned at the first verdict. Until the first crown, D's 50% stays with the lane A king | [Lane D](LANE_D.md) |
+
+**One competition brief per lane** (intent, scoring and pay numbers with a
+worked example, strategies, costs, refusals, FAQ):
+[lane A](MINER_LANE_A.md) · [lane B](MINER_LANE_B.md) ·
+[lane C, MarketCast](MINER_LANE_C_MARKETCAST.md) · [lane D](MINER_LANE_D.md).
+`cascade rules a|b|c|d` prints each lane's live values from `chain.toml`.
 
 The submission contract (what the code must be) is [INTERFACE.md](INTERFACE.md).
 This guide is the end-to-end walkthrough.
@@ -71,7 +78,7 @@ cascade status --hotkey YOUR_SS58 --lane a --ref IMMUTABLE_REF \
   --intake https://submissions.cascadesub.net --watch
 cascade status --hotkey YOUR_SS58 --lane b --targets energy --ref IMMUTABLE_REF \
   --intake https://submissions.cascadesub.net --watch
-cascade status --hotkey YOUR_SS58 --lane c --target mkt:returns --ref IMMUTABLE_REF \
+cascade status --hotkey YOUR_SS58 --lane c --target mkt:market --ref IMMUTABLE_REF \
   --intake https://submissions.cascadesub.net --watch
 ```
 
@@ -145,7 +152,16 @@ Before you fund:
 
 ## 1. Install
 
-V2 has been live on mainnet since **30 October 2026**: paid Lane A entries
+**Lane A is closed to new challengers from block 9,586,800** (mainnet
+launch, about 2026-11-25 22:28 UTC). The intake refuses a new lane A fund or
+funded submit with `409 lane_ended` (nothing charged), and `cascade deploy` /
+`cascade submit` refuse a lane A entry past the cutoff before uploading or
+committing (`--allow-closed-lane-a` overrides; the entry is still not seated).
+King checks and promotions stop, so the lane A king (uid 164) is frozen as the
+reference for lanes B and D. Steps 1–7 below describe lane A as it ran; the
+install, provider-key and tracking steps still apply to lanes B and C.
+
+V2 ran on mainnet from **30 October 2026**: paid Lane A entries
 opened at 09:00 UTC and the first v2 era started at the first era boundary
 after 12:00 UTC (block 9,399,600). The paid Lane A intake refuses
 commitments revealed before the 09:00 UTC opening; make a fresh one. A queued
@@ -316,7 +332,7 @@ byte-identical to what validators scored. Each
 |---|---|
 | `block-<N>.tar` | the exact tar validators scored |
 | `POOL_SHA256` | its sha256 (matches receipts and the publisher index) |
-| `<series_id>.npy` | the same series, unpacked |
+| `<series_id>.npy` | the same series, unpacked (folders revealed before 2026-11-24 only; for newer folders run `tar -xf block-<N>.tar` in the folder, or use `--pool-hf`) |
 | `metadata.json` | `{series_id: {freq, seasonal_period, domain, source, …}}` |
 | `provenance.json` | the build configuration recorded at publish time |
 
@@ -659,12 +675,12 @@ Picking a type never buys more compute.
 
 On mainnet v2 the list is **`8xH100` and `8xH200`** (deployed `[round]
 funded_pod_skus`); 4× layouts and Blackwell are not offered. Prices and
-measured walls are in [MINER_V2_INCENTIVE_INTRO.md](MINER_V2_INCENTIVE_INTRO.md#gpus).
+measured walls are in [measured walls and prices](#measured-walls-and-prices).
 
 ```bash
 cascade fund https://submissions.cascadesub.net --ref <repo@digest> \
     --wallet-name my-miner --wallet-hotkey gen1 --gpu 8xH200 --max-price 35 --yes
-cascade lane-c fund https://submissions.cascadesub.net --target mkt:returns \
+cascade lane-c fund https://submissions.cascadesub.net --target mkt:market \
     --ref <repo@digest> --wallet-name my-miner --wallet-hotkey gen1 --gpu L40S --yes
 ```
 
@@ -699,6 +715,30 @@ cascade lane-c fund https://submissions.cascadesub.net --target mkt:returns \
 - A layout type such as `8xH200` rents one pod with that many GPUs, and the
   leg trains data-parallel on all of them (same model as one GPU, sooner).
   Layouts rent on Lium only.
+
+#### Measured walls and prices
+
+| Layout | Measured wall (mainnet) | Lium $/h actually charged | Typical leg | **Plan for** |
+|---|---:|---:|---:|---:|
+| `8xH100` | ≈ 3.5 h | $14.40–23.20 | ~$60–95 | **up to ~$105** |
+| `8xH200` | ≈ 3.5 h | $24–46 (median ~$31) | ~$125 | **up to ~$210** |
+
+*Measured 2026-11-01/02 on mainnet:* a full v2 leg is 23,841 steps, and
+legs ran at about 112–115 steps per minute on **both** 8xH100 and 8xH200,
+so ≈ 3.5 h of GPU training either way. Prices are what Lium charged for
+8× pods on those days, not advertised rates; they move by the hour. The
+trainer's own planning walls are the deployed `funded_sku_wall_seconds`
+(read them with `cascade status --json`).
+
+- **Typical leg** = price × (wall + ~30 min boot, data and upload).
+- **Plan for** = the highest hourly rate you will accept × (wall + 1 h).
+  Use that number for `cascade preflight --max-spend` and for your Lium key
+  budget; `--max-spend` is a review input, not an enforced total.
+- A slow host can run to the 18,000 s (5 h) hard training wall, and a leg
+  that fails on a bad host and reruns also bills the pod time it already
+  used. Keep room for one rerun if your key's budget is tight.
+- **Blackwell (B200, B300) is not available.** The training image is built
+  for CUDA 12.4 (`torch==2.4.1+cu124`), which cannot run on Blackwell.
 
 ## 6. What happens to a funded entry
 
@@ -871,8 +911,10 @@ estimated improvement used for the pass/fail test.
   use the [reward schedule below](#rewards-allocation-burn-and-progression).
 - **Warm-start lineage.** Under v2 `king_ladder`, a passing king check can
   promote the king into a scheduled shared init, optionally with accepted B
-  deltas. The historical top-k mixture of king and challenger checkpoints
-  does not govern this regime. `cascade score --warm-start live` resolves the
+  deltas. From block 9,586,800 king checks are off
+  (`[v2] reign_warm_start_blocks = 0`): no promotion happens, so the init
+  stays the frozen lane A king's and no B delta is merged. The historical
+  top-k mixture of king and challenger checkpoints does not govern this regime. `cascade score --warm-start live` resolves the
   current effective init; an announced future promotion is not today's base.
 
 ### Rewards: allocation, burn and progression
@@ -883,6 +925,18 @@ are not an announcement of live activation. Signed configuration and settlement
 records determine the actual rules. Testnet retains older economics and must
 not be used to infer mainnet payments. Percentages below refer to the validator's
 competition reward vector, not a fixed TAO/day or dollar payment.
+
+**Mainnet launch split (block 9586800).** The signed step 1 launch overlay
+(`deploy/overlays/launch-20261125.pre.mainnet.toml`) replaces the template
+shares below with **A 50% / B 35% / C 15%**, and the step 2 overlay
+(`launch-20261125.mainnet.toml`) arms lane D for **A 0% / B 35% / C 15% /
+D 50%**. Under them a B slot is 35% / 10 = 3.5% of emissions and the
+MarketCast slot is 15%. Lane D's 50% stays with the frozen lane A king (the
+house) until the first miner is crowned lane D king; then D pays its court
+(80/15/5). No lane B slot is paid under the launch config (see Lane B below). The per-lane guides
+([A](MINER_LANE_A.md), [B](MINER_LANE_B.md), [C](MINER_LANE_C_MARKETCAST.md),
+[D](MINER_LANE_D.md)) work examples at this split. The tables below are the
+checked-in template and the scripted documentation check computes them.
 
 **First allocate pools; then calculate eligible payments inside each pool.**
 
@@ -895,7 +949,8 @@ competition reward vector, not a fixed TAO/day or dollar payment.
 | A + B + C | 50% | 25% | 25% |
 <!-- cascade:rewards:allocation:end -->
 
-C takes its 25% from A in the mainnet policy; B stays at 25%. Before B or C
+In the template C takes its 25% from A and B stays at 25%; at the launch
+split C takes 15% from A and B is 35%. Before B or C
 launches, it has no reserved allocation. Once a lane launches, an empty pool
 or empty target slot burns rather than being reassigned to another miner.
 Mainnet uses `remainder = "burn"`; do not import the optional older
@@ -952,10 +1007,14 @@ See [key recovery](#as-the-v2-king-keep-your-key-funded-dec-ca-0055).
 
 **Lane B: accepted expert updates.** With acceptance enabled, training,
 individual qualification and waiting for a warm start earn nothing by
-themselves. Committed warm-start acceptance starts the target's clock.
+themselves. Committed warm-start acceptance starts the slot's pay.
 There are currently **10 targets** (seven domains plus three horizons), so
-each reserves **25% / 10 = 2.5% of total emissions** at a full multiplier.
-A miner can hold multiple target slots; each has its own clock. A rejected
+under the template each slot is **25% / 10 = 2.5% of total emissions**, and
+at the launch split **35% / 10 = 3.5%**. Under the launch config no B slot is
+paid: committed acceptance needs a new shared init, which opens only at a
+lane A promotion, and promotions are off from block 9,586,800. Qualified
+updates wait as pending.
+A miner can hold several slots. A rejected
 update neither merges nor earns; a deferred update waits unpaid. Existing
 holders keep their remaining eligible pay while replacements are pending.
 
@@ -963,23 +1022,26 @@ holders keep their remaining eligible pay while replacements are pending.
 is unpaid. A later confirmation must win the target slot; passing below the
 holder's required bound does not earn that slot. C splits its pool by each
 competition's weight over **all configured competition weights**, then equally
-over that competition's target slots. With only MarketCast and its current two
-targets, each full-pay slot reserves **25% / 2 = 12.5% of total emissions**.
+over that competition's target slots. With only MarketCast and its one composite
+target (`mkt:market`), its full-pay slot reserves **all of C's pool**: 25% of
+total emissions in the template, 15% at the launch split.
 That is a slot maximum, not a promise of paying an unfilled slot. Pending,
 unstarted or ended competitions do not donate their allocation to active ones.
 
-**B/C reward progression.** B records its tier from accepted marginal gain;
-MarketCast C records it from the confirmed gain. Current full-pay tiers are:
+**B/C reward progression.** B has no tiers and no decay (plan rev6.22,
+owner 2026-11-24): a B slot holder is paid 100% of its slot every settlement
+until it is replaced. MarketCast C records a full-pay duration from the
+confirmed gain (DEC-CA-0073): 5 days at the 0.01 gain margin, rising linearly
+to 20 days at a gain LCB of 0.05 or more, rounded up to whole eras. Current C
+full-pay periods are:
 
 <!-- cascade:rewards:slot-tiers:start -->
 | Lane | Target gain LCB | Full-pay eras |
 |---|---:|---:|
-| B: accepted marginal gain | ≥ 0.05 | 10 |
-| B: accepted marginal gain | ≥ 0.02 | 5 |
-| B: accepted marginal gain | ≥ 0.01 | 2 |
-| C: confirmed MarketCast gain | ≥ 0.05 | 10 |
-| C: confirmed MarketCast gain | ≥ 0.02 | 5 |
-| C: confirmed MarketCast gain | ≥ 0.01 | 2 |
+| C: confirmed MarketCast gain | 0.01 | 10 |
+| C: confirmed MarketCast gain | 0.02 | 18 |
+| C: confirmed MarketCast gain | 0.03 | 25 |
+| C: confirmed MarketCast gain | ≥ 0.05 | 40 |
 <!-- cascade:rewards:slot-tiers:end -->
 
 A threshold of 0.05 here is a 5% lower confidence bound on the target gain;
@@ -987,28 +1049,42 @@ it is a different statistic from A's increment-unit crowning LCB. Full pay
 means **100% of that target's slot**, not 100% of the lane or subnet. The tier
 is fixed on the recorded win; a later tier retune does not restart that win.
 
-After the full-pay period, the configured one-era half-life gives multipliers
-50% → 25% → 12.5% → a **10% slot floor**. The win stops paying at **age 28
-eras**, measured from B acceptance or C confirmation, including its full-pay
-eras. It does not get another 28 eras after decay starts. Replacement by a new
+A C win has no decay: its slot ends (burns) when its full-pay duration
+ends, unless a newer win has already replaced it. Replacement by a new
 holder stops the old holder earlier. At approximately 12 hours per mainnet
-era, 28 eras is approximately 14 days; blocks, not wall-clock estimates, govern.
+era, 10 eras is approximately 5 days; blocks, not wall-clock estimates, govern.
 
 <!-- cascade:rewards:slot-decay:start -->
-B example: accepted marginal gain LCB 0.02, recorded full-pay period 5 eras.
-
-| Age since acceptance (eras) | Slot multiplier | Share of total emissions |
-|---|---:|---:|
-| 0–4 | 100% | 2.5% |
-| 5 | 50% | 1.25% |
-| 6 | 25% | 0.625% |
-| 7 | 12.5% | 0.3125% |
-| 8–27 | 10% | 0.25% |
-| 28+ | 0% | 0% |
+B (live launch split): a held slot pays 100% of its slot (3.5% of total emissions) every settlement, with no decay and no expiry, until a newer leg's merge passes acceptance on that slot. C has no decay: its slot pays 100% for its recorded full-pay duration, then ends.
 <!-- cascade:rewards:slot-decay:end -->
 
-C uses its own decay/expiry configuration, currently the same half-life,
-floor and TTL. When a competition ends, `finish_full_pay` permits an existing
+**B slots pay until replaced.** A B slot holder is paid **100% of its slot
+every settlement, with no decay and no expiry**, for as long as it holds the
+slot. A holder loses the slot only when a newer leg's merge passes acceptance
+on that slot. Acceptance is judged against the init that already contains the
+holder's experts, so the newer leg must improve on top of the holder. A tie or
+an inconclusive result leaves the holder in place. A deregistered holder's
+slot burns, and empty slots still burn. Each receipt's `lane_b_pay` record
+lists every paid holder with its `merge_block`, `age` and `since_era`.
+
+**Every slot is tested.** Every judged B leg is tested on every slot: the 7
+domains, the scored horizons and, while suite targets are on, the public
+suites. A slot clears when its CRPS **or** MASE gain LCB clears the bar with a
+positive point gain, the other metric is non-inferior, and every guard holds
+(no domain, horizon or public metric regresses). There are two bars and two
+test families:
+
+- your **declared targets** (up to `[lane_b] max_domains_per_leg`, 4) clear at
+  `gain_margin` (1%). They are corrected only among themselves (a max-T
+  family), so a one-target leg is a single test of its two metrics;
+- every **other slot** clears at the stricter `undeclared_gain_margin` (2%),
+  in its own max-T family.
+
+Every slot a leg clears is claimable, replacing that slot's holder, so one
+miner may hold every slot. The signed verdict rows list every tested slot
+with its family, bar, CRPS/MASE LCBs, point gains and whether it passed.
+
+C follows its own rule above (DEC-CA-0073). When a competition ends, `finish_full_pay` permits an existing
 holder only its remaining recorded full-pay period, capped at six wind-down
 eras; there is no decay tail after the end. Under `stop`, a settlement after
 `until_block` pays nothing. That ended competition's unpaid allocation burns.
@@ -1017,19 +1093,19 @@ and `cascade lane-c commit` refuses new entries. The status page and
 `cascade round` expose each competition's weight, share, lifecycle state and
 start/end blocks; use these alongside the reward records.
 
-**Worked allocation example, not a measured payout.** All three lanes have
-launched; A's king has a 60%-of-A ladder share, its immediate former king is
-eligible, one B target and one of the two MarketCast targets have full-pay
-holders, and all other B/C slots are empty:
+**Worked allocation example at the step 1 launch split (A 50 / B 35 / C 15),
+not a measured payout.** A's king has a 60%-of-A ladder share, its immediate former king is
+eligible, one B target and the MarketCast target (`mkt:market`) have full-pay
+holders, and all other B slots are empty:
 
 <!-- cascade:rewards:worked-example:start -->
 | Recipient in the worked example | Share of total emissions |
 |---|---:|
 | A king | 30% |
 | Eligible immediate former king | 2.5% |
-| One full-pay B holder | 2.5% |
-| One full-pay C holder (mkt:returns) | 12.5% |
-| Burn | 52.5% |
+| One full-pay B holder | 3.5% |
+| One full-pay C holder (mkt:market) | 15% |
+| Burn | 49% |
 <!-- cascade:rewards:worked-example:end -->
 
 The total is 100%. Burns combine A's unused ladder share, B's unused slots,
@@ -1346,13 +1422,14 @@ train the full model. B's generators train selected experts inside that model.
 B opens separately from A: an activation block alone does not bypass its
 measured-lineage and routing checks. Use fresh `cascade status --json`.
 
-The planned rollout allocates A 100%, then A/C 75/25, then A/B/C 50/25/25.
-The [reward schedule](#rewards-allocation-burn-and-progression) explains the
-launch cap, king ladder, acceptance clocks and burns.
+On mainnet, lanes B, C and D open together at block 9586800 under the
+launch overlay's split A 0 / B 35 / C 15 / D 50. The
+[reward schedule](#rewards-allocation-burn-and-progression) explains the
+template tables, slot pay and burns.
 
 ### Choose targets, not expert IDs
 
-Declare 1–3 targets under the checked-in mainnet limit
+Declare 1–4 targets under the checked-in mainnet limit
 (`[lane_b] max_domains_per_leg`). Choose from:
 
 - Domains: `econ_fin`, `energy`, `healthcare`, `nature`, `sales`, `transport`,
@@ -1363,7 +1440,13 @@ Declare 1–3 targets under the checked-in mainnet limit
 
 The trainer measures which experts the king routes each target to and chooses
 eligible rows. Multiple targets train the union of their selections in one
-leg, with the same budget as a single-target leg. Miners do not supply expert
+leg, with the same budget as a single-target leg. The leg is then tested on
+every slot (see "Every slot is tested" above): every target that passes
+claims its own slot, so one leg can hold several slots, including undeclared
+ones at the stricter bar. A guard failure blocks every slot of the leg. Fund such a leg with `cascade lane-b fund ... --targets
+energy,h720`, or repeat `--target` once per target (for example `--target
+energy --target suite:gift` while suite targets are on). The intake and the
+local check both refuse more than `max_domains_per_leg` targets. Miners do not supply expert
 IDs. Domain selection uses context patches; horizon selection uses masked
 forecast patches and context, never the future target values.
 
@@ -1438,14 +1521,19 @@ rental until it is resolved, so a leg is never billed twice at once.
 
 ### Qualification, merge acceptance and payment
 
-1. **Qualify.** Each declared target needs a positive point gain and an LCB
-   at least `gain_margin`, with enough independent sources
-   (`min_target_clusters`). The confidence level is corrected by the number
-   of declared targets. A horizon target uses windows scored at that horizon.
+1. **Qualify.** The leg is tested on every slot (see "Every slot is tested"
+   in the reward schedule). A slot clears when its CRPS or MASE gain LCB
+   reaches the bar (`gain_margin` for declared targets, `undeclared_gain_margin`
+   for the rest) with a positive point gain, the other metric is
+   non-inferior, and there are enough independent sources
+   (`min_target_clusters`). A horizon target uses windows scored at that
+   horizon.
 2. **Check regressions.** Other domains/horizons and required public benchmarks
    must satisfy their non-inferiority limits (`LCB ≥ −tau`). A guard failure
-   blocks every target in that leg; a target missing only its own gain test
-   is unpaid. Required public rows and compatible data revisions must exist.
+   blocks every slot in that leg. A suite slot also needs a whole-pool point
+   gain ≥ 0 and every guard to hold against the anchor king
+   (`tau_anchor_domain`, `tau_anchor_public`). Required public rows and
+   compatible data revisions must exist.
 3. **Wait for a scheduled warm start.** With acceptance enabled, qualification
    is unpaid and leaves current holders in place. Qualified deltas wait for
    the next compatible shared starting checkpoint.
@@ -1454,16 +1542,308 @@ rental until it is resolved, so a leg is never billed twice at once.
    so far while all domain, horizon and public guards remain within the
    original init's regression limits. Validators verify intermediate weights
    and private verdicts; public rows use signed trainer evidence.
-5. **Merge and pay.** Only committed accepted targets enter the scheduled
-   init and start their reward clocks. Their pay tiers use accepted marginal
-   gain. The delta merges once, even if it wins several target slots.
+5. **Merge and pay.** Only accepted slots enter the scheduled init and
+   start paying. Pay has no tiers: a held slot pays in full until it is
+   replaced. The delta merges once, even if it wins several slots.
 
 Rejected combinations neither merge nor earn; there is no extra slash, but
 training costs already used remain spent. Deferral is unpaid. Later compatible
 candidates can still pass. A later candidate for a target already accepted
-in the same batch waits for another warm start. Reward expiry does not undo a
-merge. Mainnet enables this acceptance rule with v2; testnet keeps its older
+in the same batch waits for another warm start. Mainnet enables this acceptance rule with v2; testnet keeps its older
 rule until separately activated. See the [reward tables](#rewards-allocation-burn-and-progression).
+
+### Domain tags (display only)
+
+After a settlement, every judged lane B generator is tagged with the slots it
+actually improved. The tags come from the validator's signed verdict rows, and
+nothing is evaluated again. A slot is **improved** when it was conclusive and
+cleared the gain test in step 1: CRPS or MASE family LCB at or above the bar
+(`gain_margin` for a declared target, `undeclared_gain_margin` for any other
+slot), with a positive point gain and the other metric non-inferior. A guard
+failure blocks payment, but the slot still counts as improved; its tag then
+shows `claimed: false`. Each slot also records its status (`improved`,
+`not_improved`, `inconclusive` or `not_evaluated`), whether you declared it,
+the bar, the LCB, and `margin` = LCB − bar.
+
+You can read the tags in three places: the `lane_b_domains` column of
+`receipts/index.json`, `lanes.b.domain_tags` in `cascade status --json` (from
+the latest receipt), and the `lane B domains` rows of `cascade round`. In the
+human output, `*` marks an undeclared slot. The tags are records only. They are
+not signed and are left out of every digest. They never affect weights,
+verdicts, merge acceptance or pay. Older feeds do not carry them.
+
+### Lane B track settings
+
+These `[lane_b]` keys control suite targets, declared expert rows, the
+opening rule, the sentinel interaction and leg cost. The checked-in files
+ship them at their defaults, which keeps every new behaviour off: no suite
+targets, no hash set pinned and the existing co-gate. A signed network
+config overlay can change any of them except `contamination_hashset`, which
+only a release can change. Read the effective values with
+`cascade status --json` before you rely on one.
+
+| Key | Default | What it does |
+|---|---|---|
+| `suite_targets` | `false` | Adds one `suite:<suite>` target per bench suite. Arming it requires `contamination_hashset` to be pinned. |
+| `contamination_hashset` | `""` | Pin of the benchmark hash set (`sha256:<64 hex>`). Empty means no pin and no contamination check. |
+| `contamination_min_hits` | `{exact = 1, normalised = 3}` | Sub-window hit counts at which a submitted sequence counts as an embedded benchmark window. |
+| `suite_target_max_repo_mb` | `8` | Size cap in MiB for a generator that declares a `suite:<suite>` target. It is never above `[generator] max_repo_mb`. |
+| `min_experts_frac` | `0.03125` | Lower end of the per-layer clamp for declared rows: `ceil(min_experts_frac × E)`. |
+| `max_experts_frac` | `0.1484375` | Upper end of the per-layer clamp: `floor(max_experts_frac × E)`. |
+| `router_rows` | `"frozen"` | Router rows stay frozen in an expert-only leg. This is the only allowed value. |
+| `traffic_steal_bound` | `0.02` | The most routing traffic an expert-only leg may pull from other experts. |
+| `open_rule` | `"cogate"` | The rule that opens lane B (see below). |
+| `sentinel_target_rule` | `"defer"` | What happens to a suite-target entry whose suite is the era's sentinel. This is the only allowed value. |
+| `sentinel_max_defer_eras` | `4` | The most distinct eras such an entry can be deferred in. |
+| `funded_pod_skus` | the same file's `[round] funded_pod_skus` | Lane B's own GPU list. When the key is absent, it starts as a copy of the lane A list. |
+| `max_leg_hours` | `12.0` | The most training hours a lane B leg may ask for, in 0.5 h steps (owner 2026-11-24: was 6). |
+| `max_leg_seconds` | `54000` | Hard wall-clock cap on a lane B leg (12 h × 1.25). |
+| `guard_factor` | `1.25` | Leg guard: train hours × this factor plus overhead, capped at `max_leg_seconds`. |
+| `lr_scale_min` | `0.5` | Lower bound of the `lr_scale` leg lever. |
+| `lr_scale_max` | `2.0` | Upper bound of the `lr_scale` leg lever. |
+| `sigma_rel_choices` | `[0.03, 0.05, 0.10, 0.15, 0.20]` | The power-EMA widths a miner may choose with the `ema` lever (each in 0.01 … 0.30, must contain 0.10). |
+| `max_context_length` | `32768` | Ceiling of the `context_length` lever (a power of two, 4096 … 32768). |
+| `tau_anchor_public` | `0.0` | A cleared suite slot also needs every public guard to hold against the anchor king (the era's promotion member) at this tolerance. |
+| `tau_anchor_domain` | `0.0` | The same anchor guard for every pool domain and horizon. A cleared suite slot also needs the whole-pool point gain to be at least 0. |
+
+Every lane B leg trains with no learning-rate cooldown: the learning rate
+warms up, then stays at its peak to the last step. Its scored and merged
+weights are its own power EMA (σ_rel 0.10 unless you choose another width
+with the `ema` lever), not the raw endpoint. The expert manifest records
+this on every entry as `scored_weights` (`"ema010"` by default), and
+validators refuse an entry without it. No key turns this on or off. Lane A
+is unaffected.
+
+### Lane B leg levers and limits
+
+These are the default lane B behaviour (no activation block). Each is set on
+the fund and bound by your signature; an out-of-range value is refused with
+a typed code before anything is queued or your key is stored (nothing
+charged). The expert manifest entry records what the leg trained, and every
+validator re-checks it.
+
+**Limits: tokens and/or hours, whichever comes first.** `--train-hours H`
+(`X-Lane-B-Train-Hours`, 0.5 h steps, up to `max_leg_hours` = 12) and/or
+`--train-tokens N` (`X-Lane-B-Train-Tokens`, e.g. `20e9`). The leg stops at
+the first limit it reaches. With tokens only, the hour limit is
+`max_leg_hours`. The steps are the token limit's (`N ÷ tokens per step`,
+where tokens per step = the contract's batch × context, 2,097,152 on the
+shipped contract), never more than a lane A leg of the same hours. Hitting
+the hour limit is a normal stop: the leg is judged on what it trained (lane
+B has no cooldown and scores its EMA weights). Hours only on a measured GPU
+is the WB23 leg: steps from that GPU's measured rate. Both need `--gpu`
+without a fallback. Your key pays for the rented hours.
+
+**Any GPU type, at your own risk.** With a token or hour limit you may choose
+a GPU type that has no measured rate (or is not in `funded_pod_skus`), on a
+Lium key only. The record says `gpu_measured: false`. **At your own risk: no
+refund if the leg fails (it OOMs, cannot boot or crashes).** Image pinning
+and the sandbox still apply.
+
+**Levers** (`X-Lane-B-Levers`, a JSON object; the CLI builds it):
+
+| Flag | Key | Range | Default |
+|---|---|---|---|
+| `--lr-scale X` | `lr_scale` | `lr_scale_min` … `lr_scale_max` (0.5 … 2.0), at most 3 decimals | 1.0 |
+| `--curriculum easy:0.3,hard:0.7` | `curriculum` | 1 to 3 ordered stages, names `[a-z][a-z0-9_-]{0,23}`, fractions with at most 2 decimals summing to exactly 1 | one stage |
+| `--context-length N` | `context_length` | 4096 … `max_context_length` (32768), powers of two | 4096 |
+| `--ema 0.15` | `ema` | one of `sigma_rel_choices` (0.03, 0.05, 0.10, 0.15, 0.20) | 0.10 |
+
+- `lr_scale` multiplies the leg's base LR (every optimizer group).
+- A curriculum trains stage by stage: each stage is its own corpus,
+  generated with your generator constructed with `curriculum_stage=<name>`,
+  and the leg reads stage 1 for its fraction of the steps, then stage 2, and
+  so on. Your `Generator.__init__` must declare the `curriculum_stage`
+  keyword (check with `cascade lane-b verify-repo <dir> --curriculum`);
+  otherwise the leg fails as your fault (`generator_curriculum_unsupported`).
+- `context_length` is the leg's training window. Each step then consumes
+  `context ÷ 4096` times the points, so on a measured GPU the steps of an
+  hours-only leg scale down by that factor and a token limit gives fewer
+  steps. The context must fit the chosen GPU's measured memory (WB19 peak ×
+  context ÷ 4096 ≤ 90 % of its memory), else `context_length_unfit`; on an
+  own-risk GPU it is your risk. Judging is unchanged (the scored model reads
+  4096-point histories).
+- `ema` picks the power-EMA width; only that EMA is computed, scored and
+  merged, and the record says which (`scored_weights`, e.g. `ema015`).
+
+The judging guards are unchanged by any lever: other suites, undeclared pool
+domains, horizons, the whole-pool gain and the anchor king.
+
+| Code | Meaning |
+|---|---|
+| `bad_levers` | The levers header is not a JSON object of known keys. |
+| `lr_scale_out_of_range` | `lr_scale` outside the bounds or with more than 3 decimals. |
+| `bad_curriculum` | Wrong stage count, names, fractions, or fractions not summing to 1. |
+| `context_length_out_of_range` | Not a power of two in 4096 … `max_context_length`. |
+| `context_length_unfit` | The context does not fit the chosen GPU's measured memory. |
+| `ema_out_of_range` | `ema` is not in `sigma_rel_choices`. |
+| `bad_train_tokens` | `--train-tokens` is not a whole number > 0. |
+| `train_tokens_out_of_range` | Fewer tokens than one step. |
+| `bad_train_hours` | Hours off the 0.5 h grid or above `max_leg_hours`. |
+
+### Lane B suite targets
+
+While `suite_targets = true`, each bench suite becomes a target alongside the
+domains and horizons:
+
+| Bench suite | Target name | Commitment code |
+|---|---|---|
+| GIFT-Eval | `suite:gift` | `s-gift` |
+| BOOM | `suite:boom` | `s-boom` |
+| TIME | `suite:time` | `s-time` |
+| fev | `suite:fev` | `s-fev` |
+
+Use the target name with `cascade lane-b fund --targets`, or name one suite
+target with `cascade lane-b fund --target suite:gift`, and in the
+`X-Lane-B-Targets` header. `--target` takes only a `suite:<suite>` name; it
+is refused locally with `bad_targets` while suite targets are off. The commitment carries the short code, because `:`
+separates commitment fields. While suite targets are on, no domain name may
+start with `s-`. A generator that declares a suite target must not embed any
+window of the public benchmark series. The intake scans the committed tree
+without running it, before anything is queued or charged. See
+[INTERFACE.md](INTERFACE.md#lane-b-submissions-declared-rows-and-the-benchmark-ban)
+for the scan and the size cap.
+
+**The sentinel is never a guard or a target for its era.** When the
+cross-lane sentinel is armed (`[v2] sentinel_from_block`), one suite per era
+is held out as that era's sentinel. That suite is neither a lane B guard nor
+a lane B target for that era. Merge judgement leaves it out of the public
+guards, and a suite-target entry aimed at it is not trained or judged that
+era.
+
+Such an entry is deferred, uncharged, and shown as
+`deferred: sentinel_target` in `status/lane_b.json`, with `suite`,
+`eras_deferred` and `expected_release`. It waits in at most
+`sentinel_max_defer_eras` (default `4`) distinct eras. After that it is
+trained and judged on its target, even if that suite is the sentinel again.
+A new sentinel is drawn from the era-boundary block hash each era, so the
+same suite can come up again.
+
+### Lane B declared expert rows
+
+By default the trainer picks your leg's expert rows (ESFT selection on the
+current king). You can instead declare the rows yourself with the optional
+`X-Lane-B-Declared-Rows` header on `POST /v1/lane-b/fund`. Its value is a
+JSON object keyed by MoE ordinal, and each value is a list of expert
+indices:
+
+```text
+X-Lane-B-Declared-Rows: {"0": [3, 17, 40, 90]}
+X-Lane-B-Declared-Rows: {"7": [1, 2, 3, 4]}    refused: declared_rows_bad_layer (ordinals stop at 6)
+X-Lane-B-Declared-Rows: {"0": [1, 2]}          refused: declared_rows_count (layer 0 needs 4..19 rows)
+```
+
+Each layer that has rows must stay inside the clamp set by
+`min_experts_frac` and `max_experts_frac`. Layers you leave out train no
+declared rows, and at least one row in total is required. When you send the
+header, the hotkey signature also covers the rows. INTERFACE.md gives the
+[ordinals, per-layer limits and signing](INTERFACE.md#lane-b-submissions-declared-rows-and-the-benchmark-ban).
+To send it, write the object to a file and pass
+`cascade lane-b fund --declared-rows rows.json`. The CLI parses the file with
+the intake's own parser under the clamp of the chain.toml it loads, then sends
+the canonical rows as the header and signs them. A declaration the intake
+would refuse exits 2 with the same `declared_rows_*` code, and nothing is
+sent. If you omit the flag, the trainer picks the rows.
+
+Declared rows are exclusive, and the earliest reveal holds them. If your
+rows overlap rows held by an open leg, a finished leg awaiting its verdict
+or a pending merge, your entry waits uncharged. It appears as
+`deferred: rows_held` in `status/lane_b.json` with the `holder` entry, the
+`overlap` and the `expected_release` era. It dispatches once those rows are
+free.
+
+### Lane B refusal codes, deferrals and expiry
+
+The intake refuses a fund request before anything is queued, vaulted or
+charged:
+
+| Code | HTTP | Meaning |
+|---|---|---|
+| `declared_rows_malformed` | 400 | The header is not a JSON object, or a layer's value is not a list. |
+| `declared_rows_bad_layer` | 400 | A key is not an MoE ordinal in range, or an ordinal appears twice. |
+| `declared_rows_out_of_range` | 400 | A row is not an expert index of that layer. |
+| `declared_rows_count` | 400 | A layer's row count is outside the clamp, has duplicates, or no rows are declared at all. |
+| `benchmark_series_embedded` | 400 | The tree embeds a public benchmark window. The reply's `contamination` names the `suite` and `window_id`. |
+| `repo_too_large` | 413 | A suite-target tree is over `suite_target_max_repo_mb`. |
+| `contamination_budget_exceeded` | 413 | The tree carries more numeric data than the bounded scan covers. Ship less bulk data. |
+| `contamination_hashset_unavailable` | 503 | The pinned hash set is not loaded on this intake. Retry later. |
+| `repo_unavailable` | 503 | The committed tree could not be fetched for the scan. Retry later. |
+| `contamination_scan_failed` | 503 | The scan could not complete. Retry later. |
+
+The contamination codes and the `contamination` receipt appear only while
+`contamination_hashset` is pinned. `cascade lane-b fund` prints the
+receipt's `result`, `suite` and `window_id`, and `--json` carries it in
+`error.contamination`. To check a tree before you commit it, see
+[Lane B: check a tree before funding](#lane-b-check-a-tree-before-funding).
+
+Two deferrals keep a funded entry queued without charging it:
+`deferred: rows_held` (declared rows overlap held rows) and
+`deferred: sentinel_target` (the suite target is this era's sentinel). The
+reason codes are `rows_held` and `sentinel_target`.
+
+An entry that sits idle past the payer-key TTL without entering a leg fails
+with `last_error_class` `funding_expired`. Fund again to re-enter.
+
+`cascade lane-b status` shows these reasons from the public
+`status/lane_b.json` next to the intake queue: each `deferred` row for your
+hotkey and the gate's `gate_closed_reason`. Under `--json` they are in
+`data.lane_b_status`. With no status document published, the output is the
+queue view alone.
+
+### Lane B: check a tree before funding
+
+`cascade lane-b verify-repo` runs the intake's contamination scan on your
+tree locally, so you can fix an embedded benchmark window before you commit
+and fund:
+
+```bash
+cascade lane-b verify-repo ./my-gen --json
+cascade lane-b verify-repo ./my-gen --chain-toml ./chain.toml --json
+```
+
+It scans against the hash set that `[lane_b] contamination_hashset` pins in
+that chain.toml (the release's `benchmarks/contamination/` artefact), with
+`contamination_min_hits`. The tree is read and never imported or run. No
+wallet is opened and nothing is uploaded. `data.contamination` is the same
+receipt the intake attaches (`hashset_version`, `result`, `suite`,
+`window_id`).
+
+| Exit | `error.code` | Meaning |
+|---|---|---|
+| 0 | none | `result` is `clean`. |
+| 1 | `benchmark_series_embedded` | The tree embeds a benchmark window; the receipt names the `suite` and `window_id`. |
+| 1 | `contamination_budget_exceeded` | The tree carries more numeric data than the bounded scan covers. |
+| 1 | `contamination_scan_failed` | The scan could not complete. |
+| 2 | `not_a_directory` | The path is not a directory. |
+| 2 | `contamination_hashset_unpinned` | This chain.toml pins no hash set, so there is nothing to scan against. |
+| 2 | `contamination_hashset_unavailable` | No artefact in this release matches the pin. |
+
+Without the pinned hash set the command never reports `clean`. A clean local
+result does not bind the intake, which scans the committed tree again.
+
+`cascade lane-b fund --train-hours` / `--train-tokens` set the leg's limits
+(see "Lane B leg levers and limits"); without either the leg budget is
+`[lane_b] leg_hours`. An off-grid value is refused locally (exit 2) with the
+intake's code.
+
+### When lane B opens
+
+`open_rule` chooses the gate that opens lane B. The gate latches: once open,
+it never closes again.
+
+| `open_rule` | Opens when |
+|---|---|
+| `cogate` | The lineage has `open_tokens` measured tokens and routing is stable against the previous king (the default). |
+| `tokens` | The lineage has `open_tokens` measured tokens. |
+| `tokens_king_check` | The lineage has `open_tokens` measured tokens and the latest lane A king check in the validators' signed receipt passed. |
+
+While the gate is closed, `status/lane_b.json` shows `open_rule`,
+`gate_rule` (empty until it opens) and `gate_closed_reason`. Possible
+reasons are `tokens_short` (not enough lineage tokens),
+`king_check_not_passed` (the latest king check did not pass) and
+`king_check_unavailable` (no king check could be read). Under `cogate`, the
+reason is `tokens_short` while tokens are short and empty otherwise. Once
+the gate opens, `gate_opened_block` is set and the reason is cleared.
 
 ### As a new v2 king: your starting share (DEC-CA-0055)
 
@@ -1502,13 +1882,17 @@ own-key leg, and that counts as a second lapse. `cascade round` shows the
 slash reason (`operator_paid` / `min_window` / `repeat_lapse`) and the
 earliest block it can lift.
 
-## 14. MarketCast (lane C, `mkt:<suite>` targets) — DEC-CA-0064
+## 14. MarketCast (lane C, the composite `mkt:market` target) — DEC-CA-0064
+
+New to MarketCast? Start with the step-by-step [MarketCast miner guide](MARKETCAST.md); this section is the full rule reference.
 
 **Lane C currently accepts MarketCast recipes only.** Its tests use market
-windows that start after training is dispatched and are scored once they
-close. Training data has a separate embargo cutoff.
-Today the only such competition is MarketCast, so the lane-C targets are
-`mkt:returns` and `mkt:vol` (the `[marketcast] suites`). The old DEC-CA-0056
+windows drawn from the embargo period your recipe could not train on, so a
+verdict comes at the first settlement after your leg (see "How it is judged").
+Today the only such competition is MarketCast, and its shipped lane-C target is
+ONE composite, `mkt:market`, judged over every `[marketcast] suites` member at
+once (`composite = true`; `composite = false` is the per-suite shape,
+`mkt:<suite>`, one slot each). The old DEC-CA-0056
 targets (`domain:…`, `freq:…`, `horizon:…`, judged on the public-feed
 `pool_c` snapshot) are gone. Their windows could be scraped and memorised
 before they were revealed. `cascade lane-c`, the intake and the chain
@@ -1517,8 +1901,9 @@ eval — only MarketCast (mkt:) has one; see DEC-CA-0056". While MarketCast is
 off, no lane-C target is active. If Lane C has launched, its reserved share
 burns; before Lane C launches, no C pool is reserved.
 
-**Checked-in templates: off on mainnet and testnet** (`[marketcast] from_block =
-0`). Check live status separately. While it is off, the intake, `cascade lane-c check|commit|fund` and the
+**Launch block in the checked-in template:** mainnet `[marketcast]` and `[lane_c]
+from_block = 9586800` (about 2026-11-25 22:28 UTC; `cascade rules c` prints the
+value your release ships). Check live status separately. Before that block, the intake, `cascade lane-c check|commit|fund` and the
 trainer refuse every `mkt:` target with a clear message
 about inactive MarketCast. Their JSON codes differ: `check`/`upload` return
 `bad_recipe`, `commit` returns `bad_commit`, and `fund` returns `bad_target`;
@@ -1528,12 +1913,14 @@ you called. This section describes live entry after activation.
 MarketCast is a fine-tune eval. You fine-tune a PINNED third-party base,
 `mistralai/Timestral-28M@180698bbf5a50dda3516aa6419798437fb03a430` (its
 `model.safetensors` sha256 is
-`dfc83c6220937ce5fc6687b35a4df94cd25e28a2cfe6fb92a23dad6301b2015d`), for one market suite. The
-suites are `mkt:returns`, `mkt:vol`, `mkt:range`, `mkt:funding`,
-`mkt:liquidity` and `mkt:alpha`; the launch set is returns and vol. Each suite
-is its own lane-C slot, with lane C's decay and TTL; its full-pay period is
-tiered by `[marketcast] full_pay_tiers` (same placeholder table as lane C's,
-kept separate because the MarketCast gain is a different statistic).
+`dfc83c6220937ce5fc6687b35a4df94cd25e28a2cfe6fb92a23dad6301b2015d`), to forecast the
+market. The shipped suites are `ohlcv` (the next bars' high / low / close
+price and volume), `returns`, `vol` (Garman–Klass), `high` / `low` (the
+bar's up / down excursion from its open), `range` and `liquidity` (log
+volume); `funding` and `alpha` exist but are off. `mkt:market` is one lane-C
+slot. A confirmed win pays it in full for 5 days (at `[marketcast]
+gain_margin`) up to 20 days (at `[lane_c] full_pay_max_gain` or more), then
+the slot ends (DEC-CA-0073).
 
 Licence: the pinned weights use a
 [Modified MIT licence](https://huggingface.co/mistralai/Timestral-28M/blob/180698bbf5a50dda3516aa6419798437fb03a430/LICENSE).
@@ -1547,17 +1934,18 @@ A tree, uploaded like a lane-C tree, with `marketcast.json` at its root and
 an OPTIONAL generator:
 
 ```json
-{"target": "mkt:returns",
+{"target": "mkt:market",
  "data": {"assets": {"crypto": ["BTC", "ETH", "SOL"], "metals": ["GOLD"]},
           "class_weights": {"crypto": 2.0, "metals": 1.0},
-          "frequencies": ["1m", "5m", "1h"],
+          "frequencies": ["5m", "15m", "1h", "4h", "1d"],
           "start": "2025-06-01", "end": "2026-09-01"},
  "context_length": 4096,
- "horizon_mix": {"5m": 1.0, "1h": 1.0, "1d": 0.5},
- "covariates": ["volume", "calendar", "session"],
+ "horizon_mix": {"5mx36": 1.0, "15mx96": 1.0, "1hx48": 1.0, "1dx7": 0.5},
+ "covariates": ["volume", "calendar", "session", "cross_eth", "open_interest"],
  "augmentations": [{"name": "jitter", "p": 0.5, "params": {"sigma": 0.01}},
                    {"name": "crop", "p": 0.3, "params": {"min_frac": 0.5}}],
- "objective": {"suite_weights": {"returns": 1.0, "vol": 0.2}, "coverage_penalty": 0.5},
+ "objective": {"suite_weights": {"ohlcv": 1.0, "returns": 1.0, "vol": 1.0, "range": 0.5},
+               "coverage_penalty": 0.5},
  "optimizer": {"lr": 1e-4, "schedule": "cosine", "warmup_fraction": 0.05,
                "steps": 2000, "batch": 64, "weight_decay": 0.01, "clip": 1.0,
                "ema_decay": 0.999},
@@ -1565,17 +1953,30 @@ an OPTIONAL generator:
  "synthetic_fraction": 0.0}
 ```
 
-- Every key is required (except `quantile_weights`, `coverage_penalty` and
-  `ema_decay`). Unknown keys are refused at every level, and every bound
+- Every key is required (except `quantile_weights`, `coverage_penalty`,
+  `ema_decay`, `leg_hours`, `init` and `synthetic_channels`). Unknown keys are refused at every level, and every bound
   comes from `[marketcast]`.
+- `horizon_mix` keys are the target's horizons, written `<bar>x<steps>`: a
+  forecast of `steps` bars of `<bar>` ahead. Every suite is scored on every
+  timeframe (owner 2026-11-18): `1mx60` (the next hour of minutes), `5mx36`
+  (3 h), `15mx96` (a day), `1hx48` (2 days), `4hx42` and `1dx7` (a week).
+  Old names such as `1h` are refused.
 - `data.assets` must be a subset of `[marketcast.assets]`: the universe
   Hyperliquid lists. FX is only `EUR`, `JPY` and `GBP` there.
 - `data.end` must be at least `embargo_days` (30) before your submission.
   In live training the trainer fetches the permitted public data itself;
   you do not upload a private training dataset. Local snapshot commands can
   fetch public data for research.
-- `covariates` ⊆ `cross_asset`, `funding`, `volume`, `calendar`,
-  `session`. Covariates are inputs and are never scored.
+- `covariates` ⊆ `cross_asset` (BTC returns), `cross_eth`, `cross_equity`
+  (the S&P 500 perp), `cross_gold`, `cross_fx` (EUR), `funding`, `volume`,
+  `open_interest`, `spread`, `calendar`, `session`, `events`. Covariates are
+  inputs and are never scored. The cross markets are returns on your
+  window's own bars. `open_interest` (the change of log open interest) and
+  `spread` (the impact bid / ask spread, bp) come from Hyperliquid's live
+  asset contexts, which the API serves only live: the recorder samples them
+  each pass from 2026-11-18 on, so earlier history is missing (NaN rows).
+  `events` marks scheduled high-impact releases from `[marketcast]
+  event_times` (the block an event falls in, and the hours to the next one).
 - `augmentations` ⊆ `scale`, `jitter`, `crop`, `time_warp`, `mixup`, each
   with a probability `p` and numeric `params`.
 - `trainable.scope` is one of `full`, `last_n_blocks` (+ `n_blocks` 1–12),
@@ -1584,8 +1985,61 @@ an OPTIONAL generator:
   export.
 - `synthetic_fraction` > 0 needs a generator in the tree (`generator.py`).
   It uses the same sandboxed `generate()` contract as lane A. Its series are
-  mixed in at that share (≤ 0.5), and synthetic samples carry no
-  covariates.
+  mixed in at that share (0–1). You choose the mix: `0` trains on real data
+  only, `1` on your generator only — then `data.assets` and
+  `data.class_weights` may be `{}`. A horizon with no real bars in your
+  range (e.g. `1mx60` while the minute recording is younger than the
+  embargo) trains on generator series alone; without a generator it is not
+  trained at all.
+- `synthetic_channels` (optional) gives your generator's samples their own
+  covariates. Without it, every row of a generated `(C, L)` array is a
+  separate target series and synthetic samples carry NaN (missing)
+  covariates. With it, it names a GROUP of rows, and every yield is cut into
+  consecutive groups of that many rows, each one sample. The sandbox fixes
+  `C` (`[generator] min_channels` / `max_channels`: exactly 32 on mainnet)
+  and each series' length (`max_length` 4096, so a synthetic sample's
+  context is at most 4096 − horizon steps), so 4 names give 8 samples per
+  yield and 3 names give 10, with the last 2 rows ignored. In each group, row 0 must be `"target"`, the others any of your
+  recipe's PAST covariates, plus optionally `"time"` (the unix start of each
+  step), from which the known rows (`calendar`, `session`, `events`) are
+  computed. The clock's step is the array's BAR SIZE: an array whose `time`
+  row is finite with a constant whole-minute step (60 s, 300 s, 3600 s, …)
+  is used only for horizons at that bar, so you can generate 1 m and 1 h
+  dynamics separately. An array without a usable clock is used at any bar,
+  with its known rows missing. A horizon that neither your generator's
+  clocks nor any real series covers is not trained (never a failed leg). A
+  covariate you list but do not generate is a NaN row; non-finite values are
+  missing; a yield with fewer rows than the names fails the leg as your
+  fault. The sandbox's channel-correlation gate (`channel_corr_mode`) is
+  telemetry only today (`"shadow"`); if it is ever set to `"enforce"`, a
+  yield with two near-identical rows (|corr| > `max_channel_corr`, 0.999) is
+  refused — a linear `time` row next to a smooth trending target can be. Generate the
+  rows in the units the real rows use:
+
+  | Row | Units |
+  |---|---|
+  | `volume` | `ln Σ volume` per step |
+  | `funding` | funding rate per interval, bp |
+  | `cross_asset`, `cross_eth`, `cross_equity`, `cross_gold`, `cross_fx` | log return of that market per step, bp |
+  | `open_interest` | change of log open interest per step, bp |
+  | `spread` | impact bid / ask spread, bp |
+
+  Example: `"covariates": ["volume", "cross_asset", "calendar"],
+  "synthetic_channels": ["target", "volume", "cross_asset", "time"]`, with
+  `generate()` yielding `(4, L)` arrays in that row order.
+- `leg_hours` (optional) is your fine-tune leg's wall clock, in hours, up to
+  `[marketcast] max_leg_hours` (12). You pay the pod for it. Without it the
+  leg runs `[lane_c] leg_hours` (1). Your forward windows start at dispatch,
+  so a longer leg trains longer but does not delay the verdict clock.
+- `init` (optional) warm-starts from an EARLIER MarketCast checkpoint instead
+  of the pinned base: its trained pointer (`metro-v1:trained:hippius:…`),
+  e.g. the current slot holder's or your own last fine-tune. The trainer
+  accepts only a checkpoint IT produced from a leg dispatched before your
+  submission; anything else is refused as your fault before a pod is
+  rented. That keeps every chain of warm-starts outside the embargo gap
+  and keeps out models trained elsewhere. The pod loads exactly that
+  checkpoint (sha256, base architecture, finite weights). Either way you are
+  scored against the pinned base AND, to take the slot, the holder.
 
 Local recipe/quality tests are covered in the
 [agent walkthrough](AGENT_MINING.md#lane-c-test-a-marketcast-recipe).
@@ -1593,26 +2047,26 @@ Once MarketCast is open, check, upload, commit and fund with the human's
 authorization:
 
 ```bash
-cascade lane-c check ./my-mkt --target mkt:returns
-cascade lane-c upload ./my-mkt --target mkt:returns --hub-repo NAMESPACE/NAME --json
-cascade lane-c commit --target mkt:returns --ref <repo@digest> --repo-dir ./my-mkt \
+cascade lane-c check ./my-mkt --target mkt:market
+cascade lane-c upload ./my-mkt --target mkt:market --hub-repo NAMESPACE/NAME --json
+cascade lane-c commit --target mkt:market --ref <repo@digest> --repo-dir ./my-mkt \
     --wallet-name W --wallet-hotkey H
 cascade reveal-status HOTKEY --json
 export LIUM_API_KEY=...
-cascade lane-c fund https://<intake> --target mkt:returns --ref <repo@digest> \
+cascade lane-c fund https://<intake> --target mkt:market --ref <repo@digest> \
     --wallet-name W --wallet-hotkey H --gpu L40S --yes
 ```
 
 Use the upload result's exact `data.ref` for commitment and funding. Uploading
 publishes the recipe; it does not commit or rent a GPU. Before funding, run
-`cascade preflight ./my-mkt --lane c --targets mkt:returns --hotkey HOTKEY
+`cascade preflight ./my-mkt --lane c --targets mkt:market --hotkey HOTKEY
 --ref IMMUTABLE_REF --max-price RATE --max-spend TOTAL --json` and review the
 result. Preflight's total cap is a review input, not an enforced A/B/C spend cap.
 
 The leg runs on YOUR key, with the same token budget and wall as any lane-C
-leg (`[lane_c] leg_hours`), on the GPU type you chose (DEC-CA-0060). An
+leg (your `leg_hours`, else `[lane_c] leg_hours`), on the GPU type you chose (DEC-CA-0060). An
 unavailable type waits and is never burned. The leg fine-tunes the pinned
-base, never the king, so a king change never makes it stale. A bad recipe or
+base (or your `init` checkpoint), never the king, so a king change never makes it stale. A bad recipe or
 a diverged loss is your fault and ends the entry. Infra faults requeue.
 
 Every lane-C entry (DEC-CA-0056 review 2026-10-19):
@@ -1628,11 +2082,16 @@ Every lane-C entry (DEC-CA-0056 review 2026-10-19):
 ### How it is judged
 
 - The **main validator** forecasts the untouched base and your fine-tune on
-  its GPU. It uses EVERY forward-only window of the signed snapshot of
-  realized bars (minute bars for sub-hourly series, an hourly bank for ≥ 1h
-  ones): each window starts at least `start_margin_seconds` after the time
-  the trainer dispatched your leg (`train_time`, signed by the trainer),
-  and is scored only once it has closed. It publishes the per-window losses
+  its GPU (DEC-CA-0074, owner 2026-11-24: a verdict within 13 hours). The
+  windows are DRAWN from the embargo — the `embargo_eval_days` (28) before
+  the time the trainer dispatched your leg (`train_time`, signed by the
+  trainer), days no leg ever reads (`data.end` ≤ your commit's UTC date −
+  30 days) — `backtest_windows_per_cell` (48) per asset, series and
+  timeframe, ranked by the hash of the settlement block that registers your
+  entry (it does not exist while you train). The `1mx60` and `5mx36` paths
+  also take their forward windows already closed in the snapshot (start ≥
+  `start_margin_seconds` after dispatch). Nothing waits for windows to close:
+  the verdict comes at the first settlement after your leg. It publishes the per-window losses
   and the forecasts themselves (float32 quantile sidecars), signed, at
   `marketcast/round-<id>.json`. Every validator derives the verdict from
   those rows, once a later trainer-signed lane-C manifest records the
@@ -1645,8 +2104,7 @@ Every lane-C entry (DEC-CA-0056 review 2026-10-19):
   class and requeued as an operator-side loss by the trainer: without
   operator recovery capacity it retrains on your key with a new pod, and
   pauses after three such losses.
-- Windows are spread over the whole period since your dispatch, only
-  liquid, live windows count (≥ 80 % live bars and ≥ $1M traded in the
+- Only liquid, live windows count (≥ 80 % live bars and ≥ $1M traded in the
   24 h before), and the gain weighs every horizon and every asset class
   equally, clustered by asset class × 6-hour block: you need wins across at
   least `min_time_blocks` (8) blocks, not one lucky regime. A NaN in any of
@@ -1655,13 +2113,32 @@ Every lane-C entry (DEC-CA-0056 review 2026-10-19):
   I/O error stays infra). Eligibility never looks at the realised outcome:
   a window is chosen from what is known when it starts (liquidity, and a
   price context that is not flat).
-- **Calibration gate (`mkt:returns` and `mkt:vol`, red-team 2026-10-20).**
+- **What is forecast.** Every window is a path of `<steps>` bars at its
+  horizon's bar (see `horizon_mix` above), every timeframe drawn from the
+  embargo as above. The initial test and the confirmation draw from the two
+  halves of a fixed public split of the windows, so a confirmation never
+  re-scores the initial test's windows. The rows record the whole draw
+  (`draw`: round block, its hash, span, counts) and the verdict reports the
+  backtest and forward windows' gains separately (`mkt.kinds`; the verdict
+  is the combined set's).
+- **Do not ship embargoed prices.** A generator tree is scanned (never run)
+  before your leg rents: a numeric sequence matching the embargoed bars
+  (closes or log returns of the ≥ 15-minute bars, exactly or rescaled)
+  refuses the leg as `embargo_series_embedded`.
+- **Score per window:** mean CRPS over the path's steps (2 × mean pinball
+  over the 21 knots), divided by the seasonal-naive mean absolute error of
+  the window's context (`crps_scale = "seasonal_naive"`, GIFT-Eval's MASE
+  denominator, season one day of bars; lag 1, then the level scale, when the
+  context is flat). It is fixed before the window opens, so a volatile
+  window cannot dominate its cell.
+- **Calibration gate (`returns` and `vol` windows, red-team 2026-10-20).**
   At EVERY horizon the 50 / 80 % intervals must cover within −0.05 / +0.10
   of nominal, and the share of outcomes below your 5 % quantile and above
   your 95 % quantile must each be 5 % ± 2.5 %, per horizon and pooled over
   horizons. Every rate is averaged over asset CLASSES (3 FX pairs count as
   much as 28 crypto perps), and every band widens to 3 standard errors where
-  the counts are thin. Narrowing your quantiles does not pay: the score is
+  the counts are thin — counted in WINDOWS, not path steps, which share one
+  origin. Narrowing your quantiles does not pay: the score is
   mean CRPS (see Verdict), and narrow tails fail this gate.
 - The trainer checks your recipe's `data.end` against the embargo at
   dispatch (before anything is rented), and your pod never sees a bar after
@@ -1674,11 +2151,37 @@ Every lane-C entry (DEC-CA-0056 review 2026-10-19):
   suite this round, or the slot holder), you are a `duplicate`. Nudging a
   copied checkpoint's weights does not escape it. Slots compare fine-tunes against the
   pinned base, so a king change never displaces a MarketCast slot holder.
-- **Verdict:** per asset class and horizon, the ratio of your MEAN CRPS to
-  the base's mean CRPS over the class's windows; the gain is `1 −` the
-  geomean of those ratios (classes equal inside a horizon, horizons equal),
-  and its bootstrap `LCB ≥ 0.01` at `alpha / k`. Never a per-window log
-  ratio, so a too-narrow forecast cannot beat an honest one. `k = C × m`:
+- **Verdict: proven better overall, never confidently worse anywhere.** Per
+  asset class and horizon, the ratio of your MEAN loss to the base's over
+  the class's windows; inside a suite the geomean of those ratios (classes
+  equal inside a horizon, horizons equal, the ohlcv fields as extra
+  columns); across suites a WEIGHTED geomean (`[marketcast]
+  composite_suite_weights`), so each property of a forecast counts once:
+  location (returns 0.25 + ohlcv close) 0.30, dispersion (vol 0.18 + range
+  0.12) 0.30, extremes (high 0.075 + low 0.075 + ohlcv high / low) 0.25,
+  activity (liquidity 0.10 + ohlcv volume) 0.15, the ohlcv suite's 0.20 being
+  its four fields at 0.05 each. The composite gain's bootstrap `LCB ≥ 0.01`
+  at `alpha / k`. Never a per-window log ratio, so a too-narrow forecast
+  cannot beat an honest one. On top of that, from the SAME bootstrap, the
+  entry fails when it is CONFIDENTLY worse (its upper bound below 0) than:
+  - the base on any one suite (`composite_suite_floor` 0);
+  - the base on any guard (`guards`, `guard_floor` 0), each a second proper
+    loss on the same windows: `mase` (median absolute error ÷ the same
+    seasonal-naive scale, on every suite but returns), `qlike` (QLIKE of
+    your forecast's mean variance on vol) and `tail` (the quantile score at
+    1 / 5 / 95 / 99 %, on returns and vol) — a CRPS win bought by worse
+    medians, variance or tails fails;
+  - the strong simple baselines on any suite (`baseline_gate`): a random walk
+    with EWMA volatility and filtered-historical-simulation innovations for
+    returns and price levels, a seasonal profile + AR(1) for vol, range,
+    excursions and volume. Your composite gain over them must also have
+    `LCB ≥ 0`. Measured 2026-11-18, the untouched base beats them by 9.9 %
+    overall but only ties on returns, and loses on 1d returns (−6.4 %) and
+    1d highs (−10.7 %).
+
+  A noisy near-tie on one part passes; a real regression does not. Every
+  part's gain, LCB and UCB is on the receipt row (`mkt.suites`,
+  `mkt.vs_baseline`, `mkt.base_vs_baseline`). `k = C × m`:
   `C` = distinct OWNERS (coldkeys) with an entry on the suite in the round,
   `m` = your coldkey's own entries there. Extra hotkeys on one coldkey share
   that coldkey's level and never raise the bar for others. The trainer also
@@ -1686,12 +2189,49 @@ Every lane-C entry (DEC-CA-0056 review 2026-10-19):
   positive point gain, ≥ `min_windows` windows over ≥ `min_clusters`
   (asset class × 6 h block) clusters, and the calibration gate above.
 - An initial pass is **pending confirmation**, with no payment. A later
-  settlement must pass it again at `alpha` on windows starting after the first
-  snapshot ended. Confirmation must also win the target slot; passing below
-  the current holder's required bound does not replace it or start payment.
+  settlement must pass it again at `alpha` on the other half of the drawn
+  windows (plus short-horizon forward windows that closed after the first
+  pass's snapshot). Confirmation must also win the target slot: the main
+  validator forecasts the current holder on YOUR windows, and you take the
+  slot only by beating it there (paired gain `LCB ≥ gain_margin`, recorded as
+  `mkt.vs_holder`), not by a higher LCB the holder recorded on another week.
+  If the holder cannot be forecast, the recorded-LCB comparison applies.
+  Passing the base but not the holder does not replace it or start payment.
   Expired or deregistered holders no longer block a replacement. Each target
   has one final `confirmed` holder per settlement; an initial-test runner-up
   is labelled `not_selected` and earns no reward.
-- Too few windows or assets so far ⇒ your entry WAITS, and is re-judged
-  every settlement for up to `verdict_wait_blocks` (6 days). After that it
+- Too few windows or assets ⇒ your entry WAITS, and is re-judged every
+  settlement for up to `verdict_wait_blocks` (at most 13 h). After that it
   is dropped.
+
+## 15. Open weights (lane D): the `cascade lane-d` CLI
+
+Lane D entries are trained cascade_pyramid checkpoints: exactly `config.json`,
+`weights.safetensors` (BF16 only) and the repo's own `model.py` /
+`forecast_wrapper.py`. The full guide is `docs/LANE_D.md`
+([LANE_D.md](LANE_D.md)): judging, the house, the gate, pay and a FAQ. Every
+command takes `--json`. No flag takes a key, token or upload URL.
+
+Lane D needs no compute keys: you train on your own hardware, on any data
+and with any recipe, and the operator pays for evaluation. Nothing is rented
+on your provider account. Use a dedicated hotkey: a lane D commit replaces
+that hotkey's lane A pointer. Lane D's template ships unarmed
+(`[lane_d] from_block = 0`). On mainnet the signed launch overlay arms it at
+block 9586800 (with lane B, and lane C's template block) and scores it on
+the **live half only** (`public_weight = 0.0`); the 50/50 live/public rule
+switches on later by overlay. Check `cascade status --json` before you
+submit. The [lane D brief](MINER_LANE_D.md) covers scoring, pay and tips.
+
+- `cascade lane-d export ./trained --out ./entry` writes the entry directory
+  (the four files only) and prints its digest.
+- `cascade lane-d verify ./entry` runs the validators' ingest guards locally.
+  The file allowlist runs first and nothing in the entry is executed.
+- `cascade lane-d submit https://<intake> ./entry --context 4096 --wallet-name W --wallet-hotkey H`
+  signs the manifest with your hotkey and uploads the files straight to the
+  vault. It commits nothing.
+- `cascade lane-d ready https://<intake> --digest <digest> --context 4096 --licence MIT --attest --wallet-name W --wallet-hotkey H`
+  attests the open licence (`--licence` is `MIT`;
+  without `--attest` it shows the statement and sends nothing), then commits
+  the entry on chain with an immediate reveal.
+- `cascade lane-d status https://<intake> --hotkey <ss58>` shows the public
+  lane D queue. It needs no wallet.

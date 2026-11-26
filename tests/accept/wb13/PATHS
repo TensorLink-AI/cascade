@@ -1,0 +1,21 @@
+# WB13: intake contamination check (LB1; TB10-TB12) and the D38 suite-target repo cap.
+# New torch-free static scanner: scan_repo (AST numeric literals, config.json,
+# non-code bytes vs the WB11 hash set; returns the receipt field
+# {hashset_version, result, suite, window_id}) and load_pinned_hashset (the
+# artefact [lane_b] contamination_hashset pins; fail closed). It uses the WB11
+# lookup in cascade/eval/contamination.py, which is NOT in WB13's PATHS.
+cascade/interface/contamination_scan.py
+# The wire point: POST /v1/lane-b/fund (FundingIntake.lane_b_fund) takes
+# lane_b_hashset + fetch_lane_b_repo, refuses benchmark_series_embedded /
+# repo_too_large (D38) before anything is queued, fails closed (503) while
+# pinned, and returns the receipt field.
+cascade/funding/intake.py
+# The lane B funding queue entry carries `contamination` (written to the
+# queue file only when set, so unarmed files are byte-identical).
+cascade/funding/queue.py
+# Production wiring: load the pinned hash set (load_pinned_hashset) and pass it
+# with the submitted-repo fetch to FundingIntake.
+cascade/funding/main.py
+# #931 kill switches at the intake: refuse lane_ended / competition_ended,
+# release the queued entries of an ended lane, warn on a share-0 lane.
+cascade/funding/lane_ends.py

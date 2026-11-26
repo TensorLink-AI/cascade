@@ -1,0 +1,385 @@
+"""W5g: the exact typed reason per case (plan rev6 §3.2 invariant 11:
+"`pending`, `hold` and `burn` always carry a typed reason enum, and tests
+assert the exact reason"; W5g Accept: "asserts the exact reason enum per
+case"). README.md has the contract.
+
+Every case is a real `settle_lane_d` run. For each, the entry's
+`(status, reason)` is asserted by exact value in the state file and in the
+signed report's `entries`, identically; a reason the report also lists as a
+skip appears in `skipped` exactly once with the same value; every report
+validates against `lane-d-report/1`.
+
+`test_every_reason_the_settlement_can_emit_has_a_case` reads
+`cascade/validator/lane_d.py` and fails on an emitted reason no case here
+reaches; `test_every_enum_reason_is_cased_or_owned_elsewhere` accounts for
+every value of the enum.
+"""
+
+from __future__ import annotations
+
+import ast
+import json
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from .helpers import (
+    DAY,
+    T_X,
+    Flow,
+    boundary,
+    entry,
+    entry_of,
+    forecasts,
+    gate_inputs,
+    house,
+    lane_d_cfg,
+    read_state,
+    settle,
+    skips_of,
+    snapshot,
+    uids,
+)
+
+REPO = Path(__file__).resolve().parents[3]
+
+# Enum values no settlement path emits yet; their WP pins them (plan §3.0).
+OWNED_ELSEWHERE = {
+    "coldkey_changed": "W5h (coldkey re-check at reveal, A8, T6b)",
+    "reveal_delay_exceeded": "W5h (max_reveal_delay_days close, A9, T18b)",
+    "mirror_lag_exceeded": "W5a (max_mirror_lag_hours, A1)",
+}
+
+
+class One:
+    """One settlement at boundary(n) on snapshot 1 with a healthy bench."""
+
+    def __init__(self, tmp_path, entries, *, cfg=None, models=None, uid_of=None, fc_edit=None,
+                 n=1, armed=None, **settle_kw):
+        self.cfg = cfg or lane_d_cfg()
+        self.h0 = house()
+        self.path = tmp_path / "state" / "lane_d_state.json"
+        pool1, recs1 = snapshot(tmp_path, 1)
+        if models is None:
+            models = {self.h0["digest"]: ("bad", "house-0")}
+            for e in entries:
+                models[e["digest"]] = ("sharp", e["digest"][:8])
+        fc = forecasts(recs1, models)
+        if fc_edit is not None:
+            fc_edit(fc)
+        hash_, bench, _ = gate_inputs("pass", entries[0]["digest"], self.h0["digest"], "b1")
+        self.report = settle(self.cfg, boundary(n), pool1, entries, self.h0, fc,
+                             uids(*entries) if uid_of is None else uid_of, self.path,
+                             hash_=hash_, bench=bench, armed=armed, **settle_kw).report
+
+
+def _x(**over):
+    return {**entry("x", reveal_ts=T_X), **over}
+
+
+# Each case returns (state_path, report, digest).
+
+
+def case_pending_floor(tmp_path):
+    x = _x(reveal_ts=T_X + 60 * DAY)          # after every window: never frozen
+    r = One(tmp_path, [x])
+    return r.path, r.report, x["digest"]
+
+
+def case_coldkey_cap_settlement(tmp_path):
+    a = _x()
+    b = {**entry("b", reveal_ts=T_X + 60), "coldkey_at_ready": a["coldkey_at_ready"]}
+    r = One(tmp_path, [a, b], cfg=lane_d_cfg(max_judged_per_coldkey_per_settlement=1))
+    return r.path, r.report, b["digest"]
+
+
+def case_coldkey_unresolved(tmp_path):
+    x = _x(coldkey_at_ready="")
+    r = One(tmp_path, [x])
+    return r.path, r.report, x["digest"]
+
+
+def case_king_unscored(tmp_path):
+    x = _x()
+    r = One(tmp_path, [x], models={x["digest"]: ("sharp", "x")})   # no house forecasts
+    return r.path, r.report, x["digest"]
+
+
+def case_deregistered(tmp_path):
+    x = _x()
+    r = One(tmp_path, [x], uid_of={})
+    return r.path, r.report, x["digest"]
+
+
+def case_ready_expired(tmp_path):
+    x = _x()
+    r = One(tmp_path, [x], cfg=lane_d_cfg(ready_ttl_blocks=10))      # revealed 20 blocks late
+    return r.path, r.report, x["digest"]
+
+
+def case_duplicate_digest(tmp_path):
+    x = _x(digest=house()["digest"])
+    r = One(tmp_path, [x], models={house()["digest"]: ("bad", "house-0")})
+    return r.path, r.report, x["digest"]
+
+
+def case_hotkey_has_open_entry(tmp_path):
+    a = _x()
+    b = {**entry("b", reveal_ts=T_X + 60), "hotkey": a["hotkey"]}
+    r = One(tmp_path, [a, b])
+    return r.path, r.report, b["digest"]
+
+
+def case_context_not_armed(tmp_path):
+    x = _x(context=1234)
+    r = One(tmp_path, [x])
+    return r.path, r.report, x["digest"]
+
+
+def _armed_record(armed, contexts=(4096, 8192, 16384), mls=300) -> dict:
+    """A consistent W5d armed record (written by hand, no W5d import): armed
+    variants pass both gates, the others fail the readiness gate."""
+    variants = [{"context": c, "series": 4633 if c in armed else 12,
+                 "sources": 42 if c in armed else 3, "t7_fits": True, "armed": c in armed}
+                for c in contexts]
+    return {"armed_contexts": [c for c in contexts if c in armed],
+            "evidence": {"min_long_series": mls, "min_sources": 20,
+                         "readiness_sha256": "a1" * 32, "t7_sha256": "b2" * 32,
+                         "variants": variants}}
+
+
+def case_context_below_armed(tmp_path):
+    """Plan rev6.15 (owner 2026-11-23, "Highest ≤ declared, else skip"):
+    declared 4096 with only 8192 and 16384 armed. The entry is not judged and
+    stays pending (W7a owns the producer side; this is the reason's case)."""
+    x = _x(context=4096)
+    r = One(tmp_path, [x], armed=_armed_record((8192, 16384)))
+    return r.path, r.report, x["digest"]
+
+
+def case_before_eval_delay(tmp_path):
+    """Plan rev6.14 (a): the boundary is stamped one second before X's judging
+    start j = max(T_X, T_house) + eval_delay_hours: X is not drawn, frozen or
+    judged, and stays pending."""
+    x = _x()
+    cfg = lane_d_cfg()
+    assert hasattr(cfg, "eval_delay_hours"), "rev6.14: [lane_d] eval_delay_hours is parsed"
+    j = max(int(x["reveal_ts"]), int(house()["reveal_ts"])) + int(3600 * cfg.eval_delay_hours)
+    r = One(tmp_path, [x], cfg=cfg, boundary_ts=j - 1)
+    st = json.loads(r.path.read_text())["entries"][x["digest"]]
+    assert st["frozen_set"] is None and st["used_windows"] == [], \
+        "nothing is frozen or judged before the judging start"
+    return r.path, r.report, x["digest"]
+
+
+def case_boundary_ts_missing(tmp_path):
+    """Plan rev6.14 (a), orchestrator 2026-11-23: a settlement without the
+    boundary's on-chain timestamp (the legacy call) freezes and judges nothing
+    (fail closed)."""
+    x = _x()
+    r = One(tmp_path, [x], boundary_ts=None)
+    assert r.report["cohorts"] == [] and "boundary_ts" not in r.report
+    return r.path, r.report, x["digest"]
+
+
+def case_checkpoint_fault_forecasts(tmp_path):
+    x = _x()
+
+    def poison(fc):
+        wid = sorted(fc[x["digest"]])[0]
+        fc[x["digest"]][wid] = np.full_like(fc[x["digest"]][wid], np.nan)
+
+    r = One(tmp_path, [x], fc_edit=poison)
+    return r.path, r.report, x["digest"]
+
+
+def case_lane_closed(tmp_path):
+    x = _x()
+    # until_block must be an era boundary: boundary(4) is one (4 settlements/era).
+    r = One(tmp_path, [x], cfg=lane_d_cfg(until_block=boundary(4)), n=4)
+    return r.path, r.report, x["digest"]
+
+
+def case_lost_duel(tmp_path):
+    x = _x()
+    r = One(tmp_path, [x], models={house()["digest"]: ("good", "house-0"),
+                                   x["digest"]: ("bad", "x")})
+    return r.path, r.report, x["digest"]
+
+
+def _flow(tmp_path, mode2):
+    f = Flow(tmp_path, mode2=mode2)
+    return f.path, f.reports[2], f.x["digest"]
+
+
+def case_bench_hold(tmp_path):
+    return _flow(tmp_path, "host_down")
+
+
+def case_bench_hold_regate(tmp_path):
+    f = Flow(tmp_path, mode2="no_bench")
+    return f.path, f.next("reference_fault"), f.x["digest"]
+
+
+def case_bench_hold_requeued(tmp_path):
+    f = Flow(tmp_path, mode2="no_bench", cfg=lane_d_cfg(max_bench_holds=1))
+    return f.path, f.next("host_down"), f.x["digest"]
+
+
+def case_checkpoint_fault_gate(tmp_path):
+    return _flow(tmp_path, "candidate_fault")
+
+
+def case_checkpoint_fault_regate(tmp_path):
+    f = Flow(tmp_path, mode2="no_bench")
+    return f.path, f.next("candidate_fault"), f.x["digest"]
+
+
+def case_gate_regression(tmp_path):
+    return _flow(tmp_path, "regress")
+
+
+def case_crowned(tmp_path):
+    return _flow(tmp_path, "pass")
+
+
+# case id → (builder, exact reason, exact status | a tuple of allowed statuses,
+#            listed in report.skipped?)
+CASES = {
+    "pending_floor": (case_pending_floor, "pending_floor", "pending", True),
+    "coldkey_cap_settlement": (case_coldkey_cap_settlement, "coldkey_cap_settlement",
+                               "pending", True),
+    "coldkey_unresolved": (case_coldkey_unresolved, "coldkey_unresolved", "closed", True),
+    "king_unscored": (case_king_unscored, "king_unscored", "pending", True),
+    "deregistered": (case_deregistered, "deregistered", "closed", True),
+    "ready_expired": (case_ready_expired, "ready_expired", "closed", True),
+    "duplicate_digest": (case_duplicate_digest, "duplicate_digest", "closed", True),
+    "hotkey_has_open_entry": (case_hotkey_has_open_entry, "hotkey_has_open_entry",
+                              "closed", True),
+    "context_not_armed": (case_context_not_armed, "context_not_armed", "closed", True),
+    "context_below_armed": (case_context_below_armed, "context_below_armed", "pending", True),
+    "before_eval_delay": (case_before_eval_delay, "before_eval_delay", "pending", True),
+    "boundary_ts_missing": (case_boundary_ts_missing, "boundary_ts_missing", "pending", True),
+    "checkpoint_fault_forecasts": (case_checkpoint_fault_forecasts, "checkpoint_fault",
+                                   "closed", True),
+    "checkpoint_fault_gate": (case_checkpoint_fault_gate, "checkpoint_fault", "closed", False),
+    "checkpoint_fault_regate": (case_checkpoint_fault_regate, "checkpoint_fault",
+                                "closed", True),
+    "lane_closed": (case_lane_closed, "lane_closed", "closed", True),
+    "lost_duel": (case_lost_duel, "lost_duel", "lost", False),
+    # rev6.11 (b): a held first clear is `hold` (no confirm_pending).
+    "bench_hold": (case_bench_hold, "bench_hold", "hold", False),
+    "bench_hold_regate": (case_bench_hold_regate, "bench_hold", "hold", True),
+    "bench_hold_requeued": (case_bench_hold_requeued, "bench_hold", "pending", True),
+    "gate_regression": (case_gate_regression, "gate_regression", "lost", False),
+    "crowned": (case_crowned, "crowned", "crowned", False),
+    # rev6.18 A7 (F4, owner 2026-11-23): the A10 check and its
+    # `lowfreq_regression` reason are removed (correction: case deleted).
+}
+
+
+@pytest.mark.parametrize("case", sorted(CASES))
+def test_the_exact_reason_per_case(tmp_path, case):
+    from cascade.validator import lane_d_report, lane_d_state
+
+    build, reason, status, is_skip = CASES[case]
+    path, report, dg = build(tmp_path)
+    statuses = status if isinstance(status, tuple) else (status,)
+    rec = read_state(path)["entries"][dg]
+    assert rec["reason"] == reason, f"{case}: state reason {rec['reason']!r} != {reason!r}"
+    assert rec["status"] in statuses, f"{case}: state status {rec['status']!r}"
+    e = entry_of(report, dg)
+    assert (e["status"], e["reason"]) == (rec["status"], rec["reason"]), \
+        f"{case}: the report's entry differs from the state's"
+    assert reason in lane_d_report.ENTRY_REASONS and reason in lane_d_state.ENTRY_REASONS
+    if is_skip:
+        assert skips_of(report, dg) == [reason], f"{case}: skipped {skips_of(report, dg)}"
+        assert reason in lane_d_report.SKIP_REASONS
+        assert dg not in report["judged"]
+    else:
+        assert skips_of(report, dg) == [], f"{case}: a judged entry is not a skip"
+        assert dg in report["judged"]
+    lane_d_report.validate_report(report)
+
+
+@pytest.mark.parametrize("case", sorted(CASES))
+def test_every_reason_in_state_and_report_is_typed(tmp_path, case):
+    """No free text: every entry of every case, not just the one under test,
+    carries an enum reason, and the report's entries and skips agree with
+    the state."""
+    from cascade.validator import lane_d_report, lane_d_state
+
+    path, report, _ = CASES[case][0](tmp_path)
+    state = read_state(path)
+    for dg, rec in state["entries"].items():
+        assert rec["reason"] in lane_d_state.ENTRY_REASONS, (dg, rec["reason"])
+        assert rec["status"] in lane_d_state.ENTRY_STATUSES, (dg, rec["status"])
+        e = entry_of(report, dg)
+        assert (e["status"], e["reason"]) == (rec["status"], rec["reason"])
+    for s in report["skipped"]:
+        assert s["reason"] in lane_d_report.SKIP_REASONS, s
+        assert state["entries"][s["digest"]]["reason"] == s["reason"], s
+    for slot in report["pay"]["court"]:
+        assert slot["burn_reason"] is None or slot["burn_reason"] in lane_d_report.BURN_REASONS
+
+
+def _emitted_reasons() -> set[str]:
+    """The reason enum values that appear as string literals (not docstrings)
+    in `cascade/validator/lane_d.py`, plus the gate outcomes it maps onto
+    entry reasons."""
+    from cascade.validator import lane_d_report
+
+    src = (REPO / "cascade" / "validator" / "lane_d.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    docstrings = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Module | ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            body = node.body
+            if (body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant)
+                    and isinstance(body[0].value.value, str)):
+                docstrings.add(id(body[0].value))
+    reasons = set(map(str, lane_d_report.ENTRY_REASONS))
+    found = {n.value for n in ast.walk(tree)
+             if isinstance(n, ast.Constant) and isinstance(n.value, str)
+             and id(n) not in docstrings and n.value in reasons}
+    found |= set(map(str, lane_d_report.GATE_OUTCOMES)) & reasons
+    return found
+
+
+def test_no_confirm_stage_reason_or_status_exists():
+    """rev6.11 (b): the confirmation duel is dropped. `confirm_pending` and
+    `lost_confirmation` are in no reason or status enum, and the settlement
+    emits neither (W5e: "Drop `lost_confirmation`; a loss is `lost_duel`")."""
+    from cascade.validator import lane_d_report, lane_d_state
+
+    for name in ("confirm_pending", "lost_confirmation"):
+        for enum in (lane_d_report.ENTRY_REASONS, lane_d_state.ENTRY_REASONS,
+                     lane_d_report.SKIP_REASONS):
+            assert name not in tuple(map(str, enum)), name
+        assert name not in _emitted_reasons(), name
+    for enum in (lane_d_report.ENTRY_STATUSES, lane_d_state.ENTRY_STATUSES):
+        assert "confirm_pending" not in tuple(map(str, enum))
+
+
+def test_every_reason_the_settlement_can_emit_has_a_case():
+    covered = {v[1] for v in CASES.values()}
+    missing = sorted(_emitted_reasons() - covered)
+    assert not missing, f"reasons settle_lane_d can emit with no W5g case: {missing}"
+
+
+def test_every_enum_reason_is_cased_or_owned_elsewhere():
+    from cascade.validator import lane_d_report, lane_d_state
+
+    covered = {v[1] for v in CASES.values()}
+    enum = set(map(str, lane_d_report.ENTRY_REASONS)) | set(map(str, lane_d_state.ENTRY_REASONS))
+    unaccounted = sorted(enum - covered - set(OWNED_ELSEWHERE))
+    assert not unaccounted, f"enum reasons with no case and no owner: {unaccounted}"
+    assert set(OWNED_ELSEWHERE) <= enum
+
+
+def test_the_hold_bound_key_is_parsed():
+    """`[lane_d] max_bench_holds` (W2 lists it; plan §10.4 default 4)."""
+    assert lane_d_cfg().max_bench_holds == 4
+    assert lane_d_cfg(max_bench_holds=0).max_bench_holds == 0
+    assert lane_d_cfg(max_bench_holds=7).max_bench_holds == 7
