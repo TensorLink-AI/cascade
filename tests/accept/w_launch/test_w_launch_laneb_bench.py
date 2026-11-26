@@ -145,6 +145,19 @@ def test_prebench_fetches_on_the_worker_and_stops_once_cached(tmp_path, monkeypa
     assert lb.rows(root / "kingptr") is not None
 
 
+def test_prebench_never_fetches_on_the_box_without_the_opt_in(tmp_path, monkeypatch):
+    """2026-11-26 (owner rule: no checkpoint download on the trainer box): with
+    no eval-pod runner the worker's box-side fetch is refused unless
+    CASCADE_LANE_B_LOCAL_EVAL=1 — the bench is never swept, nothing fetched."""
+    monkeypatch.delenv("CASCADE_LANE_B_LOCAL_EVAL", raising=False)
+    fetched = []
+    lb, fake = _bench(tmp_path, fetch=lambda p: fetched.append(p) or _ckpt(tmp_path, p))
+    lb.prebench("kingptr")
+    with pytest.raises(OSError, match="refused on the trainer box"):
+        _drain(lb)
+    assert fetched == [] and fake.calls == []
+
+
 def test_runner_ops_without_bench_host_never_run_locally(caplog):
     from cascade.trainer.lane_b_driver import RunnerLaneBOps
 
