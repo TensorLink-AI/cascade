@@ -3795,7 +3795,16 @@ then the merge refuses `host_mismatch` when hosts disagree on the king.
 is tied to one cloud and region, which would defeat the cheapest-available
 pick. `state-push` refuses (`state_conflict`) unless the bucket copy is a
 byte prefix of the local log and the bucket `HEAD.json` is the one
-`state-pull` saw. `mirror-sync` never touches `first_seen/`.
+`state-pull` saw.
+Both stream, because `records.jsonl` is 20 GB and growing. `state-push` proves
+the prefix by hashing the local file's first `size` bytes against HEAD's
+sha256, without downloading the bucket copy. It uploads above 256 MiB as a
+multipart upload (at most 10,000 parts, aborted on failure) and does not
+upload a file equal to the bucket copy again. `HEAD.json` records each file's
+sha256 and `sizes`. `state-pull` streams each file to a temp file, verifies
+it against HEAD, and only then replaces the local copy. A failed push leaves
+the previous HEAD, so the next cycle retries. `mirror-sync` never touches
+`first_seen/`.
 
 **Keys the owner fills (names only).**
 

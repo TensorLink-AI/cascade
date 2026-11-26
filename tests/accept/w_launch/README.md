@@ -174,3 +174,34 @@ pool_d index walk and of `verify_snapshot` does not grow with the feed count.
 `tests/unit/test_first_seen_index_memory.py` pins identical lookups, lags,
 errors, `verify_snapshot` results and `pool_d_build` output files against the
 previous implementation, kept verbatim in the test.
+
+## pool_d builder state-push: the first-seen log streams (2026-11-26)
+
+Every 3-hourly build cycle exited non-zero at `cascade-laned elastic
+state-push` with `s3_put_failed: pool_d/_builder/first_seen/records.jsonl:
+... (EntityTooLarge) ... PutObject`. The log is 20 GB (7,002 feeds) and grows
+on every build. The push read the local log and the bucket copy whole, then
+sent the log as one PUT, which Hippius refuses above its single-PUT cap.
+
+- The pool stores gain `put_file_sha`, `get_file_sha` and `object_size`. A
+  file up to `MULTIPART_CHUNK_BYTES` (256 MiB) is one PUT. A larger file is an
+  explicit multipart upload: the part size is `multipart_part_size(size)`
+  (at least 256 MiB, at most 10,000 parts), one part is in memory at a time,
+  and any failure aborts the upload. Both directions return the sha256 and
+  size of the bytes that went over the wire.
+- `state-push` makes one local pass per file. It compares the sha256 of the
+  local file's first `size` bytes with HEAD's sha256 for the bucket copy, so
+  it never downloads that copy. The upload must report the scanned sha256 and
+  size, and the stored object must have that size. A file equal to the bucket
+  copy is not uploaded again. `HEAD.json` keeps `{name: sha256}`, gains
+  `sizes`, and is still written last, so a failed push leaves the old HEAD.
+- `state-pull` streams each file to a temp file, checks its sha256 (and size,
+  when HEAD has it) and the local copy's append-only prefix, and only then
+  replaces the local file. A warm local copy equal to HEAD is not downloaded.
+  The pull mark records the restored sizes. A HEAD or mark from before
+  `sizes` still pulls and pushes.
+
+`test_w_launch_state_push_streaming.py` pins this against a fake S3 client
+that refuses a single PUT above one part. `tests/unit/test_pool_d_state_streaming.py`
+pins the store methods: the one-PUT path, multipart part sizes, abort on a
+failed part, failed complete or a file that grows, and streamed downloads.
