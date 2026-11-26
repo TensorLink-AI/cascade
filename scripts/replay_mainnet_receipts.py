@@ -15,6 +15,15 @@ Exit status:
   0  (with a GitHub warning) when storage/chain is unreachable — an outage is
      not a fork; the job says it could not verify.
 
+PENDING (2026-11-26, PRs #960/#961): a receipt the index lists, or an object
+its replay must read (the settlement's lane D record
+``lane-d/receipts/lane_d_receipt_<boundary>.json``), that is not readable YET
+(AccessDenied / 403 / 404 / NoSuchKey — the settlement is still being
+computed, or the object is not public yet) is a SKIP with a GitHub warning,
+counted and printed in the summary — never a failure. A receipt that IS
+published but cannot be verified (unparseable, schema/signature problems, a
+replay error that is not a read-not-yet-possible) still FAILs.
+
 Usage: replay_mainnet_receipts.py [--last N] [--validator SS58] [--config PATH]
 """
 
@@ -71,6 +80,35 @@ KNOWN_UNSTAMPED_EMISSION: dict[str, dict] = {
 
 def _gh(level: str, msg: str) -> None:
     print(f"::{level}::{msg}")
+
+
+# Markers of an object that is referenced but not readable (yet): an anonymous
+# GET of a key that is absent or not yet public answers AccessDenied on
+# Hippius, 404/NoSuchKey elsewhere, ObjectNotFound from the store wrapper.
+PENDING_MARKERS = ("AccessDenied", "Access Denied", "NoSuchKey", "ObjectNotFound",
+                   "Entry Not Found", "Not Found", "404", "403", "Forbidden")
+
+
+def is_pending_read(exc: BaseException) -> bool:
+    """True when ``exc`` (or anything in its cause/context chain) is a read of
+    an object that does not exist or is not readable yet — a pending
+    settlement, not a published-but-unverifiable record. Pure, so the unit
+    tests pin it."""
+    seen: set[int] = set()
+    e: BaseException | None = exc
+    while e is not None and id(e) not in seen:
+        seen.add(id(e))
+        if type(e).__name__ in ("ObjectNotFound", "NoSuchKey", "FileNotFoundError"):
+            return True
+        code = str(((getattr(e, "response", None) or {}).get("Error") or {}).get("Code", ""))
+        if code in ("AccessDenied", "NoSuchKey", "404", "403", "NotFound"):
+            return True
+        if isinstance(e, (ValueError, KeyError, TypeError)):
+            return False                  # parsed bytes: published, not pending
+        if any(m in str(e) for m in PENDING_MARKERS):
+            return True
+        e = e.__cause__ or e.__context__
+    return False
 
 
 def known_clock_problem(rc, src, pin: dict) -> str | None:
@@ -203,17 +241,38 @@ def main(argv: list[str] | None = None) -> int:
         client = None
 
     fails, replayed, unreachable = [], 0, 0
+    pending: list[str] = []
     loaded = []
     for r in picked:
         rid = str(r["round_id"])
         try:
-            rc = load_receipt(_fetch_text(cfg, str(r["receipt_key"])))
+            text = _fetch_text(cfg, str(r["receipt_key"]))
         except Exception as e:  # noqa: BLE001
             unreachable += 1
-            print(f"round {rid}: receipt unreadable ({e})")
+            if is_pending_read(e):
+                pending.append(f"round {rid}: receipt {r['receipt_key']} not readable yet")
+            print(f"round {rid}: SKIP — receipt unreadable ({e})")
+            continue
+        try:
+            rc = load_receipt(text)
+        except Exception as e:  # noqa: BLE001 — published but unparseable ⇒ FAIL
+            print(f"round {rid}: FAIL — published receipt does not load ({e})")
+            fails.append(f"round {rid} load: published receipt unverifiable ({e})")
+            continue
+        try:
+            results = audit_receipt(rc, cfg, tier=0, client=client)
+        except Exception as e:  # noqa: BLE001
+            if is_pending_read(e):
+                # e.g. the settlement's lane D receipt is still being computed
+                unreachable += 1
+                pending.append(f"round {rid}: an input the replay reads is not readable "
+                               f"yet ({str(e)[:300]})")
+                print(f"round {rid}: SKIP (pending) — {str(e)[:300]}")
+                continue
+            print(f"round {rid}: FAIL — replay raised {type(e).__name__}: {e}")
+            fails.append(f"round {rid} replay: {type(e).__name__}: {e}")
             continue
         loaded.append(rc)
-        results = audit_receipt(rc, cfg, tier=0, client=client)
         pin = KNOWN_UNSTAMPED_EMISSION.get(rid)
         if pin is not None:
             results = _replay_known_unstamped(rc, results, pin, rows, cfg, client)
@@ -237,6 +296,11 @@ def main(argv: list[str] | None = None) -> int:
         if row.status == FAIL:
             fails.append(f"image-epoch-chain: {row.detail}")
 
+    for p in pending:
+        _gh("warning", f"receipt replay SKIPPED (pending, not a failure) — {p}")
+    if pending:
+        print(f"\n{len(pending)} receipt(s) SKIPPED as pending (referenced but not "
+              "readable yet).")
     for f in fails:
         _gh("error", f"CONSENSUS DIVERGENCE vs a settled mainnet receipt — {f}")
     if fails:
@@ -250,7 +314,8 @@ def main(argv: list[str] | None = None) -> int:
         _gh("error", "no receipt was actually re-derived (every one skipped/WARN-only) — the "
                      "replay is blind; fix the replay inputs before trusting it")
         return 1
-    print(f"\nOK: {replayed}/{len(picked)} mainnet receipt(s) re-derived identically.")
+    print(f"\nOK: {replayed}/{len(picked)} mainnet receipt(s) re-derived identically"
+          f" ({len(pending)} pending skipped).")
     return 0
 
 
