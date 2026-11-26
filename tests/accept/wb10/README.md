@@ -188,3 +188,26 @@ Payouts, the take-all case, the replacement rule (only a newer accepted
 merge moves a slot) and inconclusive suites are pinned. PATHS gain the judge,
 validator rows, acceptance, the trainer call site, `v2_status.py` and the
 unit tests that pinned the retired rule.
+
+## Lane B domain tags (owner 2026-11-25, `test_wb10_domain_tags.py`)
+
+Records and display only. Each judged generator is tagged with the slots it
+actually improved, read from the signed verdict rows
+(`cascade/shared/lane_b_domains.py`). **Improved** means the slot cleared
+the `judge_expert_slots` gain test: it was conclusive, and for CRPS or MASE
+the family LCB is at least `gain_bar` with a positive point gain, while the
+other metric is non-inferior. A slot blocked by a guard is improved but has
+`claimed: false`. Each tag also records `margin = target_lcb - gain_bar`.
+The tags live in the `receipts/index.json` `lane_b_domains` column, in
+`status/v2.json` `lane_b.domain_tags`, in `cascade status` and in
+`cascade round`. The tests check:
+
+- the tags for a real verdict: an improved declared domain, a declared domain
+  that was not improved, an improved untargeted domain, an untargeted domain
+  that was not improved, and that the rule matches the judge;
+- the guard-blocked, inferior-other-metric, inconclusive and not-evaluated
+  cases;
+- that the signed receipt body, its digest and the weights are the same with
+  and without the tags, and that every other index column is unchanged;
+- that the status doc, the dashboard and `cascade status` accept the field
+  being absent.
