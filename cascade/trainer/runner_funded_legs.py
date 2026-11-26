@@ -116,8 +116,12 @@ class _FundedLegMixin:
                         expert_selection: dict | None = None, funded_queue=None,
                         king_leg: bool = False):
         from .admission import FairSlots, owner_admission
+        from .cost_guards import with_leg_timeout
         from .faults import _FundedLegSkip
 
+        # 2026-11-26 lane B/C audit: the dispatch wall follows the leg's own
+        # contract wall (12 h lane B / MarketCast legs), never below 6 h
+        disp = with_leg_timeout(self, disp, contract)
         with funded_leg_scope(self, funded_queue, contract, king_leg=king_leg, gen=gen):
             self._funded_leg_failures.pop(gen.hotkey, None)
             reused = _reupload_pending(self, gen, seeds, contract, suffix, warm_start_ref)

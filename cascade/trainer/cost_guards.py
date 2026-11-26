@@ -234,6 +234,18 @@ def leg_watchdog(runner, *, gen, pod, contract, key_check=None,
         credit = PROGRESS_STEP_QUANTUM
     else:
         credit = 0
+    if getattr(local, "mkt_rent_skus", None) is not None:
+        # 2026-11-26 lane B/C audit: the MarketCast worker (run_mkt_worker)
+        # writes NO progress record, so every poll reads None — the first-step
+        # deadline would abort every MarketCast leg longer than it (the
+        # default [lane_c] leg_hours 1.0 > 2700 s), and the contract's
+        # training_steps are lane A's for_hours steps, not the recipe's. The
+        # worker's own max_seconds stop and the dispatch timeout bound it.
+        if first > 0 or steps > 0:
+            log.info("funded leg %s: MarketCast leg — no progress record on this worker: "
+                     "first-step deadline and throughput judge off (the leg's wall bounds "
+                     "it)", gen.hotkey[:12])
+        first, steps = 0.0, 0
     return ProgressWatchdog(
         label=f"funded leg {gen.hotkey[:12]}", hotkey=gen.hotkey,
         pod_name=str(getattr(pod, "instance_id", "?")),
@@ -269,6 +281,50 @@ def wall_bounded_steps(training_steps: int, wall_seconds: float, steps_per_s) ->
         return 0
     bound = max(1, math.floor(float(wall_seconds) * rate))
     return min(int(training_steps), bound) if int(training_steps or 0) > 0 else bound
+
+
+LEG_DISPATCH_HEADROOM_SECONDS = 3600
+
+
+def leg_dispatch_timeout(timeout_seconds: int, contract, *, first_step_seconds: float = 0
+                         ) -> int:
+    """The dispatch wall of one leg: ``timeout_seconds`` (the dispatcher's own,
+    6 h — sized for lane A's 5 h wall + 1 h) or, when the leg's contract wall
+    needs more, ``max_train_seconds`` + the larger of the first-step deadline
+    and an hour. Never shorter than the dispatcher's own.
+
+    2026-11-26 lane B/C audit: a lane B leg may train up to 12 h
+    (``max_leg_seconds`` 54000) and a MarketCast recipe up to ``[marketcast]
+    max_leg_hours`` 12, but the detached run was killed at the fixed 6 h —
+    every such leg lost on the miner's bill and requeued to lose again."""
+    base = int(timeout_seconds or 0)
+    try:
+        wall = int(float(getattr(contract, "max_train_seconds", 0) or 0))
+    except (TypeError, ValueError):
+        return base
+    if wall <= 0:
+        return base
+    need = wall + int(max(float(LEG_DISPATCH_HEADROOM_SECONDS), float(first_step_seconds or 0)))
+    return max(base, need)
+
+
+def with_leg_timeout(runner, disp, contract):
+    """``disp`` with :func:`leg_dispatch_timeout` applied (a dataclass
+    dispatcher with ``timeout_seconds``; anything else unchanged). Lane A
+    (5 h wall) keeps its 6 h exactly."""
+    import dataclasses
+
+    current = getattr(disp, "timeout_seconds", None)
+    if current is None or not dataclasses.is_dataclass(disp):
+        return disp
+    first = float(getattr(getattr(getattr(runner, "cfg", None), "round", None),
+                          "progress_first_step_seconds", 0) or 0)
+    want = leg_dispatch_timeout(int(current), contract, first_step_seconds=first)
+    if want == int(current):
+        return disp
+    log.info("leg dispatch timeout %ds (contract wall %ss; dispatcher default %ds)", want,
+             getattr(contract, "max_train_seconds", "?"), int(current))
+    return dataclasses.replace(disp, timeout_seconds=want)
 
 
 @contextmanager

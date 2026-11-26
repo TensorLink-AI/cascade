@@ -65,3 +65,6 @@ cascade/trainer/runner_rolling.py
 cascade/provision/funded.py
 tests/unit/test_lane_b_reattach.py
 tests/unit/test_pod_postmortem.py
+# 2026-11-26 lane B/C assumption audit: lane A walls, dispatch timeout, the
+# MarketCast watchdog, limits / fixed-steps legs, the operator leg's layout.
+cascade/trainer/runner_capacity.py

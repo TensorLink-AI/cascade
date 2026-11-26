@@ -903,8 +903,14 @@ class _OperatorPodMixin:
             release_reservation(self)            # no rent: free the daily-cap headroom
             raise
         _loc = self.__dict__.get("_leg_local_obj")
+        # 2026-11-26 lane B audit: the rented layout, as the payer path records
+        # it (lane B reads it for gpu_n and the wall-bounded watchdog's rate):
+        # without it an operator-rented 8-GPU expert leg signed gpu_n = 0
+        # ("a one-GPU leg" to exact_rederive_ok) and its throughput judge was off
+        op_sku = str(getattr(host, "sku", "") or "")
         if _loc is not None:
             _loc.leg_trained = False           # set by the harvest (harvest_guard)
+            _loc.funded_pod_sku = op_sku
 
         def ledger_pod():
             pods = getattr(self, "_load_funded_ledger", lambda: [])()
@@ -959,7 +965,8 @@ class _OperatorPodMixin:
             from .runner_funded_legs import _dispatch_watched, _with_leg_watchdog
 
             disp = _with_leg_watchdog(
-                self, disp, gen, SimpleNamespace(instance_id=pod_id, payer_hotkey=""),
+                self, disp, gen, SimpleNamespace(instance_id=pod_id, payer_hotkey="",
+                                                 sku=op_sku),
                 contract, host)
             receipt = _dispatch_watched(
                 disp, host, lane_count=1, gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey,

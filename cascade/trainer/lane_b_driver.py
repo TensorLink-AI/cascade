@@ -2260,6 +2260,17 @@ class RunnerLaneBOps:
                 # the type the miner chose, nothing else
                 own_risk = ((str(f.get("gpu", "") or ""),)
                             if f.get("gpu_measured") is False and f.get("gpu") else ())
+                # 2026-11-26 audit: a WB23 fixed-steps leg (train_hours on a
+                # measured type, no limits) fixed its steps on the CHOSEN type's
+                # rate — the operator make-good path ignores gpu_choice and would
+                # rent any measured type (8xRTX4090 0.137 vs 8xH200 0.055 steps/s:
+                # a 2.5x slower pod wall-caps it or trips THROUGHPUT ABORT)
+                # (_funded_leg_length carries no limits terms: read the record)
+                limits = (int(f.get("train_tokens", 0) or 0) > 0
+                          or f.get("gpu_measured") is False)
+                fixed = (str(f.get("gpu", "") or ""),) if (
+                    length is not None and not limits and f.get("gpu")) else ()
+                only = own_risk or fixed
                 if not gpus.rent_skus() and not own_risk:
                     raise LegFailure("no [lane_b] funded_pod_skus type has a measured "
                                      "step rate (WB19) on the pinned image — not rented",
@@ -2278,10 +2289,14 @@ class RunnerLaneBOps:
                 # its wall (for_hours keeps lane A's step count): its
                 # watchdog judges the wall's worth of steps at the WB19 rate
                 # of the type it rents, never the contract's
+                # (audit 2026-11-26: a LIMITS leg — token limit or own-risk
+                # unmeasured GPU — also keeps lane A's reference steps behind its
+                # hour wall: wall-bounded by design, judged the same way)
                 wall_bounded = (wall_bounded_leg(self.r, _measured_rate_of(gpus, contract))
-                                if length is None else contextlib.nullcontext())
+                                if length is None or limits
+                                else contextlib.nullcontext())
                 try:
-                    with rent_scope(self.r, gpus, only=own_risk), wall_bounded:
+                    with rent_scope(self.r, gpus, only=only), wall_bounded:
                         entry = self.r._run_funded_leg(
                             self.r._dispatcher(), gen, seeds, int(block), contract,
                             f"-x{label}-u{leg.sub.uid}", warm_start_ref=leg.base_king_ref,
