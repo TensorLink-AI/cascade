@@ -72,3 +72,9 @@ cascade/trainer/runner_capacity.py
 # 2026-11-26: lane B make-good approvals bind by the bare generator ref (domain| prefix).
 cascade/funding/operator_approvals.py
 tests/accept/wb27/test_wb27_approval_ref.py
+# 2026-11-26 owner: an operator approval pins the make-good's GPU types (--sku);
+# lane B / lane C operator-billed legs rent only those, ceiling on their prices.
+cascade/trainer/money_guard.py
+cascade/trainer/operator_legs_cli.py
+cascade/trainer/marketcast_runner.py
+tests/accept/wb27/test_wb27_approval_skus.py

@@ -2270,8 +2270,17 @@ class RunnerLaneBOps:
                           or f.get("gpu_measured") is False)
                 fixed = (str(f.get("gpu", "") or ""),) if (
                     length is not None and not limits and f.get("gpu")) else ()
-                only = own_risk or fixed
-                if not gpus.rent_skus() and not own_risk:
+                # owner 2026-11-26: an OPERATOR-billed leg whose approval pins
+                # GPU types (`approve-operator-leg --sku 8xH100,8xH200`) rents
+                # exactly those, cheapest available first, measured or not
+                from .money_guard import operator_pinned_skus
+
+                pinned = operator_pinned_skus(self.r, gen.hotkey, queue=self.funded_queue())
+                only = pinned or own_risk or fixed
+                if pinned:
+                    log.warning("lane B: operator-billed leg %s rents only the approved GPU "
+                                "types %s", gen.hotkey[:12], ",".join(pinned))
+                if not gpus.rent_skus() and not own_risk and not pinned:
                     raise LegFailure("no [lane_b] funded_pod_skus type has a measured "
                                      "step rate (WB19) on the pinned image — not rented",
                                      miner_fault=False, error_class="no_capacity", burn=False)
@@ -2292,8 +2301,10 @@ class RunnerLaneBOps:
                 # (audit 2026-11-26: a LIMITS leg — token limit or own-risk
                 # unmeasured GPU — also keeps lane A's reference steps behind its
                 # hour wall: wall-bounded by design, judged the same way)
+                # (a pinned make-good may rent a type its steps were not fixed
+                # on, or an unmeasured one: wall-bounded, judge off unmeasured)
                 wall_bounded = (wall_bounded_leg(self.r, _measured_rate_of(gpus, contract))
-                                if length is None or limits
+                                if length is None or limits or pinned
                                 else contextlib.nullcontext())
                 try:
                     with rent_scope(self.r, gpus, only=only), wall_bounded:

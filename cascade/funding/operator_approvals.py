@@ -24,6 +24,15 @@ Lifecycle of one record (one per queue + hotkey):
   needs a NEW approval.
 * ``denied`` — single use: the next gate answers "denied" once.
 
+An approval may pin the GPU types the leg rents (``skus``, owner 2026-11-26:
+``approve-operator-leg <hotkey> --sku 8xH100,8xH200``): the lane B / lane C
+drivers rent ONLY those types for the operator-billed leg (cheapest available
+first among them), measured or not. A pinned approval given without
+``--max-cost`` takes its ceiling from the PINNED types' projection at the
+first gate (``ceiling_basis = "pinned_skus"``, :meth:`bind_ceiling`), never
+from the request's projection on the cheapest measured type. A record
+without ``skus`` behaves exactly as before.
+
 A re-fund changes ``funded_at``; any record bound to the old funding no
 longer matches (cleared on use). Records hold hotkeys, refs and numbers only
 — never key material. Flock-serialised, reload-before-act, exactly like
@@ -72,6 +81,23 @@ def _bound(r: dict, *, ref: str, funded_at: float | None) -> bool:
         return False
     fa = r.get("funded_at")
     return fa is None or funded_at is None or float(fa) == float(funded_at)
+
+
+def normalize_skus(skus) -> tuple[str, ...]:
+    """``"8xH100,8xH200"`` or an iterable of types → the ordered, de-duplicated
+    tuple of non-empty type names (``()`` = no pin)."""
+    if skus is None:
+        return ()
+    items = str(skus).split(",") if isinstance(skus, str) else list(skus)
+    out: list[str] = []
+    for item in items:
+        t = str(item or "").strip()
+        if t and t.lower() not in {o.lower() for o in out}:
+            out.append(t)
+    return tuple(out)
+
+
+PINNED_CEILING = "pinned_skus"
 
 
 def _kind_ok(r: dict, kind: str) -> bool:
@@ -152,6 +178,17 @@ class OperatorApprovals:
             return "over_ceiling"
         return "approved"
 
+    def pinned_skus(self, queue_name: str, hotkey: str, *, ref: str,
+                    funded_at: float | None = None) -> tuple[str, ...]:
+        """The GPU types the owner's approval of this leg pins (approved or
+        launched, bound to ``ref`` / ``funded_at``), else ``()``."""
+        r = self.get(queue_name, hotkey)
+        if not r or r.get("state") not in (APPROVED, LAUNCHED):
+            return ()
+        if not _bound(r, ref=ref, funded_at=funded_at):
+            return ()
+        return normalize_skus(r.get("skus"))
+
     def peek_approved(self, queue_name: str, hotkey: str, ref: str, *,
                       funded_at: float | None = None, kind: str = "") -> bool:
         """An unlaunched approval for this hotkey's current leg (no state change)."""
@@ -182,7 +219,11 @@ class OperatorApprovals:
             fresh = not (prev.get("state") == PENDING and _bound(prev, ref=ref,
                                                                  funded_at=funded_at)
                          and prev.get("kind") == kind)
-            recs[k] = {
+            # an owner GPU pin on this leg survives a refreshed request (a
+            # withdrawn approval re-filed at the landed cost keeps its types)
+            keep = ({f: prev[f] for f in ("skus", "ceiling_basis") if prev.get(f)}
+                    if _bound(prev, ref=ref, funded_at=funded_at) else {})
+            recs[k] = {**keep,
                 "queue": queue_name, "queue_path": str(queue_path), "hotkey": hotkey,
                 "ref": ref, "funded_at": funded_at, "uid": uid, "sku": sku, "kind": kind,
                 "reason": reason[:400],
@@ -233,6 +274,26 @@ class OperatorApprovals:
             self._save(recs)
             return True
 
+    def bind_ceiling(self, queue_name: str, hotkey: str, *, cost_usd: float) -> float | None:
+        """A GPU-pinned approval given without ``--max-cost``: bind its ceiling
+        to ``cost_usd`` (the projection on the PINNED types) x
+        :data:`DEFAULT_CEILING_FACTOR`, once. Returns the record's ceiling
+        (None when there is no such approval)."""
+        with self._locked() as recs:
+            k = _key(queue_name, hotkey)
+            r = recs.get(k)
+            if not r or r.get("state") != APPROVED:
+                return None
+            if r.get("max_cost_usd") is not None or r.get("ceiling_basis") != PINNED_CEILING:
+                return r.get("max_cost_usd")
+            if float(cost_usd) <= 0:
+                return None
+            ceiling = round(float(cost_usd) * DEFAULT_CEILING_FACTOR, 2)
+            recs[k] = {**r, "max_cost_usd": ceiling, "ceiling_bound_at": self.clock(),
+                       "ceiling_projection_usd": round(float(cost_usd), 2)}
+            self._save(recs)
+            return ceiling
+
     def take_denial(self, queue_name: str, hotkey: str) -> None:
         """A denial is single use."""
         with self._locked() as recs:
@@ -252,16 +313,21 @@ class OperatorApprovals:
 
     def decide(self, hotkey: str, *, approve: bool, attempt_id: str | None = None,
                max_cost_usd: float | None = None, queue_name: str | None = None,
-               preapprove: dict | None = None) -> dict:
+               preapprove: dict | None = None, skus=None) -> dict:
         """Approve / deny ``hotkey``'s PENDING request (one per queue; pass
         ``queue_name`` when several queues have one). With no pending request
         and ``preapprove`` given (``{"queue", "queue_path", "ref",
         "funded_at", "kind"}`` of the hotkey's live entry) an approval is
         recorded for its NEXT operator-billed leg. ``attempt_id``, when given,
-        must match the pending request's. Raises ``LookupError`` /
+        must match the pending request's. ``skus`` (approve only) pins the
+        GPU types the leg may rent (``"8xH100,8xH200"`` or a sequence); a
+        record already pinned keeps its pin when none is given. Raises ``LookupError`` /
         ``ValueError`` with an owner-readable reason; returns the record."""
         if max_cost_usd is not None and float(max_cost_usd) <= 0:
             raise ValueError("--max-cost must be positive")
+        pin = normalize_skus(skus)
+        if pin and not approve:
+            raise ValueError("--sku pins the GPU types of an APPROVED leg; a denial takes none")
         with self._locked() as recs:
             matches = [(k, r) for k, r in recs.items()
                        if r.get("hotkey") == hotkey and r.get("state") == PENDING
@@ -283,7 +349,10 @@ class OperatorApprovals:
                      "request_attempt_id": "", "requested_at": self.clock()}
             else:
                 raise LookupError(f"no pending operator-billed leg for {hotkey}")
-            if approve and max_cost_usd is None and float(r.get("projected_cost_usd") or 0) > 0:
+            pin = pin or normalize_skus(r.get("skus"))
+            pinned_ceiling = bool(approve and pin and max_cost_usd is None)
+            if (approve and max_cost_usd is None and not pinned_ceiling
+                    and float(r.get("projected_cost_usd") or 0) > 0):
                 # money safety II: an approval is never open-ended — default
                 # ceiling = the projection x DEFAULT_CEILING_FACTOR; a landed
                 # cost above it needs a new approval
@@ -291,6 +360,11 @@ class OperatorApprovals:
             rec = {**r, "state": APPROVED if approve else DENIED, "decided_at": self.clock(),
                    "max_cost_usd": (float(max_cost_usd) if approve and max_cost_usd is not None
                                     else None)}
+            if approve and pin:
+                rec["skus"] = list(pin)
+                # the request's projection priced the cheapest MEASURED type:
+                # the ceiling binds to the pinned types' projection at the gate
+                rec["ceiling_basis"] = PINNED_CEILING if pinned_ceiling else "owner"
             if r.get("kind") == "spend_cap_make_good":
                 # finishing a waste-capped leg on the operator's account runs
                 # through the ordinary make-good gate

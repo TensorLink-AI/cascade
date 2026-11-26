@@ -1116,6 +1116,29 @@ def preapproved(runner, hotkey: str, *, kind: str = "") -> bool:
         return False
 
 
+def operator_pinned_skus(runner, hotkey: str, queue=None) -> tuple[str, ...]:
+    """Owner 2026-11-26: the GPU types an OPERATOR-billed leg's approval pins
+    (``approve-operator-leg <hotkey> --sku 8xH100,8xH200``), in the owner's
+    order, else ``()`` — a miner-billed leg, no approval, or an approval
+    without a pin (today's rent scope). ``queue``: the leg's funded queue
+    (default the runner's). The lane B / lane C drivers rent exactly these
+    types (``rent_scope(only=...)`` / the MarketCast scope); the gate then
+    projects, and binds the ceiling, on them."""
+    try:
+        q = queue if queue is not None else runner._funded_queue()
+        entry = q.get(hotkey) if q is not None and hotkey else None
+        if entry is None or not bool(getattr(entry, "operator_billed", False)):
+            return ()
+        from ..funding.operator_approvals import OperatorApprovals
+
+        return OperatorApprovals.for_work_root(runner.work_root).pinned_skus(
+            Path(q.path).name, hotkey, ref=entry.ref, funded_at=entry.funded_at)
+    except Exception as e:  # noqa: BLE001 — unreadable: no pin (the gate still applies)
+        log.warning("operator leg %s: approval GPU pin unreadable (%s) — none applied",
+                    str(hotkey)[:12], e)
+        return ()
+
+
 def approval_on_file(runner, hotkey: str) -> bool:
     """An owner approval (any kind; unlaunched, or launched for THIS attempt)
     bound to ``hotkey``'s current leg — what lets it rent on the operator's
@@ -1196,6 +1219,14 @@ def operator_leg_gate(runner, gen, *, kind: str, rent: bool, lost_usd: float = 0
     qname = Path(queue.path).name
     verdict = store.check(qname, hk, ref=gen.ref, attempt_id=attempt_id, kind=kind,
                           funded_at=funded_at, projected_cost_usd=cost)
+    if verdict == "approved" and rent:
+        # owner 2026-11-26: a GPU-pinned approval without --max-cost is bound
+        # to THIS projection, made inside the leg's pinned rent scope (the
+        # pinned types' prices), never the request's cheapest measured type
+        ceiling = store.bind_ceiling(qname, hk, cost_usd=cost)
+        if ceiling is not None:
+            log.info("operator-billed leg %s: approval ceiling $%.2f (pinned GPU types, "
+                     "projected $%.2f on %s)", hk[:12], float(ceiling), cost, sku)
     if verdict == "approved":
         rid = operator_rent_preflight(runner, gen, cost) if rent else None  # keeps approval
         _leg_local(runner).operator_approval = {
@@ -1333,6 +1364,6 @@ __all__ = ["AWAITING_APPROVAL_STATUS", "OperatorBreaker", "OperatorSpend", "aler
            "would_rent_refusal",
            "clear_alert", "daily_cap_usd", "guard_operator_provider", "health_conditions",
            "is_balance_refusal", "operator_leg_gate", "operator_rent_preflight",
-           "gate_or_adopt", "grandfathered", "note_operator_launch", "operator_leg_allocated",
+           "gate_or_adopt", "grandfathered", "operator_pinned_skus", "note_operator_launch", "operator_leg_allocated",
            "take_deferred_gate", "payer_balance_note", "payer_balance_refusal", "preapproved",
            "projected_operator_leg_cost"]
