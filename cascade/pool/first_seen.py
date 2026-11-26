@@ -199,8 +199,31 @@ def partition_points(path: Path) -> list[tuple[str, int]]:
     return sorted(out)
 
 
+def _lag_entry(lag: list[int], lead: int) -> dict:
+    lead_h = lead / 3600.0
+    return {
+        "mirror_lag_hours": (statistics.median(lag) / 3600.0) if lag else None,
+        "max_lead_hours": lead_h,
+        "publish_ahead": bool(lead_h > 0),
+    }
+
+
+def _feed_lag_of(points) -> tuple[list[int], int] | None:
+    """``(lags, max lead)`` of one feed's ``(data_ts, (seen, root, baseline))``
+    pairs (``None`` when the feed has no points)."""
+    lags: list[int] = []
+    lead: int | None = None
+    for ts, (seen, _root, baseline) in points:
+        d = ts - seen
+        lead = d if lead is None else max(lead, d)
+        if not baseline and ts <= seen:
+            lags.append(seen - ts)
+    return None if lead is None else (lags, lead)
+
+
 class FirstSeenIndex:
-    """First-seen lookups over the committed records up to ``until_ts``."""
+    """First-seen lookups over the committed records up to ``until_ts``
+    (every feed in memory at once: :meth:`FirstSeenLog.index`)."""
 
     def __init__(self, entries: dict, until_ts: int):
         self._entries = entries            # (feed, panel_json, ts) -> (seen, root, baseline)
@@ -224,25 +247,114 @@ class FirstSeenIndex:
         """``{(panel_json, data_ts): first_seen}`` for one feed."""
         return {(p, t): v[0] for (f, p, t), v in self._entries.items() if f == feed}
 
-    def feed_lag(self) -> dict[str, dict]:
-        lags: dict[str, list[int]] = {}
-        leads: dict[str, int] = {}
-        for (feed, _panel, ts), (seen, _root, baseline) in self._entries.items():
-            lead = ts - seen
-            leads[feed] = lead if feed not in leads else max(leads[feed], lead)
-            lags.setdefault(feed, [])
-            if not baseline and ts <= seen:
-                lags[feed].append(seen - ts)
+    def feed_lag(self, feeds: Sequence[str] | None = None) -> dict[str, dict]:
+        """Per feed with points (only ``feeds`` when given): the measured
+        mirror lag, the maximum lead and ``publish_ahead``."""
+        want = None if feeds is None else {str(f) for f in feeds}
+        by_feed: dict[str, list] = {}
+        for (feed, _panel, ts), v in self._entries.items():
+            if want is None or feed in want:
+                by_feed.setdefault(feed, []).append((ts, v))
         out = {}
-        for feed in sorted(leads):
-            lag = lags.get(feed) or []
-            lead_h = leads[feed] / 3600.0
-            out[feed] = {
-                "mirror_lag_hours": (statistics.median(lag) / 3600.0) if lag else None,
-                "max_lead_hours": lead_h,
-                "publish_ahead": bool(lead_h > 0),
-            }
+        for feed in sorted(by_feed):
+            lag, lead = _feed_lag_of(by_feed[feed])
+            out[feed] = _lag_entry(lag, lead)
         return out
+
+
+class FirstSeenFeedIndex:
+    """The same lookups as :class:`FirstSeenIndex`, holding ONE feed at a time.
+
+    2026-11-26: ``pool_d_build`` over a 20 GB / 7,002-feed ``records.jsonl``
+    reached 39.3 GB RSS in 5 min building the whole-log dict. This index keeps
+    only per-feed byte spans of the usable records (verified against their
+    roots by :meth:`FirstSeenLog.feed_index`); a lookup for a feed loads that
+    feed's points from the log and drops the previous feed's. Answers are
+    identical to :meth:`FirstSeenLog.index`; callers that alternate feeds stay
+    correct but re-read, so group lookups by feed."""
+
+    def __init__(self, records_path: Path, spans: dict[str, list[tuple[int, int]]],
+                 usable: dict[int, str], until_ts: int):
+        self._path = Path(records_path)
+        self._spans = spans                # feed -> [(offset, length)] in file order
+        self._usable = usable              # period_start -> root
+        self.until_ts = int(until_ts)
+        self._cur_feed: str | None = None
+        self._cur: dict = {}
+        self.loads = 0                     # feed loads so far (tests, diagnostics)
+
+    def feeds(self) -> list[str]:
+        return sorted(self._spans)
+
+    def _load(self, feed: str) -> dict:
+        """``{(panel_json, ts): (seen, root, baseline)}`` of ``feed``: the
+        records in log order with the whole-log rule (earliest seen wins, the
+        first record on a tie)."""
+        entries: dict = {}
+        intern: dict[str, str] = {}
+        for r in FirstSeenLog._iter_spans(self._path, self._spans.get(feed)):
+            seen = int(r["seen_ts"])
+            val = (seen, self._usable[int(r["period_start"])], bool(r["baseline"]))
+            for pj, t in r["points"]:
+                pj = str(pj)
+                key = (intern.setdefault(pj, pj), int(t))
+                if key not in entries or seen < entries[key][0]:
+                    entries[key] = val
+        return entries
+
+    def _feed(self, feed) -> dict:
+        feed = str(feed)
+        if feed != self._cur_feed:
+            self._cur = {}                 # free the previous feed before loading
+            self._cur_feed = None
+            self._cur = self._load(feed)
+            self._cur_feed = feed
+            self.loads += 1
+        return self._cur
+
+    def release(self) -> None:
+        """Drop the loaded feed."""
+        self._cur, self._cur_feed = {}, None
+
+    def __len__(self) -> int:
+        n = 0
+        for feed in self.feeds():
+            n += len(self._load(feed))
+        return n
+
+    def _get(self, feed, panel, data_ts):
+        return self._feed(feed).get((panel_json(panel), int(data_ts)))
+
+    def first_seen(self, feed: str, panel: Mapping | str, data_ts: int) -> int | None:
+        hit = self._get(feed, panel, data_ts)
+        return None if hit is None else hit[0]
+
+    def root_for(self, feed: str, panel: Mapping | str, data_ts: int) -> str | None:
+        hit = self._get(feed, panel, data_ts)
+        return None if hit is None else hit[1]
+
+    def feed_points(self, feed: str) -> dict[tuple[str, int], int]:
+        return {k: v[0] for k, v in self._feed(feed).items()}
+
+    def feed_lag(self, feeds: Sequence[str] | None = None) -> dict[str, dict]:
+        """As :meth:`FirstSeenIndex.feed_lag`, one feed loaded at a time."""
+        names = self.feeds() if feeds is None else sorted({str(f) for f in feeds})
+        out = {}
+        for feed in names:
+            if feed not in self._spans:
+                continue
+            got = _feed_lag_of((t, v) for (_p, t), v in self._feed(feed).items())
+            if got is not None:
+                out[feed] = _lag_entry(*got)
+        return out
+
+    def to_index(self) -> FirstSeenIndex:
+        """The whole-log :class:`FirstSeenIndex` (every feed in memory)."""
+        entries: dict = {}
+        for feed in self.feeds():
+            for (pj, t), v in self._load(feed).items():
+                entries[(feed, pj, t)] = v
+        return FirstSeenIndex(entries, self.until_ts)
 
 
 class FirstSeenLog:
@@ -403,6 +515,16 @@ class FirstSeenLog:
                 f.seek(off)
                 out.append(json.loads(f.read(n).decode("utf-8")))
         return out
+
+    @staticmethod
+    def _iter_spans(path: Path, spans):
+        """:meth:`_read_spans` one parsed line at a time."""
+        if not spans:
+            return
+        with open(path, "rb") as f:
+            for off, n in spans:
+                f.seek(off)
+                yield json.loads(f.read(n).decode("utf-8"))
 
     def _feed_known(self, feed: str, hist: dict) -> set:
         """Every point key already logged for ``feed``: its records' points
@@ -574,40 +696,64 @@ class FirstSeenLog:
 
     def index(self, *, until_ts: int) -> FirstSeenIndex:
         """Points of the periods whose root was committed by ``until_ts``,
-        after checking every committed root against the log."""
+        after checking every committed root against the log (every feed in
+        memory; :meth:`feed_index` holds one feed at a time)."""
+        return self.feed_index(until_ts=until_ts).to_index()
+
+    def feed_index(self, *, until_ts: int) -> FirstSeenFeedIndex:
+        """:meth:`index` that holds one feed at a time.
+
+        One streaming pass over ``records.jsonl`` checks every committed root
+        (32-byte leaf hashes only) and keeps, per feed, the byte spans of the
+        usable records: a committed-by-``until_ts`` period, not a quarantined
+        name recorded at/after its quarantine, with points. The errors (and
+        which one wins when several apply) are :meth:`index`'s before the
+        2026-11-26 fix: ``log_corrupt`` in the records, then the roots file,
+        then a wrong ``period_start``, then ``root_mismatch``, then the
+        quarantine file."""
         until_ts = int(until_ts)
-        records = self.records()
-        roots = self.roots()
-        by_period: dict[int, list[dict]] = {}
-        for r in records:
-            if int(r["period_start"]) != period_start(int(r["seen_ts"])):
-                raise FirstSeenError("root_mismatch",
-                                     f"record of {r.get('feed')} has a wrong period_start")
-            by_period.setdefault(int(r["period_start"]), []).append(r)
-        for p, entry in roots.items():
-            recs = by_period.get(p, [])
-            got = merkle_root([canonical_json(r) for r in recs]) if recs else None
-            if got != entry["root"] or len(recs) != int(entry["n_records"]):
-                raise FirstSeenError("root_mismatch",
-                                     f"period {p}: log no longer matches its committed root")
+        try:
+            roots = self.roots()
+            roots_err = None
+        except Exception as e:  # noqa: BLE001 — re-raised after the records scan
+            roots, roots_err = {}, e
+        try:
+            quarantined = self.quarantined(until_ts=until_ts)
+            q_err = None
+        except Exception as e:  # noqa: BLE001 — re-raised after the root checks
+            quarantined, q_err = {}, e
         usable = {p: e["root"] for p, e in roots.items() if int(e["committed_ts"]) <= until_ts}
-        quarantined = self.quarantined(until_ts=until_ts)
-        entries: dict = {}
-        for r in records:
+        hashes: dict[int, list[bytes]] = {}
+        spans: dict[str, list[tuple[int, int]]] = {}
+        period_err: FirstSeenError | None = None
+        for off, n, r in self._scan(self.records_path):
             p = int(r["period_start"])
-            if p not in usable:
+            if period_err is None and p != period_start(int(r["seen_ts"])):
+                period_err = FirstSeenError(
+                    "root_mismatch", f"record of {r.get('feed')} has a wrong period_start")
+            if p in roots:
+                hashes.setdefault(p, []).append(_leaf_hash(canonical_json(r)))
+            if p not in usable or not r["points"]:
                 continue
-            seen = int(r["seen_ts"])
             q_ts = quarantined.get((str(r["feed"]), str(r["partition"])))
-            if q_ts is not None and seen >= q_ts:
+            if q_ts is not None and int(r["seen_ts"]) >= q_ts:
                 # A quarantined name recorded at/after its quarantine (e.g. by
                 # a release that did not know quarantine.jsonl): never fresh.
                 continue
-            for pj, t in r["points"]:
-                key = (str(r["feed"]), str(pj), int(t))
-                if key not in entries or seen < entries[key][0]:
-                    entries[key] = (seen, usable[p], bool(r["baseline"]))
-        return FirstSeenIndex(entries, until_ts)
+            spans.setdefault(str(r["feed"]), []).append((off, n))
+        if roots_err is not None:
+            raise roots_err
+        if period_err is not None:
+            raise period_err
+        for p, entry in roots.items():
+            hs = hashes.get(p, [])
+            got = _merkle_root_of_hashes(hs) if hs else None
+            if got != entry["root"] or len(hs) != int(entry["n_records"]):
+                raise FirstSeenError("root_mismatch",
+                                     f"period {p}: log no longer matches its committed root")
+        if q_err is not None:
+            raise q_err
+        return FirstSeenFeedIndex(self.records_path, spans, usable, until_ts)
 
 
 def verify_snapshot(meta: Mapping, log_dir: Path | str) -> list[str]:
@@ -618,28 +764,38 @@ def verify_snapshot(meta: Mapping, log_dir: Path | str) -> list[str]:
     except (KeyError, TypeError, ValueError):
         return ["metadata has no integer as_of_ts"]
     try:
-        idx = FirstSeenLog(log_dir).index(until_ts=as_of)
+        idx = FirstSeenLog(log_dir).feed_index(until_ts=as_of)
     except FirstSeenError as e:
         return [f"first-seen log: {e}"]
     listed = set(meta.get("first_seen_roots") or [])
-    for s in meta.get("series") or []:
+    series = list(meta.get("series") or [])
+    # Checked grouped by feed (one feed loaded at a time), reported in order.
+    per: dict[int, list[str]] = {}
+    order = sorted(range(len(series)),
+                   key=lambda i: str(series[i].get("feed") or series[i].get("source")))
+    for i in order:
+        s = series[i]
+        out = per[i] = []
         sid = s.get("series_id")
         ts, seen = s.get("target_ts") or [], s.get("first_seen_ts") or []
         if len(ts) != len(seen):
-            problems.append(f"{sid}: target_ts and first_seen_ts differ in length")
+            out.append(f"{sid}: target_ts and first_seen_ts differ in length")
             continue
         feed, panel = s.get("feed") or s.get("source"), s.get("panel") or {}
         for t, claimed in zip(ts, seen, strict=True):
             got = idx.first_seen(feed, panel, t)
             if got is None:
-                problems.append(f"{sid}: point {t} has no first-seen record committed by "
-                                f"as_of {as_of}")
+                out.append(f"{sid}: point {t} has no first-seen record committed by "
+                           f"as_of {as_of}")
                 continue
             if int(claimed) != got:
-                problems.append(f"{sid}: point {t} first_seen_ts {claimed} != log {got}")
+                out.append(f"{sid}: point {t} first_seen_ts {claimed} != log {got}")
             root = idx.root_for(feed, panel, t)
             if root not in listed:
-                problems.append(f"{sid}: point {t} root {root} not in first_seen_roots")
+                out.append(f"{sid}: point {t} root {root} not in first_seen_roots")
+    idx.release()
+    for i in range(len(series)):
+        problems.extend(per[i])
     return problems
 
 
@@ -647,17 +803,20 @@ def verify_snapshot(meta: Mapping, log_dir: Path | str) -> list[str]:
 
 
 def _evidence(log: FirstSeenLog, now_ts: int) -> dict:
-    records = log.records()
+    n_records = n_points = 0
+    for _off, _n, r in log._scan(log.records_path):     # streamed, never all at once
+        n_records += 1
+        n_points += len(r["points"])
     roots = sorted(log.roots().values(), key=lambda e: int(e["period_start"]))
     doc = {
         "schema": EVIDENCE_SCHEMA, "wp": "W6fs", "source": "builder",
         "generated_by": "cascade.pool.first_seen evidence",
         "host": socket.gethostname(), "generated_ts": int(now_ts),
-        "n_records": len(records), "n_points": sum(len(r["points"]) for r in records),
+        "n_records": n_records, "n_points": n_points,
         "roots": [{"period_start": int(e["period_start"]), "root": e["root"],
                    "n_records": int(e["n_records"]), "committed_ts": int(e["committed_ts"])}
                   for e in roots],
-        "feeds": log.index(until_ts=now_ts).feed_lag(),
+        "feeds": log.feed_index(until_ts=now_ts).feed_lag(),
     }
     doc["digest"] = hashlib.sha256(canonical_json(doc)).hexdigest()
     return doc
@@ -722,6 +881,7 @@ __all__ = [
     "QUARANTINE_FILE",
     "QUARANTINE_SCHEMA",
     "FirstSeenError",
+    "FirstSeenFeedIndex",
     "FirstSeenIndex",
     "FirstSeenLog",
     "canonical_json",
