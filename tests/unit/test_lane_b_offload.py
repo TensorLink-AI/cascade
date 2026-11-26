@@ -1334,3 +1334,47 @@ def test_settlement_and_era_init_are_torch_free_on_the_box(tmp_path):
                           env={**__import__("os").environ,
                                "PYTHONPATH": str(Path(__file__).resolve().parents[2])})
     assert "TORCH_FREE_OK" in proc.stdout, proc.stderr[-3000:]
+
+
+# ── deployment: a trainer restart between a leg's finish and its settlement ──
+
+
+def test_restart_between_finish_and_settle_settles_once_without_redispatch(tmp_path):
+    """The fix ships by a trainer restart AFTER the first lane B leg returned
+    and BEFORE it settled. The finished leg (its trained pointer) is on disk
+    in ``lane_b_driver.json``; the restarted process (new driver AND a new
+    funding-queue object over the same files) neither requeues, re-dispatches
+    nor re-charges it, and settles it exactly once."""
+    from tests.accept.w_s2 import helpers as ws2
+    from tests.accept.wb18 import helpers as wb18
+
+    sc = ws2.trainer_scenario(tmp_path, sentinel_from_block=0, require_public=())
+    hk = wb18.HK_E
+    finished = json.loads(json.dumps(sc.driver.st.finished))     # its on-disk form
+    assert [f["leg"]["sub"]["hotkey"] for f in finished] == [hk]
+    entry = sc.fq.get(hk)
+    assert entry.status == "in_flight"
+    attempt, n_dispatched = entry.attempt_id, len(sc.ops.dispatched)
+    on_disk = json.loads((tmp_path / "lane_b_driver.json").read_text())
+    assert on_disk["finished"] == finished and finished[0]["leg_pointer"]
+    assert json.loads(on_disk["queue"])["open"] == []          # nothing left "open"
+
+    sc.restart_all()                                           # nothing in memory survives
+    assert json.loads(json.dumps(sc.driver.st.finished)) == finished
+    for _ in range(3):
+        assert sc.tick(1, ws2.TRAINER_KING) == []
+    assert len(sc.ops.dispatched) == n_dispatched              # never re-dispatched
+    e = sc.fq.get(hk)
+    assert (e.status, e.attempt_id) == ("in_flight", attempt)  # never requeued / re-charged
+    assert json.loads(json.dumps(sc.driver.st.finished)) == finished
+
+    ws2.settle(sc, tmp_path)
+    assert len(sc.ops.published) == 1
+    assert [x.miner_hotkey for x in sc.ops.published[0].entries] == [hk]
+    assert sc.driver.st.finished == [] and str(ws2.SETTLE_BLOCK) in sc.driver.st.settled
+    assert sc.fq.get(hk).status != "in_flight"                 # spent by the settlement
+    ws2.settle(sc, tmp_path)                                   # idempotent
+    sc.restart_all()
+    ws2.settle(sc, tmp_path)
+    assert len(sc.ops.published) == 1
+    assert len(sc.ops.dispatched) == n_dispatched
