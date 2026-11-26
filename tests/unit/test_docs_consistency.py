@@ -98,18 +98,19 @@ def test_reward_examples_include_all_pools_decay_expiry_and_burn():
     assert "| A + B | 75% | 25% | 0% |" in tables["allocation"]
     assert "| A + B + C | 50% | 25% | 25% |" in tables["allocation"]
     # rev6.22: B pays a held slot in full until replaced; DEC-CA-0073: C has no
-    # decay either (its slot ends with its full-pay duration)
-    assert "B: a held slot pays 100% of its slot (2.5% of total emissions)" in tables["slot-decay"]
+    # decay either (its slot ends with its full-pay duration). W-LAUNCH: the
+    # slot pay and the worked example use the live launch split (B 35 / C 15).
+    assert "B (live launch split): a held slot pays 100% of its slot (3.5% of total emissions)" in tables["slot-decay"]
     assert "C has no decay" in tables["slot-decay"]
     assert "| C: confirmed MarketCast gain | ≥ 0.05 | 40 |" in tables["slot-tiers"]
     assert "B: accepted" not in tables["slot-tiers"]
     example = tables["worked-example"]
     assert "| A king | 30% |" in example
     assert "| Eligible immediate former king | 2.5% |" in example
-    assert "| One full-pay B holder | 2.5% |" in example
+    assert "| One full-pay B holder | 3.5% |" in example
     # owner 2026-11-10: ONE composite MarketCast slot holds all of C
-    assert "| One full-pay C holder (mkt:market) | 25% |" in example
-    assert "| Burn | 40% |" in example
+    assert "| One full-pay C holder (mkt:market) | 15% |" in example
+    assert "| Burn | 49% |" in example
 
 
 def test_wrong_reward_arithmetic_in_document_is_rejected(tmp_path):

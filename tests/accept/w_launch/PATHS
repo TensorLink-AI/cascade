@@ -56,3 +56,72 @@ cascade/shared/config/loader.py
 cascade/funding/lane_ends.py
 cascade/funding/intake.py
 cascade/funding/main.py
+
+# Provisioner orphan scope (mainnet 2026-11-25 07:50: the MarketCast offload
+# provisioner reaped a pod it never rented). The reaper terminates only pods
+# matching a write-ahead rent intent of THIS instance, for its enabled stages;
+# other provisioner-shaped pods are logged and left alone.
+cascade/provision/loop.py
+cascade/provision/state.py
+tests/unit/test_provision_loop.py
+# Launch miner docs + CLI (owner 2026-11-25): lane A closed to new challengers
+# from 9586800 in every miner-facing guide and the CLI help; `cascade deploy` /
+# `submit` refuse a lane A entry past the cutoff before any upload or commit
+# (--allow-closed-lane-a). The generated cascade:rewards:summary block states
+# the LIVE launch split (scripts/check_docs.py computes it from the overlays).
+cascade/miner/cli.py
+cascade/miner/lane_d_preview.py
+scripts/check_docs.py
+tests/unit/test_docs_consistency.py
+README.md
+AGENTS.md
+agent.md
+llms.txt
+cascade/website/llms.txt
+docs/MINER.md
+docs/MINER_LANE_A.md
+docs/MINER_LANE_B.md
+docs/MINER_LANE_D.md
+docs/LANE_D.md
+docs/VALIDATOR.md
+
+# 2026-11-25 pool_d builder OOM (first baseline `first_seen record` over 7,002
+# feeds / 14 GB held every point in memory): record() bounded by one feed,
+# staged lines appended after the unreadable check, commit() streams the log;
+# byte-identical output pinned against the previous implementation.
+cascade/pool/first_seen.py
+tests/unit/test_first_seen_record_memory.py
+
+# 2026-11-25 pool_d build refused lane_a_replay_mismatch: `elastic lane-a-pool`
+# picked the 999999999999 smoke-test sentinel (2026-09-29 workflow_dispatch) and
+# the replay lacked lane A's publish flags. Skip sentinels; ship build_args
+# --mv-pack --max-panel-series-per-feed 20 (pinned against publish-pool.yml).
+cascade/laned/elastic.py
+deploy/laned/elastic.toml
+
+# Owner 2026-11-25 22:40 (option a): pool_d takes lane A's selection from the
+# sha-verified snapshot (--lane-a-selection snapshot, default); the replay is
+# opt-in. lane-a-pool keeps the verified tar + index ref for that check.
+cascade/pool/pool_d_select.py
+cascade/pool/pool_d_build.py
+cascade/laned/elastic.py
+tests/unit/test_pool_d_snapshot_selection.py
+docs/EVAL_POOL.md
+
+# 2026-11-26 pool_d builder OOM (pool_d_build over a 20 GB / 7,002-feed
+# records.jsonl reached 39.3 GB RSS): FirstSeenLog.feed_index() streams the
+# log once and holds one feed at a time; pool_d_build and verify_snapshot use
+# it; answers and pool_d output pinned against the previous whole-log index().
+cascade/pool/first_seen.py
+cascade/pool/pool_d_build.py
+tests/unit/test_first_seen_index_memory.py
+
+# 2026-11-26 pool_d builder state-push EntityTooLarge (records.jsonl 20 GB /
+# 7,002 feeds sent as one PutObject, read whole first): the pool store streams
+# (multipart above one part, aborted on failure; streamed download; sha256 +
+# size of the bytes sent), state-push proves append-only from HEAD's sha256
+# without downloading, skips unchanged files, HEAD.json gains sizes.
+cascade/pool/pool_d_publish.py
+cascade/laned/elastic.py
+tests/unit/test_pool_d_state_streaming.py
+docs/OPERATOR.md

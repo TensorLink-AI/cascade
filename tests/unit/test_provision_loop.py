@@ -175,6 +175,21 @@ def _seed_ledger(tmp_path, prov, pods, *, clock=None):
                                                    published=True))
 
 
+def _seed_intent(tmp_path, provider, name_prefix, stage, *, clock=None):
+    """A write-ahead rent intent an earlier run of THIS instance left behind
+    (crash between the provider's create call and the ledger save)."""
+    from dataclasses import replace
+    from datetime import UTC, datetime
+
+    from cascade.provision.state import RentIntent, add_intent
+
+    clock = clock or Clock()
+    st = load_state(tmp_path / "state.json") or RoundState(round_id="")
+    st = add_intent(st, RentIntent(provider=provider, name_prefix=name_prefix, stage=stage,
+                                   at_iso=datetime.fromtimestamp(clock(), tz=UTC).isoformat()))
+    save_state(tmp_path / "state.json", replace(st))
+
+
 def test_new_manifest_rents_exactly_one_eval_pod_once(tmp_path):
     store = FakeStore({"manifests/latest.json": '{"round_id": "111"}'})
     loop, prov = _eval_loop(tmp_path, store=store)
@@ -317,7 +332,8 @@ def test_reaper_accepts_eval_pods_as_self_named(tmp_path):
     assert not is_provisioner_pod_name("cascade-eval-1")        # no round id ⇒ not ours
     prov = FakeProvider("lium")
     prov.live["cascade-900-eval-zombie"] = PodAddress("10.9.9.5", 22)
-    loop = make_loop(tmp_path, providers={"lium": prov})
+    _seed_intent(tmp_path, "lium", "cascade-900-eval", "eval")   # OUR crashed rent
+    loop, _ = _eval_loop(tmp_path, prov=prov, store=FakeStore({}))
     cycle(loop)
     assert prov.terminated == ["cascade-900-eval-zombie"]       # orphan eval pod reaped
 
@@ -631,10 +647,11 @@ def test_ttl_reaps_a_leftover_fleet_pod_and_republishes(tmp_path):
 def test_restart_resumes_ledger_and_kills_orphans(tmp_path):
     prov = FakeProvider("lium")
     _seed_ledger(tmp_path, prov, [("final", "cascade-900-final-0", "NVIDIA L40S", 2)])
-    prov.live["cascade-900-heat-zombie"] = PodAddress("10.0.0.99", 22)   # never ledgered
-    loop = make_loop(tmp_path, providers={"lium": prov})
+    _seed_intent(tmp_path, "lium", "cascade-900-eval", "eval")
+    prov.live["cascade-900-eval-0"] = PodAddress("10.0.0.99", 22)        # never ledgered
+    loop, _ = _eval_loop(tmp_path, prov=prov, store=FakeStore({}))
     cycle(loop)
-    assert prov.terminated == ["cascade-900-heat-zombie"]
+    assert prov.terminated == ["cascade-900-eval-0"]
     assert "cascade-900-final-0" in prov.live                            # owned: untouched
 
 
@@ -646,10 +663,11 @@ def test_reconcile_never_touches_hand_rented_cascade_pods(tmp_path):
     prov.live["cascade-final-b"] = PodAddress("10.9.9.2", 22)
     prov.live["cascade-heat-2"] = PodAddress("10.9.9.3", 22)            # no round id
     prov.live["cascade-n91-42-funded-king-0"] = PodAddress("10.9.9.5", 22)   # the trainer's
-    prov.live["cascade-900-heat-zombie"] = PodAddress("10.9.9.4", 22)   # ours, orphaned
-    loop = make_loop(tmp_path, providers={"lium": prov})
+    prov.live["cascade-900-eval-zombie"] = PodAddress("10.9.9.4", 22)   # ours, orphaned
+    _seed_intent(tmp_path, "lium", "cascade-900-eval", "eval")
+    loop, _ = _eval_loop(tmp_path, prov=prov, store=FakeStore({}))
     cycle(loop)
-    assert prov.terminated == ["cascade-900-heat-zombie"]
+    assert prov.terminated == ["cascade-900-eval-zombie"]
 
 
 def _adopted(tmp_path, health):

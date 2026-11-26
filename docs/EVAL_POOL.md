@@ -413,6 +413,20 @@ owner_hotkey`):
   `--anchor-block` (default: the chain head) and `--snapshot-days` override
   what it reads from the chain and `[marketcast]`.
 
+## Lane D `pool_d` and the lane A snapshot (W6b)
+
+`pool_d` carries the same series that lane A's `pool` selected. The lane D
+builder fetches the newest real lane A snapshot from `pool/index.json`. It
+skips the `999999999999` smoke-test sentinels, as validators do, and checks
+the tar against the index sha256. It keeps that tar and the entry next to the
+unpacked pool. By default (`pool_d_build --lane-a-selection snapshot`, owner
+2026-11-25) the selection is read from that verified snapshot. A forge replay
+cannot reproduce an hourly snapshot because `as_of` is the build day and that
+day's partitions keep growing. The resulting `pool_d` metadata records
+`lane_a_selection: {mode, effective_block, sha256}`. `--lane-a-selection
+replay` keeps the old byte-identical rebuild as an opt-in check.
+`tests/accept/w6b/README.md` has the contract.
+
 ## Adding a source
 
 Implement the `DataSource` protocol (`cascade/pool/source.py`) — a `name` and

@@ -935,9 +935,15 @@ orchestrator SSH keypair — never the wallet. Each cycle it:
   own shapes (`cascade-<provider>-<8 hex>-g<n>` lanes, or
   `cascade-<digits>-(heat|final|eval)…` on the provider), or it is treated as
   the provisioner's and dropped or reaped.
-* **Orphan reconcile.** Terminates live provider pods tagged with its own
-  name shape that its ledger does not own, so a crash between launch and
-  ledger-save never leaks a billing box.
+* **Orphan reconcile.** Each launch writes a rent intent (provider, name
+  prefix, stage) to the ledger before the provider call. The reconciler
+  terminates a live pod only when it matches one of THIS instance's intents,
+  for a stage the instance has enabled, and the ledger does not own it. So a
+  crash between launch and ledger-save never leaks a billing box. Other pods
+  in the provisioner's name shape belong to another renter, for example a
+  second provisioner such as the MarketCast offload instance on the same
+  account. They are logged once at WARNING and left alone. A pod leaked
+  before this change has no intent, so terminate it by hand.
 * **TTL backstop.** Every pod it rents dies one epoch after rent no matter
   what; `max_spend_per_round` caps the worst case before anything is rented.
 * **Adopted-pod re-gate.** After a restart, pods adopted from the ledger are
@@ -3789,7 +3795,16 @@ then the merge refuses `host_mismatch` when hosts disagree on the king.
 is tied to one cloud and region, which would defeat the cheapest-available
 pick. `state-push` refuses (`state_conflict`) unless the bucket copy is a
 byte prefix of the local log and the bucket `HEAD.json` is the one
-`state-pull` saw. `mirror-sync` never touches `first_seen/`.
+`state-pull` saw.
+Both stream, because `records.jsonl` is 20 GB and growing. `state-push` proves
+the prefix by hashing the local file's first `size` bytes against HEAD's
+sha256, without downloading the bucket copy. It uploads above 256 MiB as a
+multipart upload (at most 10,000 parts, aborted on failure) and does not
+upload a file equal to the bucket copy again. `HEAD.json` records each file's
+sha256 and `sizes`. `state-pull` streams each file to a temp file, verifies
+it against HEAD, and only then replaces the local copy. A failed push leaves
+the previous HEAD, so the next cycle retries. `mirror-sync` never touches
+`first_seen/`.
 
 **Keys the owner fills (names only).**
 

@@ -30,6 +30,11 @@ Shadeform volume would pin every build to one cloud and region, defeating the
 cheapest-available pick, so object storage it is. ``state-push`` refuses
 unless the bucket copy is a byte prefix of the local log (append-only) and
 the bucket head is still the one ``state-pull`` saw (no concurrent builder).
+Both stream (the log is 20 GB and growing; a single PUT that large is refused
+``EntityTooLarge``): uploads go multipart above one part, the prefix check
+hashes the local file against HEAD's sha256 instead of downloading the bucket
+copy, unchanged files are not re-uploaded, and ``HEAD.json`` records each
+file's sha256 and size so a restore verifies what it streamed down.
 
 Multi-host scoring (owner 2026-11-24): :func:`assign_shards` splits a
 cohort's entries over the hosts deterministically from the boundary block
@@ -1051,7 +1056,7 @@ def builder_run_script(b: BuilderConfig, *, as_of_ts: int, now_ts: int, started_
         "set -euo pipefail",
         f"cd {q(b.workdir)}",
         f"set -a; . {q(b.remote_env_file)}; set +a",
-        f"rm -rf -- {q(lanea)} {q(out)}",
+        f"rm -rf -- {q(lanea)} {q(lanea + '.tar')} {q(lanea + '.ref.json')} {q(out)}",
         f".venv/bin/cascade-laned elastic lane-a-pool --chain-toml chain.toml --out {q(lanea)}",
         f"{py} cascade.pool.first_seen record --forge-dir {q(b.forge_dir)} "
         f"--log-dir {q(fs)} --now-ts {int(now_ts)}",
@@ -1193,33 +1198,117 @@ def _head(store, prefix: str) -> dict | None:
     return _get_json(store, _state_key(prefix, "first_seen", "HEAD.json"))
 
 
+PULLED_SCHEMA = "laned_elastic_pulled/2"
+_EMPTY_SHA = hashlib.sha256(b"").hexdigest()
+_SCAN_CHUNK = 1 << 20
+
+
+def _scan(path: Path, prefix_len: int = 0) -> tuple[str | None, str, int]:
+    """One streaming pass over ``path`` (a missing file reads as empty):
+    ``(sha256 of its first prefix_len bytes or None when shorter, sha256 of
+    the whole file, size)``. Never holds more than one chunk."""
+    h = hashlib.sha256()
+    n = 0
+    pre = _EMPTY_SHA if prefix_len <= 0 else None
+    if path.is_file():
+        with open(path, "rb") as f:
+            while True:
+                want = _SCAN_CHUNK
+                if pre is None:
+                    want = min(want, prefix_len - n)
+                chunk = f.read(want)
+                if not chunk:
+                    break
+                h.update(chunk)
+                n += len(chunk)
+                if pre is None and n == prefix_len:
+                    pre = h.copy().hexdigest()
+    return pre, h.hexdigest(), n
+
+
+def _head_sizes(head: Mapping | None) -> Mapping:
+    sizes = (head or {}).get("sizes")
+    return sizes if isinstance(sizes, Mapping) else {}
+
+
+def _read_mark(mark: Path) -> tuple[dict | None, dict]:
+    """The HEAD ``state-pull`` saw and the byte sizes it restored. A mark
+    written before ``PULLED_SCHEMA`` is the bare HEAD (sizes unknown)."""
+    doc = json.loads(mark.read_text(encoding="utf-8"))
+    if isinstance(doc, dict) and doc.get("schema") == PULLED_SCHEMA:
+        sizes = doc.get("sizes")
+        return (doc.get("head") or None), (dict(sizes) if isinstance(sizes, Mapping) else {})
+    return (doc or None), {}
+
+
+def _object_size_or_none(store, key: str) -> int | None:
+    from ..shared.hippius import ObjectNotFound
+
+    try:
+        return int(store.object_size(key))
+    except ObjectNotFound:
+        return None
+
+
 def state_pull(store, *, prefix: str, log_dir: Path, prior_root: Path) -> dict:
-    """Restore the first-seen log and every indexed snapshot's metadata."""
+    """Restore the first-seen log and every indexed snapshot's metadata.
+
+    Each log file streams to a temp file next to it, is checked against the
+    sha256 (and, when HEAD records it, the size) in ``HEAD.json``, is checked
+    to extend any local copy (append-only), and only then replaces it. A
+    local copy already equal to HEAD (a warm builder) is kept as is."""
     from ..shared.hippius import ObjectNotFound
 
     log_dir.mkdir(parents=True, exist_ok=True)
     head = _head(store, prefix)
+    hsizes = _head_sizes(head)
+    sizes: dict[str, int] = {}
+    restored: list[str] = []
+    kept: list[str] = []
     for name in FIRST_SEEN_FILES:
         local = log_dir / name
+        key = _state_key(prefix, "first_seen", name)
+        named = head is not None and name in head
+        local_sha = local_size = None
+        if local.is_file():
+            _, local_sha, local_size = _scan(local)
+        if (named and local_sha == head.get(name)
+                and hsizes.get(name, local_size) == local_size
+                and _object_size_or_none(store, key) == local_size):
+            sizes[name] = int(local_size)
+            kept.append(name)
+            continue
+        tmp = log_dir / f".{name}.pull.tmp"
         try:
-            data = store.get_bytes(_state_key(prefix, "first_seen", name))
-        except ObjectNotFound:
-            if head is not None and name in head:
-                raise ElasticError("state_conflict",
-                                   f"HEAD names {name} but it is missing") from None
-            data = b""
-        if head is not None and name not in head:
-            # A HEAD older than this file: only an empty copy is consistent.
-            if data:
-                raise ElasticError("state_conflict", f"{name} is in the bucket but HEAD.json "
-                                                     f"does not name it")
-        elif head is not None and hashlib.sha256(data).hexdigest() != head.get(name):
-            raise ElasticError("state_conflict", f"{name} does not match HEAD.json")
-        if local.is_file() and not data.startswith(local.read_bytes()):
-            raise ElasticError("state_conflict", f"local {name} is not a prefix of the bucket "
-                                                 f"copy (append-only)")
-        local.write_bytes(data)
-    (log_dir / PULLED_MARK).write_text(json.dumps(head or {}, sort_keys=True), encoding="utf-8")
+            try:
+                got = store.get_file_sha(key, tmp)
+            except ObjectNotFound:
+                if named:
+                    raise ElasticError("state_conflict",
+                                       f"HEAD names {name} but it is missing") from None
+                tmp.write_bytes(b"")
+                got = {"sha256": _EMPTY_SHA, "size": 0}
+            if head is not None and not named:
+                # A HEAD older than this file: only an empty copy is consistent.
+                if got["size"]:
+                    raise ElasticError("state_conflict", f"{name} is in the bucket but "
+                                                         f"HEAD.json does not name it")
+            elif named and (got["sha256"] != head.get(name)
+                            or hsizes.get(name, got["size"]) != got["size"]):
+                raise ElasticError("state_conflict", f"{name} does not match HEAD.json")
+            if local_size is not None:
+                pre, _, _ = _scan(tmp, local_size)
+                if pre != local_sha:
+                    raise ElasticError("state_conflict", f"local {name} is not a prefix of "
+                                                         f"the bucket copy (append-only)")
+            os.replace(tmp, local)
+        finally:
+            tmp.unlink(missing_ok=True)
+        sizes[name] = int(got["size"])
+        restored.append(name)
+    (log_dir / PULLED_MARK).write_text(
+        json.dumps({"schema": PULLED_SCHEMA, "head": head, "sizes": sizes}, sort_keys=True),
+        encoding="utf-8")
     from ..pool.pool_d_publish import _get_json, _index_key
 
     index = _get_json(store, _index_key(prefix)) or {"snapshots": []}
@@ -1234,37 +1323,96 @@ def state_pull(store, *, prefix: str, log_dir: Path, prior_root: Path) -> dict:
         d.mkdir(parents=True, exist_ok=True)
         (d / "metadata.json").write_bytes(data)
         got.append(snap)
-    return {"head": head, "prior": got}
+    return {"head": head, "prior": got, "restored": restored, "kept": kept}
+
+
+def _bucket_copy(store, *, key: str, name: str, head: Mapping | None, pulled: Mapping,
+                 log_dir: Path) -> tuple[str, int]:
+    """``(sha256, size)`` of the bucket copy ``state-push`` must extend.
+
+    Named in HEAD: HEAD's sha256 (``state-pull`` verified the bytes against
+    it) and the size it restored (else HEAD's, else ``HeadObject``) -- no
+    download. Not named (no HEAD yet, or a file newer than HEAD): an absent or
+    empty object is empty; anything else streams down once to hash it."""
+    from ..shared.hippius import ObjectNotFound
+
+    if head is not None and name in head:
+        size = pulled.get(name, _head_sizes(head).get(name))
+        if size is None:
+            size = _object_size_or_none(store, key)
+            if size is None:
+                raise ElasticError("state_conflict", f"HEAD names {name} but it is missing")
+        return str(head[name]), int(size)
+    size = _object_size_or_none(store, key)
+    if not size:
+        return _EMPTY_SHA, 0
+    tmp = log_dir / f".{name}.remote.tmp"
+    try:
+        try:
+            got = store.get_file_sha(key, tmp)
+        except ObjectNotFound:
+            return _EMPTY_SHA, 0
+        return str(got["sha256"]), int(got["size"])
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def state_push(store, *, prefix: str, log_dir: Path, pool_d: Path | None) -> dict:
     """Upload the grown first-seen log (append-only, compare-and-swap on HEAD)
-    and the new snapshot's metadata.json."""
-    from ..shared.hippius import ObjectNotFound
+    and the new snapshot's metadata.json.
 
+    Streaming throughout (the log is 20 GB and growing): one local pass per
+    file proves the bucket copy is a byte prefix (its sha256 from HEAD against
+    the sha256 of the local file's first ``size`` bytes) and hashes the whole
+    file; the upload goes through the store's ``put_file_sha`` (multipart above
+    one part) and must report the same sha256 and size, and the stored object
+    must have that size. A file whose sha256 and size equal the bucket copy's
+    is not re-uploaded. ``HEAD.json`` keeps ``{name: sha256}`` and gains
+    ``sizes`` ({name: bytes}); it is written last, so a failed push leaves the
+    previous HEAD and the next push retries."""
     mark = log_dir / PULLED_MARK
     if not mark.is_file():
         raise ElasticError("state_conflict", "state-pull never ran on this builder")
-    seen = json.loads(mark.read_text(encoding="utf-8")) or None
+    seen, pulled = _read_mark(mark)
     head = _head(store, prefix)
     if (head or None) != seen:
         raise ElasticError("state_conflict", "the bucket HEAD moved since state-pull "
                                              "(another builder?)")
-    new_head = {}
+    plan = []
     for name in FIRST_SEEN_FILES:
-        local = (log_dir / name).read_bytes() if (log_dir / name).is_file() else b""
-        try:
-            remote = store.get_bytes(_state_key(prefix, "first_seen", name))
-        except ObjectNotFound:
-            remote = b""
-        if not local.startswith(remote):
+        key = _state_key(prefix, "first_seen", name)
+        path = log_dir / name
+        prev_sha, prev_size = _bucket_copy(store, key=key, name=name, head=head,
+                                           pulled=pulled, log_dir=log_dir)
+        pre, sha, size = _scan(path, prev_size)
+        if pre != prev_sha:
             raise ElasticError("state_conflict", f"{name}: the bucket copy is not a prefix "
                                                  f"of the local log (append-only)")
-        new_head[name] = hashlib.sha256(local).hexdigest()
-    for name in FIRST_SEEN_FILES:
-        store.put_bytes(_state_key(prefix, "first_seen", name),
-                        (log_dir / name).read_bytes() if (log_dir / name).is_file() else b"")
-    out = {"head": new_head}
+        plan.append((name, key, path, sha, size, sha == prev_sha and size == prev_size))
+    uploaded, skipped = [], []
+    new_head: dict = {}
+    sizes: dict[str, int] = {}
+    for name, key, path, sha, size, same in plan:
+        new_head[name], sizes[name] = sha, size
+        if same and _object_size_or_none(store, key) == size:
+            skipped.append(name)
+            continue
+        if path.is_file():
+            got = store.put_file_sha(key, path)
+        else:
+            store.put_bytes(key, b"")
+            got = {"sha256": _EMPTY_SHA, "size": 0}
+        if got["sha256"] != sha or int(got["size"]) != size:
+            raise ElasticError("state_conflict", f"{name} changed during state-push "
+                                                 f"(scanned {size} bytes, uploaded "
+                                                 f"{got['size']})")
+        stored = _object_size_or_none(store, key)
+        if stored != size:
+            raise ElasticError("state_conflict", f"{name}: the bucket holds {stored} bytes "
+                                                 f"after uploading {size}")
+        uploaded.append(name)
+    new_head["sizes"] = sizes
+    out = {"head": new_head, "uploaded": uploaded, "skipped": skipped}
     if pool_d is not None:
         meta = json.loads((pool_d / "metadata.json").read_text(encoding="utf-8"))
         snap = str(meta["snapshot"])
@@ -1273,7 +1421,8 @@ def state_push(store, *, prefix: str, log_dir: Path, pool_d: Path | None) -> dic
         out["prior"] = snap
     store.put_bytes(_state_key(prefix, "first_seen", "HEAD.json"),
                     json.dumps(new_head, sort_keys=True).encode())
-    mark.write_text(json.dumps(new_head, sort_keys=True), encoding="utf-8")
+    mark.write_text(json.dumps({"schema": PULLED_SCHEMA, "head": new_head, "sizes": sizes},
+                               sort_keys=True), encoding="utf-8")
     return out
 
 
@@ -1319,18 +1468,53 @@ def _forge_client():
     return _s3_client(cfg), bucket
 
 
+def select_lane_a_snapshot(index: Sequence):
+    """The newest REAL lane A index entry: smoke-test sentinels
+    (``effective_block >= POOL_SENTINEL_MIN_BLOCK``, e.g. the 999999999999
+    workflow_dispatch default of publish-pool.yml) are never a validator's
+    pool, so W6b must never replay one (2026-11-25: the 2026-09-29 sentinel
+    was picked and the replay refused with 4586 mismatching files)."""
+    from ..shared.hippius import POOL_SENTINEL_MIN_BLOCK
+
+    real = [s for s in index if int(s.effective_block) < POOL_SENTINEL_MIN_BLOCK]
+    if not real:
+        raise ElasticError("usage", "lane A pool index has no real (non-sentinel) snapshot")
+    return max(real, key=lambda s: s.effective_block)
+
+
 def lane_a_pool(chain_toml: Path, out: Path) -> dict:
-    """Fetch the newest lane A pool snapshot (sha-checked) for W6b's replay."""
+    """Fetch the newest real lane A pool snapshot (sha-checked against the
+    index) for W6b. Besides the unpacked ``out`` it keeps the verified tar
+    (``<out>.tar``) and the index entry it resolved (``<out>.ref.json``), which
+    ``pool_d_build``'s default snapshot mode re-verifies before it takes the
+    selection from the snapshot."""
     from ..shared.config import load_chain_config
-    from ..shared.hippius import fetch_pool_snapshot, pool_s3_store, read_pool_index
+    from ..shared.hippius import (
+        StorageError,
+        pool_s3_store,
+        read_pool_index,
+        tar_cid_digest,
+        unpack_tar_to_dir,
+    )
 
     cfg = load_chain_config(chain_toml)
     store = pool_s3_store(cfg.storage)
     index = read_pool_index(store)
     if not index:
         raise ElasticError("usage", "lane A pool index is empty")
-    meta = max(index, key=lambda s: s.effective_block)
-    fetch_pool_snapshot(store, meta, out)
+    meta = select_lane_a_snapshot(index)
+    data = store.get_bytes(meta.key)
+    got = tar_cid_digest(data)
+    if got != meta.sha256:
+        raise StorageError(f"pool_snapshot_digest_mismatch: {got} != {meta.sha256}")
+    unpack_tar_to_dir(data, out)
+    out = Path(out)
+    tar = out.with_name(out.name + ".tar")
+    tar.write_bytes(data)
+    ref = {"effective_block": int(meta.effective_block), "sha256": meta.sha256,
+           "key": meta.key, "tar": tar.name}
+    out.with_name(out.name + ".ref.json").write_text(
+        json.dumps(ref, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return {"effective_block": meta.effective_block, "sha256": meta.sha256, "out": str(out)}
 
 

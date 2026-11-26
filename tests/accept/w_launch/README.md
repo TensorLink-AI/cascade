@@ -82,3 +82,126 @@ reads it. From that block:
   king-only settlements continue.
 
 `test_w_launch_lane_a_cutoff.py` pins it.
+
+Provisioner orphan scope (mainnet 2026-11-25 07:50): the dedicated MarketCast
+offload provisioner (`provision.mkt.toml`, eval off, mkt on) reaped
+`cascade-1795592862-mkt-0`, a Lium pod it never rented, because the reaper
+treated every `cascade-<n>-<stage>` name missing from its own ledger as an
+orphan. Two changes fix this:
+- Every launch first writes a `RentIntent` (provider, name prefix, stage) to
+  the ledger, before the provider call. When the launch returns, the intent is
+  replaced by the pod ids in one atomic save.
+- The reaper terminates a pod only when it matches a recorded intent of THIS
+  instance for a stage the instance has enabled. Other provisioner-named pods
+  get one WARNING and are left alone.
+
+`test_w_launch_mkt_orphan_scope.py` pins:
+- a foreign mkt pod is left alone;
+- an mkt pod with this instance's intent is reaped;
+- heat, final and eval pods are never touched by an mkt-only instance;
+- the intent is on disk before `launch` is called, and a crash after create
+  is reaped on restart.
+Launch miner docs + CLI (owner 2026-11-25). Every miner-facing guide states
+that lane A is closed to new challengers from 9586800, the step 1 / step 2
+splits (A 50 / B 35 / C 15, then A 0 / B 35 / C 15 / D 50 once lane D is
+armed), that D's 50% stays with the lane A king until the first lane D crown,
+the 24 h launch embargo and that the lane D public weight is set by overlay.
+- The generated `cascade:rewards:summary` block is computed by
+  `scripts/check_docs.py` from `chain.toml` plus the mainnet launch overlays
+  (`launch_configs`), so every copy states the LIVE split; the allocation,
+  king-start and slot-tiers tables stay the checked-in template.
+- The CLI help (top level, `deploy`, `submit`, `fund`) says lane A is closed.
+  `cascade deploy` (without `--expert-domain`) and `cascade submit` (unless
+  store only, `--no-fund --no-commit`) read the chain head and refuse a lane A
+  entry at or past the cutoff BEFORE any upload, intake POST or chain commit
+  (`lane_a_closed`, exit 1; `--allow-closed-lane-a` overrides). The cutoff is
+  `[round] lane_a_until_block` when the loaded config types it, else the
+  published per-netuid cutoff (mainnet 91: 9586800); the miner's checked-in
+  chain.toml keeps the key at 0.
+- The overlay sync: both mainnet launch steps and the next-era fallback step 2
+  restate `[v2] reign_warm_start_blocks = 0` from the published step 1
+  (cfg-961291bc); without it the R3 `non-lane-d` lint refuses step 2.
+
+`test_w_launch_miner_cli.py` and `test_w_launch_overlay_sync.py` pin it.
+
+## pool_d builder OOM: first_seen record() bounded by one feed (2026-11-25)
+
+The first baseline `python -P -m cascade.pool.first_seen record` over 7,002
+feeds / 14 GB of parquet reached 39.8 GB RSS on the 39 GB `pool_d` builder
+and was OOM-killed. `record()` kept every point of every feed (`known`) and
+every new record in memory until the end, and loaded the whole log history
+the same way.
+
+- `record()` makes one streaming pass over `records.jsonl` / `quarantine.jsonl`
+  and keeps only the logged (feed, partition, sha256) keys, the logged feeds,
+  the quarantine versions and per-feed byte spans. It loads `known` for one
+  feed at a time from those spans and drops it when that feed is done.
+- New lines are staged in two unlinked temp files in `log_dir`. They are
+  appended only after the `too_many_unreadable` check passes, quarantine
+  first, so a systemic failure still records nothing.
+- `commit()` streams the log and keeps only 32-byte leaf hashes.
+- The output is byte-identical. Record, quarantine and root formats are
+  unchanged.
+
+`test_w_launch_first_seen_memory.py` pins that the peak memory does not grow
+with the feed count, on a baseline run and over a long history.
+`tests/unit/test_first_seen_record_memory.py` pins byte-identical logs
+against the previous implementation, kept verbatim in the test.
+
+## pool_d builder OOM: the first-seen index bounded by one feed (2026-11-26)
+
+`python -P -m cascade.pool.pool_d_build` over a 20 GB / 7,002-feed
+`records.jsonl` reached 39.3 GB RSS within 5 min on the 39 GB builder and
+filled swap. `FirstSeenLog.index()` held every record of the log and a
+`(feed, panel_json, ts) -> (seen, root, baseline)` dict of every committed
+point before the build looked at its first feed.
+
+- `FirstSeenLog.feed_index()` makes one streaming pass over `records.jsonl`.
+  It checks every committed root from 32-byte leaf hashes and keeps, per feed,
+  only the byte spans of the usable records. The errors, and which one wins,
+  are the previous `index()`'s.
+- The returned `FirstSeenFeedIndex` loads one feed's points on its first
+  lookup and drops the previous feed's. `pool_d_build` already walks feeds in
+  sorted order, so it takes each feed's lag and lookups from one load.
+  `verify_snapshot` checks series grouped by feed and reports them in order.
+- `index()` still returns the whole-log `FirstSeenIndex` and is now built
+  feed by feed from the same scan.
+- The output is byte-identical. Record, root and quarantine formats, schemas
+  and digests are unchanged.
+
+`test_w_launch_first_seen_index_memory.py` pins that the peak memory of the
+pool_d index walk and of `verify_snapshot` does not grow with the feed count.
+`tests/unit/test_first_seen_index_memory.py` pins identical lookups, lags,
+errors, `verify_snapshot` results and `pool_d_build` output files against the
+previous implementation, kept verbatim in the test.
+
+## pool_d builder state-push: the first-seen log streams (2026-11-26)
+
+Every 3-hourly build cycle exited non-zero at `cascade-laned elastic
+state-push` with `s3_put_failed: pool_d/_builder/first_seen/records.jsonl:
+... (EntityTooLarge) ... PutObject`. The log is 20 GB (7,002 feeds) and grows
+on every build. The push read the local log and the bucket copy whole, then
+sent the log as one PUT, which Hippius refuses above its single-PUT cap.
+
+- The pool stores gain `put_file_sha`, `get_file_sha` and `object_size`. A
+  file up to `MULTIPART_CHUNK_BYTES` (256 MiB) is one PUT. A larger file is an
+  explicit multipart upload: the part size is `multipart_part_size(size)`
+  (at least 256 MiB, at most 10,000 parts), one part is in memory at a time,
+  and any failure aborts the upload. Both directions return the sha256 and
+  size of the bytes that went over the wire.
+- `state-push` makes one local pass per file. It compares the sha256 of the
+  local file's first `size` bytes with HEAD's sha256 for the bucket copy, so
+  it never downloads that copy. The upload must report the scanned sha256 and
+  size, and the stored object must have that size. A file equal to the bucket
+  copy is not uploaded again. `HEAD.json` keeps `{name: sha256}`, gains
+  `sizes`, and is still written last, so a failed push leaves the old HEAD.
+- `state-pull` streams each file to a temp file, checks its sha256 (and size,
+  when HEAD has it) and the local copy's append-only prefix, and only then
+  replaces the local file. A warm local copy equal to HEAD is not downloaded.
+  The pull mark records the restored sizes. A HEAD or mark from before
+  `sizes` still pulls and pushes.
+
+`test_w_launch_state_push_streaming.py` pins this against a fake S3 client
+that refuses a single PUT above one part. `tests/unit/test_pool_d_state_streaming.py`
+pins the store methods: the one-PUT path, multipart part sizes, abort on a
+failed part, failed complete or a file that grows, and streamed downloads.

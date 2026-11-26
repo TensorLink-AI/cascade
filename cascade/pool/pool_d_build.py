@@ -277,8 +277,13 @@ def _prior_frontiers(prior_dirs: Sequence[Path | str], as_of_ts: int) -> dict[st
 
 def build_pool_d(*, forge_dir: Path | str, selection, first_seen_dir: Path | str,
                  as_of_ts: int, out_dir: Path | str, cfg: PoolDBuildConfig | None = None,
-                 prior_dirs: Sequence[Path | str] = (), overwrite: bool = False) -> PoolDSummary:
-    """Build one ``pool_d/1`` snapshot for the W6a ``selection`` at ``as_of_ts``."""
+                 prior_dirs: Sequence[Path | str] = (), overwrite: bool = False,
+                 lane_a_source: Mapping | None = None) -> PoolDSummary:
+    """Build one ``pool_d/1`` snapshot for the W6a ``selection`` at ``as_of_ts``.
+
+    ``lane_a_source`` (``{"mode", "effective_block", "sha256"}``) is recorded
+    in ``metadata.json`` as ``lane_a_selection`` when given (absent = the
+    pre-W-LAUNCH bytes)."""
     from .first_seen import FirstSeenLog, _epoch_seconds, panel_json
     from .sources.tsbench_forge import TsbenchForgeSource, resolve_frequency
 
@@ -291,12 +296,14 @@ def build_pool_d(*, forge_dir: Path | str, selection, first_seen_dir: Path | str
     from .first_seen import unreadable_limit
 
     fs_log = FirstSeenLog(first_seen_dir)
-    index = fs_log.index(until_ts=as_of_ts)
+    # One feed's first-seen points in memory at a time (2026-11-26: the
+    # whole-log index of a 20 GB records.jsonl reached 39.3 GB RSS); feeds
+    # are walked in order below and every lookup is for the current feed.
+    index = fs_log.feed_index(until_ts=as_of_ts)
     quarantined = fs_log.quarantined(until_ts=as_of_ts)
     quarantine_report = fs_log.quarantine_report(until_ts=as_of_ts)
     unreadable: list[list[str]] = []
     n_files_read = 0
-    lags = index.feed_lag()
     frontiers = _prior_frontiers(prior_dirs, as_of_ts)
     reader = TsbenchForgeSource(forge)
     as_of_day = dt.datetime.fromtimestamp(as_of_ts, tz=dt.UTC).date()
@@ -325,8 +332,9 @@ def build_pool_d(*, forge_dir: Path | str, selection, first_seen_dir: Path | str
         if entry is None or mapped is None:
             refused.update({s.pool_d_series_id: "not_in_forge" for s in sels})
             continue
-        lag = lags.get(feed, {"mirror_lag_hours": None, "max_lead_hours": None,
-                              "publish_ahead": False})
+        lag = index.feed_lag([feed]).get(feed, {"mirror_lag_hours": None,
+                                                "max_lead_hours": None,
+                                                "publish_ahead": False})
         emb = effective_embargo_hours(entry, global_hours=cfg.embargo_hours,
                                       publish_ahead=bool(lag["publish_ahead"]))
         if emb is None:
@@ -353,6 +361,19 @@ def build_pool_d(*, forge_dir: Path | str, selection, first_seen_dir: Path | str
             wanted[s.key[1]].append(s)
         found: set[str] = set()
         groups = df.groupby(panel_cols, sort=True) if panel_cols else [((), df)]
+        # Two panel rows with one base are lane A's harvest-level key_collision
+        # (pool_d_select.select_pool_d refuses them); a snapshot-mode selection
+        # cannot see it when lane A kept only one of them, so refuse it here.
+        # A replay selection never wants such a base, so its output is unchanged.
+        if panel_cols:
+            row_bases = Counter(
+                _series_base(feed, {c.removeprefix("_panel_"): str(v)
+                                    for c, v in zip(panel_cols, row, strict=False)})
+                for row in df[panel_cols].drop_duplicates().dropna()
+                .itertuples(index=False, name=None))
+            for base in [b for b in wanted if row_bases[b] > 1]:
+                refused.update({s.pool_d_series_id: "key_collision" for s in wanted.pop(base)})
+                found.add(base)
         for gkey, sub in groups:
             key_t = gkey if isinstance(gkey, tuple) else (gkey,)
             panel = {c.removeprefix("_panel_"): str(v)
@@ -430,6 +451,7 @@ def build_pool_d(*, forge_dir: Path | str, selection, first_seen_dir: Path | str
         for base, sel_list in wanted.items():
             if base not in found:
                 refused.update({s.pool_d_series_id: "not_in_forge" for s in sel_list})
+    index.release()
 
     limit = unreadable_limit(n_files_read, max_files=cfg.max_unreadable_files,
                              max_frac=cfg.max_unreadable_frac)
@@ -454,6 +476,10 @@ def build_pool_d(*, forge_dir: Path | str, selection, first_seen_dir: Path | str
     # Audit trail for skipped partitions; absent when empty (byte-identical).
     if quarantine_report:
         meta["quarantine"] = quarantine_report
+    if lane_a_source is not None:
+        meta["lane_a_selection"] = {"mode": str(lane_a_source["mode"]),
+                                    "effective_block": int(lane_a_source["effective_block"]),
+                                    "sha256": str(lane_a_source["sha256"])}
     if unreadable:
         meta["unreadable_partitions"] = unreadable
     if not series_out:
@@ -622,6 +648,52 @@ def replay_lane_a(lane_a_pool: Path, forge_dir: Path, *, max_panel_series_per_fe
     return selection, mismatches
 
 
+LANE_A_SELECTION_MODES = ("snapshot", "replay")
+
+
+def lane_a_ref_path(lane_a_pool: Path | str) -> Path:
+    """``<lane_a_pool>.ref.json``, written by ``cascade-laned elastic lane-a-pool``."""
+    p = Path(lane_a_pool)
+    return p.with_name(p.name + ".ref.json")
+
+
+def verify_lane_a_snapshot(lane_a_pool: Path | str, ref_path: Path | str | None = None) -> dict:
+    """Check the unpacked lane A snapshot against its pool index entry.
+
+    The ref (``{"effective_block", "sha256", "key", "tar"}``) names the
+    index entry the fetch step resolved. The tar's sha256 must equal the
+    index sha256, and the unpacked ``metadata.json`` / ``*.npy`` must equal
+    the tar's. Returns ``{"mode": "snapshot", "effective_block", "sha256"}``.
+    Raises ``ValueError`` (``lane_a_snapshot_refused: ...``) otherwise."""
+    from ..shared.hippius import tar_cid_digest, unpack_tar_to_dir
+
+    lane_a_pool = Path(lane_a_pool)
+    ref_path = Path(ref_path) if ref_path is not None else lane_a_ref_path(lane_a_pool)
+    try:
+        ref = json.loads(ref_path.read_text(encoding="utf-8"))
+        block, want = int(ref["effective_block"]), str(ref["sha256"])
+        tar = Path(ref["tar"])
+        tar = tar if tar.is_absolute() else ref_path.parent / tar
+        data = tar.read_bytes()
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        raise ValueError(f"lane_a_snapshot_refused: ref {ref_path} unreadable: {e}") from e
+    got = tar_cid_digest(data)
+    if got != want:
+        raise ValueError(f"lane_a_snapshot_refused: tar sha256 {got} != index sha256 {want} "
+                         f"(block {block})")
+    with tempfile.TemporaryDirectory(prefix="pool-d-lane-a-") as tmp:
+        try:
+            unpack_tar_to_dir(data, tmp)
+        except Exception as e:  # noqa: BLE001 — any unreadable tar is a refusal
+            raise ValueError(f"lane_a_snapshot_refused: tar unreadable: {e}") from e
+        packed, unpacked = _pool_files(Path(tmp)), _pool_files(lane_a_pool)
+    if not packed or packed != unpacked:
+        diff = sorted(n for n in set(packed) | set(unpacked) if packed.get(n) != unpacked.get(n))
+        raise ValueError(f"lane_a_snapshot_refused: {lane_a_pool} differs from the verified "
+                         f"tar in {len(diff)} file(s): {', '.join(diff[:10])}")
+    return {"mode": "snapshot", "effective_block": block, "sha256": want}
+
+
 def _canonical(obj) -> bytes:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
 
@@ -649,6 +721,12 @@ def main(argv: list[str] | None = None) -> int:
                     help="systemic-read-failure guard (default 50)")
     ap.add_argument("--max-unreadable-frac", type=float, default=None,
                     help="systemic-read-failure guard (default 0.001)")
+    ap.add_argument("--lane-a-selection", choices=LANE_A_SELECTION_MODES, default="snapshot",
+                    help="snapshot (default, owner 2026-11-25): take the selection from the "
+                         "sha-verified lane A snapshot itself; replay: rebuild lane A from the "
+                         "forge and require byte-identical files")
+    ap.add_argument("--lane-a-ref", type=Path, default=None,
+                    help="snapshot mode: the fetch step's ref (default <lane-a-pool>.ref.json)")
     args = ap.parse_args(argv)
 
     from ..shared.config import load_chain_config
@@ -666,18 +744,36 @@ def main(argv: list[str] | None = None) -> int:
         cfg = dataclasses.replace(cfg, **guard)
     print(f"pool_d: [lane_d] embargo_hours={cfg.embargo_hours:g} horizon={cfg.horizon} from "
           f"{args.chain_toml or 'the default chain.toml'}", file=sys.stderr)
-    selection, mismatches = replay_lane_a(
-        args.lane_a_pool, args.forge_dir, max_panel_series_per_feed=args.max_panel_series_per_feed,
-        mv_pack=args.mv_pack, max_series_per_source=args.max_series_per_source)
-    if mismatches:
-        print(f"error: lane_a_replay_mismatch: {len(mismatches)} file(s) differ from "
-              f"{args.lane_a_pool}: {', '.join(mismatches[:10])}", file=sys.stderr)
-        return REPLAY_MISMATCH_EXIT
+    lane_a_source = None
+    if args.lane_a_selection == "snapshot":
+        from .pool_d_select import select_from_snapshot
+
+        try:
+            lane_a_source = verify_lane_a_snapshot(args.lane_a_pool, args.lane_a_ref)
+            selection = select_from_snapshot(args.lane_a_pool)
+        except (OSError, ValueError, KeyError) as e:
+            msg = str(e) if "lane_a_snapshot_refused" in str(e) else \
+                f"lane_a_snapshot_refused: snapshot unreadable: {e}"
+            print(f"error: {msg}", file=sys.stderr)
+            return REPLAY_MISMATCH_EXIT
+        print(f"pool_d: lane A selection from snapshot block {lane_a_source['effective_block']} "
+              f"sha256 {lane_a_source['sha256'][:16]}… ({len(selection.series)} series, "
+              f"{len(selection.refused)} refused)", file=sys.stderr)
+    else:
+        selection, mismatches = replay_lane_a(
+            args.lane_a_pool, args.forge_dir,
+            max_panel_series_per_feed=args.max_panel_series_per_feed,
+            mv_pack=args.mv_pack, max_series_per_source=args.max_series_per_source)
+        if mismatches:
+            print(f"error: lane_a_replay_mismatch: {len(mismatches)} file(s) differ from "
+                  f"{args.lane_a_pool}: {', '.join(mismatches[:10])}", file=sys.stderr)
+            return REPLAY_MISMATCH_EXIT
     fs_dir = args.first_seen_dir or args.forge_dir / "first_seen"
     try:
         summary = build_pool_d(forge_dir=args.forge_dir, selection=selection,
                                first_seen_dir=fs_dir, as_of_ts=args.as_of_ts, out_dir=args.out,
-                               cfg=cfg, prior_dirs=args.prior_dir, overwrite=args.overwrite)
+                               cfg=cfg, prior_dirs=args.prior_dir, overwrite=args.overwrite,
+                               lane_a_source=lane_a_source)
     except (ValueError, FileExistsError, OSError) as e:
         print(f"error: pool_d build failed: {e}", file=sys.stderr)
         return 2
@@ -725,10 +821,12 @@ __all__ = [
     "build_pool_d",
     "effective_embargo_hours",
     "lane_a_pool_sha256",
+    "lane_a_ref_path",
     "lane_d_embargo_hours",
     "main",
     "replay_lane_a",
     "snapshot_sha256",
     "validate_pool_d",
+    "verify_lane_a_snapshot",
     "write_npz",
 ]

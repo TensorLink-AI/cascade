@@ -35,7 +35,10 @@ env_file           = "/etc/cascade-laned-pool-d.env"   # on the box, mode 600, o
 remote_env_file    = "/home/shadeform/.cascade-pool-d.env"
 release_dir        = "/root/cascade"                   # the release the box runs
 chain_toml         = "/root/cascade/chain.toml"        # the DEPLOYED chain.toml
-build_args         = []                                # extra pool_d_build flags (e.g. "--mv-pack")
+# extra pool_d_build flags. The W6b replay must use lane A's publish flags (not in
+# provenance.json): --max-panel-series-per-feed = publish-pool.yml's value, and
+# --mv-pack because every live snapshot is past [scoring] mv_score_from_block.
+build_args         = ["--mv-pack", "--max-panel-series-per-feed", "20"]
 
 [[pool_d_builder.types]]
 cloud = "massedcompute"

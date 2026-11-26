@@ -251,6 +251,22 @@ def _competition(c: dict) -> str:
             f" ({when})")
 
 
+def lane_b_domain_lines(tags: object) -> list[str]:
+    """``  lane B domains  5Fabc…xyz  improved energy +0.0123 · not improved h720 -0.0040``
+    — one row per judged generator from an index entry's ``lane_b_domains``
+    (owner 2026-11-25: the domain evals each generator ACTUALLY improved;
+    margin = family LCB minus the bar, ``*`` = an undeclared slot). Display
+    only; an entry without the column (every older row) renders nothing."""
+    from ..shared.lane_b_domains import tags_line
+
+    gens = [g for g in (tags if isinstance(tags, list) else []) if isinstance(g, dict)]
+    out = [f"  lane B domains  {_short_hotkey(str(g.get('hotkey') or '')):<11} {tags_line(g)}"
+           for g in gens[:SUBMISSIONS_SHOWN]]
+    if len(gens) > SUBMISSIONS_SHOWN:
+        out.append(f"  lane B domains  … {len(gens) - SUBMISSIONS_SHOWN} more")
+    return out
+
+
 def lane_lines(entry: dict | None) -> list[str]:
     """The lane rows of one settled index entry: the lane-A king ladder share
     (DEC-CA-0055 ``ladder``: share, last step, former-king court, key slash)
@@ -304,6 +320,8 @@ def lane_lines(entry: dict | None) -> list[str]:
         wins = (pay or {}).get("wins") if isinstance(pay, dict) else None
         out.append(f"  lane {lane}          {len(rows)} judged · {passed} passed · "
                    f"paid: {_paid(wins, target_key)}")
+        if lane == "B":
+            out.extend(lane_b_domain_lines(entry.get("lane_b_domains")))
         comps = (pay or {}).get("competitions") if lane == "C" and isinstance(pay, dict) else None
         if comps:
             # concurrent competitions (owner 2026-10-20): weight share + state + dates

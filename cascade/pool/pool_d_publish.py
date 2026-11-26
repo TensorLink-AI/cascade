@@ -22,6 +22,15 @@ builder read. Nothing here re-reads the catalog. :func:`check_build_wall`
 alerts (``pool_d_build_wall_exceeded``) when a build takes 3 h or more or ends
 after the next boundary. Uploads above one part go multipart in parts of
 ``MULTIPART_CHUNK_BYTES`` (W3a: single PUTs are only safe up to 512 MiB).
+
+The stores' ``put_file_sha`` / ``get_file_sha`` / ``object_size`` carry the
+builder's own state (``cascade-laned elastic state-push`` / ``state-pull``,
+a first-seen log of 20 GB and growing): a file goes up in one PUT up to
+``MULTIPART_CHUNK_BYTES`` and as an explicit multipart upload above it (part
+size from :func:`multipart_part_size`, at most ``MAX_MULTIPART_PARTS`` parts,
+one part in memory at a time, aborted on any failure), down as a stream, and
+both return the sha256 and size of exactly the bytes that crossed the wire
+(Hippius refuses a single PUT that large with ``EntityTooLarge``).
 Credentials come from the ``HIPPIUS_S3_*`` environment only.
 """
 
@@ -53,6 +62,8 @@ MANIFEST_SCHEMA = "lane-d-pool-manifest/1"
 INDEX_SCHEMA = "lane-d-pool-index/1"
 EVIDENCE_SCHEMA = "laned-evidence/w6d/1"
 MULTIPART_CHUNK_BYTES = 256 * 1024 * 1024
+MAX_MULTIPART_PARTS = 10_000          # the S3 limit on parts per upload
+STREAM_CHUNK_BYTES = 1 << 20          # read/hash/write granularity for streams
 TERMINAL_STATUSES = ("crowned", "lost", "closed")
 DEFAULT_PREFIX = "pool_d"
 
@@ -75,6 +86,28 @@ def _file_sha(path: Path) -> str:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def multipart_part_size(size: int) -> int:
+    """The part size for a ``size``-byte multipart upload: at least
+    ``MULTIPART_CHUNK_BYTES``, MiB-aligned, and large enough that the upload
+    needs at most ``MAX_MULTIPART_PARTS`` parts (S3 caps the part count)."""
+    mib = 1 << 20
+    need = -(-max(int(size), 0) // MAX_MULTIPART_PARTS)
+    if need <= MULTIPART_CHUNK_BYTES:
+        return MULTIPART_CHUNK_BYTES
+    return -(-need // mib) * mib
+
+
+def _copy_hashed(src, dst) -> tuple[str, int]:
+    """Stream ``src`` into ``dst`` (file objects); the sha256 and byte count."""
+    h = hashlib.sha256()
+    n = 0
+    for chunk in iter(lambda: src.read(STREAM_CHUNK_BYTES), b""):
+        h.update(chunk)
+        n += len(chunk)
+        dst.write(chunk)
+    return h.hexdigest(), n
 
 
 def _write_atomic(path: Path, data: bytes) -> None:
@@ -151,6 +184,34 @@ class FsPoolStore:
             raise ObjectNotFound(f"fs_get_missing: {key}")
         return src.read_bytes()
 
+    def put_file_sha(self, key: str, path: Path | str) -> dict:
+        """Stream ``path`` into the store; ``{"sha256", "size", "parts"}``."""
+        dest = self._path(key)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_name(f".{dest.name}.tmp")
+        with open(path, "rb") as src, open(tmp, "wb") as out:
+            sha, n = _copy_hashed(src, out)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(tmp, dest)
+        return {"sha256": sha, "size": n, "parts": 0}
+
+    def get_file_sha(self, key: str, path: Path | str) -> dict:
+        """Stream an object into ``path``; ``{"sha256", "size"}``."""
+        src = self._path(key)
+        if not src.is_file():
+            raise ObjectNotFound(f"fs_get_missing: {key}")
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with open(src, "rb") as f, open(path, "wb") as out:
+            sha, n = _copy_hashed(f, out)
+        return {"sha256": sha, "size": n}
+
+    def object_size(self, key: str) -> int:
+        src = self._path(key)
+        if not src.is_file():
+            raise ObjectNotFound(f"fs_get_missing: {key}")
+        return src.stat().st_size
+
 
 @dataclass
 class HippiusPoolStore:
@@ -219,6 +280,97 @@ class HippiusPoolStore:
             if self._missing(e):
                 raise ObjectNotFound(f"s3_get_missing: {key}") from e
             raise StorageError(f"s3_get_failed: {key}: {e}") from e
+
+    def object_size(self, key: str) -> int:
+        """The stored object's byte size (``HeadObject``)."""
+        c = self.client()
+        try:
+            return int(c.head_object(Bucket=self.cfg.bucket, Key=key)["ContentLength"])
+        except Exception as e:  # noqa: BLE001
+            if self._missing(e):
+                raise ObjectNotFound(f"s3_head_missing: {key}") from e
+            raise StorageError(f"s3_head_failed: {key}: {e}") from e
+
+    def put_file_sha(self, key: str, path: Path | str) -> dict:
+        """Upload ``path`` streamed; ``{"sha256", "size", "parts"}`` of exactly
+        the bytes sent. Up to ``MULTIPART_CHUNK_BYTES``: one PUT. Above: an
+        explicit multipart upload (:func:`multipart_part_size`), one part in
+        memory at a time; any failure aborts the upload, so no orphaned parts
+        are left behind and the previous object stays in place."""
+        c = self.client()
+        path = Path(path)
+        size = path.stat().st_size
+        if size <= MULTIPART_CHUNK_BYTES:
+            data = path.read_bytes()
+            try:
+                c.put_object(Bucket=self.cfg.bucket, Key=key, Body=data,
+                             ContentType="application/octet-stream")
+            except Exception as e:  # noqa: BLE001
+                raise StorageError(f"s3_put_failed: {key}: {e}") from e
+            return {"sha256": hashlib.sha256(data).hexdigest(), "size": len(data), "parts": 0}
+        part_size = multipart_part_size(size)
+        try:
+            upload_id = c.create_multipart_upload(
+                Bucket=self.cfg.bucket, Key=key,
+                ContentType="application/octet-stream")["UploadId"]
+        except Exception as e:  # noqa: BLE001
+            raise StorageError(f"s3_put_failed: {key}: create_multipart_upload: {e}") from e
+        h = hashlib.sha256()
+        n = 0
+        parts: list[dict] = []
+        try:
+            with open(path, "rb") as f:
+                while True:
+                    data = f.read(part_size)
+                    if not data:
+                        break
+                    if len(parts) >= MAX_MULTIPART_PARTS:
+                        raise StorageError(f"s3_put_failed: {key}: more than "
+                                           f"{MAX_MULTIPART_PARTS} parts (file grew)")
+                    h.update(data)
+                    n += len(data)
+                    num = len(parts) + 1
+                    r = c.upload_part(Bucket=self.cfg.bucket, Key=key, UploadId=upload_id,
+                                      PartNumber=num, Body=data)
+                    parts.append({"ETag": r["ETag"], "PartNumber": num})
+                    del data
+            if n != size:
+                raise StorageError(f"s3_put_failed: {key}: file changed during upload "
+                                   f"({size} -> {n} bytes)")
+            c.complete_multipart_upload(Bucket=self.cfg.bucket, Key=key, UploadId=upload_id,
+                                        MultipartUpload={"Parts": parts})
+        except BaseException as e:
+            try:
+                c.abort_multipart_upload(Bucket=self.cfg.bucket, Key=key, UploadId=upload_id)
+            except Exception as ae:  # noqa: BLE001
+                log.warning("s3_multipart_abort_failed key=%s upload_id=%s: %s",
+                            key, upload_id, ae)
+            if isinstance(e, StorageError) or not isinstance(e, Exception):
+                raise
+            raise StorageError(f"s3_put_failed: {key}: multipart aborted after "
+                               f"{len(parts)} part(s): {e}") from e
+        return {"sha256": h.hexdigest(), "size": n, "parts": len(parts)}
+
+    def get_file_sha(self, key: str, path: Path | str) -> dict:
+        """Stream an object into ``path`` (never held in memory);
+        ``{"sha256", "size"}``. A short read is a failure, not a file."""
+        c = self.client()
+        try:
+            resp = c.get_object(Bucket=self.cfg.bucket, Key=key)
+        except Exception as e:  # noqa: BLE001
+            if self._missing(e):
+                raise ObjectNotFound(f"s3_get_missing: {key}") from e
+            raise StorageError(f"s3_get_failed: {key}: {e}") from e
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(path, "wb") as out:
+                sha, n = _copy_hashed(resp["Body"], out)
+        except Exception as e:  # noqa: BLE001
+            raise StorageError(f"s3_get_failed: {key}: {e}") from e
+        want = resp.get("ContentLength")
+        if want is not None and int(want) != n:
+            raise StorageError(f"s3_get_failed: {key}: short read ({n} of {want} bytes)")
+        return {"sha256": sha, "size": n}
 
 
 def open_pool_store(chain_toml: Path | str) -> HippiusPoolStore:
@@ -572,6 +724,7 @@ __all__ = [
     "INDEX_SCHEMA",
     "MANIFEST_SCHEMA",
     "MAX_BUILD_WALL_SECONDS",
+    "MAX_MULTIPART_PARTS",
     "MULTIPART_CHUNK_BYTES",
     "PINS_SCHEMA",
     "TERMINAL_STATUSES",
@@ -584,6 +737,7 @@ __all__ = [
     "fetch_hist",
     "lane_d_embargo_hours",
     "main",
+    "multipart_part_size",
     "open_pool_store",
     "publish_snapshot",
     "retention_plan",
