@@ -98,6 +98,10 @@ LICENCE_FORBIDS = ("no redistribution", "not be redistributed", "not redistribut
                    "non-redistributable", "redistribution prohibited", "redistribution is not",
                    "proprietary", "all rights reserved", "not for redistribution")
 LICENCE_UNKNOWN = ("", "unknown", "n/a", "na", "none", "unspecified", "null", "-")
+# Owner 2026-11-26: non-commercial licences (CC BY-NC*, "non-commercial") stay out of
+# the public mirror: a TAO-emitting subnet may not count as non-commercial use.
+LICENCE_NONCOMMERCIAL = re.compile(r"(?:\bby-nc\b|\bcc[- ]?by[- ]?nc\b|\bnc[- ](?:sa|nd)\b"
+                                   r"|non[- ]?commercial)")
 HF = "https://huggingface.co"
 
 
@@ -214,6 +218,8 @@ def licence_class(lic) -> str:
         return "unknown"
     if any(p in s for p in LICENCE_FORBIDS):
         return "forbids"
+    if LICENCE_NONCOMMERCIAL.search(s):
+        return "noncommercial"
     return "ok"
 
 
@@ -260,8 +266,8 @@ def candidates(listings: dict) -> dict:
             out.append({"name": f, "reason": "non_forecasting", "detail": kw})
             continue
         lc = licence_class(meta.get("license"))
-        if lc == "forbids":
-            out.append({"name": f, "reason": "licence_forbids", "detail": str(meta.get("license"))})
+        if lc in ("forbids", "noncommercial"):
+            out.append({"name": f, "reason": f"licence_{lc}", "detail": str(meta.get("license"))})
             continue
         freq = meta.get("freq")
         keep.append({"name": f, "domain": str(meta.get("domain") or ""),
@@ -894,7 +900,12 @@ def finalize(cands: dict, dc: dict, *, allow_unknown_licence: bool, generated_by
         v = verdict.get(c["name"])
         if v is None or v["verdict"] != "pass":
             continue
-        if c["licence_class"] == "unknown" and not allow_unknown_licence:
+        # Re-derive from the licence text: the policy may be stricter than when the
+        # candidates file was written (owner 2026-11-26: non-commercial is excluded).
+        lc = licence_class(c["licence"])
+        if lc in ("forbids", "noncommercial"):
+            continue
+        if lc == "unknown" and not allow_unknown_licence:
             continue
         folders.append({"name": c["name"],
                         "reason": (f"no name match in the exclusion sources; data compare pass "

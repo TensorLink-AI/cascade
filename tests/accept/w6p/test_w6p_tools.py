@@ -236,6 +236,26 @@ def test_finalize_writes_a_valid_final_list(tmp_path):
     assert a.main(["validate", str(p)]) == 0
 
 
+def test_noncommercial_licences_never_reach_the_public_mirror(tmp_path):
+    """Owner 2026-11-26: CC BY-NC* / "non-commercial" folders are dropped even when
+    their data compare passes, and even when an older candidates file marked them
+    "ok" (finalize re-derives the class from the licence text)."""
+    a = _load(ALLOW, "laned_rmisc_allowlist_accept_nc")
+    idx = importlib.import_module("cascade.eval.lane_d_public_index")
+    for lic in ("CC BY-NC 4.0", "CC-BY-NC-SA 4.0", "cc by-nc-nd", "Non-commercial use only"):
+        assert a.licence_class(lic) == "noncommercial", lic
+    for lic in ("CC BY 4.0", "CC BY-SA 4.0", "Apache-2.0", "MIT", "CC0", "GPL-3.0"):
+        assert a.licence_class(lic) == "ok", lic
+    cands = {"schema": a.CANDIDATES_SCHEMA, "candidates": [
+        {"name": n, "domain": "Energy", "freq": "h", "licence": lic, "licence_class": "ok",
+         "source_url": "", "near": []}
+        for n, lic in (("Open", "CC BY 4.0"), ("NonCom", "CC BY-NC 4.0"))]}
+    dc = {"schema": a.DATACOMPARE_SCHEMA, "params": {}, "folders": [
+        {"name": n, "verdict": "pass", "max_hit_fraction": 0.0} for n in ("Open", "NonCom")]}
+    text = a.finalize(cands, dc, allow_unknown_licence=True, generated_by="t")
+    assert idx.parse_allowed_list(text)["names"] == ["Open"]
+
+
 def test_datacompare_vectorised_scan_equals_the_reference_channels(tmp_path):
     """W-LAUNCH: `file_hits` (Arrow buffers, batch by batch, the --workers /
     --stream path) hits exactly the hashes the reference `iter_channels` +
