@@ -98,6 +98,23 @@ def qualify(cfg, ref, work_root):
     return proof
 
 
+_ROOT_KEYS = ("contract_digest", "generator_policy", "verifier_sha256")
+
+
+def _proof_problem(proof, expected, keys) -> str | None:
+    """Why ``proof`` does not authorize ``expected`` (None: it does)."""
+    if not isinstance(proof, dict):
+        return "proof_malformed"
+    stale = [k for k in keys if proof.get(k) != expected[k]]
+    if stale:
+        return "proof_stale:" + ",".join(stale)
+    report = proof.get("verification") or {}
+    if not (report.get("ok") and report.get("scope") == "full"
+            and not report.get("runtime_skipped") and report.get("corpus_digest")):
+        return "proof_not_full"
+    return None
+
+
 def ready(cfg, ref, work_root):
     root = Path(work_root) / "v2-launch.json"
     check_worker_release(cfg, launched=root.exists())
@@ -112,12 +129,62 @@ def ready(cfg, ref, work_root):
             continue
         # A verified launch root remains valid when the first v2 winner replaces
         # the inherited king. Policy changes require a new qualification.
-        keys = ("contract_digest", "generator_policy", "verifier_sha256") if path == root else tuple(expected)
-        report = proof.get("verification") or {}
-        if (all(proof.get(k) == expected[k] for k in keys) and report.get("ok")
-                and report.get("scope") == "full" and not report.get("runtime_skipped")
-                and report.get("corpus_digest")):
+        keys = _ROOT_KEYS if path == root else tuple(expected)
+        if _proof_problem(proof, expected, keys) is None:
             if path != root:
                 write_text_atomic(root, json.dumps(proof, sort_keys=True))
             return True
     return False
+
+
+def preflight_report(cfg, ref, work_root) -> dict:
+    """Read-only launch check for ``ref`` (``--preflight-v2-baseline-check``):
+    what :func:`ready` would decide, with EVERY blocker named at once, so a
+    fresh (testnet) deployment learns all of them before its first king leg.
+    Fetches nothing, verifies nothing, rents nothing and writes nothing (not
+    even the launch root :func:`ready` writes on success).
+
+    ``{"ref", "ready", "blockers": [code, ...], "proof", "launch_root",
+    "accepted_by", "next"}``. Codes: ``worker_release: <reason>``,
+    ``identity: <reason>`` (bad ref, no v2 contract), ``no_validator_anchor``,
+    ``no_proof``, ``proof_stale:<keys>``, ``proof_not_full``,
+    ``proof_malformed``, ``proof_unreadable``."""
+    work_root = Path(work_root)
+    root = work_root / "v2-launch.json"
+    blockers: list[str] = []
+    try:
+        check_worker_release(cfg, launched=root.exists())
+    except ValueError as exc:
+        blockers.append(f"worker_release: {exc}")
+    try:
+        expected = identity(cfg, ref)
+    except Exception as exc:  # noqa: BLE001 — a bad ref is StorageError; report, never raise
+        expected = None
+        blockers.append(f"identity: {exc}")
+    if not getattr(cfg.manifest, "validator_hotkey", ""):
+        blockers.append("no_validator_anchor")
+    proof_file = proof_path(work_root, ref)
+    accepted_by = None
+    if expected is not None:
+        problems = []
+        for path in (root, proof_file):
+            try:
+                proof = json.loads(path.read_text())
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError) as exc:
+                problems.append(f"proof_unreadable: {path.name} ({type(exc).__name__})")
+                continue
+            problem = _proof_problem(proof, expected, _ROOT_KEYS if path == root else tuple(expected))
+            if problem is None:
+                accepted_by = str(path)
+                break
+            problems.append(problem)
+        if accepted_by is None:
+            blockers.extend(problems or ["no_proof"])
+    ok = not blockers
+    nxt = ("none: the first v2 king leg may rent" if ok else
+           f"cascade-trainer --chain-toml CHAIN_TOML --work-root {work_root} "
+           f"--preflight-v2-baseline {ref}")
+    return {"ref": ref, "ready": ok, "blockers": blockers, "proof": str(proof_file),
+            "launch_root": str(root), "accepted_by": accepted_by, "next": nxt}

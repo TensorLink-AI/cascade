@@ -1,0 +1,31 @@
+# WB22: lane B GPU list (D42; TB23, TB24). README.md has the contract.
+#
+# New module: lane B's GPU catalog from [lane_b] funded_pod_skus, the WB19
+# step-rate gate (an unmeasured type is refused), the trainer rent scope and
+# the audit re-derivation pin (recorded gpu_name AND gpu_n). Stdlib only.
+cascade/funding/lane_b_gpus.py
+# The intake: POST /v1/lane-b/fund checks the GPU choice against lane B's
+# catalog and the step-rate gate; /v1/fund (lane A) keeps [round]'s catalog.
+cascade/funding/intake.py
+# Production wiring: gpu_catalogs(cfg, env=) -> (lane A GpuCatalog, LaneBGpus),
+# FundingIntake(..., lane_b_gpus=...).
+cascade/funding/main.py
+# The rent path reads lane B's SKU list inside the lane B rent scope only.
+cascade/trainer/runner_capacity.py
+# The rented pod's SKU on the leg's thread-local (funded_pod_sku), read by the
+# lane B driver for gpu_n. Lane A behaviour unchanged.
+cascade/trainer/runner_funded_legs.py
+# _dispatch_funded: the rent scope, the dispatch-time rate gate, gpu_n into the
+# finished leg and the expert manifest entry.
+cascade/trainer/lane_b_driver.py
+# ExpertEntry.gpu_n (0 = not recorded; dropped from the canonical body at 0).
+cascade/shared/expert_manifest.py
+# The existing funded lane B dispatch unit test: done() now takes gpu_n=, and
+# the test runs with no step-rate table wired (lane_b_gpus_from_env patched).
+tests/unit/test_lane_b_funded.py
+# The single-target bytes test rebuilds main's body from asdict(); it drops
+# gpu_n (0 = not recorded) the way canonical_body() does.
+tests/unit/test_lane_b_multi_target.py
+# [lane_b] funded_pod_skus: lane B's own list (owner 2026-11-23). Mainnet only;
+# chain.testnet.toml keeps its [round] list.
+chain.toml

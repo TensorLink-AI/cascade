@@ -3,15 +3,15 @@
 MarketCast is lane C's competition (DEC-CA-0064). You write a **fine-tune
 recipe** for a pinned forecasting model, pay for one GPU leg that trains it,
 and win the `mkt:market` slot if your fine-tune forecasts the market better
-than the untouched model on windows that had not happened when it trained.
+than the untouched model on market windows its training never saw.
 
 This page is the step-by-step path. The full rules (recipe schema, every gate,
 every number) are in [MINER.md §14](MINER.md#14-marketcast-lane-c-the-composite-mktmarket-target--dec-ca-0064);
 when they disagree, §14 and the live `chain.toml` win.
 
 > **Status.** The checked-in `chain.toml` arms MarketCast at block
-> **9579600** (`[marketcast]` and `[lane_c] from_block`; about Tue 24 Nov 2026
-> 22:23 UTC). Once validators and the trainer run this release you can commit
+> **9586800** (`[marketcast]` and `[lane_c] from_block`; about Wed 25 Nov 2026
+> 22:28 UTC; owner 2026-11-24 moved it from 9579600). Once validators and the trainer run this release you can commit
 > and fund `mkt:market`, but no leg rents (and nothing is charged) before the
 > first lane-C era starts at that block; queued entries go first. On a
 > release with `from_block = 0` every `mkt:` command is refused
@@ -33,10 +33,11 @@ to daily bars, its quantile forecasts of the coming path are:
   over seven suites (location, volatility, range, highs, lows, liquidity,
   OHLCV) and every asset class. A gain in one place never buys a confident
   loss in another; the guards and the simple baselines enforce that.
-- **Good on a future it has not seen.** You are scored only on windows that
-  open after your leg starts, and your training data ends 30+ days before
-  you submit. What wins is structure that holds across regimes, not a
-  memorised stretch of history.
+- **Good on market it has not seen.** Your training data ends 30+ days
+  before you commit, and you are scored on windows drawn from those
+  embargoed days (plus the short paths' windows after your leg starts),
+  chosen by a block hash that does not exist while you train. What wins is
+  structure that holds across regimes, not a memorised stretch of history.
 
 ### Where the gains are
 
@@ -65,8 +66,9 @@ Directions, not a recipe — the field is open:
 
 - **Not a trading competition.** Nothing scores profit or direction alone;
   getting the width and shape of the distribution right is most of the score.
-- **Not about the eval windows.** They have not happened when you train, and
-  nothing about them leaks in advance.
+- **Not about the eval windows.** No leg reads the embargoed days, which
+  ones are drawn is decided after your leg, and a generator that embeds
+  embargoed prices is refused (`embargo_series_embedded`).
 - **Not about copying.** A near-duplicate of an earlier entry is judged a
   duplicate; seniority is the commitment block.
 - **Not about hardware.** The model is 28M parameters; a bigger GPU buys
@@ -82,8 +84,8 @@ Directions, not a recipe — the field is open:
 | Who pays | You pay the training pod (your provider key). The main validator pays for forecasting and scoring |
 | Leg length | Your `leg_hours` (≤ 12), default `[lane_c] leg_hours` = 1 h |
 | Training data | Public market bars the trainer fetches itself, ending ≥ 30 days before you submit |
-| Judged on | Forward-only windows that open ≥ 1 h after your leg is dispatched (+ embargo-gap windows for `4hx42` / `1dx7`) |
-| Time to a verdict | Up to 6 days (`verdict_wait_blocks` = 43200) for enough windows to close |
+| Judged on | Windows drawn from the 28 days before your leg's dispatch (`embargo_eval_days`; inside the 30-day embargo no leg reads), 48 per asset, series and timeframe, ranked by the registering settlement's block hash; plus the closed `1mx60` / `5mx36` forward windows (DEC-CA-0074) |
+| Time to a verdict | The first settlement after your leg finishes (an inconclusive entry waits ≤ 13 h, `verdict_wait_blocks` = 3900) |
 | To win | Composite gain LCB ≥ 0.01 over the base, no suite / guard / baseline confidently worse, calibration gate, then a **confirmation** on fresh windows and a paired win over the current holder |
 | Reward | Lane C's share (25 % of emissions, taken from lane A), paid to the slot holder by a gain-tiered schedule |
 | Licence | Timestral's [Modified MIT licence](https://huggingface.co/mistralai/Timestral-28M/blob/180698bbf5a50dda3516aa6419798437fb03a430/LICENSE) restricts companies over USD 20M revenue and their derivatives — read it first |
@@ -142,9 +144,11 @@ Bounds are the shipped `[marketcast]` values; the live `chain.toml` wins.
 
 ### What you cannot access
 
-- **The windows you are scored on**, before they happen. Every judged window
-  opens at least an hour after your leg is dispatched (or sits in your
-  embargo gap, which no leg reads).
+- **The bars you are scored on**, in training. Every judged window lies in
+  your embargo (days no leg reads) or opens at least an hour after your leg
+  is dispatched; which embargo windows are drawn is decided by a block hash
+  after your leg. A generator may not embed embargoed prices: the tree is
+  scanned before your leg rents (`embargo_series_embedded`).
 - **Anything after your leg's dispatch time.** The pod never receives a bar
   at or after it, and never anything after `data.end` + 1 day.
 - **Your own dataset.** There is no upload of private training data; a
@@ -182,10 +186,10 @@ MarketCast leg per **coldkey** (`max_open_legs_per_coldkey` = 1).
 ### 1. Test locally (no chain, no rental)
 
 ```bash
-cascade lane-c fetch-base --json                                   # pinned Timestral, digest-checked
+cascade lane-c fetch-base --out ./timestral --json                 # pinned Timestral, digest-checked
 cascade lane-c snapshot ./my-mkt --out train-snap                  # your recipe's training range
 cascade lane-c snapshot ./my-mkt --out eval-snap --evaluation --days 7   # recent held-out data
-cascade lane-c test ./my-mkt --target mkt:market \
+cascade lane-c test ./my-mkt --target mkt:market --base-dir ./timestral \
     --train-snapshot train-snap --eval-snapshot eval-snap --device cuda --json
 ```
 
@@ -201,8 +205,8 @@ The full schema with every key is in
 [§14 — What you submit](MINER.md#what-you-submit). The decisions that matter most:
 
 - **`data.end`** must be ≥ 30 days before your submission (`embargo_days`).
-  The days in between are the embargo gap: no leg reads them, and the
-  `4hx42` / `1dx7` windows are cut from them.
+  The days in between are the embargo: no leg reads them, and your eval
+  windows are drawn from them.
 - **`horizon_mix`** — horizons are `<bar>x<steps>`: `1mx60`, `5mx36`,
   `15mx96`, `1hx48`, `4hx42`, `1dx7`. Every suite is scored on every
   horizon, so a recipe that only trains short horizons still gets judged on
@@ -279,20 +283,25 @@ cascade lane-c status https://<intake> --hotkey YOUR_SS58 --json   # the public 
 3. **Settlement.** The next boundary publishes a signed lane-C manifest
    naming your trained checkpoint.
 4. **Scoring.** The main validator forecasts the base and your fine-tune on
-   every eligible forward window of a signed market snapshot and publishes
+   the windows drawn for your entry from a signed market snapshot and publishes
    the per-window losses and the forecasts at `marketcast/round-<id>.json`.
    Anyone can recompute them with `cascade-audit marketcast --reproduce`.
 5. **Judgement.** Every validator derives the same verdict from those rows.
    Not enough windows yet (≥ 200 over ≥ 8 clusters and ≥ 8 six-hour blocks)
-   ⇒ you **wait**, re-judged every settlement for up to 6 days.
+   ⇒ you **wait**, re-judged every settlement for up to 13 h. Normally the
+   verdict comes at the first settlement after your leg.
 6. **Pending.** An initial pass is `pending` — no payment yet.
-7. **Confirmed.** A later settlement must pass you again on windows that
-   started after the first snapshot ended, and you must beat the current
+7. **Confirmed.** A later settlement must pass you again on the other half of
+   the embargo windows (never the ones the initial test scored, plus any
+   forward windows after the first snapshot ended), and you must beat the current
    holder on *your* windows (paired `vs_holder` gain). Then you take the slot.
-8. **Payout.** 100 % of the slot for a gain-tiered period (`full_pay_tiers`:
-   LCB ≥ 0.05 → 10 eras, ≥ 0.02 → 5, ≥ 0.01 → 2), then halving every era to
-   a 10 % floor, stopping 28 eras (14 days) after the win. Unpaid decay and
-   empty slots burn.
+8. **Payout** (DEC-CA-0073). 100 % of the slot for `5 + 15 × clamp((LCB −
+   0.01) / 0.04, 0, 1)` days (`[lane_c] full_pay_min_days` /
+   `full_pay_max_days` / `full_pay_max_gain`, ramped from `[marketcast]
+   gain_margin`), rounded up to whole eras: 10 to 40 twelve-hour eras. Then
+   the slot ends and burns unless a newer win has replaced it. There is no
+   decay tail and no TTL. The win records its `full_eras`; `tier` is the
+   clamped gain the duration came from. Empty slots burn.
 
 ## Reading your verdict
 
@@ -314,7 +323,7 @@ carries:
 
 | You see | Meaning | What to do |
 |---|---|---|
-| waiting / `inconclusive` | Too few closed windows yet | Nothing; re-judged every settlement for up to 6 days |
+| waiting / `inconclusive` | Too few windows | Nothing; re-judged every settlement for up to 13 h |
 | `infra` | The main validator could not compute your entry | Nothing; retried without using your wait, up to 8 times, then requeued uncharged |
 | `verdict`, not passed | Your fine-tune did not prove better, or was confidently worse somewhere | Read `mkt.suites`; re-commit a new recipe |
 | `fault` | NaN forecasts, or your model's forward fails identically every time | Fix the recipe; this is your fault |
@@ -363,8 +372,10 @@ never displaces a MarketCast holder.
 bars itself. A generator (`synthetic_fraction` > 0) is the only way to add
 your own series, with their own covariates if you set `synthetic_channels`.
 
-**Can I see the windows I am scored on?** Not before they happen — that is
-the point. After scoring, the signed report and the forecasts are public.
+**Can I see the windows I am scored on?** The embargoed bars are public
+market data, but which windows are drawn is fixed by a block hash after your
+leg, and no leg trains on them. After scoring, the signed report (with the
+draw) and the forecasts are public.
 
 **Where are the rules for X?** [MINER.md §14](MINER.md#14-marketcast-lane-c-the-composite-mktmarket-target--dec-ca-0064)
 and the `[marketcast]` / `[lane_c]` tables of the live `chain.toml`.

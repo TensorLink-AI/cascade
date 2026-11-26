@@ -29,6 +29,15 @@ Before its first write the probe reads the bucket's Object Lock configuration
 once and refuses (exit 2, ``bucket_default_retention``) a bucket with a
 default retention rule, which would lock every object the run writes.
 
+``--no-object-lock`` (owner 2026-11-23: Hippius has no Object Lock and
+answers 403 to GetObjectLockConfiguration): the owner asserts the bucket has
+no Object Lock. The probe then never reads the lock configuration, never
+sends a lock header or a retention, records the two lock probes as
+``skipped`` (``no_object_lock``) and, after cleanup, leaves one small
+unlocked anchor object (``anchor_objects``) that ``verify`` re-reads in place
+of the locked ones. ``upload_part_copy_2_5gb`` runs as before (its copy was
+never locked).
+
 Credentials are read from the environment by name only
 (``HIPPIUS_S3_ACCESS_KEY`` / ``HIPPIUS_S3_SECRET_KEY`` and the read-write
 sub-token ``HIPPIUS_PROBE_SUBTOKEN_ACCESS_KEY`` /
@@ -128,6 +137,30 @@ LOCK_UNREADABLE_CODE = "bucket_lock_unreadable"
 LOCK_NOT_FOUND_CODES = ("ObjectLockConfigurationNotFoundError",)
 VERIFY_SCHEMA = "laned_w3a_verify/1"
 
+# --no-object-lock (owner 2026-11-23: Hippius has no Object Lock). The owner
+# asserts the bucket has none: no lock read, no lock header, no retention; the
+# two lock probes are skipped and one small unlocked anchor object is left for
+# `verify` to re-read in place of the locked ones.
+LOCK_PROBES = ("object_lock_multipart", "compliance_retention_unshortenable")
+SKIP_RESULT = "skipped"
+SKIP_REASON = "no_object_lock"
+OWNER_FLAG = "owner_flag"
+ANCHOR_NAME = "anchor.bin"
+ANCHOR_BINDING = "unlocked_anchor"
+
+# The no-lock L4 gate (tests/accept/w3a/README.md "The L4 gate on
+# --no-object-lock evidence"): the probes each upload path depends on
+# (decisions/STORAGE-LANE-D.md "Path ids") plus the ~2.5 GB UploadPartCopy,
+# which every path needs for the server-side king copy at crowning (W6d).
+KING_COPY_PROBE = "upload_part_copy_2_5gb"
+PATH_PROBES = {"presigned_multipart": ("presigned_upload_part", KING_COPY_PROBE),
+               "single_presigned_put": ("single_put_limit", KING_COPY_PROBE),
+               "upload_relay": (KING_COPY_PROBE,)}
+
+# The untracked output of the probe (--out) and of `verify` lives here; an
+# untracked file under it does not make the checkout dirty (tool_info).
+EVIDENCE_DIR = "evidence/"
+
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -184,9 +217,20 @@ def tool_info() -> dict:
                               check=False)
 
     head = git("rev-parse", "HEAD")
-    status = git("status", "--porcelain")
+    # every untracked file listed on its own line, so one under evidence/ (the
+    # probe's --out, verify's rewritten file) can be told apart from the rest
+    status = git("status", "--porcelain", "--untracked-files=all")
     sha = head.stdout.strip() if head.returncode == 0 else ""
-    dirty = status.returncode != 0 or bool(status.stdout.strip())
+
+    def counts(line: str) -> bool:
+        if not line.strip():
+            return False
+        if line.startswith("?? "):
+            path = line[3:].strip().strip('"')
+            return not path.startswith(EVIDENCE_DIR)
+        return True  # any tracked change: modified, staged, deleted, renamed
+
+    dirty = status.returncode != 0 or any(counts(ln) for ln in status.stdout.splitlines())
     return {"module": MODULE, "git_sha": sha, "git_dirty": dirty}
 
 
@@ -1211,6 +1255,37 @@ REASONS = {"pass": "the capability behaves as lane D needs",
            "error": "no conclusive result: see the observations"}
 
 
+def skipped_probe(name: str) -> dict:
+    """A lock probe of a ``--no-object-lock`` run: nothing is done."""
+    return {"name": name, "result": SKIP_RESULT, "passed": False, "reason": SKIP_REASON,
+            "requests": [], "objects": [], "observations": {}}
+
+
+def write_anchor(run: Run) -> list[dict]:
+    """After cleanup in a ``--no-object-lock`` run: PUT one small unlocked
+    object under the run root (main key, no lock header) and HEAD it. Its
+    record is what ``verify`` re-reads; ``[]`` if it could not be written."""
+    b, key = run.backend, f"{run.root}{ANCHOR_NAME}"
+    payload = Payload(LOCKED_OBJECT_BYTES, f"{run.run_id}:anchor")
+    try:
+        p = b.put_object(key, payload)
+        if not p.ok:
+            print(f"storage_probe: the anchor PUT answered {p.status} ({p.error_code})",
+                  file=sys.stderr)
+            return []
+        h = b.head_object(key)
+        if not h.ok or not h.data.get("etag"):
+            print(f"storage_probe: the anchor HEAD answered {h.status} ({h.error_code})",
+                  file=sys.stderr)
+            return []
+    except Exception as e:  # noqa: BLE001 — reported; the run is then incomplete
+        print(f"storage_probe: anchor write failed: {scrub(f'{type(e).__name__}: {e}')}",
+              file=sys.stderr)
+        return []
+    return [{"key": key, "version_id": h.data.get("version_id") or p.data.get("version_id"),
+             "size": payload.size, "etag": h.data.get("etag"), "sha256": payload.sha256()}]
+
+
 def run_probe(run: Run, name: str) -> dict:
     rec = Rec(name)
     try:
@@ -1257,6 +1332,15 @@ def would_do(args, params: dict) -> dict:
     root = f"{args.prefix}<run_id>/"
     big, part = params["big_object_bytes"], params["part_bytes"]
     ret = params["lock_retention_seconds"]
+    plan = _full_plan(args, root, big, part, ret, params)
+    if getattr(args, "no_object_lock", False):
+        for name in LOCK_PROBES:
+            plan[name] = [f"skipped ({SKIP_REASON}): --no-object-lock, the owner asserts the "
+                          "bucket has no lock support; no lock read and no lock header"]
+    return plan
+
+
+def _full_plan(args, root: str, big: int, part: int, ret: int, params: dict) -> dict:
     return {
         "presigned_upload_part": [
             f"CreateMultipartUpload {root}presigned-mpu.bin (main key)",
@@ -1403,6 +1487,130 @@ def _list_run_root(client, bucket: str, root: str) -> tuple[list[tuple[str, str 
     return pairs, rid
 
 
+def _read_anchor(client, bucket: str, a: dict) -> dict:
+    """HEAD and a streamed GET of one anchor (``VersionId`` only when the
+    evidence has one); any error or exception is ``anchor_object_missing``."""
+    kw = {"Bucket": bucket, "Key": a.get("key")}
+    if a.get("version_id") is not None:
+        kw["VersionId"] = a["version_id"]
+    try:
+        head = client.head_object(**kw)
+        got = client.get_object(**kw)
+        h, size, body = hashlib.sha256(), 0, got["Body"]
+        while True:
+            chunk = body.read(CHUNK)
+            if not chunk:
+                break
+            h.update(chunk)
+            size += len(chunk)
+    except Exception as e:  # noqa: BLE001 — any failed read means the bucket does not vouch
+        resp = _error_response(e)
+        what = ((resp.get("Error") or {}).get("Code") if resp is not None
+                else type(e).__name__)
+        raise VerifyRefused("anchor_object_missing", f"cannot read anchor {a.get('key')!r} in "
+                            f"bucket {bucket!r} ({what})") from None
+    return {"head": head, "sha256": h.hexdigest(), "body_size": size,
+            "request_ids": [_rid_from_meta(r.get("ResponseMetadata")) for r in (head, got)]}
+
+
+def _check_anchor(a: dict, got: dict) -> dict:
+    head, key = got["head"], a.get("key")
+    problems = []
+    if a.get("version_id") is not None and head.get("VersionId") is not None \
+            and head["VersionId"] != a["version_id"]:
+        problems.append(f"HEAD VersionId {head['VersionId']!r}")
+    if head.get("ETag") != a.get("etag"):
+        problems.append(f"HEAD ETag {head.get('ETag')!r} != {a.get('etag')!r}")
+    if head.get("ContentLength") != a.get("size") or got["body_size"] != a.get("size"):
+        problems.append(f"size {head.get('ContentLength')!r}/{got['body_size']} != "
+                        f"{a.get('size')!r}")
+    if got["sha256"] != a.get("sha256"):
+        problems.append("sha256 of the GET body differs from the evidence")
+    if not all(got["request_ids"]):
+        problems.append("a read answered without a request id")
+    if problems:
+        raise VerifyRefused("anchor_object_mismatch", f"anchor {key!r}: " + "; ".join(problems))
+    return {"key": key, "version_id": a.get("version_id"), "mode": None, "retain_until": None,
+            "size": got["body_size"], "etag": head.get("ETag"), "sha256": got["sha256"],
+            "request_ids": got["request_ids"]}
+
+
+def _list_run_root_any(client, bucket: str, root: str) -> tuple[list[tuple[str, str | None]], str]:
+    """Like :func:`_list_run_root`, falling back to a plain ``list_objects_v2``
+    listing (version id ``None``) when version listing fails."""
+    try:
+        return _list_run_root(client, bucket, root)
+    except VerifyRefused:
+        pass
+    pairs: list[tuple[str, str | None]] = []
+    rid = None
+    try:
+        for page in client.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=root):
+            rid = rid or _rid_from_meta(page.get("ResponseMetadata"))
+            pairs += [(o.get("Key"), None) for o in page.get("Contents") or []]
+    except Exception as e:  # noqa: BLE001 — no listing: cleanup can't be confirmed
+        raise VerifyRefused("run_root_not_clean", f"cannot list {root!r} "
+                            f"({type(e).__name__}): cleanup can't be confirmed") from None
+    if not rid:
+        raise VerifyRefused("run_root_not_clean", f"the listing of {root!r} carried no request id")
+    return pairs, rid
+
+
+def _verify_anchors(evidence: dict, client, now: datetime | None) -> dict:
+    """``verify_live`` for ``--no-object-lock`` evidence: re-read the unlocked
+    anchor object(s) and list the run root (no lock, so no expiry)."""
+    anchors = evidence.get("anchor_objects")
+    if not isinstance(anchors, list) or not anchors:
+        raise VerifyRefused("no_anchor_objects", "the --no-object-lock evidence has no anchor "
+                            "object, so nothing in the bucket vouches for the run")
+    if not all(isinstance(a, dict) for a in anchors):
+        raise VerifyRefused("anchor_object_mismatch", "anchor_objects entries must be objects")
+    at = _now() if now is None else _as_utc(now, "now").replace(microsecond=0)
+    bucket = evidence.get("bucket")
+    objects = [_check_anchor(a, _read_anchor(client, bucket, a)) for a in anchors]
+    root = f"{evidence.get('prefix')}{evidence.get('run_id')}/"
+    pairs, list_rid = _list_run_root_any(client, bucket, root)
+    want = {a.get("key"): a.get("version_id") for a in anchors}
+    keys = sorted({k for k, _ in pairs})
+    extra = sorted({f"{k} ({v})" for k, v in pairs
+                    if k not in want or (v is not None and want[k] is not None and v != want[k])})
+    if extra or set(keys) != set(want):
+        raise VerifyRefused("run_root_not_clean", f"the run root {root!r} holds versions that "
+                            f"are not the anchor objects: {extra or keys}")
+    return {"schema": VERIFY_SCHEMA, "verified": True, "binding": ANCHOR_BINDING,
+            "body_sha256": hashlib.sha256(canonical_body(evidence)).hexdigest(),
+            "verified_at": _iso(at), "tool": tool_info(),
+            "endpoint_host": evidence.get("endpoint_host"), "bucket": bucket,
+            "run_id": evidence.get("run_id"), "objects": objects,
+            "listing": {"prefix": root, "keys": keys, "request_id": list_rid},
+            "path_verdict": path_verdict(evidence)}
+
+
+def path_verdict(evidence: dict) -> dict:
+    """The top-level verdict of a ``--no-object-lock`` run, recomputed from
+    the evidence body (never from its recorded ``recommended_path`` or
+    ``passed``): ``{"path", "required", "passed"}``. ``path`` is the
+    recommended path of the recorded results, ``required`` the probes it
+    depends on (:data:`PATH_PROBES`); ``passed`` is true iff the evidence is
+    the owner-flag record with both lock probes ``skipped``, every required
+    probe ``pass``, no unlocked leftover, a non-empty ``anchor_objects`` and
+    ``source == "live"``. The other probes' results do not enter it."""
+    rows = [p for p in evidence.get("probes") or [] if isinstance(p, dict)]
+    res = {p.get("name"): p.get("result") for p in rows}
+    path = recommended_path(res)
+    required = list(PATH_PROBES[path])
+    bl = evidence.get("bucket_lock")
+    cleanup = evidence.get("cleanup") if isinstance(evidence.get("cleanup"), dict) else {}
+    passed = (isinstance(bl, dict) and "asserted_by" in bl
+              and evidence.get("source") == "live"
+              and len(rows) == len(PROBES) and set(res) == set(PROBES)
+              and all(res.get(n) == SKIP_RESULT for n in LOCK_PROBES)
+              and all(res.get(n) == "pass" for n in required)
+              and cleanup.get("remaining_unlocked") == []
+              and bool(evidence.get("anchor_objects")))
+    return {"path": path, "required": required, "passed": bool(passed)}
+
+
 def verify_live(evidence: dict, client, *, now: datetime | None = None) -> dict:
     """Re-read every COMPLIANCE-locked object of ``evidence`` from its bucket
     through the boto3-shaped ``client`` (read-only: HEAD, GetObjectRetention,
@@ -1413,6 +1621,9 @@ def verify_live(evidence: dict, client, *, now: datetime | None = None) -> dict:
         got = evidence.get("source") if isinstance(evidence, dict) else None
         raise VerifyRefused("not_live", f"evidence source is {got!r}, not 'live': only a live "
                             "run's evidence can be verified")
+    bl = evidence.get("bucket_lock")
+    if isinstance(bl, dict) and "asserted_by" in bl:
+        return _verify_anchors(evidence, client, now)
     locked = evidence.get("locked_objects")
     if not isinstance(locked, list) or not locked:
         raise VerifyRefused("no_locked_objects", "the evidence has no COMPLIANCE-locked "
@@ -1538,6 +1749,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     ap.add_argument("--confirm-live", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--fixture")
+    ap.add_argument("--no-object-lock", action="store_true",
+                    help="the owner asserts the bucket has no Object Lock (Hippius): no lock "
+                         "read, header or retention; the two lock probes are skipped")
     return ap.parse_args(argv)
 
 
@@ -1647,8 +1861,12 @@ def main(argv: list[str] | None = None) -> int:
         if backend.count_prefix(args.prefix) != 0:
             raise UsageError(f"--prefix {args.prefix!r} already holds objects: the probe needs "
                              "an empty throwaway prefix")
-        # RV4: before the first write, refuse a bucket with a default retention rule.
-        bucket_lock = bucket_lock_preflight(backend.lock_client(), args.bucket)
+        if args.no_object_lock:
+            # The owner's assertion: no lock configuration exists, so none is read.
+            bucket_lock = {"lock_enabled": False, "asserted_by": OWNER_FLAG}
+        else:
+            # RV4: before the first write, refuse a bucket with a default retention rule.
+            bucket_lock = bucket_lock_preflight(backend.lock_client(), args.bucket)
     except UsageError as e:
         print(f"storage_probe: {e}", file=sys.stderr)
         print(json.dumps(summary, indent=2))  # the refused run: nothing ran, nothing written
@@ -1662,6 +1880,10 @@ def main(argv: list[str] | None = None) -> int:
     started = _now()
     rows = {}
     for name in RUN_ORDER:
+        if args.no_object_lock and name in LOCK_PROBES:
+            print(f"storage_probe: skipping {name} ({SKIP_REASON})", file=sys.stderr, flush=True)
+            rows[name] = skipped_probe(name)
+            continue
         print(f"storage_probe: running {name}", file=sys.stderr, flush=True)
         rows[name] = run_probe(run, name)
     try:
@@ -1672,11 +1894,19 @@ def main(argv: list[str] | None = None) -> int:
         clean = {"deleted_versions": 0, "aborted_uploads": 0,
                  "remaining_unlocked": [f"{run.root}(cleanup failed: list the prefix)"],
                  "remaining_locked": []}
+    anchors = write_anchor(run) if args.no_object_lock else None
     finished = _now()
     probes = [rows[n] for n in PROBES]
     results = {p["name"]: p["result"] for p in probes}
-    complete = (all(r in ("pass", "fail") for r in results.values())
-                and clean["remaining_unlocked"] == [] and not run.policy_left)
+
+    def recorded(name: str, result: str) -> bool:
+        if args.no_object_lock and name in LOCK_PROBES:
+            return result == SKIP_RESULT
+        return result in ("pass", "fail")
+
+    complete = (all(recorded(n, r) for n, r in results.items())
+                and clean["remaining_unlocked"] == [] and not run.policy_left
+                and (anchors is None or bool(anchors)))
     source = "fixture" if model is not None else "live"
     evidence = {"schema": SCHEMA, "wp": WP, "source": source,
                 "endpoint_host": summary["endpoint_host"], "region": region,
@@ -1687,6 +1917,9 @@ def main(argv: list[str] | None = None) -> int:
                 "locked_objects": run.locked, "cleanup": clean,
                 "recommended_path": recommended_path(results),
                 "passed": complete and source == "live"}
+    if anchors is not None:
+        evidence["anchor_objects"] = anchors
+        summary["anchor_objects"] = anchors
     if args.out:
         out = Path(args.out)
         out.parent.mkdir(parents=True, exist_ok=True)

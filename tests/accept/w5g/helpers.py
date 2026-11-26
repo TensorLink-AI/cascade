@@ -61,6 +61,13 @@ GATE_SUITES = ("gift", "boom", "time", "fev")
 BENCH_ITEMS = 40
 
 
+# rev6.18 F4 (A3): these fixtures pin the live-only rule: the public half off
+# (public_weight = 0, a spec setting) and no per-window ratio clamp in effect
+# (a floor far below any fixture ratio), so their pre-F4 numbers stand. F4's
+# own tests (tests/accept/w5e/test_w5e_combined.py) pin the combined rule.
+LIVE_ONLY = {"public_weight": 0.0, "window_ratio_floor": 1e-9}
+
+
 def lane_d_cfg(**over):
     """The real W2 parse of an armed `[lane_d]` table with `over` applied
     (floors lowered to 24 windows / 4 sources)."""
@@ -70,7 +77,7 @@ def lane_d_cfg(**over):
            "remainder": "burn", "contexts": [4096, 8192, 16384], "horizon": HORIZON,
            "forward_margin_hours": MARGIN_H, "max_mirror_lag_hours": 6.0,
            "min_windows": 24, "min_clusters": 4, "bootstrap_B": 200}
-    return parse_lane_d({**raw, **over}, era_blocks_at=lambda _block: ERA)
+    return parse_lane_d({**raw, **LIVE_ONLY, **over}, era_blocks_at=lambda _block: ERA)
 
 
 # ── pool_d fixtures ─────────────────────────────────────────────────────────
@@ -116,7 +123,7 @@ def target_values(series_id: str, start: int) -> tuple[np.ndarray, np.ndarray]:
 
 def write_pool(directory: Path, records: list[dict], snapshot_name: str) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
-    feeds = {r["feed"]: {"mirror_lag_hours": FEED_LAG_HOURS, "forecast_product": False}
+    feeds = {r["feed"]: {"mirror_lag_hours": FEED_LAG_HOURS, "forecast_product": False, "embargo_hours": 0.0}
              for r in records}
     meta = {"schema": "pool_d/1", "snapshot": snapshot_name, "horizon": HORIZON,
             "feeds": dict(sorted(feeds.items())), "series": records}
@@ -235,13 +242,33 @@ def report_digest(report) -> str:
 # ── settlement calls ────────────────────────────────────────────────────────
 
 
+_FIXTURE_CLOCK = object()
+
+
+def fixture_boundary_ts(b) -> int:
+    """rev6.14 (a): the fixture's on-chain timestamp of boundary block `b`,
+    far after every fixture T + eval_delay_hours (12 s per block)."""
+    return 2_000_000_000 + 12 * int(b)
+
+
 def settle(cfg, b, pool_dir, entries, house_rec, fc, uid_of, state_path, *,
-           hash_=None, bench=None, prior=()):
+           hash_=None, bench=None, prior=(), armed=None, boundary_ts=_FIXTURE_CLOCK):
     """`settle_lane_d` with the W5e gate inputs (`bench=None` or
-    `hash_=None` = the gate cannot run: fail closed, `bench_hold`)."""
+    `hash_=None` = the gate cannot run: fail closed, `bench_hold`).
+    ``armed`` (rev6.6) is the W5d armed record, passed only when given.
+    ``boundary_ts`` (rev6.14 (a)): the fixture clock unless given; ``None``
+    is the legacy call (fail closed, ``boundary_ts_missing``)."""
     from cascade.validator.lane_d import settle_lane_d
 
     kw = {"prior_pool_dirs": [Path(p) for p in prior]} if prior else {}
+    if armed is not None:
+        kw["armed"] = armed
+    if boundary_ts is _FIXTURE_CLOCK:
+        boundary_ts = fixture_boundary_ts(b)
+    import inspect
+
+    if "boundary_ts" in inspect.signature(settle_lane_d).parameters:
+        kw["boundary_ts"] = boundary_ts
     return settle_lane_d(cfg=cfg, boundary=b, pool_dir=pool_dir,
                          entries=[dict(e) for e in entries], house=dict(house_rec),
                          forecasts=fc, uid_of=dict(uid_of), state_path=state_path,
@@ -345,10 +372,12 @@ def gate_inputs(mode: str, x: str, h: str, tag: str):
 
 
 class Flow:
-    """Challenger X against the genesis house H0. Boundary 1: X first-clears
-    on snapshot 1. Boundary 2: X clears its confirmation on snapshot 2 and is
-    gated with `mode2`. Later boundaries re-use snapshot 2 (no fresh window,
-    so a held X can only be re-gated) unless a fresh snapshot is asked for."""
+    """Challenger X against the genesis house H0. Boundary 1 lists no entry
+    (nothing is judged). Boundary 2: X enters and clears at its first verdict
+    on snapshot 2 and is gated with `mode2` (plan rev6.11 (b): a first clear
+    is the crowning candidate; no confirmation duel). Later boundaries re-use
+    snapshot 2 (no fresh window, so a held X can only be re-gated) unless a
+    fresh snapshot is asked for."""
 
     def __init__(self, tmp_path: Path, *, mode2: str, cfg=None, extra=(), x_quality="sharp"):
         self.tmp = Path(tmp_path)
@@ -367,14 +396,12 @@ class Flow:
         self.reports: dict[int, dict] = {}
         self.hosts: dict[int, object] = {}
         self.n = 0
-        self.settle_at(1, "pass", snap=1)
-        v = verdict_of(self.reports[1], self.x["digest"])
-        assert v is not None and v["outcome"] == "confirm_pending", \
-            f"fixture: X did not first-clear at boundary 1: {v}"
+        self.settle_at(1, "pass", snap=1, entries=[])
+        assert self.reports[1]["judged"] == [], "fixture: boundary 1 lists no entry"
         self.settle_at(2, mode2, snap=2)
         v = verdict_of(self.reports[2], self.x["digest"])
-        assert v is not None and v["stage"] == "confirm" and v["cleared"] is True, \
-            f"fixture: X did not clear its confirmation at boundary 2: {v}"
+        assert v is not None and v["stage"] == "first" and v["cleared"] is True, \
+            f"fixture: X did not clear at its first verdict at boundary 2: {v}"
 
     def pool(self, snap: int):
         if snap not in self.pools:
@@ -384,7 +411,8 @@ class Flow:
     def settle_at(self, n: int, mode: str, *, snap: int = 2, entries=None):
         pool_dir, recs = self.pool(snap)
         hash_, bench, host = gate_inputs(mode, self.x["digest"], self.h0["digest"], f"b{n}")
-        out = settle(self.cfg, boundary(n), pool_dir, entries or self.entries, self.h0,
+        listed = self.entries if entries is None else entries
+        out = settle(self.cfg, boundary(n), pool_dir, listed, self.h0,
                      forecasts(recs, self.models), self.uid_of, self.path,
                      hash_=hash_, bench=bench)
         self.reports[n] = out.report

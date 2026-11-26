@@ -14,9 +14,10 @@ satellite re-asserts the last verified vector for `stale_after_blocks`
 `lane_d: {status: "absent"}` receipt state with a lane-D-only burn, reusing
 MarketCast's `REPORT_ABSENT` / `INFRA_DEFERRED`."
 
-The settlement chain is W7c's (`tests/accept/w7c/helpers.py`): boundary(1)
-is X's first clear, boundary(2) confirms and crowns X, boundary(3) judges
-nothing. No PATHS module is imported at module level: every `cascade.*`
+The settlement chain is W7c's own 48-window `W7cChain`
+(`tests/accept/w7c/helpers.py`): boundary(1) waits on the floors,
+boundary(2) is X's first verdict, which crowns it (plan rev6.11 (b): no
+confirmation duel), boundary(3) judges nothing. No PATHS module is imported at module level: every `cascade.*`
 import is inside a function a test body calls (the W0c expect-fail
 convention). README.md states the contract.
 """
@@ -46,7 +47,10 @@ canonical = w7c.canonical
 sha = w7c.sha
 state_sha = w7c.state_sha
 read_bytes = w7c.read_bytes
-Chain = w7c.Chain
+# rev6.11 (b): a crown is decided at the first verdict, so the chain is W7c's own
+# 48-window one (boundary 1 waits on the floors, boundary 2 is X's first,
+# crowning, verdict, boundary 3 judges nothing).
+Chain = w7c.W7cChain
 
 
 def has_param(fn, name: str) -> bool:
@@ -73,7 +77,7 @@ def settle_b4(chain: Chain, state_path: Path):
     if w7c.settle_takes_gate_inputs():
         kw.update(boundary_block_hash=w7c.block_hash("b4"), sentinel=None,
                   bench=SweepSession("w14-sess-b4", chain.passing_host()))
-    return settle_lane_d(cfg=lane_d_cfg(), boundary=boundary(4), pool_dir=chain.pools[2],
+    return settle_lane_d(**_rev614_ts(settle_lane_d, boundary(4)), cfg=lane_d_cfg(), boundary=boundary(4), pool_dir=chain.pools[2],
                          entries=[dict(chain.x)], house=dict(chain.house),
                          forecasts=chain.forecasts, uid_of=dict(chain.uid_of),
                          state_path=state_path, signer=chain.signer,
@@ -99,3 +103,14 @@ def receipt_error_code(excinfo) -> str:
 
 def json_bytes(obj) -> bytes:
     return json.dumps(obj, sort_keys=True).encode()
+
+
+def _rev614_ts(settle, boundary) -> dict:
+    """rev6.14 (a): the fixture's on-chain boundary timestamp (far after every
+    fixture T + eval_delay_hours, 12 s per block), passed only where
+    ``settle_lane_d`` takes it."""
+    import inspect
+
+    if "boundary_ts" not in inspect.signature(settle).parameters:
+        return {}
+    return {"boundary_ts": 2_000_000_000 + 12 * int(boundary)}

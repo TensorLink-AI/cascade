@@ -39,7 +39,7 @@ HOUSE_T = w7a.HOUSE_T
 
 N_UIDS = 8
 LANE_A_UID = 1                  # lane A's king (the receipt's reward uid)
-CHALLENGER_UID = w7a.CHALLENGER_UID   # X's uid: KING_D once crowned at BOUNDARY_2
+CHALLENGER_UID = w7a.CHALLENGER_UID   # X's uid: KING_D once crowned at BOUNDARY_1 (rev6.11)
 UID_B, UID_C = 7, 5
 
 # The W9 typed refusals of `derive_weights` (README "derive_weights").
@@ -55,9 +55,13 @@ FORBIDDEN_PACKAGES = ("cascade.validator.lane_d", "cascade.lane_d", "cascade.lan
 FORBIDDEN_STEMS = ("cascade.validator.lane_d_", "cascade.eval.lane_d_", "cascade.lane_d_")
 # What `cascade/audit/lane_d.py` itself may import (besides the stdlib and
 # numpy): the generic statistic, the sr25519 verifier, the parsed [lane_d]
-# config type and the audit's own result helpers.
+# config type and the audit's own result helpers. rev6.18 B2: plus the
+# audit's own chain rules (`cascade.audit.lane_d_chain`, the former W7d
+# satellite replay, moved into the audit; its own imports are pinned by
+# tests/accept/w7d/test_w7d_import_graph.py).
 LANE_D_AUDIT_ALLOWED = ("cascade.eval.bootstrap", "cascade.shared.sr25519",
-                        "cascade.shared.config.lane_d", "cascade.audit.checks")
+                        "cascade.shared.config.lane_d", "cascade.audit.checks",
+                        "cascade.audit.lane_d_chain")
 
 
 def forbidden(name: str) -> bool:
@@ -137,12 +141,48 @@ def set_reason(report: dict, digest: str, reason: str) -> None:
 _CACHE: dict[str, dict] = {}
 
 
+EMBARGO_HOURS = 48.0        # [lane_d] embargo_hours (rev6.10 (a), rev6.12 (a))
+
+
+def pin_embargo(chain: dict, e: float = EMBARGO_HOURS) -> dict:
+    """W7a's snapshots with every listed feed's effective embargo pinned in
+    `feeds[feed].embargo_hours` (W6b; a listed feed without it fails closed).
+    Rewrites `metadata.json` in place; the snapshot digest follows."""
+    for pool in chain["pools"].values():
+        meta = json.loads((Path(pool) / "metadata.json").read_text())
+        for f in (meta.get("feeds") or {}).values():
+            f["embargo_hours"] = float(e)
+        (Path(pool) / "metadata.json").write_text(json.dumps(meta, sort_keys=True))
+    return chain
+
+
+def _settle_chain(tmp: Path) -> dict:
+    """W9's own copy of W7a's single-challenger chain, from W7a's building
+    blocks (so a change to W7a's `two_settlements` never reshapes W9's
+    fixture): BOUNDARY_1 on snapshot 1, BOUNDARY_2 on snapshot 2."""
+    chain = pin_embargo(w7a.build_chain(tmp / "chain"))
+    e = w7a.entry(chain["digests"][0], "challenger", coldkey=w7a.coldkey())
+    uid_of = {e["hotkey"]: CHALLENGER_UID}
+    cfg = w7a.lane_d_cfg()
+    state = tmp / "state" / "lane_d_state.json"
+    state.parent.mkdir(parents=True, exist_ok=True)
+    run = {"chain": chain, "entry": e, "uid_of": uid_of, "cfg": cfg, "state": state}
+    for name, b, snap in (("s1", BOUNDARY_1, 1), ("s2", BOUNDARY_2, 2)):
+        run[name] = w7a.settle(chain, cfg, state, signer(), boundary=b, snap=snap,
+                               entries=[e], uid_of=uid_of)
+    return run
+
+
 def crown_chain(tmp: Path) -> dict:
-    """W7a's `two_settlements` (b1 first clear, b2 confirm + gate + crown),
-    then BOUNDARY_3 settled twice from copies of the b2 state: ``s3`` with X
-    registered and ``s3d`` with X deregistered."""
+    """rev6.11 (b), no confirmation duel: b1 is X's first verdict against the
+    house H0 (clear, A10, gate pass: crowned there); b2 judges nothing (X
+    holds KING_D); then BOUNDARY_3 settled twice from copies of the b2 state:
+    ``s3`` with X registered and ``s3d`` with X deregistered.
+
+    The shape is checked in a test body (`check_crown_chain_shape`), never
+    here: a fixture assertion is an error, not a test failure."""
     if "crown" not in _CACHE:
-        run = dict(w7a.two_settlements(tmp))
+        run = _settle_chain(tmp)
         state = run["state"]
         dereg_dir = tmp / "state_dereg"
         shutil.copytree(state.parent, dereg_dir)
@@ -151,14 +191,36 @@ def crown_chain(tmp: Path) -> dict:
             run[name] = w7a.settle(run["chain"], run["cfg"], path, signer(),
                                    boundary=BOUNDARY_3, snap=2, entries=[run["entry"]],
                                    uid_of=uid_of)
-        x = run["entry"]["digest"]
-        assert run["s2"].report["crowned"] == x, "fixture: X is not crowned at b2"
-        assert run["s3"].report["king_after"]["digest"] == x
-        assert run["s3"].report["cohorts"] == [], "fixture: b3 judges nothing"
-        court = run["s3d"].report["pay"]["court"]
-        assert court[0]["uid"] is None and court[0]["burn_reason"] == "deregistered", court
         _CACHE["crown"] = run
     return _CACHE["crown"]
+
+
+def check_crown_chain_shape(run: dict) -> None:
+    """The `crown_chain` facts (README "Fixtures"), as assertions."""
+    x = run["entry"]["digest"]
+    r1, r2, r3, r3d = (run[n].report for n in ("s1", "s2", "s3", "s3d"))
+    assert r1["crowned"] == x, "fixture: X is crowned at its first verdict (b1)"
+    assert [v.get("outcome") for v in r1["verdicts"]] == ["crowned"]
+    assert r2["cohorts"] == [] and r2["crowned"] is None, "fixture: b2 judges nothing"
+    assert r2["king_after"]["digest"] == x and r3["king_after"]["digest"] == x
+    assert r3["cohorts"] == [], "fixture: b3 judges nothing"
+    court = r3d["pay"]["court"]
+    assert court[0]["uid"] is None and court[0]["burn_reason"] == "deregistered", court
+
+
+def undo_crown(report: dict, house_report: dict) -> dict:
+    """``report`` restated as if X had never been crowned: KING_D the house
+    (``house_report``'s ``king_before``, the genesis house record) before and
+    after, no prior kings, and the house slot burning instead of paying X."""
+    out = copy.deepcopy(report)
+    house_king = copy.deepcopy(house_report["king_before"])
+    out["king_before"] = copy.deepcopy(house_king)
+    out["king_after"] = copy.deepcopy(house_king)
+    out["prior_kings"] = []
+    out["pay"] = {"share": report["pay"]["share"],
+                  "court": [{"digest": house_king["digest"], "hotkey": None, "uid": None,
+                             "burn_reason": "house_king"}]}
+    return out
 
 
 # ── the cap scenarios (one settlement at b1, three entries) ────────────────
@@ -237,7 +299,7 @@ def snapshots(tmp: Path) -> dict:
     windows closed and judges the rest, so each report is genuine and
     passes the report-only audit; only the snapshot shows the defect."""
     if "snapshots" not in _CACHE:
-        chain = w7a.build_chain(tmp / "snap_chain")
+        chain = pin_embargo(w7a.build_chain(tmp / "snap_chain"))
         e = w7a.entry(chain["digests"][0], "w9-snap", coldkey=w7a.coldkey("w9-snap"))
         uid_of = {e["hotkey"]: CHALLENGER_UID}
         cfg = w7a.lane_d_cfg()

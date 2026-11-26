@@ -14,6 +14,9 @@ Four commands, none of which touches a chain, a store or a wallet:
   command (dry run, the default). ``--execute`` runs that command only with
   the ``--confirm`` token the dry run printed for the same inputs; signing
   and publishing are done by ``cascade-validator`` with the owner's wallet.
+  #911: ``--in-force`` names the body nodes run when ``--previous`` (the
+  latest published, seq/prev source) was refused; CHANGE / LANE lines and
+  the implicit lane-off guard (``--allow-lane-off``) are judged against it.
 
 The generators take ``effective_block`` from R1's block arithmetic (the next
 era start after ``--after`` on the live grid, cross-checked, with drift
@@ -39,6 +42,7 @@ import subprocess
 import sys
 import tomllib
 from dataclasses import fields, replace
+from fractions import Fraction
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -46,6 +50,7 @@ from typing import Any
 from cascade.laned import blocks
 from cascade.shared import netconfig as nc
 from cascade.shared.config import ChainConfig, effective_epoch_blocks, load_chain_config
+from cascade.shared.era import era_length_blocks
 
 EXIT_OK = 0
 EXIT_REFUSED = 1
@@ -60,6 +65,11 @@ BENIGN_KEYS = ("from_block", "until_block", "share")
 RELEASE_ONLY_KEYS = (("lane_d", "remainder"), ("lane_b", "remainder"),
                      ("lane_c", "remainder"), ("scoring", "burn_uid"))
 VALIDATOR = "cascade-validator"
+# Owner 2026-11-24 (lane D step 2 fallback): a block the publish tool fills —
+# the first era start at least one era past --head-block.
+NEXT_ERA = "next-era"
+# ... and the stake share of the release that must signal before lane D arms
+UPGRADE_THRESHOLD = Fraction(2, 3)
 
 
 class Refused(Exception):
@@ -333,8 +343,11 @@ def _generate(args: argparse.Namespace) -> int:
 
 def validator_argv(args: argparse.Namespace) -> list[str]:
     """The exact ``cascade-validator`` publish command; names forwarded verbatim."""
-    argv = [VALIDATOR, "--chain-toml", args.config, "--netconfig-overlay", args.overrides,
-            "--netconfig-effective-block", str(args.effective_block), "--netconfig-publish"]
+    argv = [VALIDATOR, "--chain-toml", args.config, "--netconfig-overlay",
+            getattr(args, "command_overrides", None) or args.overrides,
+            "--netconfig-effective-block",
+            str(getattr(args, "resolved_effective_block", None) or args.effective_block),
+            "--netconfig-publish"]
     if args.network is not None:
         argv += ["--network", args.network]
     if args.comment:
@@ -343,6 +356,11 @@ def validator_argv(args: argparse.Namespace) -> list[str]:
         argv += ["--wallet-name", args.wallet_name]
     if args.wallet_hotkey is not None:
         argv += ["--wallet-hotkey", args.wallet_hotkey]
+    seq = getattr(args, "in_force_seq", None)
+    if seq is not None:
+        argv += ["--netconfig-in-force-seq", str(seq)]
+    if getattr(args, "allow_lane_off", False):
+        argv.append("--netconfig-allow-lane-off")
     return argv
 
 
@@ -355,6 +373,8 @@ def confirm_token(argv: list[str], digest_hex: str, args: argparse.Namespace) ->
     material = {"argv": argv, "digest": digest_hex,
                 "config": _file_sha(args.config), "overrides": _file_sha(args.overrides),
                 "previous": _file_sha(args.previous) if args.previous else None}
+    if getattr(args, "in_force", None):
+        material["in_force"] = _file_sha(args.in_force)
     raw = json.dumps(material, sort_keys=True, separators=(",", ":")).encode()
     return "ok-" + hashlib.sha256(raw).hexdigest()[:20]
 
@@ -363,16 +383,134 @@ def _one_line(text: str) -> str:
     return " ".join(str(text).split())
 
 
+def next_era_start(base: ChainConfig, head: int) -> int:
+    """The first era start at least one era (at the head) past ``head``."""
+    b = int(head) + int(era_length_blocks(base.round, int(head)))
+    for _ in range(4 * int(era_length_blocks(base.round, b)) + 1):
+        if nc.is_era_start(base, b):
+            return b
+        b += 1
+    raise Invalid(f"no era start found after block {head}")
+
+
+def resolve_next_era(base: ChainConfig, overrides: dict, head: int | None,
+                     effective: int | str) -> tuple[dict, int, list[str]]:
+    """(overrides with every ``"next-era"`` value resolved, the effective
+    block, ``RESOLVED`` lines). Only ``[lane_d] from_block`` may carry it."""
+    found = [(t, k) for t, kv in overrides.items() if isinstance(kv, dict)
+             for k, v in kv.items() if v == NEXT_ERA]
+    if not found and effective != NEXT_ERA:
+        return overrides, int(effective), []
+    bad = [f"[{t}] {k}" for t, k in found if (t, k) != (LANE_D, "from_block")]
+    if bad:
+        raise Invalid(f"{NEXT_ERA!r} is supported only for [lane_d] from_block, not "
+                      + ", ".join(bad))
+    if head is None:
+        raise Invalid(f"{NEXT_ERA!r} needs --head-block (the chain head, read by the owner)")
+    block = next_era_start(base, head)
+    out = copy.deepcopy(overrides)
+    lines = []
+    for t, k in found:
+        out[t][k] = block
+        lines.append(f"[{t}] {k} = {block} (the first era start >= head {head} + one era)")
+    eff = block if effective == NEXT_ERA else int(effective)
+    if effective == NEXT_ERA:
+        lines.append(f"effective_block = {block}")
+    return out, eff, lines
+
+
+def upgrade_share(args: argparse.Namespace) -> tuple[dict | None, str]:
+    """(the upgrade tracker's report for the release, or None, why not)."""
+    from cascade.laned import upgrade_tracker as ut
+
+    if not (args.upgrade_metagraph and args.upgrade_notes and args.upgrade_feature):
+        return None, ("--upgrade-metagraph, --upgrade-notes and --upgrade-feature are "
+                      "needed to measure the release's stake share")
+    feat = str(args.upgrade_feature)
+    try:
+        if feat.startswith(nc.FEATURE_PREFIX) or re.fullmatch(r"[0-9a-f]{8}|[0-9a-f]{64}", feat):
+            feat = ut.parse_target(feat)
+        rows = ut.parse_metagraph(ut._load_json(args.upgrade_metagraph, "metagraph"))
+        notes = ut.parse_notes(ut._load_json(args.upgrade_notes, "notes"))
+        return ut.track(rows, notes, feat, UPGRADE_THRESHOLD), ""
+    except ut.InputError as e:
+        return None, f"upgrade tracker: {e}"
+
+
 def _publish(args: argparse.Namespace) -> int:
     try:
         base = read_base(args.config)
         overrides = read_overrides(args.overrides)
         previous = read_body(args.previous) if args.previous else None
+        in_force_body = read_body(args.in_force) if args.in_force else None
+        overrides, eff, resolved = resolve_next_era(base, overrides, args.head_block,
+                                                    args.effective_block)
     except Invalid as e:
         print(f"cascade-laned overlay publish: invalid input: {e}", file=sys.stderr)
         return EXIT_INVALID
-    eff = int(args.effective_block)
-    plan = nc.plan_overlay(base, overrides, eff, previous, comment=args.comment)
+    args.command_overrides = None
+    args.resolved_effective_block = eff if args.effective_block == NEXT_ERA else None
+    if resolved:
+        out_path = Path(args.resolved_out or f"{args.overrides}.resolved.toml")
+        try:
+            out_path.write_text(overrides_toml(overrides), encoding="utf-8")
+        except (OSError, Invalid) as e:
+            print(f"cascade-laned overlay publish: cannot write {out_path}: {e}",
+                  file=sys.stderr)
+            return EXIT_INVALID
+        args.command_overrides = str(out_path)
+    pre_errors: list[str] = []
+    args.in_force_seq = None
+    if in_force_body is not None:
+        # #911: seq / prev follow --previous; the checks follow --in-force
+        if previous is None:
+            print("cascade-laned overlay publish: --in-force needs --previous (the latest "
+                  "published body)", file=sys.stderr)
+            return EXIT_INVALID
+        if int(in_force_body["seq"]) > int(previous["seq"]) or (
+                int(in_force_body["seq"]) == int(previous["seq"])
+                and nc.body_digest(in_force_body) != nc.body_digest(previous)):
+            print("cascade-laned overlay publish: --in-force is not an overlay at or before "
+                  "--previous in the published chain", file=sys.stderr)
+            return EXIT_INVALID
+        in_force = in_force_body
+        if nc.body_digest(in_force_body) != nc.body_digest(previous):
+            args.in_force_seq = int(in_force_body["seq"])
+    else:
+        in_force = previous
+        if previous is not None:
+            _, skipped = nc.newest_valid(base, [previous])
+            if skipped:
+                pre_errors.append(
+                    f"{skipped[0]}. Nodes keep the newest overlay that validates in force: "
+                    "pass it as --in-force (seq/prev still follow --previous); if this seq "
+                    "was adopted under an older release (#891), pass --in-force with the "
+                    "--previous file itself")
+    plan = nc.plan_overlay(base, overrides, eff, previous, comment=args.comment,
+                           in_force=in_force, allow_lane_off=args.allow_lane_off,
+                           head_block=args.head_block)
+    plan.errors[:0] = pre_errors
+    # owner 2026-11-24: lane D arms (step 2) only once >= 2/3 of stake runs
+    # the release that carries the satellite fix (#913)
+    upgrade_lines: list[str] = []
+    if any(x.startswith("LANE D: OFF -> ON") for x in plan.lanes):
+        report, why = upgrade_share(args)
+        if report is not None:
+            upgrade_lines.append(
+                f"UPGRADE {report['pct']}% of eligible stake ({report['signed_stake']} / "
+                f"{report['total_stake']}) signals {report['target']} (needs >= 66.67%)")
+            ok = bool(report["meets_threshold"])
+            why = "" if ok else (f"only {report['pct']}% of eligible stake signals "
+                                 f"{report['target']}")
+        else:
+            upgrade_lines.append(f"UPGRADE unknown: {why}")
+            ok = False
+        if not ok:
+            msg = (f"arming lane D needs >= 2/3 of stake on the release: {why}")
+            if args.force_upgrade_threshold:
+                plan.warnings.append(msg + " — overridden (--force-upgrade-threshold)")
+            else:
+                plan.errors.append(msg + " (override: --force-upgrade-threshold)")
     try:
         body = nc.next_overlay(overrides, eff, previous, network=nc.network_identity(base),
                                comment=args.comment)
@@ -389,7 +527,15 @@ def _publish(args: argparse.Namespace) -> int:
            f"PREV {plan.body['prev'] or '-'}",
            f"EFFECTIVE_BLOCK {eff}",
            f"DIGEST {digest_hex}",
-           f"NOTE {note}"]
+           f"NOTE {note}",
+           f"IN_FORCE {plan.in_force}"]
+    out += [f"RESOLVED {r}" for r in resolved]
+    out += upgrade_lines
+    # #911: CHANGE = effective values vs the config in force (dropped
+    # restatements marked); LANE = lane on/off and share moves; DIFF = vs
+    # chain.toml as typed
+    out += [f"CHANGE {_one_line(c)}" for c in plan.changes] or ["CHANGE (none)"]
+    out += [f"LANE {_one_line(x)}" for x in plan.lanes]
     out += [f"DIFF {d}" for d in diff] or ["DIFF (none)"]
     out += [f"WARNING {_one_line(w)}" for w in plan.warnings]
     argv: list[str] = []
@@ -442,6 +588,10 @@ def _block(text: str) -> int:
     return value
 
 
+def _block_or_next(text: str) -> int | str:
+    return NEXT_ERA if text == NEXT_ERA else _block(text)
+
+
 def _generator(cmds: Any, name: str, help_text: str) -> argparse.ArgumentParser:
     p = cmds.add_parser(name, help=help_text)
     p.add_argument("--config", required=True, help="the base chain.toml (the DEPLOYED file)")
@@ -467,8 +617,30 @@ def add_parser(subparsers: Any) -> argparse.ArgumentParser:
                                         "--execute --confirm TOKEN runs it")
     p.add_argument("--config", required=True, help="the base chain.toml")
     p.add_argument("--overrides", required=True, help="overrides TOML for --netconfig-overlay")
-    p.add_argument("--effective-block", type=_block, required=True, help="an era start")
+    p.add_argument("--effective-block", type=_block_or_next, required=True,
+                   help=f"an era start, or {NEXT_ERA!r} (needs --head-block)")
+    p.add_argument("--head-block", type=_block,
+                   help=f"the chain head, read by the owner: resolves {NEXT_ERA!r} (the "
+                        "first era start at least one era past it) and runs the "
+                        "one-era-past-head checks")
+    p.add_argument("--resolved-out",
+                   help=f"where the overrides with {NEXT_ERA!r} resolved are written "
+                        "(default: <overrides>.resolved.toml); the printed command uses it")
+    p.add_argument("--upgrade-metagraph",
+                   help="upgrade_tracker metagraph JSON (needed to arm lane D)")
+    p.add_argument("--upgrade-notes", help="upgrade_tracker readiness notes JSON")
+    p.add_argument("--upgrade-feature",
+                   help="the release's readiness segment (or cfg-<8 hex>) whose stake share "
+                        "gates arming lane D")
+    p.add_argument("--force-upgrade-threshold", action="store_true",
+                   help="arm lane D although under 2/3 of stake signals --upgrade-feature")
     p.add_argument("--previous", help="the latest published body (seq N), if any")
+    p.add_argument("--in-force", help="the body nodes run, when --previous was refused "
+                                      "(default: --previous); checks and CHANGE/LANE lines "
+                                      "are judged against it, seq/prev follow --previous")
+    p.add_argument("--allow-lane-off", action="store_true",
+                   help="allow turning a lane the config in force arms off without setting "
+                        "its switch keys (a dropped restatement)")
     p.add_argument("--comment", default="", help="free text carried in the body")
     p.add_argument("--network", help="forwarded to cascade-validator --network")
     p.add_argument("--wallet-name", help="forwarded to cascade-validator --wallet-name")

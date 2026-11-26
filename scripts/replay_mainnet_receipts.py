@@ -53,6 +53,19 @@ KNOWN_UNSTAMPED_EMISSION: dict[str, dict] = {
     # clock 9547200; nothing between the two could move it.
     "14666242199155766185": {"clock_round": "9550553995117568107",
                              "clock_boundary": 9560700, "reign_start_block": 9547200},
+    # 2026-11-24 13:42:50 settlement (boundary 9576000), signed by validator
+    # rc37 (70cbc33c, still pre-ab0b412): the 13:25:08 weight re-assert landed
+    # 88 blocks earlier, so the push was rejected ("rate limit is 100 blocks")
+    # and the receipt shipped a king check (fail, LCB -0.2936 < 0.2000) without
+    # `emission`. The clock is borrowed from 9574200 (round
+    # 9495195076473738382, ladder event "none", no king check, clock 9561600 =
+    # the 2026-11-22 king-check restart). The settlement between them (9575100,
+    # round 15040697815483672835) also shipped without `emission` (07:31:33
+    # nonce-rejected push) but logged "v2 ladder: none", recorded no king check
+    # and no verdict, and kept king_since_block 9531900; no "reign clock
+    # restarted" was logged between 2026-11-22 13:35 and 2026-11-24 11:56.
+    "13058784948867351860": {"clock_round": "9495195076473738382",
+                             "clock_boundary": 9574200, "reign_start_block": 9561600},
 }
 
 
@@ -105,7 +118,7 @@ def _replay_known_unstamped(rc, results, pin, rows, cfg, client):
     """Swap a pinned receipt's ``king-check`` "no reign clock" FAIL for the
     re-derivation under the preceding receipt's verified clock: PASS there ⇒
     WARN here (the defect is still printed); anything else stays FAIL."""
-    from cascade.audit.checks import FAIL, PASS, WARN, CheckResult
+    from cascade.audit.checks import FAIL, KING_CHECK_BENCH, PASS, WARN, CheckResult
     from cascade.audit.main import _fetch_text, audit_receipt, load_receipt
 
     i = next((k for k, x in enumerate(results)
@@ -123,9 +136,16 @@ def _replay_known_unstamped(rc, results, pin, rows, cfg, client):
     else:
         why = known_clock_problem(rc, src, pin)
     if why is None:
-        kc = next(x for x in audit_receipt(with_borrowed_clock(rc, src), cfg, tier=0,
-                                           client=client) if x.name == "king-check")
-        if kc.status == PASS:
+        # The re-derived row is "king-check" when the bench half replays (or
+        # is not needed), or KING_CHECK_BENCH WARN when due-ness, the pool
+        # half and the recorded bench means all verify but the signed bench
+        # task rows were not fetchable (satellites retry; never a FAIL).
+        kc = next((x for x in audit_receipt(with_borrowed_clock(rc, src), cfg, tier=0,
+                                            client=client)
+                   if x.name in ("king-check", KING_CHECK_BENCH)), None)
+        if kc is None:
+            why = "borrowed-clock replay produced no king-check row"
+        elif (kc.name, kc.status) in (("king-check", PASS), (KING_CHECK_BENCH, WARN)):
             out = list(results)
             out[i] = CheckResult("king-check", WARN,
                                  f"KNOWN DEFECT (pre-ab0b412 validator: rate-limited push, "
@@ -134,7 +154,8 @@ def _replay_known_unstamped(rc, results, pin, rows, cfg, client):
                                  f"{pin['clock_round']}: {kc.detail}")
             _gh("warning", f"round {rc.round_id}: {out[i].detail}")
             return out
-        why = f"borrowed-clock replay {kc.status}: {kc.detail}"
+        else:
+            why = f"borrowed-clock replay {kc.name}={kc.status}: {kc.detail}"
     out = list(results)
     out[i] = CheckResult("king-check", FAIL, f"{NO_CLOCK} (known-defect pin rejected: {why})")
     return out
@@ -182,6 +203,7 @@ def main(argv: list[str] | None = None) -> int:
         client = None
 
     fails, replayed, unreachable = [], 0, 0
+    loaded = []
     for r in picked:
         rid = str(r["round_id"])
         try:
@@ -190,6 +212,7 @@ def main(argv: list[str] | None = None) -> int:
             unreachable += 1
             print(f"round {rid}: receipt unreadable ({e})")
             continue
+        loaded.append(rc)
         results = audit_receipt(rc, cfg, tier=0, client=client)
         pin = KNOWN_UNSTAMPED_EMISSION.get(rid)
         if pin is not None:
@@ -201,6 +224,18 @@ def main(argv: list[str] | None = None) -> int:
         print(f"round {rid}: {status} — " + ", ".join(f"{x.name}={x.status}" for x in results))
         for x in bad:
             fails.append(f"round {rid} {x.name}: {x.detail}")
+
+    from cascade.shared.era import image_epoch_from
+
+    if image_epoch_from(cfg) and loaded:
+        # W-IMG: one image per seed epoch across the replayed settlements
+        from cascade.audit.checks import check_image_epoch_chain
+
+        row = check_image_epoch_chain(
+            sorted(loaded, key=lambda x: int(x.epoch_start_block)), cfg)
+        print(f"image-epoch-chain={row.status} — {row.detail}")
+        if row.status == FAIL:
+            fails.append(f"image-epoch-chain: {row.detail}")
 
     for f in fails:
         _gh("error", f"CONSENSUS DIVERGENCE vs a settled mainnet receipt — {f}")

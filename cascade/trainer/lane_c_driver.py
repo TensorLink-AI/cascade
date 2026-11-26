@@ -65,6 +65,7 @@ from typing import Protocol
 
 from ..funding.queue import COMPETITION_ENDED_CLASS, OPERATOR_FAULT_CLASS, split_lane_c_ref
 from ..shared.atomic import read_text_with_backup, write_text_atomic
+from ..shared.era import image_record_at
 from .finetune import LegRecipe, RecipeError
 from .lane_c_competitions import trainer_competition
 
@@ -110,15 +111,30 @@ class LegFailure(Exception):
 
 
 class LaneCOps(Protocol):
-    def commitments(self) -> list: ...                 # chain Commitment rows (latest per hotkey)
-    def queue(self): ...                               # LaneCQueue | None
-    def lane_a_busy(self, hotkey: str) -> bool: ...    # a lane-A leg of the hotkey in flight
+    def commitments(self) -> list:
+        """Chain Commitment rows (latest per hotkey)."""
+
+    def queue(self):
+        """The LaneCQueue, or None."""
+
+    def lane_a_busy(self, hotkey: str) -> bool:
+        """A lane-A leg of the hotkey is in flight."""
+
     def fetch_recipe(self, ref: str, target: str, *, submission_time: float,
-                     train_time: float) -> LegRecipe: ...             # RecipeError = miner
-    def train_leg(self, leg: dict, recipe: LegRecipe) -> dict: ...    # LegFailure on failure
-    def sign(self, manifest): ...
-    def publish(self, key: str, text: str) -> None: ...
-    def spawn(self, fn, name: str) -> None: ...
+                     train_time: float) -> LegRecipe:
+        """The leg's recipe (RecipeError = the miner's fault)."""
+
+    def train_leg(self, leg: dict, recipe: LegRecipe) -> dict:
+        """Train one leg (LegFailure on failure)."""
+
+    def sign(self, manifest):
+        """Sign the lane-C manifest."""
+
+    def publish(self, key: str, text: str) -> None:
+        """Publish ``text`` at ``key``."""
+
+    def spawn(self, fn, name: str) -> None:
+        """Run ``fn`` in the background."""
 
 
 @dataclass
@@ -326,6 +342,16 @@ class LaneCDriver:
                 import time
 
                 leg["train_time"] = float(getattr(self.ops, "now", time.time)())
+                from ..shared.config.lane_c import is_mkt_family, mc_for
+
+                mc_ = mc_for(self.cfg, target) if is_mkt_family(target) else None
+                if mc_ is not None:
+                    # DEC-CA-0075 (item 2): the embargo in force at DISPATCH
+                    # rides the trainer-signed record; the verdict, draw and
+                    # scan use it, never a later config (W-CMP2: the
+                    # target's own competition's)
+                    leg["embargo_days"] = int(mc_.embargo_days)
+                    leg["embargo_eval_days"] = int(mc_.embargo_eval_days)
                 if ck:
                     # red-team F6: the owner the validators' family counts
                     leg["coldkey"] = ck
@@ -362,6 +388,9 @@ class LaneCDriver:
             td = getattr(self.ops, "tree_digest", None)
             if callable(td):
                 leg["tree_digest"] = str(td(leg["ref"]) or "")
+            if getattr(recipe, "embargo_scan", ()):
+                # DEC-CA-0074: the pre-rent embargo receipt rides the signed record
+                leg["embargo_scan"] = dict(recipe.embargo_scan)
             comp = trainer_competition(leg["target"])
             hours = comp.leg_hours(self.cfg, recipe) if comp is not None else None
             if hours is not None:
@@ -415,13 +444,20 @@ class LaneCDriver:
                     "train_block": int(result.get("train_block", leg["started_block"])),
                     "gpu_name": str(result.get("gpu_name", "") or ""),
                     "recipe": asdict(recipe) if recipe is not None else {},
+                    **({"train_image_digest": str(result["train_image_digest"])}
+                       if result.get("train_image_digest") else {}),
                     **({"tree_digest": str(leg["tree_digest"])} if leg.get("tree_digest")
                        else {}),
                     **({"marketcast": {**dict(result["marketcast"]),
                                        **({"train_time": float(leg["train_time"])}
                                           if "train_time" in leg else {}),
                                        **({"coldkey": str(leg["coldkey"])}
-                                          if leg.get("coldkey") else {})}}
+                                          if leg.get("coldkey") else {}),
+                                       **({"embargo_scan": dict(leg["embargo_scan"])}
+                                          if leg.get("embargo_scan") else {}),
+                                       **{k: int(leg[k]) for k in ("embargo_days",
+                                                                   "embargo_eval_days")
+                                          if k in leg}}}
                        if result.get("marketcast") else {}),
                     # any other competition's entry data (rides the manifest)
                     **({"competition": dict(result["competition"])}
@@ -500,7 +536,10 @@ class LaneCDriver:
                     funded_by="miner",
                     marketcast=dict(f.get("marketcast") or {}),
                     competition=dict(f.get("competition") or {}),
-                    tree_digest=str(f.get("tree_digest", "") or ""))
+                    tree_digest=str(f.get("tree_digest", "") or ""),
+                    # W-IMG: logged, never enforced; absent before the activation
+                    train_image_digest=(str(f.get("train_image_digest", "") or "")
+                                        if image_record_at(self.cfg, int(block)) else ""))
                     for f in todo)
                 manifest = LaneCManifest(
                     round_id=rid, era_index=int(era_index),
@@ -603,12 +642,12 @@ class LaneCDriver:
         ``"absent"``, ``rid`` joining the awaited list while the kind is live.
         Caller holds the lock."""
         from ..shared.marketcast_report import REPORT_ABSENT
-        from .lane_c_competitions import TRAINER_COMPETITIONS
+        from .lane_c_competitions import all_trainer_competitions
 
         read = getattr(self.ops, "read_report", None)
         reports: dict = {}
         awaits: dict = {}
-        for kind, comp in sorted(TRAINER_COMPETITIONS.items()):
+        for kind, comp in sorted(all_trainer_competitions().items()):
             if kind == "mkt" or comp.report_key(str(rid)) is None:
                 continue
             prev = list(self.st.awaits.get(kind) or ())
@@ -889,6 +928,37 @@ class RunnerLaneCOps:
                                     train_time=train_time)
         finally:
             shutil.rmtree(d, ignore_errors=True)
+
+    def mkt_embargo_scan(self, tree, *, train_time: float,
+                         mc=None) -> dict:  # pragma: no cover — bucket glue
+        """DEC-CA-0074 guard (b): the embargo receipt of ``tree`` (None = no
+        generator) against the signed pool snapshot active now — the legacy
+        ``pool_mkt``, or (W-CMP2) a spec instance's pool when ``mc`` is its
+        compiled table."""
+        from ..pool.marketcast import MktSnapshotSource
+        from ..shared.hippius import pool_s3_store
+        from ..shared.marketcast_embargo import scan_receipt
+
+        cfg = self.r.cfg
+        mc = cfg.marketcast if mc is None else mc
+        # DEC-CA-0075: the pool the competition spec names
+        signer = str(mc.pool_signer or "") or str(cfg.netconfig.owner_hotkey or "")
+        key = (mc.pool_prefix, signer, mc.pool_schema, tuple(mc.pool_select),
+               tuple(getattr(mc, "pool_channels", ())))
+        srcs = self.__dict__.setdefault("_mkt_scan_srcs", {})
+        src = srcs.get(key)
+        if src is None:
+            src = srcs[key] = MktSnapshotSource(
+                pool_s3_store(cfg.storage), prefix=mc.pool_prefix, signer_hotkey=signer,
+                cache_dir=Path(self.r.work_root) / "_mkt_scan",
+                schema=mc.pool_schema, select=dict(mc.pool_select),
+                channels=dict(getattr(mc, "pool_channels", ())))
+        got = src.snapshot_for(int(self.client.current_block()))
+        if got is None:
+            raise RuntimeError(f"no {mc.pool_prefix} snapshot to scan the embargo against")
+        lb = getattr(cfg, "lane_b", None)
+        hits = dict(getattr(lb, "contamination_min_hits", ()) or ()) or None
+        return scan_receipt(tree, got[0], mc, train_time=float(train_time), min_hits=hits)
 
     def tree_digest(self, ref: str) -> str:
         """The :func:`~cascade.shared.lane_c_manifest.tree_digest` of the

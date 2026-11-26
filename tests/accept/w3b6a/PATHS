@@ -1,0 +1,16 @@
+# W3b6a: the lane D bench sweep transport (plan rev6.13, W3b6 spec; owner
+# 2026-11-23 "build this"). README.md has the contract.
+#
+# New (bench-host side): the pod's end of the sweep. Each digest comes
+# through the W15 cache (W4 ingest on a miss with a grant), is materialised
+# in lane A's sidecar layout at its effective context, and gets one paired
+# sidecar pass; the reply is item_rows_from_report rows per digest.
+cascade/eval/lane_d_bench_sweep.py
+# New (box side): SSHBenchHost, the SweepSession sweep over SSH to the
+# first final/any host of a re-read hosts file. Grants only, no weights.
+cascade/validator/lane_d_bench_host.py
+# The optional `bench_hosts` key of the --lane-d-inputs TOML, and the
+# source handing the bench host each digest's effective context.
+cascade/validator/lane_d_inputs.py
+# #903: the offloaded sweep's remote command resolves uv on the host.
+cascade/validator/eval_offload.py

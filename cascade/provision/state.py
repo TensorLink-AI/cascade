@@ -7,7 +7,9 @@ the moment it is launched, *before* anything else happens to it, so a restart
 can always resume teardown from disk. The complement is :func:`reconcile`,
 which catches the opposite hole — a pod the provider created but whose record
 we failed to write (crash between the API call and the save): anything live
-and tagged ``cascade-`` that the ledger does not own is an orphan to kill.
+matching a write-ahead :class:`RentIntent` that the ledger does not own is
+an orphan to kill. A provisioner-shaped pod matching NO intent is another
+renter's (a second provisioner on the same account) and is never touched.
 
 Everything here is pure functions over plain data plus two tiny I/O helpers
 (:func:`load_state` / :func:`save_state`); time enters only as caller-supplied
@@ -23,8 +25,11 @@ from pathlib import Path
 
 __all__ = [
     "PodInstance",
+    "RentIntent",
     "RoundState",
     "add_instance",
+    "add_intent",
+    "drop_intent",
     "drop_instances",
     "instances_for_stage",
     "load_state",
@@ -71,6 +76,28 @@ class PodInstance:
 
 
 @dataclass(frozen=True)
+class RentIntent:
+    """A rent this service is ABOUT to make, recorded before the provider call.
+
+    The write-ahead for the hole the instance ledger cannot cover: a crash
+    after the provider created pods but before their ids were saved. On
+    restart, a live pod whose NAME starts with ``name_prefix`` on
+    ``provider`` is provably this instance's lost rental and may be reaped;
+    a provisioner-shaped pod matching no intent and no instance belongs to
+    someone else (another provisioner on the same account) and is left alone.
+    """
+
+    provider: str
+    name_prefix: str                 # LaunchSpec.name_prefix; pods are <prefix>-<i>…
+    stage: str
+    at_iso: str
+
+    def matches(self, provider: str, name: str) -> bool:
+        return provider == self.provider and (
+            name == self.name_prefix or name.startswith(self.name_prefix + "-"))
+
+
+@dataclass(frozen=True)
 class RoundState:
     """Everything the provisioner owns for one round, JSON-serialisable.
 
@@ -92,6 +119,9 @@ class RoundState:
     published: bool = False
     last_evaled_round: str = ""
     final_pending: bool = False
+    # Write-ahead rent intents (see RentIntent). Empty in every pre-intent
+    # ledger, and serialised only when non-empty (byte-identical round-trip).
+    rent_intents: tuple[RentIntent, ...] = field(default=())
 
 
 # ── pure transforms (the loop composes these, then saves) ────────────────────
@@ -100,6 +130,19 @@ class RoundState:
 def add_instance(state: RoundState, inst: PodInstance) -> RoundState:
     """The state with ``inst`` appended (immutably — callers save the result)."""
     return replace(state, instances=(*state.instances, inst))
+
+
+def add_intent(state: RoundState, intent: RentIntent) -> RoundState:
+    """The state with ``intent`` recorded (idempotent on provider + prefix)."""
+    keep = tuple(i for i in state.rent_intents
+                 if (i.provider, i.name_prefix) != (intent.provider, intent.name_prefix))
+    return replace(state, rent_intents=(*keep, intent))
+
+
+def drop_intent(state: RoundState, provider: str, name_prefix: str) -> RoundState:
+    """The state without the intent for ``(provider, name_prefix)``."""
+    return replace(state, rent_intents=tuple(
+        i for i in state.rent_intents if (i.provider, i.name_prefix) != (provider, name_prefix)))
 
 
 def drop_instances(state: RoundState, instance_ids: set[str]) -> RoundState:
@@ -169,6 +212,10 @@ def save_state(path: Path | str, state: RoundState) -> None:
             }
             for i in state.instances
         ],
+        **({"rent_intents": [
+            {"provider": r.provider, "name_prefix": r.name_prefix,
+             "stage": r.stage, "at_iso": r.at_iso}
+            for r in state.rent_intents]} if state.rent_intents else {}),
     }
     tmp = p.with_suffix(p.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
@@ -206,5 +253,10 @@ def load_state(path: Path | str) -> RoundState | None:
                 payer_credential_id=str(i.get("payer_credential_id", "")),
             )
             for i in raw.get("instances", [])
+        ),
+        rent_intents=tuple(
+            RentIntent(provider=str(r["provider"]), name_prefix=str(r["name_prefix"]),
+                       stage=str(r.get("stage", "")), at_iso=str(r.get("at_iso", "")))
+            for r in raw.get("rent_intents", [])
         ),
     )

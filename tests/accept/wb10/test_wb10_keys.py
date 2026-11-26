@@ -10,6 +10,7 @@ import pytest
 from .helpers import (
     MUTATIONS,
     SHIPPED,
+    SHIPPED_VALUE_OWNED_ELSEWHERE,
     SINGLE_VALUED,
     WB10_KEYS,
     as_table,
@@ -61,7 +62,8 @@ def test_wb10_contamination_min_hits_default_is_one_exact_three_normalised(name)
 def test_wb10_shipped_table_carries_every_key_at_its_default(name):
     """Both shipped files carry every WB10 key at its default; nothing armed:
     suite_targets false, no hash set pinned, lane B from_block / share as on
-    main."""
+    main. Exception: ``funded_pod_skus``, whose shipped value WB22 owns (lane
+    B's own GPU list, owner 2026-11-23); here it only has to parse."""
     table = shipped_raw(name).get("lane_b") or {}
     missing = [k for k in WB10_KEYS if k not in table]
     assert not missing, f"{name} [lane_b] lacks {missing}"
@@ -69,6 +71,13 @@ def test_wb10_shipped_table_carries_every_key_at_its_default(name):
     assert table["contamination_hashset"] == "", f"{name} pins a hash set"
     lb = load_ok(shipped_raw(name)).lane_b
     for k in WB10_KEYS:
+        if k in SHIPPED_VALUE_OWNED_ELSEWHERE:
+            # WB22 sets lane B's shipped GPU list; WB10 only pins that it is
+            # carried and parses to a non-empty list of distinct SKU strings
+            v = norm(field(lb, k))
+            assert v and len(set(v)) == len(v) and all(isinstance(s, str) and s for s in v), (
+                f"{name} [lane_b] {k} = {v!r} is not a non-empty list of distinct SKUs")
+            continue
         assert same_value(k, field(lb, k), default_of(name, k)), (
             f"{name} [lane_b] {k} = {field(lb, k)!r}, default {default_of(name, k)!r}")
 

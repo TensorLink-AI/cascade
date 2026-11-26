@@ -1,0 +1,100 @@
+# Elastic lane D hosts (plan R13 / W6d; owner 2026-11-24). Operator-only:
+# never consensus, never in a receipt, digest or overlay; read only by
+# `cascade-laned elastic` (cascade/laned/elastic.py). Names and locations only:
+# credentials are env-only (secret-shaped keys are refused).
+#
+#   GPU is ALWAYS Lium; Shadeform is CPU ONLY (owner 2026-11-24). The code
+#   refuses a Shadeform type with num_gpus > 0 and any other provider here.
+schema    = "laned_elastic/1"
+state_dir = "~/.local/state/cascade-laned-elastic"   # session state, spend ledger, alerts
+
+# ── pool_d builder: Shadeform CPU VM, one per 3-hourly build ────────────────
+# Market 2026-11-24 00:4x UTC (GET /instances/types?available=true):
+#   massedcompute cpu_medium  80 GB RAM / 1600 GB disk  $0.44/h
+#   verda         cpu_16      64 GB RAM / 1000 GB disk  $0.47/h
+#   massedcompute cpu_small   40 GB RAM /  800 GB disk  $0.22/h
+# The cheapest AVAILABLE type in `types` meeting every min_* wins.
+[pool_d_builder]
+provider           = "shadeform"        # the only value accepted
+min_vcpus          = 8
+min_memory_gb      = 32
+min_disk_gb        = 150                # R13: multi-year backfill needs the disk
+max_price_per_hour = 0.50               # hard cap: never rent above it
+monthly_cap_usd    = 350.0              # worst case 8 builds/day x 3 h x $0.44 x 30 ≈ $317
+build_hours        = 3.0                # projected bill per build (W6d wall < 3 h)
+ttl_hours          = 3.5                # Shadeform auto_delete backstop
+keep_warm          = false              # true: keep the VM between builds (~$320/month at $0.44/h)
+api_key_env        = "SHADEFORM_API_KEY"
+ssh_key_id_env     = "SHADEFORM_SSH_KEY_ID"   # VM mode (user shadeform); docker mode is never used
+ssh_user           = "shadeform"
+ssh_key_path       = "~/.ssh/id_ed25519"      # private key matching the registered Shadeform key
+workdir            = "/home/shadeform/cascade"
+forge_dir          = "/home/shadeform/tsforge"
+work_root          = "/home/shadeform/pool_d_work"
+env_file           = "/etc/cascade-laned-pool-d.env"   # on the box, mode 600, owner fills
+remote_env_file    = "/home/shadeform/.cascade-pool-d.env"
+release_dir        = "/root/cascade"                   # the release the box runs
+chain_toml         = "/root/cascade/chain.toml"        # the DEPLOYED chain.toml
+# extra pool_d_build flags. The W6b replay must use lane A's publish flags (not in
+# provenance.json): --max-panel-series-per-feed = publish-pool.yml's value, and
+# --mv-pack because every live snapshot is past [scoring] mv_score_from_block.
+build_args         = ["--mv-pack", "--max-panel-series-per-feed", "20"]
+
+[[pool_d_builder.types]]
+cloud = "massedcompute"
+shade_instance_type = "cpu_medium"
+
+[[pool_d_builder.types]]
+cloud = "verda"
+shade_instance_type = "cpu_16"
+
+[[pool_d_builder.types]]
+cloud = "massedcompute"
+shade_instance_type = "cpu_small"
+
+# ── lane D eval hosts: Lium GPUs, up per settlement with lane D work ─────────
+# Lium only. No qualified GPU => retry Lium for retry_window_minutes, alert,
+# and skip (the settlement retries); never Shadeform.
+[eval_host]
+provider               = "lium"         # the only value accepted
+min_vram_gb            = 96
+max_price_per_hour     = 8.0            # per host, hard cap
+monthly_cap_usd        = 600.0
+settlement_hours       = 3.0            # projected bill per host per settlement
+ttl_hours              = 4.0            # lium --ttl backstop
+per_host_entries       = 2              # SET FROM A9 TIMING (entries one host scores in half a settlement)
+max_hosts              = 4
+retry_window_minutes   = 180            # Lium-first rule (~3 h of retries)
+retry_interval_seconds = 120
+boot_timeout_seconds   = 1200
+image                  = ""             # digest-pinned worker image: copy from the deployed provision.toml
+ssh_pubkey_path        = "~/.ssh/lium_cascade_ed25519.pub"
+ssh_key_path           = "~/.ssh/lium_cascade_ed25519"
+ssh_user               = "root"
+# F5's qualified list (PR #830). When present it is authoritative; only
+# status = "qualified" environments count.
+scoring_envs           = "deploy/laned/scoring_envs.toml"
+# Used ONLY while scoring_envs.toml is absent (F5 unmerged): Hopper runs the
+# pinned torch 2.4.1+cu124 today. NOTE #830's cu124-torch241 entry does not
+# list "NVIDIA H200" yet: once #830 merges, H200 is refused until it is added.
+fallback_qualified_gpu_models = ["NVIDIA H200"]
+# Public-mirror warm cache (owner 2026-11-24, #894): Lium persistent volume
+# HUIDs (`lium volumes new lane-d-public-0`, then `lium volumes list`); host i
+# of a cohort gets volume i via `lium up --volume id:<HUID>`, mounted at
+# public_cache_mount (deploy/laned/public_mirror.toml cache_dir lives under it).
+# 750 GB per volume holds the fully warm mirror. Empty = no volume (alerted:
+# every drawn series is fetched from Hippius on every host).
+public_cache_volumes   = []
+public_cache_mount     = "/workspace"
+
+[[eval_host.candidates]]
+lium_gpu_type = "H200"
+gpu_model     = "NVIDIA H200"
+vram_gb       = 141
+profile       = "scripts/evalhost/profiles/elastic_h200.toml"
+
+[[eval_host.candidates]]
+lium_gpu_type = "Edition"              # Lium's name for RTX PRO 6000 Blackwell 96 GB
+gpu_model     = "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
+vram_gb       = 96
+profile       = "scripts/evalhost/profiles/elastic_rtxpro6000.toml"

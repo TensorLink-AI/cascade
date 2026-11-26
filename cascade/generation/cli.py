@@ -41,6 +41,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--progress-id", default="", help="Operator attempt identity for progress.")
     p.add_argument("--progress-file", type=Path, default=None, help="Atomic local progress JSON file.")
     p.add_argument("--json", action="store_true", help="print only the JSON summary")
+    p.add_argument("--curriculum-stage", default="",
+                   help="WB27: the lane B curriculum stage this corpus is (the generator "
+                        "is constructed with curriculum_stage=<name>)")
     p.add_argument("--min-channels", type=int, default=None,
                    help="width floor for this leg (a king leg under [generator] "
                         "king_min_channels); default: the contract's policy")
@@ -92,6 +95,13 @@ def main(argv: list[str] | None = None) -> int:
         gen_cfg = replace(gen_cfg, min_channels=args.min_channels)
     if not args.no_sandbox:
         gen_cfg = replace(gen_cfg, sandbox_strict=True)
+    if args.curriculum_stage:
+        from ..shared.lane_b_levers import valid_stage_name
+
+        if not valid_stage_name(args.curriculum_stage):
+            print(json.dumps({"ok": False, "error": "--curriculum-stage is not a stage name"}))
+            return EXIT_REFUSED
+        gen_cfg = replace(gen_cfg, curriculum_stage=str(args.curriculum_stage))
     from .progress import PROGRESS_NAME, CpuProgress
 
     urls = json.loads(args.upload_urls.read_text()) if args.upload_urls else {}

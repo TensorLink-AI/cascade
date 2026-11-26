@@ -6,8 +6,13 @@ pay-wiring trap; README "derive_weights").
 
 Honest chains: the vector equals W8's emission (`lane_parts(...,
 lane_d_cfg=..., d_court_uids=...)` + `emission_vector`), uid for uid.
-Doctored ones: `(None, why)` with a typed code from
-`cascade.audit.checks.LANE_D_WEIGHT_ERRORS`.
+Doctored ones: rev6.18 B1 (owner 2026-11-23, "A failed lane D check must
+burn only lane D's share"; tests-correction): `(vector, why)` where the
+vector is the honest one with lane D's share burned (lanes A/B/C
+unchanged) and `why` carries a typed code from
+`cascade.audit.checks.LANE_D_WEIGHT_ERRORS` (before rev6.18: `(None, why)`,
+the whole vector refused). rev6.18 B3: a chain-provenance failure is
+alert-class, so its signed court stays paid.
 
 On main `derive_weights` takes no `lane_d` (an `assert`), returns the lane
 A-only vector for an armed settlement, and `LANE_D_WEIGHT_ERRORS` does not
@@ -39,10 +44,21 @@ def _honest(run, name: str):
     return receipt, h.lane_d_record(s), want
 
 
-def _refused(got, code: str) -> None:
+def _burned(run) -> list[float]:
+    """The producer's vector with an empty lane D court: lane D's share on
+    ``burn_uid``, lanes A/B/C exactly as when lane D pays."""
+    return h.producer_vector(run["ccfg"], [])
+
+
+def _refused(got, code: str, want, sub: str | None = None) -> None:
+    """rev6.18 B1: a lane D refusal burns lane D's share only — the vector
+    is ``want`` (lanes A/B/C unchanged), never ``None``."""
     vec, why = got
-    assert vec is None, f"expected a {code} refusal, got the vector {vec}"
+    assert vec is not None and h.close_vectors(vec, want), \
+        f"expected lane D's share burned ({code}), got the vector {vec} ({why!r})"
     assert h.code_of(why) == code, f"refusal {why!r}; expected code {code!r}"
+    if sub is not None:
+        assert why.split(":", 2)[1].strip() == sub, f"refusal {why!r}; expected B3 code {sub!r}"
 
 
 # ── the typed codes ─────────────────────────────────────────────────────────
@@ -62,8 +78,8 @@ def test_weight_error_codes_are_exported():
 
 
 @pytest.mark.parametrize("name,lane_d_uid", [
-    ("s1", None),                    # the house holds KING_D: its slot burns (D21)
-    ("s2", h.CHALLENGER_UID),        # X crowned: lane D's share pays X
+    ("s1", h.CHALLENGER_UID),        # X crowned at its first verdict: pays X (rev6.11)
+    ("s2", h.CHALLENGER_UID),        # nothing judged: X keeps the slot
     ("s3", h.CHALLENGER_UID),        # nothing judged: X keeps the slot
     ("s3d", None),                   # X deregistered: its slot burns (B8)
 ])
@@ -147,26 +163,29 @@ def test_lane_d_survives_a_dec55_policy_with_b_and_c_off(run):
     assert vec[h.CHALLENGER_UID] == pytest.approx(float(ccfg.lane_d.share), rel=1e-9)
 
 
-# ── doctored inputs: typed refusals ─────────────────────────────────────────
+# ── doctored inputs: typed refusals, lane D's share only (rev6.18 B1) ──────
 
 
 def test_armed_without_a_lane_d_record_is_refused(run):
-    """Never a silent lane A-only vector when lane D pays at the boundary."""
+    """Never a silent lane A-only vector when lane D pays at the boundary:
+    lane D's share burns, lanes A/B/C unchanged."""
     receipt, _, _ = _honest(run, "s2")
-    _refused(h.derive(receipt, run["ccfg"], lane_d=None), "lane_d_record_missing")
+    _refused(h.derive(receipt, run["ccfg"], lane_d=None), "lane_d_record_missing", _burned(run))
 
 
 def test_a_lane_d_record_before_lane_d_arms_is_refused(run):
+    """Lane D pays nothing at an unarmed settlement: the lane A vector."""
     _, rec, _ = _honest(run, "s1")
-    receipt = h.lane_a_receipt(h.ARM_BLOCK, h.lane_a_only_vector(run["ccfg"]))
-    _refused(h.derive(receipt, run["ccfg"], lane_d=rec), "lane_d_not_armed")
+    lane_a = h.lane_a_only_vector(run["ccfg"])
+    receipt = h.lane_a_receipt(h.ARM_BLOCK, lane_a)
+    _refused(h.derive(receipt, run["ccfg"], lane_d=rec), "lane_d_not_armed", lane_a)
 
 
 def test_another_settlements_report_is_refused(run):
     """b1's report and receipt offered for the b2 settlement."""
     receipt, _, _ = _honest(run, "s2")
     _refused(h.derive(receipt, run["ccfg"], lane_d=h.lane_d_record(run["s1"])),
-             "lane_d_boundary_mismatch")
+             "lane_d_boundary_mismatch", _burned(run))
 
 
 def test_a_receipt_that_binds_another_body_is_refused(run):
@@ -174,18 +193,19 @@ def test_a_receipt_that_binds_another_body_is_refused(run):
     receipt, _, _ = _honest(run, "s2")
     bad = dict(run["s2"].receipt, report_sha256=run["s1"].receipt["report_sha256"])
     rec = h.lane_d_record(run["s2"], receipt=bad)
-    _refused(h.derive(receipt, run["ccfg"], lane_d=rec), "lane_d_report_mismatch")
+    _refused(h.derive(receipt, run["ccfg"], lane_d=rec), "lane_d_report_mismatch", _burned(run))
 
 
 def test_a_doctored_court_uid_is_refused(run):
     """The paid uid moved and the receipt re-bound to the doctored body, but
-    the signature no longer verifies."""
+    the signature no longer verifies (B3 `ld_signature`, burn)."""
     receipt, _, _ = _honest(run, "s2")
     report = copy.deepcopy(run["s2"].report)
     report["pay"]["court"][0]["uid"] = h.UID_B
     rebound = dict(run["s2"].receipt, report_sha256=h.body_sha256(report))
     rec = h.lane_d_record(run["s2"], report=report, receipt=rebound)
-    _refused(h.derive(receipt, run["ccfg"], lane_d=rec), "lane_d_report_unverified")
+    _refused(h.derive(receipt, run["ccfg"], lane_d=rec), "lane_d_report_unverified",
+             _burned(run), sub="ld_signature")
 
 
 def test_a_report_signed_by_another_key_is_refused(run):
@@ -193,30 +213,45 @@ def test_a_report_signed_by_another_key_is_refused(run):
     report = h.resign(run["s2"].report, h.w7a.fixture_key("w9-not-the-validator"))
     rebound = dict(run["s2"].receipt, report_sha256=h.body_sha256(report))
     rec = h.lane_d_record(run["s2"], report=report, receipt=rebound)
-    _refused(h.derive(receipt, run["ccfg"], lane_d=rec), "lane_d_report_unverified")
+    _refused(h.derive(receipt, run["ccfg"], lane_d=rec), "lane_d_report_unverified",
+             _burned(run), sub="ld_signature")
 
 
 def test_a_re_signed_report_the_audit_refutes_is_refused(run):
     """Validator key, receipt re-bound, but `pay.share` doubled: `check_lane_d`
-    FAILs it, so its pay is never derived."""
+    FAILs it (B3 `ld_params`, the config echo: burn), so its pay is never
+    derived and lane D's share burns."""
     receipt, _, _ = _honest(run, "s2")
     report = copy.deepcopy(run["s2"].report)
     report["pay"]["share"] = 0.5
     report = h.resign(report)
     rebound = dict(run["s2"].receipt, report_sha256=h.body_sha256(report))
     rec = h.lane_d_record(run["s2"], report=report, receipt=rebound)
-    _refused(h.derive(receipt, run["ccfg"], lane_d=rec), "lane_d_report_unverified")
+    vec, why = h.derive(receipt, run["ccfg"], lane_d=rec)
+    _refused((vec, why), "lane_d_report_unverified", _burned(run))
+    from cascade.audit.lane_d import REFUSAL_CODES
+
+    sub = why.split(":", 2)[1].strip()
+    assert REFUSAL_CODES.get(sub) == "burn", why
 
 
-def test_a_report_the_chain_refutes_is_refused(run):
-    """b3 forged to undo X's crown (test_w9_chain), re-signed and re-bound:
-    with the earlier reports given, its pay is never derived."""
+def test_a_report_the_chain_refutes_alerts_and_keeps_paying(run):
+    """b3 forged to undo X's crown (test_w9_chain), re-signed and re-bound.
+    Its chain provenance fails (B3 `ld_chain`: alert-class), so it is
+    alerted and its signed record stays in force (rev6.18 B3, owner
+    2026-11-23: "Every other failed check logs, alerts and keeps paying").
+    Its KING_D is the house, so it reads as lane D's genesis (DEC-CA-0076,
+    laned:tests-correction; was: the house slot burns): lane D carves
+    nothing and the vector is lane A's alone."""
+    from cascade.audit.checks import lane_d_pay
+
     receipt, _, _ = _honest(run, "s3")
-    forged = copy.deepcopy(run["s3"].report)
-    for key in ("king_before", "king_after", "prior_kings", "pay"):
-        forged[key] = copy.deepcopy(run["s1"].report[key])
-    forged = h.resign(forged)
+    forged = h.resign(h.undo_crown(run["s3"].report, run["s1"].report))
     rebound = dict(run["s3"].receipt, report_sha256=h.body_sha256(forged))
     rec = h.lane_d_record(run["s3"], report=forged, receipt=rebound,
                           prior=[run["s1"].report, run["s2"].report])
-    _refused(h.derive(receipt, run["ccfg"], lane_d=rec), "lane_d_report_unverified")
+    vec, why = h.derive(receipt, run["ccfg"], lane_d=rec)
+    assert why == "" and h.close_vectors(vec, h.lane_a_only_vector(run["ccfg"])), \
+        (vec, why)
+    pay = lane_d_pay(receipt, run["ccfg"], rec)
+    assert pay.paid and pay.genesis and any(a.startswith("ld_chain:") for a in pay.alerts), pay

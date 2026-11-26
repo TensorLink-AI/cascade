@@ -66,8 +66,10 @@ def test_reason_enum_is_the_codes_enum():
 
     enum = tuple(h.mod().REASON_ENUM)
     assert enum == tuple(ENTRY_REASONS)
-    for code in ("coldkey_cap_settlement", "confirm_pending", "bench_hold", "pending_floor"):
+    for code in ("coldkey_cap_settlement", "bench_hold", "pending_floor"):
         assert code in enum
+    # rev6.11 (b): no confirmation duel, so no confirm_pending reason.
+    assert "confirm_pending" not in enum and "lost_confirmation" not in enum
 
 
 def test_doc_publishes_the_reason_enum(rich):
@@ -127,11 +129,13 @@ def test_coldkey_cap_settlement_entry_is_queued_with_its_reason(rich):
     assert row["confirm_stage"] == "first"
 
 
-def test_confirm_pending_entry_shows_the_confirm_stage(rich):
+def test_held_first_clear_is_queued_at_the_first_stage(rich):
+    """rev6.11 (b): a first clear the gate could not decide is held open
+    (`hold` / `bench_hold`); there is no confirm stage."""
     row = h.row_of(_doc(rich), rich["fx"].x["digest"])
-    assert row["status"] == "confirm_pending"
-    assert row["reason"] == "confirm_pending"
-    assert row["confirm_stage"] == "confirm"
+    assert row["status"] == "hold"
+    assert row["reason"] == "bench_hold"
+    assert row["confirm_stage"] == "first"
 
 
 def test_pending_floor_entry_shows_the_first_stage(rich):
@@ -143,9 +147,9 @@ def test_pending_floor_entry_shows_the_first_stage(rich):
 def test_bench_hold_entry_is_queued_with_its_reason(held):
     doc = _doc(held, block=h.B2 + 5)
     row = h.row_of(doc, held["fx"].x["digest"])
-    assert row["status"] == "confirm_pending"
+    assert row["status"] == "hold"
     assert row["reason"] == "bench_hold"
-    assert row["confirm_stage"] == "confirm"
+    assert row["confirm_stage"] == "first"
     assert doc["king"]["house"] is True
 
 
@@ -174,9 +178,12 @@ def test_pending_progress_counts_windows_and_clusters_against_the_floors(progres
     assert set(x["progress"]) >= h.PROGRESS_KEYS
     assert {k: x["progress"][k] for k in h.PROGRESS_KEYS} == {
         "windows": 24, "clusters": 4, "min_windows": 30, "min_clusters": 4, "frozen": False}
+    # rev6.10 (a) / rev6.12 (a): the fixture feeds pin embargo_hours = 48, so
+    # Z (revealed 5 h after X) counts the same embargo windows of snapshot 1
+    # as X: data time in (b - e, b], released to miners after b.
     z = h.row_of(doc, fx.z["digest"])
     assert (z["progress"]["windows"], z["progress"]["clusters"], z["progress"]["frozen"]) == (
-        0, 0, False)
+        24, 4, False)
 
 
 def test_progress_is_derived_from_the_state_frozen_set(progress):
@@ -187,17 +194,24 @@ def test_progress_is_derived_from_the_state_frozen_set(progress):
     assert row["progress"]["clusters"] == len(set(fs["sources"].values()))
 
 
-def test_progress_of_a_frozen_confirmation_set(held):
+def test_progress_of_a_held_first_clear(held):
+    """The held clear's frozen set, judged at B2 over snapshots 1 and 2."""
+    fs = held["state"]["entries"][held["fx"].x["digest"]]["frozen_set"]
+    assert fs is not None and fs["frozen"] is True
     row = h.row_of(_doc(held, block=h.B2 + 5), held["fx"].x["digest"])
     p = row["progress"]
-    assert (p["windows"], p["clusters"], p["frozen"]) == (24, 4, True)
+    assert (p["windows"], p["clusters"], p["frozen"]) == (
+        len(fs["window_ids"]), len(set(fs["sources"].values())), True)
+    assert p["windows"] >= 24 and p["clusters"] == 4
 
 
-def test_progress_restarts_after_a_first_clear(rich):
-    # The confirmation accumulates a fresh, disjoint set (frozen_set reset).
-    assert rich["state"]["entries"][rich["fx"].x["digest"]]["frozen_set"] is None
+def test_progress_of_a_held_clear_is_its_judged_set(rich):
+    # rev6.11 (b): no confirmation set accumulates; a held first clear keeps
+    # the frozen set it was judged on (snapshot 1: 24 windows, 4 sources).
+    fs = rich["state"]["entries"][rich["fx"].x["digest"]]["frozen_set"]
+    assert fs is not None and fs["frozen"] is True
     p = h.row_of(_doc(rich), rich["fx"].x["digest"])["progress"]
-    assert (p["windows"], p["clusters"], p["frozen"]) == (0, 0, False)
+    assert (p["windows"], p["clusters"], p["frozen"]) == (24, 4, True)
 
 
 # ── the king and the house ──────────────────────────────────────────────────
@@ -237,7 +251,7 @@ def test_board_is_the_latest_reports_judgement(crowned):
     assert board["crowned"] == crowned["fx"].x["digest"] == rep["crowned"]
     assert board["judged"] == rep["judged"]
     assert board["skipped"] == rep["skipped"]
-    assert board["verdicts"] == [{k: v[k] for k in sorted(h.VERDICT_KEYS)}
+    assert board["verdicts"] == [{k: v.get(k) for k in sorted(h.VERDICT_KEYS)}
                                  for v in rep["verdicts"]]
     assert board["gate"] == rep["gate"], "the gate record (suite, results, LCBs) verbatim"
 
@@ -246,7 +260,9 @@ def test_board_shows_losses_and_skips(rich):
     fx, rep = rich["fx"], rich["report"]
     board = _doc(rich)["board"]
     outcomes = {v["digest"]: v["outcome"] for v in board["verdicts"]}
-    assert outcomes == {fx.x["digest"]: "confirm_pending", fx.l["digest"]: "lost"}
+    # rev6.11 (b): X's first clear is the crowning candidate, held by the
+    # down bench ("cleared", never crowned); L lost its duel.
+    assert outcomes == {fx.x["digest"]: "cleared", fx.l["digest"]: "lost"}
     assert {"digest": fx.y["digest"], "reason": "coldkey_cap_settlement"} in board["skipped"]
     assert board["crowned"] is None
     assert board["gate"] == rep.get("gate")

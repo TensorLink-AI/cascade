@@ -15,6 +15,7 @@ from .helpers import (
     SHIPPED,
     UNTIL_BLOCK,
     W2_KEYS,
+    co_for,
     field,
     load_ok,
     norm,
@@ -30,8 +31,7 @@ OVERLAY_KEYS = [k for k in W2_KEYS if k not in ("remainder", "dtypes")]
 # Overlay values that differ from both the plan default and ARM (an overlay
 # restating a default is refused as "no effect"). takes_from moves the armed
 # carve (ARM: lane_a) to another lane.
-OVERLAY_VALUE = {"takes_from": "lane_b", "confirm_on_king_change": "original",
-                 "lowfreq_freqs": ["Q"], "ready_ttl_blocks": 54321}
+OVERLAY_VALUE = {"takes_from": "lane_b", "ready_ttl_blocks": 54321}
 
 
 def test_w2_allowed_has_lane_d():
@@ -45,7 +45,7 @@ def test_w2_allowed_has_lane_d():
 @pytest.mark.parametrize("key", OVERLAY_KEYS)
 def test_w2_every_tuning_key_passes_check_overrides(key):
     value = MUTATIONS[key][1]
-    why = overrides_refusal({"lane_d": {key: value}})
+    why = overrides_refusal({"lane_d": {**co_for(key, value), key: value}})
     assert why is None, f"[lane_d] {key} refused by check_overrides: {why}"
 
 
@@ -55,7 +55,7 @@ def test_w2_every_tuning_key_overlay_takes_effect(name, key):
     """Each key set by a signed overlay (with the activation keys) validates
     and lands in the built config."""
     b = OVERLAY_VALUE.get(key, MUTATIONS[key][1])
-    ov = {**ARM, key: b}
+    ov = {**ARM, **co_for(key, b), key: b}
     if key == "gate_suites":
         # unequal, so the weights are not a no-op restatement of the default
         ov["gate_weights"] = {s: float(i + 1) for i, s in enumerate(b)}
@@ -82,6 +82,23 @@ def test_w2_lane_c_remainder_overlay_is_refused_as_release_only():
     assert why is not None, "an overlay setting [lane_c] remainder was accepted"
     assert "[lane_c] remainder" in why and "burn destination is release-only" in why, why
     assert overrides_refusal({"lane_c": {"share": 0.2}}) is None
+
+
+@pytest.mark.parametrize("name", SHIPPED)
+def test_w2_retired_lane_d_overlay_key_is_refused(name):
+    """rev6.18 B11: confirm_on_king_change reaches no parser any more, so an
+    overlay setting it is refused as having no effect."""
+    from cascade.shared import netconfig as nc
+
+    base = load_ok(shipped_raw(name))
+    body = overlay_body(base, {"lane_d": {"confirm_on_king_change": "original"}})
+    try:
+        nc.validate_overlay(base, body)
+    except nc.NetConfigError as e:
+        assert "no effect" in str(e), f"refused for another reason: {e}"
+    else:
+        raise AssertionError("an overlay setting retired [lane_d] "
+                             "confirm_on_king_change was adopted")
 
 
 @pytest.mark.parametrize("name", SHIPPED)

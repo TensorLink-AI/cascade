@@ -19,10 +19,15 @@ lane C (review fixes 2026-10-19):
    in :class:`~cascade.shared.lane_c.LaneCState`).
 2. **Rows** (the DEC-CA-0063 pattern). The MAIN validator (``[netconfig]
    owner_hotkey``) computes each round's rows once, on its GPU: the signed
-   snapshot active at the round's block, every forward-only window of the
-   entry (start strictly after ``train_time + start_margin_seconds`` — the
-   TRAINER's clock — and, on a confirm, after the judge-phase snapshot's
-   end), the pinned base and the fine-tune forecast on them, losses computed
+   snapshot active at the round's block, the entry's DRAWN windows
+   (DEC-CA-0074, :func:`entry_draw`: per (asset, series, horizon) the
+   ``backtest_windows_per_cell`` best-ranked by the round block's hash, lying
+   wholly in the ``embargo_eval_days`` before the TRAINER-stamped dispatch —
+   bars no leg reads — in the judge or confirm half of a fixed public
+   partition; plus the ``forward_horizons``' closed forward windows after
+   ``train_time + start_margin_seconds`` and, on a confirm, after the
+   judge-phase snapshot's end), the pinned base and the fine-tune forecast
+   on them, losses computed
    from the float32 quantiles it publishes as a sidecar. A compute failure
    is retried :data:`MKT_COMPUTE_ATTEMPTS` times, then the entry is marked
    ``infra_deferred`` (never judged, never dropped for it). It publishes the
@@ -45,7 +50,7 @@ lane C (review fixes 2026-10-19):
    ``alpha`` on a confirm), positive point gain, ``min_windows`` over
    ``min_clusters`` assets and, on ``mkt:returns``, the coverage gate. An
    entry inconclusive for lack of windows / clusters WAITS while within
-   ``verdict_wait_blocks`` of its origin (measured on the ROUND's block, so
+   ``verdict_wait_blocks`` (capped at 13 h) of its origin (measured on the ROUND's block, so
    a late report never eats the wait); an ``infra`` deferral waits without
    consuming it, up to ``max_infra_deferrals``, then drops with the
    requeue-eligible operator error class.
@@ -58,6 +63,7 @@ lane C's (``resolve_outcomes`` / ``LaneCState``).
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 import re
@@ -68,7 +74,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from ..shared.config.lane_c import MKT_KIND, is_mkt_target
+from ..shared.config.lane_c import MKT_KIND, is_mkt_target, kind_of
 from ..shared.lane_c import PendingEntry, competition_past_end
 from ..shared.lane_c_manifest import LaneCEntry, commit_block_as_of, finetune_commit_as_of
 from ..shared.marketcast_report import (
@@ -83,6 +89,7 @@ from ..shared.marketcast_report import (
     encode_quantiles,
     guard_scores,
     holder_gain,
+    kind_scores,
     load_mkt_report,
     mkt_quantiles_key,
     mkt_ref_quantiles_key,
@@ -95,6 +102,92 @@ from ..shared.marketcast_report import (
 )
 
 log = logging.getLogger("cascade.validator")
+
+
+# ── W-CMP2 (DEC-CA-0075): the competition this runner is judging ────────────
+#
+# The MarketCast runner is MULTI-INSTANCE: ``mkt`` (its legacy instance —
+# ``[marketcast]``, ``mkt_reports``, ``mkt_backlog`` / ``mkt_seen``, report key
+# ``marketcast/round-<R>.json``, all byte-identical) and every spec instance
+# ``<id>`` (its compiled table, ``reports[<id>]``, ``comp[<id>]`` state, report
+# key ``marketcast/<id>/round-<R>.json``). Every mixin method reads the
+# instance from :func:`current_ctx` (thread-local; default ``mkt``).
+
+import threading as _threading  # noqa: E402
+
+_CTX = _threading.local()
+
+
+@dataclass(frozen=True)
+class MktCtx:
+    """One instance of the MarketCast runner."""
+    kind: str
+    mc: object
+
+    @property
+    def legacy(self) -> bool:
+        return self.kind == MKT_KIND
+
+    def is_target(self, target: object) -> bool:
+        return kind_of(str(target or "")) == self.kind
+
+    def report_key(self, rid: str) -> str:
+        from ..shared.marketcast_report import instance_report_key
+
+        return mkt_report_key(rid) if self.legacy else instance_report_key(self.kind, rid)
+
+    def arbiters(self, cm) -> dict:
+        if cm is None:
+            return {}
+        if self.legacy:
+            return dict(getattr(cm, "mkt_reports", None) or {})
+        return dict((getattr(cm, "reports", None) or {}).get(self.kind) or {})
+
+    def backlog(self, st) -> list:
+        if self.legacy:
+            return list(st.mkt_backlog)
+        return list(dict(getattr(st, "comp", {}) or {}).get(self.kind, {}).get("backlog", []))
+
+    def seen(self, st) -> dict:
+        if self.legacy:
+            return dict(st.mkt_seen)
+        return dict(dict(getattr(st, "comp", {}) or {}).get(self.kind, {}).get("seen", {}))
+
+    def store(self, st, backlog: list, seen: dict) -> None:
+        if self.legacy:
+            st.mkt_backlog, st.mkt_seen = list(backlog), dict(seen)
+            return
+        comp = dict(st.comp or {})
+        sec = {k: v for k, v in (("backlog", list(backlog)), ("seen", dict(seen))) if v}
+        if sec:
+            comp[self.kind] = sec
+        else:
+            comp.pop(self.kind, None)
+        st.comp = comp
+
+
+def current_ctx(cfg=None) -> MktCtx:
+    """The instance being judged on this thread (default: ``mkt`` on
+    ``cfg``'s ``[marketcast]``)."""
+    c = getattr(_CTX, "ctx", None)
+    if c is not None:
+        return c
+    return MktCtx(MKT_KIND, getattr(cfg, "marketcast", None))
+
+
+class mkt_context:  # noqa: N801 — a context manager used like a function
+    """``with mkt_context(ctx):`` — judge / publish as instance ``ctx``."""
+
+    def __init__(self, ctx: MktCtx) -> None:
+        self.ctx = ctx
+
+    def __enter__(self) -> MktCtx:
+        self.saved = getattr(_CTX, "ctx", None)
+        _CTX.ctx = self.ctx
+        return self.ctx
+
+    def __exit__(self, *exc) -> None:
+        _CTX.ctx = self.saved
 
 # base quantiles kept in memory per (snapshot, window) before the cache resets
 MKT_BASE_CACHE_MAX = 200_000
@@ -149,8 +242,32 @@ def mkt_train_time(entry: LaneCEntry) -> float | None:
     return t if math.isfinite(t) and t > 0 else None
 
 
+# DEC-CA-0074: the trainer's embargo contamination receipt results an entry
+# may carry (anything else, or none, and it is not judged on the embargo)
+EMBARGO_SCAN_OK = ("clean", "no_generator")
+EMBARGO_EMBEDDED = "embargo_series_embedded"
+
+
+def embargo_scan_problem(entry: LaneCEntry) -> tuple[str, str] | None:
+    """DEC-CA-0074 guard (b) on the validator: an entry is judged on
+    embargo windows only if its trainer-signed ``marketcast`` record carries
+    the trainer's pre-rent embargo scan (``embargo_scan``) with a passing
+    result. ``embedded`` is the miner's ``fault``; a missing / unknown
+    receipt is ``stale`` (trained without the guard)."""
+    rec = dict(dict(entry.marketcast or {}).get("embargo_scan") or {})
+    res = str(rec.get("result", "") or "")
+    if res in EMBARGO_SCAN_OK:
+        return None
+    if res == "embedded":
+        return "fault", (f"{EMBARGO_EMBEDDED}: the generator embeds embargoed bars "
+                         f"({rec.get('window_id')})")
+    return "stale", ("windows are drawn from the embargo and the trainer-signed record "
+                     f"carries no passing embargo scan (result {res or 'absent'!r})")
+
+
 def mkt_prechecks(entry: LaneCEntry, *, lc, mc, commitments) -> tuple[str, str] | None:
-    """``(stage, reason)`` of the first failed pre-check, or None."""
+    """``(stage, reason)`` of the first failed pre-check, or None (the last
+    is the DEC-CA-0074 embargo-scan receipt, :func:`embargo_scan_problem`)."""
     if entry.target not in lc.targets or suite_of(entry.target) not in mc.target_suites:
         return "target", f"{entry.target!r} is not an enabled MarketCast target"
     m = dict(entry.marketcast or {})
@@ -168,20 +285,7 @@ def mkt_prechecks(entry: LaneCEntry, *, lc, mc, commitments) -> tuple[str, str] 
     if bound != (entry.target, entry.recipe_ref):
         return "binding", (f"commitment as of block {entry.train_block} is {bound!r}, not "
                            f"({entry.target!r}, {entry.recipe_ref!r})")
-    return None
-
-
-def entry_gap_end(entry: LaneCEntry, mc, phase: str) -> float:
-    """The submission instant an entry's ``gap_horizons`` windows end by
-    (owner 2026-11-18): the trainer-stamped ``train_time`` on a judge, 0 on a
-    confirm (the gap is the judge's evidence; a confirm needs fresh windows)
-    or when no gap horizon is configured."""
-    if phase != "judge" or not tuple(getattr(mc, "gap_horizons", ())):
-        return 0.0
-    t = mkt_train_time(entry)
-    if t is None:
-        raise ValueError("no train_time on the entry's marketcast record")
-    return float(t)
+    return embargo_scan_problem(entry)
 
 
 def entry_after(entry: LaneCEntry, mc, *, fresh_after: float = 0.0) -> float:
@@ -193,6 +297,61 @@ def entry_after(entry: LaneCEntry, mc, *, fresh_after: float = 0.0) -> float:
     if t is None:
         raise ValueError("no train_time on the entry's marketcast record")
     return max(t + float(mc.start_margin_seconds), float(fresh_after or 0.0))
+
+
+# DEC-CA-0075 (item 2): the embargo in force at the leg's DISPATCH, stamped
+# by the trainer into the signed ``marketcast`` record; the draw / scan /
+# verdict read these, never the verdict-time config, so an overlay that
+# changes ``[marketcast] embargo_days`` / ``embargo_eval_days`` never scores
+# a leg on windows inside its own training data.
+EMBARGO_RECORD_KEYS = ("embargo_days", "embargo_eval_days")
+
+
+def entry_embargo_mc(entry, mc):
+    """``mc`` with the entry's RECORDED dispatch-time embargo (legacy entry
+    without the record: ``mc`` unchanged — the value then was the config's)."""
+    from dataclasses import replace
+
+    rec = dict(getattr(entry, "marketcast", None) or {})
+    got = {k: int(rec[k]) for k in EMBARGO_RECORD_KEYS
+           if type(rec.get(k)) is int and int(rec[k]) > 0}
+    return replace(mc, **got) if got else mc
+
+
+def entry_draw(entry: LaneCEntry, mc, *, phase: str, block: int, block_hash: str,
+               fresh_after: float = 0.0) -> dict:
+    """DEC-CA-0074: the entry's signed draw record at round ``block``
+    (:func:`cascade.pool.marketcast.embargo_draw`): backtests from the
+    embargo before its trainer-stamped dispatch, forwards after
+    :func:`entry_after`. DEC-CA-0075: on the embargo RECORDED at the leg's
+    dispatch (:func:`entry_embargo_mc`)."""
+    from ..pool.marketcast import embargo_draw
+
+    mc = entry_embargo_mc(entry, mc)
+    t = mkt_train_time(entry)
+    if t is None:
+        raise ValueError("no train_time on the entry's marketcast record")
+    return embargo_draw(mc, train_time=t, phase=phase, block=int(block), block_hash=block_hash,
+                        after=entry_after(entry, mc, fresh_after=fresh_after))
+
+
+def _draw_mismatch(entry: LaneCEntry, rows: MktEntryRows, mc, *, phase: str, block: int,
+                   fresh_after: float) -> str:
+    """Why the rows' signed draw is not the DEC-CA-0074 rule's for ``entry``
+    at round ``block`` (``""`` = it is). Pure; the block hash is taken from
+    the rows (the main validator read it; ``cascade-audit`` checks it on
+    chain)."""
+    from ..pool.marketcast import draw_problem
+
+    d = dict(rows.draw or {})
+    if not d:
+        return "no draw record"
+    try:
+        want = entry_draw(entry, mc, phase=phase, block=block,
+                          block_hash=str(d.get("block_hash", "")), fresh_after=fresh_after)
+    except ValueError as e:
+        return str(e)
+    return draw_problem(d, want)
 
 
 def anchor_time(train_block: int, snapshot_meta: dict) -> float:
@@ -260,19 +419,22 @@ def mkt_family_sizes(cands) -> dict[tuple[str, str, str], int]:
 def judge_marketcast_entry(entry: LaneCEntry, rows: MktEntryRows | None, *, mc, k: int,
                            phase: str, seed: str, round_block: int, origin_block: int,
                            base_pointer: str = "", report: dict | None = None,
-                           why_infra: str = "", infra_deferrals: int = 0):
+                           why_infra: str = "", infra_deferrals: int = 0,
+                           lc=None, era_blocks: int = 0):
     """The judgement of one MarketCast entry from its signed rows (a
     :class:`~cascade.validator.lane_c.LaneCJudgement`). ``rows`` None, or
     rows the main validator marked ``infra_deferred``, is an ``infra``
     judgement (``why_infra``): never a loss — it waits (``infra_deferrals``
     + 1 ≤ ``max_infra_deferrals``) or drops with the operator error class
     (requeue-eligible, uncharged). ``within_wait`` is measured on the
-    ROUND's block."""
+    ROUND's block. A passing verdict carries its gain-scaled full-pay
+    duration (DEC-CA-0073) on ``[lane_c]`` (``lc``) terms at ``era_blocks``
+    (the era length at the confirming settlement); ``lc`` None = no record."""
     from ..funding.queue import OPERATOR_FAULT_CLASS
     from .lane_c import LaneCJudgement
 
     alpha = float(mc.alpha) / max(1, int(k))
-    within = int(round_block) - int(origin_block) <= int(mc.verdict_wait_blocks)
+    within = int(round_block) - int(origin_block) <= int(mc.wait_blocks)   # <= 13 h
     rec = {**(report or {}), "origin_block": int(origin_block), "within_wait": bool(within)}
 
     def _j(passed, stage, reason, **kw):
@@ -323,6 +485,12 @@ def judge_marketcast_entry(entry: LaneCEntry, rows: MktEntryRows | None, *, mc, 
     vs = holder_gain(rows, mc, k=k, seed=seed)
     if vs is not None:
         rec["vs_holder"] = vs        # owner 2026-11-18: the paired slot test
+    if getattr(rows, "draw", None):
+        # DEC-CA-0074 (c): which rule drew the windows, and the forward /
+        # backtest sub-scores (reported; the verdict is the combined set's)
+        rec["draw"] = {k_: rows.draw.get(k_) for k_ in ("rule", "block", "block_hash", "phase",
+                                                         "lo", "hi", "n")}
+        rec["kinds"] = kind_scores(rows, mc, suite=suite_of(entry.target), k=k, seed=seed)
     inc = _inconclusive(v.reason)
     rec["inconclusive"] = inc
     excluded = sum(1 for w in rows.windows if not math.isfinite(float(w.base)))
@@ -339,10 +507,12 @@ def judge_marketcast_entry(entry: LaneCEntry, rows: MktEntryRows | None, *, mc, 
         rec["coverage_passed"] = bool(v.coverage.passed)
     gain = float(v.gain) if np.isfinite(v.gain) else None
     lcb = float(v.gain_lcb) if np.isfinite(v.gain_lcb) else None
-    # an mkt: win's full-pay period is tiered by [marketcast] full_pay_tiers
-    from ..eval.expert_lane import full_pay
+    # DEC-CA-0073: an mkt: win's full-pay duration scales with its gain LCB
+    # from [marketcast] gain_margin (5 days) to [lane_c] full_pay_max_gain (20)
+    from ..shared.lane_c import target_full_pay_record
 
-    fp = full_pay(lcb, mc.full_pay_tiers).record() if v.passed else None
+    fp = (target_full_pay_record(entry.target, lcb, lc, mc, era_blocks=int(era_blocks))
+          if v.passed and lc is not None else None)
     return _j(v.passed, "verdict", v.reason, gain_lcb=lcb, gain=gain, n=int(v.n),
               clusters=int(v.n_clusters), inconclusive=inc, full_pay=fp)
 
@@ -394,7 +564,8 @@ def _ft_forward(fc, windows, idx, steps, *, knots, batch, past, known):
 
 def compute_entry_rows(entry: LaneCEntry, *, phase: str, after: float, snap, mc,
                        base_fc, load_ft: Callable, base_cache: dict, round_id: str = "",
-                       batch: int = 64, ft_cache: dict | None = None
+                       batch: int = 64, ft_cache: dict | None = None,
+                       draw: dict | None = None
                        ) -> tuple[MktEntryRows, bytes | None]:
     """Forecast the base and the fine-tune on EVERY eligible window of the
     entry and return ``(rows, quantile sidecar bytes)``. ``load_ft(pointer)
@@ -410,17 +581,18 @@ def compute_entry_rows(entry: LaneCEntry, *, phase: str, after: float, snap, mc,
     window id)``, the fine-tune's in ``ft_cache`` per ``(pointer, snapshot
     digest, window id)`` (the F4 near-duplicate test reuses them). Losses
     come from the float32 quantiles the sidecar publishes
-    (:func:`~cascade.shared.marketcast_report.score_windows`)."""
+    (:func:`~cascade.shared.marketcast_report.score_windows`). ``draw``
+    (DEC-CA-0074, :func:`entry_draw`) is the windows' signed draw; it rides
+    the rows (None = the plain forward-only cut after ``after``: tests)."""
     from ..eval.marketcast import COVERAGE_GATE_SUITES
     from ..eval.timestral_adapter import batched_forecasts
     from ..pool.marketcast import target_windows
     from ..shared.config.marketcast import base_suite
 
     knots = tuple(mc.quantile_knots)
-    gap_end = entry_gap_end(entry, mc, phase)
-    windows = target_windows(snap, mc, suite_of(entry.target), after=after, gap_end=gap_end)
+    windows = target_windows(snap, mc, suite_of(entry.target), after=after, draw=draw or None)
     base_rows = MktEntryRows(entry.miner_hotkey, entry.trained_pointer, entry.target, phase,
-                             float(after), gap_end=gap_end)
+                             float(after), draw=dict(draw or {}))
     try:
         ft_fc, covs = load_ft(entry.trained_pointer)
     except MktFault as e:
@@ -538,7 +710,7 @@ def near_dup_record(rows: MktEntryRows, data: bytes, refs, *, snap, mc, load_ft:
     if not refs or not rows.windows:
         return {}, None
     windows = target_windows(snap, mc, suite_of(rows.target), after=float(rows.after),
-                             gap_end=float(rows.gap_end))
+                             draw=rows.draw or None)
     qs = decode_quantiles(data, [w.steps for w in windows], len(mc.quantile_knots))
     qb = [q[0] for q in qs]
     qf = [q[1] for q in qs]
@@ -585,7 +757,7 @@ def holder_record(rows: MktEntryRows, data: bytes, holder, *, snap, mc, load_ft:
     if holder is None or not rows.windows or holder[1] == rows.trained_pointer:
         return rows, None
     windows = target_windows(snap, mc, suite_of(rows.target), after=float(rows.after),
-                             gap_end=float(rows.gap_end))
+                             draw=rows.draw or None)
     qb = [q[0] for q in decode_quantiles(data, [w.steps for w in windows],
                                          len(mc.quantile_knots))]
     try:
@@ -631,6 +803,11 @@ class MktPlan:
     # settlement ends with no holder), so the fold must too. Transient (a
     # plan is folded in the poll that computed it, never persisted).
     evict_after: list = field(default_factory=list)   # (target, hotkey, pointer), AFTER offers
+    # Owner 2026-11-24: every slot holder's registration consulted this
+    # settlement — ``{target, hotkey, uid}`` (uid None = deregistered) as of
+    # the boundary − 1; the receipt records them (``lane_c_registrations``)
+    # so satellites / the audit / late validators never need chain history.
+    registrations: list = field(default_factory=list)
 
 
 def _candidate(entry: LaneCEntry, phase: str, p: PendingEntry | None,
@@ -665,14 +842,15 @@ def _superseded(seen: dict, e: LaneCEntry) -> dict | None:
     return h
 
 
-def _slot_holders(work) -> dict[str, tuple[str, str, int]]:
+def _slot_holders(work, ctx: MktCtx | None = None) -> dict[str, tuple[str, str, int]]:
     """Red-team F4: ``{mkt target: (hotkey, pointer, commit block)}`` of the
     current slot holders — references for the near-duplicate test (a
     holder whose commit block the identity registry lacks is senior: -1)."""
     cbs = {(v.get("hotkey"), v.get("pointer")): int(v.get("commit_block", -1))
            for v in work.mkt_seen.values()}
     return {t: (w.hotkey, w.trained_pointer, cbs.get((w.hotkey, w.trained_pointer), -1))
-            for t, w in work.slots.items() if is_mkt_target(t)}
+            for t, w in work.slots.items()
+            if (ctx.is_target(t) if ctx is not None else is_mkt_target(t))}
 
 
 def _dup_reason(h: dict) -> str:
@@ -694,6 +872,8 @@ class MarketCastMixin:
 
     mkt_forecaster_fn: Callable | None = None
     mkt_snapshot_fn: Callable | None = None
+    # DEC-CA-0074: ``block -> 0x hash`` of a round block (tests; None = chain)
+    mkt_block_hash_fn: Callable | None = None
     # GPU offload (cascade.validator.mkt_offload): the hosts file the
     # provisioner's [provisioner.mkt] stage publishes (None = forecast on
     # --device); how long one publish run waits for the pod; injectable
@@ -702,6 +882,10 @@ class MarketCastMixin:
     mkt_host_wait_s: float = 1800.0
     mkt_lease_fn: Callable | None = None
     mkt_session_fn: Callable | None = None
+
+    def _mkt_cfg(self):
+        """The MarketCast-shaped table of the instance being judged."""
+        return current_ctx(getattr(self, "cfg", None)).mc
 
     def _mkt_main_hotkey(self) -> str:
         return str(getattr(getattr(self.cfg, "netconfig", None), "owner_hotkey", "") or "")
@@ -723,18 +907,40 @@ class MarketCastMixin:
         fn = self.mkt_snapshot_fn
         if fn is not None:
             return fn(block)
-        src = getattr(self, "_mkt_source_obj", None)
-        if src is None:
+        mc = self._mkt_cfg()
+        # DEC-CA-0075: the competition spec names the pool (prefix + signer +
+        # schema + series filter); a spec change takes a new source, and each
+        # instance keeps its own (W-CMP2)
+        signer = str(mc.pool_signer or "") or self._mkt_main_hotkey()
+        key = (mc.pool_prefix, signer, mc.pool_schema, tuple(mc.pool_select),
+               tuple(getattr(mc, "pool_channels", ())))
+        srcs = self.__dict__.setdefault("_mkt_sources", {})
+        src = srcs.get(current_ctx(getattr(self, "cfg", None)).kind)
+        if src is None or srcs.get(("key", current_ctx(getattr(self, "cfg", None)).kind)) != key:
             from ..pool.marketcast import MktSnapshotSource
             from ..shared.hippius import pool_s3_store
 
             src = MktSnapshotSource(
-                pool_s3_store(self.cfg.storage), prefix=self.cfg.marketcast.pool_prefix,
-                signer_hotkey=self._mkt_main_hotkey(),
+                pool_s3_store(self.cfg.storage), prefix=mc.pool_prefix,
+                signer_hotkey=signer,
                 cache_dir=Path(getattr(self, "cache_dir", None) or "./_eval_pool"),
-                verify_signature=bool(self.verify_signatures))
-            self._mkt_source_obj = src
+                verify_signature=bool(self.verify_signatures),
+                schema=mc.pool_schema, select=dict(mc.pool_select),
+                channels=dict(getattr(mc, "pool_channels", ())))
+            srcs[current_ctx(getattr(self, "cfg", None)).kind] = src
+            srcs[("key", current_ctx(getattr(self, "cfg", None)).kind)] = key
         return src.snapshot_for(block)
+
+    def _mkt_block_hash(self, block: int) -> str:
+        """The hash of ``block`` (DEC-CA-0074 draw seed): ``mkt_block_hash_fn``
+        (tests) or the loop's chain client."""
+        fn = self.mkt_block_hash_fn
+        if fn is not None:
+            return str(fn(int(block)))
+        chain = getattr(self, "_lane_b_chain", None)
+        if chain is None:
+            raise RuntimeError("no chain client wired to read the draw's block hash")
+        return str(chain.block_hash(int(block)))
 
     def _mkt_base(self):
         fn = self.mkt_forecaster_fn
@@ -747,7 +953,7 @@ class MarketCastMixin:
         if hit is None:  # pragma: no cover — GPU + the timestral extra
             from ..eval.timestral_adapter import load_pinned_base
 
-            mc = self.cfg.marketcast
+            mc = self._mkt_cfg()
             hit, _d = load_pinned_base(mc.base_ref, mc.base_sha256,
                                        cache_dir=getattr(self, "cache_dir", None),
                                        device=str(getattr(self, "device", "cpu")))
@@ -759,7 +965,7 @@ class MarketCastMixin:
         d = getattr(self, "_mkt_base_dir", None)
         if d is None:
             d = self._mkt_base_dir = resolve_pinned_base_dir(
-                self.cfg.marketcast, cache_dir=getattr(self, "cache_dir", None))
+                self._mkt_cfg(), cache_dir=getattr(self, "cache_dir", None))
         return Path(d)
 
     def _mkt_load_ft(self, pointer: str):
@@ -790,7 +996,7 @@ class MarketCastMixin:
                 raise MktFault("fine-tune weights are not finite")
             raw = (dest / META_FILE).read_bytes()
             meta = json.loads(raw)
-            why = meta_problem(meta, self.cfg.marketcast, size=len(raw))
+            why = meta_problem(meta, self._mkt_cfg(), size=len(raw))
             if why:
                 raise MktFault(why)
             sess = self.__dict__.get("_mkt_sess")
@@ -816,7 +1022,7 @@ class MarketCastMixin:
 
         if arbiter == REPORT_ABSENT:
             return None, "", "the main validator's report never appeared (recorded absent)"
-        key = mkt_report_key(rid)
+        key = current_ctx(getattr(self, "cfg", None)).report_key(rid)
         try:
             text = self._mkt_store().get_text(key)
         except Exception as e:  # noqa: BLE001 — the recorded bytes exist: retried
@@ -851,17 +1057,18 @@ class MarketCastMixin:
         from ..shared.lane_c import LaneCState
         from .lane_c import LaneCJudgement
 
-        mc = getattr(self.cfg, "marketcast", None)
-        new = [e for e in (cm.entries if cm is not None else ()) if is_mkt_target(e.target)]
-        legacy = [p for p in st.pending if is_mkt_target(p.target)]
+        ctx = current_ctx(getattr(self, "cfg", None))
+        mc = ctx.mc
+        new = [e for e in (cm.entries if cm is not None else ()) if ctx.is_target(e.target)]
+        legacy = [p for p in st.pending if ctx.is_target(p.target)]
         if mc is None or not mc.active(block):
             js = [LaneCJudgement(e, False, "target", "MarketCast is not active at this "
                                  "settlement", phase="judge", k=1,
                                  alpha=float(getattr(mc, "alpha", 0.05)),
                                  mkt={"inconclusive": ""}) for e in new]
             return None, js
-        quiet = not (new or legacy or st.mkt_backlog)
-        comp = self.cfg.lane_c.competition(MKT_KIND)
+        quiet = not (new or legacy or ctx.backlog(st))
+        comp = self.cfg.lane_c.competition(ctx.kind)
         if comp is not None and competition_past_end(comp, block):
             if quiet:
                 return None, []
@@ -879,11 +1086,11 @@ class MarketCastMixin:
             return None, []
         bp = mc.base_pointer
         work = LaneCState(slots=dict(st.slots), mkt_seen={k: dict(v) for k, v in
-                                                          st.mkt_seen.items()})
+                                                          ctx.seen(st).items()})
         import copy
 
-        backlog = copy.deepcopy(list(st.mkt_backlog))
-        arbiters = dict(getattr(cm, "mkt_reports", None) or {}) if cm is not None else {}
+        backlog = copy.deepcopy(ctx.backlog(st))
+        arbiters = ctx.arbiters(cm)
         expiry = 2 * int(mc.report_timeout_settlements)
         for item in backlog:
             if not item.get("arbiter") and str(item["round_id"]) in arbiters:
@@ -896,10 +1103,15 @@ class MarketCastMixin:
         from ..shared.lane_c import win_expired
 
         for target, holder in list(work.slots.items()):
+            if not ctx.is_target(target):
+                continue                   # another competition's slot (W-CMP2)
+            # DEC-CA-0073: the holder's full-pay duration ran out — the slot ends
             expired = win_expired(work.eras_since(holder, block,
-                                                 era_length_blocks(self.cfg.round, block)), self.cfg.lane_c)
-            unregistered = registration is not None and self._mkt_registration(
-                registration, holder.hotkey, max(0, block - 1), rid=rid) is None
+                                                 era_length_blocks(self.cfg.round, block)),
+                                  holder, self.cfg.lane_c)
+            unregistered = registration is not None and self._mkt_holder_uid(
+                registration, target, holder.hotkey, max(0, block - 1), rid=rid,
+                plan=plan) is None
             if expired or unregistered:
                 plan.evict.append((target, holder.hotkey, holder.trained_pointer))
                 del work.slots[target]
@@ -1001,12 +1213,12 @@ class MarketCastMixin:
             work.mkt_seen = dict(keep)
         plan.backlog, plan.seen = backlog, work.mkt_seen
         if self._mkt_is_main():
-            holders = _slot_holders(work)
+            holders = _slot_holders(work, ctx)
             todo = [item for item in backlog if not item.get("arbiter")]
             if self.mkt_eval_hosts is not None:
                 # offloaded: off the settlement thread (the pod may take
                 # minutes to come up; the trainer's arbiter waits for it)
-                self._mkt_publish_async(copy.deepcopy(todo), dict(holders))
+                self._mkt_publish_async(copy.deepcopy(todo), dict(holders), ctx=ctx)
             else:
                 for item in todo:
                     self._mkt_publish_round(item, holders=holders)
@@ -1021,6 +1233,96 @@ class MarketCastMixin:
                 if not holds:
                     j.holder = _holder_dict(holder)
         return plan, judgements + reg
+
+    def _mkt_holder_uid(self, registration: Callable, target: str, hotkey: str, block: int,
+                        *, rid: str, plan: MktPlan):
+        """A slot holder's uid AS OF ``block`` (the boundary − 1), recorded on
+        ``plan``. Sources, in order (owner 2026-11-24 — no chain history
+        needed): this node's boundary snapshot (read live at the boundary,
+        :meth:`_lane_c_registration_tick`); the MAIN validator's signed
+        receipt record for this round (a late node catching up); else the
+        chain read (whose client falls back to an archive endpoint for a
+        pruned block)."""
+        found, uid = self._mkt_known_registration(hotkey, block, rid=rid)
+        if not found:
+            uid = self._mkt_registration(registration, hotkey, block, rid=rid)
+        plan.registrations.append({"target": str(target), "hotkey": str(hotkey),
+                                   "uid": None if uid is None else int(uid)})
+        return uid
+
+    def _lane_c_reg_snapshots(self):
+        from ..shared.lane_c_registrations import RegistrationSnapshots
+
+        snaps = self.__dict__.get("_lane_c_reg_snaps")
+        if snaps is None:
+            snaps = RegistrationSnapshots(Path(
+                str(self.cfg.validator.state_db_path) + ".lane_c_registrations.json"))
+            self.__dict__["_lane_c_reg_snaps"] = snaps
+        return snaps
+
+    def _mkt_known_registration(self, hotkey: str, block: int, *, rid: str
+                                ) -> tuple[bool, int | None]:
+        """``(found, uid)`` from a recorded source (never the chain)."""
+        from ..shared.lane_c_registrations import recorded_uid
+
+        try:
+            snap = self._lane_c_reg_snapshots().get(int(block))
+        except Exception:  # noqa: BLE001 — a cache fault falls through
+            snap = None
+        if snap is not None:
+            uid = snap.get(str(hotkey))
+            return True, (None if uid is None else int(uid))
+        return recorded_uid(self._mkt_main_registrations(rid), hotkey, int(block))
+
+    def _mkt_main_registrations(self, rid: str) -> dict | None:
+        """The MAIN validator's signed ``lane_c_registrations`` record for
+        round ``rid`` (verified against ``[netconfig] owner_hotkey``), or
+        None — absent, unreadable or unsigned (cached per round)."""
+        cache = self.__dict__.setdefault("_mkt_main_reg_cache", {})
+        if rid in cache:
+            return cache[rid]
+        rec = None
+        main = self._mkt_main_hotkey()
+        if main:
+            from ..shared.hippius import receipt_round_key
+            from ..shared.receipt import load_receipt, verify_receipt_signature
+
+            try:
+                receipt = load_receipt(self._mkt_store().get_text(
+                    receipt_round_key(str(rid), main)))
+                if (str(receipt.round_id) == str(rid)
+                        and verify_receipt_signature(receipt, main)):
+                    rec = getattr(receipt, "lane_c_registrations", None)
+            except Exception:  # noqa: BLE001 — not published yet / unreadable
+                rec = None
+        if rec is not None:
+            cache[rid] = rec
+        return rec
+
+    def _lane_c_registration_tick(self, client: object) -> None:
+        """Snapshot ``hotkey → uid`` of the netuid AS OF the current
+        settlement boundary − 1 while that block is fresh on any node (lane C
+        active only; one metagraph read per boundary). Never raises."""
+        from ..shared.lane_c_registrations import SNAPSHOT_FRESH_BLOCKS
+
+        lc = getattr(self.cfg, "lane_c", None)
+        fn = getattr(client, "hotkey_uids_at_block", None)
+        if lc is None or not lc.from_block or fn is None:
+            return
+        try:
+            cur = int(client.current_block())  # type: ignore[attr-defined]
+            grid = int(self._lane_b_epoch_blocks(cur))
+            b = cur // grid * grid
+            if b <= 0 or not lc.active(b):
+                return
+            snaps = self._lane_c_reg_snapshots()
+            key = b - 1
+            if snaps.get(key) is not None or cur - key > SNAPSHOT_FRESH_BLOCKS:
+                return
+            snaps.put(key, dict(fn(key)))
+        except Exception as e:  # noqa: BLE001 — the settlement falls back
+            log.warning("lane C: boundary registration snapshot failed (%s); the settlement "
+                        "falls back to the main validator's record / the chain", e)
 
     @staticmethod
     def _mkt_registration(registration: Callable, hotkey: str, block: int, *, rid: str):
@@ -1069,11 +1371,12 @@ class MarketCastMixin:
             _row(e, None, "judge")
         for p in sorted(legacy, key=PendingEntry.sort_key):
             _row(LaneCEntry(**p.entry), p, "confirm" if p.kind == "confirm" else "judge")
-        for item in st.mkt_backlog:
+        ctx = current_ctx(getattr(self, "cfg", None))
+        for item in ctx.backlog(st):
             for c in item.get("candidates") or ():
                 e, phase, p = _unpack(c)
                 _row(e, p, phase)
-        return MktPlan(backlog=[], seen=dict(st.mkt_seen)), js
+        return MktPlan(backlog=[], seen=ctx.seen(st)), js
 
     def _mkt_apply_item(self, item: dict, work, *, settle_rid: str, settle_block: int,
                         era_index: int) -> tuple[list, list, list]:
@@ -1089,20 +1392,28 @@ class MarketCastMixin:
             resolve_outcomes,
         )
 
-        mc = self.cfg.marketcast
+        mc = self._mkt_cfg()
         R, B = str(item["round_id"]), int(item["block"])
         arbiter = str(item["arbiter"])
         rep, sha, why = self._mkt_read_recorded(R, arbiter)
         cands = [_unpack(c) for c in item["candidates"]]
         # red-team F6: the family counts OWNERS (coldkeys), weighted Bonferroni
         ks = mkt_family_sizes([e for e, ph, _p in cands if ph == "judge"])
-        info = {"report_key": mkt_report_key(R), "report_sha256": sha, "round": R,
+        # DEC-CA-0075: the competition spec's test family (bonferroni = today)
+        from ..shared.rules_menu import family_size
+
+        ks = {key: family_size(mc.test_family, v) for key, v in ks.items()}
+        info = {"report_key": current_ctx(getattr(self, "cfg", None)).report_key(R), "report_sha256": sha,
+                "round": R,
                 "round_block": B}
         if item.get("expired"):
             info["report_expired"] = True
         if rep is not None:
             info["snapshot_sha256"] = str(rep.snapshot.get("sha256", ""))
             info["snapshot_end"] = float(rep.snapshot.get("end", 0) or 0)
+        from ..shared.era import era_length_blocks
+
+        settle_eb = int(era_length_blocks(self.cfg.round, int(settle_block)))
         js = []
         for e, phase, p in cands:
             base = e.marketcast or {}
@@ -1147,14 +1458,19 @@ class MarketCastMixin:
                         rows, why_e = None, (f"the report cuts windows after {rows.after}, the "
                                              f"trainer's dispatch time gives "
                                              f"{entry_after(e, mc, fresh_after=fresh)}")
-                    elif not rows.deferred and float(rows.gap_end) != entry_gap_end(e, mc, phase):
-                        rows, why_e = None, (f"the report cuts gap windows before "
-                                             f"{rows.gap_end}, the trainer's dispatch time "
-                                             f"gives {entry_gap_end(e, mc, phase)}")
+                    elif not rows.deferred:
+                        # DEC-CA-0074: the signed draw must be the rule's for
+                        # this round, entry and phase (the hash is the audit's)
+                        why_d = _draw_mismatch(e, rows, mc, phase=phase, block=B,
+                                               fresh_after=fresh)
+                        if why_d:
+                            rows, why_e = None, f"the report's window draw: {why_d}"
                 j = judge_marketcast_entry(
                     e, rows, mc=mc, k=k, phase=phase, seed=f"{R}|{e.miner_hotkey}|{e.target}",
                     round_block=B, origin_block=origin, base_pointer=mc.base_pointer, report=rec,
-                    why_infra=why_e, infra_deferrals=int(pm.get("infra_deferrals", 0) or 0))
+                    why_infra=why_e, infra_deferrals=int(pm.get("infra_deferrals", 0) or 0),
+                    # the duration is on the era grid at the CONFIRMING settlement
+                    lc=self.cfg.lane_c, era_blocks=settle_eb)
             if p is not None:
                 j.carried = phase == "judge"
                 j.origin_round = str(p.round_id)
@@ -1178,7 +1494,7 @@ class MarketCastMixin:
         and stage the reference sidecars in ``sidecars``."""
         from .mkt_offload import MktOffloadError
 
-        mc = self.cfg.marketcast
+        mc = self._mkt_cfg()
         out = []
         same_target: dict = {}
         for (hk, ptr, ph), v in datas.items():
@@ -1221,7 +1537,7 @@ class MarketCastMixin:
 
     # ── the main validator's rows ──
 
-    def _mkt_publish_async(self, todo: list, holders: dict) -> bool:
+    def _mkt_publish_async(self, todo: list, holders: dict, *, ctx: MktCtx | None = None) -> bool:
         """Offloaded publishing: one background run over ``todo`` (False =
         a run is still going; the next settlement retries what it leaves)."""
         t = self.__dict__.get("_mkt_pub_thread")
@@ -1233,8 +1549,14 @@ class MarketCastMixin:
             return False
         import threading
 
-        t = threading.Thread(target=self._mkt_publish_remote, args=(todo, holders),
-                             name="mkt-publish", daemon=True)
+        ctx = ctx if ctx is not None else current_ctx(getattr(self, "cfg", None))
+
+        def _run():
+            # the instance travels with the run (W-CMP2)
+            with mkt_context(ctx):
+                self._mkt_publish_remote(todo, holders)
+
+        t = threading.Thread(target=_run, name=f"mkt-publish-{ctx.kind}", daemon=True)
         self.__dict__["_mkt_pub_thread"] = t
         t.start()
         return True
@@ -1250,7 +1572,7 @@ class MarketCastMixin:
         need = []
         for item in todo:
             try:
-                store.get_text(mkt_report_key(str(item["round_id"])))
+                store.get_text(current_ctx(getattr(self, "cfg", None)).report_key(str(item["round_id"])))
             except ObjectNotFound:
                 need.append(item)
             except Exception as e:  # noqa: BLE001 — unknown: retried next settlement
@@ -1272,9 +1594,11 @@ class MarketCastMixin:
             try:
                 sess.start()
                 self.__dict__["_mkt_sess"] = sess
-                for item in need:
-                    lease.touch(str(item["round_id"]))
-                    published += bool(self._mkt_publish_round(item, holders=holders))
+                beat = getattr(lease, "heartbeat", None)
+                with (beat(rid0) if callable(beat) else contextlib.nullcontext()):
+                    for item in need:
+                        lease.touch(str(item["round_id"]))
+                        published += bool(self._mkt_publish_round(item, holders=holders))
             finally:
                 self.__dict__.pop("_mkt_sess", None)
                 sess.close()
@@ -1301,7 +1625,7 @@ class MarketCastMixin:
         from ..shared.hippius import ObjectNotFound, StorageError
 
         rid = str(item["round_id"])
-        key = mkt_report_key(rid)
+        key = current_ctx(getattr(self, "cfg", None)).report_key(rid)
         store = self._mkt_store()
         try:
             store.get_text(key)
@@ -1312,7 +1636,7 @@ class MarketCastMixin:
             log.warning("marketcast round=%s: report existence unreadable (%s); retried at the "
                         "next settlement", rid, e)
             return False
-        mc = self.cfg.marketcast
+        mc = self._mkt_cfg()
         sess = self.__dict__.get("_mkt_sess")
         if self.mkt_eval_hosts is not None and sess is None:
             log.warning("marketcast round=%s: offload configured but no pod session; "
@@ -1329,6 +1653,14 @@ class MarketCastMixin:
                       "next settlement", rid, mc.pool_prefix, item["block"])
             return False
         snap, skey, ssha = got
+        try:
+            # DEC-CA-0074: the round block's hash ranks the embargo draw (it
+            # did not exist while the legs trained)
+            bhash = self._mkt_block_hash(int(item["block"]))
+        except Exception as e:  # noqa: BLE001 — a chain read: retried next settlement
+            log.error("marketcast round=%s: block %s hash unreadable (%s); retried at the "
+                      "next settlement", rid, item["block"], e)
+            return False
         cache = getattr(self, "_mkt_base_cache", None)
         if cache is None or len(cache) > MKT_BASE_CACHE_MAX:
             cache = self._mkt_base_cache = {}
@@ -1353,8 +1685,9 @@ class MarketCastMixin:
             fresh = float((p.mkt or {}).get("fresh_after", 0.0) or 0.0) \
                 if (p is not None and phase == "confirm") else 0.0
             after = entry_after(e, mc, fresh_after=fresh)
-            stub = MktEntryRows(e.miner_hotkey, e.trained_pointer, e.target, phase, after,
-                                gap_end=entry_gap_end(e, mc, phase))
+            stub = MktEntryRows(e.miner_hotkey, e.trained_pointer, e.target, phase, after)
+            draw = entry_draw(e, mc, phase=phase, block=int(item["block"]),
+                              block_hash=bhash, fresh_after=fresh)
             n = int((p.mkt or {}).get("infra_deferrals", 0) or 0) + 1 if p is not None else 1
             # the trainer requeues (uncharged) an entry whose deferral is its last
             cap = (f" — past max_infra_deferrals ({n} > {mc.max_infra_deferrals})"
@@ -1371,7 +1704,7 @@ class MarketCastMixin:
                     rows, data = compute_entry_rows(
                         e, phase=phase, after=after, snap=snap, mc=mc, base_fc=base_fc,
                         load_ft=self._mkt_load_ft, base_cache=cache, round_id=rid,
-                        ft_cache=ft_cache)
+                        ft_cache=ft_cache, draw=draw)
                     break
                 except MktOffloadError as x:
                     # the POD failed, not this entry: nothing is deferred or
@@ -1460,7 +1793,7 @@ def _near_dup_refs(rows: MktEntryRows, sen: tuple, datas: dict, holders: dict) -
     return refs
 
 
-def fold_mkt_plan(st, plan: MktPlan | None) -> list:
+def fold_mkt_plan(st, plan: MktPlan | None, ctx: MktCtx | None = None) -> list:
     """Replay a :class:`MktPlan` onto the live state (the fold) in the exact
     order judge time applied it to its scratch copy (``_mkt_settle``): evict
     expired / deregistered holders, offer the wins in order, evict the
@@ -1481,14 +1814,15 @@ def fold_mkt_plan(st, plan: MktPlan | None) -> list:
         if st.record(w):
             took.append(w)
     _evict(getattr(plan, "evict_after", ()))
-    st.mkt_backlog = list(plan.backlog)
-    st.mkt_seen = dict(plan.seen)
-    st.pending = [p for p in st.pending if not is_mkt_target(p.target)]
+    ctx = ctx if ctx is not None else MktCtx(MKT_KIND, None)
+    ctx.store(st, list(plan.backlog), dict(plan.seen))
+    st.pending = [p for p in st.pending if not ctx.is_target(p.target)]
     return took
 
 
 __all__ = [
-    "MKT_COMPUTE_ATTEMPTS", "MarketCastMixin", "MktFault", "MktPlan", "anchor_time",
-    "compute_entry_rows", "holder_record", "entry_after", "entry_gap_end", "fold_mkt_plan", "judge_marketcast_entry",
+    "MKT_COMPUTE_ATTEMPTS", "MarketCastMixin", "MktCtx", "current_ctx", "mkt_context", "MktFault", "MktPlan", "anchor_time",
+    "compute_entry_rows", "holder_record", "entry_after", "entry_draw", "entry_embargo_mc",
+    "EMBARGO_RECORD_KEYS", "embargo_scan_problem", "fold_mkt_plan", "judge_marketcast_entry",
     "mkt_prechecks", "mkt_train_time", "snapshot_record", "suite_of",
 ]

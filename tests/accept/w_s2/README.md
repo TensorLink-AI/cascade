@@ -133,3 +133,9 @@ These are left to the builder:
 | `PATHS` | the modules W-S2 may change |
 | `helpers.py` | the scenario: real judge, acceptance, validator mixin and driver; the GPU-boundary stubs; the torch guard |
 | `test_w_s2_guard_exclusion.py` | the plan text (W-S2 / TS4 / D35 / §16 verbatim), contract items 1–10, the invariant pairs |
+
+## rev6.20 (owner 2026-11-24): stage `scored_weights`
+
+`judge_entry` refuses an entry whose `scored_weights` is not `"ema010"`
+(every lane B leg scores its power EMA), before any fetch.
+`test_w_s2_scored_weights_stage.py`.

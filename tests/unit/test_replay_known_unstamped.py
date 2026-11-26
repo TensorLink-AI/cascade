@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from cascade.audit.checks import FAIL, PASS, SKIP, WARN, CheckResult
+from cascade.audit.checks import FAIL, KING_CHECK_BENCH, PASS, SKIP, WARN, CheckResult
 
 _SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "replay_mainnet_receipts.py"
 _spec = importlib.util.spec_from_file_location("_replay_mainnet_receipts", _SCRIPT)
@@ -55,6 +55,15 @@ def test_pinned_mainnet_entry_is_the_documented_round():
                    "reign_start_block": 9547200}
 
 
+def test_pinned_mainnet_entry_2026_11_24():
+    # rc37 settlement 9576000: rate-limited push (13:42:50, 88 blocks after the
+    # 13:25:08 re-assert); clock 9561600 from the 9574200 receipt — the 9575100
+    # settlement between them recorded no king check, no verdict, ladder none.
+    pin = R.KNOWN_UNSTAMPED_EMISSION["13058784948867351860"]
+    assert pin == {"clock_round": "9495195076473738382", "clock_boundary": 9574200,
+                   "reign_start_block": 9561600}
+
+
 def test_clock_borrowable_when_everything_verifies():
     assert R.known_clock_problem(_bad(), _src(), PIN) is None
     patched = R.with_borrowed_clock(_bad(), _src())
@@ -89,7 +98,10 @@ def _patch(monkeypatch, *, src, rederived):
 
     def fake_audit(rc, cfg, *, tier, client=None):
         calls.append(rc)
-        return [CheckResult("king-check", rederived[0], rederived[1])]
+        if rederived is None:
+            return [CheckResult("status", PASS)]
+        name = rederived[2] if len(rederived) > 2 else "king-check"
+        return [CheckResult(name, rederived[0], rederived[1])]
 
     monkeypatch.setattr(M, "audit_receipt", fake_audit)
     monkeypatch.setattr(M, "_fetch_text", lambda cfg, key: key)
@@ -131,3 +143,24 @@ def test_other_king_check_fails_untouched(monkeypatch):
     assert R._replay_known_unstamped(_bad(), other, PIN, ROWS, cfg=None,
                                      client=None) == other
     assert not calls
+
+
+def test_bench_rows_unfetched_warn_downgrades(monkeypatch):
+    # due-ness + pool half + recorded bench means verify, signed task rows not
+    # fetched ⇒ the audit's KING_CHECK_BENCH WARN; still a verified downgrade
+    _patch(monkeypatch, src=_src(), rederived=(WARN, "fail reproduced; NOT replayed",
+                                               KING_CHECK_BENCH))
+    out = R._replay_known_unstamped(_bad(), BEFORE, PIN, ROWS, cfg=None, client=None)
+    assert out[1].name == "king-check" and out[1].status == WARN
+    assert "KNOWN DEFECT" in out[1].detail and "NOT replayed" in out[1].detail
+
+
+@pytest.mark.parametrize("rederived", [
+    None,                                               # no king-check row at all
+    (FAIL, "bench half differs", KING_CHECK_BENCH),
+    (WARN, "transient deferral"),                       # king-check WARN is not a PASS
+])
+def test_other_rederivations_keep_fail(monkeypatch, rederived):
+    _patch(monkeypatch, src=_src(), rederived=rederived)
+    out = R._replay_known_unstamped(_bad(), BEFORE, PIN, ROWS, cfg=None, client=None)
+    assert out[1].status == FAIL and "pin rejected" in out[1].detail

@@ -56,10 +56,16 @@ class ReceiptMixin:
         king_check: dict | None = None,
         lane_c: list[dict] | None = None,
         lane_c_pay: dict | None = None,
+        lane_c_registrations: dict | None = None,
         king_check_scores: tuple = (),
         sentinel: dict | None = None,
+        lane_d: dict | None = None,
     ) -> RoundReceipt:
         """Assemble the round's public receipt (pure — no I/O, no signing).
+
+        ``lane_d`` (LANE_D_PLAN W14) is the settlement's lane D receipt record
+        (present, or ``status: "absent"``), passed through to the receipt;
+        ``None`` (unarmed) keeps today's bytes.
 
         ``era_base_seed`` (DEC-CA-0043, era settlements only) is
         ``block_seed(era.seed_block)``: the era's training seeds derive from
@@ -100,7 +106,8 @@ class ReceiptMixin:
                 prelaunch_burn_block=self.prelaunch_burn_block,
                 emission=emission, king_check=king_check,
                 king_check_scores=king_check_scores,
-                lane_c=lane_c, lane_c_pay=lane_c_pay, sentinel=sentinel,
+                lane_c=lane_c, lane_c_pay=lane_c_pay, sentinel=sentinel, lane_d=lane_d,
+                lane_c_registrations=lane_c_registrations,
                 **self._netconfig_receipt_kw(),
                 **self._satellite_receipt_kw(manifest),
                 **self._bench_report_receipt_kw(manifest),
@@ -142,7 +149,8 @@ class ReceiptMixin:
             prelaunch_burn_block=self.prelaunch_burn_block,
             emission=emission, king_check=king_check,
             king_check_scores=king_check_scores,
-            lane_c=lane_c, lane_c_pay=lane_c_pay, sentinel=sentinel,
+            lane_c=lane_c, lane_c_pay=lane_c_pay, sentinel=sentinel, lane_d=lane_d,
+            lane_c_registrations=lane_c_registrations,
             **self._netconfig_receipt_kw(),
             **self._satellite_receipt_kw(manifest),
             **self._bench_report_receipt_kw(manifest),
@@ -239,6 +247,7 @@ class ReceiptMixin:
         lane_b_pay: dict | None = None,
         lane_c: list[dict] | None = None,
         lane_c_pay: dict | None = None,
+        lane_c_registrations: dict | None = None,
     ) -> None:  # pragma: no cover — live-loop glue; assembly is unit-tested
         """Gather chain context, sign, and publish the round receipt.
 
@@ -311,6 +320,7 @@ class ReceiptMixin:
                 era_base_seed=era_base_seed,
                 lane_b=lane_b, lane_b_pay=lane_b_pay,
                 lane_c=lane_c, lane_c_pay=lane_c_pay,
+                lane_c_registrations=lane_c_registrations,
                 emission=getattr(self, "_last_emission", None),
                 king_check=self._king_check_for(str(manifest.round_id)),
                 king_check_scores=self._king_check_scores_for(str(manifest.round_id)),
@@ -412,6 +422,11 @@ class ReceiptMixin:
                 economics=econ,
                 activation=activation,
             )
+            from ..shared.netconfig import out_of_bounds_report
+
+            oob = out_of_bounds_report()   # #891: in-force keys at the release value
+            if oob:
+                status["netconfig_out_of_bounds"] = oob
             publish_chain_status(store, status)
         except Exception as e:  # noqa: BLE001 — telemetry only
             log.debug("chain status publish skipped: %s", e)

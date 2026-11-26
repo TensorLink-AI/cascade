@@ -4,7 +4,8 @@ the producer's eligibility, verdict or weight functions.").
 
 Three independent views, all required (README "Invariant 12"):
 
-1. static, direct: every module under `cascade/satellite/` imports, at any
+1. static, direct: the chain-rules module `cascade/audit/lane_d_chain.py` (rev6.18 B2: the
+   former `cascade/satellite/lane_d_replay.py`) imports, at any
    depth (function-level imports included), only the stdlib, numpy, its own
    package and the allowed shared primitives;
 2. static, transitive: the closure over repo modules from those files holds
@@ -56,22 +57,24 @@ def _env() -> dict:
 
 
 def test_the_replay_module_exists_at_its_pinned_path():
+    """rev6.18 B2 (owner 2026-11-23: one lane D checker): the chain rules
+    live in the audit package; the second (satellite) checker is gone."""
     assert MODULE_PATH.is_file(), f"{MODULE_PATH.relative_to(REPO)} does not exist"
     assert module_name(MODULE_PATH) == MODULE
-    assert (REPO / "cascade" / "satellite" / "__init__.py").is_file(), \
-        "cascade/satellite/ is not a package"
+    assert not (REPO / "cascade" / "satellite").exists(), \
+        "cascade/satellite/ (the second lane D checker) still exists"
 
 
 def test_inv12_satellite_direct_imports_are_only_stdlib_numpy_and_allowed_primitives():
     files = satellite_modules()
-    assert MODULE_PATH in files, "no cascade/satellite/lane_d_replay.py to check"
+    assert MODULE_PATH in files, "no cascade/audit/lane_d_chain.py to check"
     bad = {}
     for f in files:
         for imp in sorted(direct_imports(module_name(f))):
             top = imp.split(".")[0]
             if top in _STDLIB or top == "__future__" or top == "numpy":
                 continue
-            if imp.startswith("cascade.satellite") or imp in ALLOWED_PACKAGES:
+            if imp == MODULE or imp in ALLOWED_PACKAGES:
                 continue
             if any(imp == p or imp.startswith(p + ".") for p in ALLOWED_PRIMITIVES):
                 continue
@@ -81,7 +84,7 @@ def test_inv12_satellite_direct_imports_are_only_stdlib_numpy_and_allowed_primit
 
 def test_inv12_satellite_static_closure_reaches_no_producer_module():
     files = satellite_modules()
-    assert MODULE_PATH in files, "no cascade/satellite/lane_d_replay.py to check"
+    assert MODULE_PATH in files, "no cascade/audit/lane_d_chain.py to check"
     closure = static_closure([module_name(f) for f in files])
     assert MODULE in closure
     bad = sorted(m for m in closure if forbidden(m))
@@ -90,7 +93,7 @@ def test_inv12_satellite_static_closure_reaches_no_producer_module():
 
 def test_inv12_satellite_imports_nothing_dynamically():
     files = satellite_modules()
-    assert MODULE_PATH in files, "no cascade/satellite/lane_d_replay.py to check"
+    assert MODULE_PATH in files, "no cascade/audit/lane_d_chain.py to check"
     found = [d for f in files for d in dynamic_imports(f)]
     assert not found, f"dynamic imports the static graph cannot check: {found}"
 
@@ -126,6 +129,8 @@ def test_inv12_a_full_replay_loads_no_producer_module_and_no_torch(saved):
                          timeout=CHAIN_TIMEOUT)
     assert out.returncode == 0, out.stderr[-2000:]
     got = json.loads(out.stdout.strip().splitlines()[-1])
-    assert len(got["results"]) == 4, got["results"]
+    # `house_bar` settles b1..b3 (rev6.11 (b), #755: X crowned at b2, Y at b3).
+    assert len(got["results"]) == 3, got["results"]
+    assert all(r["status"] == "MATCH" for r in got["results"]), got["results"]
     bad = [m for m in got["modules"] if forbidden(m)]
     assert not bad, f"a replay loads {bad}"

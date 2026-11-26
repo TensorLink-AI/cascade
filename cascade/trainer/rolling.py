@@ -138,6 +138,16 @@ class EraState:
     # the PUBLISHED random-init checkpoint the init bench scored ("" when the
     # epoch is warm-started: the init is ``warm_start_ckpt`` itself)
     init_pointer: str = ""
+    # #934: the worker image pin the king entry was dispatched under (the
+    # era contract's ``train_image_digest`` when the leg landed) — a later
+    # image repin still PROVES the entry's digest with it (DEC-CA-0067), so
+    # the king is kept, never retrained. "" = unknown (older state).
+    king_image: str = ""
+    # #934: the king pointer this trainer last PUBLISHED in a settlement of
+    # the era (carried across the seed epoch with the king entry). The
+    # validators hold that pointer for the rest of the seed epoch, so a
+    # contract change never drops/retrains it (it defers to the next epoch).
+    king_pointer_published: str = ""
 
     def spec(self) -> EraSpec:
         return EraSpec(index=self.index, start_block=self.start_block,
@@ -906,6 +916,14 @@ class RollingScheduler:
         self.lane_b = getattr(runner, "lane_b_driver", None)
         # DEC-CA-0056 lane-C driver (None = lane C not wired in this process)
         self.lane_c = getattr(runner, "lane_c_driver", None)
+        # W-LAUNCH lane A shutdown ([round] lane_a_until_block): the block the
+        # cutoff was last logged in force at (one INFO line, not one per tick)
+        self._lane_a_ended_logged: int | None = None
+        until = int(getattr(self.cfg.round, "lane_a_until_block", 0) or 0)
+        if until > 0:
+            log.info("rolling: lane A cutoff configured — from block %d no new lane A "
+                     "challenger leg is seated ([round] lane_a_until_block); in-flight "
+                     "legs, the king leg and king-only settlements continue", until)
 
     # ── persistence ──────────────────────────────────────────────────────────
 
@@ -1046,11 +1064,21 @@ class RollingScheduler:
             slot = {"rid": rid, "started": self.clock(), "digest": "", "error": None,
                     "king": king.trained_pointer, "boundary": int(block)}
 
+            # WB26: suite-target legs carry the era anchor king's bench rows —
+            # the anchor the validator derives from this era's manifest
+            anchor_kw = {}
+            if self.cfg.lane_b.suite_targets:
+                from ..validator.lane_b import lane_b_anchor_pointer
+
+                anchor = lane_b_anchor_pointer(cur)
+                if anchor:
+                    anchor_kw = {"anchor_pointer": anchor}
+
             def _run(slot=slot) -> None:
                 try:
                     drv.settle(round_id=rid, block=int(block), era_index=cur.index,
                                king_pointer=king.trained_pointer,
-                               work_dir=Path(self.r.work_root) / "lane_b")
+                               work_dir=Path(self.r.work_root) / "lane_b", **anchor_kw)
                     slot["digest"] = drv.expert_manifest_digest(rid)
                 except Exception as e:  # noqa: BLE001 — lane B never stalls lane A
                     slot["error"] = e
@@ -1383,11 +1411,39 @@ class RollingScheduler:
         of a leg that recorded the full ``digest`` against ``era``'s contract,
         else None (see :func:`cascade.shared.manifest.prove_runtime_terms`):
         the current pin, every ``[v2] prior_train_image_digests`` entry and —
-        with an automatic repin — the pre-switch pin are tried."""
+        with an automatic repin — the pre-switch pin are tried, plus (#934)
+        the image the era's king entry was dispatched under, so a mid-epoch
+        image repin keeps proving the king it already published."""
         from .leg_pins import proven_runtime_terms
 
+        extra = (str(era.king_image),) if getattr(era, "king_image", "") else ()
         return proven_runtime_terms(self.cfg, self.cfg.training.at_block(int(era.start_block)),
-                                    digest)
+                                    digest, extra_images=extra)
+
+    def _pinned_image(self, era) -> str:
+        """#934: the worker image pin ``era``'s contract names right now (the
+        image a king leg landing now was dispatched under)."""
+        from ..shared.manifest import contract_payload
+
+        try:
+            payload = contract_payload(self.cfg.training.at_block(int(era.start_block)))
+        except Exception:  # noqa: BLE001 — a pre-v2 / partial config: unknown
+            return ""
+        return str(payload.get("train_image_digest", "") or "")
+
+    def _era_king_fixed(self, era, king) -> bool:
+        """#934: ``king`` is the pointer the validators hold for ``era``'s seed
+        epoch — the trainer already published it in a settlement (its record,
+        carried across the epoch), or ``era`` is a LATER era of its seed epoch
+        (the epoch's king leg was carried in, the validators adopted it at the
+        epoch's first settlement). Such a king entry is never dropped or
+        retrained mid-epoch: a new pointer is ``era_king_pointer_mismatch``
+        on every validator for the rest of the epoch."""
+        if king is None:
+            return False
+        if era.king_pointer_published and era.king_pointer_published == king.trained_pointer:
+            return True
+        return self._in_epoch_tail(era)
 
     def _numerics_of(self, era, digest: str) -> str | None:
         """The numerics digest of a leg whose runtime terms are proven
@@ -1628,6 +1684,9 @@ class RollingScheduler:
             return False
         dst.king_entry = dict(src.king_entry)
         dst.king_init = dst.warm_start_ckpt
+        # #934: the pin it ran and the pointer the validators hold ride along
+        dst.king_image = src.king_image
+        dst.king_pointer_published = src.king_pointer_published
         dst.king_uid, dst.king_ref = src.king_uid, src.king_ref
         dst.king_bench = dict(src.king_bench) if src.king_bench else None
         dst.king_bench_published = False       # rides dst's first report
@@ -1839,14 +1898,59 @@ class RollingScheduler:
             log.warning("rolling: king key TTL re-stamp failed (ignored): %s", e)
 
     def _king_hotkey(self, client) -> str | None:
-        """The king per the validators' receipts; the metagraph only cross-
-        checks (it lags a dethrone longer than a settlement)."""
+        """Lane A's king from SIGNED sources only (#933): the validators'
+        receipt trail (``receipt_king`` — the latest anchor-signed scored
+        receipt, walked back past rejected ones, sticky in memory), else the
+        trainer's own persisted era king (the last king it knew), else None —
+        HOLD: no king change, logged at ERROR and raised as an operator alert.
+
+        Never the on-chain incentive: once lanes B/C/D take emissions (and
+        lane A's share can be 0) the top-incentive hotkey is another lane's
+        payee, and adopting it restarted the king leg for lane D's king on
+        testnet 2026-11-25. The metagraph is read for a log-only cross-check."""
         receipt = self.ops.receipt_king()
-        chain = self.ops.metagraph_king(client)
-        if receipt and chain and receipt != chain:
-            log.info("rolling: receipt king %s != metagraph king %s (incentive lag; "
-                     "the receipt decides)", receipt[:12], chain[:12])
-        return receipt or chain
+        if receipt:
+            self._king_hold_noted = None
+            self._clear_king_alert()
+            chain = self.ops.metagraph_king(client)
+            if chain and receipt != chain:
+                log.info("rolling: receipt king %s != top-incentive hotkey %s (incentive "
+                         "lag or another lane's payee; the receipt decides)",
+                         receipt[:12], chain[:12])
+            return receipt
+        cur = self.state.current
+        known = (cur.king_hotkey if cur is not None else "") or ""
+        if known:
+            if getattr(self, "_king_hold_noted", None) != known:   # once per held king
+                self._king_hold_noted = known
+                log.warning("rolling: no signed receipt names a lane A king — holding the "
+                            "persisted era king %s (never the top-incentive hotkey)",
+                            known[:12])
+            return known
+        msg = ("no signed receipt names a lane A king and no persisted era king — HOLD: "
+               "no king leg until a signed receipt names one (the top-incentive hotkey is "
+               "never adopted)")
+        if getattr(self, "_king_hold_noted", None) != "":
+            self._king_hold_noted = ""
+            log.error("rolling: %s", msg)
+        self._raise_king_alert(msg)
+        return None
+
+    def _raise_king_alert(self, msg: str) -> None:
+        try:
+            from .money_guard import alert
+
+            alert(self.r, "lane_a_king_unresolved", "lane_a", msg, severity="critical")
+        except Exception as e:  # noqa: BLE001 — the ERROR line above is the record
+            log.debug("rolling: king alert not raised (%s)", e)
+
+    def _clear_king_alert(self) -> None:
+        try:
+            from .money_guard import clear_alert
+
+            clear_alert(self.r, "lane_a_king_unresolved", "lane_a")
+        except Exception:  # noqa: BLE001
+            pass
 
     # ── king legs ────────────────────────────────────────────────────────────
 
@@ -2039,6 +2143,8 @@ class RollingScheduler:
             with self._lock:
                 era.king_entry = _entry_to_json(replace(cached, role="king"))
                 era.king_init = era.warm_start_ckpt     # cached_leg matched on it
+                era.king_image = self._pinned_image(era)   # #934 (a proof candidate only)
+                era.king_pointer_published = ""
                 era.king_funded_by = funded
                 self._save()
             log.info("rolling: era %d king leg already complete (cached) — reused", era.index)
@@ -2049,6 +2155,7 @@ class RollingScheduler:
                         era.epoch_start, era.king_hotkey[:12])
 
         end_wall = self.king_end_wall(era, block=block, now=now)
+        dispatched_image = self._pinned_image(era)   # #934: the pin this leg runs
 
         def _run() -> None:
             try:
@@ -2065,6 +2172,8 @@ class RollingScheduler:
                 with self._lock:
                     era.king_entry = _entry_to_json(entry)
                     era.king_init = era.warm_start_ckpt
+                    era.king_image = dispatched_image
+                    era.king_pointer_published = ""
                     era.king_funded_by = funded
                     era.king_leg_failed = ""
                     era.king_leg_failures = 0
@@ -2375,6 +2484,12 @@ class RollingScheduler:
         if floor:
             queue.rebase_preopening_reveals(floor, lambda hk, ref: self._reveal_block(history, hk, ref, block))
         queue.expire_stale()
+        if self._lane_a_ended(block):
+            # W-LAUNCH: lane A is shut down — seat nothing new. In-flight legs
+            # (their threads, reattach, settlement) are never touched here, and
+            # pregen builds nothing for entries that will never train.
+            self._intake_history = None
+            return
         cap = int(self.cfg.round.funded_field_cap or 0) or max(1, int(self.cfg.round.finalist_cap))
         in_flight = len(queue.in_flight())
         burned = self.ops.burned(block)
@@ -2488,6 +2603,22 @@ class RollingScheduler:
             self._launch_leg(gen, era, block, adm.target_boundary, entry.label)
         if held:
             queue.touch(held)
+
+    def _lane_a_ended(self, block: int) -> bool:
+        """W-LAUNCH: whether ``[round] lane_a_until_block`` is reached at
+        ``block`` (no new lane A challenger is seated). Logs one INFO line the
+        first time the cutoff is seen in force (again after a config change)."""
+        rnd = self.cfg.round
+        until = rnd.lane_a_ended_at(block) if hasattr(rnd, "lane_a_ended_at") else None
+        if until is None:
+            return False
+        if self._lane_a_ended_logged != until:
+            self._lane_a_ended_logged = until
+            log.info("rolling: lane A cutoff IN FORCE at block %d ([round] "
+                     "lane_a_until_block = %d): no new lane A challenger is seated; "
+                     "in-flight legs run to their verdict, the king leg and king-only "
+                     "settlements continue", int(block), until)
+        return True
 
     # ── corpus pre-generation ────────────────────────────────────────────────
 
@@ -2988,6 +3119,8 @@ class RollingScheduler:
                 cur.king_hotkey, cur.king_uid, cur.king_ref = king, winner.uid, winner.ref
                 cur.king_entry = _entry_to_json(entry)
                 cur.king_init = cur.warm_start_ckpt     # a settled leg of THIS era
+                cur.king_image = self._pinned_image(cur)  # #934 (a proof candidate only)
+                cur.king_pointer_published = ""
                 cur.king_bench = winner.bench
                 cur.king_bench_published = winner.bench is not None
                 # The dethroner paid for its own winning leg (DEC-CA-0055 item 6):
@@ -3163,7 +3296,32 @@ class RollingScheduler:
                 return
         lo, hi = era_window(self.cfg.round, cur)
         stale = self._stale_contract(cur)
-        if not (lo <= int(king.train_block) < hi) or stale(king.training_contract_digest):
+        in_window = lo <= int(king.train_block) < hi
+        if in_window and stale(king.training_contract_digest) and self._era_king_fixed(cur, king):
+            # #934: the validators hold THIS king pointer for the rest of the
+            # seed epoch. Retraining it under the new contract mints a new
+            # pointer — era_king_pointer_mismatch on every validator for every
+            # later settlement of the epoch (and their lane B/C rows with
+            # them). The contract change (worker image repin / code change)
+            # takes effect at the next seed-epoch boundary: keep the king,
+            # never retrain it, publish nothing until the epoch's contract is
+            # back (restore the pin, or list it in [v2] prior_train_image_digests).
+            log.error("rolling: boundary %d — CONTRACT CHANGED MID SEED EPOCH: era %d's king "
+                      "entry %s (contract %s) is the pointer the validators hold for seed "
+                      "epoch %d, but the configured contract is %s and does not prove it. "
+                      "NOT retraining (a new pointer is rejected for the rest of the "
+                      "epoch); the change defers to the next seed-epoch boundary. "
+                      "Settlement HELD: %d finished leg(s) wait, nothing published. Fix: "
+                      "restore the epoch's worker pin or list it in [v2] "
+                      "prior_train_image_digests", epoch_start, cur.index,
+                      king.trained_pointer, king.training_contract_digest[:12] or "<none>",
+                      cur.epoch_start if cur.epoch_start >= 0 else cur.index,
+                      self._contract_identity(cur)[:12], len(ready))
+            with self._lock:
+                self.state.last_settled_boundary = epoch_start
+                self._save()
+            return
+        if not in_window or stale(king.training_contract_digest):
             # Validators reject a settlement whole for ONE entry outside the
             # window; a king entry outside it can only come from a stamp bug
             # or a reused record of another era — retrain it, publish nothing.
@@ -3350,6 +3508,17 @@ class RollingScheduler:
             self.state.last_settled_boundary = max(int(self.state.last_settled_boundary),
                                                    epoch_start)
             self.state.pending_publish = None
+            king_out = manifest.entry_for_role("king") if hasattr(
+                manifest, "entry_for_role") else None
+            if (king_out is not None and cur.king_entry
+                    and cur.king().trained_pointer == king_out.trained_pointer):
+                # #934: the validators now hold this pointer for the seed epoch
+                cur.king_pointer_published = str(king_out.trained_pointer)
+                nxt = self.state.next
+                if (nxt is not None and nxt is not cur and self._same_epoch(cur, nxt)
+                        and nxt.king_entry
+                        and nxt.king().trained_pointer == king_out.trained_pointer):
+                    nxt.king_pointer_published = cur.king_pointer_published
             if "vbench_pending" in pend:
                 self.state.vbench_pending = {str(k): int(v)
                                              for k, v in pend["vbench_pending"].items()}

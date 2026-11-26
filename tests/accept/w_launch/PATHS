@@ -1,0 +1,127 @@
+# W-LAUNCH (owner 2026-11-24): lane B / lane C (MarketCast) / lane D start
+# together at the Wed 2026-11-25 launch era start (mainnet 9586800).
+# chain.toml types [lane_c] / [marketcast] from_block (moved from 9579600).
+chain.toml
+# The two-step ready-to-sign launch overlays (mainnet + testnet); lane B and
+# lane D arm here and the A0/B35/C15/D50 split is restated.
+deploy/overlays/launch-20261125.pre.mainnet.toml
+deploy/overlays/launch-20261125.mainnet.toml
+deploy/overlays/launch-20261125.pre.testnet.toml
+deploy/overlays/launch-20261125.testnet.toml
+# Owner 2026-11-24: lane D's step 2 is launch-20261125.*.toml (live at launch,
+# gated on >= 2/3 of stake on the release); these fallbacks arm it at the next
+# era ([lane_d] from_block = "next-era", resolved by the publish tool).
+deploy/overlays/lane-d-step2.mainnet.toml
+deploy/overlays/lane-d-step2.testnet.toml
+# Unit tests and docs that pin the shipped lane C / MarketCast block.
+tests/unit/test_lane_c_config.py
+tests/unit/test_lane_c_competitions.py
+tests/unit/test_marketcast.py
+tests/unit/test_marketcast_composite.py
+tests/unit/test_predecision_main.py
+tests/unit/test_validator_bench.py
+tests/unit/test_dec55_crown_tiers.py
+# TESTNET-FAST option A (owner 2026-11-24): testnet's king ladder is on, so
+# the DEC-CA-0055 shipped-value pin carries it.
+tests/unit/test_dec55_config_wire.py
+# ... and testnet's validator bench source (from 8515800) in the bench pins.
+tests/unit/test_validator_bench_budget.py
+tests/unit/test_validator_bench_liveness.py
+docs/MARKETCAST.md
+# Owner 2026-11-25 (leak mitigation, cascade#935): the launch runbook's
+# step-2 embargo_hours = 24 line and its restore-to-48 reminder.
+docs/OPERATOR.md
+docs/AGENT_MINING.md
+# cascade#909 (owner 2026-11-25): lane B's public rows are benched on an EVAL
+# POD (--lane-b-bench-hosts, launch: targon-eval.toml), never on the trainer box;
+# off the settlement path (content-keyed cache, background worker); fail closed.
+cascade/trainer/lane_b_bench.py
+cascade/trainer/lane_b_driver.py
+cascade/trainer/main.py
+
+# #933: the trainer's lane A king comes from signed receipts, then the
+# persisted era king, else HOLD — never the top-incentive hotkey (another
+# lane's payee once B/C/D take emissions). Docstrings in the promotion path.
+cascade/trainer/rolling.py
+cascade/trainer/runner_promotion.py
+cascade/trainer/promotion.py
+
+# W-LAUNCH lane A shutdown (owner 2026-11-25, "lane A should shut down when
+# the other lanes start"): [round] lane_a_until_block (trainer + intake only,
+# never an overlay key, never a digest input). The intake refuses new lane A
+# funds 409 lane_ended and releases unstarted entries; the trainer seats no new
+# lane A challenger (in-flight legs, king leg, king-only settlements continue).
+cascade/shared/config/rounds.py
+cascade/shared/config/loader.py
+cascade/funding/lane_ends.py
+cascade/funding/intake.py
+cascade/funding/main.py
+
+# Provisioner orphan scope (mainnet 2026-11-25 07:50: the MarketCast offload
+# provisioner reaped a pod it never rented). The reaper terminates only pods
+# matching a write-ahead rent intent of THIS instance, for its enabled stages;
+# other provisioner-shaped pods are logged and left alone.
+cascade/provision/loop.py
+cascade/provision/state.py
+tests/unit/test_provision_loop.py
+# Launch miner docs + CLI (owner 2026-11-25): lane A closed to new challengers
+# from 9586800 in every miner-facing guide and the CLI help; `cascade deploy` /
+# `submit` refuse a lane A entry past the cutoff before any upload or commit
+# (--allow-closed-lane-a). The generated cascade:rewards:summary block states
+# the LIVE launch split (scripts/check_docs.py computes it from the overlays).
+cascade/miner/cli.py
+cascade/miner/lane_d_preview.py
+scripts/check_docs.py
+tests/unit/test_docs_consistency.py
+README.md
+AGENTS.md
+agent.md
+llms.txt
+cascade/website/llms.txt
+docs/MINER.md
+docs/MINER_LANE_A.md
+docs/MINER_LANE_B.md
+docs/MINER_LANE_D.md
+docs/LANE_D.md
+docs/VALIDATOR.md
+
+# 2026-11-25 pool_d builder OOM (first baseline `first_seen record` over 7,002
+# feeds / 14 GB held every point in memory): record() bounded by one feed,
+# staged lines appended after the unreadable check, commit() streams the log;
+# byte-identical output pinned against the previous implementation.
+cascade/pool/first_seen.py
+tests/unit/test_first_seen_record_memory.py
+
+# 2026-11-25 pool_d build refused lane_a_replay_mismatch: `elastic lane-a-pool`
+# picked the 999999999999 smoke-test sentinel (2026-09-29 workflow_dispatch) and
+# the replay lacked lane A's publish flags. Skip sentinels; ship build_args
+# --mv-pack --max-panel-series-per-feed 20 (pinned against publish-pool.yml).
+cascade/laned/elastic.py
+deploy/laned/elastic.toml
+
+# Owner 2026-11-25 22:40 (option a): pool_d takes lane A's selection from the
+# sha-verified snapshot (--lane-a-selection snapshot, default); the replay is
+# opt-in. lane-a-pool keeps the verified tar + index ref for that check.
+cascade/pool/pool_d_select.py
+cascade/pool/pool_d_build.py
+cascade/laned/elastic.py
+tests/unit/test_pool_d_snapshot_selection.py
+docs/EVAL_POOL.md
+
+# 2026-11-26 pool_d builder OOM (pool_d_build over a 20 GB / 7,002-feed
+# records.jsonl reached 39.3 GB RSS): FirstSeenLog.feed_index() streams the
+# log once and holds one feed at a time; pool_d_build and verify_snapshot use
+# it; answers and pool_d output pinned against the previous whole-log index().
+cascade/pool/first_seen.py
+cascade/pool/pool_d_build.py
+tests/unit/test_first_seen_index_memory.py
+
+# 2026-11-26 pool_d builder state-push EntityTooLarge (records.jsonl 20 GB /
+# 7,002 feeds sent as one PutObject, read whole first): the pool store streams
+# (multipart above one part, aborted on failure; streamed download; sha256 +
+# size of the bytes sent), state-push proves append-only from HEAD's sha256
+# without downloading, skips unchanged files, HEAD.json gains sizes.
+cascade/pool/pool_d_publish.py
+cascade/laned/elastic.py
+tests/unit/test_pool_d_state_streaming.py
+docs/OPERATOR.md

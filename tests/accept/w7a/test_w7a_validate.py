@@ -20,8 +20,8 @@ from .helpers import (
     SCHEMA_ERROR_CODES,
     TOP_LEVEL_REQUIRED,
     assert_valid,
+    loser_then_crown,
     reseal,
-    two_settlements,
 )
 
 
@@ -34,20 +34,29 @@ def scratch(tmp_path_factory):
 def _reports(scratch):
     from cascade.validator.lane_d_report import ReportSchemaError, validate_report
 
-    built = two_settlements(scratch)
+    built = loser_then_crown(scratch)
     return built, validate_report, ReportSchemaError
 
 
 def _refused(scratch, report, code, field=None, *, prefix=None):
     _, validate_report, err = _reports(scratch)
-    with pytest.raises(err) as info:
-        validate_report(report)
-    assert info.value.code == code, f"code {info.value.code!r} (field {info.value.field!r})"
-    assert info.value.code in SCHEMA_ERROR_CODES
+    exc = _raised(validate_report, report, err)
+    assert exc.code == code, f"code {exc.code!r} (field {exc.field!r})"
+    assert exc.code in SCHEMA_ERROR_CODES
     if field is not None:
-        assert info.value.field == field, f"field {info.value.field!r}, want {field!r}"
+        assert exc.field == field, f"field {exc.field!r}, want {field!r}"
     if prefix is not None:
-        assert str(info.value.field).startswith(prefix), info.value.field
+        assert str(exc.field).startswith(prefix), exc.field
+
+
+def _raised(validate_report, report, err):
+    """The `ReportSchemaError` `validate_report(report)` raises; a report it
+    accepts is an `AssertionError` (never pytest's `DID NOT RAISE`)."""
+    try:
+        validate_report(report)
+    except err as exc:
+        return exc
+    raise AssertionError("validate_report accepted a report it must refuse")
 
 
 def _s2(scratch) -> dict:
@@ -115,6 +124,7 @@ def test_scoring_method_other_than_quantile_head_is_refused(scratch, method):
 @pytest.mark.parametrize("name", TOP_LEVEL_REQUIRED[1:])
 def test_every_required_top_level_field_is_required(scratch, name):
     r = _s2(scratch)
+    assert name in r, f"the report has no {name}"
     del r[name]
     _refused(scratch, r, "missing_field", name)
 
@@ -138,27 +148,27 @@ def test_every_params_field_is_required(scratch, name):
     ("windows", 0, "mirror_lag_hours"), ("windows", 0, "feed"),
     ("entries", 0, "coldkey"), ("entries", 0, "reason"),
     ("cohorts", 0, "first_seen_roots"), ("cohorts", 0, "refused"),
-    ("verdicts", 0, "confirmation"), ("verdicts", 0, "lowfreq"),
+    ("verdicts", 0, "halves"), ("verdicts", 0, "sources"), ("verdicts", 0, "domains"),
     ("pool", None, "first_seen_roots"),
 ])
 def test_nested_fields_are_required(scratch, path):
     r = _s2(scratch)
     top, idx, key = path
     obj = r[top] if idx is None else r[top][idx]
+    assert key in obj, f"the report has no {top}.{key}"
     del obj[key]
     field = f"{top}.{key}" if idx is None else f"{top}[{idx}].{key}"
     _refused(scratch, r, "missing_field", field)
 
 
-def test_nested_confirmation_lowfreq_and_court_fields_are_required(scratch):
-    for key in ("stage", "rule", "first_set_sha256", "first_king_digest"):
+def test_nested_lowfreq_and_court_fields_are_required(scratch):
+    # rev6.18 A7 / A8 (F4): the removed lowfreq block's fields become the
+    # live half's point-gain fields.
+    for key in ("n", "gain"):
         r = _s2(scratch)
-        del r["verdicts"][0]["confirmation"][key]
-        _refused(scratch, r, "missing_field", f"verdicts[0].confirmation.{key}")
-    for key in ("result", "freqs", "n_windows", "tau_public"):
-        r = _s2(scratch)
-        del r["verdicts"][0]["lowfreq"][key]
-        _refused(scratch, r, "missing_field", f"verdicts[0].lowfreq.{key}")
+        assert "halves" in r["verdicts"][0], "F4: verdicts carry their per-half point gains"
+        del r["verdicts"][0]["halves"]["live"][key]
+        _refused(scratch, r, "missing_field", f"verdicts[0].halves.live.{key}")
     r = _s2(scratch)
     del r["pay"]["court"][0]["burn_reason"]
     _refused(scratch, r, "missing_field", "pay.court[0].burn_reason")
@@ -211,9 +221,14 @@ def test_inv11_null_entry_reason_is_refused(scratch):
     (("entries", 0, "reason"), "LOST_DUEL"),
     (("entries", 0, "status"), "frozen"),
     (("verdicts", 0, "outcome"), "won"),
-    (("verdicts", 0, "confirmation", "stage"), "second"),
-    (("verdicts", 0, "confirmation", "rule"), "latest"),
-    (("verdicts", 0, "lowfreq", "result"), "skipped"),
+    # rev6.11 (b): the confirm statuses, reasons and outcomes are gone.
+    (("entries", 0, "status"), "confirm_pending"),
+    (("entries", 0, "reason"), "confirm_pending"),
+    (("entries", 0, "reason"), "lost_confirmation"),
+    (("verdicts", 0, "outcome"), "confirm_pending"),
+    (("verdicts", 0, "outcome"), "confirmed"),
+    (("verdicts", 0, "halves", "live", "n"), 0),
+    (("entries", 0, "reason"), "lowfreq_regression"),
     (("pool", "sha256"), "abc"),
     (("pool", "first_seen_roots", 0), "not-a-root"),
     (("rows_sha256",), "Z" * 64),
@@ -222,6 +237,7 @@ def test_values_outside_the_enum_or_format_are_refused(scratch, path, value):
     r = _s2(scratch)
     obj = r
     for p in path[:-1]:
+        assert isinstance(obj, list) or p in obj, f"the report has no {path[:-1]}"
         obj = obj[p]
     obj[path[-1]] = value
     field = path[0] + "".join(f"[{p}]" if isinstance(p, int) else f".{p}" for p in path[1:])
@@ -268,3 +284,37 @@ def test_rows_sha256_mismatch_is_refused(scratch):
     r["rows"][0]["crps"] = float(r["rows"][0]["crps"]) + 1.0
     _refused(scratch, r, "rows_sha256_mismatch", "rows_sha256")
     assert_valid(reseal(r))  # a resealed row set is structurally valid
+
+
+# ── rev6.11 (b): no confirmation stage or block ─────────────────────────────
+
+
+def _refused_any(scratch, report, codes, field):
+    _, validate_report, err = _reports(scratch)
+    exc = _raised(validate_report, report, err)
+    assert exc.code in codes, f"code {exc.code!r} (field {exc.field!r})"
+    assert exc.field == field, f"field {exc.field!r}, want {field!r}"
+
+
+def test_a_confirmation_block_is_refused(scratch):
+    r = _s2(scratch)
+    r["verdicts"][0]["confirmation"] = {"stage": "first", "rule": "restart",
+                                       "first_set_sha256": None, "first_king_digest": None}
+    _refused(scratch, r, "unknown_field", "verdicts[0].confirmation")
+
+
+@pytest.mark.parametrize("where", ["verdicts", "cohorts"])
+def test_a_confirm_stage_is_refused(scratch, where):
+    """`stage` is fixed to `first` or dropped: `confirm` is `bad_value`
+    (stage kept, enum ["first"]) or `unknown_field` (stage dropped)."""
+    r = _s2(scratch)
+    r[where][0]["stage"] = "confirm"
+    _refused_any(scratch, r, ("bad_value", "unknown_field"), f"{where}[0].stage")
+
+
+def test_params_carry_no_confirm_on_king_change(scratch):
+    r = _s2(scratch)
+    assert "confirm_on_king_change" not in r["params"], \
+        "confirm_on_king_change leaves the config echo (rev6.11 (b))"
+    r["params"]["confirm_on_king_change"] = "restart"
+    _refused(scratch, r, "unknown_field", "params.confirm_on_king_change")

@@ -14,6 +14,10 @@ Copied from docs/plans/LANE_D_PLAN.md (rev6):
   weights." Item 4: "Structured comparisons only."
 - §1.5: "`checks.derive_weights` and `check_lane_d` re-derive the lane D
   weights from the receipt chain."
+- rev6.11 (b): every crown is decided at the first verdict (first clear ∧
+  A10 ∧ gate); the replay re-derives no confirmation stage, record or D20
+  rule, and a held first clear is `hold` / `bench_hold` (status / reason;
+  its verdict outcome is `cleared`, never `crowned`).
 
 Every honest chain is a sequence of real `settle_lane_d` runs on a synthetic
 pool (numpy only, no torch), published the way W7c persists it: the signed
@@ -42,8 +46,8 @@ import numpy as np
 
 REPO = Path(__file__).resolve().parents[3]
 
-MODULE = "cascade.satellite.lane_d_replay"
-MODULE_PATH = REPO / "cascade" / "satellite" / "lane_d_replay.py"
+MODULE = "cascade.audit.lane_d_chain"
+MODULE_PATH = REPO / "cascade" / "audit" / "lane_d_chain.py"
 
 HOUR = 3600
 DAY = 86_400
@@ -59,6 +63,7 @@ ERA = 3600
 SETTLEMENT = 900
 ARM_BLOCK = 2700 * ERA
 N_SNAPSHOTS = 5
+FLOOR_WINDOWS = 48          # two snapshots of 24 windows each
 
 STATE_SCHEMA = "lane-d-state/1"
 
@@ -70,6 +75,7 @@ def boundary(n: int) -> int:
 
 SOURCES = ("src0", "src1", "src2", "src3")
 FEED_LAG_HOURS = 1.0
+EMBARGO_HOURS = 48.0        # [lane_d] embargo_hours (rev6.10 (a))
 SCORING_LEVELS = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
 _Z = tuple(NormalDist().inv_cdf(level) for level in SCORING_LEVELS)
 GATE_SUITES = ("gift", "boom", "time", "fev")
@@ -87,7 +93,11 @@ FORBIDDEN_PACKAGES = (
     "cascade.shared.chain",     # decayed_share_vector (weights)
     "cascade.shared.lane_b",    # lane B weights
     "cascade.shared.lane_c",    # lane C weights
-    "cascade.audit",            # check_lane_d: the other independent re-derivation
+    # rev6.18 B2: this module now lives IN the audit package (the chain rules
+    # of check_lane_d); it still never leans on the per-report checker or
+    # the rest of the audit (cascade.audit.lane_d imports it, not the reverse)
+    "cascade.audit.lane_d", "cascade.audit.checks", "cascade.audit.main",
+    "cascade.audit.rederive",
     "cascade.lane_d",           # the lane D intake service
     "cascade.laned",            # lane D operator tooling (vault sweeper, restore, ...)
     "cascade.eval.lane_d_scorer", "cascade.eval.lane_d_ingest",  # eval-host scoring
@@ -104,10 +114,12 @@ ALLOWED_PRIMITIVES = (
     "cascade.shared.config.lane_d", # the parsed [lane_d] config type
 )
 ALLOWED_PACKAGES = ("cascade", "cascade.eval", "cascade.shared", "cascade.shared.config",
-                    "cascade.satellite")
+                    "cascade.audit")
 
 UNVERIFIABLE_REASONS = ("unknown_schema", "report_missing", "report_unreadable",
-                        "signature_unverifiable", "prior_unverified")
+                        "signature_unverifiable", "prior_unverified",
+                        # rev6.11 (b): a report carrying a confirmation stage
+                        "confirmation_stage_present")
 
 
 def forbidden(name: str) -> bool:
@@ -145,16 +157,25 @@ def genesis_digest(house: dict) -> str:
 # ── config ──────────────────────────────────────────────────────────────────
 
 
+# rev6.18 F4 (A3): these fixtures pin the live-only rule: the public half off
+# (public_weight = 0, a spec setting) and no per-window ratio clamp in effect
+# (a floor far below any fixture ratio), so their pre-F4 numbers stand. F4's
+# own tests (tests/accept/w5e/test_w5e_combined.py) pin the combined rule.
+LIVE_ONLY = {"public_weight": 0.0, "window_ratio_floor": 1e-9}
+
+
 def lane_d_cfg(**over):
-    """The real W2 parse of an armed `[lane_d]` table (floors 24 windows / 4
-    sources, as in the W5e / W7c fixtures)."""
+    """The real W2 parse of an armed `[lane_d]` table. Floors 48 windows / 4
+    sources (rev6.11, as in the W7c fixture): two snapshots of 24 windows, so
+    an entry waits on the floors at its first settlement and is judged, once,
+    at its second."""
     from cascade.shared.config.lane_d import parse_lane_d
 
     raw = {"from_block": ARM_BLOCK, "share": 0.25, "takes_from": "lane_a",
            "remainder": "burn", "contexts": [4096, 8192, 16384], "horizon": HORIZON,
            "forward_margin_hours": MARGIN_H, "max_mirror_lag_hours": 6.0,
-           "min_windows": 24, "min_clusters": 4, "bootstrap_B": 200}
-    return parse_lane_d({**raw, **over}, era_blocks_at=lambda _block: ERA)
+           "min_windows": FLOOR_WINDOWS, "min_clusters": 4, "bootstrap_B": 200}
+    return parse_lane_d({**raw, **LIVE_ONLY, **over}, era_blocks_at=lambda _block: ERA)
 
 
 # ── pool_d fixtures (trimmed copy of tests/accept/w7c/helpers.py) ───────────
@@ -199,7 +220,10 @@ def _target_values(series_id: str, start: int) -> tuple[np.ndarray, np.ndarray]:
 
 def _write_pool(directory: Path, records: list[dict], snapshot: str) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
-    feeds = {r["feed"]: {"mirror_lag_hours": FEED_LAG_HOURS, "forecast_product": False}
+    # rev6.10 / rev6.12 (W6b): every listed feed pins its effective embargo
+    # (48 h, the decided default; a listed feed without it fails closed).
+    feeds = {r["feed"]: {"mirror_lag_hours": FEED_LAG_HOURS, "forecast_product": False,
+                         "embargo_hours": EMBARGO_HOURS}
              for r in records}
     meta = {"schema": "pool_d/1", "snapshot": snapshot, "horizon": HORIZON,
             "feeds": dict(sorted(feeds.items())), "series": records}
@@ -384,7 +408,7 @@ class Chain:
             kw.update(boundary_block_hash=block_hash(f"b{n}"), sentinel=None,
                       bench=SweepSession(f"w7d-sess-b{n}", host))
         b = boundary(n)
-        s = settle_lane_d(cfg=self.cfg, boundary=b, pool_dir=self.pools[n - 1],
+        s = settle_lane_d(**_rev614_ts(settle_lane_d, b), cfg=self.cfg, boundary=b, pool_dir=self.pools[n - 1],
                           entries=[dict(e) for e in entries],
                           house=dict(house if house is not None else self.h0),
                           forecasts=self.forecasts, uid_of=dict(self.uids),
@@ -400,8 +424,15 @@ class Chain:
 # ── the honest chains (README "Fixture chains") ─────────────────────────────
 
 
+#    rev6.11 (b): there is no confirmation duel. An entry is judged once, at
+#    its first verdict, and a clear that passes A10 and the gate is crowned
+#    there. The 48-window floors make b1 a floor wait for X (snapshot 1
+#    only), so b2 (snapshots 1 + 2) is X's first, crowning verdict.
+
+
 def chain_gated(root: Path) -> Chain:
-    """b1 X first clear vs H0; b2 X confirms, gate pass, crowned; b3 nothing."""
+    """b1 X waits on the floors (nothing judged); b2 X's first verdict vs
+    H0: clear, gate pass, crowned; b3 nothing."""
     c = Chain(root)
     c.step(1, entries=[c.x], gated=False)
     c.step(2, entries=[c.x])
@@ -410,8 +441,9 @@ def chain_gated(root: Path) -> Chain:
 
 
 def chain_held(root: Path) -> Chain:
-    """b1 X first clear; b2 X confirms ungated (bench_hold, nothing crowns);
-    b3 X re-gated without a duel, pass, crowned (a gate result, no verdict)."""
+    """b1 floor wait; b2 X's first verdict clears ungated (`bench_hold`,
+    nothing crowns, X stays `pending` holding its clear); b3 X re-gated
+    without a duel, pass, crowned (a gate result, no verdict)."""
     c = Chain(root)
     c.step(1, entries=[c.x], gated=False)
     c.step(2, entries=[c.x], gated=False)
@@ -420,38 +452,30 @@ def chain_held(root: Path) -> Chain:
 
 
 def chain_house_bar(root: Path) -> Chain:
-    """X crowned at b2; Y (revealed after b2) is judged against KING_D = X
-    AND the house (a second bar) at b3 (first clear) and b4 (confirm,
-    crowned); X becomes a prior king, so the court has two paid slots."""
+    """X crowned at b2 (as `gated`); Y (revealed after b2, eligible from
+    snapshot 2 on: 48 windows at b3) is judged against KING_D = X AND the
+    house (a second bar) at b3, its first verdict, and crowned there; X
+    becomes a prior king, so the court has two paid slots."""
     c = Chain(root)
     c.step(1, entries=[c.x], gated=False)
     c.step(2, entries=[c.x])
-    c.step(3, entries=[c.x, c.y], gated=False)
-    c.step(4, entries=[c.x, c.y])
+    c.step(3, entries=[c.x, c.y])
     return c
 
 
-def chain_d20_restart(root: Path) -> Chain:
-    """D20 `restart`: X first clears vs H0 at b1; the house refreshes to H1
-    at b2, so X restarts at stage first vs H1; b3 confirms vs H1, crowned."""
+def chain_refresh(root: Path) -> Chain:
+    """b1 X floor wait vs H0; the house refreshes to H1 at b2 (the throne
+    moves in place while the house holds it), and X's first verdict is
+    against H1: clear, gate pass, crowned; b3 nothing."""
     c = Chain(root)
     c.step(1, entries=[c.x], gated=False)
-    c.step(2, entries=[c.x], house=c.h1, gated=False)
+    c.step(2, entries=[c.x], house=c.h1)
     c.step(3, entries=[c.x], house=c.h1)
     return c
 
 
-def chain_d20_original(root: Path) -> Chain:
-    """D20 `original`: X first clears vs H0 at b1; the house refreshes to H1
-    at b2 and X confirms against H0 (the first-clear king), crowned."""
-    c = Chain(root, cfg=lane_d_cfg(confirm_on_king_change="original"))
-    c.step(1, entries=[c.x], gated=False)
-    c.step(2, entries=[c.x], house=c.h1)
-    return c
-
-
 CHAINS = {"gated": chain_gated, "held": chain_held, "house_bar": chain_house_bar,
-          "d20_restart": chain_d20_restart, "d20_original": chain_d20_original}
+          "refresh": chain_refresh}
 
 
 # ── doctoring (the lie is re-signed by the validator's key) ─────────────────
@@ -544,7 +568,7 @@ def save_publication(pub: Publication, out: Path) -> Path:
     sd.mkdir(exist_ok=True)
     for b, raw in pub.states.items():
         (sd / f"{b}.bin").write_bytes(raw)
-    cfg_over = {"confirm_on_king_change": str(pub.cfg.confirm_on_king_change)}
+    cfg_over: dict = {}     # every honest chain runs on the default fixture config
     (out / "meta.json").write_text(json.dumps({"signer": pub.signer_ss58,
                                                "boundaries": pub.boundaries,
                                                "reports_dir": str(pub.reports_dir),
@@ -575,7 +599,7 @@ if len(sys.argv) > 2 and sys.argv[2] == "block-sdk":
     for name in ("bittensor", "bittensor.sp_core", "bittensor_wallet", "substrateinterface"):
         sys.modules[name] = None
 from tests.accept.w7d.helpers import lane_d_cfg
-import cascade.satellite.lane_d_replay as rp
+import cascade.audit.lane_d_chain as rp
 pub = Path(sys.argv[1])
 meta = json.loads((pub / "meta.json").read_text())
 receipts = json.loads((pub / "receipts.json").read_text())
@@ -691,14 +715,27 @@ def static_closure(starts) -> set[str]:
 
 
 def satellite_modules() -> list[Path]:
-    d = REPO / "cascade" / "satellite"
-    return sorted(d.rglob("*.py")) if d.is_dir() else []
+    """rev6.18 B2: the chain-rules module (the former satellite replay, now
+    `cascade/audit/lane_d_chain.py`)."""
+    return [MODULE_PATH] if MODULE_PATH.is_file() else []
 
 
 def court_shares(cfg, court: list[dict]) -> list[tuple[str, int | None, float]]:
     """§1.4 pay, re-derived here: slot i of the court is worth
-    `king_decay**i` of `share`, normalised; a slot without a uid burns."""
-    raw = [float(cfg.king_decay) ** i for i in range(len(court))]
+    `court_weights[i]` of `share` (rev6.23, owner 2026-11-24: 0.80 / 0.15 /
+    0.05), normalised over the court's slots; a slot without a uid burns."""
+    raw = [float(w) for w in cfg.court_weights][:len(court)]
     total = sum(raw)
     return [(s["digest"], s["uid"], float(cfg.share) * w / total)
             for s, w in zip(court, raw, strict=True)]
+
+
+def _rev614_ts(settle, boundary) -> dict:
+    """rev6.14 (a): the fixture's on-chain boundary timestamp (far after every
+    fixture T + eval_delay_hours, 12 s per block), passed only where
+    ``settle_lane_d`` takes it."""
+    import inspect
+
+    if "boundary_ts" not in inspect.signature(settle).parameters:
+        return {}
+    return {"boundary_ts": 2_000_000_000 + 12 * int(boundary)}

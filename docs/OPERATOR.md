@@ -35,6 +35,8 @@ remains unspecified and blocked.
 7. [C competition changes](#lane-c-competitions-add-re-weight-end-dec-ca-0056)
 8. [Network config overlays](#network-config-overlays-dec-ca-0057): change
    verdict / payout constants without a fleet release
+9. [Lane D operations](#lane-d-operations-open-weights): intake, vault,
+   launch eval host, S8, first-seen recorder, retention, runbook
 
 ## Before go-live / before a testnet cycle
 
@@ -118,8 +120,9 @@ edited `chain.toml` before shipping it.
    qualifying the production VM image. A dependency import failure must stop
    provisioning before any miner generator runs.
 6. **Main validator identity.** Mainnet pins `[netconfig] owner_hotkey` to
-   its configured main validator. Testnet keeps a separate unset identity;
-   set it when enabling validator-sourced benches there. The
+   its configured main validator. Testnet pins its own main validator
+   (validator0, = testnet `[manifest] validator_hotkey`; owner 2026-11-24),
+   which also arms testnet overlays (S0c drill R7t). The
    loader refuses `[v2] bench_source = "validator"` with a resolved block >
    0 unless `owner_hotkey` is set, `[v2] king_ladder = true`, the block is an
    era boundary at/after `[v2] from_block`, and `owner_hotkey` equals
@@ -144,9 +147,10 @@ edited `chain.toml` before shipping it.
    - `[v2] ladder_start_tiers`: seed replicas on the private pool (the 0.50
      tier must be rare under noise); keep the lowest threshold at `[v2]
      win_margin_end`.
-   - `[lane_b]` / `[lane_c] full_pay_tiers` and `[marketcast]
-     full_pay_tiers` (overlay-settable): from real win LCBs (testnet receipts'
-     `target_lcb` / `gain_lcb`); lowest threshold at `gain_margin`.
+   - `[lane_b]` has no tiers (rev6.22): calibrate `[lane_b]
+     undeclared_gain_margin` (0.02) from testnet slot rows. Lane C pays a
+     gain-scaled duration (`[lane_c] full_pay_min_days` / `full_pay_max_days`
+     / `full_pay_max_gain`, DEC-CA-0073).
    - `[marketcast] near_dup_tol` (0.02, overlay-settable) and the liquidity
      floor `min_dollar_volume_24h` (release-only): once the recorder shows
      real volumes.
@@ -221,6 +225,46 @@ trainer probes each pod's worker runtime before dispatch, and `cascade-audit`
 Tier 2 uses the match to decide when a byte-exact checkpoint comparison
 applies. Rented pods boot `[round] funded_pod_image`; pin it as described in
 [Credentials on payer pods](#credentials-on-payer-pods).
+
+### Changing the worker image per seed epoch (W-IMG, plan rev6.24 (e))
+
+Once the fleet runs the W-IMG release and `[v2] image_epoch_from_block` is
+typed (an era start, deployed to every validator before it), validators no
+longer need a config change for a new training image:
+
+1. Commit the qualification record and measure the SKU walls on the new
+   image (the rent gates are unchanged).
+2. Set the trainer's `[v2] *_after` pins to the new release and restart the
+   trainer outside a scoring window with no legs in flight.
+3. The trainer binds the release at the next seed-epoch start at least two
+   eras ahead (log: `W-IMG: after image … BOUND at seed-epoch start block N`,
+   file `image_epoch_state.json`). Every leg of that epoch runs it; earlier
+   eras keep the current pins.
+4. Once that epoch has started and no earlier-epoch leg is in flight, move the
+   after pins into `[v2.training] train_image_digest` / `[round]` pins, append
+   the old pin to `[v2] prior_train_image_digests` and clear the `*_after`
+   pins (or set the next release).
+
+Validators reject a settlement whose entries ran mixed images
+(`era_image_mixed`) or whose image changed inside a seed epoch
+(`era_image_changed`).
+
+**An image without measured pod walls (owner 2026-11-24).** If
+`[round] funded_sku_wall_measured_image` names another image than the one a
+funded leg or king pod would rent, the rent is no longer refused. Instead:
+
+- every SKU's leg wall is planned at `[round]
+  unmeasured_image_wall_cap_seconds` (default 18000 = 5 h, never above the
+  contract's `max_train_seconds`), instead of the measured table;
+- the progress watchdog holds the leg to that cap;
+- the completed-leg record carries `walls_measured: false` and
+  `wall_cap_seconds`;
+- the trainer logs `image … has NO measured pod walls — renting with the
+  leg wall capped at 18000 s`.
+
+Measure the walls on the new image and set `funded_sku_wall_measured_image`
+to return to the table. `unmeasured_image_wall_cap_seconds = 0` restores the
+old refusal. A measured image behaves exactly as before.
 
 ### Re-pinning the image inside a v2 seed epoch (DEC-CA-0067)
 
@@ -891,9 +935,15 @@ orchestrator SSH keypair — never the wallet. Each cycle it:
   own shapes (`cascade-<provider>-<8 hex>-g<n>` lanes, or
   `cascade-<digits>-(heat|final|eval)…` on the provider), or it is treated as
   the provisioner's and dropped or reaped.
-* **Orphan reconcile.** Terminates live provider pods tagged with its own
-  name shape that its ledger does not own, so a crash between launch and
-  ledger-save never leaks a billing box.
+* **Orphan reconcile.** Each launch writes a rent intent (provider, name
+  prefix, stage) to the ledger before the provider call. The reconciler
+  terminates a live pod only when it matches one of THIS instance's intents,
+  for a stage the instance has enabled, and the ledger does not own it. So a
+  crash between launch and ledger-save never leaks a billing box. Other pods
+  in the provisioner's name shape belong to another renter, for example a
+  second provisioner such as the MarketCast offload instance on the same
+  account. They are logged once at WARNING and left alone. A pod leaked
+  before this change has no intent, so terminate it by hand.
 * **TTL backstop.** Every pod it rents dies one epoch after rent no matter
   what; `max_spend_per_round` caps the worst case before anything is rented.
 * **Adopted-pod re-gate.** After a restart, pods adopted from the ledger are
@@ -1904,7 +1954,8 @@ Before you flip it:
 **Relay host setup.** Use a small operator VM with disk at least the largest
 checkpoint (about 20 GB for the 1.23B preset) plus headroom, and good
 bandwidth to R2 and Hippius. Install the cascade checkout at the released
-commit (`uv sync --frozen`), so its `checkpoint_guard` matches the trainer's.
+commit (`uv sync --frozen` with the extras the relay uses, repeated on every
+upgrade), so its `checkpoint_guard` matches the trainer's.
 Add it to the hosts file:
 
 ```toml
@@ -2284,8 +2335,8 @@ tests).
 
 **No recording lead time** (owner 2026-11-10). A series at frequency `f` is
 cut from the COARSEST bank whose interval divides `f`: the 1-minute bars
-(`snapshot_days`, 30 — a 32768-step 1m context is 22.8 days, plus the 6-day
-verdict wait), a native 5m / 15m bank (`native_history_days`: 121 / 348) or
+(`snapshot_days`, 30 — a 32768-step 1m context is 22.8 days; the
+DEC-CA-0074 draw reads the 28 days before a dispatch), a native 5m / 15m bank (`native_history_days`: 121 / 348) or
 the hourly bank (`coarse_history_days`, 1372). Each bank is sized for the
 full `eval_context_length` (32768, owner 2026-11-21); bars neither the API
 nor the recording holds stay NaN, so a window's context is as long as the
@@ -2302,8 +2353,11 @@ A snapshot carries the 1-minute bars on one UTC-minute grid, the native
 banks (`n5m/`, `n15m/`, body `native`), the coarse HOURLY bank and a block →
 time anchor. It goes to `pool_mkt/snapshots/block-<N>.tar` plus
 `pool_mkt/index.json` in the pool bucket. Publish often: an entry's windows exist only once a snapshot
-covering them is active. The verdict waits up to `verdict_wait_blocks` for
-them.
+covering them is active (its embargo draw up to the dispatch, its forward
+windows after it). An inconclusive entry waits up to `verdict_wait_blocks`
+(capped at 3900 = 13 h, DEC-CA-0074). The trainer also reads the snapshot
+active at a dispatch to scan a generator tree for embargoed bars
+(`embargo_series_embedded`) before it rents.
 
 Hyperliquid history depth (measured 2026-10-19 with read-only `info`
 calls, BTC and `xyz:GOLD`): `candleSnapshot` serves only the most recent
@@ -2313,8 +2367,8 @@ from listing. So:
 
 - the hourly bank fits (180 < 208 days), and is what makes the 1d horizons
   scorable (21 daily bars could never hold the 32-step minimum context);
-- the API alone keeps only ~3.6 days of 1m candles, less than the 6-day
-  verdict wait — hence the recorder above (each window's realized candles
+- the API alone keeps only ~3.6 days of 1m candles, less than the 28-day
+  embargo draw — hence the recorder above (each window's realized candles
   must be captured before the API drops them);
 - a recipe's embargoed training range (≥ 30 days old) has no minute or
   5-minute bars on Hyperliquid. Set `[marketcast] bar_relay =
@@ -2356,21 +2410,28 @@ per asset.
 The loader refuses a configuration with an unscorable (suite, horizon): the
 history of the bank its frequency is cut from (`coarse_history_days`,
 `native_history_days` or `snapshot_days`) must hold the 32-step context + the
-horizon, and the span its windows are cut from must hold ONE aligned window
-(≥ 2 × the horizon; 2026-11-18, was two): the forward wait
-(`verdict_wait_blocks` × 12 s − `start_margin_seconds`), or for a
-`gap_horizons` horizon the `embargo_days` gap.
+horizon. Arming (DEC-CA-0074, `draw_problems`) also needs the
+`embargo_eval_days` span to hold ONE aligned window of every horizon (≥ 2 ×
+the horizon) and `min_time_blocks` blocks, a forward horizon to fit
+`verdict_wait_blocks` × 12 s − `start_margin_seconds`, and `embargo_days` ≥ 2.
 
 **The horizon grid** (owner 2026-11-18). A horizon is `<bar>x<steps>`: a
 path of `steps` bars of `<bar>`; every shipped suite is scored on every
 timeframe (`[marketcast.frequencies]` / `[marketcast.horizons]` in both
-tomls): `1mx60`, `5mx36`, `15mx96`, `1hx48` forward-only, and `4hx42`,
-`1dx7` in `gap_horizons` — a week cannot close inside the 6-day wait, so
-those windows are cut from the embargo gap before the submission
-(`pool.marketcast.gap_span`: from the first UTC day no recipe can train on
-up to `train_time`). Gap windows exist in the JUDGE phase only (a confirm
-has none); each entry's rows carry the `gap_end` they were cut before,
-which validators and the audit bind to the trainer's `train_time`. On the
+tomls). Owner 2026-11-24 (DEC-CA-0074): every timeframe is DRAWN from the
+embargo (`pool.marketcast.embargo_draw`): per (asset, series, horizon) the
+`backtest_windows_per_cell` (48) best-ranked windows by
+sha256(rule | round block hash | window id), lying wholly in the
+`embargo_eval_days` (28) before the trainer's `train_time` (never before the
+first UTC day no recipe can train on), in the judge or confirm half of a
+fixed public window partition; `1mx60` / `5mx36` (`forward_horizons`) also
+take up to `windows_per_cell` closed forward windows (after `train_time` +
+`start_margin_seconds`, by `train_time` + the wait). The main validator reads
+the round block's hash (the loop's chain client); each entry's rows carry the
+whole `draw`, which validators re-derive (a mismatch is an infra deferral)
+and the audit also checks against the chain (`cascade-audit marketcast
+--network`, `--no-chain` WARNs). `gap_horizons` is retired (an older file
+naming it loads; the key does nothing). On the
 real 9-asset test subset (4 forward days) the grid cut 4320 / 2710 / 260 /
 80 / 270 / 270 windows (1mx60 … 1dx7): the 2-day and week paths are thin
 (1–4 windows per asset per round), but each carries 7–96 steps. The
@@ -2920,12 +2981,18 @@ Schema 1:
   pending[]}}, holders_source, trainer}` — only once `[lane_c] from_block`
   is typed (absent ⇒ the pages read "not live"). A holder carries its win's
   `tier` / `full_eras` / `below_floor`.
-- **Gain-tiered full-pay period (owner 2026-10-20).** `[lane_b]` / `[lane_c]
-  full_pay_tiers` (overlay-settable) and `[marketcast] full_pay_tiers`
-  (overlay-settable) replace `full_rounds` (a config still typing it is refused
+- **Lane C full-pay duration (owner 2026-11-24, DEC-CA-0073).** A lane-C
+  win pays in full for `full_pay_min_days` (5) at the competition's
+  `gain_margin`, rising linearly to `full_pay_max_days` (20) at
+  `full_pay_max_gain` (0.05) or more, rounded up to eras on the grid at the
+  win; then its slot ends. `[lane_c] full_pay_tiers` / `half_life_rounds` /
+  `floor` / `win_ttl_eras` and `[marketcast] full_pay_tiers` are retired
+  (`RETIRED_KEYS`: ignored at load, refused in overlays).
+- **Gain-tiered full-pay period (owner 2026-10-20), lane B.** `[lane_b]
+  full_pay_tiers` (overlay-settable) replaces `full_rounds` (a config still typing it is refused
   at load): `[[lcb_threshold, full_eras], ...]`, default `[[0.05, 10], [0.02,
   5], [0.01, 2]]`, thresholds strictly descending in (0, 1), `full_eras`
-  non-increasing and `<= win_ttl_eras` (lane C's TTL for `[marketcast]`). A
+  non-increasing and `<= win_ttl_eras`. A
   win pays in full for the `full_eras` of the highest threshold its gain LCB
   meets, then the unchanged decay and TTL; the tier is fixed at the win and
   stamped on every `lane_b_pay` / `lane_c_pay` win (`gain_lcb`, `tier`,
@@ -3363,9 +3430,34 @@ that prefix (the trainer's Hippius S3 pair works).
    ```
 
    It prints the next `seq` / `prev`, the digest and its `cfg-<8 hex>` note
-   segment, the merged diff against `chain.toml`, and every check a
-   validator runs (allow-list, merged load checks, era start,
-   retroactivity), then `VALID` or `INVALID`.
+   segment, the overlay it is judged against (`judged against the config in
+   force`), every key whose effective value changes against that config,
+   lane on/off and share moves (`LANE D: ON -> OFF`, `LANE B SHARE: …`), the
+   merged diff against `chain.toml`, and every check a validator runs
+   (allow-list, merged load checks, era start, retroactivity), then `VALID`
+   or `INVALID`.
+
+   **The restate rule (#911).** Read the "changes vs the config in force"
+   block, not the `chain.toml` diff: an overlay replaces the one in force
+   whole, so a key it forgets reverts to `chain.toml`, and the `chain.toml`
+   diff does not show that. Such a line is marked `DROPPED`. After launch
+   step 2, every overlay must restate `[lane_d] from_block` (and the
+   `share` / `takes_from` of each lane you keep), including a lane B or lane C
+   kill. The tool refuses an overlay that turns off a lane the config in
+   force arms without setting one of that lane's switch keys (`from_block`,
+   `until_block`, `share`). To turn a lane off deliberately, set its
+   `until_block` (the kill switch), or pass `--netconfig-allow-lane-off`
+   (wrapper: `--allow-lane-off`).
+
+   **After a refused overlay.** Nodes keep the newest overlay that validates
+   in force. The next overlay still takes `seq` / `prev` from the latest
+   published body (a reused seq is refused as a fork), but its checks are
+   judged against the body in force. By default this is the newest published
+   body that validates on this `chain.toml`, and each newer body that was
+   skipped is printed as a `WARNING`. To name the body in force explicitly,
+   pass `--netconfig-in-force-seq N` (`0` means `chain.toml` alone). Do that
+   when a body was adopted under an older release and this release refuses it
+   (#891).
 4. Publish with the owner wallet:
 
    ```bash
@@ -3386,6 +3478,61 @@ that prefix (the trainer's Hippius S3 pair works).
 The trainer runs the same resolver read-only (`netconfig_state.json` in its
 work root). It never signals, and it switches its rolling scheduler and
 promotion engine to the overlay at the same block.
+
+#### Mainnet launch runbook: lanes B, C and D live at 9586800
+
+Owner decision (2026-11-24, 22:30): lane D goes live at the launch block
+9586800, together with lanes B and C. Publish two overlays, both at least
+one era (3600 blocks) before 9586800:
+
+1. **Step 1: `deploy/overlays/launch-20261125.pre.mainnet.toml`.** This
+   overlay carries every non-lane-D key and splits emission
+   A 50 / B 35 / C 15.
+2. **Step 2: `deploy/overlays/launch-20261125.mainnet.toml`.** This overlay
+   restates step 1 and arms lane D: `from_block = 9586800`, share 0.5 taken
+   from lane A, `public_weight = 0.0`. The resulting split is
+   A 0 / B 35 / C 15 / D 50.
+
+   Before you publish step 2, check that at least 2/3 of eligible validator
+   stake signals the release with the #913 satellite fix in its readiness
+   note. Use the wrapper with step 1 as `--previous` (and as the overlay in
+   force):
+
+   ```bash
+   cascade-laned overlay publish --config chain.toml \
+       --overrides deploy/overlays/launch-20261125.mainnet.toml \
+       --effective-block 9586800 --head-block <head> --previous <step 1 body.json> \
+       --upgrade-metagraph <metagraph.json> --upgrade-notes <notes.json> \
+       --upgrade-feature <the #913 release's readiness segment>
+   ```
+
+   The plan must show `LANE D: OFF -> ON` and
+   `LANE A SHARE: 0.5 -> 0.0 (from settlement …)`. The `UPGRADE` line prints
+   the stake share (computed with `cascade.laned.upgrade_tracker`).
+
+   The tool refuses any overlay that arms lane D below 2/3. Without tracker
+   inputs the share is unknown, and the overlay is also refused.
+   `--force-upgrade-threshold` overrides the refusal. That override is an
+   owner decision, so record it in the OPSLOG.
+3. **Fallback if step 2 misses the launch** (gate not met, or less than one
+   era left): publish `deploy/overlays/lane-d-step2.mainnet.toml` once the
+   gate passes. It carries the same body with `[lane_d] from_block =
+   "next-era"`. With `--effective-block next-era --head-block <head>`, the
+   tool resolves that placeholder to the first era start at least one era
+   past the head. It writes the resolved overrides to `--resolved-out`, and
+   the printed validator command uses that file.
+4. Every later overlay restates `[lane_d] from_block`: `9586800`, or the
+   resolved fallback block. See the restate rule above.
+5. Step 2 and its fallback set `[lane_d] embargo_hours = 24` (the shipped
+   value is 48). Owner decision 2026-11-25: lane A pool data up to snapshot
+   block 9579600 is already public on HF, and a 48 h embargo window would
+   overlap it. Restore `[lane_d] embargo_hours = 48` by overlay after
+   2026-11-27, once cascade#935 is in force.
+
+Testnet rehearses the same flow with `launch-20261125.{pre.,}testnet.toml`
+and the fallback `lane-d-step2.testnet.toml`. The gate exists only in this
+wrapper. `cascade-validator --netconfig-overlay` does not read the tracker,
+so always publish step 2 through the wrapper.
 
 #### `cascade-laned overlay`: lane D bring-up kit (S0c)
 
@@ -3408,8 +3555,17 @@ and a base whose `[round]` drifted from the grid is refused. Output goes to
 `--out` as `body.json` and `overrides.toml`.
 
 `publish` is the Approve-tier wrapper around step 4. By default it is a dry
-run. It prints the SEQ, PREV, DIGEST, NOTE, DIFF and CHECK lines, the exact
-validator publish command and a CONFIRM token. Show that output to the owner.
+run. It prints the SEQ, PREV, DIGEST, NOTE, IN_FORCE, CHANGE, LANE, DIFF and
+CHECK lines, the exact validator publish command and a CONFIRM token. CHANGE
+lines are effective changes against the body in force, and dropped
+restatements are marked `DROPPED`. LANE lines show lane on/off and share
+moves. DIFF lines are against `chain.toml` as typed. `--previous` is the
+latest published body. If nodes refused it, the plan is refused until you
+pass `--in-force` with the body they kept, which is the newest one that
+validates. `seq` / `prev` still follow `--previous`, and the printed command
+carries `--netconfig-in-force-seq`. An overlay that implicitly turns off a
+lane the body in force arms is refused unless you pass `--allow-lane-off`
+(see the restate rule above). Show that output to the owner.
 Only after approval, rerun with the same arguments plus `--execute` and
 `--confirm` set to that token. The wrapper then runs the printed command,
 and `cascade-validator` signs with the owner wallet. A refused plan gets no
@@ -3439,7 +3595,10 @@ cascade-trainer --chain-toml chain.toml --work-root ./_train_work --preflight-v2
 
 This fetches the pinned tree, runs full bounded verification, and records a
 local proof tied to its ref, contract, generator policy and verifier source.
-It rents nothing. The first v2 king leg refuses rental without a matching
+It rents nothing. It exits 3 when the launch is still blocked after
+qualification (the printed blockers). `--preflight-v2-baseline-check REF` is
+the read-only version: it lists every blocker without fetching or writing
+(see [Lane D recurring jobs](#lane-d-recurring-jobs)). The first v2 king leg refuses rental without a matching
 proof and a pinned validator receipt anchor. A launch root survives a later
 v2 dethrone; changing the verifier or policy requires qualification again.
 The trainer and validator may share the configured signer; receipts then share
@@ -3480,3 +3639,294 @@ an installed cron or publish a new snapshot. Rebuild from the existing mirror,
 inspect family/drop/window counts, and publish only for a future settlement.
 See [pool build rules](EVAL_POOL.md#v2-pool-size-channel-width-and-evidence).
 A new 32-channel compliant baseline and GPU qualification remain required.
+
+## Lane D operations (open weights)
+
+Lane D ([LANE_D.md](LANE_D.md); plan `docs/plans/LANE_D_PLAN.md` §10) ships
+unarmed (`[lane_d] from_block = 0`). Activation is a signed overlay at an era
+boundary; the kill switch is the overlay `[lane_d] until_block` that
+[`cascade-laned overlay`](#cascade-laned-overlay-lane-d-bring-up-kit-s0c)
+writes. Stages S0–S8 gate the bring-up. Every step that rents, deletes or
+publishes is Approve-tier.
+
+**What runs.** Nothing large transits the box:
+
+| Component | Where | Role |
+|---|---|---|
+| `cascade-laned-intake` | the box, loopback behind Caddy (`deploy/cascade-laned-intake.service`, `python -P -m cascade.lane_d`) | `POST /v1/lane-d/submit`, `POST /v1/lane-d/ready`, `GET /v1/lane-d/queue`; mints `presigned_multipart` upload grants and never logs one |
+| Vault | private bucket `cascade-lane-d-vault`, prefix `lane-d` (`[lane_d_ops] vault_bucket` / `vault_prefix`) | entries at `lane-d/<hotkey>/<digest>/`; never a shared bucket |
+| Launch eval host | `[lane_d_ops] eval_host` (empty until the S4 bring-up) | forecasts for the cohort, KING_D and the house at 4k–16k context |
+| `pool_d` builder | a dedicated small CPU VM | builds the private `pool_d` snapshots; never the box or a rented GPU pod |
+| Main validator | the box | scores forecasts against the `pool_d` targets, runs the bootstrap, signs the `lane-d-report/1` report and writes `lane_d_state.json` |
+
+**The eval host runs a qualified scoring environment (plan rev6.18 B5).**
+Any GPU may score lane D when its environment is a `qualified` entry of
+`deploy/laned/scoring_envs.toml` at the settlement boundary: the GPU model is
+listed, the driver is in range and the torch build matches. Launch list:
+`cu124-torch241` (the release's `uv sync --frozen --extra train` venv, torch 2.4.1+cu124;
+e.g. valpriv-4090, at least 24 GB) and `sm120-torch212` (RTX PRO 6000
+Blackwell, e.g. valeval-blackwell4; **candidate** until its qualification
+evidence is committed, so it is refused until then). Lane A's pinned training
+contract is not affected. The eval host names its environment with
+`python -m cascade.eval.lane_d_forecasts hello --env NAME` (or
+`CASCADE_LANE_D_SCORING_ENV`); the validator's handshake refuses an
+unqualified one (`lane_d_handshake_env_refused`, settlement
+`env_unqualified`, nothing scored) and the signed report records `host`
+(env, GPU model, driver, torch build, GPU fingerprint, host identity). Every
+model of a settlement is forecast on that one host; the optional
+`score_cache_dir` (`--lane-d-inputs`) reuses forecasts only for the same host
+identity and code, so moving to another host re-scores the whole cohort.
+Qualifying a new environment: the procedure in the file's header (candidate
+PR, W0b + golden-set agreement vs `cu124-torch241`, A9 timing, evidence file,
+owner merge with an activation `from_block`). The kit is
+`python -P -m cascade.eval.lane_d_env_qual {golden,forecast,compare,check}`:
+`golden` picks 500 live + 500 public windows from `pool_d/1` directories,
+`forecast` runs on the pod in the environment under test (and, for the
+reference, in the release venv on a `cu124-torch241` GPU), `compare` scores
+both, replays the cohort and attaches the W0b junit XML and the A9
+`laned_t7/1` pod document (`cascade.eval.lane_d_t7_pod --window-counts 15000
+--n-models 10`), and `check --env NAME` re-derives the committed evidence
+file (the W4 acceptance test does the same for every qualified entry). The
+`sm120-torch212` venv is `uv sync --project deploy/laned/envs/sm120-torch212
+--frozen --group qualify` with the repo on `PYTHONPATH`; its hello reports
+`torch_build = 2.12.1+cu130/cuda-13.0`. Bring the host up at S4 with an
+on-rent check (`nvidia-smi -L`, VRAM, driver, disk), pinned known_hosts and a
+dry run. It gets presigned GETs only, never a credential.
+
+**S8: long context.** `valeval-laned` (80–96 GB, any GPU in a qualified
+scoring environment, at least 300 GB disk for the prefetch
+cache and `pool_d_hist`) is rented only at S8, for the 32k–128k contexts.
+No overlay arms a context: every variant is in `contexts` from launch and
+the validator arms it at each settlement once its readiness count
+(`laned_readiness/1`) and its T7 row (`cascade/eval/lane_d_t7.py`,
+`laned_t7/1`: at most half a settlement, inside the host's GPU memory) both
+pass. The `--lane-d-inputs` TOML names the two documents (`readiness = "..."`,
+`t7 = "..."`, both required); they are re-read at every settlement, so
+publishing a new T7 or readiness file takes effect at the next settlement
+without a restart. A missing or invalid document, or no armed variant, means
+no lane D settlement that tick (`inputs_unavailable`), never a guessed set.
+
+**The first-seen recorder (W6fs).** Forward-only judging needs a first-seen
+time for every target point. W6fs adds an append-only ingest log in the forge
+mirror path, used only by the `pool_d` builder, plus a per-feed mirror-lag
+measurement. Its daily Merkle root is committed before any snapshot uses that
+day's records, so first-seen cannot be backdated. It is launch-blocking: a
+series without both clocks, or a feed above `[lane_d] max_mirror_lag_hours`,
+is never eligible.
+
+**Vault retention.** Hippius has no Object Lock and does not apply lifecycle
+rules, so retention is our job. `python -P -m cascade.laned.vault_sweeper`
+moves losers out of the vault `[lane_d] loser_ttl_eras` after judgement into
+an owner-only archive, then deletes archive copies after the 14-day dispute
+window. `--dry-run` writes nothing; a live run needs the owner's standing
+approval (D16). Kings are published to the Hub, R2 and HF mirrors and kept.
+
+**Runbook, per settlement.** Refresh the house if lane A's king digest
+changed. Check that the newest `pool_d` snapshot is pinned (stale over about
+30 h is CRIT; entries stay pending). Forecasts run on the eval host,
+handshake first. The box scores, bootstraps and applies max-T. A candidate
+gets the drawn gate suite on the bench host, behind lane A, paired against
+KING_D and the house. Then come the signed report, `lane_d_state.json` and
+the receipt digests. Faults hold entries at no cost: an eval host or vault
+outage leaves entries queued, a bench outage holds the crowning
+(`bench_hold`, at most `[lane_d] max_bench_holds` settlements), and a
+handshake mismatch scores nothing.
+
+**State.** Protect `lane_d_state.json` like `cascade_state.json`: snapshot
+it before every restart, never hand-edit it, and never restore it across a
+settlement. The S5 restart order is eval host, validator, lane D intake,
+trainer (no legs in flight).
+
+**Alerts.** An entry whose coldkey cannot be resolved raises
+`lane_d_coldkey_unresolved` and closes unjudged after
+`[lane_d] max_coldkey_unresolved_settlements` settlements. Alerts reach a
+webhook only when `/etc/cascade-ops.env` is filled; otherwise they reach only
+`alerts.jsonl`.
+
+### Elastic lane D hosts (`cascade-laned elastic`)
+
+Owner decision 2026-11-24 (plan R13, W6d): both lane D hosts are rented only
+while they have work. **GPU is always Lium; Shadeform is CPU only.** The
+controller runs on the box (HTTP and ssh only, nothing heavy) and is
+configured by `deploy/laned/elastic.toml` (operator-only, never consensus).
+
+| Role | Provider | Comes up | Goes down |
+|---|---|---|---|
+| `pool-d-builder` | Shadeform CPU VM (VM mode, user `shadeform`); any type with `num_gpus > 0` is refused | every 3 h (`cascade-laned-pool-d.timer`, 00/03/…/21:05 UTC) | right after `pool_d_publish` and `state-push`, unless `keep_warm = true`; always on failure |
+| `lane-d-eval-host` | Lium, through the existing adapter (digest-pinned worker image, host quarantine, lemon recording) | for a settlement with lane D work: `ceil(entries / per_host_entries)` hosts, at most `max_hosts` | when that settlement's scoring has decided (`down --cohort-done`) |
+
+**Costs.** Builder: the cheapest available type meeting the spec, at the
+2026-11-24 snapshot `massedcompute cpu_small` $0.22/h (40 GB / 800 GB) or
+`cpu_medium` $0.44/h (80 GB / 1600 GB), times the build hours (boot +
+`uv sync --frozen --all-extras` + mirror delta + build). Eight builds a day at 1 h each and
+$0.44/h is about $106 a month; a build that runs the full 3 h makes it the
+same as keeping one VM warm (about $317 a month). Eval hosts: Lium price per
+host times the settlement's scoring hours, times the number of hosts (for
+example 2 H200 hosts at $3–4/h for 3 h is $18–24 a settlement). Caps:
+`max_price_per_hour` per role (never rented above), `monthly_cap_usd` per role
+over the controller's own spend ledger (`<state_dir>/spend.jsonl`); an eval
+cohort that the monthly cap cannot fund in full gets fewer hosts and an
+alert. Every rental carries a provider-side backstop (Shadeform
+`auto_delete` date + spend threshold, Lium `--ttl`).
+
+**Which GPU.** A candidate in `[[eval_host.candidates]]` is rented only when
+its `gpu_model` is listed by a `status = "qualified"` environment in F5's
+`deploy/laned/scoring_envs.toml`. Until that file is on main the
+`fallback_qualified_gpu_models` list applies (H200 on the pinned
+torch 2.4.1+cu124). The RTX PRO 6000 Blackwell (`Edition`) stays refused until
+F5's sm_120 environment is qualified. No qualified Lium GPU: the controller
+retries Lium for `retry_window_minutes`, writes the alert
+`lane_d_eval_no_lium_gpu` and exits `no_capacity` (the settlement retries).
+It never rents a GPU on Shadeform.
+
+**Same host per cohort (B6), many hosts.** A cohort keeps its hosts until it
+decides; a second `up` for the same cohort reuses them, `up` for another
+cohort and `down` without `--cohort-done` refuse (`cohort_open`).
+`run --role lane-d-eval-host` writes the shard plan: entries split
+deterministically from the boundary block hash and the entry ids, KING_D and
+the house on every host. The consensus half (each challenger paired with its
+own host's king inside the max-T LCB, and the signed report's per-model host
+and per-host king scores) extends F5 (#830) and needs a plan revision; until
+then the merge refuses `host_mismatch` when hosts disagree on the king.
+
+**Builder state.** The W6fs first-seen log and each snapshot's `metadata.json`
+(the next build's `--prior-dir`) live in the private `pool_d` bucket under
+`<pool_d_prefix>/_builder/`. Object storage, not a Shadeform volume: a volume
+is tied to one cloud and region, which would defeat the cheapest-available
+pick. `state-push` refuses (`state_conflict`) unless the bucket copy is a
+byte prefix of the local log and the bucket `HEAD.json` is the one
+`state-pull` saw.
+Both stream, because `records.jsonl` is 20 GB and growing. `state-push` proves
+the prefix by hashing the local file's first `size` bytes against HEAD's
+sha256, without downloading the bucket copy. It uploads above 256 MiB as a
+multipart upload (at most 10,000 parts, aborted on failure) and does not
+upload a file equal to the bucket copy again. `HEAD.json` records each file's
+sha256 and `sizes`. `state-pull` streams each file to a temp file, verifies
+it against HEAD, and only then replaces the local copy. A failed push leaves
+the previous HEAD, so the next cycle retries. `mirror-sync` never touches
+`first_seen/`.
+
+**Keys the owner fills (names only).**
+
+- `/etc/cascade-laned-elastic.env` (mode 600, the systemd `EnvironmentFile`):
+  `SHADEFORM_API_KEY`, `SHADEFORM_SSH_KEY_ID`, and `LIUM_API_KEY` if the Lium
+  CLI is not already configured.
+- `/etc/cascade-laned-pool-d.env` (mode 600, copied to the builder at mode
+  600; create it with the `env-template` action, below): `HIPPIUS_S3_ACCESS_KEY`,
+  `HIPPIUS_S3_SECRET_KEY`, `TSFORGE_S3_ACCESS_KEY`, `TSFORGE_S3_SECRET_KEY`,
+  `TSFORGE_BUCKET`, `TSFORGE_S3_ENDPOINT`.
+- `deploy/laned/elastic.toml [eval_host] image`: the digest-pinned worker
+  image from the deployed provision.toml, and `per_host_entries` from the A9
+  timing.
+
+**How to run.** Always `quote` (or `--dry-run`) first; renting is
+Approve-tier. The console script `cascade-laned elastic` is the same tool;
+the snippets use the module form.
+
+```
+python -P -m cascade.laned.cli elastic env-template --path /etc/cascade-laned-pool-d.env
+python -P -m cascade.laned.cli elastic quote --role pool-d-builder
+python -P -m cascade.laned.cli elastic cycle --role pool-d-builder --dry-run
+python -P -m cascade.laned.cli elastic cycle --role pool-d-builder        # one build; the timer runs this
+python -P -m cascade.laned.cli elastic down  --role pool-d-builder
+
+python -P -m cascade.laned.cli elastic quote --role lane-d-eval-host --entries 5 --cohort B
+python -P -m cascade.laned.cli elastic up    --role lane-d-eval-host --entries 5 --cohort B
+python -P -m cascade.laned.cli elastic bootstrap --role lane-d-eval-host
+python -P -m cascade.laned.cli elastic run   --role lane-d-eval-host --block-hash H --king K \
+    --house HOUSE --entry-id E1 --entry-id E2 --out shards.json
+python -P -m cascade.laned.cli elastic down  --role lane-d-eval-host --cohort-done
+```
+
+Exit codes: 3 `no_capacity`, 4 `price_cap`, 5 `monthly_cap`, 6 `gpu_refused`,
+7 `cohort_open`, 8 `not_qualified`, 9 `state_conflict`, 10 `step_failed`,
+11 `teardown_unverified`, 12 `host_mismatch` (tests/accept/r13/README.md).
+
+### Lane D recurring jobs
+
+Each job is one idempotent command (a re-run with nothing new does nothing),
+takes `--dry-run` (prints the plan, writes nothing) and reads only local
+files: no chain read, rental or deploy. Only `king-publish` and `takedown`
+write a bucket or repo (the existing public mirrors and manifest store, never
+a new one), and only live (without `--dry-run`, `--vault-dir` / `--mirror` /
+`--index-store-dir`, the filesystem mode testnet uses). The systemd units in
+`deploy/laned/systemd/` are **templates**: nothing installs or starts them.
+Installing one (copy to `/etc/systemd/system/`, fill
+`/etc/cascade-laned-jobs.env` from `cascade-laned-jobs.env.example`,
+`systemctl enable --now <name>.timer`) is an owner step, testnet first. Every
+mutating unit ships with `--dry-run`. Going live is a drop-in that repeats
+`ExecStart` without it, after the dry-run output has been reviewed.
+
+Exit codes for `python -P -m cascade.lane_d.ops_jobs <job>`: 0 means done,
+nothing to do, or dry-run planned. 1 means an input is invalid or a check
+found a problem, and nothing was written. 2 is a usage error. 3 means the job
+is blocked on an owner step.
+
+| Unit (`.service` + `.timer`) | Schedule | Command | Inputs (names only) | Owner steps |
+|---|---|---|---|---|
+| `cascade-laned-house-pointer` | 15 min | `ops_jobs house-pointer` | `LANED_KING_SOURCE` (the validator's JSON state, `king_pointer`, read only), `LANED_HOUSE_POINTER` (the inputs TOML `house_pointer`), `LANED_HOUSE_SOURCE`, `LANED_SIGNER_SS58`, `LANED_WALLET_NAME` / `LANED_WALLET_HOTKEY` (validator **hotkey**) | For each new lane A king, build the house on the eval host pod (below, `house_source build`) and stage it for `cascade-laned-house-source`; until it is installed the job exits 3. Then approve the live drop-in. |
+| `cascade-laned-house-source` | 15 min | `ops_jobs house-source` | `LANED_HOUSE_SOURCE_STAGE` (the pod-built `laned_house_source/1`, its `.provenance.json` beside it), `LANED_HOUSE_SOURCE` | **Pod step:** `python -P -m cascade.lane_d.house_source build --king-pointer <KING_A pointer> --lineage-block <commit block> … --network <net> --chain-toml chain.toml --entry-dir <dir> --out house_source.json --cache-dir <eval cache> --budget-bytes <N>` on the eval host (the house is not in the vault; `--cache-dir` admits it). It casts KING_A to BF16 (D47, rule `laned_bf16_cast/1`: round-to-nearest-even, sorted tensors, F32/F16/BF16 in, anything else or non-finite refused) into the four lane D entry files and dates it by D46 (the chain timestamp of the latest lineage commit block). Copy `house_source.json` and its `.provenance.json` to the stage. The install re-checks the provenance (manifest re-hash, release code, cast rule, lineage) without reading weights. Live drop-in. |
+| `cascade-laned-published-weights` | hourly | `python -P -m cascade.lane_d.published_weights` | `LANED_INTAKE_STATE`, `LANED_INDEX`, `LANED_SIGNER_SS58`, `LANED_MIRROR_DIR` (local copy of one public mirror); lane A legs, kings and the house via `--shas-file` | Fetchers: `python -P -m cascade.lane_d.published_sources mirror-index --index-url <public index URL> --mirror-url <public mirror base URL> --signer-ss58 … --dest $LANED_MIRROR_DIR` (box-safe, kilobytes) and, **on a pod or the builder** (it downloads and casts checkpoints), `published_sources checkpoint-shas --refs-from <round manifests> --work-dir … --out shas.json` (each checkpoint's weights sha256 and its D47 BF16-cast sha256, the house included); add `--shas-file shas.json`. Live drop-in. |
+| `cascade-laned-readiness-measure` | 3 h, **builder VM only** | `scripts/laned_w1_measure.py --forge-dir … --readiness-out …` | `LANED_FORGE_DIR` (synced forge mirror), `LANED_EVIDENCE_STAGE` | Move the staged `laned_readiness.json` to the validator host's stage. With the elastic builder ([above](#elastic-lane-d-hosts-cascade-laned-elastic)), the VM exists only during a build, so the owner runs this command inside that cycle rather than from a standing timer. The template suits a standing testnet builder. |
+| `cascade-laned-evidence` | 3 h | `ops_jobs evidence` | `LANED_CHAIN_TOML`, `LANED_EVIDENCE_STAGE`, `LANED_PINNED_READINESS` / `LANED_PINNED_T7` (the inputs TOML `readiness` / `t7`) | **T7 is an owner step.** On the eval host pod run `python -P -m cascade.eval.lane_d_t7_pod --checkpoint-dir <a lane D entry> --histories <pool_d windows .npz> (or --synthetic-seed N) --host <eval_host> --gpu <model> --mem-gb <GB> --out t7.json` (CUDA, `source = "pod"`; every variant at 1000 and 5000 windows, the 5000 row gates, both under `window_sweep`), stage `t7.json`, then add `--t7`. A non-pod T7, an unparseable document, or one that disarms an armed context is refused (`--allow-disarm` overrides the last). |
+| `cascade-laned-vault-sweep` | daily 04:30 UTC | `ops_jobs vault-ledger`, then `python -P -m cascade.laned.vault_sweeper --dry-run` | `LANED_STATE`, `LANED_LEDGER`, `LANED_VAULT_DIR` / `LANED_ARCHIVE_DIR` (fs mode, testnet), `LANED_SWEEP_LOG_DIR` | A `--live` sweep needs the standing approval **D16** and a drop-in. S3 mode (`--s3 --archive-bucket`) takes its credentials from the owner's own mode-600 env file, never this one. |
+| `cascade-laned-king-check` | hourly | `ops_jobs king-check` | `LANED_STATE` (its persisted reports), `LANED_INDEX`, `LANED_SIGNER_SS58`; optional `--vault-dir` and `--mirror hub=… r2=… hf=…` local copies for the full re-hash | A red check after `cascade-laned-king-publish` ran is an owner look. |
+| `cascade-laned-king-publish` (+ `.path`) | on each publish request, hourly backstop; **testnet-ctl / builder, not the loaded 7 GB box** (one checkpoint in memory) | `ops_jobs king-publish` | `LANED_STATE` (its reports and `lane_d_publish_requests/`), `LANED_INTAKE_STATE` (ready licences), `LANED_INDEX`, `LANED_SIGNER_SS58`, `LANED_CHAIN_TOML` (`[storage]` names), `LANED_WALLET_NAME` / `LANED_WALLET_HOTKEY`; env credentials by name only: `HIPPIUS_S3_*`, `HIPPIUS_HUB_TOKEN`, `HF_TOKEN`, `BACKUP_S3_*` | The validator's settlement step writes `lane_d_publish_requests/<boundary>.json` for each crowning (with the era's sentinel record). The job copies the king vault → Hub `{hub_namespace}/laned-king-c{context}-{hotkey8}`, R2 (`[storage] backup_bucket`, else `manifest_bucket`, under `lane-d-kings/`) and HF `tensorlink-dev/cascade-lane-d-kings`, re-signs the index, puts it on the manifest store and writes `LANED_INDEX`. Exit 3 without a ready licence record or a missing armed sentinel record. Live drop-in. **Takedown** (B13) is a one-shot: `ops_jobs takedown --digest D --reason licence\|rights --block B --index … --signer-ss58 … --chain-toml …` (`--dry-run` first). |
+
+**Lane A item (testnet bring-up): qualify a compliant initial king.** Run
+`cascade-trainer --chain-toml chain.testnet.toml --work-root ./_train_work
+--preflight-v2-baseline-check NAMESPACE/GENERATOR@sha256:DIGEST` first. It is
+read-only: it fetches, writes and rents nothing. It prints every blocker at
+once (`worker_release: …`, `identity: …`, `no_validator_anchor`,
+`no_proof`, `proof_stale:<keys>`, `proof_not_full`) and exits 0 when ready, 3
+when blocked, 2 on error. Then run `--preflight-v2-baseline` with the same
+ref. That fetches the generator, runs the full sandbox verification and
+records the proof, then reports the same way. It exits 3, not 0, when another
+blocker remains. The trainer's `v2 launch blocked before rental` line names
+the king's real ref and work root.
+
+**Watcher tags** for cascade-ops (owner: add follower patterns; nothing here
+writes to cascade-ops). Lines are `<ts> LEVEL cascade.lane_d.ops: <tag> …` in
+`LANED_LOG` (`--log-file`):
+
+| Tag | Level | Meaning |
+|---|---|---|
+| `lane_d_ops_house_current` | info | pointer matches the lane A king |
+| `lane_d_ops_house_no_lane_a_king` | info | lane A has no king, so the previous house stays |
+| `lane_d_ops_house_resign_planned` | info | dry-run: the payload it would sign |
+| `lane_d_ops_house_resigned` | warning | new house pointer signed |
+| `lane_d_ops_house_resign_blocked` | error | lane A king changed and its house source is not prepared (exit 3) |
+| `lane_d_ops_house_failed` | error | unreadable or invalid input, or the wrong signer; nothing written |
+| `lane_d_ops_evidence_current` | info | pinned readiness / T7 already current |
+| `lane_d_ops_evidence_planned` | info | dry-run install plan |
+| `lane_d_ops_evidence_installed` | warning | new readiness / T7 installed (armed before → after) |
+| `lane_d_ops_evidence_refused` | error | invalid, non-pod or disarming document |
+| `lane_d_ops_ledger_current` | info | vault ledger unchanged |
+| `lane_d_ops_ledger_planned` | info | dry-run ledger |
+| `lane_d_ops_ledger_written` | info | ledger exported for the sweeper |
+| `lane_d_ops_ledger_failed` | error | state or closure unprovable; nothing written |
+| `lane_d_ops_king_ok` | info | every crowned report agrees with the index |
+| `lane_d_ops_king_unpublished` | critical | a crowned king is missing or disagrees (index, vault or mirror) |
+| `lane_d_ops_king_check_failed` | error | the index or the inputs are unreadable or unverified |
+| `lane_d_ops_house_source_current` | info | the installed house source is current |
+| `lane_d_ops_house_source_planned` | info | dry-run: the house source it would install |
+| `lane_d_ops_house_source_installed` | warning | a new house source installed for the house-pointer job |
+| `lane_d_ops_house_source_refused` | error | the provenance does not prove the source; nothing installed |
+| `lane_d_ops_king_publish_current` | info | every crowned settlement is in the index |
+| `lane_d_ops_king_publish_planned` | info | dry-run: the kings it would publish |
+| `lane_d_ops_king_published` | warning | kings copied to the mirrors and the index re-signed |
+| `lane_d_ops_king_publish_blocked` | error | no ready licence record or an armed sentinel record missing (exit 3) |
+| `lane_d_ops_king_publish_failed` | error | a vault or mirror re-hash failed, or the wrong signer; index unchanged |
+| `lane_d_ops_takedown_planned` | info | dry-run (or already taken down) |
+| `lane_d_ops_takedown_done` | warning | Hub and HF copies removed, index re-signed |
+| `lane_d_ops_takedown_failed` | error | unknown king, a copy left behind, or the wrong signer; index unchanged |
+
+The validator logs `lane_d_king_publish_requested` (info) when it leaves a
+publish request and `lane_d_king_publish_request_failed` (warning) when it
+could not; the settlement and pay stand either way and `king-check` flags the
+unpublished king.
+
+The published-weights job prints `published_weights: wrote …`,
+`published_weights: current …`, `published_weights: dry-run …` and, on
+failure, `published_weights: … nothing written`. The sweeper writes its own
+JSON action log under `LANED_SWEEP_LOG_DIR`.

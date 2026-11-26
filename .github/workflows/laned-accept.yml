@@ -1,9 +1,22 @@
 # Lane D loop gate (plan §3 conventions, §3.1 rules 1 and 6, §17; built by W0c).
 #
 # pull_request labelled laned:<WP>: `scripts/laned/accept <WP> --check-pr`
-#   (rule 1: tests/accept/ never together with another path; an implementation
-#   PR stays inside the WP's PATHS), then the mode check-pr prints:
+#   (rev6.17 rule 1: tests/accept/<wp>/ may change together with code inside
+#   the labelled WPs' PATHS, PATHS entries riding along; FEATURE rule in
+#   accept --help), then the mode check-pr prints:
 #     MODE implementation   -> full Accept
+#     MODE combined         -> --combined (rev6.17, tests + code in one PR): the
+#                              WP's new tests from the PR run on the base's code
+#                              and must fail for a right reason (a new test
+#                              passing there proves nothing: refused unless a
+#                              verification WP), changed ones must not fail for
+#                              a wrong reason, then the full Accept on the PR
+#                              head; ledger mode combined + tests_tree + PR
+#                              number (status: L1 and L2 at the squash merge)
+#   laned:tests-correction is a flag label, never a WP: it lets a combined PR
+#   delete or weaken existing assertions (check-pr refuses that otherwise).
+#   Every pull_request ledger row records the PR number: the squash merge
+#   `(#N)` is the L2 commit of each WP whose last row for that PR is green.
 #     MODE tests-only       -> --verification (the WP has no implementation (L2
 #                              commit) on the base yet): if every non-test
 #                              PATHS entry already exists on the base and the
@@ -34,13 +47,13 @@
 #   tests/accept/<wp>/ dirs, one label per dir, none of them built on the base;
 #   each WP then runs its own --verification above and is ledger-recorded with
 #   its own tests_tree (every tests-only run records it). A per-WP PASS/FAIL
-#   table is printed and the job fails when any WP fails. Plan rev6.3 (b): a
-#   tests-only PR for up to 3 WPs all built on the base is a batch of
-#   tests-corrections (MODE tests-correction per WP), and an implementation PR
-#   may carry up to 3 WPs (BATCH IMPLEMENTATION rule in accept --help:
-#   disjoint PATHS, no in-batch Depends, each WP's tests on the base, every
-#   file in exactly one WP's PATHS): MODE implementation per WP, each WP's own
-#   full Accept and ledger row, CROSS over the whole set.
+#   table is printed and the job fails when any WP fails. Rev6.17 (owner
+#   2026-11-23, one PR per feature): no WP cap, built and unbuilt WPs mix in
+#   a tests-only batch (each its own MODE), and a PR with code may carry any
+#   number of laned:<WP> labels, overlapping PATHS and in-batch Depends
+#   included (FEATURE rule; it replaces the rev6.3 (b) <= 3 disjoint-WP
+#   BATCH IMPLEMENTATION rule and the COUPLED rule): each WP's own mode
+#   (combined or implementation), ledger row and CROSS over the whole set.
 #   then, every mode but review: `accept <WPs> --cross` re-accepts every OTHER
 #   WP at >= L2 on the base whose tests depend on the PR's changed paths
 #   (imports, string-named paths, PATHS overlap; CROSS rule in accept --help)
@@ -49,17 +62,15 @@
 #   Verification mode is open only to the WPs listed in
 #   scripts/laned/verification_wps on the base (RV5); a declared verification
 #   WP at L2 is cross-eligible like an implemented one.
-#   Last, `freshness` (every PR, RV5): fetches origin/<base> at job time and
-#   fails with `STALE BASE: update-branch and re-run` when main has moved past
-#   the base this run tested (HEAD^1 of the merge commit) with a change that
-#   touches, imports or is imported by the PR's paths, or that a WP test dir
-#   depending on the PR also depends on (FRESHNESS rule in accept --help).
-#   MERGE RULE: a green run is only valid for the base it ran on. Before
-#   merging a laned:* PR the loop must update-branch and re-run this workflow
-#   when origin/main has moved since the run (the orchestrator enforces it;
-#   a STALE BASE result is never merged). Branch protection "require branches
-#   to be up to date before merging" (+ this check as required) is the owner's
-#   repository setting, not something this workflow can turn on.
+#   Last, `freshness` (every PR, RV5; a WARNING since 2026-11-24): fetches
+#   origin/<base> at job time and, when main has moved past the base this run
+#   tested (HEAD^1 of the merge commit) with a change that touches, imports or
+#   is imported by the PR's paths, or that a WP test dir depending on the PR
+#   also depends on (FRESHNESS rule in accept --help), prints `WARNING STALE
+#   BASE ...` into the job summary. It never fails the PR: main moves faster
+#   than one CI run, and the merge queue (merge_group below) re-runs every
+#   queued PR's own Accept and a CROSS on the combined ref against the latest
+#   main, so a stale-base PR cannot land broken. No update-branch loop.
 #   The tooling comes from the base
 #   branch once it exists there, so a PR cannot loosen its own gate.
 # push to main: Accept for every WP at >= L2 (with `--evidence <file>` from the
@@ -67,6 +78,17 @@
 #   LANED_EVIDENCE), `accept --gate` for every stage gate file present (both
 #   record the verified blob sha in the ledger), then `scripts/laned/status`
 #   recomputes the board and pushes it to branch laned/build-state (never main).
+# merge_group (GitHub merge queue, 2026-11-23): the same `pr` job, so a check
+#   named `pr` always reports on the group ref and can never sit "expected".
+#   With no PR labels the per-PR steps skip. The merge-group step (the gate
+#   since PR freshness became a warning, 2026-11-24) writes the queued PRs'
+#   labels to a JSON file, runs `accept --merge-group --base
+#   <merge_group.base_sha> --head HEAD --group-labels <file>` (every queued
+#   PR's OWN WPs: mode from check-pr on that PR's commit, then the full Accept
+#   / verification / tests-correction / evidence run on the combined ref;
+#   MERGE-GROUP rule in accept --help), then `accept <own WPs> --cross` over
+#   the whole group. Nothing goes to the ledger (only PR, dispatch and push
+#   runs are harvested). The push job below still runs after the merge.
 # workflow_dispatch: an expect-fail run of one WP at a given commit (bootstrap
 #   for WPs whose tests landed before this workflow existed). The harvester keeps
 #   that result when the commit is an ancestor of the dispatched ref's head.
@@ -78,6 +100,8 @@ name: laned-accept
 on:
   pull_request:
     types: [opened, reopened, labeled, synchronize]
+  merge_group:
+    types: [checks_requested]
   push:
     branches: [main]
   workflow_dispatch:
@@ -94,9 +118,13 @@ permissions:
 
 jobs:
   pr:
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # merge_group runs every queued PR's own Accept plus the CROSS: longer
+    timeout-minutes: ${{ github.event_name == 'merge_group' && 120 || 60 }}
+    permissions:
+      contents: read
+      pull-requests: read   # merge_group: read the queued PRs' laned:<WP> labels
     concurrency:
       group: laned-accept-${{ github.event.pull_request.number || github.run_id }}
       cancel-in-progress: true
@@ -118,58 +146,96 @@ jobs:
           if [ -n "$DISPATCH_WP" ]; then
             wps="$DISPATCH_WP"
           else
-            wps=$(python3 -c 'import json, os; print(" ".join(l.split(":", 1)[1] for l in json.loads(os.environ["LABELS"] or "[]") if l.startswith("laned:")))')
+            # merge_group has no PR labels (toJSON gives "null"): wps stays
+            # empty and only the merge-group step below runs.
+            wps=$(python3 -c 'import json, os; print(" ".join(l.split(":", 1)[1] for l in (json.loads(os.environ["LABELS"] or "[]") or []) if l.startswith("laned:") and l != "laned:tests-correction"))')
           fi
+          # laned:tests-correction is a flag, never a WP (FEATURE rule, accept --help)
+          correction=$(python3 -c 'import json, os; print("1" if "laned:tests-correction" in (json.loads(os.environ["LABELS"] or "[]") or []) else "")')
           echo "wps=$wps" >> "$GITHUB_OUTPUT"
+          echo "correction=$correction" >> "$GITHUB_OUTPUT"
           echo "WPs: ${wps:-none (no laned:<WP> label; nothing to check)}"
 
       - name: Prepare isolated TLS trust for the CI job
-        if: steps.select.outputs.wps != ''
+        if: steps.select.outputs.wps != '' || github.event_name == 'merge_group'
         run: python3 scripts/prepare_ci_tls.py "$RUNNER_TEMP/cascade-ca" >> "$GITHUB_ENV"
 
       - name: Install uv
-        if: steps.select.outputs.wps != ''
+        if: steps.select.outputs.wps != '' || github.event_name == 'merge_group'
         uses: astral-sh/setup-uv@v5
         with:
           version: "0.13.4"
           enable-cache: true
 
       - name: Check system TLS trust before Git dependency fetches
-        if: steps.select.outputs.wps != ''
+        if: steps.select.outputs.wps != '' || github.event_name == 'merge_group'
         run: uv run --no-project --python 3.11 python scripts/check_tls_trust.py --system-only
 
       - name: Sync (frozen, all extras)
-        if: steps.select.outputs.wps != ''
+        if: steps.select.outputs.wps != '' || github.event_name == 'merge_group'
         run: uv sync --frozen --all-extras
 
       - name: Use the base branch's loop tooling when it has one
-        if: steps.select.outputs.wps != ''
+        if: steps.select.outputs.wps != '' || github.event_name == 'merge_group'
         env:
-          BASE_REF: ${{ github.base_ref || 'main' }}
+          # merge_group: the queue's base commit (never the group's own code)
+          BASE_REV: ${{ github.event.merge_group.base_sha || format('origin/{0}', github.base_ref || 'main') }}
         run: |
           tools="$RUNNER_TEMP/laned-tools"
           mkdir -p "$tools"
-          if git cat-file -e "origin/$BASE_REF:scripts/laned/accept" 2>/dev/null; then
-            git archive "origin/$BASE_REF" scripts/laned | tar -x -C "$tools"
-            echo "tooling: origin/$BASE_REF"
+          if git cat-file -e "$BASE_REV:scripts/laned/accept" 2>/dev/null; then
+            git archive "$BASE_REV" scripts/laned | tar -x -C "$tools"
+            echo "tooling: $BASE_REV"
           else
             mkdir -p "$tools/scripts" && cp -r scripts/laned "$tools/scripts/"
-            echo "tooling: this PR (none on origin/$BASE_REF yet)"
+            echo "tooling: this PR (none on $BASE_REV yet)"
           fi
           echo "LANED=$tools/scripts/laned" >> "$GITHUB_ENV"
+
+      - name: Merged PRs' laned labels (LABELLED L2 rule)
+        # rev6.17: a squash merge `(#N)` is a WP's L2 commit only when PR N
+        # carried laned:<WP> and changed a non-test path in its PATHS
+        # (accept --help, FEATURE rule). Fails closed: without the labels the
+        # git-only rule would over-count (the #817 / W5i case).
+        if: steps.select.outputs.wps != '' || github.event_name == 'merge_group'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          f="$RUNNER_TEMP/laned-pr-labels.json"
+          for i in 1 2 3; do
+            gh pr list -R "$GITHUB_REPOSITORY" --state merged --limit 5000 --json number,labels > "$f" && break
+            [ "$i" = 3 ] && { echo "::error::cannot list merged PRs' labels"; exit 1; }
+            sleep 10
+          done
+          echo "merged PRs with labels listed: $(python3 -c 'import json, sys; print(len(json.load(open(sys.argv[1]))))' "$f")"
+          echo "LANED_PR_LABELS=$f" >> "$GITHUB_ENV"
 
       - name: Accept (check-pr, then expect-fail or accept)
         if: steps.select.outputs.wps != ''
         env:
           WPS: ${{ steps.select.outputs.wps }}
+          CORRECTION: ${{ steps.select.outputs.correction }}
           EVENT: ${{ github.event_name }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || inputs.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number || '' }}
           RUN_HEAD_SHA: ${{ github.event_name == 'workflow_dispatch' && github.sha || '' }}
         run: |
           mkdir -p "$(dirname "$LANED_RESULTS")"
           # workflow_dispatch: the entry carries the `sha` input, not the run's
           # head; record the run's head so the harvester can cross-check it.
           run_head=(); [ -n "$RUN_HEAD_SHA" ] && run_head=(--run-head-sha "$RUN_HEAD_SHA")
+          # FEATURE rule (rev6.17): every pull_request ledger row carries the PR
+          # number (status: the squash merge `(#N)` is each green WP's L2), and
+          # laned:tests-correction reaches check-pr / --combined as --correction.
+          # Base tooling that predates them gets neither (it fails closed).
+          pr_arg=()
+          if [ -n "$PR_NUMBER" ] && grep -q -- '"--pr"' "$LANED/ci_ledger.py"; then
+            pr_arg=(--pr "$PR_NUMBER")
+          fi
+          corr_arg=()
+          if [ -n "$CORRECTION" ] && grep -q -- '"--correction"' "$LANED/accept"; then
+            corr_arg=(--correction)
+          fi
           # BATCH rule (accept --help; plan rev6.2 (h)): check-pr sees every
           # laned:<WP> label, so one tests-only PR may carry several WPs' test
           # dirs, each only under its own label. Tooling without --pr-wps keeps
@@ -184,13 +250,14 @@ jobs:
             echo "::group::$wp"
             if [ "$EVENT" = "workflow_dispatch" ]; then
               mode=tests-only
-            elif out=$(python3 "$LANED/accept" "$wp" --check-pr --base HEAD^1 --head HEAD "${batch_arg[@]}" --root .); then
+            elif out=$(python3 "$LANED/accept" "$wp" --check-pr --base HEAD^1 --head HEAD "${batch_arg[@]}" \
+                "${corr_arg[@]}" --root .); then
               echo "$out"
               mode=$(echo "$out" | sed -n 's/^MODE //p')
             else
               echo "$out"
               python3 "$LANED/ci_ledger.py" record --file "$LANED_RESULTS" --wp "$wp" --mode check-pr \
-                --event "$EVENT" --head-sha "$HEAD_SHA" --conclusion failure
+                --event "$EVENT" --head-sha "$HEAD_SHA" --conclusion failure "${pr_arg[@]}"
               table+=("$wp | check-pr | FAIL")
               status=1; echo "::endgroup::"; continue
             fi
@@ -200,8 +267,16 @@ jobs:
               # laned:RV<n>: check-pr already verified the diff is exactly
               # evidence/rv<n>.md; a review PR has no tests to run.
               python3 "$LANED/ci_ledger.py" record --file "$LANED_RESULTS" --wp "$wp" --mode check-pr \
-                --event "$EVENT" --head-sha "$HEAD_SHA" --conclusion success
+                --event "$EVENT" --head-sha "$HEAD_SHA" --conclusion success "${pr_arg[@]}"
               table+=("$wp | review | PASS")
+              echo "::endgroup::"; continue
+            fi
+            if [ "$mode" = "retired" ]; then
+              # RETIRED rule (accept --help; scripts/laned/retired_wps at the
+              # base): an owner decision dropped the WP, its label is inert.
+              # check-pr allowed only deleting its tests dir; nothing runs and
+              # no ledger row is written (a row would read as progress).
+              table+=("$wp | retired | SKIP")
               echo "::endgroup::"; continue
             fi
             if [ "$mode" = "evidence" ]; then
@@ -216,7 +291,7 @@ jobs:
                 [ "$rc" = 0 ] && conclusion=success || { conclusion=failure; status=1; }
                 python3 "$LANED/ci_ledger.py" record --file "$LANED_RESULTS" --wp "$wp" --mode evidence \
                   --event "$EVENT" --head-sha "$HEAD_SHA" --conclusion "$conclusion" \
-                  --evidence-sha "$(git rev-parse "HEAD:$ev")"
+                  --evidence-sha "$(git rev-parse "HEAD:$ev")" "${pr_arg[@]}"
                 [ "$rc" = 0 ] && table+=("$wp | evidence $ev | PASS") || table+=("$wp | evidence $ev | FAIL")
               done
               echo "::endgroup::"; continue
@@ -246,13 +321,24 @@ jobs:
               run_mode=tests-correction
               uv run --frozen python "$LANED/accept" "$wp" --tests-correction --base HEAD^1 --head HEAD \
                 --root . && rc=0 || rc=$?
+            elif [ "$mode" = "combined" ]; then
+              # FEATURE rule (rev6.17): tests + code in one PR. The WP's new and
+              # changed tests run on the base's code first (new ones must fail
+              # for a right reason), then the full Accept on the PR head.
+              run_mode=combined
+              cout=$(uv run --frozen python "$LANED/accept" "$wp" --combined --base HEAD^1 --head HEAD \
+                "${corr_arg[@]}" --root . 2>&1) && rc=0 || rc=$?
+              echo "$cout"
+              tests_tree=$(echo "$cout" | sed -n 's/^TESTS-TREE //p' | tail -n 1)
+              [ -n "$tests_tree" ] && tree_arg=(--tests-tree "$tests_tree")
             else
               run_mode=accept
               uv run --frozen python "$LANED/accept" "$wp" --root . && rc=0 || rc=$?
             fi
             [ "$rc" = 0 ] && conclusion=success || { conclusion=failure; status=1; }
             python3 "$LANED/ci_ledger.py" record --file "$LANED_RESULTS" --wp "$wp" --mode "$run_mode" \
-              --event "$EVENT" --head-sha "$HEAD_SHA" --conclusion "$conclusion" "${run_head[@]}" "${tree_arg[@]}"
+              --event "$EVENT" --head-sha "$HEAD_SHA" --conclusion "$conclusion" "${run_head[@]}" "${tree_arg[@]}" \
+              "${pr_arg[@]}"
             [ "$rc" = 0 ] && table+=("$wp | $run_mode | PASS") || table+=("$wp | $run_mode | FAIL")
             echo "::endgroup::"
           done
@@ -284,6 +370,62 @@ jobs:
             >> "$GITHUB_STEP_SUMMARY"
           exit "$rc"
 
+      - name: Merge-group accept (each queued PR's own WPs, then the CROSS, on the combined ref)
+        # merge_group: the group has no labels, so the per-PR steps above all
+        # skip. PR-level freshness is only a warning (2026-11-24), so THIS is
+        # the gate that a stale-base PR cannot land broken:
+        #   1. `accept --merge-group`: for every queued PR (`(#N)` commits of
+        #      merge_group.base_sha..HEAD) and every laned:<WP> label, check-pr
+        #      on that PR's commit names the mode and the WP's own run follows
+        #      on the combined ref (full Accept for implementation / combined;
+        #      verification, tests-correction, evidence as on the PR).
+        #   2. `accept <own WPs> --cross` over the whole group diff: every
+        #      OTHER WP at >= L2 on the base whose tests depend on any queued
+        #      change (what two individually green PRs break together).
+        # Fails closed: an unreadable label, a commit naming no PR or base
+        # tooling without --cross fails the check. Base tooling that predates
+        # --merge-group (only until this rule lands) uses the group's own.
+        if: github.event_name == 'merge_group'
+        env:
+          GROUP_BASE: ${{ github.event.merge_group.base_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -o pipefail   # the default `bash -e` would take tee's status
+          if ! grep -q -- '--cross' "$LANED/accept"; then
+            echo "::error::the base's loop tooling has no --cross mode; the group cannot be checked"
+            exit 1
+          fi
+          echo "group $GROUP_BASE..$(git rev-parse HEAD):"
+          git log --first-parent --format='  %h %s' "$GROUP_BASE..HEAD"
+          labels_file="$RUNNER_TEMP/laned-group-labels.json"
+          echo '{}' > "$labels_file"
+          for n in $(git log --first-parent --format=%s "$GROUP_BASE..HEAD" \
+              | sed -n -e 's/.*(#\([0-9][0-9]*\))$/\1/p' -e 's/^Merge pull request #\([0-9][0-9]*\) .*/\1/p' | sort -u); do
+            names=$(gh pr view "$n" -R "$GITHUB_REPOSITORY" --json labels --jq '[.labels[].name]') \
+              || { echo "::error::cannot read the labels of #$n"; exit 1; }
+            python3 -c 'import json, sys; f, n, names = sys.argv[1:]; d = json.load(open(f)); d[n] = json.loads(names); json.dump(d, open(f, "w"))' \
+              "$labels_file" "$n" "$names"
+          done
+          echo "queued PRs' labels: $(cat "$labels_file")"
+          tool="$LANED/accept"
+          if ! grep -q -- '--merge-group' "$tool"; then
+            echo "the base's loop tooling has no --merge-group mode yet; using the group's own"
+            tool=scripts/laned/accept
+          fi
+          out="$RUNNER_TEMP/laned-group.txt"
+          uv run --frozen python "$tool" --merge-group --base "$GROUP_BASE" --head HEAD \
+            --group-labels "$labels_file" --root . | tee "$out" && grc=0 || grc=$?
+          wps=$(sed -n 's/^GROUP-OWN //p' "$out" | tail -n 1)
+          [ "$wps" = "none" ] && wps=""
+          echo "queued PRs' own WPs (accepted above, excluded from the CROSS): ${wps:-none}"
+          cout="$RUNNER_TEMP/laned-cross.txt"
+          uv run --frozen python "$LANED/accept" "${wps:-none}" --cross --base "$GROUP_BASE" --head HEAD --root . \
+            | tee "$cout" && crc=0 || crc=$?
+          { echo "### Merge-group own-WP accept"; echo; echo '```'; grep -E '^GROUP' "$out" || true; echo '```'
+            echo "### Merge-group cross-WP accept"; echo; echo '```'; grep -E '^(CROSS|cross) ' "$cout" || true; echo '```'; } \
+            >> "$GITHUB_STEP_SUMMARY"
+          [ "$grc" = 0 ] && [ "$crc" = 0 ]
+
       - name: Loop tooling self-tests (W0c PRs)
         if: contains(format(' {0} ', steps.select.outputs.wps), ' W0c ')
         run: |
@@ -300,9 +442,12 @@ jobs:
           if-no-files-found: ignore
 
       - name: freshness
-        # RV5: a green run on a base main has since moved past must not merge
-        # when main's new commits interact with the PR's paths (FRESHNESS rule
-        # in accept --help). origin/<base> is fetched now, at job time.
+        # RV5, a WARNING since 2026-11-24 (FRESHNESS rule in accept --help):
+        # a stale base is reported in the summary, never fails the PR. The
+        # merge queue's merge-group step re-accepts every queued WP on the
+        # combined ref, so the PR does not chase main. origin/<base> is
+        # fetched now, at job time. Base tooling without --warn-only still
+        # cannot fail the step (its STALE result is turned into the warning).
         if: always() && github.event_name == 'pull_request' && steps.select.outputs.wps != ''
         env:
           WPS: ${{ steps.select.outputs.wps }}
@@ -311,13 +456,22 @@ jobs:
         run: |
           git fetch --no-tags --quiet origin "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF"
           echo "tested base: $(git rev-parse HEAD^1) (event base.sha $EVENT_BASE_SHA); origin/$BASE_REF now: $(git rev-parse "origin/$BASE_REF")"
-          if ! grep -q -- '--freshness' "$LANED/accept"; then
-            echo "the base branch's loop tooling has no --freshness mode yet; using this PR's"
-            tool=scripts/laned/accept
+          tool="$LANED/accept"
+          grep -q -- '--freshness' "$tool" || tool=scripts/laned/accept
+          warn=(); grep -q -- '--warn-only' "$tool" && warn=(--warn-only)
+          out=$(python3 "$tool" "$WPS" --freshness --base HEAD^1 --head HEAD --main "origin/$BASE_REF" \
+            "${warn[@]}" --root . 2>&1) && rc=0 || rc=$?
+          echo "$out"
+          if [ "$rc" != 0 ] || echo "$out" | grep -q 'STALE BASE'; then
+            echo "::warning::stale base (not enforced: the merge queue re-runs the Accept on the combined ref)"
+            { echo "### freshness: WARNING (not enforced)"; echo; echo '```'
+              echo "$out" | grep -E '^(stale:|STALE|WARNING STALE|freshness:)' || true; echo '```'
+              echo "The merge queue re-runs this PR's Accept and the CROSS on the latest main; no update-branch needed."; } \
+              >> "$GITHUB_STEP_SUMMARY"
           else
-            tool="$LANED/accept"
+            { echo "### freshness: OK"; echo; echo "$out" | grep -E '^FRESH' || true; } >> "$GITHUB_STEP_SUMMARY"
           fi
-          python3 "$tool" "$WPS" --freshness --base HEAD^1 --head HEAD --main "origin/$BASE_REF" --root .
+          exit 0
 
   main:
     if: github.event_name == 'push'
@@ -326,6 +480,7 @@ jobs:
     permissions:
       contents: write   # push the board to laned/build-state (never main)
       actions: read     # read laned-results artifacts for the ledger
+      pull-requests: read   # merged PRs' laned:<WP> labels (LABELLED L2 rule)
     concurrency:
       group: laned-build-state
       cancel-in-progress: false
@@ -358,6 +513,17 @@ jobs:
 
       - name: Sync (frozen, all extras)
         run: uv sync --frozen --all-extras
+
+      - name: Merged PRs' laned labels (LABELLED L2 rule)
+        # see the pr job's step of the same name; fails closed
+        run: |
+          f="$RUNNER_TEMP/laned-pr-labels.json"
+          for i in 1 2 3; do
+            gh pr list -R "$GITHUB_REPOSITORY" --state merged --limit 5000 --json number,labels > "$f" && break
+            [ "$i" = 3 ] && { echo "::error::cannot list merged PRs' labels"; exit 1; }
+            sleep 10
+          done
+          echo "LANED_PR_LABELS=$f" >> "$GITHUB_ENV"
 
       - name: Harvest the CI results ledger
         run: |

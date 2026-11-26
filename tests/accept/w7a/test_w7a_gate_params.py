@@ -30,8 +30,8 @@ from .helpers import (
     entry,
     fixture_key,
     lane_d_cfg,
+    loser_then_crown,
     settle,
-    two_settlements,
 )
 
 OVERLAY = {"gate_weights": {"gift": 2.0, "boom": 1.0}, "max_source_share": 0.5,
@@ -61,7 +61,7 @@ def _check(params, cfg):
 
 
 def test_params_carry_the_parsed_gate_and_source_knobs(scratch):
-    built = two_settlements(scratch)
+    built = loser_then_crown(scratch)
     for s in (built["s1"], built["s2"]):
         _check(s.report["params"], built["cfg"])
     assert built["s2"].report["params"]["gate_weights"] == {
@@ -90,7 +90,7 @@ def test_params_follow_an_overlay_that_changes_them(scratch):
 
 
 def _s2(scratch) -> dict:
-    return copy.deepcopy(two_settlements(scratch)["s2"].report)
+    return copy.deepcopy(loser_then_crown(scratch)["s2"].report)
 
 
 def _refused(report, code, field):

@@ -82,6 +82,7 @@ from .manifest_chain import (  # noqa: F401 — re-exported for callers of casca
     ref_as_of,
 )
 from .marketcast import MarketCastMixin
+from .offthread_worker import LaneDWorker
 from .promotion_gate import PromotionGateMixin
 from .receipts import ReceiptMixin
 from .state import ChampionState, StateTransition
@@ -358,6 +359,13 @@ class ValidatorRunner(
     # one being judged — where the trainer's record of its validator bench
     # report (``validator_bench_reports``) is looked up.
     _vbench_later_raw: list = field(default_factory=list, repr=False)
+    # W19 (LANE_D_PLAN invariant 6): the lane D settlement step, called with
+    # the armed settlement boundary on a LaneDWorker daemon thread, never on
+    # this (weight/poll) thread. The step receives only the boundary: it must
+    # open its own chain access, never share the poll thread's client.
+    # None ⇒ no lane D work at all (the poll loop is unchanged).
+    lane_d_step: Callable[[int], object] | None = None
+    _lane_d_worker: LaneDWorker | None = field(default=None, repr=False)
 
     def process_round(
         self,
@@ -450,9 +458,9 @@ class ValidatorRunner(
         epoch_block = self._epoch_start_block(manifest)
         base_params = self.cfg.koth_params(block=epoch_block)
         # Score the shared warm-start init when either consumer needs it: the
-        # increment margin (DEC-CA-0027) or the init-baseline floor
-        # ([scoring] init_gate_mode). The increment fallback mutates only the
-        # JUDGED params — the receipt keeps recording the unmodified config
+        # increment margin (DEC-CA-0027) or the legacy shadow init floor
+        # (before [scoring] init_gate_retired_from_block). The increment
+        # fallback mutates only the JUDGED params — the receipt keeps recording the unmodified config
         # params (check_koth_params compares them against chain.toml) — and
         # the audit re-derives the judged margin rule as "params say
         # increment AND baseline rows exist" (rows alone do not imply
@@ -572,17 +580,6 @@ class ValidatorRunner(
                 break
             judged.append((hk, by_size[paired_sizes[0]], result))
             cohort_scores.append((hk, chal_scores))
-            if result.init_floor_passed is not None:
-                log.info(
-                    "round=%s init-baseline floor (%s) %s: chal=%.5f vs "
-                    "init=%.5f (tol=%.3f) — %s%s",
-                    manifest.round_id, base_params.init_gate_mode, hk,
-                    result.chal_geomean, result.baseline_geomean,
-                    base_params.init_gate_tolerance,
-                    "passes" if result.init_floor_passed else "WORSE THAN INIT",
-                    ("" if base_params.init_gate_mode == "enforce"
-                     or result.init_floor_passed else " (shadow: not gating)"),
-                )
 
         # Cohort family-wise correction (DEC-CA-0038): replace each judged
         # challenger's solo lcb with its joint max-T bound — one shared
@@ -1111,8 +1108,41 @@ class ValidatorRunner(
                 self._reassert_weights_at_head(client)
             except Exception as e:  # noqa: BLE001
                 log.warning("weight re-assert check failed: %s", e)
+            self._lane_d_tick(client)
             self._vbench_lease_tick()
             time.sleep(poll)
+
+    def _lane_d_tick(self, client: object) -> None:
+        """W19 (invariant 6): submit the armed lane D settlement to the
+        off-thread worker and return at once; weights never wait on lane D.
+        No step wired, or ``[lane_d]`` unarmed for the current boundary ⇒
+        nothing is read, submitted or started. Never raises."""
+        step = self.lane_d_step
+        if step is None:
+            return
+        lane_d = getattr(self.cfg, "lane_d", None)
+        nc_ = getattr(self, "netconfig", None)
+        # containment (owner 2026-11-24): an adopted overlay may arm lane D
+        # while the startup config leaves it off; with neither, nothing is read
+        overlaid = bool(nc_ is not None and getattr(nc_, "enabled", False)
+                        and getattr(getattr(nc_, "state", None), "history", None))
+        if (lane_d is None or int(getattr(lane_d, "from_block", 0) or 0) <= 0) and not overlaid:
+            return
+        try:
+            boundary = self._reassert_boundary(int(client.current_block()))  # type: ignore[attr-defined]
+            if overlaid:
+                lane_d = getattr(self.cfg_at(boundary), "lane_d", None)
+            if lane_d is None or not lane_d.active(boundary):
+                return
+            worker = self._lane_d_worker
+            if worker is None or worker.step is not step:
+                if worker is not None and worker.running:
+                    return
+                worker = LaneDWorker(step)
+                self._lane_d_worker = worker
+            worker.submit(boundary)
+        except Exception as e:  # noqa: BLE001 — lane D must never reach the weight loop
+            log.warning("lane D tick failed: %s", e)
 
     def _reassert_weights_at_head(self, client: object) -> None:
         """The freshness re-assert, under the config in force at the head
@@ -1145,6 +1175,10 @@ class ValidatorRunner(
         # of the manifests, so a lock-in seen this poll governs the settlement
         # judged this poll.
         self._activation_tick(client)
+        # Lane C (owner 2026-11-24): snapshot the slot holders' registrations
+        # as of the boundary − 1 while that block is fresh (no-op unless lane
+        # C is active), so eviction never needs chain history.
+        self._lane_c_registration_tick(client)
         from ..shared.calendar_launch import resolve_calendar_launch
 
         base = self._base_cfg()

@@ -35,9 +35,10 @@ KING_D_UID = 6
 PRIOR_1_UID = 5
 PRIOR_2_UID = 7
 
-# D1/D48: 0.25 of the total, taken from lane A. D7: 2 prior kings, decay 0.5.
+# D1/D48: 0.25 of the total, taken from lane A. D7: 2 prior kings; rev6.23
+# (owner 2026-11-24): court_weights 0.80 / 0.15 / 0.05.
 ARMED = {"from_block": ARM_BLOCK, "share": 0.25, "takes_from": "lane_a",
-         "remainder": "burn", "reward_prior_kings": 2, "king_decay": 0.5}
+         "remainder": "burn", "reward_prior_kings": 2, "court_weights": [0.80, 0.15, 0.05]}
 
 # Exact float tolerance for armed goldens (the order of float operations is
 # the builder's choice; the values are exact fractions).
@@ -45,11 +46,18 @@ REL = 1e-12
 ABS = 1e-15
 
 
+# rev6.18 F4 (A3): these fixtures pin the live-only rule: the public half off
+# (public_weight = 0, a spec setting) and no per-window ratio clamp in effect
+# (a floor far below any fixture ratio), so their pre-F4 numbers stand. F4's
+# own tests (tests/accept/w5e/test_w5e_combined.py) pin the combined rule.
+LIVE_ONLY = {"public_weight": 0.0, "window_ratio_floor": 1e-9}
+
+
 def lane_d_cfg(**over):
     """The real W2 parse of ``ARMED`` with ``over`` applied."""
     from cascade.shared.config.lane_d import parse_lane_d
 
-    return parse_lane_d({**ARMED, **over}, era_blocks_at=lambda _block: ERA)
+    return parse_lane_d({**ARMED, **LIVE_ONLY, **over}, era_blocks_at=lambda _block: ERA)
 
 
 def lane_b_cfg(share: float = 0.25, **over):

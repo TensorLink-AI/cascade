@@ -7,8 +7,11 @@ validator. Unarmed (``not cfg.active(boundary)``) it returns
 
 1. registers newly revealed entries in ``lane_d_state.json`` (``ready``
    TTL, duplicate digests, deregistered hotkeys → closed with a typed reason);
-2. selects this settlement's judged entries FIFO by reveal time under the
-   per-settlement and per-coldkey caps (the rest wait, ``coldkey_cap_settlement``);
+2. selects this settlement's judged entries (W5h,
+   :mod:`~cascade.validator.lane_d_queue`): entries pending past
+   ``max_reveal_delay_days`` close, the coldkey re-check at reveal refuses a
+   changed coldkey and holds (bounded) an unreadable one, then FIFO by reveal
+   time under the per-settlement and per-coldkey caps (the rest wait);
 3. advances each judged entry's ``frozen_set`` (W5b,
    :mod:`~cascade.validator.lane_d_frozen`): the union over the newest
    snapshot ``pool_dir`` and the retained ``prior_pool_dirs`` of the windows
@@ -16,7 +19,7 @@ validator. Unarmed (``not cfg.active(boundary)``) it returns
    :func:`~cascade.validator.lane_d_forward.eligible_windows` admit for
    ``max(T_E, T_K)`` (both clocks after the bound, mirror lag, forecast
    products, present in S0, no backfill), excluding windows the entry was
-   already judged on (the confirmation set is disjoint), capped at
+   already judged on, capped at
    ``max_source_share`` with a drop seeded by the boundary, frozen at the
    floors (``min_windows``, ``min_clusters``). An unfrozen entry stays
    ``pending_floor``; nothing resets at an era boundary (T18). A cohort is
@@ -30,27 +33,31 @@ validator. Unarmed (``not cfg.active(boundary)``) it returns
    (``lane_closed``);
 4. scores every window for the king and each member from the eval host's
    ``(horizon, 9)`` quantile forecasts (``score_window``) into report rows;
-5. decides with the paired cluster bootstrap (clusters = source), max-T over
-   the cohort: a member clears iff ``LCB ≥ d_margin`` and its point gain is
-   positive. When a miner holds KING_D, every member is also judged, the
+5. decides with the rev6.18 A3 combined rule (F4, :func:`judge_cohort`):
+   per window the ratio ``s_bar / s_member`` of the lane D per-window
+   geomeans, clamped to ``[window_ratio_floor, 1 / window_ratio_floor]``,
+   its log averaged over the cohort's live (forward: fresh + embargo)
+   windows into ``L_live`` and over the settlement's public windows
+   (GiftEvalPretrain + RMISC, the same for every cohort) into ``L_pub``;
+   ``L = (1 − w) L_live + w L_pub`` with ``w = public_weight``. One max-T
+   two-part cluster bootstrap over the cohort (live clusters = source,
+   public clusters = ``<source>|<family>``, resampled within each half,
+   recombined per replicate) gives each member's LCB on the gain scale
+   ``1 − exp(−L)``; a member clears iff ``LCB ≥ d_margin`` AND its live
+   point gain > 0 AND (``w > 0``) its public point gain > 0. Each verdict
+   carries its per-half, per-source and per-domain point gains and window
+   counts (A8). When a miner holds KING_D, every member is also judged, the
    same way and on the same set, against the current house, and clears only
    if it clears both (Proposed change 3: the house ranks first on ties, so a
    copy of the house never clears); the house's rows sit next to the king's.
-   A first clear goes ``confirm_pending`` and must clear again on a
-   disjoint set (D20 ``confirm_on_king_change``) before it is crowned;
-5a. runs the §1.3b A10 low-frequency non-inferiority check (W3b5,
-   :mod:`~cascade.validator.lane_d_lowfreq`) on EVERY verdict that cleared at
-   stage ``confirm``, whatever the gate draw: the slice is the newest
-   snapshot's windows whose ``freq`` is in ``lowfreq_freqs`` (the private
-   pool, not the forward-only set, §1.7), and the candidate's paired CRPS and
-   MASE ``LCB_α`` against the verdict's KING_D and the house must each be
-   ``≥ −tau_public``. ``fail`` is a judged, final loss
-   (``lost``/``lowfreq_regression``, never gated, never crowned);
-   ``no_windows`` (an empty slice) never blocks. The verdict's ``lowfreq``
-   block carries the four LCBs for ``pass``/``fail``;
-5b. gates the crowning candidates (W5e, §1.3b): every verdict that cleared
-   at stage ``confirm`` and did not fail A10, plus every entry still holding a cleared
-   confirmation the gate could not decide (``bench_hold``), is swept with
+   rev6.11 (b): there is no confirmation duel. A first clear is the crowning
+   candidate and is crowned at that settlement when it passes the §1.3b
+   gate (``confirm_on_king_change`` is a legacy key, parsed and ignored;
+   there is no D20 king-change rule). rev6.18 A7: the A10 low-frequency
+   check is removed; D24: there are no backtest windows;
+5b. gates the crowning candidates (W5e, §1.3b): every verdict that cleared,
+   plus every entry still holding a first clear the
+   gate could not decide (``bench_hold``, status ``hold``), is swept with
    KING_D and the house in the settlement's ``bench`` session on the ONE
    suite drawn from ``boundary_block_hash``
    (:func:`~cascade.validator.lane_d_gate.gate_record`; the era's
@@ -71,7 +78,9 @@ validator. Unarmed (``not cfg.active(boundary)``) it returns
    ``schemas/lane_d_report_1.json``; every entry considered and not judged is
    a typed skip, court slots that burn name a ``burn_reason``; ``pool.snapshots``
    binds every snapshot a judged window's version came from, the newest
-   always included, and each window names its ``snapshot_sha256``). The
+   always included, and each window names its ``snapshot_sha256``; rev6.6:
+   given the W5d ``armed`` record, ``armed_contexts`` / ``armed_evidence``,
+   checked by :func:`check_armed`). The
    signed report is checked by ``validate_report``: a report outside the
    schema raises and nothing is returned or saved (fail closed). Then it
    saves the new state and returns the pay
@@ -90,10 +99,9 @@ W5f (§1.4 "The house", §2 items 1-2, T10) is the house's entry and refresh:
 - a new house while a miner holds KING_D is the second bar of every miner
   cohort from that boundary AND enters as a challenger
   (``lane_d_state.HOUSE_ENTRY_KEY``): judged forward-only against KING_D in
-  its own cohort (``members == [house]``, no ``house_digest``), first clear
-  then the mandatory confirmation on a disjoint set, A10 and the §1.3b gate
-  (swept with KING_D as its only anchor: the house reference is itself). A
-  confirmed, passing house retakes KING_D: the dethroned miner king becomes
+  its own cohort (``members == [house]``, no ``house_digest``), first clear,
+  A10 and the §1.3b gate (swept with KING_D as its only anchor: the house
+  reference is itself). A cleared, passing house retakes KING_D: the dethroned miner king becomes
   the newest prior king, the slot burns (``house_king``) and ``crowned``
   stays null (a retake is not a miner crowning). A weaker house loses and
   is never in the court or a prior king. An open miner entry whose digest
@@ -125,6 +133,15 @@ binds it into a receipt record (:mod:`~cascade.validator.lane_d_state`):
   returns the persisted report, pay and receipt with nothing re-scored,
   re-gated or written; an older boundary is ``stale_boundary``.
 
+W14 (the lane D-only fast kill, Proposed design change 4): a settlement with
+no lane D report goes through :func:`absent_settlement` instead. It reads
+the prior state under the same fail-closed rules, writes nothing, refuses a
+boundary already settled or whose report is persisted, and returns the
+absent receipt record with ``pay`` = lane D's share and an empty court: the
+caller pays it with ``lane_parts(..., d_absent=True)``, so only lane D's
+share burns. KING_D, the court and every pending entry are untouched, and
+the next real settlement judges and pays them.
+
 Light imports only (numpy + the scorer's numpy half): this module is on the
 validator package's import path.
 """
@@ -134,21 +151,28 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
-from ..eval.bootstrap import cohort_maxt_lcbs
-from ..eval.lane_d_scorer import SCORING_LEVELS, SCORING_METHOD, score_window
-from .lane_d_bench import paired_gate
+from ..eval.bootstrap import clamped_log_ratios, log_gain, parts_maxt_lcbs
+from ..eval.lane_d_channels import apply_pick, channel_plan, channel_record, forecast_shape
+from ..eval.lane_d_scorer import (
+    GATE_MIN_SOURCES,
+    SCORING_LEVELS,
+    SCORING_METHOD,
+    effective_context,
+    score_window,
+)
+from .lane_d_bench import paired_gate, sweep_record_text
+from .lane_d_draw import draw_windows, freq_class
 from .lane_d_forward import eligible_windows
 from .lane_d_frozen import advance_frozen_set
 from .lane_d_gate import gate_record
 from .lane_d_house import check_house
-from .lane_d_lowfreq import forecast_ok as _forecast_ok
-from .lane_d_lowfreq import lowfreq_check, lowfreq_windows
-from .lane_d_lowfreq import target_usable as _target_usable
+from .lane_d_queue import select_queue
 from .lane_d_report import (
     REPORT_SCHEMA,
     SKIP_REASONS,
@@ -157,13 +181,20 @@ from .lane_d_report import (
     validate_report,
 )
 from .lane_d_state import (
+    ABSENT_REASONS,
+    CONFIRM_MIGRATION_EXTENSION,
+    CONFIRM_MIGRATION_TAG,
     HOUSE_ENTRY_KEY,
+    KING_TENURE_KEY,
     PRIOR_STATE_EXTENSION,
+    LaneDReceiptError,
     LaneDStateError,
     check_persisted_report,
     load_prior_state,
     load_report_file,
+    make_absent_receipt,
     make_receipt,
+    migrate_confirm_pending,
     refresh_house,
     report_digest,
     report_path,
@@ -173,7 +204,9 @@ from .lane_d_state import (
 )
 
 POOL_SCHEMA = "pool_d/1"
-OPEN_STATUSES = ("pending", "confirm_pending")
+# W-IMG (plan rev6.24 (e)): the eval host code identity a settlement ran on
+EVAL_IMAGE_EXTENSION = "eval_image"
+OPEN_STATUSES = ("pending", "hold")
 
 
 @dataclass(frozen=True)
@@ -219,6 +252,11 @@ def _parse_feeds(raw, where: Path) -> dict:
             raise ValueError(f"{where}: feed {name!r} forecast_product {fp!r} is not a bool")
         out[str(name)] = {"mirror_lag_hours": None if lag is None else float(lag),
                           "forecast_product": fp}
+        # W5a (rev6.10 (a)): the pinned per-feed embargo, carried unchanged
+        # (absent stays absent): a missing or non-numeric value is the
+        # window's refusal in lane_d_forward (unlisted_feed), never a pool error.
+        if "embargo_hours" in f:
+            out[str(name)]["embargo_hours"] = f["embargo_hours"]
     return out
 
 
@@ -301,30 +339,72 @@ def load_pool(pool_dir, horizon: int) -> dict:
 # ── statistic ───────────────────────────────────────────────────────────────
 
 
-def _geo(crps: np.ndarray, mase: np.ndarray) -> float:
-    return math.sqrt(math.exp(float(np.mean(np.log(np.maximum(crps, 1e-12)))))
-                     * math.exp(float(np.mean(np.log(np.maximum(mase, 1e-9))))))
+LIVE_SOURCE = "live"
 
 
-def _components(crps: np.ndarray, mase: np.ndarray):
-    """Bootstrap inputs whose per-window WQL is exactly ``crps``."""
-    return ((np.asarray(crps, dtype=np.float64) / 2.0)[:, None],
-            np.ones(len(crps), dtype=np.float64), np.asarray(mase, dtype=np.float64))
+def _breakdown(x: np.ndarray, labels: list[str]) -> dict:
+    """``{label: {"n", "gain"}}`` of one member's per-window log-ratios
+    grouped by ``labels`` (sorted keys; gain = ``1 − exp(−mean)``)."""
+    out = {}
+    lab = np.asarray(labels, dtype=object)
+    for key in sorted(set(labels)):
+        sel = lab == key
+        out[str(key)] = {"n": int(sel.sum()), "gain": log_gain(float(np.mean(x[sel])))}
+    return out
 
 
-def judge_cohort(king: tuple, members: list[tuple], *, clusters: list, cfg, seed: str
-                 ) -> list[dict]:
-    """``[{"lcb", "gain", "cleared"}]`` per member: max-T LCB over the cohort
-    (k = 1 is the plain percentile LCB) and the full-sample relative gain."""
-    lcbs = cohort_maxt_lcbs(_components(*king), [_components(*m) for m in members],
-                            alpha=float(cfg.alpha), B=int(cfg.bootstrap_B), seed=seed,
-                            clusters=clusters)
-    kg = _geo(*king)
+def judge_cohort(king: tuple, members: list[tuple], *, clusters: list, cfg, seed: str,
+                 public: dict | None = None, bar: float | None = None) -> list[dict]:
+    """rev6.18 A3 (F4): ``[{"lcb", "gain", "cleared", "halves", "sources",
+    "domains"}]`` per member against the bar ``king`` (module docstring,
+    item 5).
+
+    ``king`` / ``members`` are ``(crps, mase)`` per-window arrays on the
+    cohort's live windows, ``clusters`` their sources. ``public`` (required
+    iff ``public_weight > 0``) is ``{"anchor": (crps, mase), "members":
+    [(crps, mase)], "clusters": [...], "sources": [...]}`` on the settlement's
+    public windows (clusters ``<source>|<family>``). ``lcb`` / ``gain`` are
+    the combined statistic's on the gain scale ``1 − exp(−L)``; ``halves``
+    the live and public point gains, ``sources`` per source (``live``,
+    ``gift_eval_pretrain``, ``rmisc``) and ``domains`` per cluster
+    (``live|<source>``, ``<source>|<family>``), each ``{"n", "gain"}``.
+
+    ``bar`` is the settlement's crown bar (rev6.23,
+    :meth:`LaneDConfig.crown_bar`), ``None`` = ``cfg.d_margin`` (the bar's
+    floor); a member clears iff ``lcb >= bar`` and every half's point gain
+    is positive."""
+    bar = float(cfg.d_margin) if bar is None else float(bar)
+    floor = float(cfg.window_ratio_floor)
+    w = float(cfg.public_weight)
+    xl = [clamped_log_ratios(*king, *m, floor=floor) for m in members]
+    parts = [(xl, list(clusters), 1.0 - w)]
+    xp = None
+    if w > 0.0:
+        if public is None or not len(public["clusters"]):
+            raise ValueError("public_weight > 0 needs the public half's scores")
+        xp = [clamped_log_ratios(*public["anchor"], *pm, floor=floor) for pm in public["members"]]
+        parts.append((xp, list(public["clusters"]), w))
+    lcbs = parts_maxt_lcbs(parts, alpha=float(cfg.alpha), B=int(cfg.bootstrap_B), seed=seed)
+    live_labels = [f"{LIVE_SOURCE}|{c}" for c in clusters]
     out = []
-    for (c, m), lcb in zip(members, lcbs, strict=True):
-        gain = (kg - _geo(c, m)) / (kg if abs(kg) >= 1e-9 else 1e-9)
-        out.append({"lcb": float(lcb), "gain": float(gain),
-                    "cleared": bool(float(lcb) >= float(cfg.d_margin) and gain > 0.0)})
+    for j, lcb in enumerate(lcbs):
+        l_live = float(np.mean(xl[j]))
+        halves = {"live": {"n": int(xl[j].size), "gain": log_gain(l_live)}}
+        sources = {LIVE_SOURCE: dict(halves["live"])}
+        domains = _breakdown(xl[j], live_labels)
+        big_l = (1.0 - w) * l_live
+        ok = halves["live"]["gain"] > 0.0
+        if xp is not None:
+            l_pub = float(np.mean(xp[j]))
+            halves["public"] = {"n": int(xp[j].size), "gain": log_gain(l_pub)}
+            sources.update(_breakdown(xp[j], list(public["sources"])))
+            domains.update(_breakdown(xp[j], list(public["clusters"])))
+            big_l += w * l_pub
+            ok = ok and halves["public"]["gain"] > 0.0
+        out.append({"lcb": float(lcb), "gain": log_gain(big_l),
+                    "cleared": bool(float(lcb) >= bar and ok),
+                    "halves": halves, "sources": dict(sorted(sources.items())),
+                    "domains": domains})
     return out
 
 
@@ -380,36 +460,14 @@ def _close_house_copies(state: dict, skipped: list[dict]) -> None:
         skipped.append({"digest": str(state["house"]["digest"]), "reason": "duplicate_digest"})
 
 
-def _select(state: dict, cfg, exclude: frozenset[str] = frozenset()
-            ) -> tuple[list[str], list[dict]]:
-    """FIFO by reveal time under the per-settlement / per-coldkey caps.
-    ``exclude`` (held gate candidates, re-gated without a duel) is never
-    selected and never counts against a cap."""
-    open_ = sorted((dg for dg, r in state["entries"].items()
-                    if r["status"] in OPEN_STATUSES and dg not in exclude),
-                   key=lambda dg: (state["entries"][dg]["reveal_ts"], dg))
-    chosen, skipped, per_cold = [], [], {}
-    for dg in open_:
-        cold = state["entries"][dg]["coldkey_at_ready"]
-        if (len(chosen) >= int(cfg.max_entries_per_settlement)
-                or per_cold.get(cold, 0) >= int(cfg.max_judged_per_coldkey_per_settlement)):
-            state["entries"][dg]["reason"] = "coldkey_cap_settlement"
-            skipped.append({"digest": dg, "reason": "coldkey_cap_settlement"})
-            continue
-        per_cold[cold] = per_cold.get(cold, 0) + 1
-        chosen.append(dg)
-    return chosen, skipped
-
-
-def _comparison_king(rec: dict, state: dict, cfg) -> tuple[str, str]:
-    """(stage, king digest) a member is judged against (D20)."""
-    conf = rec.get("confirm")
-    if rec["status"] == "confirm_pending" and conf:
-        if conf["king_digest"] == state["king"]["digest"]:
-            return "confirm", state["king"]["digest"]
-        if cfg.confirm_on_king_change == "original":
-            return "confirm", conf["king_digest"]
-    return "first", state["king"]["digest"]
+def _judging_start_skip(boundary_ts, t_entry, t_king, delay_s: float) -> str | None:
+    """rev6.14 (a): ``None`` when an entry revealed at ``t_entry`` may be
+    drawn, frozen or judged at a boundary stamped ``boundary_ts`` (>= j =
+    max(T_E, T_K) + delay), else its typed skip reason."""
+    if boundary_ts is None:
+        return "boundary_ts_missing"
+    t = max(int(t_entry), int(t_king)) if t_king is not None else int(t_entry)
+    return None if int(boundary_ts) >= t + delay_s else "before_eval_delay"
 
 
 def _king_reveal_ts(state: dict, digest: str) -> int | None:
@@ -423,39 +481,27 @@ def _king_reveal_ts(state: dict, digest: str) -> int | None:
     return None
 
 
-def _confirm_king_ts(recs: dict[str, dict], members: list[str], digest: str) -> int | None:
-    """D20 ``"original"``: the reveal time of a first-clear king the state no
-    longer knows (not the king, the house or a prior king), from the
-    ``confirm`` record of a member that first-cleared against it."""
-    for m in sorted(members):
-        conf = recs[m].get("confirm") or {}
-        ts = conf.get("king_reveal_ts")
-        if conf.get("king_digest") == digest and isinstance(ts, int) and not isinstance(ts, bool):
-            return int(ts)
-    return None
-
-
 # ── the §1.3b gate (W5e) ────────────────────────────────────────────────────
 
 
-def _held_candidates(state: dict, cfg) -> list[str]:
-    """The open entries holding a cleared confirmation the gate could not
-    decide (``gate_hold``, a ``bench_hold``). They are re-gated without a new
-    duel. If KING_D changed since the hold, D20 decides: ``"original"`` keeps
-    the hold; ``"restart"`` drops it and the entry restarts at stage
-    ``first`` (its windows stay used)."""
-    return [dg for dg, rec in sorted(state["entries"].items()) if _keeps_hold(rec, state, cfg)]
+def _held_candidates(state: dict) -> list[str]:
+    """The open entries holding a first clear the gate could not decide
+    (``gate_hold``, a ``bench_hold``). They are re-gated without a new duel.
+    A clear held against a KING_D that has since changed is dropped (no D20
+    rule, rev6.11 (b)): the entry is judged afresh against the new king (its
+    windows stay used)."""
+    return [dg for dg, rec in sorted(state["entries"].items()) if _keeps_hold(rec, state)]
 
 
-def _keeps_hold(rec: dict, state: dict, cfg) -> bool:
+def _keeps_hold(rec: dict, state: dict) -> bool:
     """Is ``rec`` (a miner entry or the house entry) an open holder of a
     ``gate_hold`` that is re-gated this settlement (see
-    :func:`_held_candidates`)? A hold D20 ``"restart"`` drops is dropped here."""
+    :func:`_held_candidates`)? A hold taken under another KING_D is dropped
+    here."""
     hold = rec.get("gate_hold")
     if rec["status"] not in OPEN_STATUSES or not hold:
         return False
-    if (hold["king_d"] != state["king"]["digest"]
-            and cfg.confirm_on_king_change != "original"):
+    if hold["king_d"] != state["king"]["digest"]:
         rec.pop("gate_hold")
         rec.update(status="pending", reason="pending_floor", confirm=None, frozen_set=None)
         return False
@@ -479,8 +525,36 @@ def _gate_result(res: dict, digest: str) -> dict:
             "session": str(res["session"])}
 
 
+BENCH_ROWS_ROLES = ("candidate", "king_d", "house")
+
+
+def bench_rows_dir(state_path) -> Path:
+    """W3b6b: where a settlement's bound bench records are persisted,
+    ``<state dir>/<state stem>_bench_rows/<sha256>.json`` (beside
+    ``<stem>_reports``, snapshotted with the state)."""
+    p = Path(state_path)
+    return p.parent / f"{p.stem}_bench_rows"
+
+
+def _save_bench_rows(state_path, texts: dict[str, str]) -> None:
+    """Write each bound record's exact bytes (atomic per file; an existing
+    file is content-addressed, so it is already these bytes)."""
+    if not texts:
+        return
+    d = bench_rows_dir(state_path)
+    d.mkdir(parents=True, exist_ok=True)
+    for digest, text in sorted(texts.items()):
+        path = d / f"{digest}.json"
+        if path.is_file():
+            continue
+        tmp = d / f".{digest}.tmp"
+        tmp.write_bytes(text.encode("ascii"))
+        os.replace(tmp, path)
+
+
 def _run_gate(cands: list[dict], state: dict, cfg, boundary: int,
-              block_hash: str | None, sentinel: str | None, bench
+              block_hash: str | None, sentinel: str | None, bench,
+              texts: dict[str, str] | None = None
               ) -> tuple[dict | None, dict[str, str]]:
     """``(gate record, {digest: outcome})`` for this settlement's crowning
     candidates. No candidate: ``(None, {})`` and no host call. No ``bench``
@@ -503,6 +577,7 @@ def _run_gate(cands: list[dict], state: dict, cfg, boundary: int,
     results, outcomes = [], {}
     for c in _ranked(cands):
         dg = c["digest"]
+        bound = None
         try:
             cand_rec, king_rec, house_rec = bench.paired(dg, king_d, house_d, suites=suites)
         except Exception:  # any host failure is infrastructure: hold, never crown
@@ -511,8 +586,20 @@ def _run_gate(cands: list[dict], state: dict, cfg, boundary: int,
             res = paired_gate(cand_rec, king_rec, house_rec, suite=suite,
                               alpha=float(cfg.alpha), tau_public=float(cfg.tau_public),
                               B=int(cfg.bootstrap_B), seed=seed, sentinel=sentinel)
+            # W3b6b: bind the three records the gate decided on (their
+            # canonical text's sha256, inside the signed body).
+            bound = {}
+            for role, rec in zip(BENCH_ROWS_ROLES, (cand_rec, king_rec, house_rec),
+                                 strict=True):
+                text = sweep_record_text(rec)
+                digest = hashlib.sha256(text.encode("ascii")).hexdigest()
+                bound[role] = digest
+                if texts is not None:
+                    texts[digest] = text
         outcomes[dg] = str(res["outcome"])
         result = _gate_result(res, dg)
+        if bound is not None:
+            result["rows"] = bound
         if "held_from" in c:
             # RV7 B2: a held candidate (no verdict here) names its hold.
             result["held_from"] = dict(c["held_from"])
@@ -557,14 +644,87 @@ def _load_pools(pool_dir, prior_pool_dirs, horizon: int) -> list[dict]:
     return [load_pool(d, horizon) for d in dirs] + [load_pool(newest, horizon)]
 
 
+def _pick_channels(pools: list[dict], block_hash: str | None, max_channels: int | None
+                   ) -> dict:
+    """rev6.18 A4 (F2): reduce every multichannel pool window to the channels
+    it is scored on, in place, and return ``{window_id: ChannelPick}``.
+
+    The pick of an id is decided by its first version in pin order (oldest
+    first, as the box's eval-host request is built,
+    :meth:`~cascade.validator.lane_d_inputs.LaneDInputsSource._windows`):
+    all-empty channels drop, then at most ``max_channels`` (``[generator]
+    max_channels``) are kept, picked by the boundary block hash for a wider
+    series (:mod:`cascade.eval.lane_d_channels`). A version that cannot
+    carry its id's pick, or a pick with no channel (no non-empty channel,
+    an over-cap series without a block hash, or no ``max_channels`` given:
+    the legacy call), leaves the pool: no model is scored on it. Univariate
+    windows are untouched (the same dicts), so a univariate settlement is
+    unchanged."""
+    windows = [w for p in pools for w in p["windows"]]
+    if max_channels is None:
+        picks = channel_plan(windows, None, 1)
+        picks = {wid: type(p)(p.series_id, p.n_raw, p.empty, ()) for wid, p in picks.items()}
+    else:
+        picks = channel_plan(windows, block_hash, int(max_channels))
+    if not picks and not any(np.ndim(w["history"]) == 2 or np.ndim(w["target"]) == 2
+                             for w in windows):
+        return picks
+    for p in pools:
+        kept = []
+        for w in p["windows"]:
+            v = apply_pick(w, picks.get(w["window_id"]))
+            if v is not None:
+                kept.append(v)
+        p["windows"] = kept
+    return picks
+
+
+def _target_usable(w: dict, horizon: int) -> bool:
+    """The stored target is a finite, non-zero ``(horizon,)`` vector."""
+    t = w["target"]
+    return (t.shape == (horizon,) and bool(np.isfinite(t).all())
+            and float(np.abs(t).sum()) > 0.0)
+
+
+def _forecast_ok(fc: dict | None, wid: str, horizon: int) -> bool | None:
+    """True = a usable forecast, None = absent, False = malformed (a fault)."""
+    if fc is None or wid not in fc:
+        return None
+    q = np.asarray(fc[wid], dtype=np.float64)
+    return bool(q.shape == (horizon, len(SCORING_LEVELS)) and np.isfinite(q).all())
+
+
+def _fc_ok(fc: dict | None, wid: str, h: int, picks: dict) -> bool | None:
+    """:func:`_forecast_ok` with the
+    window's scored shape: ``(h, 9)``, or ``(k, h, 9)`` for a window scored
+    on k ≥ 2 channels (F2)."""
+    if wid not in picks:
+        return _forecast_ok(fc, wid, h)
+    if fc is None or wid not in fc:
+        return None
+    q = np.asarray(fc[wid], dtype=np.float64)
+    return bool(q.shape == forecast_shape(picks[wid], h, len(SCORING_LEVELS))
+                and np.isfinite(q).all())
+
+
+def _usable(w: dict, h: int) -> bool:
+    """:func:`_target_usable`, and for a
+    ``(k, h)`` target (F2): finite, with at least one channel of scale."""
+    t = w["target"]
+    if np.ndim(t) != 2:
+        return _target_usable(w, h)
+    return (t.shape[1] == h and bool(np.isfinite(t).all())
+            and float(np.abs(t).sum()) > 0.0)
+
+
 def _pool_window_ids(pools: list[dict]) -> set[str]:
     """Every window id any loaded snapshot holds."""
     return {w["window_id"] for p in pools for w in p["windows"] if w["window_id"]}
 
 
 def _admitted_versions(pools: list[dict], t_entry: int, t_king: int, cfg
-                       ) -> tuple[dict[str, tuple[dict, dict]], dict[str, int]]:
-    """RV4 one version per window: ``{window_id: (window, pool)}`` taken from
+                       ) -> tuple[dict[str, tuple[dict, dict, object]], dict[str, int]]:
+    """RV4 one version per window: ``{window_id: (window, pool, verdict)}`` taken from
     the EARLIEST loaded snapshot (oldest first, ``pool_dir`` last) whose §1.3
     verdict admits it for ``max(t_entry, t_king)``. A judged window is scored,
     and its report row taken, from that one snapshot only: never admission
@@ -576,12 +736,12 @@ def _admitted_versions(pools: list[dict], t_entry: int, t_king: int, cfg
     snapshot admits it)."""
     verdicts = [list(eligible_windows(p, t_entry=int(t_entry), t_king=int(t_king), cfg=cfg))
                 for p in pools]
-    admitted: dict[str, tuple[dict, dict]] = {}
+    admitted: dict[str, tuple[dict, dict, object]] = {}
     for pool, vs in zip(pools, verdicts, strict=True):
         for w, v in zip(pool["windows"], vs, strict=True):
             wid = w["window_id"]
             if wid and v.eligible and wid not in admitted:
-                admitted[wid] = (w, pool)
+                admitted[wid] = (w, pool, v)
     refused: dict[str, int] = {}
     seen: set[str] = set()
     for pool, vs in reversed(list(zip(pools, verdicts, strict=True))):
@@ -596,9 +756,11 @@ def _admitted_versions(pools: list[dict], t_entry: int, t_king: int, cfg
 
 
 def _cohort_set(pools: list[dict], members: list[str], bars: list[str], king_ts: int,
-                recs: dict[str, dict], forecasts: dict, cfg, pinned: dict[str, str]
-                ) -> tuple[list[tuple[dict, dict]], dict[str, int]]:
-    """The cohort's judged window set as ``(window, its snapshot)`` pairs: the
+                recs: dict[str, dict], forecasts: dict, cfg, pinned: dict[str, str],
+                picks: dict | None = None
+                ) -> tuple[list[tuple[dict, dict, object]], dict[str, int]]:
+    """The cohort's eligible window set as ``(window, its snapshot, its §1.3
+    verdict)`` triples (the W5j draw picks the judged windows from it): the
     intersection of the members' frozen sets that is eligible for
     ``max(T over cohort ∪ king)``, each window in the version of its earliest
     admitting snapshot (:func:`_admitted_versions`), with a usable target, a
@@ -620,17 +782,97 @@ def _cohort_set(pools: list[dict], members: list[str], bars: list[str], king_ts:
     for wid in sorted(common):
         if wid not in admitted:
             continue
-        w, pool = admitted[wid]
+        w, pool, v = admitted[wid]
         if wid in pinned and pinned[wid] != pool["sha256"]:
             continue
-        if not _target_usable(w, h) or any(
-                _forecast_ok(forecasts.get(b), wid, h) is not True for b in bars):
+        picks = picks or {}
+        if not _usable(w, h) or any(
+                _fc_ok(forecasts.get(b), wid, h, picks) is not True for b in bars):
             continue
         if any(wid in recs[m]["used_windows"]
-               or _forecast_ok(forecasts.get(m), wid, h) is not True for m in members):
+               or _fc_ok(forecasts.get(m), wid, h, picks) is not True for m in members):
             continue
-        out.append((w, pool))
+        out.append((w, pool, v))
     return out, refused
+
+
+def _draw_cells(picked: list[tuple[dict, dict, object]], cfg) -> list[dict]:
+    """The W5j draw input for a cohort's eligible set: one forward cell per
+    pool ``freq`` (timeframe, bin ``forward``, h = ``horizon``), one draw
+    series per pool ``series_id`` holding its eligible windows' target points
+    in time order. A window is atomic (its id, target and forecasts exist at
+    origin 0 only), so an ineligible separator point follows each window: no
+    candidate straddles two windows, and every candidate is a pool window.
+    ``e0`` is all-false on an embargo window (it fails the e = 0 rule)."""
+    h = int(cfg.horizon)
+    by_cell: dict[str, dict[str, list]] = {}
+    for w, _pool, v in picked:
+        by_cell.setdefault(str(w.get("freq") or ""), {}).setdefault(
+            str(w["series_id"]), []).append((w, bool(v.embargo_window)))
+    cells = []
+    for freq in sorted(by_cell):
+        members = []
+        for sid in sorted(by_cell[freq]):
+            ts, el, e0, src = [], [], [], None
+            for w, emb in sorted(by_cell[freq][sid], key=lambda x: int(x[0]["target_ts"][0])):
+                src = str(w["source"]) if src is None else src
+                ts += [int(t) for t in w["target_ts"][:h]]
+                el += [True] * h
+                e0 += [not emb] * h
+                ts.append(int(w["target_ts"][h - 1]))
+                el.append(False)
+                e0.append(False)
+            members.append({"series_id": sid, "source": src, "ts": ts, "eligible": el,
+                            "e0": e0})
+        cells.append({"timeframe": freq, "bin": "forward", "kind": "forward",
+                      "h_lo": h, "h_hi": h, "series": members})
+    return cells
+
+
+def _drawn(picked: list[tuple[dict, dict, object]], cfg, block_hash: str | None,
+           budget: int) -> tuple[list[tuple[dict, dict, object]], dict | None, bool]:
+    """W5j: ``(judged windows, draw result, meets floors)`` of one cohort.
+    With ``block_hash`` the judged windows are the seeded per-bin draw over
+    the eligible set within ``budget``; without it (the legacy call, which
+    can never crown: W5e fails it closed) the whole eligible set is judged
+    up to ``budget``, as before W5j."""
+    if block_hash is None:
+        ws = picked[:max(0, int(budget))]
+        return ws, None, _meets_floors([w for w, _, _ in ws], cfg)
+    d = draw_windows(_draw_cells(picked, cfg), boundary_block_hash=str(block_hash), cfg=cfg,
+                     budget=int(budget))
+    by_id = {w["window_id"]: (w, pool, v) for w, pool, v in picked}
+    ws = [by_id[x["window_id"]] for x in d["windows"]]
+    return ws, d, bool(d["meets_floors"])
+
+
+def _window_embargo_fields(w: dict, v, h: int) -> dict:
+    """The signed rev6.10-rev6.12 fields of one judged window (W7a): ``freq``,
+    the effective ``embargo_hours`` e, ``min_release_ts`` = min first-seen +
+    e, ``rule`` (``embargo`` when e > 0, else ``embargo0``), ``embargo_window``
+    (rev6.12: False = fresh), and the W5j draw cell (``timeframe`` = freq,
+    ``bin`` / ``kind`` forward, ``freq_class``, ``h``, ``origin`` = the target
+    start)."""
+    freq = str(w.get("freq") or "")
+    e = float(v.embargo_hours)
+    return {"freq": freq, "embargo_hours": e,
+            "min_release_ts": int(min(w["first_seen_ts"])) + int(round(3600.0 * e)),
+            "rule": "embargo" if e > 0.0 else "embargo0",
+            "embargo_window": bool(v.embargo_window),
+            "timeframe": freq, "bin": "forward", "kind": "forward",
+            "freq_class": freq_class(freq), "h": int(h), "origin": int(w["target_ts"][0])}
+
+
+def _subscore(scores, idx: list[int]) -> dict:
+    """rev6.12 (b): ``{n, geomean}`` of one digest's rows at positions ``idx``
+    (the lane D geomean of its CRPS and MASE, floors 1e-12 / 1e-9); null
+    geomean when n = 0."""
+    if not idx:
+        return {"n": 0, "geomean": None}
+    crps, mase = scores
+    lc = float(np.mean(np.log(np.maximum(np.asarray(crps)[idx], 1e-12))))
+    lm = float(np.mean(np.log(np.maximum(np.asarray(mase)[idx], 1e-9))))
+    return {"n": len(idx), "geomean": math.sqrt(math.exp(lc) * math.exp(lm))}
 
 
 def _advance_member(rec: dict, pools: list[dict], king_ts: int, cfg, seed: str) -> dict:
@@ -685,21 +927,34 @@ def _params(cfg) -> dict:
             "max_mirror_lag_hours": float(cfg.max_mirror_lag_hours),
             "min_windows": int(cfg.min_windows), "min_clusters": int(cfg.min_clusters),
             "d_margin": float(cfg.d_margin), "alpha": float(cfg.alpha),
-            "bootstrap_B": int(cfg.bootstrap_B), "king_decay": float(cfg.king_decay),
+            "bootstrap_B": int(cfg.bootstrap_B),
+            # rev6.23: the tenure-decaying crown bar (d_margin is its end) and
+            # the explicit court weights (they replace king_decay).
+            "d_margin_start": float(cfg.d_margin_start),
+            "d_margin_warmup_settlements": int(cfg.d_margin_warmup_settlements),
+            "court_weights": [float(w) for w in cfg.court_weights],
             "reward_prior_kings": int(cfg.reward_prior_kings),
-            "confirm_on_king_change": str(cfg.confirm_on_king_change),
             "max_entries_per_settlement": int(cfg.max_entries_per_settlement),
             "max_judged_per_coldkey_per_settlement":
                 int(cfg.max_judged_per_coldkey_per_settlement),
             "scoring_levels": [float(q) for q in SCORING_LEVELS],
             "gate_suites": [str(s) for s in cfg.gate_suites],
             "tau_public": float(cfg.tau_public),
-            "lowfreq_freqs": [str(f) for f in cfg.lowfreq_freqs],
+            # rev6.18 A3 (F4): the public half's weight and the ratio clamp.
+            "public_weight": float(cfg.public_weight),
+            "window_ratio_floor": float(cfg.window_ratio_floor),
             # §1.3b draw weights as parsed (a suite without a weight is absent),
             # the T18e/B14 source cap and the §1.7 context floor.
             "gate_weights": {str(s): float(w) for s, w in cfg.gate_weights},
             "max_source_share": float(cfg.max_source_share),
-            "min_long_series": int(cfg.min_long_series)}
+            "min_long_series": int(cfg.min_long_series),
+            # rev6.10 (a) / rev6.12 (b) (W2e): the embargo cap, the W5j
+            # settlement budget and the minimum fresh share.
+            "embargo_hours": float(cfg.embargo_hours),
+            "max_windows_per_settlement": int(cfg.max_windows_per_settlement),
+            "min_fresh_window_share": float(cfg.min_fresh_window_share),
+            # rev6.14 (a): the judging start j = T + eval_delay_hours.
+            "eval_delay_hours": float(cfg.eval_delay_hours)}
 
 
 def _pool_record(pools: list[dict], windows_out: dict) -> dict:
@@ -722,13 +977,6 @@ def _pool_record(pools: list[dict], windows_out: dict) -> dict:
             "first_seen_roots": roots, "snapshots": snaps}
 
 
-def _not_candidate(cfg) -> dict:
-    """The ``lowfreq`` block of a verdict that is not a crowning candidate
-    (a first clear or a loser): never checked by A10."""
-    return {"result": "not_candidate", "freqs": [str(f) for f in cfg.lowfreq_freqs],
-            "n_windows": 0, "tau_public": float(cfg.tau_public)}
-
-
 def _closing(cfg, boundary: int) -> bool:
     """T18: the settlement at ``until_block`` (the last active one) judges
     nothing and closes every open entry."""
@@ -736,12 +984,243 @@ def _closing(cfg, boundary: int) -> bool:
     return until > 0 and int(boundary) == until
 
 
+class LaneDPublicError(ValueError):
+    """rev6.18 A3 (F4): the public half a ``public_weight > 0`` settlement
+    needs is missing or does not match its draw; ``code`` is one of
+    :data:`PUBLIC_ERROR_CODES`. Raised before anything is read beyond the
+    state or written (infrastructure, never a miner's fault)."""
+
+    def __init__(self, code: str, detail: str = ""):
+        if code not in PUBLIC_ERROR_CODES:
+            raise ValueError(f"LaneDPublicError: unknown code {code!r}")
+        self.code = code
+        super().__init__(f"{code}: {detail}" if detail else code)
+
+
+PUBLIC_ERROR_CODES = (
+    "public_missing",      # w > 0 and no indexes, scores or block hash
+    "public_sources",      # the indexes are not exactly the pinned public sources
+    "public_mismatch",     # the scores / dropped list do not match the draw
+    "public_empty",        # a source keeps no window after the read-time drops
+)
+
+
+def _public_half(cfg, public_indexes, public_scores, block_hash, horizon: int,
+                 digests) -> dict | None:
+    """The settlement's public half (rev6.18 A1/A3, F4), or ``None`` at
+    ``public_weight = 0`` (not drawn). Draws every pinned public source from
+    its index and ``block_hash`` (:func:`~cascade.validator.lane_d_public.draw_public`)
+    and binds the eval host's per-window scores to it:
+
+    ``public_scores = {"scores": {digest: {source: [{window_id, family, crps,
+    mase}]}}, "dropped": {source: [{window_id, reason}]}}`` (the inputs
+    source's; every digest of ``digests`` — the settlement's forecasts — has
+    a score set). The kept windows are the drawn ones minus the dropped
+    ones, in ``window_id`` order; a digest's scores must name exactly them
+    (else ``public_mismatch``, the eval host's fault). Its values are checked
+    per digest by :func:`_public_arrays` (a non-finite score is the
+    checkpoint's)."""
+    if float(cfg.public_weight) <= 0.0:
+        return None
+    if not public_indexes or not isinstance(public_scores, dict) or block_hash is None:
+        raise LaneDPublicError("public_missing", "public_weight > 0 needs the public indexes, "
+                               "the eval host's public scores and the boundary block hash")
+    from ..eval.lane_d_public_index import PUBLIC_SOURCES
+    from .lane_d_public import DROP_REASONS, draw_public, public_record
+
+    if sorted(public_indexes) != sorted(PUBLIC_SOURCES):
+        raise LaneDPublicError("public_sources", f"indexes for {sorted(public_indexes)}, not "
+                               f"{sorted(PUBLIC_SOURCES)}")
+    draws = [draw_public(public_indexes[src], source=src, boundary_block_hash=str(block_hash),
+                         horizon=int(horizon)) for src in sorted(public_indexes)]
+    dropped_in = public_scores.get("dropped") or {}
+    scores_in = public_scores.get("scores")
+    if not isinstance(dropped_in, dict) or not isinstance(scores_in, dict):
+        raise LaneDPublicError("public_mismatch", "public scores are not {scores, dropped}")
+    windows, dropped = [], {}
+    for d in draws:
+        src = d["source"]
+        drawn = {w["window_id"]: w for w in d["windows"]}
+        drops = list(dropped_in.get(src) or [])
+        if any(not isinstance(x, dict) or x.get("window_id") not in drawn
+               or x.get("reason") not in DROP_REASONS for x in drops) \
+                or len({x["window_id"] for x in drops}) != len(drops):
+            raise LaneDPublicError("public_mismatch", f"{src}: a dropped window is not a "
+                                   f"drawn one with a typed reason")
+        gone = {x["window_id"] for x in drops}
+        dropped[src] = [{"window_id": str(x["window_id"]), "reason": str(x["reason"])}
+                        for x in drops]
+        kept = [drawn[k] for k in sorted(drawn) if k not in gone]
+        if not kept:
+            raise LaneDPublicError("public_empty", f"{src}: no public window is kept")
+        windows += [{"window_id": w["window_id"], "source": src, "family": str(w["family"])}
+                    for w in kept]
+    windows.sort(key=lambda w: w["window_id"])
+    missing = sorted(dg for dg in digests if dg not in scores_in)
+    if missing:
+        raise LaneDPublicError("public_mismatch", f"no public scores for {missing[:3]}")
+    return {"draws": draws, "dropped": dropped, "windows": windows, "scores": scores_in,
+            "record": public_record,
+            "_pos": {w["window_id"]: i for i, w in enumerate(windows)}}
+
+
+def _pub_ready(x) -> bool:
+    """A digest's public half is usable (``True`` at ``public_weight = 0``)."""
+    return x is True or isinstance(x, tuple)
+
+
+def _public_arrays(pub: dict, dg: str) -> tuple[np.ndarray, np.ndarray] | None | bool:
+    """One digest's ``(crps, mase)`` on the kept public windows, ``None``
+    when it has no score set, ``False`` when a score is not a finite
+    non-negative number (the checkpoint's fault). A score set that names
+    other windows or families is the eval host's (``public_mismatch``)."""
+    per = pub["scores"].get(dg)
+    if per is None:
+        return None
+    if not isinstance(per, dict):
+        raise LaneDPublicError("public_mismatch", f"{dg[:16]}: public scores are not per source")
+    got = {}
+    for src, rows in per.items():
+        for r in rows or []:
+            if not isinstance(r, dict) or "window_id" not in r:
+                raise LaneDPublicError("public_mismatch", f"{dg[:16]}: a malformed public row")
+            got[str(r["window_id"])] = (str(src), r)
+    want = pub["windows"]
+    if sorted(got) != [w["window_id"] for w in want]:
+        raise LaneDPublicError("public_mismatch", f"{dg[:16]}: public scores do not cover "
+                               f"exactly the kept public windows")
+    crps, mase = [], []
+    for w in want:
+        src, r = got[w["window_id"]]
+        if src != w["source"] or str(r.get("family")) != w["family"]:
+            raise LaneDPublicError("public_mismatch", f"{dg[:16]}: {w['window_id']} names "
+                                   f"another source or family")
+        try:
+            c, m = float(r["crps"]), float(r["mase"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        if not (math.isfinite(c) and math.isfinite(m) and c >= 0.0 and m >= 0.0):
+            return False
+        crps.append(c)
+        mase.append(m)
+    return np.asarray(crps), np.asarray(mase)
+
+
+class LaneDArmedError(ValueError):
+    """A settlement's armed record (rev6.6) is refused: ``code`` is one of
+    :data:`ARMED_CODES`."""
+
+    def __init__(self, code: str, detail: str = ""):
+        self.code = code
+        super().__init__(f"{code}: {detail}" if detail else code)
+
+
+ARMED_CODES = ("no_armed_context", "armed_invalid")
+_ARMED_KEYS = frozenset({"armed_contexts", "evidence"})
+_EVIDENCE_KEYS = frozenset({"min_long_series", "min_sources", "readiness_sha256", "t7_sha256",
+                            "variants"})
+_VARIANT_KEYS = frozenset({"context", "series", "sources", "t7_fits", "armed"})
+
+
+def _nonneg_int(x) -> bool:
+    return type(x) is int and x >= 0
+
+
+def check_armed(armed, cfg) -> dict:
+    """The report fields ``{"armed_contexts", "armed_evidence"}`` of a valid
+    W5d armed record for ``cfg``; ``LaneDArmedError`` otherwise. The record
+    must be exactly what :func:`~cascade.eval.lane_d_scorer.armed_record`
+    gives for ``cfg.contexts`` and ``cfg.min_long_series``: every variant's
+    ``armed`` flag is recomputed from its gates and the armed set from the
+    flags. Pure; never mutates ``armed``."""
+    def bad(why: str):
+        raise LaneDArmedError("armed_invalid", why)
+
+    if not isinstance(armed, dict) or set(armed) != _ARMED_KEYS:
+        bad(f"the record must be an object with exactly {sorted(_ARMED_KEYS)}")
+    ev, stated = armed["evidence"], armed["armed_contexts"]
+    if not isinstance(ev, dict) or set(ev) != _EVIDENCE_KEYS:
+        bad(f"evidence must be an object with exactly {sorted(_EVIDENCE_KEYS)}")
+    if ev["min_long_series"] != int(cfg.min_long_series) or type(ev["min_long_series"]) is not int:
+        bad(f"min_long_series {ev['min_long_series']!r} != config {int(cfg.min_long_series)}")
+    if type(ev["min_sources"]) is not int or ev["min_sources"] != GATE_MIN_SOURCES:
+        bad(f"min_sources {ev['min_sources']!r} != {GATE_MIN_SOURCES}")
+    for k in ("readiness_sha256", "t7_sha256"):
+        if ev[k] is not None and not _is_hex64(ev[k]):
+            bad(f"{k} must be 64 lower-case hex or null")
+    variants = ev["variants"]
+    want = [int(c) for c in sorted(cfg.contexts)]
+    if not isinstance(variants, list) or len(variants) != len(want):
+        bad(f"variants must cover the contexts {want}")
+    flags = []
+    for c, v in zip(want, variants, strict=True):
+        if not isinstance(v, dict) or set(v) != _VARIANT_KEYS or v["context"] != c \
+                or type(v["context"]) is not int:
+            bad(f"variant for {c} malformed")
+        if not (_nonneg_int(v["series"]) and _nonneg_int(v["sources"])
+                and type(v["t7_fits"]) is bool and type(v["armed"]) is bool):
+            bad(f"variant {c}: counts are non-negative ints, flags bools")
+        gates = (v["series"] >= ev["min_long_series"] and v["sources"] >= ev["min_sources"]
+                 and v["t7_fits"])
+        if v["armed"] is not gates:
+            bad(f"variant {c}: armed {v['armed']} disagrees with its gates")
+        if gates:
+            flags.append(c)
+    if not isinstance(stated, list) or any(type(c) is not int for c in stated) \
+            or stated != flags:
+        bad(f"armed_contexts {stated!r} != the armed variants {flags}")
+    if not flags:
+        raise LaneDArmedError("no_armed_context", "no lane D variant is armed; nothing can be scored")
+    return {"armed_contexts": list(flags),
+            "armed_evidence": json.loads(json.dumps(ev, allow_nan=False))}
+
+
 def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: dict,
                   forecasts: dict, uid_of: dict, state_path, signer,
                   prior_pool_dirs=(), expect_prior_sha256: str | None = None,
                   boundary_block_hash: str | None = None, sentinel: str | None = None,
-                  bench=None) -> LaneDSettlement:
+                  bench=None, armed: dict | None = None,
+                  boundary_ts: int | None = None,
+                  max_channels: int | None = None,
+                  public_indexes: dict | None = None,
+                  public_scores: dict | None = None,
+                  host: dict | None = None,
+                  eval_identity: dict | None = None) -> LaneDSettlement:
     """Settle lane D at ``boundary`` (see the module docstring).
+
+    ``boundary_ts`` (rev6.14 (a)) is the boundary block's on-chain
+    ``Timestamp.Now`` (seconds), signed in the report. An entry (and the house
+    challenger) is drawn, frozen or judged only when ``boundary_ts`` >= its
+    judging start ``j = max(T_E, T_K) + 3600 * eval_delay_hours``, else it is
+    skipped ``before_eval_delay``. Without it (the legacy call) nothing is
+    frozen or judged: every open entry is skipped ``boundary_ts_missing``
+    (fail closed).
+
+    ``public_indexes`` (rev6.18 A1/A2/A6, F3) is ``{source: index dir}`` of the
+    public sources (W6p indexes) and ``public_scores`` (F4) the eval host's
+    per-window scores of every forecast digest on their drawn windows
+    (:func:`_public_half`). At ``public_weight > 0`` both are required with
+    ``boundary_block_hash`` (else :class:`LaneDPublicError`
+    ``public_missing``, before anything is written): each source is drawn
+    (:func:`~cascade.validator.lane_d_public.draw_public`, 5000 windows, the
+    same for KING_D, the house and every challenger), every judged digest is
+    scored on the kept windows (the public half of :func:`judge_cohort`) and
+    the report carries the ``public`` block (revision, index and file-list
+    hashes, window ids, the read-time drops, the public ``rows`` and their
+    ``rows_sha256``). A member whose public scores are not finite is
+    ``checkpoint_fault``. At ``public_weight = 0`` nothing is drawn or
+    recorded.
+
+    ``max_channels`` (rev6.18 A4, F2) is ``[generator] max_channels``: the
+    channel cap of a multichannel ``(C, L)`` pool window, whose pick
+    (empty channels dropped, a wider series cut to ``max_channels`` by
+    ``boundary_block_hash``) is :mod:`cascade.eval.lane_d_channels`'. Each
+    such window is ONE per-window score per model (channels averaged,
+    :func:`~cascade.eval.lane_d_scorer.score_window`), one resampling unit
+    in its source's cluster, and its report window carries the pick
+    (``series_id``, ``n_channels_raw``, ``empty_channels``, ``n_channels``,
+    ``channels_sha256``). ``None`` (the legacy call) scores no
+    multichannel window. Univariate windows are unaffected.
 
     ``pool_dir`` is the newest ``pool_d`` snapshot; ``prior_pool_dirs`` are
     the earlier retained ones. They feed every open entry's union and supply
@@ -761,9 +1240,39 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     persisted settlement is ``state_missing`` and a rolled-back one is
     ``state_digest_mismatch`` (:func:`~cascade.validator.lane_d_state.load_prior_state`);
     every such refusal comes before any pool or forecast is read and writes
-    nothing."""
+    nothing.
+
+    ``armed`` (rev6.6) is the settlement's W5d
+    :func:`~cascade.eval.lane_d_scorer.armed_record`. Given, it is checked by
+    :func:`check_armed` (a ``LaneDArmedError`` before anything is read or
+    written) and recorded as the report's ``armed_contexts`` /
+    ``armed_evidence``; the forecasts are the eval host's at each entry's
+    ``effective_context``. ``None`` (the legacy call) records neither.
+
+    ``host`` (rev6.18 B7) is the eval host record the W4 handshake verified
+    (:func:`~cascade.eval.lane_d_handshake.check_worker`: environment, GPU
+    model, driver, torch build, fingerprint and the B6 host identity). Every
+    forecast in ``forecasts`` came from that one host (B6). Given, it must be
+    well formed (a ``ValueError`` before anything is read or written) and is
+    signed as the report's ``host``; ``None`` records no host.
+
+    ``eval_identity`` (W-IMG, plan rev6.24 (e)): the eval host's code
+    identity the forecasts ran on, recorded under ``extensions`` as
+    :data:`EVAL_IMAGE_EXTENSION` (logged, never consensus). ``None`` (every
+    settlement before ``[v2] image_epoch_from_block``) records nothing."""
     if not cfg.active(boundary):
         return LaneDSettlement(report=None, pay=None, receipt=None)
+    if boundary_ts is not None and (isinstance(boundary_ts, bool) or not isinstance(boundary_ts, int)
+                                    or boundary_ts < 0):
+        raise ValueError(f"boundary_ts must be a non-negative int timestamp; got {boundary_ts!r}")
+    armed_fields = None if armed is None else check_armed(armed, cfg)
+    if host is not None:
+        from ..shared.config.lane_d import host_record_problem
+
+        why = host_record_problem(host)
+        if why:
+            raise ValueError(f"lane D host record refused: {why}")
+        host = {k: str(v) for k, v in host.items()}
     # W5f: the house is the verified record a signed pointer enters
     # (lane_d_house). Anything else is refused before any state, report or
     # pool is read or written (fail closed).
@@ -778,6 +1287,19 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     if settled >= boundary:
         raise LaneDStateError("stale_boundary", f"lane D already settled through {settled}; "
                               f"got {boundary}")
+    # rev6.18 A3 (F4): the public half, drawn and bound to the eval host's
+    # scores before anything else is read or written (fail closed).
+    pub = _public_half(cfg, public_indexes, public_scores, boundary_block_hash,
+                       int(cfg.horizon), sorted(forecasts))
+    pub_arr: dict[str, object] = {}
+
+    def pub_of(dg: str):
+        if pub is None:
+            return True
+        if dg not in pub_arr:
+            pub_arr[dg] = _public_arrays(pub, dg)
+        return pub_arr[dg]
+
     # A report file without its state: a crash between the two writes. RV7
     # B1: recovery ADOPTS it, never re-sweeps the bench. It is parsed
     # strictly and checked (the settling validator's signature, the boundary,
@@ -789,9 +1311,22 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
         check_persisted_report(persisted,
                                signer_ss58=str(getattr(signer, "hotkey", signer).ss58_address),
                                boundary=boundary, prior_state_sha256=prior_sha, where=rp)
+    # W7c (rev6.11 (b); orchestrator decision 2026-11-23): a testnet state
+    # written by the old code may hold `confirm_pending` entries. Migrated
+    # after the prior digest is taken, so the receipt binds legacy -> migrated.
+    migrated = migrate_confirm_pending(state)
     refresh_house(state, house)
     king_before = _king_record(state["king"])
+    # rev6.23 (owner 2026-11-24): the crown bar decays with KING_D's tenure,
+    # the lane D settlements it has held the crown before this one (a house
+    # KING_D counts; a house refresh in place does not reset it). Absent in
+    # a state written before rev6.23: 0.
+    tenure = int(state.get(KING_TENURE_KEY, 0))
+    crown_bar = cfg.crown_bar(tenure)
     pools = _load_pools(pool_dir, prior_pool_dirs, int(cfg.horizon))
+    # rev6.18 A4 (F2): multichannel windows reduced to their scored channels
+    # (a no-op on a univariate pool).
+    picks = _pick_channels(pools, boundary_block_hash, max_channels)
     pool = pools[-1]
     pool_ids = _pool_window_ids(pools)
     seed = f"lane-d/1:{boundary}:{pool['sha256']}"
@@ -805,6 +1340,10 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     # ``refresh_house`` when a new house meets a miner KING_D. It is judged
     # like an entry but lives outside ``entries`` (it has no hotkey and is
     # never paid); each judging job carries the records it judges.
+    # DEC-CA-0076 (owner 2026-11-24): after the first miner crown the house
+    # never challenges; an entry left by older code is dropped.
+    if not state["king"].get("house"):
+        state.pop(HOUSE_ENTRY_KEY, None)
     house_rec = state.get(HOUSE_ENTRY_KEY)
     hd = str(state["house"]["digest"])
     _close_house_copies(state, skipped)
@@ -832,43 +1371,67 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
         house_open = False
     else:
         # A held gate candidate is re-gated, never re-duelled (W5e).
-        held = _held_candidates(state, cfg)
-        chosen, capped = _select(state, cfg, frozenset(held))
-        skipped += capped
-        house_held = house_open and _keeps_hold(house_rec, state, cfg)
+        held = _held_candidates(state)
+        # W5h (lane_d_queue): the reveal-delay close, the coldkey re-check
+        # at reveal, then FIFO by T under the caps.
+        chosen, queued = select_queue(state, cfg, boundary, entries, frozenset(held))
+        skipped += queued
+        house_held = house_open and _keeps_hold(house_rec, state)
 
     # A member whose forecasts are malformed on any pool window is the miner's fault
     # (the house's own: its entry closes, fail closed).
     for dg in list(chosen):
         fc = forecasts.get(dg)
-        if fc is not None and any(_forecast_ok(fc, wid, h) is False for wid in sorted(pool_ids)):
+        if (fc is not None and any(_fc_ok(fc, wid, h, picks) is False
+                                   for wid in sorted(pool_ids))) or pub_of(dg) is False:
             state["entries"][dg]["status"] = "closed"
             skip(dg, "checkpoint_fault")
             chosen.remove(dg)
+    # rev6.15 (W5d / W7a): an entry is scored at the highest armed variant
+    # <= its declared context, never above it; with none armed at or below
+    # it, it is not judged this settlement (`pending` / `context_below_armed`).
+    # Only on a settlement handed the armed record; the house is exempt.
+    if armed_fields is not None:
+        armed_set = [int(c) for c in armed_fields["armed_contexts"]]
+        for dg in list(chosen):
+            rec = state["entries"][dg]
+            if effective_context(int(rec["context"]), armed_set) is None:
+                skip(dg, "context_below_armed")
+                chosen.remove(dg)
+    # rev6.14 (a): the judging start j = max(T_E, T_K) + eval_delay_hours,
+    # against the signed boundary timestamp; fail closed without it.
+    delay_s = 3600.0 * float(cfg.eval_delay_hours)
+    king_t = _king_reveal_ts(state, str(state["king"]["digest"]))
+    for dg in list(chosen):
+        rec = state["entries"][dg]
+        why = _judging_start_skip(boundary_ts, rec["reveal_ts"], king_t, delay_s)
+        if why is not None:
+            skip(dg, why)
+            chosen.remove(dg)
+    if house_open and not house_held:
+        why = _judging_start_skip(boundary_ts, house_rec["reveal_ts"], king_t, delay_s)
+        if why is not None:
+            skip(hd, why, house_rec)
+            house_open = False
     if house_open and not house_held:
         fc = forecasts.get(hd)
-        if fc is not None and any(_forecast_ok(fc, wid, h) is False for wid in sorted(pool_ids)):
+        if (fc is not None and any(_fc_ok(fc, wid, h, picks) is False
+                                   for wid in sorted(pool_ids))) or pub_of(hd) is False:
             house_rec["status"] = "closed"
             skip(hd, "checkpoint_fault", house_rec)
             house_open = False
 
-    groups: dict[tuple[str, str], list[str]] = {}
-    for dg in chosen:
-        stage, kd = _comparison_king(state["entries"][dg], state, cfg)
-        if stage == "first" and state["entries"][dg]["status"] == "confirm_pending":
-            state["entries"][dg].update(status="pending", reason="pending_floor", confirm=None,
-                                        frozen_set=None)
-        groups.setdefault((kd, stage), []).append(dg)
-    # The miner cohorts, then the house challenger in its own cohort against
-    # KING_D (§2 item 2): the house is never its own second bar.
-    jobs = [(kd, stage, members, {m: state["entries"][m] for m in members}, False)
-            for (kd, stage), members in sorted(groups.items())]
+    # rev6.11 (b): every member is judged at its first (and only) verdict
+    # against the current KING_D: one miner cohort, then the house challenger
+    # in its own cohort against KING_D (§2 item 2): the house is never its own
+    # second bar.
+    kd0 = str(state["king"]["digest"])
+    jobs = []
+    if chosen:
+        jobs.append((kd0, "first", list(chosen),
+                     {m: state["entries"][m] for m in chosen}, False))
     if house_open and not house_held and not state["king"].get("house"):
-        stage, kd = _comparison_king(house_rec, state, cfg)
-        if stage == "first" and house_rec["status"] == "confirm_pending":
-            house_rec.update(status="pending", reason="pending_floor", confirm=None,
-                             frozen_set=None)
-        jobs.append((kd, stage, [hd], {hd: house_rec}, True))
+        jobs.append((kd0, "first", [hd], {hd: house_rec}, True))
 
     # RV4: each judged window is scored from ONE snapshot's version; the
     # report names that snapshot (``windows[].snapshot_sha256``) and lists
@@ -876,25 +1439,28 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     # snapshot each already-judged window was scored from.
     pinned: dict[str, str] = {}
     rows, windows_out, cohorts, verdicts = [], {}, [], []
-    # The crowning candidates: verdicts that clear at stage ``confirm``.
+    draws: list[dict] = []
+    # The crowning candidates: first verdicts that clear (rev6.11 (b)).
     candidates: list[dict] = []
-    # §1.3b A10: the newest private-pool snapshot's low-frequency windows
-    # (not the forward-only frozen set, §1.7), the same for every candidate.
-    lf_slice = lowfreq_windows(pool, cfg)
+    # rev6.18 A3 (F4): every digest scored on the public half (report rows).
+    pub_scored: set[str] = set()
     for kd, stage, members, recs, is_house in jobs:
         king_ts = _king_reveal_ts(state, kd)
-        if king_ts is None and stage == "confirm":
-            # D20 "original" after a king change: the first-clear king's T
-            # comes from the confirm record (not king_unscored).
-            king_ts = _confirm_king_ts(recs, members, kd)
-        # Change 3: when a miner holds KING_D, the current house is a second
-        # bar on the same set (a copy of a fresh house must not win). Its
-        # forecasts are required: a house that cannot be scored fails closed.
-        # The house challenger is judged against KING_D alone.
-        bars = [kd] if kd == hd or is_house else [kd, hd]
-        if king_ts is None or any(forecasts.get(b) is None for b in bars):
+        # DEC-CA-0076 (owner 2026-11-24): KING_D is the only bar. At genesis
+        # it is the house; after the first miner crown the house is no
+        # second bar (W5c change 3 retired).
+        bars = [kd]
+        if king_ts is None or any(forecasts.get(b) is None or not _pub_ready(pub_of(b))
+                                  for b in bars):
             for m in members:
                 skip(m, "king_unscored", recs[m])
+            continue
+        # A member without a public score set (never asked of the eval host)
+        # cannot be judged on the combined rule: it waits (fail closed).
+        for m in [m for m in members if not _pub_ready(pub_of(m))]:
+            skip(m, "king_unscored", recs[m])
+            members.remove(m)
+        if not members:
             continue
         members = sorted(members, key=lambda m: (recs[m]["reveal_ts"], m))
         frozen = []
@@ -908,24 +1474,32 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
         members = frozen
         if not members:
             continue
-        picked, refused = _cohort_set(pools, members, bars, king_ts, recs, forecasts, cfg,
-                                      pinned)
-        while members and not _meets_floors([w for w, _ in picked], cfg):
+        # W5j: the judged windows are the cohort's seeded per-bin draw over
+        # its eligible set, within what is left of the settlement's
+        # max_windows_per_settlement; a draw below the floors (or short of
+        # the minimum fresh share, or out of budget) leaves the latest-T
+        # member pending.
+        budget = int(cfg.max_windows_per_settlement) - len(windows_out)
+        eligible, refused = _cohort_set(pools, members, bars, king_ts, recs, forecasts, cfg,
+                                        pinned, picks)
+        picked, drawn, ok = _drawn(eligible, cfg, boundary_block_hash, budget)
+        while members and not ok:
             m = members.pop()
             skip(m, "pending_floor", recs[m])
             if members:
-                picked, refused = _cohort_set(pools, members, bars, king_ts, recs, forecasts,
-                                              cfg, pinned)
+                eligible, refused = _cohort_set(pools, members, bars, king_ts, recs,
+                                                forecasts, cfg, pinned, picks)
+                picked, drawn, ok = _drawn(eligible, cfg, boundary_block_hash, budget)
         if not members:
             continue
-        ws = [w for w, _ in picked]
+        ws = [w for w, _, _ in picked]
         scores = {}
         scored = [*bars, *members]
         for dg in scored:
             pairs = [score_window(forecasts[dg][w["window_id"]], w["target"], w["history"],
                                   w["seasonal_period"]) for w in ws]
             scores[dg] = (np.asarray([p[0] for p in pairs]), np.asarray([p[1] for p in pairs]))
-        for i, (w, src_pool) in enumerate(picked):
+        for i, (w, src_pool, v) in enumerate(picked):
             lag = (src_pool["feeds"].get(w["feed"]) or {}).get("mirror_lag_hours")
             pinned[w["window_id"]] = str(src_pool["sha256"])
             windows_out[w["window_id"]] = {
@@ -934,13 +1508,33 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
                 "min_first_seen_ts": int(min(w["first_seen_ts"])),
                 "mirror_lag_hours": None if lag is None else float(lag),
                 # The snapshot whose version of the window was scored.
-                "snapshot_sha256": str(src_pool["sha256"])}
+                "snapshot_sha256": str(src_pool["sha256"]),
+                # rev6.10 (a) / rev6.12 (W7a): the effective embargo, the
+                # release time and the rule it was admitted under, the
+                # fresh / embargo class, and the W5j draw cell.
+                **_window_embargo_fields(w, v, h)}
+            if w["window_id"] in picks:
+                # rev6.18 A4 (F2, W7a): a multichannel window's channel
+                # pick (absent on a univariate window).
+                windows_out[w["window_id"]].update(channel_record(picks[w["window_id"]]))
             for dg in scored:
                 rows.append({"window_id": w["window_id"], "digest": dg, "cohort": len(cohorts),
                              "crps": float(scores[dg][0][i]), "mase": float(scores[dg][1][i])})
         clusters = [w["source"] for w in ws]
+        pub_m = None if pub is None else [pub_of(m) for m in members]
+
+        def pub_in(bar: str, pub_m=pub_m) -> dict | None:
+            if pub is None:
+                return None
+            return {"anchor": pub_of(bar), "members": pub_m,
+                    "clusters": [f"{w['source']}|{w['family']}" for w in pub["windows"]],
+                    "sources": [w["source"] for w in pub["windows"]]}
+
+        if pub is not None:
+            pub_scored.update(scored)
         res = judge_cohort(scores[kd], [scores[m] for m in members],
-                           clusters=clusters, cfg=cfg, seed=seed)
+                           clusters=clusters, cfg=cfg, seed=seed, public=pub_in(kd),
+                           bar=crown_bar)
         if len(bars) > 1:
             # The same max-T judgment with the house as the bar: a member
             # clears only if it clears both. ``judge_cohort`` needs a
@@ -949,7 +1543,8 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
             # the KING_D ``lcb`` / ``gain`` and records the house judgement
             # as ``house``, so a satellite re-derives both from the rows.
             vs_house = judge_cohort(scores[hd], [scores[m] for m in members],
-                                    clusters=clusters, cfg=cfg, seed=seed)
+                                    clusters=clusters, cfg=cfg, seed=seed, public=pub_in(hd),
+                                    bar=crown_bar)
             res = [{**r, "cleared": bool(r["cleared"] and rh["cleared"]),
                     "house": {"digest": hd, "lcb": rh["lcb"], "gain": rh["gain"],
                               "cleared": bool(rh["cleared"])}}
@@ -959,56 +1554,52 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
         cohort = {"index": len(cohorts), "king_digest": kd, "king_reveal_ts": int(king_ts),
                   "stage": stage, "members": list(members), "t_max": int(t_max),
                   "window_ids": [w["window_id"] for w in ws], "set_sha256": set_sha,
-                  "first_seen_roots": [], "refused": refused}
+                  "first_seen_roots": [], "refused": refused,
+                  # rev6.12 (b): the fresh / embargo split of the judged set.
+                  "fresh_windows": sum(1 for _, _, v in picked if not v.embargo_window),
+                  "embargo_windows": sum(1 for _, _, v in picked if v.embargo_window)}
         if len(bars) > 1:
             # Present only with a house bar (absent, not null, when the
             # house holds KING_D: one bar, today's shape).
             cohort["house_digest"] = hd
         cohorts.append(cohort)
+        if drawn is not None:
+            # quota: the windows the draw kept per "<timeframe>|<bin>" cell
+            # (after the source cap and the fresh share), so a satellite
+            # binds each cell's count to the judged set.
+            kept: dict[str, int] = {k: 0 for k in drawn["capacity"]}
+            for w, _, _ in picked:
+                k = f"{str(w.get('freq') or '')}|forward"
+                kept[k] = kept.get(k, 0) + 1
+            draws.append({"index": cohort["index"], "quota": kept,
+                          "capacity": dict(drawn["capacity"]),
+                          # the candidate set the draw ran over
+                          "candidates_sha256": hashlib.sha256("\n".join(sorted(
+                              w["window_id"] for w, _, _ in eligible)).encode()).hexdigest()})
+        fresh_idx = [i for i, (_, _, v) in enumerate(picked) if not v.embargo_window]
+        emb_idx = [i for i, (_, _, v) in enumerate(picked) if v.embargo_window]
         for m, r in zip(members, res, strict=True):
             rec = recs[m]
             rec["used_windows"] = sorted(set(rec["used_windows"]) | {w["window_id"] for w in ws})
-            first = rec.get("confirm") if stage == "confirm" else None
-            confirmation = {"stage": stage, "rule": str(cfg.confirm_on_king_change),
-                            "first_set_sha256": first["first_set_sha256"] if first else None,
-                            "first_king_digest": first["king_digest"] if first else None}
-            # W3b5 (A10): every crowning candidate is checked on the private
-            # pool's low-frequency slice before the gate; first clears and
-            # losers are not candidates.
-            lowfreq = (lowfreq_check(lf_slice, forecasts, candidate=m, king_d=kd, house=hd,
-                                     cfg=cfg, seed=seed)
-                       if r["cleared"] and stage == "confirm" else _not_candidate(cfg))
             if not r["cleared"]:
                 outcome = "lost"
-                rec.update(status="lost",
-                           reason="lost_confirmation" if stage == "confirm" else "lost_duel")
-            elif stage == "first":
-                outcome = "confirm_pending"
-                # The confirmation accumulates a fresh set, disjoint from
-                # ``used_windows`` (D20).
-                rec.update(status="confirm_pending", reason="confirm_pending",
-                           confirm={"first_set_sha256": set_sha, "king_digest": kd,
-                                    "king_reveal_ts": int(king_ts),
-                                    "rule": str(cfg.confirm_on_king_change),
-                                    "boundary": boundary},
-                           frozen_set=None)
-            elif lowfreq["result"] == "fail":
-                # A10 failed: a judged, final loss; never swept by the gate.
-                outcome = "lost"
-                rec.update(status="lost", reason="lowfreq_regression")
+                rec.update(status="lost", reason="lost_duel")
             else:
-                # A crowning candidate (A10 pass or no_windows): crowned
-                # only through the §1.3b gate.
-                outcome = "confirmed"
+                # A crowning candidate: crowned only through the §1.3b gate
+                # (``crowned`` below), else it stays ``cleared`` (held, or a
+                # passing non-best). rev6.18 A7: no A10 check.
+                outcome = "cleared"
                 candidates.append({"digest": m, "lcb": float(r["lcb"]),
                                    "reveal_ts": int(rec["reveal_ts"]), "set_sha256": set_sha,
                                    "house": is_house})
             verdicts.append({"digest": m, "king_digest": kd, "stage": stage,
                              "cohort": len(cohorts) - 1, **r, "outcome": outcome,
-                             "confirmation": confirmation, "lowfreq": lowfreq})
+                             # rev6.12 (b): the fresh and embargo sub-scores.
+                             "fresh": _subscore(scores[m], fresh_idx),
+                             "embargo": _subscore(scores[m], emb_idx)})
 
-    # Held candidates (an earlier bench_hold) are re-gated with the clear
-    # they confirmed, without a duel: no rows, no verdict this settlement.
+    # Held candidates (an earlier bench_hold) are re-gated with their first
+    # clear, without a duel: no rows, no verdict this settlement.
     held_recs = [(dg, state["entries"][dg], False) for dg in held]
     if house_held:
         held_recs.append((hd, house_rec, True))
@@ -1026,9 +1617,10 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
                                          "set_sha256": str(hold["set_sha256"]),
                                          "lcb": float(hold["lcb"]),
                                          "king_d": str(hold["king_d"])}})
+    bench_texts: dict[str, str] = {}
     if persisted is None:
         gate, gate_outcomes = _run_gate(candidates, state, cfg, boundary, boundary_block_hash,
-                                        sentinel, bench)
+                                        sentinel, bench, bench_texts)
     else:
         # Recovery: the outcomes the persisted, verified report recorded.
         gate, gate_outcomes = _adopted_gate(candidates, persisted, rp)
@@ -1046,8 +1638,8 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
             # charged. W5g (§10.4): the consecutive holds of one held clear
             # are counted in its ``gate_hold`` record (state, restart-safe).
             # Holds 1..max_bench_holds keep the clear (an existing hold keeps
-            # its first record); the next one re-queues the entry unjudged:
-            # ``pending`` / ``bench_hold``, the clear and its first clear
+            # its first record) with status ``hold``; the next one re-queues
+            # the entry unjudged: ``pending`` / ``bench_hold``, the clear
             # dropped, judged afresh on the next fresh windows.
             prev = rec.get("gate_hold")
             holds = (int(prev.get("holds", 1)) if prev else 0) + 1
@@ -1058,7 +1650,7 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
                 rec["gate_hold"] = {**(prev or {
                     "boundary": boundary, "king_d": str(state["king"]["digest"]),
                     "lcb": c["lcb"], "set_sha256": c["set_sha256"]}), "holds": holds}
-                rec["status"] = "confirm_pending"
+                rec["status"] = "hold"
             reason = "bench_hold"
         else:
             rec.pop("gate_hold", None)
@@ -1099,6 +1691,9 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
         for v in verdicts:
             if v["digest"] == best["digest"]:
                 v["outcome"] = "crowned"
+    # rev6.23: a crown (a miner, or the house retaking) restarts the tenure;
+    # the next settlement is the new KING_D's first after its crowning.
+    state[KING_TENURE_KEY] = 1 if passing else tenure + 1
     court = _court(state, cfg, uid_of)
     pay = {"share": float(cfg.share), "court_uids": [s["uid"] for s in court]}
     pool_rec = _pool_record(pools, windows_out)
@@ -1126,13 +1721,58 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
         "windows": [windows_out[k] for k in sorted(windows_out)],
         "verdicts": verdicts, "rows": rows, "rows_sha256": rows_sha256(rows),
         "pay": {"share": pay["share"], "court": court},
+        # rev6.23: the tenure the bar was taken at and the bar applied.
+        "crown_bar": {"tenure": tenure, "margin": crown_bar},
         # RV7 B1: the state this settlement ran from, under the signature, so
         # recovery can check a persisted report against the state as loaded.
-        "extensions": {PRIOR_STATE_EXTENSION: prior_sha},
+        "extensions": {PRIOR_STATE_EXTENSION: prior_sha,
+                       # W7c: the one settlement that migrated a legacy
+                       # confirm_pending state (never consensus).
+                       **({CONFIRM_MIGRATION_EXTENSION: {"tag": CONFIRM_MIGRATION_TAG,
+                                                         "entries": migrated}}
+                          if migrated else {}),
+                       # W-IMG: the eval image the forecasts ran on (logged)
+                       **({EVAL_IMAGE_EXTENSION: {k: str(v) for k, v in
+                                                  sorted(dict(eval_identity).items())}}
+                          if eval_identity else {})},
     }
+    if draws:
+        # W5j: the settlement's draw record, present iff a cohort was drawn
+        # (absent, never null, otherwise; the legacy call has no block hash).
+        report["draw"] = {"boundary_block_hash": str(boundary_block_hash),
+                          "seed": f"{boundary_block_hash}:lane_d_windows",
+                          "max_windows_per_settlement": int(cfg.max_windows_per_settlement),
+                          "cohorts": draws}
     if gate is not None:
         # Present iff the gate ran (absent, never null, otherwise).
         report["gate"] = gate
+    if pub is not None:
+        # rev6.18 F3 (W5k) / F4: one public draw per source, the read-time
+        # drops, and every judged digest's public rows (A3), bound by their
+        # own sha256 (the same canonical form as ``rows_sha256``).
+        prows = []
+        for w in pub["windows"]:
+            for dg in sorted(pub_scored):
+                c, m_ = pub_of(dg)
+                i = pub["_pos"][w["window_id"]]
+                prows.append({"window_id": w["window_id"], "digest": dg,
+                              "crps": float(c[i]), "mase": float(m_[i])})
+        report["public"] = {**pub["record"](pub["draws"], pub["dropped"]),
+                            "rows": prows, "rows_sha256": rows_sha256(prows)}
+
+    if boundary_ts is not None:
+        # rev6.14 (a): the boundary block's on-chain timestamp the judging
+        # start was applied against (absent, never null, on the legacy call).
+        report["boundary_ts"] = int(boundary_ts)
+    if armed_fields is not None:
+        # rev6.6: the settlement's armed set and the evidence it was armed
+        # on, signed, so satellites verify it (never re-derive it from
+        # cfg.contexts). Absent on the legacy call.
+        report.update(armed_fields)
+    if host is not None:
+        # rev6.18 B7: the scoring host, signed; the audit checks its env is
+        # qualified at this boundary.
+        report["host"] = host
     report = sign_report(report, signer)
     # Fail closed: a report outside lane-d-report/1 is never returned, and
     # neither the report file nor the state is written (ReportSchemaError
@@ -1141,6 +1781,8 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     validate_report(report)
     body_sha = report_digest(report)
     if persisted is None:
+        # W3b6b: the bound records' bytes land before the report that binds them.
+        _save_bench_rows(state_path, bench_texts)
         save_report_file(rp, report)
     elif report_digest(persisted) != body_sha:
         # The posterior derived from the persisted outcomes must be the one
@@ -1209,5 +1851,52 @@ def _already_settled(state: dict, rp: Path, boundary: int) -> LaneDSettlement:
     return LaneDSettlement(report=report, pay=_persisted_pay(report, rp), receipt=receipt)
 
 
-__all__ = ["LaneDSettlement", "judge_cohort", "load_pool", "settle_lane_d",
-           "window_id"]
+def absent_settlement(*, cfg, boundary: int, state_path, house: dict, reason: str,
+                      expect_prior_sha256: str | None = None) -> LaneDSettlement:
+    """W14: settle lane D at ``boundary`` with NO lane D report (the operator
+    stopped reports, ``reason="report_absent"``, or the settlement could not
+    run, ``"infra_deferred"``; :data:`~cascade.validator.lane_d_state.ABSENT_REASONS`).
+
+    Unarmed (``not cfg.active(boundary)``): ``LaneDSettlement(None, None,
+    None)``. Armed: ``report`` is ``None``, ``receipt`` the absent record
+    binding the loaded state's digest as prior and posterior, and ``pay``
+    ``{"share": cfg.share, "court_uids": []}`` (the caller burns lane D's
+    whole share with ``lane_parts(..., d_absent=True)``).
+
+    The prior state is read with :func:`~cascade.validator.lane_d_state.load_prior_state`
+    (``state_missing`` / ``state_digest_mismatch``, and ``expect_prior_sha256``
+    as in :func:`settle_lane_d`). It never replaces a judgement: a boundary
+    the state already settled is ``report_conflict`` (that boundary) or
+    ``stale_boundary`` (an older one), and a boundary whose report is
+    persisted (a crash W7c recovery must adopt) is ``report_conflict``. An
+    unknown ``reason`` is ``LaneDReceiptError`` ``bad_value``. Nothing is
+    written, on success or refusal, so a re-call returns the same settlement."""
+    if not cfg.active(boundary):
+        return LaneDSettlement(report=None, pay=None, receipt=None)
+    if not isinstance(reason, str) or reason not in ABSENT_REASONS:
+        raise LaneDReceiptError("bad_value", f"absent reason {reason!r} is not one of "
+                                f"{list(ABSENT_REASONS)}")
+    house = check_house(house)
+    boundary = int(boundary)
+    state = load_prior_state(state_path, house, boundary,
+                             expect_prior_sha256=expect_prior_sha256)
+    settled = int(state["boundary"])
+    if settled == boundary:
+        raise LaneDStateError("report_conflict", f"lane D already settled boundary "
+                              f"{boundary}; it cannot be recorded absent")
+    if settled > boundary:
+        raise LaneDStateError("stale_boundary", f"lane D already settled through {settled}; "
+                              f"got {boundary}")
+    rp = report_path(state_path, boundary)
+    if os.path.lexists(rp):
+        raise LaneDStateError("report_conflict", f"{rp}: a report is persisted for boundary "
+                              f"{boundary}; recovery must adopt it (settle_lane_d), never "
+                              "record it absent")
+    receipt = make_absent_receipt(boundary=boundary, state_sha256=state_digest(state),
+                                  reason=reason)
+    return LaneDSettlement(report=None, pay={"share": float(cfg.share), "court_uids": []},
+                           receipt=receipt)
+
+
+__all__ = ["LaneDSettlement", "absent_settlement", "judge_cohort", "load_pool",
+           "settle_lane_d", "window_id"]

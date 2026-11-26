@@ -1,0 +1,14 @@
+# W10: the lane D miner CLI `cascade lane-d export | verify | submit | ready |
+# status` (plan rev6.4 §3.0 W10 row, §1.2 "Flow" steps 1-4 and D43, §10.2
+# "Miner kit"; README.md has the contract).
+# NEW: the lane-d command group (add_lane_d), the W3a-chosen upload path only,
+# the signed intake requests, the immediate-reveal commit.
+cascade/miner/lane_d.py
+# `lane-d test` (owner 2026-11-24): the offline preview with the validators'
+# own lane D scoring, loaded at call time by cascade/miner/lane_d.py.
+cascade/miner/lane_d_preview.py
+# build_parser registers add_lane_d; the module docstring lists the group.
+cascade/miner/cli.py
+# `cascade rules a|b|c|d` (owner 2026-11-24 miner CLI refresh): prints each
+# lane's live rule values from chain.toml; registered in build_parser.
+cascade/miner/rules.py

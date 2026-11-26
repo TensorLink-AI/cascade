@@ -170,6 +170,92 @@ def power_ema_active(warm_start_dir, expert_selection):
     return False
 
 
+def lane_b_ema_leg(lr_schedule, expert_selection):
+    """Is this a lane B EMA / no-cooldown leg (plan rev6.20, owner
+    2026-11-24)? ``True`` iff the leg contract's ``lr_schedule`` is
+    ``"warmup_constant_ema"`` (set by ``lane_b_leg_contract`` on every lane B
+    leg contract) on an expert leg; ``False`` for ``"wsd"`` (every lane A
+    leg, and an expert leg trained directly on the era contract). Any
+    other schedule, or the EMA schedule on a lane A leg, is refused. Pure."""
+    if lr_schedule == "wsd":
+        return False
+    if lr_schedule == "warmup_constant_ema":
+        if expert_selection is None:
+            raise ValueError("pyramid recipe: lr_schedule='warmup_constant_ema' is lane B only "
+                             "(needs an expert selection)")
+        return True
+    raise ValueError(f"pyramid recipe requires lr_schedule='wsd' (or the lane B "
+                     f"'warmup_constant_ema'); got {lr_schedule!r}")
+
+
+def lane_b_schedule_factor(step, total_steps):
+    """The lane B EMA leg's LR factor: WSD's warmup (the same step count as
+    ``pyramid_optimizer.schedule_factor`` at ``total_steps``), then 1.0 to
+    the last step: no cooldown / decay tail. Pure."""
+    cooldown = max(1, round(total_steps / 11))
+    warmup = min(80, max(1, total_steps - cooldown))
+    return step / warmup if step < warmup else 1.0
+
+
+def lane_b_lever_terms(contract, expert_selection, no_cooldown, ema_sigmas, ema_eval):
+    """``(lr_scale, ema_sigmas, ema_eval)`` of a leg from its contract's lane B
+    lever terms (WB27, plan rev6.21): ``lane_b_lr_scale`` (1.0 = none)
+    multiplies every optimizer group's base LR; on a lane B EMA /
+    no-cooldown leg ``power_ema_sigma_rels = (s,)`` with ``power_ema_eval =
+    0`` is the miner's ONE EMA width (owner 2026-11-24: only it is computed,
+    scored and merged; code bounds 0.01-0.30); ``()`` / ``-1`` keep the
+    image's EMAs (``ema_sigmas`` / ``ema_eval`` as passed). Refused on a lane
+    A leg, off the EMA schedule, or out of bounds. Pure."""
+    lr_scale = float(getattr(contract, "lane_b_lr_scale", 1.0))
+    chosen = tuple(float(x) for x in (getattr(contract, "power_ema_sigma_rels", ()) or ()))
+    pick = int(getattr(contract, "power_ema_eval", -1))
+    if expert_selection is None and (lr_scale != 1.0 or chosen or pick != -1):
+        raise ValueError("pyramid recipe: lane_b_lr_scale / power_ema_sigma_rels are lane B "
+                         "leg levers (need an expert selection)")
+    if not 0.25 <= lr_scale <= 4.0:
+        raise ValueError(f"pyramid recipe: lane_b_lr_scale {lr_scale} outside [0.25, 4]")
+    if not chosen and pick == -1:
+        return lr_scale, tuple(ema_sigmas), ema_eval
+    if not no_cooldown:
+        raise ValueError("pyramid recipe: a chosen EMA needs the lane B EMA schedule")
+    if len(chosen) != 1 or pick != 0 or not 0.01 <= chosen[0] <= 0.30:
+        raise ValueError(f"pyramid recipe: the lane B EMA choice must be one width in "
+                         f"[0.01, 0.30] with power_ema_eval 0; got {chosen!r}, {pick}")
+    return lr_scale, chosen, 0
+
+
+def lane_b_context_patches(context_length, expert_selection, patch_size):
+    """Patches per training window: 128 (4096 points) on every leg, or a lane
+    B leg's chosen context (WB27: a power of two in 4096..32768) divided by
+    the patch size. Any other context, or a longer one on a lane A leg, is
+    refused. Pure."""
+    c, p = int(context_length), int(patch_size)
+    if c == 4096:
+        return 4096 // p
+    if expert_selection is None:
+        raise ValueError("pyramid recipe: a context above 4096 is a lane B leg lever")
+    if not 4096 <= c <= 32768 or c & (c - 1) or c % p:
+        raise ValueError(f"pyramid recipe: lane B context_length {c} must be a power of two "
+                         "in [4096, 32768]")
+    return c // p
+
+
+def lane_b_leg_record(step, steps, tokens, duration, max_train_seconds, token_budget=None):
+    """owner 2026-11-24 (rev6.21): a lane B limits leg's record — the steps
+    and tokens it trained and the limit that stopped it: ``"steps"`` (its
+    token limit / steps cap), ``"tokens"`` (the point budget), ``"hours"`` (its hour limit: a normal stop,
+    not a failure) or ``"corpus"`` (the corpus ran out first). Pure."""
+    if int(step) >= int(steps):
+        stop = "steps"
+    elif token_budget is not None and int(tokens) >= int(token_budget):
+        stop = "tokens"
+    elif float(duration) >= float(max_train_seconds):
+        stop = "hours"
+    else:
+        stop = "corpus"
+    return {"steps": int(step), "tokens": int(tokens), "stop": stop}
+
+
 def power_ema_state(emas):
     """Every EMA's shadows and step counter as one flat tensor dict."""
     flat = {}
@@ -178,7 +264,7 @@ def power_ema_state(emas):
     return flat
 
 
-def save_checkpoint(out, state, cfg, contract, *, power_ema=None):
+def save_checkpoint(out, state, cfg, contract, *, power_ema=None, lane_b_leg=None):
     import json
 
     from .ckpt_digest import save_tensors_hashed
@@ -192,6 +278,10 @@ def save_checkpoint(out, state, cfg, contract, *, power_ema=None):
     if power_ema is not None:
         # only on EMA-scored legs; a raw leg's config.json is byte-identical
         meta[POWER_EMA_MARKER] = power_ema
+    if lane_b_leg is not None:
+        # owner 2026-11-24: only on a lane B limits leg (what it trained and
+        # the limit that stopped it); every other config.json is unchanged
+        meta["lane_b_leg"] = lane_b_leg
     (out / "config.json").write_text(json.dumps(meta, sort_keys=True))
     (out / "model.py").write_bytes(Path(__file__).with_name("pyramid_model.py").read_bytes())
     (out / "forecast_wrapper.py").write_bytes(Path(__file__).with_name("pyramid_wrapper.py").read_bytes())
@@ -199,29 +289,56 @@ def save_checkpoint(out, state, cfg, contract, *, power_ema=None):
 
 def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out_dir,
                   logger=None, warm_start_dir=None, expert_selection=None, continuation=None):
+    # WB27 (plan rev6.21): a lane B leg may train at a longer context. The
+    # model has no length bound (xPos per forward pass); the only 4096 lock is
+    # from_contract's contract-field check, so the model config is built at
+    # 4096 (the checkpoint's moe.context_length stays 4096) and only the batch
+    # window of this leg grows.
+    from dataclasses import replace
+
     from safetensors.torch import load_file
 
     from .continuation import assert_training_runtime, restore_rng, rng_state, training_runtime
     from .moe_trainer import PowerEMA, restore_frozen, route_bias_scale, router_lr_scale
 
-    cfg = CascadeMoEConfig.from_contract(contract)
+    ctx_patches = lane_b_context_patches(contract.context_length, expert_selection,
+                                         contract.patch_size)
+    cfg = CascadeMoEConfig.from_contract(
+        contract if int(contract.context_length) == 4096
+        else replace(contract, context_length=4096))
     if contract.training_steps < 1:
         raise ValueError("cascade_pyramid requires a positive training_steps budget")
     # Recipe values are explicit contract terms; refuse silently ignored alternatives.
     expected = dict(optimizer="normuon_adamw", base_lr=0.002125, weight_decay=2e-8,
         grad_clip=7.0, batch_denomination="sequences", budget_denomination="points",
-        masking="contiguous_patch", input_transform="arcsinh_causal", lr_schedule="wsd",
+        masking="contiguous_patch", input_transform="arcsinh_causal",
         anneal_fraction=0.0, ema_decay=0.0, power_ema_sigma_rels=(),
         copula_samples=4, copula_loss_cap=0.1, muon_momentum=0.96,
         muon_row_beta2=0.999, adamw_beta1=0.91, adamw_beta2=0.972,
         adamw_lr_scale=0.2, mup_lr_exponent=1.42, umup_base_d_model=512,
         warm_lr_scale=1.0)
+    if expert_selection is not None:
+        # WB27: a lane B leg may carry its ONE chosen EMA width; checked by
+        # lane_b_lever_terms below (lane A keeps power_ema_sigma_rels=())
+        expected.pop("power_ema_sigma_rels")
     for name, value in expected.items():
         if getattr(contract, name) != value:
             raise ValueError(f"pyramid recipe requires {name}={value!r}")
+    no_cooldown = lane_b_ema_leg(contract.lr_schedule, expert_selection)
     ema_sigmas, ema_eval = power_ema_settings()
-    # computed on every leg (shadow); SCORED only where the init says so
-    ema_scored = bool(ema_sigmas) and power_ema_active(warm_start_dir, expert_selection)
+    # WB27 (plan rev6.21): the miner's lane B levers (1.0 / -1 on every other leg)
+    lever_lr_scale, ema_sigmas, ema_eval = lane_b_lever_terms(
+        contract, expert_selection, no_cooldown, ema_sigmas, ema_eval)
+    stop_record = bool(getattr(contract, "lane_b_stop_record", False))
+    if stop_record and expert_selection is None:
+        raise ValueError("pyramid recipe: lane_b_stop_record is a lane B leg term")
+    if no_cooldown and not ema_sigmas:
+        raise ValueError("the lane B EMA schedule needs the image's power EMA "
+                         "(POWER_EMA_SIGMA_RELS is empty)")
+    # computed on every leg (shadow); SCORED only where the init says so, or
+    # on a lane B leg under the EMA / no-cooldown schedule (plan rev6.20)
+    ema_scored = bool(ema_sigmas) and (
+        no_cooldown or power_ema_active(warm_start_dir, expert_selection))
     if tuple(contract.accepted_fields) not in ((), ("groups",)):
         raise ValueError("pyramid recipe accepts only optional groups")
     if str(trainer.dtype) != "torch.float32":
@@ -270,6 +387,14 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
         for group in optimizer.adamw.param_groups:
             if any(id(p) in router_ids for p in group["params"]):
                 group["base_lr"] *= router_lr_scale(contract)
+    if lever_lr_scale != 1.0:
+        # WB27: the lane B leg's lr_scale on every group (NorMuon and AdamW)
+        seen = set()
+        for group in [*optimizer.param_groups,
+                      *(optimizer.adamw.param_groups if optimizer.adamw else [])]:
+            if id(group) not in seen:
+                seen.add(id(group))
+                group["base_lr"] *= lever_lr_scale
     bias_scale = route_bias_scale(contract)
     resumed_optimizer = False
     if warm_start_dir is not None and slices is None:
@@ -278,8 +403,12 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
     cop_gen = torch.Generator(device=trainer.device).manual_seed(training_seed % (2**63))
     from .pyramid_dp import Gang, gang_size, micro_batch_pass, owned_splits
 
-    world = gang_size(trainer.device) if slices is None else 1
-    gang = Gang(world, cfg, deterministic=trainer.deterministic, seed=training_seed) if world > 1 else None
+    # every leg, lane A or a lane-B expert leg, trains on the whole layout;
+    # an expert gang reduces, shards and syncs only the selected leaves
+    world = gang_size(trainer.device)
+    gang = Gang(world, cfg, deterministic=trainer.deterministic, seed=training_seed,
+                device=trainer.device, expert_selection=expert_selection,
+                slices=slices) if world > 1 else None
     if gang is not None:
         gang.shard_optimizer(model, optimizer)
         gang.scatter_pending = bool(resumed_optimizer)
@@ -347,8 +476,8 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
     clean = False
     try:
         batches = iter_training_batches(batch_source(timed, contract, patch_size=cfg.patch_size,
-            max_ctx_patches=128, seed=training_seed), patch_size=cfg.patch_size,
-            max_ctx_patches=128, batch_size=contract.batch_size,
+            max_ctx_patches=ctx_patches, seed=training_seed), patch_size=cfg.patch_size,
+            max_ctx_patches=ctx_patches, batch_size=contract.batch_size,
             batch_denomination=contract.batch_denomination)
         for index, batch in enumerate(batches):
             groups = None
@@ -383,7 +512,8 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
                 if gang is not None:
                     gang.gather_muon()
                 stable = trainer._stable_snapshot(model, optimizer)
-            factor = schedule_factor(step, steps)
+            factor = (lane_b_schedule_factor(step, steps) if no_cooldown
+                      else schedule_factor(step, steps))
             for group in optimizer.param_groups:
                 group["lr"] = group["base_lr"] * factor
             optimizer.zero_grad(set_to_none=True)
@@ -477,8 +607,12 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
     scored = average(emas[ema_eval]) if ema_scored else live
     out = Path(out_dir)
     save_checkpoint(out, scored, cfg, contract, power_ema=(
-        {"sigma_rels": list(ema_sigmas), "scored_sigma_rel": ema_sigmas[ema_eval]}
-        if ema_scored else None))
+        {"sigma_rels": list(ema_sigmas), "scored_sigma_rel": ema_sigmas[ema_eval],
+         # plan rev6.20: the leg's schedule, the record settlement checks
+         **({"schedule": contract.lr_schedule} if no_cooldown else {})}
+        if ema_scored else None),
+        lane_b_leg=(lane_b_leg_record(step, steps, tokens, duration, contract.max_train_seconds,
+                                      token_budget) if stop_record else None))
     from .ckpt_digest import save_tensors_hashed
 
     # comparison extras, never scored (validators load only weights.safetensors);
@@ -504,7 +638,7 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
         "active_params": counts["active"], "train_seconds": duration,
         "deadline_hit": step < steps and duration >= contract.max_train_seconds,
         "data_wait_s": timed.wait_s,
-        "tokens_frac": tokens / max(1, token_budget), "lr_schedule": "wsd",
+        "tokens_frac": tokens / max(1, token_budget), "lr_schedule": contract.lr_schedule,
         "optim_state_resumed": resumed_optimizer,
         "training_complete": step == steps,
         "corpus_exhausted": step < steps and tokens < token_budget and duration < contract.max_train_seconds}
@@ -514,6 +648,9 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
         metrics.update(power_ema_eval_sigma_rel=ema_sigmas[ema_eval])
     if slices:
         metrics.update(expert_training_backend="compact_rows", expert_trainable_param_count=sum(p.numel() for p in params))
+        # lane B only: the ranks the expert leg trained on (lane A metrics,
+        # which feed receipts, are unchanged)
+        metrics.update(gpu_n=world)
     if grouped_corpus:
         summary = channel_stats.summary()
         if summary is not None:

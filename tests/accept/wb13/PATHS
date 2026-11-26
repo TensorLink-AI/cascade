@@ -16,3 +16,6 @@ cascade/funding/queue.py
 # Production wiring: load the pinned hash set (load_pinned_hashset) and pass it
 # with the submitted-repo fetch to FundingIntake.
 cascade/funding/main.py
+# #931 kill switches at the intake: refuse lane_ended / competition_ended,
+# release the queued entries of an ended lane, warn on a share-0 lane.
+cascade/funding/lane_ends.py

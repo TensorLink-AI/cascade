@@ -154,18 +154,83 @@ Wrong reasons:
 - nothing collected;
 - all tests passing.
 
-### `accept <WP> --check-pr --base REF --head REF [--root R]`
+### `accept <WP> --check-pr --base REF --head REF [--pr-wps WP,...] [--correction] [--root R]`
 
-It diffs `git diff --name-only BASE...HEAD`:
+It diffs `git diff --name-only BASE...HEAD` (plan rev6.17, owner
+2026-11-23: one PR per feature; tests + code together; PATHS ride along):
 
-- **Tests and other paths together.** If the diff touches `tests/accept/`
-  and any other path, the check fails with `FAIL rule1` (rule 1).
+- ~~**Tests and other paths together.** If the diff touches `tests/accept/`
+  and any other path, the check fails with `FAIL rule1` (rule 1).~~
+  (struck by rev6.17)
+- **Tests and code together (FEATURE rule, rev6.17).** The diff may change
+  `tests/accept/<wp>/` (its `PATHS` included) of every labelled WP together
+  with code. Every code path must match some labelled WP's scope: its `PATHS`
+  on the base plus the entries this PR adds (a removed entry still counts
+  from the base). Otherwise `FAIL paths` names the offending paths. It
+  prints `PATHS-ADDED <WP> <entry>` / `PATHS-REMOVED <WP> <entry>`, and
+  `MODE combined` for a WP whose tests dir is in the diff, else
+  `MODE implementation`.
+- **Weakened tests.** A combined PR that deletes a test module, removes a
+  test (or asserting) function, has fewer assertions in a function or
+  helper, adds skip/xfail markers, or removes a `PATHS` entry of a WP fails
+  with `FAIL weakened` (one `weakened <WP>: ...` line each) unless the PR
+  also carries the flag label `laned:tests-correction` (`--correction`).
 - **Tests only.** If the diff only touches `tests/accept/<wp>/`, it prints
-  `MODE tests-only` and exits 0. Touching another WP's test directory fails.
+  `MODE tests-only` (unbuilt WP) or `MODE tests-correction` (built) and
+  exits 0. With one label, touching another WP's test directory fails.
 - **Implementation.** Otherwise every changed path must match the WP's
   `PATHS`. If they all do, it prints `MODE implementation` and exits 0. If
   not, it prints `FAIL paths` with the offending paths. `scripts/laned/` is
   outside every WP's `PATHS` except W0c's.
+- **Several labels (`--pr-wps`).** Any number of `laned:<WP>` labels
+  (rev6.17: no 3-WP cap, overlapping `PATHS` and in-batch Depends allowed;
+  `scripts/laned/coupled_batches` is no longer needed). It prints
+  `BATCH <WPs>`, `SCOPE <WP> <n> file(s)` and `WPMODE <WP> <mode>` per WP
+  and the asked WP's `MODE`. Refusals: `batch-non-wp-label`,
+  `batch-duplicate-label`, `batch-stray-tests`, `batch-unlabelled-tests`,
+  `batch-no-tests` (a WP with no `PATHS` + test file at HEAD),
+  `batch-out-of-scope`, `batch-label-without-changes`,
+  `batch-paths-too-broad`, `batch-paths-foreign-tests`.
+
+### `accept <WP> --combined --base REF --head REF [--correction] [--root R]`
+
+The run for `MODE combined`. The WP's NEW tests (test functions absent on
+the base) and CHANGED tests (AST differs, or a helper / conftest / fixture
+in their closure changed), taken from HEAD, run against the base's code (a
+temporary base worktree whose `tests/accept/<wp>/` is HEAD's), classified as
+in `--expect-fail`:
+
+- every new test must fail for a right reason; one that passes on the base
+  proves nothing and fails the run, unless the WP is listed in
+  `scripts/laned/verification_wps` at the base;
+- no new or changed test may fail for a wrong reason;
+- at least one must fail for a right reason (unless verification WP or
+  `--correction`).
+
+Then the full Accept must pass on HEAD. It prints `TESTS-TREE <sha>`,
+`LEDGER-MODE combined` and `PASS <WP> combined`.
+
+### `accept --freshness --base REF --head REF --main REF [--warn-only] [--root R]`
+
+The stale-base check (FRESHNESS rule in `accept --help`). Without
+`--warn-only` a stale base prints `STALE BASE: update-branch and re-run` and
+exits non-zero. With `--warn-only` (the `pull_request` job since the merge
+queue, owner 2026-11-24) the same analysis prints `WARNING STALE BASE ...`
+and exits 0; a fresh base prints `FRESH ...` either way.
+
+### `accept --merge-group --base REF --head REF --group-labels FILE [--root R]`
+
+The merge queue's gate (MERGE-GROUP rule in `accept --help`). `--root` is the
+combined ref checked out; `--base` is `merge_group.base_sha`; `FILE` is JSON
+`{"<PR>": ["laned:W3", ...]}`. Each first-parent commit of BASE..HEAD must
+name its PR (`... (#N)` or `Merge pull request #N ...`) and appear in the
+file. For each `laned:<WP>` of that PR, check-pr on the commit (`C^1...C`)
+names the mode, and the WP's own run follows on the combined tree:
+implementation / combined → full Accept, tests-only → `--verification`,
+tests-correction → `--tests-correction`, evidence → full Accept with each
+evidence file, review → nothing. It prints `GROUP-OWN <WPs|none>`, `GROUP
+<WP> <mode> PASS|FAIL (#N)` per run and `GROUP PASS` / `GROUP FAIL`, exiting
+non-zero on any FAIL, a commit naming no PR, or a PR missing from the file.
 
 ### `accept --gate <STAGE> [--root R]` (§17.2)
 
@@ -207,17 +272,22 @@ WP ids are matched as whole tokens, so `W0` never matches `W0c`.
 
 ```json
 {"runs": [{"workflow": "laned-accept", "event": "push|pull_request",
-           "mode": "accept|expect-fail", "wp": "W1", "head_sha": "<sha>",
-           "conclusion": "success|failure", "created_at": "<ISO 8601>"}]}
+           "mode": "accept|expect-fail|combined|...", "wp": "W1", "head_sha": "<sha>",
+           "conclusion": "success|failure", "created_at": "<ISO 8601>",
+           "pr": 123}]}
 ```
+
+`pr` (rev6.17) is recorded on every `pull_request` row (`ci_ledger.py record
+--pr N`): the row also tells the LABELLED L2 rule that PR N carried
+`laned:<wp>`.
 
 ### Levels (each needs all the levels below it)
 
 | level | condition |
 |---|---|
 | L0 | the WP is listed |
-| L1 | `tests/accept/<wp>/PATHS` exists at REF **and** there is a successful `expect-fail` run for the WP (its sha need not be on main) |
-| L2 | there is an implementation commit on REF's first-parent history that descends from the commit that added the WP's `PATHS`, touches at least one path outside `tests/accept/`, and has every changed path in `PATHS`. The first such commit is "the L2 commit". |
+| L1 | `tests/accept/<wp>/PATHS` exists at REF **and** there is a successful `expect-fail` run for the WP (its sha need not be on main), **or** (rev6.17) the WP's last ledger row for PR N is a green `combined` run and the squash merge `(#N)` changes `tests/accept/<wp>/` |
+| L2 | LABELLED rule (rev6.17): a squash merge `... (#N)` whose PR labels are known (`$LANED_PR_LABELS`, the workflow's `gh pr list --state merged --json number,labels`, plus ledger rows with `pr`) is the L2 commit iff PR N carried `laned:<WP>` and it changes at least one non-test path (outside `tests/`) in the WP's `PATHS`; a known PR without the label never is. Otherwise (no PR number, labels unknown) the git-only rule: an implementation commit on REF's first-parent history that descends from the commit that added the WP's `PATHS`, touches at least one path outside `tests/accept/`, and has every changed path in `PATHS`. The first such commit is "the L2 commit". |
 | L3 | the latest `push`/`accept` run for the WP (ordered by the position of `head_sha` in REF's history, then by `created_at`) whose sha is the L2 commit or a later one on REF has `conclusion: success`. Runs on earlier commits are ignored. A later red run drops the WP back to L2. |
 | L4 | it is a ci-only WP (plan §17.1: "n/a for ci-only WPs, which pass L4 automatically"), **or** its evidence file exists at REF and the evidence check passes. The evidence file is `--evidence <file>` from the Accept cell, else `evidence/<wp>.json`. So an accepted ci-only WP that no RV covers yet is at L4, not L3. |
 | L5 | some `evidence/rv<n>.md` has a `Covers:` line naming the WP and no open `- [ ] BLOCKING <WP>` line |
@@ -297,3 +367,45 @@ It must trigger on `pull_request` with `types` including `labeled` and
 `synchronize`, and on `push` to `main`. It must run `scripts/laned/accept`
 with `--check-pr` and `--expect-fail`, select WPs from `laned:<WP>` labels,
 and run `scripts/laned/status` on push to main.
+
+Rev6.17: `MODE combined` runs `accept <WP> --combined`; `laned:tests-correction`
+is a flag label (never a WP) passed as `--correction`; every PR ledger row
+carries `--pr`; both jobs write the merged PRs' labels to
+`$LANED_PR_LABELS` (`gh pr list`, fails closed). The tooling still comes
+from the base branch, so a PR that changes the rules runs under the old ones.
+
+Merge queue (owner 2026-11-24): the `pull_request` freshness step runs
+`--freshness --warn-only`, reports a stale base as a `::warning::` plus a
+job-summary section and always exits 0. On `merge_group` the merge-group
+step writes the queued PRs' labels to a file, runs `accept --merge-group`
+(each queued PR's own WPs on the combined ref) and then `accept <GROUP-OWN
+WPs> --cross` over the group; it fails when either fails. Trade-off: PR CI no
+longer chases main, merge-group CI gets longer (own Accepts + CROSS; the
+`pr` job's timeout is 120 min on `merge_group`).
+
+## Loop brief (orchestrator-facing, rev6.17)
+
+- One PR per feature: put every WP the feature touches on one PR, one
+  `laned:<WP>` label each, tests and code together, `PATHS` additions in the
+  same PR. No 3-WP cap, no disjoint-`PATHS` or dependency split, no
+  `coupled_batches` declaration.
+- Each new test must fail on the base for a right reason and pass on the
+  head (`--combined`); a test that already passes on the base belongs to a
+  verification WP or is not new evidence.
+- Never delete or loosen an existing assertion (or drop a `PATHS` entry)
+  without the `laned:tests-correction` label and a reason in the PR body.
+- Every WP whose code a PR changes must carry its label: an unlabelled WP
+  gets no L2 from the merge, however broad its `PATHS`.
+- Tests-only and tests-correction PRs still work; they are optional.
+- A stale base is a warning on the PR, not a reason to update-branch and
+  re-run: enqueue green PRs; the merge queue re-accepts them on latest main.
+- Plan text changes: one plan PR per batch of decisions (no `laned:` label;
+  `docs/plans/` is PROTECTED from every WP PR).
+- Retired WPs (owner decision D24, plan rev6.18; `test_w0c_retired.py`):
+  `scripts/laned/retired_wps` lists `<WP> <owner decision reference>` (W5i).
+  Read at the base, never from the PR. A retired WP's PATHS never count for
+  scope, so a PR touching e.g. `cascade/validator/lane_d.py` needs no
+  `laned:W5i`; a leftover label of it is inert (`MODE retired`, nothing
+  runs, no ledger row). Its tests dir may only be deleted, under its label
+  plus `laned:tests-correction`. Never a CROSS or merge-group run; the board
+  keeps it at L0, side state `retired`, Level RETIRED.

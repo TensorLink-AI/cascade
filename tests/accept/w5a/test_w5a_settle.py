@@ -7,7 +7,8 @@
 * invariant 10 pair: unarmed nothing is judged or written; armed the trap
   windows are refused and the eligible ones scored;
 * the skeleton end to end with trap windows on which the challenger is
-  catastrophically wrong: refused, so it still clears, confirms and is paid.
+  catastrophically wrong: refused, so it still clears, is crowned (rev6.11:
+  at its first verdict) and is paid.
 
 On main the settlement scores the clock-passing traps (over-lag, forecast
 product, backfill, absent from S0), so these fail on an assertion.
@@ -68,7 +69,7 @@ def _settle(cfg, boundary, pool_dir, entries, house, forecasts, uid_of, state_pa
     (`helpers.gate_inputs`): the e2e skeleton crowns at BOUNDARY_2."""
     from cascade.validator.lane_d import settle_lane_d
 
-    return settle_lane_d(cfg=cfg, boundary=boundary, pool_dir=pool_dir,
+    return settle_lane_d(**_rev614_ts(settle_lane_d, boundary), cfg=cfg, boundary=boundary, pool_dir=pool_dir,
                          entries=[dict(e) for e in entries], house=dict(house),
                          forecasts=forecasts, uid_of=dict(uid_of), state_path=state_path,
                          signer=fixture_key("signer"),
@@ -95,6 +96,7 @@ def test_inv4_settle_never_scores_an_ineligible_window(tmp_path):
     for seed in range(8):
         rng = np.random.default_rng(1000 + seed)
         cfg = lane_d_cfg(forward_margin_hours=float(rng.choice([0.0, 6.0, 12.0])),
+                         eval_delay_hours=12.0,   # rev6.14 (a): >= the margin
                          max_mirror_lag_hours=float(rng.choice([3.0, 6.0, 9.0])))
         t_king = int(T0 + int(rng.integers(-72, 73)) * HOUR)
         entries = [_entry(f"p{seed}-e{i}", T0 + int(rng.integers(0, 49)) * HOUR)
@@ -199,9 +201,9 @@ def _trap_chain(tmp_path):
     return cfg, entry, house, snaps, {entry["hotkey"]: CHALLENGER_UID}
 
 
-def _assert_no_trap_scored(report, traps, by_wid, feeds, cfg):
+def _assert_no_trap_scored(report, traps, by_wid, feeds, cfg, *, require_rows=True):
     wids = {r["window_id"] for r in report["rows"]}
-    assert wids, "the armed settlement scored no rows"
+    assert wids or not require_rows, "the armed settlement scored no rows"
     scored_traps = sorted(wids & traps)
     assert not scored_traps, f"ineligible windows were scored: {scored_traps[:5]}"
     bound = bound_of(T0, HOUSE_T, cfg)
@@ -249,13 +251,28 @@ def test_e2e_skeleton_refuses_trap_windows_and_still_pays_the_challenger(tmp_pat
         pool_dir, fc, traps, feeds, by_wid = snaps[n]
         s = _settle(cfg, boundary, pool_dir, [entry], house, fc, uid_of, state_path)
         assert s.report is not None, f"boundary {boundary}: no report"
-        _assert_no_trap_scored(s.report, traps, by_wid, feeds, cfg)
+        # rev6.11 (b): the challenger is crowned at its first verdict
+        # (BOUNDARY_1); BOUNDARY_2 may then judge nothing.
+        _assert_no_trap_scored(s.report, traps, by_wid, feeds, cfg,
+                               require_rows=boundary == BOUNDARY_1)
         reports.append(s)
     s2 = reports[-1]
     state = json.loads(state_path.read_text())
     assert state["king"]["digest"] == entry["digest"], \
         "the challenger was not crowned: trap windows sank it"
     assert s2.pay["court_uids"][0] == CHALLENGER_UID
+    assert hasattr(cfg, "court_weights"), "[lane_d] court_weights is not parsed (rev6.23)"
     vec = lane_d_vector(N_UIDS, share=s2.pay["share"], court_uids=s2.pay["court_uids"],
-                        king_decay=cfg.king_decay, burn_uid=0)
+                        court_weights=cfg.court_weights, burn_uid=0)
     assert vec[CHALLENGER_UID] > 0.0
+
+
+def _rev614_ts(settle, boundary) -> dict:
+    """rev6.14 (a): the fixture's on-chain boundary timestamp (far after every
+    fixture T + eval_delay_hours, 12 s per block), passed only where
+    ``settle_lane_d`` takes it."""
+    import inspect
+
+    if "boundary_ts" not in inspect.signature(settle).parameters:
+        return {}
+    return {"boundary_ts": 2_000_000_000 + 12 * int(boundary)}

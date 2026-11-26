@@ -55,7 +55,11 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # Measured 2026-11-24 (run 45315434742): sync ~7 min, build ~47 min (the
+    # builder pages Hyperliquid's candle API per asset and bank and backs off
+    # on HTTP 429), then the relay mirror. 60 min cancelled the mirror after a
+    # completed publish; the mirror now has its own step budget below.
+    timeout-minutes: 150
     env:
       HIPPIUS_S3_ACCESS_KEY: ${{ secrets.CASCADE_S3_ACCESS_KEY }}
       HIPPIUS_S3_SECRET_KEY: ${{ secrets.CASCADE_S3_SECRET_KEY }}
@@ -152,9 +156,17 @@ jobs:
       # Training pods read the RAW recording through the trainer's relay
       # ([marketcast] bar_relay = "<pool bucket>/marketcast/bars/"), read with
       # the pool keys like every pool reader. Mirror what was synced above into
-      # it; `sync` uploads only the changed day files after the first run.
+      # it. `sync` is a delta: a local file is uploaded only when its size
+      # differs or its mtime (the forge object's LastModified, set by the
+      # download above) is newer than the relay copy, so after the first full
+      # mirror each run sends only the day files rewritten since. An
+      # interrupted mirror is therefore resumable: the next run uploads only
+      # what is still missing. The step has its own budget so a slow mirror
+      # fails this step (visible, and the publish above has already landed)
+      # instead of hitting the job timeout.
       - name: Mirror the recording into the pool bucket  (POOL key)
         if: steps.gate.outputs.run
+        timeout-minutes: 60
         env:
           TOML: ${{ steps.gate.outputs.toml }}
           AWS_MAX_ATTEMPTS: "10"

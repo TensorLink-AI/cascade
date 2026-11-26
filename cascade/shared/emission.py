@@ -331,7 +331,8 @@ def lane_parts(court_uids: Sequence[int], n_uids: int, *, king_decay: float, bur
                lane_b_cfg: Any = None, wins: Iterable[Any] = (),
                lane_c_cfg: Any = None, c_wins: Iterable[Any] = (),
                c_slot_frac: dict[str, float] | None = None,
-               lane_d_cfg: Any = None, d_court_uids: Sequence[int | None] = ()
+               lane_d_cfg: Any = None, d_court_uids: Sequence[int | None] = (),
+               d_absent: bool = False
                ) -> tuple[list[float], list[float]]:
     """``(lane_a, lane_b)`` — the lanes of the vector KEPT APART (their sum
     is :func:`cascade.shared.lane_b.combined_weights`'s vector). ``lane_a`` is
@@ -361,7 +362,13 @@ def lane_parts(court_uids: Sequence[int], n_uids: int, *, king_decay: float, bur
     and its relative split are unchanged and only its pool shrinks), and its
     court part (:func:`lane_d_vector` over ``d_court_uids``, king first,
     ``None`` = the house's slot, which burns) is ADDED to the second element.
-    ``None`` = exactly the result without lane D (invariant 1)."""
+    ``None`` = exactly the result without lane D (invariant 1).
+
+    ``d_absent`` (W14, the lane D-only fast kill: the settlement's lane D
+    receipt record is ``status: "absent"``): lane D's share is carved exactly
+    as when it pays, and the WHOLE share goes to ``burn_uid`` whatever
+    ``d_court_uids`` holds; lane A and every lane B / C slot are unchanged.
+    Without ``lane_d_cfg`` it changes nothing."""
     from .chain import decayed_share_vector
     from .lane_c import lane_pool_shares
 
@@ -390,33 +397,41 @@ def lane_parts(court_uids: Sequence[int], n_uids: int, *, king_decay: float, bur
                           share=share_c, slot_frac=c_slot_frac)
         b = [x + y for x, y in zip(b, c, strict=True)]
     if lane_d_cfg is not None:
-        d = lane_d_vector(n_uids, share=share_d, court_uids=list(d_court_uids),
-                          king_decay=float(lane_d_cfg.king_decay), burn_uid=burn_uid)
+        # An empty court burns lane D's whole share (lane_d_vector).
+        d_court = [] if d_absent else list(d_court_uids)
+        d = lane_d_vector(n_uids, share=share_d, court_uids=d_court,
+                          court_weights=lane_d_cfg.court_weights, burn_uid=burn_uid)
         b = [x + y for x, y in zip(b, d, strict=True)]
     return [pool_a * w for w in court], b
 
 
 def lane_d_vector(n_uids: int, *, share: float, court_uids: Sequence[int | None],
-                  king_decay: float, burn_uid: int) -> list[float]:
+                  court_weights: Sequence[float], burn_uid: int) -> list[float]:
     """Lane D's part of the vector; sums to ``share``. ``court_uids`` is the
     court king first, then prior miner kings by recency; slot ``i`` is worth
-    ``king_decay**i`` (normalised over the slots). A ``None`` slot (the house
-    holding KING_D, D21, or a deregistered court member), an out-of-range or
-    a repeated uid burns to ``burn_uid``; an empty court burns it all."""
+    ``court_weights[i]`` (rev6.23, owner 2026-11-24: 0.80 / 0.15 / 0.05),
+    normalised over the slots the court has (a court shorter than
+    ``court_weights`` renormalises, as the retired geometric split did). A
+    ``None`` slot (the house holding KING_D, D21, or a deregistered court
+    member), an out-of-range or a repeated uid burns to ``burn_uid``; an
+    empty court (or one whose slots weigh 0) burns it all."""
     if not 0 <= int(burn_uid) < n_uids:
         raise ValueError(f"burn_uid {burn_uid} out of range [0,{n_uids})")
-    if not 0.0 < float(king_decay) <= 1.0:
-        raise ValueError(f"king_decay must be in (0, 1]; got {king_decay}")
+    weights = [float(w) for w in court_weights]
+    if any(not w >= 0.0 for w in weights):
+        raise ValueError(f"court_weights must be >= 0; got {list(court_weights)}")
     s = float(share)
     out = [0.0] * n_uids
     if s == 0.0:
         return out
     slots = list(court_uids)
-    if not slots:
+    if len(slots) > len(weights):
+        raise ValueError(f"court has {len(slots)} slots; court_weights has {len(weights)}")
+    raw = weights[:len(slots)]
+    total = sum(raw)
+    if not slots or total <= 0.0:
         out[burn_uid] = s
         return out
-    raw = [float(king_decay) ** i for i in range(len(slots))]
-    total = sum(raw)
     seen: set[int] = set()
     for uid, w in zip(slots, raw, strict=True):
         amt = s * w / total

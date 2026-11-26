@@ -8,11 +8,17 @@ The crowning chain is REAL settlements (``settle_lane_d`` on main, no
 hand-written state), built from the W5c fixture conventions (copied, not
 imported, so this WP stands alone):
 
-- BOUNDARY_1: K1 first-clears against the genesis house H0;
-- BOUNDARY_2: K1 confirms on a disjoint snapshot and is crowned (previous
-  KING_D = H0, the house);
-- BOUNDARY_3: Y first-clears against K1 (and the house);
-- BOUNDARY_4: Y confirms and is crowned (previous KING_D = K1, a miner).
+- BOUNDARY_1: no entry is listed yet; nothing is judged (H0 holds KING_D);
+- BOUNDARY_2: K1 enters, clears at its first verdict and is crowned
+  (previous KING_D = H0, the house);
+- BOUNDARY_3: Y is not listed yet; nothing is judged (K1 holds KING_D);
+- BOUNDARY_4: Y enters, clears at its first verdict against K1 (and the
+  house) and is crowned (previous KING_D = K1, a miner).
+
+Plan rev6.11 (b) drops the confirmation duel: a crown is decided at the
+first verdict (first clear ∧ A10 ∧ the §1.3b gate). The chain lists each
+challenger from the settlement that crowns it, so the crowns stay at
+BOUNDARY_2 and BOUNDARY_4.
 
 The only stand-ins are the two external services: the bench pod
 (:class:`RecordingHost`, recorded per-item sentinel rows behind a real
@@ -66,6 +72,13 @@ QUALITY = {"sharp": (0.005, 0.1, 0.0), "good": (0.02, 0.2, 0.0),
            "fair": (0.05, 0.3, 0.0), "bad": (0.0, 0.3, 3.0)}
 
 
+# rev6.18 F4 (A3): these fixtures pin the live-only rule: the public half off
+# (public_weight = 0, a spec setting) and no per-window ratio clamp in effect
+# (a floor far below any fixture ratio), so their pre-F4 numbers stand. F4's
+# own tests (tests/accept/w5e/test_w5e_combined.py) pin the combined rule.
+LIVE_ONLY = {"public_weight": 0.0, "window_ratio_floor": 1e-9}
+
+
 def lane_d_cfg(**over):
     from cascade.shared.config.lane_d import parse_lane_d
 
@@ -73,7 +86,7 @@ def lane_d_cfg(**over):
            "remainder": "burn", "contexts": [4096, 8192, 16384], "horizon": HORIZON,
            "forward_margin_hours": MARGIN_H, "max_mirror_lag_hours": 6.0,
            "min_windows": 24, "min_clusters": 4, "bootstrap_B": 200}
-    return parse_lane_d({**raw, **over}, era_blocks_at=lambda _block: ERA)
+    return parse_lane_d({**raw, **LIVE_ONLY, **over}, era_blocks_at=lambda _block: ERA)
 
 
 def _bound(t: int) -> int:
@@ -115,7 +128,7 @@ def _target_values(series_id: str, start: int) -> tuple[np.ndarray, np.ndarray]:
 
 def write_pool(directory: Path, records: list[dict], snapshot: str) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
-    feeds = {r["feed"]: {"mirror_lag_hours": FEED_LAG_HOURS, "forecast_product": False}
+    feeds = {r["feed"]: {"mirror_lag_hours": FEED_LAG_HOURS, "forecast_product": False, "embargo_hours": 0.0}
              for r in records}
     meta = {"schema": "pool_d/1", "snapshot": snapshot, "horizon": HORIZON,
             "feeds": dict(sorted(feeds.items())), "series": records}
@@ -183,10 +196,25 @@ def _settle(cfg, boundary, pool_dir, entries, fc, state_path, prior=()):
 
     kw = {"prior_pool_dirs": [Path(p) for p in prior]} if prior else {}
     kw.update(gate_inputs(boundary, H0["digest"]))
-    return settle_lane_d(cfg=cfg, boundary=boundary, pool_dir=pool_dir,
+    return settle_lane_d(**_rev614_ts(settle_lane_d, boundary), cfg=cfg, boundary=boundary, pool_dir=pool_dir,
                          entries=[dict(e) for e in entries], house=dict(H0),
                          forecasts=fc, uid_of=_uids(*entries), state_path=state_path,
                          signer=fixture_key("signer"), **kw)
+
+
+class BrokenChain(dict):
+    """A chain that did not crown where the fixture needs it: every read
+    fails the reading test with the fixture's ``AssertionError``."""
+
+    def __init__(self, why: str):
+        super().__init__()
+        self.why = why
+
+    def __getitem__(self, key):
+        raise AssertionError(self.why)
+
+    def get(self, key, default=None):
+        raise AssertionError(self.why)
 
 
 def build_chain(root: Path, after=None) -> dict:
@@ -203,14 +231,23 @@ def build_chain(root: Path, after=None) -> dict:
     p2 = group("p2", 6, band_start(K1["reveal_ts"]) + DAY)
     p3 = group("p3", 6, band_start(Y["reveal_ts"]))
     p4 = group("p4", 6, band_start(Y["reveal_ts"]) + DAY)
-    plan = ((BOUNDARY_1, p1, [K1]), (BOUNDARY_2, p2, [K1]),
-            (BOUNDARY_3, p3, [K1, Y]), (BOUNDARY_4, p4, [K1, Y]))
+    # rev6.11 (b): a challenger is crowned at its first verdict, so each is
+    # listed from the settlement that crowns it.
+    plan = ((BOUNDARY_1, p1, []), (BOUNDARY_2, p2, [K1]),
+            (BOUNDARY_3, p3, [K1]), (BOUNDARY_4, p4, [K1, Y]))
     for boundary, recs, entries in plan:
         pool = write_pool(root / f"pool-{boundary}", recs, f"w3b3-{boundary}")
         fc = {H0["digest"]: model_forecasts(recs, "bad", "house-0"),
               K1["digest"]: model_forecasts(recs, "fair", "k1"),
               Y["digest"]: model_forecasts(recs, "sharp", "y")}
         s = _settle(cfg, boundary, pool, entries, fc, state)
+        want = {BOUNDARY_2: K1["digest"], BOUNDARY_4: Y["digest"]}.get(boundary)
+        if s.report is None or s.report["crowned"] != want:
+            # Reported inside each test that reads the chain (an assertion in
+            # the test body, not a fixture error).
+            return BrokenChain(f"fixture: boundary {boundary} must crown {want} at the "
+                               f"first verdict (rev6.11 (b)); crowned "
+                               f"{s.report and s.report['crowned']}")
         out[boundary] = (s.report, s.pay)
         if after is not None:
             after(boundary, s.report, s.pay)
@@ -454,3 +491,14 @@ def gate_inputs(boundary, house_digest: str) -> dict:
 
         kw["bench"] = SweepSession(f"w3b3-sess-{int(boundary)}", HealthyBench(house_digest))
     return kw
+
+
+def _rev614_ts(settle, boundary) -> dict:
+    """rev6.14 (a): the fixture's on-chain boundary timestamp (far after every
+    fixture T + eval_delay_hours, 12 s per block), passed only where
+    ``settle_lane_d`` takes it."""
+    import inspect
+
+    if "boundary_ts" not in inspect.signature(settle).parameters:
+        return {}
+    return {"boundary_ts": 2_000_000_000 + 12 * int(boundary)}

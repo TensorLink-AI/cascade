@@ -1,0 +1,23 @@
+# TEMPLATE for the pool_d BUILDER VM only (never the box, never a GPU pod; it
+# holds TSFORGE_S3 read access through its own synced forge mirror): the W1
+# forge-mode measurement that produces laned_readiness/1 (--readiness-out)
+# into the evidence stage. Read-only toward the mirror; it writes only the
+# two stage files. Moving the staged file to the validator host's
+# ${LANED_EVIDENCE_STAGE} is the owner's transport (scp / rsync), then
+# cascade-laned-evidence validates and installs it there.
+
+[Unit]
+Description=cascade lane D readiness re-measure (W1 forge mode, builder VM)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/
+Environment=PYTHONPATH=/root/cascade
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/cascade-laned-jobs.env
+ExecStart=/root/cascade/.venv/bin/python -P /root/cascade/scripts/laned_w1_measure.py --forge-dir ${LANED_FORGE_DIR} --readiness-out ${LANED_EVIDENCE_STAGE}/laned_readiness.json --out ${LANED_EVIDENCE_STAGE}/w1.json
+Nice=19
+NoNewPrivileges=true
+StandardOutput=append:/root/cascade/laned-jobs.log
+StandardError=append:/root/cascade/laned-jobs.log

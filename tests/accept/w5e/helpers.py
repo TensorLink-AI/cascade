@@ -5,15 +5,15 @@ Copied from docs/plans/LANE_D_PLAN.md (rev6) §1.3 "Verdict":
 - The statistic is a paired cluster bootstrap of the CRPS/MASE geomean ratio,
   clusters = source. The challenger wins if `LCB_α ≥ d_margin` and the point
   gain is strictly positive.
-- (rev3) Mandatory confirmation duel. A candidate that clears must clear
-  again on the next disjoint eligible window set (the next freeze of new
-  forward windows, sharing no window with the first) before it's crowned.
-  While confirming, the entry's state is `confirm_pending`.
-- [DECIDE D20]: a king change between first clear and confirmation (house
-  refresh or KING_D change): (a) restart the duel against the new king
-  (first clear discarded; the entry re-freezes against the new king;
-  default `"restart"`); (b) confirm against the king that held at the first
-  clear (`"original"`).
+- (rev6.11 (b), owner 2026-11-23) The confirmation duel is DROPPED: a crown
+  is decided at the FIRST verdict, first clear (max-T LCB against KING_D)
+  ∧ A10 ∧ the §1.3b gate. There is no `confirm` stage, no `confirm_pending`
+  state and no D20 king-change rule; `confirm_on_king_change` is a legacy
+  key, parsed and ignored. The stage leaves the producer, the audit
+  (`cascade/audit/lane_d.py`) and the replay
+  (`cascade/satellite/lane_d_replay.py`) together (PATHS, orchestrator
+  2026-11-23), so the honest first-verdict crowns these fixtures build are
+  audited and replayed as crowns.
 
 §1.3b: one gate suite per crowning, drawn from the settlement boundary's
 block hash over `gate_suites` minus the era's §16 sentinel; paired on one
@@ -68,6 +68,13 @@ GATE_SUITES = ("gift", "boom", "time", "fev")
 BENCH_ITEMS = 40
 
 
+# rev6.18 F4 (A3): these fixtures pin the live-only rule: the public half off
+# (public_weight = 0, a spec setting) and no per-window ratio clamp in effect
+# (a floor far below any fixture ratio), so their pre-F4 numbers stand. F4's
+# own tests (tests/accept/w5e/test_w5e_combined.py) pin the combined rule.
+LIVE_ONLY = {"public_weight": 0.0, "window_ratio_floor": 1e-9}
+
+
 def lane_d_cfg(**over):
     """The real W2 parse of an armed `[lane_d]` table with `over` applied
     (floors lowered to 24 windows / 4 sources; the 0.25 source cap never
@@ -78,7 +85,7 @@ def lane_d_cfg(**over):
            "remainder": "burn", "contexts": [4096, 8192, 16384], "horizon": HORIZON,
            "forward_margin_hours": MARGIN_H, "max_mirror_lag_hours": 6.0,
            "min_windows": 24, "min_clusters": 4, "bootstrap_B": 200}
-    return parse_lane_d({**raw, **over}, era_blocks_at=lambda _block: ERA)
+    return parse_lane_d({**raw, **LIVE_ONLY, **over}, era_blocks_at=lambda _block: ERA)
 
 
 # ── pool_d fixtures ─────────────────────────────────────────────────────────
@@ -128,7 +135,11 @@ def target_values(series_id: str, start: int) -> tuple[np.ndarray, np.ndarray]:
 
 def write_pool(directory: Path, records: list[dict], snapshot: str) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
-    feeds = {r["feed"]: {"mirror_lag_hours": FEED_LAG_HOURS, "forecast_product": False}
+    # rev6.10 (a): every listed feed pins its effective `embargo_hours` (W6b;
+    # W5a fails a feed without it closed). 0 = the rev3 rule, so these
+    # fixtures keep their verdicts under the embargo-aware W5a.
+    feeds = {r["feed"]: {"mirror_lag_hours": FEED_LAG_HOURS, "forecast_product": False,
+                         "embargo_hours": 0.0}
              for r in records}
     meta = {"schema": "pool_d/1", "snapshot": snapshot, "horizon": HORIZON,
             "feeds": dict(sorted(feeds.items())), "series": records}
@@ -238,13 +249,13 @@ def entry_of(report, dg) -> dict:
 
 def settle(cfg, b, pool_dir, entries, house_rec, fc, uid_of, state_path, prior=()):
     """`settle_lane_d` with main's keywords only (no gate inputs): the legacy
-    call. Armed, it may only be used where no member reaches a confirming
-    clear (RV5: an armed crowning without the gate inputs is `bench_hold`);
+    call. Armed, it may only be used where no member clears (rev6.11: a
+    first clear is a crowning candidate; RV5: an armed crowning without the gate inputs is `bench_hold`);
     unarmed it returns `report=None, pay=None` as on main."""
     from cascade.validator.lane_d import settle_lane_d
 
     kw = {"prior_pool_dirs": [Path(p) for p in prior]} if prior else {}
-    return settle_lane_d(cfg=cfg, boundary=b, pool_dir=pool_dir,
+    return settle_lane_d(**_rev614_ts(settle_lane_d, b), cfg=cfg, boundary=b, pool_dir=pool_dir,
                          entries=[dict(e) for e in entries], house=dict(house_rec),
                          forecasts=fc, uid_of=dict(uid_of), state_path=state_path,
                          signer=fixture_key("signer"), **kw)
@@ -265,7 +276,7 @@ def settle_gated(cfg, b, pool_dir, entries, house_rec, fc, uid_of, state_path, *
     assert not missing, (f"settle_lane_d takes no {missing}: the W3b gate is not wired into "
                          "the settlement (W5e)")
     kw = {"prior_pool_dirs": [Path(p) for p in prior]} if prior else {}
-    return settle_lane_d(cfg=cfg, boundary=b, pool_dir=pool_dir,
+    return settle_lane_d(**_rev614_ts(settle_lane_d, b), cfg=cfg, boundary=b, pool_dir=pool_dir,
                          entries=[dict(e) for e in entries], house=dict(house_rec),
                          forecasts=fc, uid_of=dict(uid_of), state_path=state_path,
                          signer=fixture_key("signer"), boundary_block_hash=hash_,
@@ -371,3 +382,14 @@ def expected_gate_record(cfg, b: int, hash_: str, sentinel=None) -> dict:
     from cascade.validator.lane_d_gate import gate_record
 
     return gate_record(cfg, int(b), hash_, sentinel=sentinel)
+
+
+def _rev614_ts(settle, boundary) -> dict:
+    """rev6.14 (a): the fixture's on-chain boundary timestamp (far after every
+    fixture T + eval_delay_hours, 12 s per block), passed only where
+    ``settle_lane_d`` takes it."""
+    import inspect
+
+    if "boundary_ts" not in inspect.signature(settle).parameters:
+        return {}
+    return {"boundary_ts": 2_000_000_000 + 12 * int(boundary)}

@@ -10,6 +10,9 @@ Copied from docs/plans/LANE_D_PLAN.md (rev6; rev6.2 item (e), PR #636):
   statuses / `closed_era`, open disputes) is produced by W17."
 - §11.3 Support: "`status/lane_d.json` shows each pending entry's
   eligible-window progress against the floors."
+- rev6.10 (a) / rev6.12 (a): the fixture feeds (W7c's chain) pin
+  `embargo_hours = 48`, so progress counts embargo windows (data time in
+  `(b - e, b]`, released after `b`) as well as fresh ones.
 - §1.3b Progress board: "every king's suite numbers (gate and the era's
   sentinel, suite named) go into the signed lane D index (§11.1) and
   `status/lane_d.json`." §16 rule 4 / W-S3: "W17 should embed
@@ -62,7 +65,9 @@ KING_KEYS = {"digest", "hotkey", "house", "since_boundary", "tenure_blocks"}
 DOC_KEYS = {"schema", "lane", "block", "era", "boundary", "reason_enum", "floors", "king",
             "house", "prior_kings", "queue", "board", "sentinel"}
 BOARD_KEYS = {"boundary", "crowned", "judged", "skipped", "verdicts", "gate"}
-VERDICT_KEYS = {"digest", "king_digest", "stage", "outcome", "lcb", "gain"}
+# rev6.18 A8 (F4): the board also shows each verdict's per-half and per-source
+# point gains (`halves`, `sources`).
+VERDICT_KEYS = {"digest", "king_digest", "stage", "outcome", "lcb", "gain", "halves", "sources"}
 WALL_CLOCK_KEYS = ("as_of", "generated_at", "timestamp", "updated_at", "published_at")
 LEDGER_KEYS = {"schema", "era", "entries", "disputes"}
 LEDGER_ENTRY_KEYS = {"hotkey", "digest", "status", "closed_era"}
@@ -121,11 +126,16 @@ def _shipped() -> str:
     return (REPO / "chain.toml").read_text(encoding="utf-8")
 
 
+# rev6.18 A3 (F4): the W7c fixture scores the live half only. Stated here,
+# not read from w7c.helpers, so a BASE run (this WP's dir over a main without
+# F4) still collects and fails on the F4 assertions.
+LIVE_ONLY = {"public_weight": 0.0, "window_ratio_floor": 1e-9}
+
 ARMED_LANE_D = {"from_block": ARM_BLOCK, "share": 0.25, "takes_from": "lane_a",
                 "remainder": "burn", "contexts": [4096, 8192, 16384],
                 "horizon": w7c.HORIZON, "forward_margin_hours": w7c.MARGIN_H,
                 "max_mirror_lag_hours": 6.0, "min_windows": 24, "min_clusters": 4,
-                "bootstrap_B": 200}
+                "bootstrap_B": 200, **LIVE_ONLY}
 
 
 def chain_cfg(*, armed: bool = True, sentinel: bool = False, **lane_over):
@@ -251,7 +261,7 @@ class Fixture:
         kw = {}
         if snapshot > 1:
             kw["prior_pool_dirs"] = list(self.pools[:snapshot - 1])
-        return settle_lane_d(cfg=cfg.lane_d, boundary=boundary, pool_dir=self.pools[snapshot - 1],
+        return settle_lane_d(**_rev614_ts(settle_lane_d, boundary), cfg=cfg.lane_d, boundary=boundary, pool_dir=self.pools[snapshot - 1],
                              entries=[dict(e) for e in entries], house=dict(self.house),
                              forecasts=self.forecasts, uid_of=dict(self.uid_of),
                              state_path=state_path, signer=self.signer,
@@ -272,24 +282,26 @@ def read_report(state_path: Path, boundary: int) -> dict:
 
 def rich_b1(root: Path) -> dict:
     """The queue scenario: every fixture entry revealed before B1, settled
-    once at B1 with ``max_judged_per_coldkey_per_settlement = 1``."""
+    once at B1 with ``max_judged_per_coldkey_per_settlement = 1``. The bench
+    pod is down, so X's first clear (the crowning candidate, rev6.11 (b)) is
+    held open: ``hold`` / ``bench_hold``."""
     fx = Fixture(root)
     cfg = chain_cfg(max_judged_per_coldkey_per_settlement=1)
     sp = fx.state_path("rich")
     s = fx.settle(cfg=cfg, boundary=B1, snapshot=1, state_path=sp, tag="rich",
-                  entries=[fx.x, fx.y, fx.z, fx.l, fx.e, fx.d])
+                  entries=[fx.x, fx.y, fx.z, fx.l, fx.e, fx.d], host=DownHost())
     return {"fx": fx, "cfg": cfg, "state_path": sp, "state": read_state(sp),
             "report": s.report, "reports": [read_report(sp, B1)]}
 
 
 def crowned(root: Path) -> dict:
-    """The king scenario: X and L at B1 (X first clear, L lost), then X
-    confirmed and crowned at B2_NEXT_ERA (the next era) on snapshot 2."""
+    """The king scenario: L at B1 (lost), then X listed and crowned at its
+    first verdict at B2_NEXT_ERA (the next era) on snapshot 2 (rev6.11 (b))."""
     fx = Fixture(root)
     cfg = chain_cfg()
     sp = fx.state_path("crowned")
     s1 = fx.settle(cfg=cfg, boundary=B1, snapshot=1, state_path=sp, tag="crowned",
-                   entries=[fx.x, fx.l])
+                   entries=[fx.l])
     st1 = read_state(sp)
     s2 = fx.settle(cfg=cfg, boundary=B2_NEXT_ERA, snapshot=2, state_path=sp, tag="crowned",
                    entries=[fx.x, fx.l])
@@ -299,12 +311,12 @@ def crowned(root: Path) -> dict:
 
 
 def held(root: Path) -> dict:
-    """The bench-hold scenario: X first clear at B1, then confirmed at B2
-    with the bench pod down: ``confirm_pending`` / ``bench_hold``."""
+    """The bench-hold scenario: B1 lists no entry; X's first clear at B2
+    with the bench pod down is held: ``hold`` / ``bench_hold`` (rev6.11 (b))."""
     fx = Fixture(root)
     cfg = chain_cfg()
     sp = fx.state_path("held")
-    fx.settle(cfg=cfg, boundary=B1, snapshot=1, state_path=sp, tag="held", entries=[fx.x])
+    fx.settle(cfg=cfg, boundary=B1, snapshot=1, state_path=sp, tag="held", entries=[])
     s2 = fx.settle(cfg=cfg, boundary=B2, snapshot=2, state_path=sp, tag="held",
                    entries=[fx.x], host=DownHost())
     return {"fx": fx, "cfg": cfg, "state_path": sp, "state": read_state(sp),
@@ -367,3 +379,14 @@ def all_keys(obj) -> set[str]:
         for v in obj:
             out |= all_keys(v)
     return out
+
+
+def _rev614_ts(settle, boundary) -> dict:
+    """rev6.14 (a): the fixture's on-chain boundary timestamp (far after every
+    fixture T + eval_delay_hours, 12 s per block), passed only where
+    ``settle_lane_d`` takes it."""
+    import inspect
+
+    if "boundary_ts" not in inspect.signature(settle).parameters:
+        return {}
+    return {"boundary_ts": 2_000_000_000 + 12 * int(boundary)}

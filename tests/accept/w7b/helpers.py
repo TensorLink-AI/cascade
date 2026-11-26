@@ -69,12 +69,12 @@ ARMED = {
 }
 # W5a fails closed: a feed missing from `feeds` is `unlisted_feed`, so every
 # feed the series name is listed (as in tests/accept/w7a/helpers.py).
-FEEDS = {"feed-a": {"mirror_lag_hours": 1.5, "forecast_product": False},
-         "src1": {"mirror_lag_hours": None, "forecast_product": False},
-         "src2": {"mirror_lag_hours": 1.0, "forecast_product": False},
-         "src3": {"mirror_lag_hours": None, "forecast_product": False},
-         "src4": {"mirror_lag_hours": 1.0, "forecast_product": False},
-         "src5": {"mirror_lag_hours": 1.0, "forecast_product": False}}
+FEEDS = {"feed-a": {"mirror_lag_hours": 1.5, "forecast_product": False, "embargo_hours": 0.0},
+         "src1": {"mirror_lag_hours": None, "forecast_product": False, "embargo_hours": 0.0},
+         "src2": {"mirror_lag_hours": 1.0, "forecast_product": False, "embargo_hours": 0.0},
+         "src3": {"mirror_lag_hours": None, "forecast_product": False, "embargo_hours": 0.0},
+         "src4": {"mirror_lag_hours": 1.0, "forecast_product": False, "embargo_hours": 0.0},
+         "src5": {"mirror_lag_hours": 1.0, "forecast_product": False, "embargo_hours": 0.0}}
 # W5a fails closed on a missing `frontier` too (`absent_from_s0`), so every
 # series records its S0 as one `[as_of_ts, end_ts]` frontier record: S0 was
 # taken 3 h before the snapshot's first target (after the bound, T0 + 6 h)
@@ -137,10 +137,17 @@ def raw_verify(ss58: str, message: bytes, signature_hex: str) -> bool:
     return verify_hotkey(ss58, message, signature_hex)
 
 
+# rev6.18 F4 (A3): these fixtures pin the live-only rule: the public half off
+# (public_weight = 0, a spec setting) and no per-window ratio clamp in effect
+# (a floor far below any fixture ratio), so their pre-F4 numbers stand. F4's
+# own tests (tests/accept/w5e/test_w5e_combined.py) pin the combined rule.
+LIVE_ONLY = {"public_weight": 0.0, "window_ratio_floor": 1e-9}
+
+
 def lane_d_cfg(**over):
     from cascade.shared.config.lane_d import parse_lane_d
 
-    return parse_lane_d({**ARMED, **over}, era_blocks_at=lambda _block: ERA)
+    return parse_lane_d({**ARMED, **LIVE_ONLY, **over}, era_blocks_at=lambda _block: ERA)
 
 
 def _quantiles_around(median: np.ndarray, spread: float) -> np.ndarray:
@@ -228,7 +235,7 @@ def signed_report(tmp: Path) -> dict:
         state = tmp / "state" / "lane_d_state.json"
         state.parent.mkdir(parents=True, exist_ok=True)
         cfg = lane_d_cfg()
-        s = settle_lane_d(cfg=cfg, boundary=BOUNDARY_1, pool_dir=pool, entries=[e],
+        s = settle_lane_d(**_rev614_ts(settle_lane_d, BOUNDARY_1), cfg=cfg, boundary=BOUNDARY_1, pool_dir=pool, entries=[e],
                           house={"digest": house, "reveal_ts": HOUSE_T}, forecasts=fc,
                           uid_of={hotkey: CHALLENGER_UID}, state_path=state, signer=signer)
         _CACHE[key] = {"report": s.report, "signer": signer, "other": other, "cfg": cfg}
@@ -303,3 +310,14 @@ def chain_raw(validator_hotkey: str) -> dict:
     if validator_hotkey.strip():
         raw.setdefault("netconfig", {})["owner_hotkey"] = validator_hotkey
     return raw
+
+
+def _rev614_ts(settle, boundary) -> dict:
+    """rev6.14 (a): the fixture's on-chain boundary timestamp (far after every
+    fixture T + eval_delay_hours, 12 s per block), passed only where
+    ``settle_lane_d`` takes it."""
+    import inspect
+
+    if "boundary_ts" not in inspect.signature(settle).parameters:
+        return {}
+    return {"boundary_ts": 2_000_000_000 + 12 * int(boundary)}

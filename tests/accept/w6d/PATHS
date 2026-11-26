@@ -1,0 +1,7 @@
+# W6d pool_d pinning on Hippius, digests, retention, 3-hourly cadence (plan
+# §3.0 W6d row rev6.10/rev6.11, §1.7 "Build host", rev6.11 (d); README.md has
+# the contract).
+# Publish (builder), pin sync (box), history fetch (eval host), retention,
+# the cadence and build-wall check, the Hippius / filesystem stores and the CLI
+# (the owner's live run writes evidence/w6d.json with it).
+cascade/pool/pool_d_publish.py

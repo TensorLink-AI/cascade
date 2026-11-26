@@ -38,6 +38,13 @@ W7c pins the file and the digests a settlement's receipt binds:
   persisted report only once :func:`check_persisted_report` accepts it
   (pinned signer ``report_unverified``; boundary and bound prior digest
   ``report_conflict``); it never re-sweeps the bench (RV7 B1).
+- W14 (the lane D-only fast kill): a settlement with no lane D report (the
+  operator stopped reports, or the settlement could not run) carries the
+  absent record (:func:`make_absent_receipt`): ``status`` ``"absent"``
+  (MarketCast's ``REPORT_ABSENT``), a typed ``reason`` in
+  :data:`ABSENT_REASONS` and ONE state digest (prior == posterior: nothing
+  moves). A record is absent-kind iff it has a ``status`` key; the present
+  record keeps its five W7c keys. Both kinds chain under the same rules.
 
 No migration from the pre-W7c layout (``indent=1``, a signature in
 ``last_report``): lane D has never been armed on any deployment
@@ -56,6 +63,7 @@ import sys
 from pathlib import Path
 
 from ..shared.atomic import write_text_atomic
+from ..shared.marketcast_report import INFRA_DEFERRED, REPORT_ABSENT
 from . import lane_d_report
 
 STATE_SCHEMA = "lane-d-state/1"
@@ -83,15 +91,30 @@ PRIOR_STATE_EXTENSION = "prior_state_sha256"
 # KING_D (absent otherwise, so a state with no house challenger keeps its
 # pre-W5f bytes).
 HOUSE_ENTRY_KEY = "house_entry"
+# rev6.23: the state key of KING_D's tenure, the lane D settlements it has held
+# the crown before the next one (the crown bar's input). Written by every
+# settlement; absent at genesis (so the genesis bytes are unchanged) = 0.
+KING_TENURE_KEY = "king_tenure"
 # A persisted report's file name under ``report_path``'s directory.
 _REPORT_NAME = re.compile(r"lane_d_report_([0-9]+)\.json")
 RECEIPT_ERROR_CODES = ("not_object", "unknown_schema", "missing_field", "unknown_field",
                        "bad_value", "boundary_mismatch", "report_mismatch", "state_mismatch",
-                       "boundary_order", "chain_break")
+                       "boundary_order", "chain_break",
+                       # W14: an absent record whose posterior is not its prior,
+                       # or one checked against a report for its boundary
+                       "absent_state_change", "absent_with_report")
 # The lane D receipt record, exactly these keys (README W7c "The receipt record").
 RECEIPT_FIELDS = ("schema", "boundary", "prior_state_sha256", "posterior_state_sha256",
                   "report_sha256")
 _RECEIPT_DIGESTS = ("prior_state_sha256", "posterior_state_sha256", "report_sha256")
+# W14 (Proposed design change 4): the absent record, exactly these keys.
+ABSENT_STATUS = REPORT_ABSENT
+# ``report_absent``: no lane D report was produced or published (the
+# stop-publishing kill); ``infra_deferred``: the settlement could not run.
+ABSENT_REASONS = ("report_absent", INFRA_DEFERRED)
+ABSENT_FIELDS = ("schema", "status", "boundary", "reason", "prior_state_sha256",
+                 "posterior_state_sha256")
+_ABSENT_DIGESTS = ("prior_state_sha256", "posterior_state_sha256")
 _HEX = frozenset("0123456789abcdef")
 
 
@@ -364,14 +387,38 @@ def house_entry(house: dict) -> dict:
             "confirm": None, "frozen_set": None}
 
 
+CONFIRM_MIGRATION_TAG = "confirm_state_migrated"
+CONFIRM_MIGRATION_EXTENSION = "confirm_state_migration"
+LEGACY_CONFIRM_STATUS = "confirm_pending"
+
+
+def migrate_confirm_pending(state: dict) -> list[str]:
+    """W7c (plan rev6.11 (b); orchestrator decision 2026-11-23): a testnet
+    state written by the old code may hold entries in ``confirm_pending`` (a
+    first clear waiting for its confirmation duel, which no longer exists).
+    The legacy ``confirm`` record carries no first-clear LCB, so the entry is
+    never a crown candidate: whatever king it names, it becomes ``pending`` /
+    ``pending_floor`` with its ``confirm`` record and frozen set dropped and
+    its ``used_windows`` kept (never re-judged on them). Mutates ``state``;
+    returns the migrated digests, sorted (empty: nothing to migrate). Lane D
+    was never armed on mainnet, so only testnet state is touched."""
+    out: list[str] = []
+    for dg, rec in sorted(state.get("entries", {}).items()):
+        if isinstance(rec, dict) and (rec.get("status") == LEGACY_CONFIRM_STATUS
+                                      or rec.get("reason") == LEGACY_CONFIRM_STATUS):
+            rec.update(status="pending", reason="pending_floor", confirm=None, frozen_set=None)
+            out.append(str(dg))
+    return out
+
+
 def refresh_house(state: dict, house: dict) -> None:
     """§1.4: the house follows lane A's king digest. While the house holds
     KING_D the throne moves with it in place (no duel; ``prior_kings`` is
-    untouched and the old house is never a prior king). A miner KING_D keeps
-    its throne and the new house enters as a challenger: its entry record is
-    :data:`HOUSE_ENTRY_KEY` (replacing an older house's), unless its digest
-    is KING_D's or a prior king's (it is already judged as that). Re-applying
-    the same pointer changes nothing."""
+    untouched and the old house is never a prior king). Owner 2026-11-24
+    (DEC-CA-0076): the house is the bar for lane D's genesis only — once a
+    miner holds KING_D the house is gone from the competition: a new house
+    pointer is recorded and enters NO challenger (no house entry, no
+    retake). Re-applying the same pointer changes nothing."""
     h = {"digest": str(house["digest"]), "reveal_ts": int(house["reveal_ts"])}
     if state["house"]["digest"] == h["digest"]:
         return
@@ -379,10 +426,6 @@ def refresh_house(state: dict, house: dict) -> None:
     state.pop(HOUSE_ENTRY_KEY, None)
     if state["king"].get("house"):
         state["king"] = {**h, "hotkey": None, "house": True}
-        return
-    known = {state["king"]["digest"], *(p["digest"] for p in state["prior_kings"])}
-    if h["digest"] not in known:
-        state[HOUSE_ENTRY_KEY] = house_entry(h)
 
 
 # ── the persisted report ────────────────────────────────────────────────────
@@ -472,10 +515,55 @@ def _signed_by(report: dict, signer_ss58: str) -> bool:
 # ── the receipt record ──────────────────────────────────────────────────────
 
 
+def is_absent_receipt(receipt) -> bool:
+    """True when ``receipt`` is absent-kind: an object with a ``status`` key
+    (W14). A present record (W7c) has no ``status``."""
+    return isinstance(receipt, dict) and "status" in receipt
+
+
+def _check_boundary(receipt, where: str) -> None:
+    b = receipt["boundary"]
+    if isinstance(b, bool) or not isinstance(b, int) or b < 0:
+        raise LaneDReceiptError("bad_value", f"{where}: boundary {b!r} is not a "
+                                "non-negative int")
+
+
+def _check_absent(receipt: dict, where: str) -> dict:
+    missing = [k for k in ABSENT_FIELDS if k not in receipt]
+    if missing:
+        raise LaneDReceiptError("missing_field", f"{where}: missing {missing}")
+    extra = sorted(str(k) for k in receipt if k not in ABSENT_FIELDS)
+    if extra:
+        raise LaneDReceiptError("unknown_field", f"{where}: unknown fields {extra}")
+    if receipt["schema"] != RECEIPT_SCHEMA:
+        raise LaneDReceiptError("unknown_schema", f"{where}: receipt schema "
+                                f"{receipt['schema']!r} is not {RECEIPT_SCHEMA}")
+    if receipt["status"] != ABSENT_STATUS:
+        raise LaneDReceiptError("bad_value", f"{where}: status {receipt['status']!r} is "
+                                f"not {ABSENT_STATUS!r}")
+    reason = receipt["reason"]
+    if not isinstance(reason, str) or reason not in ABSENT_REASONS:
+        raise LaneDReceiptError("bad_value", f"{where}: reason {reason!r} is not one of "
+                                f"{list(ABSENT_REASONS)}")
+    _check_boundary(receipt, where)
+    for k in _ABSENT_DIGESTS:
+        if not _is_hex64(receipt[k]):
+            raise LaneDReceiptError("bad_value", f"{where}: {k} {receipt[k]!r} is not "
+                                    "64 lower-case hex")
+    if receipt["prior_state_sha256"] != receipt["posterior_state_sha256"]:
+        raise LaneDReceiptError("absent_state_change", f"{where}: an absent settlement "
+                                f"moves no state, but its prior "
+                                f"{receipt['prior_state_sha256']} != its posterior "
+                                f"{receipt['posterior_state_sha256']}")
+    return receipt
+
+
 def _check_receipt(receipt, where: str) -> dict:
     if not isinstance(receipt, dict):
         raise LaneDReceiptError("not_object", f"{where}: not an object "
                                 f"({type(receipt).__name__})")
+    if is_absent_receipt(receipt):
+        return _check_absent(receipt, where)
     missing = [k for k in RECEIPT_FIELDS if k not in receipt]
     if missing:
         raise LaneDReceiptError("missing_field", f"{where}: missing {missing}")
@@ -485,10 +573,7 @@ def _check_receipt(receipt, where: str) -> dict:
     if receipt["schema"] != RECEIPT_SCHEMA:
         raise LaneDReceiptError("unknown_schema", f"{where}: receipt schema "
                                 f"{receipt['schema']!r} is not {RECEIPT_SCHEMA}")
-    b = receipt["boundary"]
-    if isinstance(b, bool) or not isinstance(b, int) or b < 0:
-        raise LaneDReceiptError("bad_value", f"{where}: boundary {b!r} is not a "
-                                "non-negative int")
+    _check_boundary(receipt, where)
     for k in _RECEIPT_DIGESTS:
         if not _is_hex64(receipt[k]):
             raise LaneDReceiptError("bad_value", f"{where}: {k} {receipt[k]!r} is not "
@@ -506,14 +591,48 @@ def make_receipt(*, boundary: int, prior_state_sha256: str, posterior_state_sha2
     return dict(_check_receipt(receipt, "make_receipt"))
 
 
+def make_absent_receipt(*, boundary: int, state_sha256: str, reason: str) -> dict:
+    """The W14 absent record of a settlement with no lane D report
+    (structure-checked): ``state_sha256`` is the digest of the state as
+    loaded, both its prior and its posterior (an absent settlement moves no
+    lane D state); ``reason`` is one of :data:`ABSENT_REASONS`."""
+    receipt = {"schema": RECEIPT_SCHEMA, "status": ABSENT_STATUS, "boundary": boundary,
+               "reason": reason, "prior_state_sha256": state_sha256,
+               "posterior_state_sha256": state_sha256}
+    return dict(_check_receipt(receipt, "make_absent_receipt"))
+
+
+def _check_posterior(receipt: dict, state) -> None:
+    if state is None:
+        return
+    try:
+        got = state_digest(state)
+    except (TypeError, ValueError) as e:
+        raise LaneDReceiptError("state_mismatch", f"state is not canonical JSON: {e}"
+                                ) from e
+    if got != receipt["posterior_state_sha256"]:
+        raise LaneDReceiptError("state_mismatch", f"state digest {got} != receipt "
+                                f"posterior {receipt['posterior_state_sha256']}")
+
+
 def verify_receipt(receipt, *, report, state=None) -> None:
     """Refuse (``LaneDReceiptError``) unless, in order: the receipt is well
     formed; ``report["boundary"]`` is the receipt's (an old report replayed at
     a later settlement is ``boundary_mismatch``); the report's canonical body
     hashes to ``report_sha256`` (``report_mismatch``); and, when ``state`` is
     given, it hashes to ``posterior_state_sha256`` (``state_mismatch``). The
-    report's signature is W7b's ``verify_report``, not checked here."""
+    report's signature is W7b's ``verify_report``, not checked here.
+
+    An absent record (W14) has no report: ``report`` must be ``None``
+    (``absent_with_report``: any report for the boundary contradicts it),
+    then ``state``, when given, is checked as above."""
     _check_receipt(receipt, "receipt")
+    if is_absent_receipt(receipt):
+        if report is not None:
+            raise LaneDReceiptError("absent_with_report", f"an absent record at boundary "
+                                    f"{receipt['boundary']} is contradicted by a report")
+        _check_posterior(receipt, state)
+        return
     rb = report.get("boundary") if isinstance(report, dict) else None
     if isinstance(rb, bool) or not isinstance(rb, int) or rb != receipt["boundary"]:
         raise LaneDReceiptError("boundary_mismatch", f"report boundary {rb!r} != receipt "
@@ -526,22 +645,15 @@ def verify_receipt(receipt, *, report, state=None) -> None:
     if got != receipt["report_sha256"]:
         raise LaneDReceiptError("report_mismatch", f"report body sha256 {got} != receipt "
                                 f"report_sha256 {receipt['report_sha256']}")
-    if state is not None:
-        try:
-            got = state_digest(state)
-        except (TypeError, ValueError) as e:
-            raise LaneDReceiptError("state_mismatch", f"state is not canonical JSON: {e}"
-                                    ) from e
-        if got != receipt["posterior_state_sha256"]:
-            raise LaneDReceiptError("state_mismatch", f"state digest {got} != receipt "
-                                    f"posterior {receipt['posterior_state_sha256']}")
+    _check_posterior(receipt, state)
 
 
 def verify_receipt_chain(receipts) -> None:
     """Refuse (``LaneDReceiptError``) unless every receipt is well formed, the
     boundaries strictly increase (``boundary_order``) and every prior digest
     is the previous receipt's posterior (``chain_break``: a dropped receipt or
-    a state file edited between two settlements)."""
+    a state file edited between two settlements). Present and absent (W14)
+    records mix under the same rules."""
     if isinstance(receipts, dict | str | bytes) or not hasattr(receipts, "__iter__"):
         raise LaneDReceiptError("not_object", "receipts must be a sequence of receipts")
     seq = list(receipts)
@@ -558,12 +670,15 @@ def verify_receipt_chain(receipts) -> None:
                                     f"{a['posterior_state_sha256']}")
 
 
-__all__ = ["ENTRY_REASONS", "ENTRY_STATUSES", "HOUSE_ENTRY_KEY", "PRIOR_STATE_EXTENSION",
+__all__ = ["ABSENT_FIELDS", "ABSENT_REASONS", "ABSENT_STATUS",
+           "CONFIRM_MIGRATION_EXTENSION", "CONFIRM_MIGRATION_TAG", "ENTRY_REASONS", "ENTRY_STATUSES",
+           "HOUSE_ENTRY_KEY", "KING_TENURE_KEY", "LEGACY_CONFIRM_STATUS", "PRIOR_STATE_EXTENSION",
            "RECEIPT_ERROR_CODES",
            "RECEIPT_FIELDS", "RECEIPT_SCHEMA", "STATE_ERROR_CODES", "STATE_ONLY_REASONS",
            "STATE_SCHEMA", "LaneDReceiptError", "LaneDStateError", "bound_prior_state",
            "canonical_state", "check_persisted_report", "genesis", "house_entry",
-           "load_prior_state", "load_report_file", "load_state", "make_receipt",
+           "is_absent_receipt", "load_prior_state", "load_report_file", "load_state",
+           "make_absent_receipt", "make_receipt",
            "persisted_report_boundaries", "refresh_house", "report_digest", "report_path",
            "restore_state", "save_report_file", "save_state", "state_digest",
            "verify_receipt", "verify_receipt_chain"]

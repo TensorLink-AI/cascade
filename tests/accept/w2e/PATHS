@@ -1,0 +1,14 @@
+# W2e [lane_d] keys added by plan rev6.9 / rev6.10 / rev6.11 (§3.0 W2e row,
+# rev6.10 (a)/(b), rev6.11 (a)/(e), rev6.9 (a) loader check; README.md has the
+# contract).
+# The parser: the five keys, their ranges and the cross-key checks.
+cascade/shared/config/lane_d.py
+cascade/shared/config/loader.py
+# Overlay-settable lane D tuning (§14.2): ALLOWED / check_overrides /
+# validate_overlay re-run the cross-key checks at overlay adoption.
+cascade/shared/netconfig.py
+# [lane_d] defaults only; from_block stays 0 (nothing armed).
+chain.toml
+chain.testnet.toml
+# rev6.18 D24 (F4): the retired backtest keys leave the W-OV overlay envelope.
+cascade/shared/netconfig_bounds.py

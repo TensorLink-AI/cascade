@@ -107,3 +107,44 @@ def build_intake_headers(action, hotkey, ref, api_key, sign_fn, *, now=None,
     if label:
         headers[LABEL_HEADER] = label
     return headers
+
+
+REDACTED = "[redacted]"
+
+
+def credential_secrets(api_key: str) -> tuple[str, ...]:
+    """Every secret string inside ``api_key``: the value itself and, for a
+    provider bundle, each provider key in it (longest first)."""
+    if not api_key:
+        return ()
+    found = {api_key}
+    from ..funding.providers import decode_credentials
+
+    try:
+        decoded = decode_credentials(api_key)
+    except (TypeError, ValueError):
+        decoded = ()  # a bundle that does not decode still has its whole value redacted
+    found.update(c.api_key for c in decoded if c.api_key)
+    return tuple(sorted(found, key=len, reverse=True))
+
+
+def redact_secrets(value, api_key: str):
+    """``value`` (an intake reply: dicts, lists, strings) with every secret of
+    ``api_key`` replaced by :data:`REDACTED`, so a reply that echoes the
+    provider key is never printed with it."""
+    secrets = credential_secrets(api_key)
+    if not secrets:
+        return value
+
+    def scrub(v):
+        if isinstance(v, str):
+            for s in secrets:
+                v = v.replace(s, REDACTED)
+            return v
+        if isinstance(v, dict):
+            return {scrub(k): scrub(x) for k, x in v.items()}
+        if isinstance(v, list | tuple):
+            return [scrub(x) for x in v]
+        return v
+
+    return scrub(value)

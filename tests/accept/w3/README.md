@@ -139,6 +139,28 @@ Resubmits:
 - While the hotkey has an open entry, a new submit is
   `409 hotkey_entry_open` (T6).
 
+## Contexts (rev6.6, owner 2026-11-23)
+
+`test_w3_contexts.py`. `[lane_d] contexts` is the set a miner may declare.
+Since rev6.6 its default lists every variant,
+`[4096, 8192, 16384, 32768, 65536, 131072]` (W2).
+
+- A context in `cfg.contexts` is accepted at submit and at ready, whether or
+  not the variant is armed. Arming is computed per settlement by the main
+  validator (W5d `armed_record`, recorded by W7a), not by the intake. An
+  entry that declares an unarmed variant is scored at the highest armed
+  variant **below its declared context** until its own variant arms; with no
+  armed variant ≤ the declared context it is not scored that settlement
+  (`pending` / `context_below_armed`, plan rev6.15) and never above it. The ready record and the commit payload
+  keep the **declared** context.
+- A context not in `cfg.contexts` is still refused at submit with
+  `400 context_not_armed`. The code keeps its historical name; it means "not
+  a declarable context". Nothing is minted.
+- The default-config test fails on a main whose W2 default is still the
+  three launch contexts (an `AssertionError` on `cfg.contexts`). It passes once
+  W2's rev6.6 default lands, with no W3 code change. The other two tests pass
+  on main.
+
 ## Dedup (before any eval spend)
 
 Dedup is by the manifest's `weights.safetensors` sha256:
@@ -153,13 +175,24 @@ Dedup is by the manifest's `weights.safetensors` sha256:
 - An expired entry's weights no longer block.
 - If `published_weights()` fails, the answer is `503 dedup_unavailable`.
 
+The registry file (`<state-dir>/published_weights.json`,
+`{"schema": "lane-d-published-weights/1", "weights_sha256": [...]}`) is
+written by `python -P -m cascade.lane_d.published_weights`
+(`test_w3_published_weights.py`). It uses published sources only. Lane D kings
+come from the signed `champions/lane_d/index.json`, checked against the pinned
+signer, with each king's mirror `manifest.json` re-hashed to the signed
+digest. Lane A legs and kings, and the house, come from checkpoint directories
+fetched from their published refs. The write is atomic, and shas already in
+the file are kept (`--replace` drops them). A source that fails to verify, or
+an existing file that is not a registry, means nothing is written.
+
 ## Ready
 
 The body is `{"licence": <id>, "attestation": <text>}`; unparseable is
 `400 bad_body`. The steps, in order:
 
 1. **B13 licence attestation.** The licence must be one of
-   `service.LICENCES == ("Apache-2.0", "OpenMDW-1.1")` (D13), else
+   `service.LICENCES == ("MIT",)` (D13), else
    `400 licence_not_open`. The attestation must be exactly
    `service.LICENCE_ATTESTATION`, else `400 licence_attestation_missing`.
    That's one statement of at least 80 characters naming both licences,
@@ -244,6 +277,31 @@ entry. A failed `reveal_block` read never expires an entry; the answer is
   `context`, `coldkey_at_ready`, `ready_block`, `ready_expires_block`,
   `weights_sha256`, `licence` and `licence_attestation_sha256`. Ready-time
   fields are `null` before ready.
+- Background refresh (#842, testnet 2026-11-24): the validator reads the
+  file directly, so `ready → revealed` / `ready → ready_expired` must land
+  without traffic. `LaneDIntake.tick()` runs the request-path refresh under
+  the request lock (same atomic write; a failed chain read or write is
+  logged and returns `None`, nothing changes).
+  `LaneDIntake.refresh_timer(interval_s=None, *, wait=None)` returns a
+  `service.RefreshTimer` ticking every `[lane_d_ops] queue_poll_seconds`
+  (`run()` ticks first, then `wait(interval)`; `True` ends the loop;
+  `start()` / `stop()` run it on a daemon thread; a tick never kills the
+  loop). `main()` ticks once at startup, then starts the timer.
+  Tests: `test_w3_refresh_timer.py`.
+
+## Kill switch (#931)
+
+`[lane_d] until_block` in the config IN FORCE at the chain head (the static
+`[lane_d]`, or `cfg_at(head)`: `cascade.lane_d.main.LaneDView` over the
+read-only `NetConfigResolver`, so an adopted overlay kill applies with no
+restart) closes the intake once the head reaches it. A new submit, and a
+ready that would open an entry, answer `409 lane_ended` with `until_block`;
+nothing is stored and no grant is minted. Rows already in the queue are not
+rewritten: the validator reads the queue file. Before the end, or with no
+end, nothing changes. An unreadable view keeps the static `[lane_d]`.
+
+Tests: `test_w3_lane_ended.py` (on main they fail on the missing
+`lane_ended` refusal code or the missing `LaneDView`).
 
 ## Secrets
 

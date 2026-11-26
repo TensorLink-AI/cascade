@@ -60,6 +60,13 @@ SCORING_LEVELS = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
 _Z = tuple(NormalDist().inv_cdf(level) for level in SCORING_LEVELS)
 
 
+# rev6.18 F4 (A3): these fixtures pin the live-only rule: the public half off
+# (public_weight = 0, a spec setting) and no per-window ratio clamp in effect
+# (a floor far below any fixture ratio), so their pre-F4 numbers stand. F4's
+# own tests (tests/accept/w5e/test_w5e_combined.py) pin the combined rule.
+LIVE_ONLY = {"public_weight": 0.0, "window_ratio_floor": 1e-9}
+
+
 def lane_d_cfg(**over):
     """The real W2 parse of an armed `[lane_d]` table with `over` applied.
     Floors are lowered so small fixtures can meet them (24 windows, 4
@@ -71,7 +78,7 @@ def lane_d_cfg(**over):
            "remainder": "burn", "contexts": [4096, 8192, 16384], "horizon": HORIZON,
            "forward_margin_hours": MARGIN_H, "max_mirror_lag_hours": 6.0,
            "min_windows": 24, "min_clusters": 4, "bootstrap_B": 200}
-    return parse_lane_d({**raw, **over}, era_blocks_at=lambda _block: ERA)
+    return parse_lane_d({**raw, **LIVE_ONLY, **over}, era_blocks_at=lambda _block: ERA)
 
 
 def window_id(series_id: str, target_ts) -> str:
@@ -126,7 +133,7 @@ def write_pool(directory: Path, records: list[dict], snapshot: str) -> Path:
     top-level `feeds` block (measured lag under the limit, not a forecast
     product) and carries a `frontier` (W5a fails closed without them)."""
     directory.mkdir(parents=True, exist_ok=True)
-    feeds = {r["feed"]: {"mirror_lag_hours": FEED_LAG_HOURS, "forecast_product": False}
+    feeds = {r["feed"]: {"mirror_lag_hours": FEED_LAG_HOURS, "forecast_product": False, "embargo_hours": 0.0}
              for r in records}
     meta = {"schema": "pool_d/1", "snapshot": snapshot, "horizon": HORIZON,
             "feeds": dict(sorted(feeds.items())), "series": records}
@@ -283,7 +290,7 @@ def settle(cfg, boundary, pool_dir, entries, house_rec, fc, uid_of, state_path, 
 
     kw = {"prior_pool_dirs": [Path(p) for p in prior]} if prior else {}
     kw.update(gate_inputs(boundary, house_rec["digest"]))
-    return settle_lane_d(cfg=cfg, boundary=boundary, pool_dir=pool_dir,
+    return settle_lane_d(**_rev614_ts(settle_lane_d, boundary), cfg=cfg, boundary=boundary, pool_dir=pool_dir,
                          entries=[dict(e) for e in entries], house=dict(house_rec),
                          forecasts=fc, uid_of=dict(uid_of), state_path=state_path,
                          signer=fixture_key("signer"), **kw)
@@ -306,3 +313,14 @@ def verdict_of(report, dg) -> dict | None:
 
 def skipped_reasons(report, dg) -> list[str]:
     return [s["reason"] for s in report["skipped"] if s["digest"] == dg]
+
+
+def _rev614_ts(settle, boundary) -> dict:
+    """rev6.14 (a): the fixture's on-chain boundary timestamp (far after every
+    fixture T + eval_delay_hours, 12 s per block), passed only where
+    ``settle_lane_d`` takes it."""
+    import inspect
+
+    if "boundary_ts" not in inspect.signature(settle).parameters:
+        return {}
+    return {"boundary_ts": 2_000_000_000 + 12 * int(boundary)}

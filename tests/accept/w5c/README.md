@@ -217,3 +217,23 @@ module; every BOUNDARY_1/2/3 report of each is audited.
   `test_house_holds_king_d_report_carries_no_house_judgement` passes (that
   shape is today's).
 - Every other test passes.
+
+## Correction (plan rev6.10 (a) / rev6.12 (a)): fixture feeds pin `embargo_hours`
+
+W5a (tests in #758) makes forward eligibility embargo-aware and fails a
+listed feed whose `embargo_hours` is missing closed as `unlisted_feed`. This
+WP's pool fixture wrote feeds without the key, so once the W5a
+implementation lands every fixture window would be refused. Every fixture
+feed now pins `embargo_hours: 0.0` (e = 0, the rev3 rule byte for byte, so
+every verdict is unchanged); on main the key is ignored. No assertion
+changed; every test passes on main and with the W5a implementation.
+
+## Correction (plan rev6.11 (b)): crown at the first verdict
+
+The confirmation duel is dropped (owner 2026-11-23): a crown is decided at
+the first verdict, first clear (max-T LCB vs KING_D) ∧ A10 ∧ the §1.3b gate.
+There is no `confirm` stage, no `confirm_pending` status or reason and no
+`lost_confirmation`; a held first clear is `hold` / `bench_hold`. This WP's
+crowning chains move to that rule with nothing weakened. The house chain lists K1 from BOUNDARY_2, where it is crowned at its first verdict; a challenger that clears both bars at BOUNDARY_3 is crowned there (it was `confirm_pending`). The house-holds-KING_D report is BOUNDARY_2's. The deferred-entry test keeps KING_D fixed with a sharp house, so the deferred entry is judged alone on exactly its frozen set and decided (`lost` / `lost_duel`). On main the
+old code still runs the confirmation stage, so the changed tests fail on an
+assertion until the W5e implementation lands.

@@ -61,6 +61,7 @@ ERROR_TEXT = {
     "spent": "This commitment has already consumed its judged submission.",
     "duplicate": "Admission rejected the entry as a duplicate.",
     "competition_ended": "The competition closed before this entry could train.",
+    "lane_ended": "The lane closed (its until_block passed) before this entry could train; it was released: nothing was rented or charged.",
 }
 
 EVALUATION_TEXT = {
@@ -429,6 +430,74 @@ def lane_queue_status(args, lane):
     if not clock["fresh"]:
         return out.fail("submission_status_unavailable", "Queue timestamp missing or stale; update the intake/publisher before relying on it.", NETWORK)
     return OK
+
+
+# ── lane B: the public status/lane_b.json reasons (WB15 / WB17 / WB18) ──────
+
+LANE_B_STATUS_KEY = "status/lane_b.json"
+LANE_B_GATE_TEXT = {
+    "tokens_short": "the lane B gate is closed: the warm-start lineage has fewer tokens than "
+                    "[lane_b] open_tokens",
+    "king_check_not_passed": ("the lane B gate is closed: the latest lane A king check in the "
+                              "validators' signed receipt did not pass"),
+    "king_check_unavailable": "the lane B gate is closed: no lane A king check is available",
+}
+LANE_B_DEFERRAL_TEXT = {
+    "rows_held": "deferred: the declared rows overlap rows another leg holds",
+    "sentinel_target": "deferred: the entry targets this era's sentinel suite",
+}
+
+
+def lane_b_status_view(doc, *, hotkey=None):
+    """The reason fields of a ``status/lane_b.json`` document: the gate's
+    ``gate_closed_reason`` ("" while open) and the ``deferred`` rows (only
+    ``hotkey``'s when given). ``None`` for anything but a status object."""
+    if not isinstance(doc, dict):
+        return None
+    gate = doc.get("gate_closed_reason")
+    rows = doc.get("deferred")
+    deferred = [dict(r) for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+    if hotkey:
+        deferred = [r for r in deferred if r.get("hotkey") == hotkey]
+    rule = doc.get("open_rule")
+    return {"source": LANE_B_STATUS_KEY, "as_of": doc.get("as_of"), "block": doc.get("block"),
+            "gate_closed_reason": gate if isinstance(gate, str) else "",
+            "open_rule": rule if isinstance(rule, str) else "",
+            "deferred": deferred}
+
+
+def lane_b_public_status(args, *, hotkey=None):
+    """``status/lane_b.json`` from the ``[storage]`` public bucket of the
+    command's chain.toml, as :func:`lane_b_status_view`; ``None`` when no
+    document is published or it cannot be read (the queue view stands alone)."""
+    from ..shared.config import load_chain_config
+    from .dashboard import fetch_public_json
+
+    try:
+        cfg = load_chain_config(getattr(args, "chain_toml", None))
+    except (OSError, ValueError):
+        return None
+    return lane_b_status_view(fetch_public_json(cfg.storage, LANE_B_STATUS_KEY), hotkey=hotkey)
+
+
+def render_lane_b_status(out, view):
+    out.info(f"Lane B status ({LANE_B_STATUS_KEY}, as of "
+             f"{safe_text(view.get('as_of')) or 'unknown'})")
+    reason = view.get("gate_closed_reason")
+    if reason:
+        out.info(f"  Gate closed: {safe_text(reason)} — "
+                 f"{LANE_B_GATE_TEXT.get(reason, 'the lane B gate is closed')}")
+    else:
+        out.info("  Gate: open")
+    for row in view.get("deferred") or []:
+        why = row.get("deferred")
+        release = row.get("expected_release")
+        release = release if isinstance(release, dict) else {}
+        line = (f"  {safe_text(row.get('hotkey'))} {safe_text(row.get('entry_ref'))}: "
+                f"{safe_text(why)} — {LANE_B_DEFERRAL_TEXT.get(why, 'deferred')}")
+        if release.get("era") is not None:
+            line += f"; expected release era {safe_text(release.get('era'))}"
+        out.info(line)
 
 
 def generation_view(snapshot, view, *, now, max_age):

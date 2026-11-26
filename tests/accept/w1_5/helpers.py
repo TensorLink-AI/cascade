@@ -81,11 +81,18 @@ ARMED = {
 }
 
 
+# rev6.18 F4 (A3): these fixtures pin the live-only rule: the public half off
+# (public_weight = 0, a spec setting) and no per-window ratio clamp in effect
+# (a floor far below any fixture ratio), so their pre-F4 numbers stand. F4's
+# own tests (tests/accept/w5e/test_w5e_combined.py) pin the combined rule.
+LIVE_ONLY = {"public_weight": 0.0, "window_ratio_floor": 1e-9}
+
+
 def lane_d_cfg(**over):
     """The real W2 parse of ``ARMED`` with ``over`` applied."""
     from cascade.shared.config.lane_d import parse_lane_d
 
-    return parse_lane_d({**ARMED, **over}, era_blocks_at=lambda _block: ERA)
+    return parse_lane_d({**ARMED, **LIVE_ONLY, **over}, era_blocks_at=lambda _block: ERA)
 
 
 def window_id(series_id: str, target_ts: list[int]) -> str:
@@ -118,7 +125,7 @@ def make_series(snapshot: int, seed: int) -> list[dict]:
 def feeds_block(series: list[dict]) -> dict:
     """The top-level ``feeds`` block: every feed the series name, with a
     measured lag under the limit and not a forecast product."""
-    return {feed: {"mirror_lag_hours": FEED_LAG_HOURS, "forecast_product": False}
+    return {feed: {"mirror_lag_hours": FEED_LAG_HOURS, "forecast_product": False, "embargo_hours": 0.0}
             for feed in sorted({s["feed"] for s in series})}
 
 

@@ -23,7 +23,8 @@ def test_config_defaults_are_inert():
 
 
 @pytest.mark.parametrize("bad", [
-    {"share": 1.5}, {"floor": 0.0}, {"remainder": "x"}, {"domains": ["a", "a"]},
+    {"share": 1.5}, {"undeclared_gain_margin": 0.005}, {"remainder": "x"},
+    {"domains": ["a", "a"]},
     {"from_block": 5}, {"min_experts": 40, "max_experts": 38},
 ])
 def test_config_guards(bad):
@@ -39,19 +40,18 @@ def test_inactive_is_exactly_lane_a():
     assert v == decayed_share_vector([1, 2], 10, decay=0.5, burn_uid=0)
 
 
-def test_decay_schedule_and_burn():
+def test_full_slot_forever_and_burn():
+    """LANE_D_PLAN rev6.22 (owner 2026-11-24): a held slot pays its full share
+    every settlement, no decay, no TTL; the empty slots burn."""
     st = LaneBState()
     st.record(_win("energy", 5, 1000))
     slot = 0.5 / 3
-    # ages in ERAS (era_blocks = 100 here); full 5 eras, half-life 1, floor 0.1,
-    # paid until win_ttl_eras (28) — then the slot burns
-    for eras, mult in [(0, 1.0), (4, 1.0), (5, 0.5), (6, 0.25), (7, 0.125), (8, 0.1),
-                       (20, 0.1), (27, 0.1), (28, 0.0), (40, 0.0)]:
+    for eras in (0, 4, 5, 8, 27, 28, 40, 10_000):
         v = combined_weights([1], 10, king_decay=0.5, burn_uid=0, state=st,
                              block=1000 + eras * 100, era_blocks=100, cfg=CFG)
-        assert v[5] == pytest.approx(slot * mult)
+        assert v[5] == pytest.approx(slot)
         assert v[1] == pytest.approx(0.5)
-        assert v[0] == pytest.approx(0.5 - slot * mult)
+        assert v[0] == pytest.approx(0.5 - slot)
         assert sum(v) == pytest.approx(1.0)
 
 
@@ -90,34 +90,34 @@ def test_json_round_trip():
             LaneBState.from_json(torn)
 
 
-def test_ttl_expiry_drops_the_payout_and_keeps_the_win():
-    """win_ttl_eras: payout stops at that age (the record and its merge
-    provenance stay — the merged weights are in the king forever); 0 = never."""
+def test_no_ttl_the_holder_is_paid_until_replaced():
+    """rev6.22: no expiry; the payout row carries age and since_era, multiplier 1."""
     from cascade.shared.lane_b import lane_b_payouts
 
     st = LaneBState()
     st.record(_win("energy", 5, 1000))
-    live = lane_b_payouts(st, block=1000 + 27 * 100, era_blocks=100, cfg=CFG, n_uids=10)
-    assert [p["age"] for p in live] == [27]
-    assert lane_b_payouts(st, block=1000 + 28 * 100, era_blocks=100, cfg=CFG, n_uids=10) == []
-    assert st.wins["energy"].uid == 5 and st.history
-    forever = parse_lane_b({"from_block": 1000, "domains": ["energy"], "win_ttl_eras": 0})
-    assert lane_b_payouts(st, block=10**9, era_blocks=100, cfg=forever, n_uids=10)
+    for eras in (27, 28, 500):
+        (row,) = lane_b_payouts(st, block=1000 + eras * 100, era_blocks=100, cfg=CFG,
+                                n_uids=10)
+        assert (row["age"], row["multiplier"], row["since_era"]) == (eras, 1.0, 10)
+    st.record(_win("energy", 7, 1000 + 600 * 100))
+    (row,) = lane_b_payouts(st, block=1000 + 700 * 100, era_blocks=100, cfg=CFG, n_uids=10)
+    assert row["uid"] == 7
 
 
-@pytest.mark.parametrize("bad", [{"win_ttl_eras": -1}, {"win_ttl_eras": 5},
-                                 {"win_ttl_eras": 3, "full_pay_tiers": [[0.05, 5]]}])
-def test_ttl_guard(bad):
-    with pytest.raises(ValueError):
-        parse_lane_b(bad)
+@pytest.mark.parametrize("key", ["win_ttl_eras", "full_pay_tiers", "half_life_rounds",
+                                 "floor"])
+def test_retired_payout_keys_are_ignored(key):
+    """rev6.22: the decay / TTL keys are retired (loader RETIRED_KEYS); a
+    direct parse ignores them and the config has no such field."""
+    from cascade.shared.config import RETIRED_KEYS
+
+    assert key in RETIRED_KEYS["lane_b"]
+    assert not hasattr(parse_lane_b({key: 5}), key)
 
 
-def test_replay_settlements_covers_the_ttl():
-    """Unset ⇒ (ttl + 1) × era_settlements, so a rebuilt validator holds every
-    still-paying win; an explicit value below the cover is refused."""
-    assert parse_lane_b({}, era_settlements=4).replay_settlements == 29 * 4
+def test_replay_settlements_default_and_explicit():
+    """No TTL (rev6.22) means no finite cover: the legacy default 64; an
+    explicit value is kept (under acceptance recovery walks the full ledger)."""
+    assert parse_lane_b({}, era_settlements=4).replay_settlements == 64
     assert parse_lane_b({"replay_settlements": 200}, era_settlements=4).replay_settlements == 200
-    with pytest.raises(ValueError):
-        parse_lane_b({"replay_settlements": 64}, era_settlements=4)
-    # no TTL ⇒ no finite cover: the legacy default
-    assert parse_lane_b({"win_ttl_eras": 0}, era_settlements=4).replay_settlements == 64

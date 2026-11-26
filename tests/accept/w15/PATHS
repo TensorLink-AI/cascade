@@ -1,0 +1,13 @@
+# W15 prefetch cache: a sha-keyed (content-addressed), resumable, byte-budget
+# LRU on the launch eval host with KING_D and the house pinned (plan rev6 §3.0
+# W15 row; §1.2 step 5 "Prefetch"; §10 "Data paths" 2; README.md has the
+# contract).
+#
+# New: PrefetchCache, CacheError/CACHE_CODES, prefetch_grant (fills through
+# W4's ingest_presigned, so every guard runs before an entry is admitted) and
+# open_prefetch_cache (None while lane D is unarmed, invariant 1).
+cascade/eval/lane_d_cache.py
+# rev6.18 B6 (F5): the score cache keyed by host identity, and the
+# settlement source that uses it (one host per cohort; host change re-scores).
+cascade/validator/lane_d_score_cache.py
+cascade/validator/lane_d_inputs.py

@@ -178,7 +178,7 @@ returns `PASS` on a genuine report, and `FAIL` when the signature,
 
 ### `cascade/shared/emission.py`
 
-- `lane_d_vector(n_uids, *, share, court_uids, king_decay, burn_uid) ->
+- `lane_d_vector(n_uids, *, share, court_uids, court_weights, burn_uid) ->
   list[float]` sums to `share`. A sole court member gets all of it, and a
   `None` (house) slot burns.
 - `lane_parts(…, lane_d_cfg=None, d_court_uids=())`:
@@ -252,3 +252,13 @@ legacy call otherwise. The tests pass both on today's main and after W5e.
   the gate record arrives with W5e (written by the gated settlement, a
   `pass` for the crowned digest), which W7a's RV4 schema accepts. These
   tests don't splice one in, and no assertion changed.
+
+## Correction (plan rev6.10 (a) / rev6.12 (a)): fixture feeds pin `embargo_hours`
+
+W5a (tests in #758) makes forward eligibility embargo-aware and fails a
+listed feed whose `embargo_hours` is missing closed as `unlisted_feed`. This
+WP's pool fixture wrote feeds without the key, so once the W5a
+implementation lands every fixture window would be refused. Every fixture
+feed now pins `embargo_hours: 0.0` (e = 0, the rev3 rule byte for byte, so
+every verdict is unchanged); on main the key is ignored. No assertion
+changed; every test passes on main and with the W5a implementation.

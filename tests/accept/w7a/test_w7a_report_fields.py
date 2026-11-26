@@ -2,8 +2,9 @@
 W7a row, §1.5 "(rev3) The report also carries", §14.3 items 1-3, B7, B12).
 
 End to end on the synthetic chain (no torch): W1.5's box-side pipeline on two
-snapshots, the first clear at BOUNDARY_1 and the confirmation that crowns at
-BOUNDARY_2. The pools carry the W5a `feeds` block (every feed listed), a
+snapshots. rev6.11 (b): a crown is decided at the first verdict, so the loser
+L is judged and lost at BOUNDARY_1 and the challenger's first verdict crowns
+at BOUNDARY_2. The pools carry the W5a `feeds` block (every feed listed), a
 per-series `feed` and `frontier` and the B12 `first_seen_roots`, plus one
 §1.3 trap window. A second run uses the W1.5 pool format (none of those
 keys): under W5a's fail-closed rule every window is refused `unlisted_feed`.
@@ -27,7 +28,7 @@ from .helpers import (
     canonical_rows_sha256,
     coldkey,
     finite,
-    two_settlements,
+    loser_then_crown,
     window_id,
 )
 
@@ -39,7 +40,7 @@ def scratch(tmp_path_factory):
 
 
 def _built(scratch, *, rich=True):
-    built = two_settlements(scratch / ("rich" if rich else "legacy"), rich=rich)
+    built = loser_then_crown(scratch / ("rich" if rich else "legacy"), rich=rich)
     for s in (built["s1"], built["s2"]):
         assert s.report is not None, "an armed settlement produced no lane D report"
         assert_valid(s.report)
@@ -56,20 +57,31 @@ def _expected_params(cfg) -> dict:
         "max_mirror_lag_hours": float(cfg.max_mirror_lag_hours),
         "min_windows": int(cfg.min_windows), "min_clusters": int(cfg.min_clusters),
         "d_margin": float(cfg.d_margin), "alpha": float(cfg.alpha),
-        "bootstrap_B": int(cfg.bootstrap_B), "king_decay": float(cfg.king_decay),
+        "bootstrap_B": int(cfg.bootstrap_B),
+        # rev6.23: the crown bar keys and the court weights (king_decay retired).
+        "d_margin_start": float(cfg.d_margin_start),
+        "d_margin_warmup_settlements": int(cfg.d_margin_warmup_settlements),
+        "court_weights": [float(w) for w in cfg.court_weights],
         "reward_prior_kings": int(cfg.reward_prior_kings),
-        "confirm_on_king_change": str(cfg.confirm_on_king_change),
         "max_entries_per_settlement": int(cfg.max_entries_per_settlement),
         "max_judged_per_coldkey_per_settlement": int(cfg.max_judged_per_coldkey_per_settlement),
         "scoring_levels": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
         "gate_suites": [str(s) for s in cfg.gate_suites],
         "tau_public": float(cfg.tau_public),
-        "lowfreq_freqs": [str(f) for f in cfg.lowfreq_freqs],
+        # rev6.18 A3 (F4): the public weight and the ratio clamp (A7: no
+        # lowfreq_freqs).
+        "public_weight": float(getattr(cfg, "public_weight", 0.5)),
+        "window_ratio_floor": float(getattr(cfg, "window_ratio_floor", 0.5)),
         # RV4: the gate draw's weights as parsed (absent suites weigh 0), the
         # B14 source cap and the §1.7 context floor.
         "gate_weights": {str(s): float(w) for s, w in cfg.gate_weights},
         "max_source_share": float(cfg.max_source_share),
         "min_long_series": int(cfg.min_long_series),
+        # rev6.10 / rev6.11 (a) / rev6.12 (b): the W2e keys (read with the plan
+        # defaults, so the test never touches an attribute W2e hasn't added).
+        "embargo_hours": float(getattr(cfg, "embargo_hours", 48.0)),
+        "max_windows_per_settlement": int(getattr(cfg, "max_windows_per_settlement", 5000)),
+        "min_fresh_window_share": float(getattr(cfg, "min_fresh_window_share", 0.2)),
     }
 
 
@@ -91,7 +103,9 @@ def test_e2e_legacy_pool_format_report_validates(scratch):
 
     built = _built(scratch, rich=False)
     cfg, house, e = built["cfg"], built["chain"]["house"], built["entry"]
+    judged_at = {1: built["loser"], 2: e}
     for snap, s in ((1, built["s1"]), (2, built["s2"])):
+        e = judged_at[snap]
         pool = load_pool(built["chain"]["pools"][snap], int(cfg.horizon))
         verdicts = list(eligible_windows(pool, t_entry=e["reveal_ts"],
                                          t_king=house["reveal_ts"], cfg=cfg))
@@ -104,9 +118,12 @@ def test_e2e_legacy_pool_format_report_validates(scratch):
         assert r["cohorts"] == [] and r["windows"] == [] and r["rows"] == []
         assert r["judged"] == [] and r["verdicts"] == []
         assert r["rows_sha256"] == canonical_rows_sha256([])
-        assert r["skipped"] == [{"digest": e["digest"], "reason": "pending_floor"}]
-        ent = {x["digest"]: x for x in r["entries"]}[e["digest"]]
-        assert (ent["status"], ent["reason"]) == ("pending", "pending_floor")
+        waiting = sorted({built["loser"]["digest"], e["digest"]})
+        assert sorted(k["digest"] for k in r["skipped"]) == waiting
+        assert {k["reason"] for k in r["skipped"]} == {"pending_floor"}
+        for dg in waiting:
+            ent = {x["digest"]: x for x in r["entries"]}[dg]
+            assert (ent["status"], ent["reason"]) == ("pending", "pending_floor")
 
 
 def test_e2e_params_carry_every_satellite_value(scratch):
@@ -165,49 +182,57 @@ def test_e2e_first_seen_roots_and_refusal_tally_per_frozen_set(scratch):
 
 def test_e2e_judged_set_skips_and_coldkey(scratch):
     built = _built(scratch)
-    dg = built["entry"]["digest"]
-    for s in (built["s1"], built["s2"]):
+    ld, dg = built["loser"]["digest"], built["entry"]["digest"]
+    for s, ent_in, cold in ((built["s1"], built["loser"], coldkey("coldkey-loser")),
+                            (built["s2"], built["entry"], coldkey())):
         r = s.report
-        assert r["judged"] == [dg]
+        assert r["judged"] == [ent_in["digest"]]
         assert r["skipped"] == []
-        ent = {e["digest"]: e for e in r["entries"]}[dg]
-        assert ent["coldkey"] == coldkey()
-        assert ent["hotkey"] == built["entry"]["hotkey"]
-        assert ent["context"] == built["entry"]["context"]
-    assert {e["digest"]: e for e in built["s1"].report["entries"]}[dg]["status"] \
-        == "confirm_pending"
+        ent = {e["digest"]: e for e in r["entries"]}[ent_in["digest"]]
+        assert ent["coldkey"] == cold
+        assert ent["hotkey"] == ent_in["hotkey"]
+        assert ent["context"] == ent_in["context"]
+    e1 = {e["digest"]: e for e in built["s1"].report["entries"]}[ld]
+    assert (e1["status"], e1["reason"]) == ("lost", "lost_duel")
     e2 = {e["digest"]: e for e in built["s2"].report["entries"]}[dg]
     assert (e2["status"], e2["reason"]) == ("crowned", "crowned")
 
 
-def test_e2e_confirmation_block(scratch):
+def test_e2e_no_confirmation_block_and_the_first_verdict_crowns(scratch):
+    """rev6.11 (b): no `confirmation` block, no confirm stage. The loser's
+    first verdict is lost; the challenger's first verdict crowns."""
     built = _built(scratch)
-    house = built["chain"]["house"]["digest"]
     (v1,) = built["s1"].report["verdicts"]
     (v2,) = built["s2"].report["verdicts"]
-    assert v1["outcome"] == "confirm_pending" and v1["cleared"] is True
-    assert v1["confirmation"] == {"stage": "first", "rule": "restart",
-                                  "first_set_sha256": None, "first_king_digest": None}
-    first_set = built["s1"].report["cohorts"][0]["set_sha256"]
-    assert v2["outcome"] == "crowned"
-    assert v2["confirmation"] == {"stage": "confirm", "rule": "restart",
-                                  "first_set_sha256": first_set, "first_king_digest": house}
-    ids1 = set(built["s1"].report["cohorts"][0]["window_ids"])
-    ids2 = set(built["s2"].report["cohorts"][0]["window_ids"])
-    assert ids1 and ids2 and not ids1 & ids2, "the confirmation set must be disjoint"
+    assert v1["digest"] == built["loser"]["digest"]
+    assert v1["outcome"] == "lost" and v1["cleared"] is False
+    assert v2["digest"] == built["entry"]["digest"]
+    assert v2["outcome"] == "crowned" and v2["cleared"] is True
+    for s in (built["s1"], built["s2"]):
+        for v in s.report["verdicts"]:
+            assert "confirmation" not in v, "the confirmation block is removed (rev6.11)"
+            assert v.get("stage", "first") == "first"
+        for c in s.report["cohorts"]:
+            assert c.get("stage", "first") == "first"
+        assert "confirm_on_king_change" not in s.report["params"]
 
 
-def test_e2e_lowfreq_result(scratch):
+def test_e2e_verdicts_carry_point_gains_not_lowfreq(scratch):
+    """rev6.18 A7 / A8 (F4): correction of the A10 `lowfreq` result test (the
+    check is removed, owner 2026-11-23). Every verdict carries its live
+    half's point gain (`halves.live`, = `sources.live`) and its per-domain
+    gains, whose windows add up to the half's; at public_weight 0 (this
+    fixture) there is no public half."""
     built = _built(scratch)
-    cfg = built["cfg"]
-    (v1,) = built["s1"].report["verdicts"]
-    (v2,) = built["s2"].report["verdicts"]
-    freqs = [str(f) for f in cfg.lowfreq_freqs]
-    assert v1["lowfreq"] == {"result": "not_candidate", "freqs": freqs, "n_windows": 0,
-                             "tau_public": float(cfg.tau_public)}
-    # The crowning candidate: the fixture is hourly only, so no low-frequency window.
-    assert v2["lowfreq"] == {"result": "no_windows", "freqs": freqs, "n_windows": 0,
-                             "tau_public": float(cfg.tau_public)}
+    for s in (built["s1"], built["s2"]):
+        for v in s.report["verdicts"]:
+            assert "lowfreq" not in v, "the A10 lowfreq block is removed (rev6.18 A7)"
+            assert set(v.get("halves") or {}) == {"live"}, v.get("halves")
+            live = v["halves"]["live"]
+            assert set(live) == {"n", "gain"} and live["n"] > 0
+            assert v["sources"] == {"live": live}
+            assert sum(d["n"] for d in v["domains"].values()) == live["n"]
+            assert all(k.startswith("live|") for k in v["domains"])
 
 
 def test_e2e_court_slots_carry_burn_reason(scratch):

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import asdict, dataclass, field, replace
 
 from .manifest import parse_trained_pointer
@@ -54,8 +55,69 @@ class ExpertEntry:
     # from the canonical body, so a single-target entry's bytes are unchanged.
     # ``selection`` is then the UNION of the targets' selections.
     targets: tuple[str, ...] = ()
+    # WB22 / WB25: GPUs the leg trained on (the rented layout's count), the
+    # audit re-derivation's pin next to ``gpu_name`` (a different count
+    # changes the reduction order). 0 = not recorded — dropped from the
+    # canonical body, so an entry without it keeps its bytes.
+    gpu_n: int = 0
+    # plan rev6.20 (owner 2026-11-24): which weights the leg scored (and the
+    # rebased / merged checkpoint carries). Every lane B leg scores a power
+    # EMA of a no-cooldown leg: "ema010" (sigma_rel 0.10) by default, or the
+    # miner's chosen width (WB27, "ema<width x 100>"), always in the signed
+    # body. A manifest that lacks the field loads as "" (the raw cooled
+    # endpoint), which the judge refuses (stage ``scored_weights``).
+    scored_weights: str = "ema010"
+    # W-IMG (plan rev6.24 (e), owner 2026-11-24: "we just log what image pin
+    # was used, it's auditable"): the worker image digest the leg ran.
+    # Recorded, never enforced; "" = not recorded (every entry before
+    # ``[v2] image_epoch_from_block``) — dropped from the canonical body.
+    train_image_digest: str = ""
+
+    # WB23 (D42, D42b): the miner-chosen leg length fixed at admission — the
+    # hours, the steps (real hours on the chosen GPU) and the wall guard. All
+    # 0 = a leg funded without ``train_hours``; each is dropped from the
+    # canonical body at 0, so such an entry keeps its bytes. Validators check
+    # them against ``[lane_b]`` (``lane_b_leg.check_leg_record``).
+    train_hours: float = 0.0
+    leg_steps: int = 0
+    leg_guard_seconds: int = 0
+    # WB27 (plan rev6.21): the miner-chosen levers the leg trained (canonical
+    # non-default values, ``lane_b_levers.LegLevers.as_dict``); {} = every
+    # default — dropped from the canonical body, so an entry without levers
+    # keeps its bytes. Judges re-check them (``check_entry_levers``).
+    levers: dict = field(default_factory=dict)
+    # owner 2026-11-24 (rev6.21) limits legs: the token limit (0 = none), an
+    # own-risk GPU (False; True dropped), and what the leg actually trained
+    # (steps, tokens, the limit that stopped it), read from the leg
+    # checkpoint — judges re-derive from these. Dropped at their defaults.
+    train_tokens: int = 0
+    gpu_measured: bool = True
+    trained_steps: int = 0
+    trained_tokens: int = 0
+    stop: str = ""
 
     def __post_init__(self) -> None:
+        from .config.lane_b import LANE_B_SCORED_WEIGHTS, lane_b_scored_label_ok
+
+        if not lane_b_scored_label_ok(self.scored_weights):
+            raise ValueError(f"expert entry scored_weights must be one of "
+                             f"{LANE_B_SCORED_WEIGHTS}; got {self.scored_weights!r}")
+        if isinstance(self.gpu_n, bool) or not isinstance(self.gpu_n, int) or self.gpu_n < 0:
+            raise ValueError(f"expert entry gpu_n must be an int >= 0; got {self.gpu_n!r}")
+        for name in ("leg_steps", "leg_guard_seconds", "train_tokens", "trained_steps",
+                     "trained_tokens"):
+            v = getattr(self, name)
+            if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+                raise ValueError(f"expert entry {name} must be an int >= 0; got {v!r}")
+        th = self.train_hours
+        if (isinstance(th, bool) or not isinstance(th, (int, float))
+                or not math.isfinite(th) or th < 0):
+            raise ValueError(f"expert entry train_hours must be a finite number >= 0; "
+                             f"got {th!r}")
+        object.__setattr__(self, "train_hours", float(th))
+        if not isinstance(self.levers, dict):
+            raise ValueError(f"expert entry levers must be an object; got {self.levers!r}")
+        object.__setattr__(self, "levers", json.loads(json.dumps(self.levers, sort_keys=True)))
         for name in ("selection", "exclude"):
             object.__setattr__(self, name, {int(k): sorted(int(x) for x in v)
                                             for k, v in sorted(getattr(self, name).items())})
@@ -96,6 +158,20 @@ class ExpertManifest:
                 e.pop("targets", None)        # single-target: today's bytes
             else:
                 e["targets"] = list(e["targets"])
+            if not e.get("gpu_n"):
+                e.pop("gpu_n", None)          # not recorded: today's bytes
+            if not e.get("train_image_digest"):
+                e.pop("train_image_digest", None)   # W-IMG: not recorded
+            for k in ("train_hours", "leg_steps", "leg_guard_seconds"):
+                if not e.get(k):
+                    e.pop(k, None)            # WB23: no leg length = today's bytes
+            if not e.get("levers"):
+                e.pop("levers", None)         # WB27: every lever default = today's bytes
+            for k in ("train_tokens", "trained_steps", "trained_tokens", "stop"):
+                if not e.get(k):
+                    e.pop(k, None)            # limits legs only
+            if e.get("gpu_measured", True) is True:
+                e.pop("gpu_measured", None)   # a measured GPU = today's bytes
         return json.dumps(d, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
     def digest(self) -> str:
@@ -113,6 +189,8 @@ def load_expert_manifest(text: str) -> ExpertManifest:
         raise ValueError(f"unsupported expert manifest version {o.get('version')}")
     entries = tuple(
         ExpertEntry(**{**e,
+                       # no record = not an EMA-scored leg (refused when judged)
+                       "scored_weights": e.get("scored_weights", ""),
                        "selection": {int(k): list(v) for k, v in e["selection"].items()},
                        "exclude": {int(k): list(v) for k, v in e["exclude"].items()}})
         for e in o["entries"]

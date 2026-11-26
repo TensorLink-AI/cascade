@@ -30,8 +30,17 @@ Direct-MoE lane (DEC-CA-0052): ``cascade direct status|deposit-key|fund``, see
 ``cascade/miner/direct.py``.
 
 Fine-tuning lane (DEC-CA-0056; MarketCast-only: ``mkt:<suite>`` targets):
-``cascade lane-c check|commit|fund|status``, see ``cascade/miner/lane_c.py``. Domain-expert lane funding (DEC-CA-0059 item
-8): ``cascade lane-b fund|status``, see ``cascade/miner/lane_b.py``.
+``cascade lane-c upload|check|commit|fund|status|test``, see ``cascade/miner/lane_c.py``. Domain-expert
+lane (DEC-CA-0059 item 8): ``cascade lane-b fund|status|verify-repo|test``, see
+``cascade/miner/lane_b.py`` (``test``: ``cascade/miner/lane_tests.py``).
+
+Open-weights lane (DEC-CA-0062, DEC-CA-0070): ``cascade lane-d
+export|verify|submit|ready|status|test``, see ``cascade/miner/lane_d.py``
+(``test``: ``cascade/miner/lane_d_preview.py``, loaded at call time).
+
+Rules of every lane: ``cascade rules a|b|c|d [--all | --key K]`` prints the
+values the lane is judged and paid under, read from ``chain.toml`` (see
+``cascade/miner/rules.py``; one guide per lane, docs/MINER_LANE_*.md).
 
 Every command takes ``--json`` (or ``CASCADE_JSON=1``): one JSON document on
 stdout, human lines on stderr (``cascade/miner/output.py``). Paid actions
@@ -84,7 +93,15 @@ def _add_verify(sub: argparse._SubParsersAction) -> None:
 
 
 def _add_deploy(sub: argparse._SubParsersAction) -> None:
-    p = sub.add_parser("deploy", help="Upload your generator to Hippius and commit it on-chain.")
+    p = sub.add_parser(
+        "deploy",
+        description=LANE_A_CLOSED_NOTE,
+        help="Upload your generator to Hippius and commit it on-chain (lane A, or lane B with "
+             "--expert-domain). Lane A is closed to new challengers from block 9586800: a lane A "
+             "deploy refuses past it unless --allow-closed-lane-a.")
+    p.add_argument("--allow-closed-lane-a", action="store_true",
+                   help="Go ahead with a lane A deploy although lane A takes no new "
+                        "challengers from block 9586800 (the entry will not be seated).")
     p.add_argument("repo_dir", type=Path, help="Path to your prepared generator repo (local dir).")
     p.add_argument("--chain-toml", type=Path, default=None, help="Override chain.toml path.")
     p.add_argument("--network", default="finney", help="Bittensor network (finney/test/local).")
@@ -146,11 +163,13 @@ def _add_deploy(sub: argparse._SubParsersAction) -> None:
         metavar="DOMAIN",
         help="Lane B (v2, DEC-CA-0050): commit the generator as a DOMAIN-EXPERT entry "
         "(metro-v1:expert:<DOMAIN>:hippius:<ref>) instead of a lane-A entry. DOMAIN must "
-        "be one of chain.toml [lane_b] domains — or a comma-separated list of up to "
-        "[lane_b] max_domains_per_leg targets (DEC-CA-0059: domains and/or horizon "
-        "targets horizon:<h> / h<h>, h a scored horizon), trained as ONE leg and judged "
-        "and paid per target. A hotkey holds ONE commitment: this replaces your lane-A "
-        "entry until you commit again.",
+        "be one of chain.toml [lane_b] targets — or a comma-separated list of up to "
+        "[lane_b] max_domains_per_leg of them (domains, horizon targets horizon:<h> / h<h> "
+        "for a scored horizon h, and suite:<s> while [lane_b] suite_targets is on), "
+        "trained as ONE leg. The leg is judged on EVERY slot: declared targets clear at "
+        "[lane_b] gain_margin, every other slot at undeclared_gain_margin, and each "
+        "cleared slot is paid. Preview locally with `cascade lane-b test`. A hotkey "
+        "holds ONE commitment: this replaces your lane-A entry until you commit again.",
     )
     p.set_defaults(func=_cmd_deploy)
 
@@ -470,6 +489,60 @@ def _live_cfg(cfg, client):
         return startup_activation(cfg, client, store_path=None)
     except Exception:  # noqa: BLE001 — a CLI convenience must never fail a command
         return cfg
+
+
+# W-LAUNCH lane A shutdown (owner 2026-11-25, #941): lane A takes no new
+# challengers from the launch era start. The operator's DEPLOYED chain.toml
+# types ``[round] lane_a_until_block``; the checked-in copy a miner loads keeps
+# it at 0 (trainer + intake policy, not an overlay key), so the published
+# cutoff per netuid is the fallback. Client-side courtesy only: the intake
+# (409 ``lane_ended``) and the trainer enforce it.
+LANE_A_CLOSED_FROM = {91: 9586800}
+LANE_A_CLOSED_NOTE = ("Lane A is closed to new challengers from block 9586800 "
+                      "(mainnet launch, 2026-11-25); compete in lanes B, C and D.")
+
+
+def lane_a_closed_from(cfg) -> int:
+    """The block lane A stops taking new challengers on ``cfg``'s network (0 = open)."""
+    typed = int(getattr(getattr(cfg, "round", None), "lane_a_until_block", 0) or 0)
+    if typed > 0:
+        return typed
+    return int(LANE_A_CLOSED_FROM.get(int(getattr(cfg, "netuid", 0) or 0), 0))
+
+
+def _lane_a_gate(args: argparse.Namespace, cfg, out, *, what: str) -> int | None:
+    """Refuse a lane A ``what`` (deploy / submit) BEFORE any upload or chain
+    write once the head has reached lane A's cutoff; ``--allow-closed-lane-a``
+    overrides. None = go ahead. An unreadable head only warns: the later
+    commit needs the same chain and fails loudly there."""
+    until = lane_a_closed_from(cfg)
+    if until <= 0:
+        return None
+    if getattr(args, "allow_closed_lane_a", False):
+        out.info(f"warning: lane A takes no new challengers from block {until}; "
+                 f"--allow-closed-lane-a set, so this {what} goes ahead and will not be seated.")
+        return None
+    from ..shared.chain import ChainClient, ChainError
+
+    try:
+        head = ChainClient.from_config(
+            cfg, network=args.network, wallet_name=args.wallet_name,
+            wallet_hotkey=args.wallet_hotkey, wallet_path=args.wallet_path,
+        ).current_block()
+    except ChainError as e:
+        out.info(f"warning: could not read the chain head ({e}); lane A takes no new "
+                 f"challengers from block {until}.")
+        return None
+    if head < until:
+        out.info(f"note: lane A takes no new challengers from block {until} "
+                 f"({until - head} blocks from head {head}); an entry not seated by then never trains.")
+        return None
+    return out.fail(
+        "lane_a_closed",
+        f"refusing to {what}: lane A takes no new challengers from block {until} "
+        f"(head {head}). Nothing was uploaded or committed. Compete in lanes B, C or D "
+        f"(`cascade rules b|c|d`), or pass --allow-closed-lane-a to {what} anyway.",
+        REJECTED, until_block=until, head_block=head)
 
 
 def _cmd_round(args: argparse.Namespace) -> int:
@@ -995,14 +1068,19 @@ def _cmd_deploy(args: argparse.Namespace) -> int:
         out.info(f"fresh submission repo: {args.hub_repo}")
 
     ref = args.ref
+    if ref is None and not args.hub_repo:
+        return out.fail(
+            "missing_hub_repo",
+            "error: --hub-repo or --hub-namespace (Hippius Hub) is required to "
+            "upload — the Hub is always tried first. --hf-repo is only a fallback "
+            "for when the Hub push fails; pass it alongside one of them. Or use "
+            "--ref to commit an already-uploaded ref.", USAGE)
+    if not expert_domain:
+        # W-LAUNCH: a lane A entry past lane A's cutoff stops before any upload or commit
+        refused = _lane_a_gate(args, cfg, out, what="deploy")
+        if refused is not None:
+            return refused
     if ref is None:
-        if not args.hub_repo:
-            return out.fail(
-                "missing_hub_repo",
-                "error: --hub-repo or --hub-namespace (Hippius Hub) is required to "
-                "upload — the Hub is always tried first. --hf-repo is only a fallback "
-                "for when the Hub push fails; pass it alongside one of them. Or use "
-                "--ref to commit an already-uploaded ref.", USAGE)
         # Verify locally (cheaper than burning a chain commit), then upload.
         if not args.skip_verify:
             report = verify_repo(args.repo_dir, cfg, skip_runtime=False, across_launch=True)
@@ -1079,10 +1157,16 @@ def _cmd_deploy(args: argparse.Namespace) -> int:
 def _add_submit(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser(
         "submit",
-        help="Verify, ZIP, and submit your generator DIRECTLY to the operator's "
+        description=LANE_A_CLOSED_NOTE,
+        help="Verify, ZIP, and submit your lane A generator DIRECTLY to the operator's "
              "intake — private until it takes the throne — then commit the "
-             "returned vault ref on-chain.",
+             "returned vault ref on-chain. Lane A is closed to new challengers from block "
+             "9586800: past it this refuses (the intake answers 409 lane_ended to a funded "
+             "submit) unless --no-fund --no-commit (store only) or --allow-closed-lane-a.",
     )
+    p.add_argument("--allow-closed-lane-a", action="store_true",
+                   help="Go ahead with a lane A submit although lane A takes no new "
+                        "challengers from block 9586800 (the entry will not be seated).")
     p.add_argument("repo_dir", type=Path, help="Path to your prepared generator repo.")
     p.add_argument("intake_url", help="Operator intake base URL (https://…).")
     p.add_argument("--chain-toml", type=Path, default=None)
@@ -1237,6 +1321,11 @@ def _cmd_submit(args: argparse.Namespace) -> int:
             if refused is not None:
                 return refused
     cfg = load_chain_config(args.chain_toml)
+    if api_key or not args.no_commit:
+        # store only (--no-fund --no-commit) stays open: lane B legs may name a vault ref
+        refused = _lane_a_gate(args, cfg, out, what="submit")
+        if refused is not None:
+            return refused
     if api_key:
         from .live_status import LiveStateUnavailable
         from .training_context import live_context
@@ -1347,7 +1436,10 @@ def _cmd_submit(args: argparse.Namespace) -> int:
 def _add_fund(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser(
         "fund",
-        help="Fund your revealed submission's training leg with YOUR Lium API key.",
+        description=LANE_A_CLOSED_NOTE,
+        help="Fund your revealed lane A submission's training leg with YOUR Lium API key. "
+             "Lane A is closed to new challengers from block 9586800: the intake refuses a "
+             "new fund with 409 lane_ended (nothing charged).",
     )
     p.add_argument("intake_url",
                    help="Operator intake base URL (https://…; TLS protects the key in transit).")
@@ -1417,11 +1509,33 @@ def _cmd_credentials(args: argparse.Namespace) -> int:
     return OK
 
 
-def add_gpu_args(p: argparse.ArgumentParser, *, budget: bool = False) -> None:
+LANE_B_GPU_HELP = (
+    "GPU type your key rents for the lane B leg: one of chain.toml [lane_b] funded_pod_skus "
+    "(shipped: 8xH200, 8xH100, 4xH200, 4xH100, 8xRTX4090; a type rents once WB19 has "
+    "measured it), or ANY other layout (e.g. 4xL40S) with --train-tokens / --train-hours, "
+    "AT YOUR OWN RISK: no refund if the leg OOMs, cannot boot or crashes (Lium key only). "
+    "With --train-hours on a measured type the steps come from its measured rate.")
+
+
+LANE_C_GPU_HELP = (
+    "GPU type your key rents for the MarketCast (lane C) leg. A leg fine-tunes Timestral-28M "
+    "on ONE GPU, so any Lium type works. Recommended: chain.toml [marketcast] funded_pod_skus "
+    "(shipped: 1xRTX4090, 1xA100, 1xH100, 8xH100; no --gpu = the cheapest fitting of these). "
+    "ANY other Lium type (e.g. 1xRTX3090, 1xH200, 1xL40S) is accepted AT YOUR OWN RISK: the fund "
+    "reply warns, the leg is still capped by [marketcast] max_leg_hours / your recipe's "
+    "leg_hours, it rents on your own Lium key (plain Lium key only, never Shadeform) and "
+    "nothing is refunded if the type is slow, cannot boot, runs out of memory or crashes.")
+
+
+def add_gpu_args(p: argparse.ArgumentParser, *, budget: bool = False,
+                 lane_b: bool = False, lane_c: bool = False) -> None:
     """DEC-CA-0060 ``--gpu`` / ``--allow-fallback`` / ``--max-price`` on a fund
-    command (lane A ``fund``, ``lane-b fund`` and ``lane-c fund``)."""
+    command (lane A ``fund``, ``lane-b fund`` and ``lane-c fund``). ``lane_b``:
+    the lane B help (its own GPU list and own-risk types, WB22 / WB27);
+    ``lane_c``: the MarketCast help (any Lium GPU, own risk off the list)."""
     p.add_argument("--gpu", default="",
-                   help="GPU type your key rents (one of chain.toml [round] funded_pod_skus; "
+                   help=LANE_B_GPU_HELP if lane_b else LANE_C_GPU_HELP if lane_c else
+                   "GPU type your key rents (one of chain.toml [round] funded_pod_skus; "
                         "mainnet: 8xH100 or 8xH200). Same token budget and wall as every leg — a faster "
                         "type costs more per hour, never buys more compute. Default: the "
                         "cheapest fitting type under the operator's price caps. The "
@@ -1643,12 +1757,16 @@ def build_parser() -> argparse.ArgumentParser:
     from .iterate import add_iterate
     from .lane_b import add_lane_b
     from .lane_c import add_lane_c
+    from .lane_d import add_lane_d
     from .live_status import add_status
     from .preflight import add_preflight
+    from .rules import add_rules
     from .starter import add_init
 
     parser = argparse.ArgumentParser(
-        prog="cascade", description="cascade subnet miner CLI (generator and direct-MoE lanes).",
+        prog="cascade", description="cascade subnet miner CLI: lane A generators, lane B experts, "
+                                    "lane C MarketCast, lane D open weights (`cascade rules <lane>` "
+                                    "prints each lane's rules). " + LANE_A_CLOSED_NOTE,
         epilog="--json on any command prints one machine-readable result. Exit codes: 0 ok, "
                "1 rejected, 2 usage, 3 network, 4 registry, 5 needs --yes. See AGENTS.md.")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -1672,6 +1790,8 @@ def build_parser() -> argparse.ArgumentParser:
     add_direct(sub)
     add_lane_b(sub)
     add_lane_c(sub)
+    add_lane_d(sub)
+    add_rules(sub)
     _add_json_flag(parser)
     return parser
 

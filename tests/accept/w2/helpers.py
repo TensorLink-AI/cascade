@@ -42,39 +42,48 @@ W2_DEFAULTS: dict[str, object] = {
     "share": 0.0,
     "takes_from": "lane_b",
     "remainder": "burn",
-    "contexts": (4096, 8192, 16384),
+    # rev6.6 (owner 2026-11-23): every variant is declarable from launch;
+    # arming is computed per settlement (W5d), never configured.
+    "contexts": (4096, 8192, 16384, 32768, 65536, 131072),
     "horizon": 64,
-    "forward_margin_hours": 6.0,
+    "forward_margin_hours": 0.0,       # rev6.14 (a): 6 -> 0 (b = T)
     "min_windows": 1000,
     "min_clusters": 20,
     "min_long_series": 300,
     "d_margin": 0.01,
+    # rev6.23 (owner 2026-11-24): the tenure-decaying crown bar (d_margin is its end).
+    "d_margin_start": 0.03,
+    "d_margin_warmup_settlements": 32,
     "alpha": 0.05,
     "bootstrap_B": 10_000,
     "gate_suites": ("gift", "boom", "time", "fev"),
     "gate_weights": None,              # equal over gate_suites (checked separately)
     "tau_public": 0.01,
     "reward_prior_kings": 2,
-    "king_decay": 0.5,
+    # rev6.23 (owner 2026-11-24): explicit court weights replace king_decay.
+    "court_weights": (0.80, 0.15, 0.05),
     "max_entries_per_settlement": 8,
     "max_open_per_coldkey": 2,
     "max_bench_holds": 4,
     "loser_ttl_eras": 4,
     "dtypes": ("BF16",),
     "max_mirror_lag_hours": 6.0,
-    "confirm_on_king_change": "restart",
     "max_judged_per_coldkey_per_settlement": 2,
     "max_coldkey_unresolved_settlements": 4,
     "max_reveal_delay_days": 14,
-    "lowfreq_freqs": None,             # "daily and slower" (checked separately)
     "ready_ttl_blocks": None,          # no plan default: a positive integer
     "max_source_share": 0.25,
 }
 W2_KEYS = tuple(W2_DEFAULTS)
 
-# DEC-CA-0062 placeholder / legacy keys that must keep parsing (the deployed
-# file carries the first block of them).
-LEGACY_VALUES: dict[str, object] = {
+# rev6.18 B11 (owner brief 2026-11-23): the DEC-CA-0062 placeholder keys and
+# confirm_on_king_change are RETIRED. The deployed file still carries them, so
+# each must load and change nothing (listed in the loader's RETIRED_KEYS);
+# the shipped files carry none of them.
+RETIRED_VALUES: dict[str, object] = {
+    "confirm_on_king_change": "original",
+    # rev6.23 (owner 2026-11-24): court_weights replaces it.
+    "king_decay": 0.25,
     "targets": ("energy",),
     "teacher_ref": "ephemeris:panel@1",
     "teacher_api": "ephemeris",
@@ -92,7 +101,7 @@ LEGACY_VALUES: dict[str, object] = {
     "floor": 0.2,
     "win_ttl_eras": 20,
 }
-LEGACY_KEYS = tuple(LEGACY_VALUES)
+RETIRED_LANE_D = tuple(RETIRED_VALUES)
 
 # Per key: (value A, value B) for the mutation test, plus co-keys the value
 # needs to load (until_block needs an armed from_block; a co-key set to None is
@@ -104,13 +113,16 @@ MUTATIONS: dict[str, tuple[object, object, dict]] = {
     "until_block": (UNTIL_BLOCK, UNTIL_BLOCK_2, {"from_block": ARM_BLOCK}),
     "share": (0.25, 0.1, {"takes_from": "lane_a"}),
     "takes_from": ("lane_a", "lane_c", {}),
-    "contexts": ([4096, 32768], [4096, 8192, 16384, 32768, 65536, 131072], {}),
+    # rev6.6: B is a non-default subset (the default is all six variants).
+    "contexts": ([4096, 32768], [4096, 8192, 16384], {}),
     "horizon": (32, 128, {}),
-    "forward_margin_hours": (3.0, 12.0, {}),
+    "forward_margin_hours": (3.0, 6.0, {}),   # rev6.14 (a): <= eval_delay_hours (6)
     "min_windows": (500, 2000, {}),
     "min_clusters": (10, 30, {}),
     "min_long_series": (150, 600, {}),
     "d_margin": (0.02, 0.03, {}),
+    "d_margin_start": (0.04, 0.05, {}),
+    "d_margin_warmup_settlements": (16, 64, {}),
     "alpha": (0.1, 0.01, {}),
     "bootstrap_B": (2000, 20_000, {}),
     "gate_suites": (["gift", "boom"], ["gift", "boom", "time"], {"gate_weights": None}),
@@ -118,18 +130,17 @@ MUTATIONS: dict[str, tuple[object, object, dict]] = {
                      {"gift": 1.0, "boom": 1.0, "time": 1.0, "fev": 3.0},
                      {"gate_suites": ["gift", "boom", "time", "fev"]}),
     "tau_public": (0.02, 0.005, {}),
+    # rev6.23: court_weights moves with it (co_for: one weight per slot).
     "reward_prior_kings": (3, 1, {}),
-    "king_decay": (0.25, 0.75, {}),
+    "court_weights": ([0.7, 0.2, 0.1], [0.6, 0.3, 0.1], {}),
     "max_entries_per_settlement": (4, 16, {}),
     "max_open_per_coldkey": (3, 1, {}),
     "max_bench_holds": (6, 2, {}),
     "loser_ttl_eras": (8, 2, {}),
     "max_mirror_lag_hours": (3.0, 12.0, {}),
-    "confirm_on_king_change": ("original", "restart", {}),
     "max_judged_per_coldkey_per_settlement": (1, 3, {}),
     "max_coldkey_unresolved_settlements": (6, 2, {}),
     "max_reveal_delay_days": (7, 21, {}),
-    "lowfreq_freqs": (["W"], ["D", "W"], {}),
     "ready_ttl_blocks": (1800, 2700, {}),
     "max_source_share": (0.5, 0.1, {}),
 }
@@ -150,7 +161,9 @@ REFUSED: dict[str, list[object]] = {
     "min_windows": [0, -1, True, 1.5],
     "min_clusters": [0, -1, True, 2.5],
     "min_long_series": [-1, True, 1.5],
-    "d_margin": [0.0, -0.01, 1.0, True],
+    "d_margin": [0.0, -0.01, 1.0, True, 0.05],     # 0.05 > d_margin_start (rev6.23)
+    "d_margin_start": [0.0, -0.03, 1.0, True, 0.005],  # 0.005 < d_margin
+    "d_margin_warmup_settlements": [0, -1, True, 1.5, "32"],
     "alpha": [0.0, 1.0, -0.05, True],
     "bootstrap_B": [0, -1, True, 1000.5],
     "gate_suites": [[], [""], ["gift", "gift"], "gift", [1]],
@@ -160,18 +173,19 @@ REFUSED: dict[str, list[object]] = {
                      {"gift": "1"}],
     "tau_public": [-0.01, 1.0, True],
     "reward_prior_kings": [-1, True, 1.5],
-    "king_decay": [0.0, -0.5, 1.5, True],
+    "court_weights": [[0.8, 0.2], [0.8, 0.15, 0.05, 0.0], [0.9, 0.15, -0.05],
+                      [0.8, 0.15, 0.1], [0.8, 0.15, 0.05 + 1e-8], [True, False, False],
+                      ["0.8", 0.15, 0.05], 0.8, [float("nan"), 0.5, 0.5],
+                      [float("inf"), 0.0, 0.0], []],
     "max_entries_per_settlement": [0, -1, True, 2.5],
     "max_open_per_coldkey": [0, -1, True],
     "max_bench_holds": [-1, True, 1.5],
     "loser_ttl_eras": [-1, True, 1.5],
     "dtypes": [[], ["F32"], ["BF16", "F32"], ["bf16"], "BF16"],
     "max_mirror_lag_hours": [0.0, -1.0, True],
-    "confirm_on_king_change": ["", "both", True],
     "max_judged_per_coldkey_per_settlement": [0, -1, True],
     "max_coldkey_unresolved_settlements": [0, -1, True],
     "max_reveal_delay_days": [0, -1, True],
-    "lowfreq_freqs": [[], [""], [1], "D"],
     "ready_ttl_blocks": [0, -1, True, 1.5],
     "max_source_share": [0.0, -0.1, 1.5, True],
 }
@@ -182,9 +196,21 @@ ACCEPTED: dict[str, list[object]] = {
     "horizon": [1, 64, 512],
     "takes_from": ["lane_a", "lane_b", "lane_c"],
     "dtypes": [["BF16"]],
-    "confirm_on_king_change": ["restart", "original"],
     "max_source_share": [1.0, 0.25],
+    "court_weights": [[1.0, 0.0, 0.0], [1 / 3, 1 / 3, 1 / 3], [0.80, 0.15, 0.05 + 1e-10]],
+    "d_margin_start": [0.01, 0.5],        # = d_margin (no decay) and wide
+    "d_margin_warmup_settlements": [1, 1000],
 }
+
+
+def co_for(key: str, value) -> dict:
+    """The co-keys ``key = value`` needs to load: MUTATIONS' co-keys, and
+    (rev6.23) for ``reward_prior_kings = n`` a ``court_weights`` of
+    ``1 + n`` slots (the loader refuses a length mismatch)."""
+    co = dict(MUTATIONS[key][2]) if key in MUTATIONS else {}
+    if key == "reward_prior_kings" and type(value) is int and value >= 0:
+        co["court_weights"] = [1.0] + [0.0] * value
+    return co
 
 
 # ── loading ──────────────────────────────────────────────────────────────────
@@ -195,9 +221,38 @@ def _raw_text(name: str) -> str:
     return (REPO / name).read_text(encoding="utf-8")
 
 
-def shipped_raw(name: str) -> dict:
-    """A fresh deep copy of a shipped config's tomllib table."""
+# TESTNET-FAST profile (owner 2026-11-24: lanes B/C/D end-to-end on testnet in
+# hours): chain.testnet.toml scales these [lane_d] waits / caps to its 30-min
+# settlement grid, each line commented `# TESTNET-FAST (2026-11-24): <mainnet>`.
+# key -> (release default, testnet-fast value). The default tests above run on
+# the testnet file with these restored (shipped_raw); test_w2_testnet_fast.py
+# pins the profile values themselves and that chain.toml carries none of them.
+TESTNET = "chain.testnet.toml"
+TESTNET_FAST_LANE_D: dict[str, tuple[object, object]] = {
+    "eval_delay_hours": (6.0, 0.5),
+    "min_windows": (1000, 200),
+    "min_clusters": (20, 5),
+    "min_long_series": (300, 30),
+    "d_margin_warmup_settlements": (32, 4),
+    "embargo_hours": (48.0, 1.0),
+    "max_windows_per_settlement": (5000, 1000),
+}
+
+
+def file_raw(name: str) -> dict:
+    """The shipped file exactly as written (testnet-fast profile included)."""
     return tomllib.loads(_raw_text(name))
+
+
+def shipped_raw(name: str) -> dict:
+    """A fresh deep copy of a shipped config's tomllib table; on the testnet
+    file the TESTNET-FAST [lane_d] keys are restored to their release default."""
+    raw = file_raw(name)
+    if name == TESTNET:
+        ld = raw.setdefault("lane_d", {})
+        for k, (default, _fast) in TESTNET_FAST_LANE_D.items():
+            ld[k] = default
+    return raw
 
 
 def raw_with(name: str, lane_d: dict | None = None, *, drop: tuple[str, ...] = (),

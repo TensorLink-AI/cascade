@@ -132,7 +132,7 @@ Top level (all required): `schema`, `boundary`, `signer`, `signature`,
 
 | object | required fields (the tests check these; more are the builder's choice, but they must be in the schema) |
 |---|---|
-| `params` | `share`, `takes_from`, `remainder`, `horizon`, `horizons` (§14.3 horizon list, `[horizon]` today), `contexts`, `forward_margin_hours`, `max_mirror_lag_hours`, `min_windows`, `min_clusters`, `d_margin`, `alpha`, `bootstrap_B`, `king_decay`, `reward_prior_kings`, `confirm_on_king_change`, `max_entries_per_settlement`, `max_judged_per_coldkey_per_settlement`, `scoring_levels`, `gate_suites` (§14.3 suite list), `tau_public`, `lowfreq_freqs`, **(RV4)** `gate_weights` (`{suite: weight}` as parsed: keys ⊆ `gate_suites`, a suite absent from the table is absent here; finite numbers ≥ 0), `max_source_share` (number in (0, 1]), `min_long_series` (int ≥ 0). Each equals the parsed `[lane_d]` value (lists as JSON lists) |
+| `params` | `share`, `takes_from`, `remainder`, `horizon`, `horizons` (§14.3 horizon list, `[horizon]` today), `contexts`, `forward_margin_hours`, `max_mirror_lag_hours`, `min_windows`, `min_clusters`, `d_margin`, **(rev6.23)** `d_margin_start`, `d_margin_warmup_settlements`, `alpha`, `bootstrap_B`, ~~`king_decay`~~ **(rev6.23)** `court_weights` (JSON list), `reward_prior_kings`, `confirm_on_king_change`, `max_entries_per_settlement`, `max_judged_per_coldkey_per_settlement`, `scoring_levels`, `gate_suites` (§14.3 suite list), `tau_public`, `lowfreq_freqs`, **(RV4)** `gate_weights` (`{suite: weight}` as parsed: keys ⊆ `gate_suites`, a suite absent from the table is absent here; finite numbers ≥ 0), `max_source_share` (number in (0, 1]), `min_long_series` (int ≥ 0). Each equals the parsed `[lane_d]` value (lists as JSON lists) |
 | `pool` | `snapshot`, `sha256`, `horizon` (the newest snapshot's), `first_seen_roots`: the B12 daily Merkle roots the snapshots rely on, sorted, from pool metadata `first_seen_roots` (the sorted union of `snapshots[].first_seen_roots`), **(RV4)** `snapshots` |
 | `pool.snapshots[]` | **(RV4)** `snapshot`, `sha256` (64-hex), `first_seen_roots` (64-hex list) |
 | `entries[]` | `digest`, `hotkey`, `coldkey` (A8: as recorded at `ready`, `null` if unresolved), `context` (§14.3 per-entry context), `ready_block`, `reveal_block`, `reveal_ts`, `status`, `reason` |
@@ -197,12 +197,83 @@ to W5e and W5g.
 separators=(",", ":"), allow_nan=False)` (A9). The tests re-derive it
 independently.
 
+## Armed contexts (rev6.6, owner 2026-11-23): `test_w7a_armed.py`
+
+Plan rev6.6 §1.1: "The main validator records the armed set and its evidence
+in the signed report", so satellites verify it (W7d) instead of re-deriving it
+from `cfg.contexts`. `params.contexts` stays the **declarable** set.
+
+- `settle_lane_d(..., armed=None)` is keyword-only. `armed` is the W5d
+  `armed_record` result `{"armed_contexts": [...], "evidence": {...}}`. With
+  it, the report carries the top-level `armed_contexts` (the record's list) and
+  `armed_evidence` (the record's `evidence`, verbatim), and both are inside the
+  signed body. Without it (the legacy call) neither field is present, and the
+  report is exactly what it was before rev6.6.
+- Registration is unchanged. An entry whose context is in `cfg.contexts`
+  opens whether or not the variant is armed (the eval host scores it at W5d's
+  `effective_context`). A context outside `cfg.contexts` is closed
+  `context_not_armed`.
+- A bad record is refused with `LaneDArmedError` (a `ValueError` whose `.code`
+  is `no_armed_context` or `armed_invalid`) **before** any state, pool or
+  report is read or written. Writing nothing is pinned by an empty state dir.
+  - `no_armed_context`: `armed_contexts` is empty. Nothing armed means nothing
+    can be scored.
+  - `armed_invalid`: anything else. Examples: not an object; a key other than
+    the two; an evidence key other than `min_long_series`, `min_sources`,
+    `readiness_sha256`, `t7_sha256` and `variants`; `variants` not exactly
+    `cfg.contexts` ascending, each `{context, series, sources, t7_fits,
+    armed}` with non-negative ints and bools; `armed` not equal to
+    `series >= min_long_series and sources >= min_sources and t7_fits`;
+    `armed_contexts` not equal to the armed variants ascending;
+    `min_long_series` not equal to `cfg.min_long_series`; `min_sources` not 20;
+    a sha256 that is neither 64 lower-case hex nor `null`.
+- Schema: `armed_contexts` (an array of ints, `minItems` 1) and
+  `armed_evidence` (closed objects) are optional top-level properties.
+  `validate_report` adds the cross-field rules:
+  - one without the other is `missing_field` at the absent one;
+  - `null` is `bad_type`;
+  - an empty set, a value outside `params.contexts`, evidence that doesn't
+    support the set, a recomputed `armed` flag that disagrees, `variants` not
+    covering `params.contexts`, or `min_long_series` not equal to
+    `params.min_long_series` is `bad_value` at an `armed_*` path;
+  - an unknown key is `unknown_field`.
+- On main, `settle_lane_d` has no `armed` keyword. The settle tests fail on
+  the `_settle_takes_armed` assertion (never a `TypeError`, never a fixture
+  error), and the schema test fails on its assertion.
+  `test_schema_file_top_level_fields_are_exact_and_closed` fails on the new
+  `TOP_LEVEL_OPTIONAL`.
+
+### Correction (plan rev6.15, owner 2026-11-23): `context_below_armed`
+
+"Highest ≤ declared, else skip". With the `armed` record given, after the
+W5h queue selection, each chosen member whose declared `context` has no
+armed variant ≤ it (`min(armed_contexts) > context`, computed from the
+record, without importing the scorer) is not judged:
+
+- it gets status `pending` (unchanged) and reason `context_below_armed`, is
+  listed once in `skipped`, and appears in neither `judged` nor `verdicts`;
+- the house challenger is exempt: it declares no context, and W8c always
+  forecasts it (4096, else the highest armed below, else the lowest armed);
+- the legacy call (`armed=None`) and an entry with an armed variant ≤ its
+  context are unchanged.
+
+`context_below_armed` is appended to `SKIP_REASONS` (and so to
+`ENTRY_REASONS`) and to both enums of the schema file. The report stays
+`lane-d-report/1`.
+
+The `validate_report` cross-check is `bad_value` when a
+`context_below_armed` skip has no `armed_contexts`, or when the entry's
+`context` is ≥ some armed variant.
+
+Tests: the last six of `test_w7a_armed.py`. On main they fail on their
+assertions: the reason is not in the enum, and the entry is judged at 8192.
+
 ## Enums (exact sets)
 
 | name | values |
 |---|---|
 | `ENTRY_STATUSES` | `pending`, `hold`, `confirm_pending`, `crowned`, `lost`, `closed` |
-| `SKIP_REASONS` | `pending_floor`, `coldkey_cap_settlement`, `coldkey_unresolved`, `coldkey_changed`, `king_unscored`, `bench_hold`, `deregistered`, `ready_expired`, `reveal_delay_exceeded`, `duplicate_digest`, `hotkey_has_open_entry`, `context_not_armed`, `checkpoint_fault`, `mirror_lag_exceeded`, `lane_closed` (W5b: closed at `until_block`) |
+| `SKIP_REASONS` | `pending_floor`, `coldkey_cap_settlement`, `coldkey_unresolved`, `coldkey_changed`, `king_unscored`, `bench_hold`, `deregistered`, `ready_expired`, `reveal_delay_exceeded`, `duplicate_digest`, `hotkey_has_open_entry`, `context_not_armed`, `checkpoint_fault`, `mirror_lag_exceeded`, `lane_closed` (W5b: closed at `until_block`), `context_below_armed` (rev6.15: no armed variant ≤ the declared context; stays `pending`) |
 | `ENTRY_REASONS` | `SKIP_REASONS` plus `confirm_pending`, `lost_duel`, `lost_confirmation`, `lowfreq_regression`, `gate_regression` (RV4: a judged loss on the §1.3b gate, like `lowfreq_regression`, so not a skip), `crowned` |
 | `BURN_REASONS` | `house_king` (D21: the house holds KING_D), `deregistered` (B8: a court member lost its UID) |
 | `WINDOW_REFUSAL_REASONS` | W5a's `REFUSAL_REASONS`, in precedence order: `missing_clock`, `unlisted_feed` (W5a fail-closed), `forecast_product`, `over_lag`, `before_margin`, `publish_ahead`, `late_mirror`, `absent_from_s0`, `backfill` |
@@ -509,3 +580,154 @@ suites. That shows the contract can be built and that every honest fixture
 report PASSes.
 
 `test_w7a_audit_gate.py` and every other W7a test file are unchanged.
+
+### Correction (rev6.11, rev6.12): no confirmation duel; embargo, fresh share and draw fields
+
+Tests-correction PR (w0c `--tests-correction`). Plan rev6.11 (b) drops the
+confirmation duel (crown at the first verdict, W5e); rev6.10 (a)/(b),
+rev6.11 (a) and rev6.12 (a)/(b) add the embargo, the W5j draw and the
+minimum fresh share to the report. This supersedes the enum, field and
+fixture text above where they disagree.
+
+**Removed (rev6.11 (b)).** `ENTRY_STATUSES` loses `confirm_pending`;
+`ENTRY_REASONS` loses `confirm_pending` and `lost_confirmation`;
+`CONFIRM_RULES` and `$defs.confirm_rule` go; `$defs.confirmation` (the
+block) goes and a verdict carrying `confirmation` is `unknown_field`;
+`confirmation_stage`, if kept, is exactly `["first"]` (a `stage` of
+`confirm` is `bad_value`, or `unknown_field` if `stage` is dropped);
+`verdict_outcome` equals `VERDICT_OUTCOMES`, holds `lost` and `crowned`
+and neither `confirm_pending` nor `confirmed` (the name of a held / passing
+non-best outcome is the builder's); `params.confirm_on_king_change` leaves
+the echo (`unknown_field`). Stay on `/1` (plan rec).
+
+**Fixture.** `loser_then_crown` (new; `two_settlements` stays as it was for W9, W8b and W8c) judges the loser L alone at BOUNDARY_1
+(lost / `lost_duel`, the house keeps the slot: `house_king`) and the
+challenger, revealed after BOUNDARY_1, at BOUNDARY_2, where its first
+verdict crowns. Every fixture feed pins `embargo_hours: 0` (W5a fails a feed
+without it closed), and W3b5's pool used here is patched the same way.
+
+**Audit (`check_lane_d`, in PATHS).** A crown is first clear ∧ A10 ∧ gate:
+a cleared verdict is the crowning candidate; `bench_hold` / no gate record
+holds it (neither crowned nor lost, entry `hold` / `bench_hold`); a cohort
+or verdict with `stage: "confirm"` FAILs; every cohort is judged against
+`king_before`; `held_from` names the settlement where the FIRST verdict
+cleared and was held, and its `king_d` must be `king_before` (no D20: a king
+change drops the hold); in chain mode the named report must hold that held
+verdict (a report where the gate passed or crowned it is not a hold). The
+RV7 (b) first-clear chain is gone; a loser doctored into a crown FAILs.
+
+**New report fields.**
+
+| object | field | rule |
+|---|---|---|
+| `params` | `embargo_hours`, `max_windows_per_settlement`, `min_fresh_window_share` | required, as parsed (W2e; tests read them with the plan defaults 48 / 5000 / 0.5) |
+| `windows[]` | `freq` | the series' pool `freq` |
+| | `embargo_hours` | the effective e, number in [0, `params.embargo_hours`] |
+| | `min_release_ts` | `min_first_seen_ts + round(3600 · embargo_hours)` |
+| | `rule` | `embargo0` iff `embargo_hours == 0`, else `embargo` (`$defs.window_rule`) |
+| | `embargo_window` | bool: `false` = fresh, `true` = embargo (mixed included); `embargo0` ⇒ `false` |
+| | `timeframe`, `bin`, `kind`, `freq_class`, `h`, `origin` | the draw cell (W5j / W5i names; `$defs.window_bin`, `window_kind`, `freq_class`); `h` and `origin` equal the window id's `h<h>` and middle field |
+| `cohorts[]` | `fresh_windows`, `embargo_windows` | the counts of its windows by flag; `fresh ≥ min_fresh_window_share × size` (else `bad_value` at `embargo_windows`) |
+| `verdicts[]` | `fresh`, `embargo` | closed `{n, geomean}`: the member's rows on the cohort's fresh / embargo windows; `geomean` is the lane D `_geo` of those rows (rel. 1e-9), `null` iff `n == 0` |
+| top level | `draw` (optional, never `null`) | `{boundary_block_hash (0x + 64 hex), seed = "<hash>:lane_d_windows", max_windows_per_settlement = params', cohorts[]: {index (a cohort of the report), quota, capacity ({"<timeframe>|<bin>": int}, quota ≤ capacity), candidates_sha256}}` |
+| `cohorts` | — | the judged windows across cohorts never exceed `max_windows_per_settlement` (`bad_value` at `cohorts`) |
+
+Tests: `test_w7a_embargo_fields.py` (spliced through
+`helpers.with_embargo_fields`, plus the producer's own report). Whether a
+window is fresh relative to its cohort's `b` is re-derived by W9 / W7d, not
+by `validate_report`.
+
+**On main** (W5e still confirms, W7a's schema still has the confirm enums):
+every changed file's failures are `AssertionError`s: the producer still
+writes `confirm_pending` / the confirmation block / the old params, the
+spliced reports are refused `unknown_field`, and the audit expects
+confirmations. A scratch prototype (W5e stage removed, the schema and
+validator rules above, the producer emitting the fields, the audit changes)
+passed every W7a, W5e and W5a test (462).
+
+**Order:** the W7a implementation needs W2e's keys and lands after W5e's
+(the audit's honest fixtures crown at the first verdict).
+
+### Scoring host (rev6.18 B7)
+
+Tests: `test_w7a_host.py`. `settle_lane_d(..., host=None)` (keyword-only)
+takes the verified eval host record; given, it must pass
+`host_record_problem` (else `ValueError` before anything is written) and is
+signed as the top-level `host` (schema `$defs.host`: exactly `env`,
+`gpu_model`, `driver`, `torch_build`, `fingerprint`, `identity`).
+`validate_report` re-checks the identity (`bad_value` at `host`).
+`LaneDInputs.host` (W8b) carries it to `settle_lane_d`. Absent without a host.
+
+## Multichannel windows (rev6.18 F2): `test_w7a_multivariate.py`, `mv.py`
+
+`mv.py` is the multichannel chain fixture the F2 tests of W5d/W5e/W7a/W9
+share: W7a's synthetic chain with chosen sources stored `(C, L)`, the
+channel pick re-stated from the plan, and `settle_mv` (asserts
+`settle_lane_d` takes `max_channels`).
+
+- `$defs.window` has six optional properties, present exactly on a
+  multichannel window (C >= 2 stored channels): `series_id`,
+  `n_channels_raw` (>= 2), `empty_channels` (ascending, distinct, below
+  `n_channels_raw`), `n_channels` (>= 1, at most the non-empty count),
+  `channels` (the scored indices, ascending, none empty) and
+  `channels_sha256` (sha256 of the compact JSON list `channels`). The
+  window's `if {required: [n_channels]} then {required: all six}` and the
+  cross-field check enforce all-or-none. A univariate window carries none
+  of them, so a univariate report is unchanged.
+
+## Public sources (rev6.18 F3): `test_w7a_public.py`, `pub.py`
+
+`pub.py` settles F2's chain with `settle_lane_d(..., public_indexes=)`
+(the tiny GiftEvalPretrain and RMISC mirrors of
+`tests/accept/w6p/fixtures.py`; asserts the keyword first). It is shared
+with W9.
+
+- Top-level optional `public` (absent, never null, when no index is
+  given): `{schema: "lane-d-public/1", sources: [...]}`, one entry per
+  source, sorted by `source` (`gift_eval_pretrain`, `rmisc`).
+- `$defs.public_source` (closed): `source`, `repo`, `revision` (40
+  hex, the ONE pinned HF revision), `index_sha256`, `files_sha256`,
+  `seed` (`<boundary block hash>:lane_d_public:<source>`), `n_windows`
+  (5000), `horizon` (`[lane_d] horizon`), `min_history` (128),
+  `multi_window`, `capacity` / `quota` (`{"<family>|<freq>": n}`),
+  `windows` (`$defs.public_window`: `window_id`, `ordinal`, `family`,
+  `freq`, `cut`, `h`, `length`) and `dropped` (`{window_id, reason}`,
+  the read-time drops of W5k).
+- Cross-field (`_check_public`): sources unique and sorted; the seed on the
+  report's block hash (the draw's / gate's); quotas sum to at most
+  `n_windows`, each at most its capacity, each cell's drawn windows at most
+  its quota; window ids unique, sorted, `<source>:<series_id>:<cut>:h<h>`,
+  `h = horizon`, `min_history <= cut <= length - h`, no two targets of a
+  series overlapping; dropped windows drawn, unique, sorted.
+
+On main these tests fail on the `public_indexes` assertion or the schema's
+top-level property set (`TOP_LEVEL_OPTIONAL` now lists `public`).
+
+## Schema minor (rev6.18 F4: A3, A7, A8, D24)
+
+`lane-d-report/1` gains, per verdict, `halves` (`live`, and at
+`public_weight > 0` `public`: `{n, gain}`), `sources` (`live`,
+`gift_eval_pretrain`, `rmisc`) and `domains` (`live|<source>`,
+`<source>|<family>`), every gain `1 - exp(-mean clamped log-ratio)`; the
+`public` block gains `rows` (every judged digest on every kept public window,
+window_id then digest order) and `rows_sha256`; `params` gains
+`public_weight` and `window_ratio_floor`. Removed: the A10 `lowfreq` block,
+`lowfreq_regression`, `params.lowfreq_freqs` (A7), the backtest window kind
+and bins (D24). `validate_report` binds them (`_check_halves`; the public
+rows digest is checked with `rows_sha256`). The house judgement keeps its
+four fields. `test_w7a_f4_fields.py` pins it; the A10 field tests are
+corrected (owner decisions A7 / D24), and `pub.py` gains the index-only
+public fixture (no pyarrow) and the eval host's public scores.
+
+## Correction (owner 2026-11-23): `min_fresh_window_share` default 0.5 -> 0.2
+
+Owner rule: "fresh data should always be in there, but trade off" and "first
+verdict ~6 h". The W1 forge measured ~250 fresh windows at T+6 h, so a 0.5
+share would hold verdicts ~24 h. The default (loader, both shipped files) is
+**0.2**; fresh windows are still drawn first and always included. The tests
+that pinned the 0.5 default now pin 0.2. Lane D is not rolled out, so there is
+no activation key.
+
+## rev6.14 (a): judging start vs eligibility boundary (owner 2026-11-23)
+
+The report signs the optional top-level `boundary_ts` (the boundary block's on-chain `Timestamp.Now`; absent, never null, on the legacy call) and echoes `params.eval_delay_hours`; `SKIP_REASONS` gains `before_eval_delay` and `boundary_ts_missing`. `validate_report` refuses a cohort with `boundary_ts < t_max + 3600 * eval_delay_hours` (`bad_value` at `cohorts[i]`), a judged cohort without `boundary_ts` (`missing_field`), a `boundary_ts_missing` skip on a stamped settlement, a `before_eval_delay` skip whose start has passed, and `forward_margin_hours > eval_delay_hours`. `test_w7a_rev614.py`.

@@ -1,0 +1,143 @@
+# Lane D RMISC allowed list (LANE_D_PLAN rev6.18 A5). Written by
+# scripts/laned_rmisc_allowlist.py finalize; do not hand-edit.
+schema = "lane-d-rmisc-allowed/1"
+repo = "nju-zhangsq/RMISC"
+revision = "d0cdd935300ca9b3b2d6f23e6085db24cb7560c2"
+status = "final"
+generated_by = "laned_rmisc_allowlist.py finalize; candidates sha256 2e1a5c3083b9a422; datacompare sha256 bf9b580504aa8823"
+
+[[folder]]
+name = "AzurePublicDatasetV2"
+reason = "no name match in the exclusion sources; data compare pass (max hit fraction 0.0074)"
+licence = "CC BY 4.0"
+domain = "Energy"
+freq = "5min"
+data_check = "pass"
+
+[[folder]]
+name = "Behavior-1k"
+reason = "no name match in the exclusion sources; data compare pass (max hit fraction 0.0091)"
+licence = "MIT"
+domain = "Industry"
+freq = "unknown"
+data_check = "pass"
+
+[[folder]]
+name = "BuildingsBenchComAmy"
+reason = "no name match in the exclusion sources; data compare pass (max hit fraction 0.0039)"
+licence = "Apache"
+domain = "Energy"
+freq = "h"
+data_check = "pass"
+
+[[folder]]
+name = "BuildingsBenchComTmy"
+reason = "no name match in the exclusion sources; data compare pass (max hit fraction 0.0040)"
+licence = "Apache"
+domain = "Energy"
+freq = "h"
+data_check = "pass"
+
+[[folder]]
+name = "BuildingsBenchResAmy"
+reason = "no name match in the exclusion sources; data compare pass (max hit fraction 0.0034)"
+licence = "Apache"
+domain = "Energy"
+freq = "h"
+data_check = "pass"
+
+[[folder]]
+name = "BuildingsBenchResTmy"
+reason = "no name match in the exclusion sources; data compare pass (max hit fraction 0.0034)"
+licence = "Apache"
+domain = "Energy"
+freq = "h"
+data_check = "pass"
+
+[[folder]]
+name = "CSTSNormalTest"
+reason = "no name match in the exclusion sources; data compare pass (max hit fraction 0.0000)"
+licence = "CC BY 4.0"
+domain = "Others"
+freq = "s"
+data_check = "pass"
+
+[[folder]]
+name = "CSTSNormalTrain"
+reason = "no name match in the exclusion sources; data compare pass (max hit fraction 0.0000)"
+licence = "CC BY 4.0"
+domain = "Others"
+freq = "s"
+data_check = "pass"
+
+[[folder]]
+name = "ChinaMinuteStock"
+reason = "no name match in the exclusion sources; data compare pass (max hit fraction 0.0057)"
+licence = "MIT"
+domain = "Finance"
+freq = "min"
+data_check = "pass"
+
+[[folder]]
+name = "EbayServer"
+reason = "no name match in the exclusion sources; data compare pass (max hit fraction 0.0120)"
+licence = "CC BY 4.0"
+domain = "Others"
+freq = "unknown"
+data_check = "pass"
+
+[[folder]]
+name = "GasSensorDynamic"
+reason = "no name match in the exclusion sources; data compare pass (max hit fraction 0.0030)"
+licence = "CC BY 4.0"
+domain = "Industry"
+freq = "unknown"
+data_check = "pass"
+
+[[folder]]
+name = "MiniApp"
+reason = "no name match in the exclusion sources; data compare pass (max hit fraction 0.0146)"
+licence = "GPL-3.0"
+domain = "Others"
+freq = "unknown"
+data_check = "pass"
+
+[[folder]]
+name = "NIFTYStock"
+reason = "no name match in the exclusion sources; data compare pass (max hit fraction 0.0156)"
+licence = "CC0"
+domain = "Finance"
+freq = "unknown"
+data_check = "pass"
+
+[[folder]]
+name = "OilWell"
+reason = "no name match in the exclusion sources; data compare pass (max hit fraction 0.0146)"
+licence = "CC BY 4.0"
+domain = "Energy"
+freq = "unknown"
+data_check = "pass"
+
+[[folder]]
+name = "ResidentialPower"
+reason = "no name match in the exclusion sources; data compare pass (max hit fraction 0.0097)"
+licence = "CC BY 4.0"
+domain = "Energy"
+freq = "min"
+data_check = "pass"
+
+[[folder]]
+name = "TetuanPowerConsumption"
+reason = "no name match in the exclusion sources; data compare pass (max hit fraction 0.0196)"
+licence = "CC BY 4.0"
+domain = "Energy"
+freq = "10min"
+data_check = "pass"
+
+[[folder]]
+name = "WADI"
+reason = "no name match in the exclusion sources; data compare pass (max hit fraction 0.0143)"
+licence = "Apache-2.0"
+domain = "Industry"
+freq = "5s"
+data_check = "pass"

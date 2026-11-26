@@ -14,7 +14,7 @@
 #   4. PLAN snapshot  the §10.8 state files into <root>/_state_backups/<ts>/;
 #   5. PLAN restart   the service on the release (python -P, PYTHONPATH,
 #                     systemd scope, OOM score -500), or for the eval host an
-#                     ssh sync of the release + `uv sync --frozen`;
+#                     ssh sync of the release + `uv sync --frozen --inexact` (keeps the host profile extras);
 #   6. PLAN verify    <release>/scripts/deploy_gate.py verify.
 # --dry-run prints those lines and changes nothing. --execute prints each
 # line as RUN and runs it, stopping at the first failure. A rollback is the
@@ -476,7 +476,7 @@ laned_emit_restart_eval_host() {
   laned_step_shown restart \
     "git -C $RELEASE_DIR ls-files -z | $(laned_quote "${rsync_argv[@]}")" \
     laned_sync_eval_host "${rsync_argv[@]}"
-  laned_step restart "${ssh_argv[@]}" "cd $REMOTE_DIR && PATH=\"\$HOME/.local/bin:\$PATH\" uv sync --frozen"
+  laned_step restart "${ssh_argv[@]}" "cd $REMOTE_DIR && PATH=\"\$HOME/.local/bin:\$PATH\" uv sync --frozen --inexact"
   laned_step restart "${ssh_argv[@]}" \
     "cd $REMOTE_DIR && .venv/bin/python -P -c 'import cascade.validator.private_worker'"
 }

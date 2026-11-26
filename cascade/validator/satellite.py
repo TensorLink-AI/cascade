@@ -31,12 +31,26 @@ d. re-derives everything else with the code ``cascade-audit`` runs
    recorded one (``weights-derive``);
 e. at every weight push, checks each paid UID against its OWN metagraph: the
    hotkey registered at that UID must be one the receipt pays
-   (``reward-uid``).
+   (``reward-uid``). Lane D's verified signed court (#913) is attributed
+   apart: a lane D court uid registered to another hotkey burns lane D's
+   share only (``lane_d_check_burn``), lanes A/B/C as derived.
 
 All checks pass ⇒ the satellite sets the vector it derived through the chain
 client's weight path (float32 → u16 quantisation, ``WEIGHT_RETRY_BLOCKS``
 backoff). Any failure ⇒ it burns (``burn_uid``) while staying active and logs
-the failing check at every push until a receipt replays cleanly. Main silent ⇒
+the failing check at every push until a receipt replays cleanly — except
+lane D (LANE_D_PLAN rev6.18 B1/B3): at a settlement lane D pays, the
+satellite reads the lane D record (``lane-d/reports``, the receipt record
+the round receipt embeds) and the audit's one lane D checker decides it
+(the ``lane_d`` row, :func:`cascade.audit.checks.check_lane_d_pay`). A
+``burn``-class failure burns lane D's share ONLY (lanes A/B/C are set as
+derived; log tag ``lane_d_check_burn``); an ``alert``-class one is logged
+(``lane_d_check_alert``) and the signed court stays paid. Lanes B and C
+are scoped the same way (containment, owner 2026-11-24): a FAIL on a lane
+B / lane C row (``lane_b``; ``lane_c``, ``lane_c_chain``, ``marketcast*``)
+at a settlement that lane pays burns that lane's share ONLY (log tags
+``lane_b_check_burn`` / ``lane_c_check_burn``); lane A and lane D are set
+from the satellite's own derivation. Main silent ⇒
 it re-asserts the last verified vector until ``[satellite] stale_after_blocks``
 past that settlement's boundary, then burns until a new receipt verifies.
 
@@ -80,6 +94,63 @@ UNVERIFIABLE_WARN = frozenset({"receipt-signature", "manifest-signature", "netco
                                "bench-coverage", "calendar-launch"})
 
 
+# Containment (owner 2026-11-24): audit rows owned by ONE of lanes B / C. A
+# FAIL on one of them at a settlement that lane pays burns that lane's share
+# only (log tag ``lane_b_check_burn`` / ``lane_c_check_burn``); lane A and
+# lane D are set as derived. Everything else (lane A's rows, the sentinel —
+# a lane A gate —, the netconfig row, signatures, continuity) still burns the
+# whole vector.
+LANE_ROWS = {"lane_b": "b", "lane_c": "c", "lane_c_chain": "c", "marketcast": "c",
+             "lane_c_registrations": "c"}
+
+
+def _lane_of_row(name: str) -> str | None:
+    """``"b"`` / ``"c"`` for a lane-owned audit row (``marketcast:<kind>``
+    spec instances are lane C's), else ``None``."""
+    if name.startswith("marketcast:"):
+        return "c"
+    return LANE_ROWS.get(name)
+
+
+def _lane_pays(cfg: ChainConfig, lane: str, boundary: int) -> bool:
+    return bool((cfg.lane_b if lane == "b" else cfg.lane_c).active(int(boundary)))
+
+
+def _lane_shares(cfg: ChainConfig, boundary: int) -> dict[str, float]:
+    """Lane B's / lane C's allocations at ``boundary`` (0 when not paying)."""
+    from ..shared.lane_c import lane_pool_shares
+
+    b = cfg.lane_b if cfg.lane_b.active(boundary) else None
+    c = cfg.lane_c if cfg.lane_c.active(boundary) else None
+    d = cfg.lane_d if cfg.lane_d.active(boundary) else None
+    try:
+        sb, sc, _ = lane_pool_shares(b, c, d)
+    except ValueError:
+        return {"b": 0.0, "c": 0.0}
+    return {"b": float(sb) if b is not None else 0.0, "c": float(sc) if c is not None else 0.0}
+
+
+def within_lane_envelope(recorded: list[float], burned: list[float], *, burn_uid: int,
+                         share: float) -> bool:
+    """Containment attribution of a ``weights`` mismatch: True when the
+    recorded vector differs from ``burned`` (the satellite's derivation with
+    the suspect lanes' shares on ``burn_uid``) ONLY by up to ``share`` moved
+    off ``burn_uid`` onto other uids — exactly what a wrong lane B / lane C
+    payout can do. Every other uid's recorded weight is at least the derived
+    one, and the excess sums to at most ``share``."""
+    eps = 1e-9
+    if len(recorded) != len(burned) or share <= 0.0:
+        return False
+    excess = 0.0
+    for u, (r, w) in enumerate(zip(recorded, burned, strict=True)):
+        if u == int(burn_uid):
+            continue
+        if float(r) < float(w) - eps:
+            return False
+        excess += float(r) - float(w)
+    return excess <= float(share) + eps
+
+
 class Transient(Exception):
     """A check could not run (storage, verifier). Retry; never a verdict."""
 
@@ -103,6 +174,10 @@ class Replay:
     burn_uid: int = 0
     attribution: dict = field(default_factory=dict)
     advance: bool = True
+    # #913: when ``vector`` pays lane D's signed court, the same derivation
+    # with lane D's share on ``burn_uid`` (lanes A/B/C identical); a lane D
+    # payee the satellite's metagraph does not register burns to it.
+    vector_d_burned: list[float] | None = None
 
 
 def _fail(check: str, detail: str, *, advance: bool = True) -> Replay:
@@ -134,10 +209,13 @@ def _anchor_of(receipt) -> dict:
     }
 
 
-def _attribution(receipt) -> dict:
+def _attribution(receipt, lane_d_court: dict | None = None) -> dict:
     """Who the receipt pays: every hotkey its posterior state pays (plus the
     verdict's king) and the ``uid -> hotkey`` pairs the lane payout records
-    pin explicitly."""
+    pin explicitly. ``lane_d_court`` (#913): the ``{uid: hotkey}`` slots of
+    lane D's verified signed court (KING_D, then prior kings) when the
+    derived vector pays it; kept apart under ``"lane_d"`` so a lane D payee
+    mismatch burns lane D's share only (:meth:`SatelliteRunner.desired`)."""
     from ..shared.settlement_state import paid_hotkeys
 
     paid = paid_hotkeys(getattr(receipt, "state_post", None))
@@ -150,7 +228,30 @@ def _attribution(receipt) -> dict:
             if w.get("hotkey") is not None and w.get("uid") is not None:
                 pinned[str(int(w["uid"]))] = str(w["hotkey"])
                 paid.add(str(w["hotkey"]))
-    return {"paid": sorted(paid), "pinned": pinned}
+    out = {"paid": sorted(paid), "pinned": pinned}
+    if lane_d_court:
+        out["lane_d"] = {str(int(u)): str(h) for u, h in sorted(lane_d_court.items())}
+    return out
+
+
+def lane_d_payee_problem(vector: list[float], burned: list[float], hotkeys: list[str],
+                         attribution: dict) -> str | None:
+    """#913: ``None`` when every uid lane D's part of ``vector`` pays (weight
+    above ``burned``, the same vector with lane D's share burned) is
+    registered on the satellite's own metagraph to the hotkey lane D's
+    signed court names for it; else why not."""
+    pins = {int(u): str(h) for u, h in (attribution.get("lane_d") or {}).items()}
+    for u, (w, b) in enumerate(zip(vector, burned, strict=False)):
+        if float(w) - float(b) <= 1e-12:
+            continue
+        if u not in pins:
+            return f"uid {u} carries lane D weight but lane D's signed court names no hotkey for it"
+        if u >= len(hotkeys):
+            return f"lane D uid {u} is past the metagraph's {len(hotkeys)} uids"
+        if str(hotkeys[u]) != pins[u]:
+            return (f"lane D uid {u} is registered to {str(hotkeys[u])[:12]}…, lane D's signed "
+                    f"court names {pins[u][:12]}…")
+    return None
 
 
 def check_reward_uids(vector: list[float], burn_uid: int, hotkeys: list[str],
@@ -161,6 +262,8 @@ def check_reward_uids(vector: list[float], burn_uid: int, hotkeys: list[str],
     record names); else why not."""
     paid = set(attribution.get("paid") or ())
     pinned = {int(u): str(h) for u, h in (attribution.get("pinned") or {}).items()}
+    # #913: lane D's court slots (checked first by lane_d_payee_problem)
+    lane_d = {int(u): str(h) for u, h in (attribution.get("lane_d") or {}).items()}
     for u, w in enumerate(vector):
         if w <= 0 or u == burn_uid:
             continue
@@ -169,7 +272,7 @@ def check_reward_uids(vector: list[float], burn_uid: int, hotkeys: list[str],
         hk = str(hotkeys[u])
         if u in pinned and pinned[u] != hk:
             return f"uid {u} is registered to {hk[:12]}…, the payout record names {pinned[u][:12]}…"
-        if hk not in paid:
+        if hk not in paid and lane_d.get(u) != hk:
             return f"uid {u} is registered to {hk[:12]}…, which the receipt does not pay"
     return None
 
@@ -221,12 +324,15 @@ def replay_receipt(receipt, cfg: ChainConfig, *, reader: Any, prev: dict | None,
     check cannot run."""
     from ..audit.checks import (
         FAIL,
+        LANE_D_ROW,
         WARN,
         check_lane_c_chain,
         derive_weights,
         ladder_prior_mismatch,
+        lane_d_court_payees,
     )
-    from ..audit.main import apply_receipt_overlay, audit_receipt
+    from ..audit.lane_d import TRANSIENT_CODE
+    from ..audit.main import apply_receipt_overlay, audit_receipt, fetch_lane_d_record
     from ..shared.activation import apply_receipt_activation
     from ..shared.era import forfeited_hotkeys
     from ..shared.hippius import manifest_round_key
@@ -302,6 +408,7 @@ def replay_receipt(receipt, cfg: ChainConfig, *, reader: Any, prev: dict | None,
             raise Transient(f"calendar-launch: {exc}") from exc
         cfg_audit = cfg_r
     # c. continuity
+    scoped: dict[str, str] = {}       # lane -> the failed lane-owned check
     post = getattr(receipt, "state_post", None)
     if post is None:
         return _fail("continuity", "the receipt records no state_post")
@@ -345,7 +452,9 @@ def replay_receipt(receipt, cfg: ChainConfig, *, reader: Any, prev: dict | None,
                                   lane_c=prev.get("lane_c"))
         row = check_lane_c_chain([prev_ns, receipt], cfg_r)
         if row.status == FAIL:
-            return _fail("lane_c_chain", row.detail)
+            if not _lane_pays(cfg_r, "c", boundary):
+                return _fail("lane_c_chain", row.detail)
+            scoped["c"] = f"lane_c_chain: {row.detail}"
     else:
         log.warning("round=%s: first receipt this satellite replays — continuity is "
                     "anchored here", rid)
@@ -358,29 +467,120 @@ def replay_receipt(receipt, cfg: ChainConfig, *, reader: Any, prev: dict | None,
         sentinel_replay(receipt, cfg_r, client)
     except ValueError as e:
         return _fail("sentinel", str(e))
+    # rev6.18 B1: at a settlement lane D pays, its record (the signed report
+    # and its receipt record) is read once and checked by the audit's one
+    # lane D checker (audit_receipt -> check_lane_d); a failure burns lane
+    # D's share only.
+    pays_d = cfg_r.lane_d.active(int(receipt.epoch_start_block))
+    lane_d = None
+    if pays_d:
+        try:
+            lane_d = fetch_lane_d_record(receipt, reader)
+        except Exception as e:  # noqa: BLE001 — a read failure is retried, never a burn
+            raise Transient(f"lane-d-fetch: {e}") from e
     # d. the audit's tier-0 re-derivation (verdict, cohort, bench gate from the
     # trainer-signed report, king check / ladder, lane payouts, weights)
     rows = audit_receipt(receipt, cfg_audit, tier=0, client=None,
-                         netconfig_store=reader, bench_store=reader)
+                         netconfig_store=reader, bench_store=reader, lane_d=lane_d)
+    lane_d_burn = ""
+    weights_fail = None
+    boundary_r = int(receipt.epoch_start_block)
     for r in rows:
-        if r.status == FAIL:
-            return _fail(r.name, r.detail)
+        if r.name == LANE_D_ROW:
+            if r.status == FAIL:
+                lane_d_burn = r.detail
+            continue
+        if r.status != FAIL:
+            continue
+        lane = _lane_of_row(r.name)
+        if lane is not None and _lane_pays(cfg_r, lane, boundary_r):
+            scoped.setdefault(lane, f"{r.name}: {r.detail}")
+            continue
+        if r.name == "weights":
+            # the recorded vector carries the failed lane's part; decided
+            # below once every lane-owned row is known
+            weights_fail = r
+            continue
+        return _fail(r.name, r.detail)
+    if weights_fail is not None and not scoped:
+        # containment: a weights mismatch that lies wholly inside lane B's /
+        # lane C's share (a payout bug, not a lane A one) burns those lanes
+        # only; anything else still burns the whole vector
+        shares = _lane_shares(cfg_r, boundary_r)
+        got_w = [float(w) for w in receipt.weights or ()]
+        for cand in (("b",), ("c",), ("b", "c")):
+            if not all(shares[x] > 0.0 for x in cand):
+                continue
+            vec_l, why_l = derive_weights(
+                receipt, cfg_r, lane_d=lane_d if pays_d and not lane_d_burn else None,
+                burn_lanes=frozenset(cand))
+            if vec_l is not None and within_lane_envelope(
+                    got_w, vec_l, burn_uid=int(cfg_r.scoring.burn_uid),
+                    share=sum(shares[x] for x in cand)):
+                for x in cand:
+                    scoped[x] = f"weights: {weights_fail.detail}"
+                break
+        else:
+            return _fail(weights_fail.name, weights_fail.detail)
     for r in rows:
-        if r.status == WARN and r.name in UNVERIFIABLE_WARN:
+        if r.status != WARN:
+            continue
+        if r.name in UNVERIFIABLE_WARN or (r.name == LANE_D_ROW
+                                           and r.detail.startswith(TRANSIENT_CODE)):
             raise Transient(f"{r.name}: {r.detail}")
+    for r in rows:
+        if r.name == LANE_D_ROW and r.status == WARN:
+            log.warning("lane_d_check_alert round=%s %s", rid, r.detail)
     burn = int(cfg_r.scoring.burn_uid)
     if not receipt.weights:
         return Replay(ok=True, vector=None, burn_uid=burn, attribution=_attribution(receipt))
-    vec, why = derive_weights(receipt, cfg_r)
+    # a lane D record the lane_d row refused is dropped: derive_weights then
+    # burns lane D's share (lane_d_record_missing), lanes A/B/C unchanged
+    vec, why = derive_weights(receipt, cfg_r,
+                              lane_d=lane_d if pays_d and not lane_d_burn else None,
+                              burn_lanes=frozenset(scoped))
     if vec is None:
         return _fail("weights-derive", why)
+
+    def _paid(v: list[float]) -> Replay:
+        """``v`` set; when it pays lane D's verified court (#913) the court's
+        payees join the attribution and the lane-D-burned twin rides along."""
+        if not (pays_d and not lane_d_burn and not why):
+            return Replay(ok=True, vector=list(v), burn_uid=burn,
+                          attribution=_attribution(receipt))
+        twin, _ = derive_weights(receipt, cfg_r, lane_d=None, burn_lanes=frozenset(scoped))
+        return Replay(ok=True, vector=list(v), burn_uid=burn,
+                      attribution=_attribution(receipt, lane_d_court_payees(lane_d)),
+                      vector_d_burned=None if twin is None else list(twin))
+
+    if scoped:
+        # containment: the failed lane's share burns; lane A (and lane D,
+        # as derived above) are set from the satellite's own derivation —
+        # the recorded vector is not compared, it carries the faulty part
+        for lane, detail in sorted(scoped.items()):
+            log.warning("lane_%s_check_burn round=%s lane %s's share burns to uid %d, the "
+                        "other lanes as derived: %s", lane, rid, lane.upper(), burn, detail)
+        if weights_fail is not None:
+            log.warning("round=%s weights row (expected with a failed lane): %s", rid,
+                        weights_fail.detail)
+        if pays_d and why:
+            log.warning("lane_d_check_burn round=%s lane D's share burns to uid %d: %s", rid,
+                        burn, lane_d_burn or why)
+        return _paid(vec)
+    if pays_d and why:
+        # lane D's share burns; lanes A/B/C were compared by the audit's
+        # weights row, so the vector set is the derived one
+        log.warning("lane_d_check_burn round=%s lane D's share burns to uid %d, lanes A/B/C "
+                    "unchanged: %s", rid, burn, lane_d_burn or why)
+        return Replay(ok=True, vector=list(vec), burn_uid=burn,
+                      attribution=_attribution(receipt))
     got = [float(w) for w in receipt.weights]
     bad = [u for u, (a, b) in enumerate(zip(vec, got, strict=True))
            if not math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-12)]
     if bad:
         return _fail("weights-derive", f"uid {bad[0]}: derived {vec[bad[0]]} != recorded "
                      f"{got[bad[0]]}")
-    return Replay(ok=True, vector=list(vec), burn_uid=burn, attribution=_attribution(receipt))
+    return _paid(vec)
 
 
 # ── storage ──────────────────────────────────────────────────────────────────
@@ -417,6 +617,7 @@ class SatelliteState:
     vector: list[float] | None = None
     burn_uid: int = 0
     attribution: dict = field(default_factory=dict)
+    vector_d_burned: list[float] | None = None
     verified_round: str = ""
     verified_boundary: int = 0
     failing: str = ""
@@ -474,6 +675,11 @@ class SatelliteRunner(ActivationMixin):
     _prelaunch_tally: Any = field(default=None, repr=False)
     _image_decoupled: ActivationRecord = field(default_factory=ActivationRecord, repr=False)
     _image_decoupled_tally: Any = field(default=None, repr=False)
+    # DEC-CA-0068 shared ladder: its own record + tally, exactly as the full
+    # validator (loop.py) declares them (#790 — without them the mixin's
+    # startup raised AttributeError and the satellite never cast the vote).
+    _shared_ladder: ActivationRecord = field(default_factory=ActivationRecord, repr=False)
+    _shared_ladder_tally: Any = field(default=None, repr=False)
     _cfg_base: Any = field(default=None, repr=False)
     _settlement_block: int | None = field(default=None, repr=False)
     _netconfig_now: int | None = field(default=None, repr=False)
@@ -611,6 +817,7 @@ class SatelliteRunner(ActivationMixin):
             st.verified_round, st.verified_boundary = rid, int(receipt.epoch_start_block)
             if res.vector is not None:
                 st.vector, st.burn_uid, st.attribution = res.vector, res.burn_uid, res.attribution
+                st.vector_d_burned = res.vector_d_burned
             log.info("round=%s verified (%s)", rid,
                      "vector derived" if res.vector is not None else "no vector recorded; "
                      "the standing vector stays")
@@ -639,8 +846,19 @@ class SatelliteRunner(ActivationMixin):
             return burn_vec, BURNING, (f"main validator silent: {age} blocks since round "
                                        f"{st.verified_round} > stale_after_blocks="
                                        f"{self.sat.stale_after_blocks}")
-        vec = fit_vector(st.vector, n)
-        why = (check_reward_uids(st.vector, st.burn_uid, hotkeys, st.attribution)
+        src, attribution = st.vector, st.attribution
+        if st.vector_d_burned is not None and attribution.get("lane_d"):
+            # #913: lane D's court payees against this satellite's metagraph;
+            # a mismatch burns lane D's share ONLY (lanes A/B/C as derived)
+            why_d = lane_d_payee_problem(st.vector, st.vector_d_burned, hotkeys, attribution)
+            if why_d is not None:
+                log.warning("lane_d_check_burn round=%s lane D's share burns to uid %d, lanes "
+                            "A/B/C unchanged: reward-uid: %s", st.verified_round, st.burn_uid,
+                            why_d)
+                src = st.vector_d_burned
+                attribution = {k: v for k, v in attribution.items() if k != "lane_d"}
+        vec = fit_vector(src, n)
+        why = (check_reward_uids(src, st.burn_uid, hotkeys, attribution)
                if vec is not None else f"vector has weight past the metagraph's {n} uids")
         if why is not None:
             self._push_failing = "reward-uid"
@@ -691,8 +909,12 @@ class SatelliteRunner(ActivationMixin):
     # ── status ──
 
     def status(self, now_block: int | None = None) -> dict:
+        from ..shared.netconfig import out_of_bounds_report
+
         st = self.state
+        oob = out_of_bounds_report()      # #891: in-force keys at the release value
         return {
+            **({"netconfig_out_of_bounds": oob} if oob else {}),
             "hotkey": self.hotkey, "main_validator": self.owner, "mode": self._mode,
             "block": now_block, "last_verified_round": st.verified_round,
             "last_verified_boundary": st.verified_boundary,
@@ -775,6 +997,9 @@ def _build_parser() -> argparse.ArgumentParser:
                                 description="cascade satellite validator (DEC-CA-0058).")
     p.add_argument("--chain-toml", type=Path, default=None)
     p.add_argument("--network", default="finney")
+    p.add_argument("--history-network", default="archive",
+                   help="chain endpoint for reads at a PAST block the --network node pruned "
+                        "(retried there once; never writes / head reads). 'none' disables")
     p.add_argument("--wallet-name", default=None)
     p.add_argument("--wallet-hotkey", default=None)
     p.add_argument("--wallet-path", default=None)
@@ -804,7 +1029,9 @@ def run_from_args(args: argparse.Namespace) -> int:
                  or Path(cfg.validator.state_db_path).parent)
     client = ChainClient.from_config(cfg, network=args.network, wallet_name=args.wallet_name,
                                      wallet_hotkey=args.wallet_hotkey,
-                                     wallet_path=args.wallet_path)
+                                     wallet_path=args.wallet_path,
+                                     history_network=getattr(args, "history_network",
+                                                             "archive"))
     hotkey = str(client.hotkey_ss58() or "")
     runner = build_satellite(cfg, state_dir=Path(state_dir), hotkey=hotkey)
     from ..shared.logging_util import restore_cascade_logging

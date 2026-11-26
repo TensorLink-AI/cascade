@@ -15,10 +15,20 @@ from pathlib import Path
 from .loop import build_runner
 
 
+def _history(args: argparse.Namespace) -> str:
+    """``--history-network`` (absent on a parser without it: the default)."""
+    return str(getattr(args, "history_network", "archive"))
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="cascade-validator", description="cascade validator loop.")
     p.add_argument("--chain-toml", type=Path, default=None, help="Override chain.toml path.")
     p.add_argument("--network", default="finney", help="Bittensor network (finney/test/local).")
+    p.add_argument("--history-network", default="archive",
+                   help="Chain endpoint for reads at a PAST block (registration / stake / "
+                        "commitment / block hash as of a boundary) that the --network node "
+                        "pruned: retried there once, never used for writes or head reads. "
+                        "Default: the SDK's archive network. 'none' disables.")
     p.add_argument("--wallet-name", default=None)
     p.add_argument("--wallet-hotkey", default=None)
     p.add_argument("--wallet-path", default=None)
@@ -62,6 +72,10 @@ def _build_parser() -> argparse.ArgumentParser:
                         "weight-set instead of voting the champion, while staying "
                         "Yuma-active. Same as [validator] force_burn = true. Champion "
                         "state is untouched; drop the flag and restart to resume voting.")
+    p.add_argument("--lane-d-inputs", type=Path, default=None,
+                   help="W8c: the lane D inputs TOML (intake state dir, pool_d pins, house "
+                        "pointer + signer, eval hosts; cascade.validator.lane_d_inputs."
+                        "load_inputs_services). Read only while [lane_d] is armed.")
     p.add_argument("--offline", action="store_true", help="No chain/Hippius; print state and exit.")
     p.add_argument("--satellite", action="store_true",
                    help="Run as a DEC-CA-0058 satellite: replay the main validator's "
@@ -107,6 +121,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--netconfig-publish", action="store_true",
                    help="Sign with --wallet-name/--wallet-hotkey (must be [netconfig] "
                         "owner_hotkey) and publish to config/network/ in the manifest bucket.")
+    p.add_argument("--netconfig-in-force-seq", type=int, default=None,
+                   help="The published seq nodes run (0 = chain.toml alone). Default: the "
+                        "newest published body that validates on this chain.toml (a refused "
+                        "newer one is skipped); seq/prev still follow the latest published.")
+    p.add_argument("--netconfig-allow-lane-off", action="store_true",
+                   help="Publish even though the overlay turns a lane armed by the config "
+                        "in force off without setting its switch keys (a dropped restatement).")
     return p
 
 
@@ -119,6 +140,7 @@ def _netconfig_overlay(args) -> int:
     from ..shared.netconfig import (
         NetConfigError,
         fetch_overlays,
+        newest_valid,
         plan_overlay,
         publish_overlay,
         sign_overlay,
@@ -132,11 +154,13 @@ def _netconfig_overlay(args) -> int:
     with args.netconfig_overlay.open("rb") as fh:
         overrides = tomllib.load(fh)
     previous = None
+    bodies: list[dict] = []
     try:
         store = open_manifest_store(cfg.storage)
         if owner:
             envs = fetch_overlays(store, owner=owner)
-            previous = envs[-1]["body"] if envs else None
+            bodies = [e["body"] for e in envs]
+            previous = bodies[-1] if bodies else None
     except NetConfigError as e:
         print(f"the published overlay chain does not verify: {e}", file=sys.stderr)
         return 2
@@ -153,12 +177,28 @@ def _netconfig_overlay(args) -> int:
         from ..shared.chain import ChainClient
 
         client = ChainClient.from_config(cfg, network=args.network,
+                                         history_network=_history(args),
                                          wallet_name=args.wallet_name,
                                          wallet_hotkey=args.wallet_hotkey,
                                          wallet_path=args.wallet_path)
         head = int(client.current_block())
+    # #911: judge against the body nodes run, not a refused latest one
+    want = getattr(args, "netconfig_in_force_seq", None)
+    if want is None:
+        in_force, skipped = newest_valid(cfg, bodies)
+    elif int(want) == 0:
+        in_force, skipped = None, []
+    else:
+        hits = [b for b in bodies if int(b["seq"]) == int(want)]
+        if not hits:
+            print(f"--netconfig-in-force-seq {want} is not in the published chain",
+                  file=sys.stderr)
+            return 2
+        in_force, skipped = hits[0], []
     plan = plan_overlay(cfg, overrides, args.netconfig_effective_block, previous,
-                        comment=args.netconfig_comment, head_block=head)
+                        comment=args.netconfig_comment, head_block=head, in_force=in_force,
+                        allow_lane_off=bool(getattr(args, "netconfig_allow_lane_off", False)))
+    plan.warnings[:0] = skipped
     print(plan.render())
     if not plan.ok:
         return 1
@@ -201,7 +241,8 @@ def _publish_direct_config(args) -> int:
     cfg = load_chain_config(args.chain_toml)
     location = {"bucket": args.direct_config_bucket,
                 "endpoint": cfg.storage.s3_endpoint, "region": cfg.storage.s3_region}
-    client = ChainClient.from_config(cfg, network=args.network, wallet_name=args.wallet_name,
+    client = ChainClient.from_config(cfg, network=args.network, history_network=_history(args),
+                                     wallet_name=args.wallet_name,
                                      wallet_hotkey=args.wallet_hotkey, wallet_path=args.wallet_path)
     keypair = client.wallet().hotkey
     current = client.plain_commitment(keypair.ss58_address)
@@ -259,7 +300,7 @@ def _run_direct(args) -> int:
     cfg = load_chain_config(args.chain_toml)
     storage = {"endpoint": cfg.storage.s3_endpoint, "region": cfg.storage.s3_region}
     client = None if args.offline else ChainClient.from_config(
-        cfg, network=args.network, wallet_name=args.wallet_name,
+        cfg, network=args.network, history_network=_history(args), wallet_name=args.wallet_name,
         wallet_hotkey=args.wallet_hotkey, wallet_path=args.wallet_path)
     network, poll = None, args.direct_poll_seconds
     # The last accepted config survives restarts, so a panel the owner adds
@@ -459,7 +500,7 @@ def main(argv: list[str] | None = None) -> int:
     from ..shared.chain import ChainClient
 
     client = ChainClient.from_config(
-        runner.cfg, network=args.network,
+        runner.cfg, network=args.network, history_network=_history(args),
         wallet_name=args.wallet_name, wallet_hotkey=args.wallet_hotkey, wallet_path=args.wallet_path,
     )
     log = logging.getLogger("cascade.validator")
@@ -491,6 +532,75 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         log.info("bench lease armed from %s: sweeps rent their host on demand (%s)",
                  args.bench_lease, runner.bench_lease.status())
+    # W8b (LANE_D_PLAN): the lane D settlement step, which W19's worker runs
+    # off this (poll/weight) thread at each armed boundary. Unarmed
+    # ([lane_d] from_block = 0) it is None: nothing is opened, read or
+    # published. It reads block hashes through its OWN chain client, built on
+    # its thread (a websocket is never shared with the poll ``client``).
+    from .lane_d_wiring import build_lane_d_step
+
+    # W8c: its settlement inputs come from the source --lane-d-inputs
+    # configures (intake entries, pinned pool_d, the signed house pointer, the
+    # eval host's forecasts), read on the worker's thread through the source's
+    # own chain client. Unarmed nothing is read or built.
+    #
+    # Containment (owner 2026-11-24): the step and its inputs are built even
+    # while the STARTUP chain.toml leaves lane D off, and judge each boundary
+    # under the config in force there (``runner.cfg_at``: the adopted
+    # overlay's), so an overlay-armed lane D settles instead of burning its
+    # share. Unarmed at a boundary they return / refuse exactly as unarmed.
+    # Inputs that are missing or do not load while lane D is unarmed at
+    # startup are logged and the step fails closed (inputs_unavailable) if an
+    # overlay later arms it; armed at startup they still refuse to start.
+    armed_at_start = int(runner.cfg.lane_d.from_block or 0) > 0
+    lane_d_store = None
+    lane_d_services = None
+    from ..shared.hippius import open_manifest_store
+
+    try:
+        lane_d_store = open_manifest_store(runner.cfg.storage)
+    except Exception as e:  # noqa: BLE001 — unarmed: never stops the validator
+        if armed_at_start:
+            raise
+        log.warning("lane D store unavailable (%s); an overlay-armed lane D cannot publish", e)
+    if args.lane_d_inputs is None:
+        if armed_at_start:
+            log.error("lane D is armed but --lane-d-inputs is not set: every lane D "
+                      "settlement refuses inputs_unavailable")
+    else:
+        from .lane_d_inputs import LaneDInputsConfigError, load_inputs_services
+
+        try:
+            lane_d_services = load_inputs_services(runner.cfg, args.lane_d_inputs)
+        except LaneDInputsConfigError as e:
+            if armed_at_start:
+                print(e, file=sys.stderr)
+                return 2
+            log.error("lane D inputs %s do not load (%s): an overlay-armed lane D refuses "
+                      "inputs_unavailable", args.lane_d_inputs, e)
+    lane_d_dir = Path(runner.cfg.validator.state_db_path).parent
+    lane_d_inputs = None
+    if lane_d_services is not None:
+        from .lane_d_inputs import build_lane_d_inputs
+
+        lane_d_inputs = build_lane_d_inputs(
+            runner.cfg, state_dir=lane_d_dir,
+            chain_factory=lambda: ChainClient.from_config(
+                runner.cfg, network=args.network, history_network=_history(args)),
+            cfg_at=runner.cfg_at, always=True, **lane_d_services)
+    runner.lane_d_step = build_lane_d_step(
+        runner.cfg, state_dir=lane_d_dir,
+        signer=runner.bench_signer,
+        chain_factory=lambda: ChainClient.from_config(
+            runner.cfg, network=args.network, history_network=_history(args)),
+        store=lane_d_store, inputs=lane_d_inputs,
+        bench=None if lane_d_inputs is None else lane_d_inputs.bench,
+        cfg_at=runner.cfg_at, always=True)
+    if armed_at_start:
+        log.info("lane D armed from block %d: settlements run off the poll thread",
+                 int(runner.cfg.lane_d.from_block))
+    else:
+        log.info("lane D step wired, inert until an adopted overlay arms [lane_d]")
     if runner.cfg.storage.pool_bucket:
         from .pool import load_bucket_pool
 

@@ -3,8 +3,12 @@ miners): blast-radius classification and the timing / in-flight guards."""
 
 from __future__ import annotations
 
+import importlib.util
 import json
 from datetime import UTC, datetime
+from pathlib import Path
+
+import pytest
 
 from scripts import deploy_gate as g
 
@@ -162,3 +166,83 @@ def test_intake_process_match():
     assert not g._runs_module("intake-laned", [b"python", b"-P", b"-m", b"cascade.lane_dx"])
     assert not g._runs_module("intake-laned", [b"python", b"-P", b"-m"])
     assert not g._runs_module("validator", [b"python", b"-P", b"-m", b"cascade.validator.main"])
+
+
+# ── the settlement grid comes from the chain config being deployed ───────────
+
+REPO = Path(__file__).resolve().parents[2]
+
+
+def test_grid_read_from_mainnet_and_testnet_configs():
+    main_grid = g.load_grid(REPO / "chain.toml")
+    test_grid = g.load_grid(REPO / "chain.testnet.toml")
+    assert main_grid.epoch_blocks == 900 and test_grid.epoch_blocks == 150
+    assert main_grid.boundaries(9516105) == (9515700, 9516600)
+    assert test_grid.boundaries(9516105) == (9516000, 9516150)
+
+
+def test_grid_switch_at_the_activation_block():
+    grid = g.Grid(150, epoch_blocks_prev=300, activation_block=600)
+    assert grid.boundaries(450) == (300, 600)
+    assert grid.boundaries(599) == (300, 600)
+    assert grid.boundaries(600) == (600, 750)
+    assert grid.boundaries(1000) == (900, 1050)
+    assert g.Grid(900).boundaries(9516105) == g.DEFAULT_GRID.boundaries(9516105)
+
+
+def test_gate_places_the_window_on_the_given_grid(tmp_path):
+    # block 9516140 at NOW: 10 blocks (2 min) before a 150-block boundary,
+    # inside testnet's scaled 3.3 min blackout (#787); 92 min before the next
+    # 900-block one.
+    testnet = g.load_grid(REPO / "chain.testnet.toml")
+    near = [_vline("02:59:00", "x block 9516135")]
+    v = g.gate(service="validator", areas={}, diff_text="", now=NOW, trainer_lines=[],
+               validator_lines=near, work=tmp_path, on_main=True, acks=set(), grid=testnet)
+    assert [r for r, _ in v.refuse] == ["settlement"]
+    v = g.gate(service="validator", areas={}, diff_text="", now=NOW, trainer_lines=[],
+               validator_lines=near, work=tmp_path, on_main=True, acks=set())
+    assert not v.refuse                                          # default 900 grid
+    assert not _gate(tmp_path, service="validator", vlines=CLOCK).refuse   # default 900 grid
+    mainnet = g.load_grid(REPO / "chain.toml")
+    v = g.gate(service="validator", areas={}, diff_text="", now=NOW, trainer_lines=[],
+               validator_lines=CLOCK, work=tmp_path, on_main=True, acks=set(), grid=mainnet)
+    assert not v.refuse
+
+
+def test_resolve_grid_order_and_default_note(tmp_path):
+    grid, note = g.resolve_grid(None, tmp_path)
+    assert grid == g.DEFAULT_GRID and "no chain config" in note and "900" in note
+    (tmp_path / "chain.toml").write_text("[round]\nepoch_blocks = 150\n")
+    grid, note = g.resolve_grid(None, tmp_path)
+    assert grid.epoch_blocks == 150 and str(tmp_path / "chain.toml") in note
+    grid, _ = g.resolve_grid(REPO / "chain.toml", tmp_path)          # --chain-toml wins
+    assert grid.epoch_blocks == 900
+    (tmp_path / "chain.toml").write_text("# no [round] table\n")
+    grid, note = g.resolve_grid(None, tmp_path)
+    assert grid == g.DEFAULT_GRID and "sets no [round] epoch_blocks" in note
+    (tmp_path / "bad.toml").write_text("[round]\nepoch_blocks = 0\n")
+    with pytest.raises(g.GridError):
+        g.resolve_grid(tmp_path / "bad.toml", tmp_path)
+
+
+def _window():
+    spec = importlib.util.spec_from_file_location("laned_window", REPO / "deploy/laned/window.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_window_uses_the_chain_config_grid(tmp_path, capsys):
+    w = _window()
+    # tail() drops the first line (it may be cut mid-line), so a header goes first
+    (tmp_path / "validator.log").write_text(_vline("02:58:00", "log opened") + "\n"
+                                            + CLOCK[0] + "\n")
+    now = "2026-11-16T03:00:00Z"
+    assert w.main(["--root", str(tmp_path), "--now", now]) == 0
+    out = capsys.readouterr().out
+    assert "NOTE no chain config" in out and "900" in out
+    assert w.main(["--root", str(tmp_path), "--now", now,
+                   "--chain-toml", str(REPO / "chain.testnet.toml")]) == 1
+    assert "REFUSE [settlement]" in capsys.readouterr().out
+    assert w.main(["--root", str(tmp_path), "--now", now,
+                   "--chain-toml", str(tmp_path / "missing.toml")]) == 2

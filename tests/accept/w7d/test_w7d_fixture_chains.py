@@ -54,39 +54,75 @@ def test_fixture_receipts_link_from_genesis_and_bind_bodies_and_states(chains):
             prev = rec["posterior_state_sha256"]
 
 
+def _outcomes(report: dict) -> list:
+    return [v.get("outcome") for v in report.get("verdicts") or []]
+
+
+def _gate_digests(report: dict) -> list:
+    return [(g.get("digest"), g.get("outcome")) for g in
+            (report.get("gate") or {}).get("results") or []]
+
+
+def _status(report: dict, dg: str) -> list:
+    return [e.get("status") for e in report.get("entries") or [] if e.get("digest") == dg]
+
+
 def test_fixture_chain_shapes(chains):
+    """rev6.11 (b): the crown at the first verdict. Each assertion names the
+    README "Fixture chains" fact it checks; on main the old code first-clears
+    X at b2 (`confirm_pending`) and never crowns (assertion failures)."""
     x, y = chains["gated"].x["digest"], chains["gated"].y["digest"]
     g = _reports(chains["gated"])
-    assert [r["crowned"] for r in g] == [None, x, None]
-    assert [v["outcome"] for v in g[0]["verdicts"]] == ["confirm_pending"]
-    assert g[1]["gate"]["results"][0]["outcome"] == "pass"
+    assert [r["crowned"] for r in g] == [None, x, None], "gated: X crowned at b2"
+    assert g[0]["verdicts"] == [] and _status(g[0], x) == ["pending"], "gated: b1 floor wait"
+    assert _outcomes(g[1]) == ["crowned"], "gated: b2 is X's first and only verdict"
+    assert _gate_digests(g[1]) == [(x, "pass")]
     assert g[2]["verdicts"] == [] and "gate" not in g[2]
 
     h = _reports(chains["held"])
-    assert [r["crowned"] for r in h] == [None, None, x]
-    assert "gate" not in h[1] and h[1]["verdicts"][0]["outcome"] == "confirmed"
-    assert h[2]["verdicts"] == [] and h[2]["gate"]["results"][0]["digest"] == x
-    (held_entry,) = [e for e in h[1]["entries"] if e["digest"] == x]
-    assert held_entry["status"] == "confirm_pending"
+    assert [r["crowned"] for r in h] == [None, None, x], "held: X crowned at b3"
+    # A held first clear is status `hold`, reason `bench_hold`; its verdict
+    # outcome is `cleared` (never crowned), as W5g, W7d's house chains (C
+    # in `open_copy`) and W17 pin it.
+    assert "gate" not in h[1] and _outcomes(h[1]) == ["cleared"], \
+        "held: b2's ungated first clear is held"
+    assert _status(h[1], x) == ["hold"], "held: a held candidate stays open as hold"
+    assert [e.get("reason") for e in h[1].get("entries") or [] if e.get("digest") == x] \
+        == ["bench_hold"], "held: the hold's reason is bench_hold"
+    assert h[2]["verdicts"] == [] and _gate_digests(h[2]) == [(x, "pass")]
 
     hb = _reports(chains["house_bar"])
-    assert [r["crowned"] for r in hb] == [None, x, None, y]
-    assert "house_digest" in hb[2]["cohorts"][0] and "house" in hb[2]["verdicts"][0]
-    assert [p["digest"] for p in hb[3]["prior_kings"]] == [x]
-    assert [s["uid"] for s in hb[3]["pay"]["court"]] == [12, 11]
+    assert [r["crowned"] for r in hb] == [None, x, y], "house_bar: X at b2, Y at b3"
+    # DEC-CA-0076 (laned:tests-correction): after X's crown the house is no bar
+    assert hb[2]["cohorts"] and "house_digest" not in hb[2]["cohorts"][0]
+    assert hb[2]["verdicts"] and "house" not in hb[2]["verdicts"][0]
+    assert [p["digest"] for p in hb[2]["prior_kings"]] == [x]
+    assert [s["uid"] for s in hb[2]["pay"]["court"]] == [12, 11]
 
-    rs = _reports(chains["d20_restart"])
-    h1 = chains["d20_restart"].h1["digest"]
-    assert rs[1]["verdicts"][0]["stage"] == "first" and rs[1]["verdicts"][0]["king_digest"] == h1
-    assert rs[1]["king_before"]["digest"] == h1, "the house refresh moves a house-held throne"
-    assert rs[2]["crowned"] == x
+    rf = _reports(chains["refresh"])
+    h1 = chains["refresh"].h1["digest"]
+    assert rf[1]["king_before"]["digest"] == h1, "the house refresh moves a house-held throne"
+    assert rf[1]["cohorts"] and rf[1]["cohorts"][0]["king_digest"] == h1
+    assert [r["crowned"] for r in rf] == [None, x, None], "refresh: X crowned at b2 vs H1"
 
-    og = _reports(chains["d20_original"])
-    h0 = chains["d20_original"].h0["digest"]
-    v = og[1]["verdicts"][0]
-    assert v["stage"] == "confirm" and v["king_digest"] == h0
-    assert v["confirmation"]["first_king_digest"] == h0
-    assert og[1]["crowned"] == x
+
+def test_fixture_no_report_carries_a_confirmation_stage(chains):
+    """rev6.11 (b) / W7a: no cohort or verdict at a stage other than `first`
+    (or none), no `confirmation` block, no `confirm_pending` / `confirmed` /
+    `lost_confirmation` anywhere."""
+    gone = {"confirm_pending", "confirmed", "lost_confirmation"}
+    for name, c in chains.items():
+        for r in _reports(c):
+            for co in r["cohorts"]:
+                assert co.get("stage", "first") == "first", (name, r["boundary"], co.get("stage"))
+            for v in r["verdicts"]:
+                assert v.get("stage", "first") == "first", (name, r["boundary"])
+                assert "confirmation" not in v, (name, r["boundary"])
+                assert v.get("outcome") not in gone, (name, r["boundary"], v.get("outcome"))
+            for e in r["entries"]:
+                assert e.get("status") not in gone and e.get("reason") not in gone, \
+                    (name, r["boundary"], e)
+            assert "confirm_on_king_change" not in r["params"], (name, r["boundary"])
 
 
 def test_fixture_chain_rules_hold_on_every_honest_chain(chains):
@@ -94,7 +130,6 @@ def test_fixture_chain_rules_hold_on_every_honest_chain(chains):
     for name, c in chains.items():
         reps = _reports(c)
         rpk = int(c.cfg.reward_prior_kings)
-        firsts: dict[str, dict] = {}
         judged_on: dict[str, set] = {}
         for i, r in enumerate(reps):
             if i:
@@ -120,20 +155,11 @@ def test_fixture_chain_rules_hold_on_every_honest_chain(chains):
             for v in r["verdicts"]:
                 co = cohorts[v["cohort"]]
                 dg = v["digest"]
-                if v["stage"] == "first":
-                    assert co["king_digest"] == r["king_before"]["digest"], (name, i)
-                else:
-                    first = firsts[dg]
-                    assert v["confirmation"]["first_set_sha256"] == first["set_sha256"]
-                    assert v["confirmation"]["first_king_digest"] == first["king_digest"]
-                    if c.cfg.confirm_on_king_change == "restart":
-                        assert co["king_digest"] == r["king_before"]["digest"]
-                    else:
-                        assert co["king_digest"] == first["king_digest"]
-                    assert not set(co["window_ids"]) & judged_on.get(dg, set()), (name, i)
+                # C4 (rev6.11): every verdict is a first verdict against
+                # king_before, and an entry is judged at most once.
+                assert co["king_digest"] == r["king_before"]["digest"], (name, i)
+                assert dg not in judged_on, (name, i, "judged twice")
                 judged_on.setdefault(dg, set()).update(co["window_ids"])
-                if v["stage"] == "first" and v["outcome"] == "confirm_pending":
-                    firsts[dg] = co
 
 
 def test_fixture_the_allowed_primitives_reach_no_forbidden_module():
@@ -153,5 +179,5 @@ def test_fixture_forbidden_names_cover_the_producer_modules():
               "cascade.shared.emission", "cascade.shared.chain", "cascade.audit.lane_d",
               "cascade.eval.lane_d_scorer", "torch"):
         assert forbidden(m), m
-    for m in ALLOWED_PRIMITIVES + ("cascade.satellite.lane_d_replay", "numpy", "hashlib"):
+    for m in ALLOWED_PRIMITIVES + ("cascade.audit.lane_d_chain", "numpy", "hashlib"):
         assert not forbidden(m), m

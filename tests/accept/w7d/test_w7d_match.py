@@ -4,7 +4,8 @@ crown, pay shares and receipt digests (plan rev6 §3.0 W7d, §14.3 items 1-2,
 
 Every chain is real `settle_lane_d` runs (helpers.CHAINS): gated, held
 (bench_hold then a re-gated crown), house bar (a miner king, the house as a
-second bar, a prior king in the court), D20 `restart` and D20 `original`.
+second bar, a prior king in the court) and a house refresh (rev6.11: no
+confirmation duel, every crown at a first verdict).
 On main the module is absent: `ModuleNotFoundError: cascade.satellite`.
 """
 
@@ -71,19 +72,19 @@ def test_result_type_and_status_constants():
     assert mod.SettlementReplay.__dataclass_params__.frozen
 
 
-@pytest.mark.parametrize("name", ["gated", "held", "house_bar", "d20_restart", "d20_original"])
+@pytest.mark.parametrize("name", ["gated", "held", "house_bar", "refresh"])
 def test_every_honest_chain_matches_from_the_published_report_files(chains, name):
     pub = chains[name].pub
     _all_match(replay(pub), pub)
 
 
-@pytest.mark.parametrize("name", ["gated", "house_bar", "d20_original"])
+@pytest.mark.parametrize("name", ["gated", "house_bar", "refresh"])
 def test_an_honest_chain_matches_from_a_report_mapping(chains, name):
     pub = chains[name].pub
     _all_match(replay(pub, reports=pub.reports()), pub)
 
 
-@pytest.mark.parametrize("name", ["gated", "held", "house_bar", "d20_restart", "d20_original"])
+@pytest.mark.parametrize("name", ["gated", "held", "house_bar", "refresh"])
 def test_an_honest_chain_matches_with_state_snapshots_and_metagraphs(chains, name):
     pub = chains[name].pub
     res = replay(pub, states=dict(pub.states), uid_of=dict(pub.uid_of))
@@ -92,7 +93,7 @@ def test_an_honest_chain_matches_with_state_snapshots_and_metagraphs(chains, nam
         assert r.posterior_state_sha256 == sha(pub.states[b])
 
 
-@pytest.mark.parametrize("name", ["gated", "held", "house_bar", "d20_restart", "d20_original"])
+@pytest.mark.parametrize("name", ["gated", "held", "house_bar", "refresh"])
 def test_the_replay_rederives_crown_king_verdicts_and_gate(chains, name):
     c = chains[name]
     res = replay(c.pub)
@@ -111,19 +112,26 @@ def test_the_held_candidate_is_regated_and_crowned_without_a_verdict(chains):
     res = replay(c.pub)
     _all_match(res, c.pub)
     x = c.x["digest"]
-    assert res[1].crowned is None and dict(res[1].outcomes) == {x: "confirmed"}
+    # The held first clear's verdict outcome is `cleared` (status `hold`,
+    # reason `bench_hold`; test_w7d_fixture_chains, W5g, W17).
+    assert res[1].crowned is None and dict(res[1].outcomes) == {x: "cleared"}
     assert dict(res[1].gate) == {}, "no gate ran at the held settlement"
     assert res[2].crowned == x and dict(res[2].outcomes) == {} and dict(res[2].gate) == {x: "pass"}
 
 
-def test_the_house_bar_and_d20_chains_crown_where_the_producer_did(chains):
-    hb = replay(chains["house_bar"].pub)
-    assert [r.crowned for r in hb] == [None, chains["house_bar"].x["digest"], None,
-                                       chains["house_bar"].y["digest"]]
-    rs = replay(chains["d20_restart"].pub)
-    assert [r.crowned for r in rs] == [None, None, chains["d20_restart"].x["digest"]]
-    og = replay(chains["d20_original"].pub)
-    assert [r.crowned for r in og] == [None, chains["d20_original"].x["digest"]]
+def test_every_crown_is_at_the_first_verdict_where_the_producer_put_it(chains):
+    """rev6.11 (b): crowned = first clear ∧ A10 ∧ gate, at the entry's first
+    (and only) verdict."""
+    for name, want in (("gated", [None, "x", None]), ("house_bar", [None, "x", "y"]),
+                       ("refresh", [None, "x", None])):
+        c = chains[name]
+        res = replay(c.pub)
+        _all_match(res, c.pub)
+        assert [r.crowned for r in res] == [None if w is None else getattr(c, w)["digest"]
+                                            for w in want], name
+        for r in res:
+            if r.crowned is not None:
+                assert dict(r.outcomes).get(r.crowned) == "crowned", (name, r.boundary)
 
 
 @pytest.mark.parametrize("name", ["gated", "held", "house_bar"])
@@ -140,18 +148,23 @@ def test_the_replay_rederives_pay_shares(chains, name):
         assert math.isclose(sum(s for _, _, s in got), float(c.cfg.share), rel_tol=1e-12)
 
 
-def test_the_house_bar_court_pays_the_new_king_and_the_prior_king_by_decay(chains):
+def test_the_house_bar_court_pays_the_new_king_and_the_prior_king_by_court_weights(chains):
     c = chains["house_bar"]
     last = replay(c.pub, uid_of=dict(c.pub.uid_of))[-1]
-    share, decay = float(c.cfg.share), float(c.cfg.king_decay)
+    assert len(last.pay) == 2, f"fixture: Y crowned over X, two paid slots; got {last.pay}"
+    # rev6.23: a two-slot court renormalises court_weights[:2] (80 / 15).
+    assert hasattr(c.cfg, "court_weights"), "[lane_d] court_weights is not parsed (rev6.23)"
+    share, (w0, w1) = float(c.cfg.share), [float(w) for w in c.cfg.court_weights[:2]]
     (y_d, y_uid, y_s), (x_d, x_uid, x_s) = [tuple(s) for s in last.pay]
     assert (y_d, y_uid, x_d, x_uid) == (c.y["digest"], 12, c.x["digest"], 11)
-    assert math.isclose(y_s, share / (1 + decay)) and math.isclose(x_s, share * decay / (1 + decay))
+    assert math.isclose(y_s, share * w0 / (w0 + w1)) and math.isclose(x_s, share * w1 / (w0 + w1))
+    assert math.isclose(y_s, share * 0.80 / 0.95) and math.isclose(x_s, share * 0.15 / 0.95)
     # The weights the producer's emission derives from the same court agree
     # (the test may import it; the replay may not).
     from cascade.shared.emission import lane_d_vector
 
-    vec = lane_d_vector(16, share=share, court_uids=[12, 11], king_decay=decay, burn_uid=0)
+    vec = lane_d_vector(16, share=share, court_uids=[12, 11],
+                        court_weights=c.cfg.court_weights, burn_uid=0)
     assert math.isclose(vec[12], y_s) and math.isclose(vec[11], x_s)
 
 
@@ -203,12 +216,12 @@ def test_inv7_a_mismatch_names_field_paths_never_free_text(chains):
         rep["verdicts"][0]["outcome"] = "lost"
         rep["params"]["alpha"] = 0.1
 
-    reports, receipts = doctored(c.pub, 1, lie)
+    reports, receipts = doctored(c.pub, 2, lie)
     res = replay(c.pub, reports=reports, receipts=receipts)
-    assert res[0].status == mod.MISMATCH, describe(res)
-    assert res[0].mismatches, "a MISMATCH without a field path"
-    assert len(set(res[0].mismatches)) == len(res[0].mismatches)
-    bad = [p for p in res[0].mismatches if not PATH_RE.fullmatch(p)]
+    assert res[1].status == mod.MISMATCH, describe(res)
+    assert res[1].mismatches, "a MISMATCH without a field path"
+    assert len(set(res[1].mismatches)) == len(res[1].mismatches)
+    bad = [p for p in res[1].mismatches if not PATH_RE.fullmatch(p)]
     assert not bad, f"mismatches that are not field paths: {bad}"
 
 
@@ -223,7 +236,7 @@ def _run(saved, seed: str) -> dict:
     return json.loads(out.stdout.strip().splitlines()[-1])
 
 
-@pytest.mark.parametrize("name", ["house_bar", "d20_original"])
+@pytest.mark.parametrize("name", ["house_bar", "refresh"])
 def test_replay_results_are_independent_of_the_hash_seed(chains, tmp_path, name):
     saved = save_publication(chains[name].pub, tmp_path / "pub")
     runs = [_run(saved, seed) for seed in ("0", "1", "4242")]

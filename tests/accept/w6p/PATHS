@@ -1,0 +1,19 @@
+# W6p public-source index builder + mirror tooling (plan rev6.18 A1, A5, A6;
+# F3; README.md has the contract). Read-only on Hugging Face until the owner
+# runs the mirror with the bucket keys.
+# The pinned sources, the per-dataset series index (index_sha256,
+# files_sha256), the series reader and the RMISC allowed-list format.
+cascade/eval/lane_d_public_index.py
+# Owner tools: size check, mirror to Hippius + R2 and index build; the RMISC
+# allowed-list pipeline (metadata candidates, the data compare the owner runs,
+# finalize, validate).
+scripts/laned_public_mirror.py
+scripts/laned_rmisc_allowlist.py
+# The committed allowed list (a placeholder until the owner's finalize run).
+data/lane_d/rmisc_allowed.toml
+# Owner 2026-11-24 (#894): the canonical mirror is a Hippius S3 object set.
+# Shard / shard-map format, the eval host's ranged fetcher + volume blob cache,
+# the resumable streaming builder, and the store/cache config.
+cascade/eval/lane_d_public_mirror.py
+cascade/eval/lane_d_public_build.py
+deploy/laned/public_mirror.toml

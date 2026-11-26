@@ -197,3 +197,46 @@ The report enum has no `insufficient` value, and these tests don't add one.
 - 5 pass: the empty slice, series outside `lowfreq_freqs`, first clears,
   confirmation losers and input-order determinism. W7a and W5e built those
   rules, and W3b5 owns them as its assertions.
+
+## Correction (plan rev6.10 (a) / rev6.12 (a)): fixture feeds pin `embargo_hours`
+
+W5a (tests in #758) makes forward eligibility embargo-aware and fails a
+listed feed whose `embargo_hours` is missing closed as `unlisted_feed`. This
+WP's pool fixture wrote feeds without the key, so once the W5a
+implementation lands every fixture window would be refused. Every fixture
+feed now pins `embargo_hours: 0.0` (e = 0, the rev3 rule byte for byte, so
+every verdict is unchanged); on main the key is ignored. No assertion
+changed; every test passes on main and with the W5a implementation.
+
+## Correction (plan rev6.11 (b)): crown at the first verdict
+
+The confirmation duel is dropped (owner 2026-11-23): a crown is decided at
+the first verdict, first clear (max-T LCB vs KING_D) ∧ A10 ∧ the §1.3b gate.
+There is no `confirm` stage, no `confirm_pending` status or reason and no
+`lost_confirmation`; a held first clear is `hold` / `bench_hold`. This WP's
+crowning chains move to that rule with nothing weakened. Boundary(1) lists no entry; the candidate is judged, A10-checked and gated at its first verdict at boundary(2) (the miner-king chain: Y at boundary(2), X at boundary(4)). The first-clear test now pins that a first clear is checked at once, and the loser test pins `lost_duel`. On main the
+old code still runs the confirmation stage, so the changed tests fail on an
+assertion until the W5e implementation lands.
+
+## REMOVED (plan rev6.18 A7, F4; owner 2026-11-23 DECIDED)
+
+Owner decision (rev6.18, verbatim): "The low-frequency check A10 is
+removed." This is a correction of the whole suite above, which is kept for
+history only: `test_w3b5_lowfreq.py` and its `helpers.py` are deleted with
+the check. `test_w3b5_removed.py` pins the removal:
+
+- `cascade/validator/lane_d_lowfreq.py` is gone and `settle_lane_d` runs and
+  records no A10 check (no `lowfreq` block, no `lowfreq_regression`);
+- the `lane-d-report/1` schema has no `lowfreq` / `lowfreq_lcbs` /
+  `lowfreq_result` definitions, no verdict `lowfreq`, no
+  `lowfreq_regression` entry reason and no `params.lowfreq_freqs`;
+- `lane_d_report` exports no `LOWFREQ_RESULTS` and has no `_check_lowfreq`;
+- the audit (`cascade/audit/lane_d.py`, chain mode `lane_d_chain.py`) has no
+  lowfreq rule;
+- `[lane_d] lowfreq_freqs` is retired: not parsed, listed in
+  `RETIRED_KEYS["lane_d"]` (a deployed file that carries it loads), and gone
+  from both shipped files.
+
+Slow cadences are now covered by the public half (rev6.18 A1-A3:
+GiftEvalPretrain + RMISC, 50% of the combined score). `tau_public` stays: the
+§1.3b gate uses it.

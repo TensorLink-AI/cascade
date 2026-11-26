@@ -66,17 +66,24 @@ GATE_SUITES = ("gift", "boom", "time", "fev")
 BENCH_ITEMS = 40
 
 
+# rev6.18 F4 (A3): these fixtures pin the live-only rule: the public half off
+# (public_weight = 0, a spec setting) and no per-window ratio clamp in effect
+# (a floor far below any fixture ratio), so their pre-F4 numbers stand. F4's
+# own tests (tests/accept/w5e/test_w5e_combined.py) pin the combined rule.
+LIVE_ONLY = {"public_weight": 0.0, "window_ratio_floor": 1e-9}
+
+
 def lane_d_cfg(**over):
     """The real W2 parse of an armed `[lane_d]` table with `over` applied
-    (floors lowered to 24 windows / 4 sources; 2 prior kings, decay 0.5)."""
+    (floors lowered to 24 windows / 4 sources; 2 prior kings, court_weights 80 / 15 / 5)."""
     from cascade.shared.config.lane_d import parse_lane_d
 
     raw = {"from_block": ARM_BLOCK, "share": 0.25, "takes_from": "lane_a",
            "remainder": "burn", "contexts": [4096, 8192, 16384], "horizon": HORIZON,
            "forward_margin_hours": MARGIN_H, "max_mirror_lag_hours": 6.0,
            "min_windows": 24, "min_clusters": 4, "bootstrap_B": 200,
-           "reward_prior_kings": 2, "king_decay": 0.5}
-    return parse_lane_d({**raw, **over}, era_blocks_at=lambda _block: ERA)
+           "reward_prior_kings": 2, "court_weights": [0.80, 0.15, 0.05]}
+    return parse_lane_d({**raw, **LIVE_ONLY, **over}, era_blocks_at=lambda _block: ERA)
 
 
 def unarmed_cfg():
@@ -133,7 +140,7 @@ def target_values(series_id: str, start: int) -> tuple[np.ndarray, np.ndarray]:
 
 def write_pool(directory: Path, records: list[dict], snapshot: str) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
-    feeds = {r["feed"]: {"mirror_lag_hours": FEED_LAG_HOURS, "forecast_product": False}
+    feeds = {r["feed"]: {"mirror_lag_hours": FEED_LAG_HOURS, "forecast_product": False, "embargo_hours": 0.0}
              for r in records}
     meta = {"schema": "pool_d/1", "snapshot": snapshot, "horizon": HORIZON,
             "feeds": dict(sorted(feeds.items())), "series": records}
@@ -309,7 +316,7 @@ def settle(cfg, b, pool_dir, entries, house_rec, fc, state_path, *, prior=(),
     if tag is not None:
         kw.update(boundary_block_hash=block_hash(tag),
                   bench=passing_bench(candidates, references, f"sess-{tag}"))
-    return settle_lane_d(cfg=cfg, boundary=b, pool_dir=pool_dir,
+    return settle_lane_d(**_rev614_ts(settle_lane_d, b), cfg=cfg, boundary=b, pool_dir=pool_dir,
                          entries=[dict(e) for e in entries], house=copy.deepcopy(house_rec),
                          forecasts=fc, uid_of=dict(UIDS if uid_of is None else uid_of),
                          state_path=state_path, signer=fixture_key("signer"), **kw)
@@ -367,8 +374,9 @@ class Chain:
 
 
 def crown_x(chain: Chain) -> None:
-    """boundary(1): X (fair) first-clears against the genesis house H0 (bad);
-    boundary(2): X confirms on a disjoint snapshot and passes the gate."""
+    """boundary(1): X (fair) clears against the genesis house H0 (bad) at its
+    first verdict and, through the gate, is crowned (plan rev6.11 (b): no
+    confirmation duel); boundary(2): X holds KING_D, nothing is judged."""
     chain.model(H0["digest"], "bad", "house-0")
     chain.model(X["digest"], "fair", "x")
     chain.run(1, [X], H0)
@@ -379,8 +387,9 @@ def crown_x(chain: Chain) -> None:
 
 
 def crown_y(chain: Chain) -> None:
-    """boundary(3)/(4): Y (good) clears KING_D = X and the house bar H0, then
-    confirms: Y is KING_D and X its prior miner king."""
+    """boundary(3): Y (good) clears KING_D = X and the house bar H0 at its
+    first verdict and is crowned (rev6.11 (b)); boundary(4) judges nothing:
+    Y is KING_D and X its prior miner king."""
     chain.model(Y["digest"], "good", "y")
     chain.run(3, [X, Y], H0)
     chain.run(4, [X, Y], H0, candidates=[Y["digest"]],
@@ -396,3 +405,14 @@ def miner_court(chain: Chain) -> None:
     """boundary(1)..(4): two real miner crowns, KING_D = Y, prior = [X]."""
     crown_x(chain)
     crown_y(chain)
+
+
+def _rev614_ts(settle, boundary) -> dict:
+    """rev6.14 (a): the fixture's on-chain boundary timestamp (far after every
+    fixture T + eval_delay_hours, 12 s per block), passed only where
+    ``settle_lane_d`` takes it."""
+    import inspect
+
+    if "boundary_ts" not in inspect.signature(settle).parameters:
+        return {}
+    return {"boundary_ts": 2_000_000_000 + 12 * int(boundary)}

@@ -22,9 +22,12 @@ included), the cross-field rules of :func:`_cross_field` (snapshot binding,
 a crowned report carries a gate record (W5e, RV5) holding a ``pass`` for the
 crowned digest, the gate record's consistency with the report, the
 W5c house bar's ``house_digest`` / ``verdicts[].house`` binding,
-``gate_weights`` keys, the W3b5 ``verdicts[].lowfreq`` LCBs present exactly
-for ``pass``/``fail`` and consistent with ``tau_public``), and
-``rows_sha256`` is the canonical digest of ``rows`` (checked last). The
+``gate_weights`` keys, rev6.18 F4's per-half / per-source / per-domain
+point gains (:func:`_check_halves`: the public half present exactly at
+``public_weight > 0``, a clear needs ``lcb >= d_margin`` and both halves'
+gains > 0) and the public rows' coverage), and ``rows_sha256`` is the
+canonical digest of ``rows`` and ``public.rows_sha256`` of ``public.rows``
+(checked last). The
 signature is :func:`verify_report`'s job.
 
 Light imports only: this module sits on the validator package's import path.
@@ -55,26 +58,29 @@ _SIGNATURE_RE = re.compile(r"[0-9a-f]{128}")
 
 # ── the typed enums (each equals the schema file's ``$defs.<name>.enum``) ────
 
-ENTRY_STATUSES = ("pending", "hold", "confirm_pending", "crowned", "lost", "closed")
+# rev6.11 (b): no confirmation stage, so no ``confirm_pending`` status or
+# reason and no ``lost_confirmation``; a bench_hold candidate is ``hold``.
+ENTRY_STATUSES = ("pending", "hold", "crowned", "lost", "closed")
 SKIP_REASONS = ("pending_floor", "coldkey_cap_settlement", "coldkey_unresolved",
                 "coldkey_changed", "king_unscored", "bench_hold", "deregistered",
                 "ready_expired", "reveal_delay_exceeded", "duplicate_digest",
                 "hotkey_has_open_entry", "context_not_armed", "checkpoint_fault",
-                "mirror_lag_exceeded", "lane_closed")
-# ``gate_regression``: a judged loss on the §1.3b gate (like
-# ``lowfreq_regression``), so an entry reason and never a skip reason.
-ENTRY_REASONS = SKIP_REASONS + ("confirm_pending", "lost_duel", "lost_confirmation",
-                                "lowfreq_regression", "gate_regression", "crowned")
+                "mirror_lag_exceeded", "lane_closed", "context_below_armed",
+                "before_eval_delay", "boundary_ts_missing")
+# ``gate_regression``: a judged loss on the §1.3b gate, so an entry reason
+# and never a skip reason. rev6.18 A7: ``lowfreq_regression`` is gone.
+ENTRY_REASONS = SKIP_REASONS + ("lost_duel", "gate_regression", "crowned")
 BURN_REASONS = ("house_king", "deregistered")
 # The §1.3b paired gate's outcomes and references: W3b2's
 # ``lane_d_bench.OUTCOMES`` / ``REFS`` (stated here, not imported, to keep this
 # module's imports light; the acceptance tests pin the equality).
 GATE_OUTCOMES = ("pass", "gate_regression", "checkpoint_fault", "bench_hold")
 GATE_REFS = ("king_d", "house")
-CONFIRMATION_STAGES = ("first", "confirm")
-CONFIRM_RULES = ("restart", "original")
-LOWFREQ_RESULTS = ("pass", "fail", "no_windows", "not_candidate")
-VERDICT_OUTCOMES = ("lost", "confirm_pending", "confirmed", "crowned")
+# rev6.11 (b): a crown is decided at the first verdict; ``cleared`` is a
+# first clear that was not crowned (held by the gate, or a passing non-best
+# candidate).
+CONFIRMATION_STAGES = ("first",)
+VERDICT_OUTCOMES = ("lost", "cleared", "crowned")
 SCHEMA_ERROR_CODES = ("not_object", "unknown_schema", "missing_field", "unknown_field",
                       "bad_type", "bad_value", "rows_sha256_mismatch")
 
@@ -338,37 +344,71 @@ def _check_house(report: dict) -> None:
                                     "not the cohort's house_digest")
 
 
-def _check_lowfreq(report: dict) -> None:
-    """W3b5 (A10): a verdict's ``lowfreq.lcb`` is present iff its result is
-    ``pass`` or ``fail``; an evaluated block has at least one window and an
-    empty one (``no_windows``) none; ``fail`` iff some LCB is below
-    ``-tau_public``; and a ``fail`` is a cleared confirmation that is
-    ``lost`` (never crowned or held)."""
+def _gain_close(a, b) -> bool:
+    return math.isclose(float(a), float(b), rel_tol=1e-9, abs_tol=1e-12)
+
+
+def _check_halves(report: dict) -> None:
+    """rev6.18 A3/A8 (F4): per verdict (and its house judgement) the public
+    half is present iff ``params.public_weight > 0``; ``sources.live`` is
+    the live half; the public sources' and the domains' window counts add up
+    to their halves'; a clear has ``lcb >= d_margin`` and every half's gain
+    > 0. The ``public`` block is present iff ``public_weight > 0`` and its
+    rows name only kept public windows, each judged digest on every one."""
+    w = float(report["params"]["public_weight"])
+    dm = float(report["params"]["d_margin"])
+    if (w > 0.0) != ("public" in report):
+        raise ReportSchemaError("missing_field" if w > 0.0 else "unknown_field", "public",
+                                "the public block is present iff public_weight > 0")
     for i, v in enumerate(report["verdicts"]):
-        at = _join(_join("verdicts", i), "lowfreq")
-        lf = v["lowfreq"]
-        evaluated = lf["result"] in ("pass", "fail")
-        if evaluated and "lcb" not in lf:
-            raise ReportSchemaError("missing_field", _join(at, "lcb"))
-        if not evaluated and "lcb" in lf:
-            raise ReportSchemaError("unknown_field", _join(at, "lcb"),
-                                    f"result {lf['result']} carries no LCBs")
-        if evaluated and lf["n_windows"] < 1:
-            raise ReportSchemaError("bad_value", _join(at, "n_windows"),
-                                    "an evaluated slice has at least one window")
-        if lf["result"] == "no_windows" and lf["n_windows"] != 0:
-            raise ReportSchemaError("bad_value", _join(at, "n_windows"), "no_windows is empty")
-        if not evaluated:
-            continue
-        worst = min(float(lf["lcb"][r][m]) for r in GATE_REFS for m in ("crps", "mase"))
-        want = "fail" if worst < -float(lf["tau_public"]) else "pass"
-        if lf["result"] != want:
-            raise ReportSchemaError("bad_value", _join(at, "result"),
-                                    f"the worst LCB {worst} gives {want}")
-        if want == "fail" and not (v["stage"] == "confirm" and v["cleared"]
-                                   and v["outcome"] == "lost"):
-            raise ReportSchemaError("bad_value", _join(_join("verdicts", i), "outcome"),
-                                    "a lowfreq fail is a cleared confirmation that is lost")
+        at = _join("verdicts", i)
+        hv, src, dom = v["halves"], v["sources"], v["domains"]
+        if ("public" in hv) != (w > 0.0):
+            raise ReportSchemaError("bad_value", _join(at, "halves"),
+                                    "a public half is present iff public_weight > 0")
+        if v["cleared"] and not (float(v["lcb"]) >= dm
+                                 and all(float(x["gain"]) > 0.0 for x in hv.values())):
+            raise ReportSchemaError("bad_value", _join(at, "cleared"),
+                                    "a clear needs lcb >= d_margin and a gain > 0 on every half")
+        house = v.get("house")
+        if house is not None and house["cleared"] and float(house["lcb"]) < dm:
+            raise ReportSchemaError("bad_value", _join(_join(at, "house"), "cleared"),
+                                    "a house clear needs lcb >= d_margin")
+        if set(src) - {"live"} and w <= 0.0 or "live" not in src \
+                or src["live"] != hv["live"]:
+            raise ReportSchemaError("bad_value", _join(at, "sources"),
+                                    "sources.live is the live half; public sources only at "
+                                    "public_weight > 0")
+        n_pub = sum(x["n"] for k, x in src.items() if k != "live")
+        if w > 0.0 and n_pub != hv["public"]["n"]:
+            raise ReportSchemaError("bad_value", _join(at, "sources"),
+                                    "the public sources' windows are not the public half's")
+        n_live_dom = sum(x["n"] for k, x in dom.items() if k.startswith("live|"))
+        n_pub_dom = sum(x["n"] for k, x in dom.items() if not k.startswith("live|"))
+        if n_live_dom != hv["live"]["n"] or n_pub_dom != (hv["public"]["n"] if w > 0.0 else 0):
+            raise ReportSchemaError("bad_value", _join(at, "domains"),
+                                    "the domains' windows are not their halves'")
+    if w <= 0.0:
+        return
+    kept = []
+    for s_ in report["public"]["sources"]:
+        gone = {d["window_id"] for d in s_["dropped"]}
+        kept += [x["window_id"] for x in s_["windows"] if x["window_id"] not in gone]
+    kept.sort()
+    rows = report["public"]["rows"]
+    digests = sorted({r["digest"] for r in rows})
+    want = [(wid, dg) for wid in kept for dg in digests]
+    if [(r["window_id"], r["digest"]) for r in rows] != want:
+        raise ReportSchemaError("bad_value", "public.rows",
+                                "not every scored digest on every kept public window, in "
+                                "window_id then digest order")
+    judged = set()
+    for c in report["cohorts"]:
+        judged |= {c["king_digest"], *c["members"],
+                   *([c["house_digest"]] if "house_digest" in c else [])}
+    if set(digests) != judged:
+        raise ReportSchemaError("bad_value", "public.rows",
+                                "the public rows' digests are not the judged cohorts' models")
 
 
 def _check_gate_weights(report: dict) -> None:
@@ -380,12 +420,342 @@ def _check_gate_weights(report: dict) -> None:
                                     "not one of params.gate_suites")
 
 
+def _check_armed(report: dict) -> None:
+    """rev6.6: ``armed_contexts`` and ``armed_evidence`` come together; the
+    evidence covers ``params.contexts`` exactly (ascending), states
+    ``params.min_long_series``, each variant's ``armed`` is its two gates and
+    the armed set is the armed variants, ascending."""
+    has_set, has_ev = "armed_contexts" in report, "armed_evidence" in report
+    if not has_set and not has_ev:
+        return
+    if not has_set:
+        raise ReportSchemaError("missing_field", "armed_contexts", "armed_evidence without it")
+    if not has_ev:
+        raise ReportSchemaError("missing_field", "armed_evidence", "armed_contexts without it")
+    ev, params = report["armed_evidence"], report["params"]
+    if ev["min_long_series"] != params["min_long_series"]:
+        raise ReportSchemaError("bad_value", "armed_evidence.min_long_series",
+                                "not params.min_long_series")
+    contexts = sorted(params["contexts"])
+    if [v["context"] for v in ev["variants"]] != contexts:
+        raise ReportSchemaError("bad_value", "armed_evidence.variants",
+                                f"must cover params.contexts {contexts} ascending")
+    armed = []
+    for i, v in enumerate(ev["variants"]):
+        gates = (v["series"] >= ev["min_long_series"] and v["sources"] >= ev["min_sources"]
+                 and v["t7_fits"])
+        if v["armed"] is not gates:
+            raise ReportSchemaError("bad_value", _join(_join("armed_evidence.variants", i), "armed"),
+                                    "disagrees with its gates")
+        if gates:
+            armed.append(v["context"])
+    if report["armed_contexts"] != armed:
+        raise ReportSchemaError("bad_value", "armed_contexts",
+                                f"not the armed variants {armed} of armed_evidence")
+
+
+DRAW_SEED_TAG = "lane_d_windows"
+_SUBSCORE_RTOL = 1e-9
+
+
+def _check_judging_start(report: dict) -> None:
+    """rev6.14 (a): every cohort was frozen at a boundary stamped at or after
+    its judging start ``t_max + 3600 * eval_delay_hours`` (so never without
+    ``boundary_ts``); a ``before_eval_delay`` skip names an entry whose start
+    is still after ``boundary_ts``; ``boundary_ts_missing`` only without it."""
+    delay = 3600.0 * float(report["params"]["eval_delay_hours"])
+    if float(report["params"]["forward_margin_hours"]) > float(report["params"]["eval_delay_hours"]):
+        raise ReportSchemaError("bad_value", "params.forward_margin_hours",
+                                "above params.eval_delay_hours (b > j)")
+    bts = report.get("boundary_ts")
+    for i, c in enumerate(report["cohorts"]):
+        if bts is None:
+            raise ReportSchemaError("missing_field", "boundary_ts",
+                                    "a cohort was frozen without the boundary timestamp")
+        if bts < int(c["t_max"]) + delay:
+            raise ReportSchemaError("bad_value", _join("cohorts", i),
+                                    "frozen before its judging start (eval_delay_hours)")
+    reveal = {e["digest"]: int(e["reveal_ts"]) for e in report["entries"]}
+    king_t = int(report["king_before"]["reveal_ts"])
+    for i, sk in enumerate(report["skipped"]):
+        at = _join(_join("skipped", i), "reason")
+        if sk["reason"] == "boundary_ts_missing" and bts is not None:
+            raise ReportSchemaError("bad_value", at, "boundary_ts is present")
+        if sk["reason"] == "before_eval_delay":
+            t = reveal.get(sk["digest"])
+            if bts is None or t is None or bts >= max(t, king_t) + delay:
+                raise ReportSchemaError("bad_value", at, "the judging start has passed")
+
+
+def _check_below_armed(report: dict) -> None:
+    """rev6.15: a ``context_below_armed`` skip (or entry reason) needs the
+    signed armed set, and no armed variant may be <= the entry's declared
+    context."""
+    below = {s["digest"] for s in report["skipped"] if s["reason"] == "context_below_armed"}
+    below |= {e["digest"] for e in report["entries"] if e["reason"] == "context_below_armed"}
+    if not below:
+        return
+    if "armed_contexts" not in report:
+        raise ReportSchemaError("bad_value", "skipped",
+                                "context_below_armed without the signed armed set")
+    armed = [int(c) for c in report["armed_contexts"]]
+    for i, e in enumerate(report["entries"]):
+        if e["digest"] in below and any(c <= int(e["context"]) for c in armed):
+            raise ReportSchemaError("bad_value", _join(_join("entries", i), "reason"),
+                                    "an armed variant is <= the declared context")
+
+
+CHANNEL_FIELDS = ("series_id", "n_channels_raw", "empty_channels", "n_channels",
+                  "channels", "channels_sha256")
+
+
+def _check_window_channels(report: dict) -> None:
+    """rev6.18 A4 (F2): a window carries all of :data:`CHANNEL_FIELDS` or
+    none; its dropped channels are distinct, ascending and inside
+    ``n_channels_raw``, and it scores at most the channels left."""
+    for i, w in enumerate(report["windows"]):
+        at = _join("windows", i)
+        have = [k for k in CHANNEL_FIELDS if k in w]
+        if not have:
+            continue
+        if len(have) != len(CHANNEL_FIELDS):
+            missing = next(k for k in CHANNEL_FIELDS if k not in w)
+            raise ReportSchemaError("missing_field", _join(at, missing),
+                                    "a multichannel window carries every channel field")
+        raw, empty = int(w["n_channels_raw"]), list(w["empty_channels"])
+        if empty != sorted(set(empty)) or any(not 0 <= int(c) < raw for c in empty):
+            raise ReportSchemaError("bad_value", _join(at, "empty_channels"),
+                                    "not distinct ascending channel indices below n_channels_raw")
+        if int(w["n_channels"]) > raw - len(empty):
+            raise ReportSchemaError("bad_value", _join(at, "n_channels"),
+                                    "more channels scored than are non-empty")
+        chans = [int(c) for c in w["channels"]]
+        if (len(chans) != int(w["n_channels"]) or chans != sorted(set(chans))
+                or any(not 0 <= c < raw or c in empty for c in chans)):
+            raise ReportSchemaError("bad_value", _join(at, "channels"),
+                                    "not n_channels distinct ascending non-empty channel indices")
+        body = json.dumps(chans, separators=(",", ":")).encode()
+        if hashlib.sha256(body).hexdigest() != w["channels_sha256"]:
+            raise ReportSchemaError("bad_value", _join(at, "channels_sha256"),
+                                    "not the sha256 of the channels list")
+
+
+def _check_windows_embargo(report: dict) -> None:
+    """rev6.10 (a) / rev6.12 / W5j: each window's embargo record and draw cell
+    agree with themselves, its id and the config echo."""
+    cap = float(report["params"]["embargo_hours"])
+    for i, w in enumerate(report["windows"]):
+        at = _join("windows", i)
+        e = float(w["embargo_hours"])
+        if e > cap:
+            raise ReportSchemaError("bad_value", _join(at, "embargo_hours"),
+                                    f"above params.embargo_hours {cap}")
+        if w["rule"] != ("embargo" if e > 0.0 else "embargo0"):
+            raise ReportSchemaError("bad_value", _join(at, "rule"),
+                                    f"rule {w['rule']!r} for an effective embargo of {e} h")
+        if w["min_release_ts"] != int(w["min_first_seen_ts"]) + int(round(3600.0 * e)):
+            raise ReportSchemaError("bad_value", _join(at, "min_release_ts"),
+                                    "not min_first_seen_ts + 3600 * embargo_hours")
+        if w["rule"] == "embargo0" and w["embargo_window"]:
+            raise ReportSchemaError("bad_value", _join(at, "embargo_window"),
+                                    "an embargo0 window is fresh")
+        parts = str(w["window_id"]).rsplit(":", 2)
+        if len(parts) == 3 and parts[2] != f"h{w['h']}":
+            raise ReportSchemaError("bad_value", _join(at, "h"), "not the window id's h")
+        if len(parts) == 3 and parts[1] != str(w["origin"]):
+            raise ReportSchemaError("bad_value", _join(at, "origin"), "not the window id's origin")
+
+
+def _check_cohort_split(report: dict) -> None:
+    """rev6.12 (b): each cohort's fresh / embargo counts match its windows'
+    flags and the fresh share holds; W5j: the judged windows stay within
+    ``params.max_windows_per_settlement``."""
+    flag = {w["window_id"]: bool(w["embargo_window"]) for w in report["windows"]}
+    share = float(report["params"]["min_fresh_window_share"])
+    for i, c in enumerate(report["cohorts"]):
+        at = _join("cohorts", i)
+        ids = [x for x in c["window_ids"] if x in flag]
+        n_emb = sum(1 for x in ids if flag[x])
+        if c["fresh_windows"] != len(ids) - n_emb:
+            raise ReportSchemaError("bad_value", _join(at, "fresh_windows"),
+                                    "not the count of its fresh windows")
+        if c["embargo_windows"] != n_emb:
+            raise ReportSchemaError("bad_value", _join(at, "embargo_windows"),
+                                    "not the count of its embargo windows")
+        if ids and c["fresh_windows"] < share * len(ids):
+            raise ReportSchemaError("bad_value", _join(at, "embargo_windows"),
+                                    f"the fresh share is below {share}")
+    judged = {x for c in report["cohorts"] for x in c["window_ids"]}
+    if len(judged) > int(report["params"]["max_windows_per_settlement"]):
+        raise ReportSchemaError("bad_value", "cohorts",
+                                "more judged windows than max_windows_per_settlement")
+
+
+def _geo(rows: list) -> float | None:
+    if not rows:
+        return None
+    lc = sum(math.log(max(float(r["crps"]), 1e-12)) for r in rows) / len(rows)
+    lm = sum(math.log(max(float(r["mase"]), 1e-9)) for r in rows) / len(rows)
+    return math.sqrt(math.exp(lc) * math.exp(lm))
+
+
+def _check_subscores(report: dict) -> None:
+    """rev6.12 (b): each verdict's fresh / embargo sub-score is its rows on
+    its cohort's fresh / embargo windows (``geomean`` null iff n = 0)."""
+    flag = {w["window_id"]: bool(w["embargo_window"]) for w in report["windows"]}
+    cohorts = report["cohorts"]
+    for i, v in enumerate(report["verdicts"]):
+        c = cohorts[v["cohort"]] if 0 <= v["cohort"] < len(cohorts) else None
+        if c is None:
+            continue
+        ids = set(c["window_ids"])
+        mine = [r for r in report["rows"] if r["digest"] == v["digest"]
+                and r["cohort"] == v["cohort"] and r["window_id"] in ids]
+        for name, emb in (("fresh", False), ("embargo", True)):
+            rs = [r for r in mine if flag.get(r["window_id"]) is emb]
+            at = _join(_join("verdicts", i), name)
+            if v[name]["n"] != len(rs):
+                raise ReportSchemaError("bad_value", _join(at, "n"), "not its row count")
+            want, got = _geo(rs), v[name]["geomean"]
+            if (want is None) is not (got is None) or (
+                    want is not None and abs(float(got) - want) > _SUBSCORE_RTOL * want):
+                raise ReportSchemaError("bad_value", _join(at, "geomean"), "not its rows' geomean")
+
+
+def _check_draw(report: dict) -> None:
+    """W5j: the draw record is bound to its block hash, the budget and the
+    report's cohorts; per cell, quota = the cohort's judged windows of that
+    cell and quota <= capacity."""
+    if "draw" not in report:
+        return
+    d = report["draw"]
+    if d["seed"] != f"{d['boundary_block_hash']}:{DRAW_SEED_TAG}":
+        raise ReportSchemaError("bad_value", "draw.seed", "not <boundary_block_hash>:lane_d_windows")
+    if d["max_windows_per_settlement"] != report["params"]["max_windows_per_settlement"]:
+        raise ReportSchemaError("bad_value", "draw.max_windows_per_settlement",
+                                "not params.max_windows_per_settlement")
+    cells = {w["window_id"]: f"{w['timeframe']}|{w['bin']}" for w in report["windows"]}
+    by_index = {c["index"]: c for c in report["cohorts"]}
+    seen: set[int] = set()
+    for i, dc in enumerate(d["cohorts"]):
+        at = _join(_join("draw", "cohorts"), i)
+        c = by_index.get(dc["index"])
+        if c is None or dc["index"] in seen:
+            raise ReportSchemaError("bad_value", _join(at, "index"), "not a cohort of the report")
+        seen.add(dc["index"])
+        count: dict[str, int] = {}
+        for x in c["window_ids"]:
+            k = cells.get(x)
+            if k is not None:
+                count[k] = count.get(k, 0) + 1
+        for k in sorted(set(dc["quota"]) | set(count)):
+            q = dc["quota"].get(k, 0)
+            if q > dc["capacity"].get(k, 0) or q != count.get(k, 0):
+                raise ReportSchemaError("bad_value", _join(_join(at, "quota"), k),
+                                        "not the cohort's drawn windows of that cell, or above "
+                                        "its capacity")
+
+
+PUBLIC_SEED_TAG = "lane_d_public"
+_BLOCK_HASH_RE = re.compile(r"0x[0-9a-f]{64}")
+
+
+def _check_public(report: dict) -> None:
+    """rev6.18 A1/A2/A6 (F3, W5k): each public source once, sorted; its seed
+    is ``<block hash>:lane_d_public:<source>`` on the settlement's block hash
+    (the draw's / gate's when present); per cell the drawn windows are at
+    most the quota and the quota at most the capacity, the quotas sum to at
+    most ``n_windows``; window ids are unique, sorted, of the form
+    ``<source>:<series_id>:<cut>:h<h>`` with ``h = horizon`` and ``min_history
+    <= cut <= length - h``; a series' targets never overlap; every dropped
+    window is a drawn one, listed once."""
+    if "public" not in report:
+        return
+    bhs = {d.get("boundary_block_hash") for d in (report.get("draw"),) if isinstance(d, dict)}
+    bhs |= {g.get("block_hash") for g in (report.get("gate"),) if isinstance(g, dict)}
+    srcs = report["public"]["sources"]
+    names = [s["source"] for s in srcs]
+    if names != sorted(set(names)):
+        raise ReportSchemaError("bad_value", "public.sources", "sources not unique and sorted")
+    for i, s in enumerate(srcs):
+        at = _join(_join("public", "sources"), i)
+        src, h = s["source"], int(s["horizon"])
+        bh, _, tail = s["seed"].partition(":")
+        if (tail != f"{PUBLIC_SEED_TAG}:{src}" or not _BLOCK_HASH_RE.fullmatch(bh)
+                or (bhs and bh not in bhs) or len(bhs) > 1):
+            raise ReportSchemaError("bad_value", _join(at, "seed"),
+                                    "not <boundary_block_hash>:lane_d_public:<source>")
+        if sum(s["quota"].values()) > int(s["n_windows"]):
+            raise ReportSchemaError("bad_value", _join(at, "quota"), "quotas exceed n_windows")
+        for k, q in s["quota"].items():
+            if q > s["capacity"].get(k, 0):
+                raise ReportSchemaError("bad_value", _join(_join(at, "quota"), k),
+                                        "above its capacity")
+        count: dict[str, int] = {}
+        ids = [w["window_id"] for w in s["windows"]]
+        if ids != sorted(set(ids)):
+            raise ReportSchemaError("bad_value", _join(at, "windows"),
+                                    "window ids not unique and sorted")
+        spans: dict[str, list[tuple[int, int]]] = {}
+        for j, w in enumerate(s["windows"]):
+            wat = _join(_join(at, "windows"), j)
+            k = f"{w['family']}|{w['freq']}"
+            count[k] = count.get(k, 0) + 1
+            cut = int(w["cut"])
+            head = f"{src}:"
+            tail = f":{cut}:h{h}"
+            wid = w["window_id"]
+            if (w["h"] != h or not wid.startswith(head) or not wid.endswith(tail)
+                    or len(wid) <= len(head) + len(tail)):
+                raise ReportSchemaError("bad_value", _join(wat, "window_id"),
+                                        "not <source>:<series_id>:<cut>:h<horizon>")
+            if not int(s["min_history"]) <= cut <= int(w["length"]) - h:
+                raise ReportSchemaError("bad_value", _join(wat, "cut"),
+                                        "outside [min_history, length - h]")
+            sid = wid[len(head):-len(tail)]
+            if any(cut < e and a < cut + h for a, e in spans.get(sid, ())):
+                raise ReportSchemaError("bad_value", _join(wat, "cut"),
+                                        "target overlaps another window of its series")
+            spans.setdefault(sid, []).append((cut, cut + h))
+        for k, n in count.items():
+            if n > s["quota"].get(k, 0):
+                raise ReportSchemaError("bad_value", _join(_join(at, "quota"), k),
+                                        "fewer than the cell's drawn windows")
+        dropped = [d["window_id"] for d in s["dropped"]]
+        if dropped != sorted(set(dropped)) or not set(dropped) <= set(ids):
+            raise ReportSchemaError("bad_value", _join(at, "dropped"),
+                                    "dropped windows not unique, sorted and drawn")
+
+
+def _check_host(report: dict) -> None:
+    """rev6.18 B7: a ``host`` record's ``identity`` hashes its other
+    fields (whether its env is qualified is the audit's check: it depends on
+    the boundary and the committed environment list)."""
+    if "host" not in report:
+        return
+    from ..shared.config.lane_d import host_record_problem
+
+    why = host_record_problem(report["host"])
+    if why:
+        raise ReportSchemaError("bad_value", "host", why)
+
+
 def _cross_field(report: dict) -> None:
     """The rules between fields, run after every structural check passes."""
+    _check_public(report)
+    _check_armed(report)
+    _check_host(report)
+    _check_below_armed(report)
+    _check_judging_start(report)
+    _check_windows_embargo(report)
+    _check_window_channels(report)
+    _check_cohort_split(report)
+    _check_subscores(report)
+    _check_draw(report)
     _check_gate_weights(report)
     _check_snapshots(report)
     _check_house(report)
-    _check_lowfreq(report)
+    _check_halves(report)
     if report["crowned"] is not None and not isinstance(report.get("gate"), dict):
         # W5e (RV5): nothing crowns ungated (the schema's top-level
         # conditional states the same rule).
@@ -410,6 +780,9 @@ def validate_report(report) -> None:
     _cross_field(report)
     if rows_sha256(report["rows"]) != report["rows_sha256"]:
         raise ReportSchemaError("rows_sha256_mismatch", "rows_sha256")
+    if "public" in report and rows_sha256(report["public"]["rows"]) \
+            != report["public"]["rows_sha256"]:
+        raise ReportSchemaError("rows_sha256_mismatch", "public.rows_sha256")
 
 
 def canonical_json(obj) -> bytes:
@@ -506,8 +879,8 @@ def pinned_report_signer(cfg) -> str:
     return pin
 
 
-__all__ = ["BURN_REASONS", "CONFIRMATION_STAGES", "CONFIRM_RULES", "ENTRY_REASONS",
-           "ENTRY_STATUSES", "GATE_OUTCOMES", "GATE_REFS", "LOWFREQ_RESULTS", "REPORT_SCHEMA", "SCHEMA_ERROR_CODES",
+__all__ = ["BURN_REASONS", "CONFIRMATION_STAGES", "ENTRY_REASONS",
+           "ENTRY_STATUSES", "GATE_OUTCOMES", "GATE_REFS", "REPORT_SCHEMA", "SCHEMA_ERROR_CODES",
            "SCHEMA_PATH", "SIGNATURE_PATTERN", "SIGNATURE_SCHEME", "SKIP_REASONS",
            "VERDICT_OUTCOMES", "WINDOW_REFUSAL_REASONS", "ReportSchemaError", "canonical_body",
            "canonical_json", "load_schema", "pinned_report_signer", "rows_sha256",

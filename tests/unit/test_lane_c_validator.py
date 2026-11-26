@@ -187,9 +187,9 @@ def test_recovery_keeps_expired_holder_and_old_report_state(cfg, tmp_path, recov
     live = _runner(cfg, tmp_path / "live", store, history=[])
     recovered = _runner(cfg, tmp_path / "recovered", store, history=[])
     for r in (live, recovered):
-        r.cfg = replace(r.cfg, lane_c=replace(r.cfg.lane_c, replay_settlements=2,
-                                             win_ttl_eras=1))
-    old = replace(_win(block=2 * EB), base_pointer=KING_PTR, gain_lcb=0.10)
+        r.cfg = replace(r.cfg, lane_c=replace(r.cfg.lane_c, replay_settlements=2))
+    # DEC-CA-0073: a one-era full-pay duration expires the holder
+    old = replace(_win(block=2 * EB), base_pointer=KING_PTR, gain_lcb=0.10, full_eras=1)
     new = replace(old, hotkey="bob", uid=UIDS["bob"], round_id="1007", win_block=8 * EB,
                   gain_lcb=0.03)
     seen = {"a" * 64: {"hotkey": "alice", "commit_block": EB}}

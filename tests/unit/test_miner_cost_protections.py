@@ -75,13 +75,20 @@ def _with_round(text: str, extra: str) -> str:
 # ── config: every knob is parsed by the loader (round-trip) ──────────────────
 
 def test_knobs_default_and_round_trip_through_the_loader(tmp_path):
+    from cascade.shared.config import RoundConfig
+
     base = load_chain_config(ROOT / "chain.toml").round
-    assert base.funded_sku_wall_measured_image == ""          # gate off by default
+    # gate off by default; the shipped file types the live rc15 pin (S0a B9)
+    assert RoundConfig().funded_sku_wall_measured_image == ""
+    assert base.funded_sku_wall_measured_image == (
+        "sha256:5d41d94bc0c0d3ae3dfd042b0cc7e4d900c7d1f48173808436c12bf764a67641")
     assert base.progress_watchdog_grace_seconds == 1200
     assert base.progress_watchdog_tolerance == 1.5
     assert base.provider_ttl_margin_seconds == 3600
     assert base.payer_key_check_seconds == 1800
-    text = _with_round((ROOT / "chain.toml").read_text(), "\n".join([
+    shipped = re.sub(r"(?m)^funded_sku_wall_measured_image = .*\n", "",
+                     (ROOT / "chain.toml").read_text())
+    text = _with_round(shipped, "\n".join([
         f'funded_sku_wall_measured_image = "ghcr.io/x/worker@{DIGEST_A}"',
         "progress_watchdog_grace_seconds = 600",
         "progress_watchdog_tolerance = 2.0",
@@ -353,13 +360,22 @@ def test_measured_wall_gate_is_off_by_default_and_passes_a_match():
     assert measured_wall_refusal(RoundConfig(funded_pod_image=img)) == ""
     assert measured_wall_refusal(RoundConfig(funded_pod_image=img,
                                              funded_sku_wall_measured_image=DIGEST_C)) == ""
+    # W-IMG (owner 2026-11-24, "YES to the 5 h cap"): an unmeasured image
+    # rents under [round] unmeasured_image_wall_cap_seconds (default 18000);
+    # the old refusal is the cap set to 0
+    assert measured_wall_refusal(RoundConfig(funded_pod_image=img,
+                                             funded_sku_wall_measured_image=DIGEST_A)) == ""
     why = measured_wall_refusal(RoundConfig(funded_pod_image=img,
-                                            funded_sku_wall_measured_image=DIGEST_A))
+                                            funded_sku_wall_measured_image=DIGEST_A,
+                                            unmeasured_image_wall_cap_seconds=0))
     assert "no measured wall for the pinned image" in why
 
 
 def test_unmeasured_image_refuses_the_rent_unburned(tmp_path, monkeypatch, caplog):
-    runner = _runner(tmp_path, funded_sku_wall_measured_image=DIGEST_A)
+    # the cap off (0): today's refusal (W-IMG: the default rents under the cap,
+    # tests/accept/w_img/test_w_img_wall_cap.py)
+    runner = _runner(tmp_path, funded_sku_wall_measured_image=DIGEST_A,
+                     unmeasured_image_wall_cap_seconds=0)
     _vault(tmp_path, "hkA")
     rents = []
     monkeypatch.setattr(funded_mod, "rent_funded_pod", lambda **kw: rents.append(kw))

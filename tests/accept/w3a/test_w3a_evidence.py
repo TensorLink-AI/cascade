@@ -27,9 +27,11 @@ from pathlib import Path
 import pytest
 
 from .helpers import (
+    DECISION,
     PROBES,
     evidence_problems,
     fixture_evidence,
+    gate_problems,
     probe,
     relabel_as_live,
     verified_live_problems,
@@ -69,13 +71,18 @@ def test_evidence_schema_and_verdicts_reproduced():
 
 
 def test_evidence_every_probe_has_a_live_result():
+    """The L4 gate. Lock-enabled evidence: every probe pass/fail and
+    ``passed: true`` (unchanged). ``--no-object-lock`` evidence: the lock
+    probes skipped, the Chosen path's probes pass, every other result recorded
+    verbatim in the decision, and ``verified_live.path_verdict.passed``
+    (README "The L4 gate on --no-object-lock evidence")."""
     ev = _evidence()
     assert ev.get("source") == "live", ev.get("source")
     res = {p.get("name"): p.get("result") for p in ev.get("probes", [])}
     assert set(res) == set(PROBES), sorted(res)
-    errored = {n: r for n, r in res.items() if r not in ("pass", "fail")}
-    assert not errored, f"probes without a recorded live result (re-run them): {errored}"
-    assert ev.get("passed") is True, ev.get("passed")
+    assert DECISION.is_file(), f"{DECISION} is missing"
+    problems = gate_problems(ev, DECISION.read_text(encoding="utf-8"))
+    assert problems == [], "W3a evidence does not clear the L4 gate:\n  " + "\n  ".join(problems)
 
 
 def test_evidence_was_verified_against_the_live_bucket():

@@ -1,0 +1,6 @@
+# W6a pool_d selection = pool's selected series ids, joined (plan §1.7 "pool_d
+# (D12)", §3.0 W6a row; README.md has the contract).
+# The join module: harvest once, run lane A's own collect_records unchanged,
+# then map every selected lane A record to its stable join key
+# (source, pre-suffix source series key, channel).
+cascade/pool/pool_d_select.py

@@ -270,6 +270,136 @@ request ids, `passed`: `helpers.relabel_as_live`) has a self-consistent
 body, and is **refused**: it has no `verified_live` record, and `verify`
 refuses it against any bucket that does not hold its locked objects.
 
+## No Object Lock: `--no-object-lock` (owner 2026-11-23)
+
+Hippius has **no Object Lock**: a full-access bucket-scoped sub-token and the
+main key both get AccessDenied 403 on GetObjectLockConfiguration /
+GetBucketVersioning, and the console offers no lock permission. So the
+fail-closed preflight above (`bucket_lock_unreadable`, exit 2) refuses every
+Hippius bucket. The owner re-runs the probe with an explicit flag and picks
+the upload path from that evidence. Kings are **not** COMPLIANCE-locked;
+immutability comes from the content-addressed path + the ingest re-hash +
+the R2/HF mirrors. (`test_w3a_no_object_lock.py`.)
+
+```
+python -P -m cascade.laned.storage_probe --bucket <throwaway bucket> --prefix <throwaway prefix>/ \
+    --other-bucket <bucket outside the sub-token> --out evidence/w3a_probe.json --confirm-live \
+    --no-object-lock
+```
+
+With `--no-object-lock` the owner **asserts** the bucket has no Object Lock
+(so it has no default retention either), and the probe:
+
+- never calls GetObjectLockConfiguration (neither the preflight nor the lock
+  probes' own read), never sends an `ObjectLock*` header on any write and
+  never calls PutObjectRetention;
+- records `bucket_lock: {"lock_enabled": false, "asserted_by": "owner_flag"}`
+  (exactly these two keys: no read was made);
+- records `object_lock_multipart` and `compliance_retention_unshortenable`
+  as `{"result": "skipped", "passed": false, "reason": "no_object_lock",
+  "requests": [], "objects": [], "observations": {}}`, never `pass`;
+- still runs `upload_part_copy_2_5gb`: its destination was always a plain
+  (unlocked) multipart upload, so the copy runs unchanged and records
+  `pass`/`fail` as before (nothing to skip in it);
+- writes `locked_objects: []` and `cleanup.remaining_locked: []`;
+- after cleanup writes **one unlocked anchor object** under the run root
+  (`<prefix><run_id>/anchor.bin`, ≤ 4096 bytes, never a probe object), PUT
+  with the main key and HEADed, recorded as top-level
+  `anchor_objects: [{"key", "version_id" (null without versioning), "size",
+  "etag", "sha256"}]`. It is not in `cleanup.remaining_unlocked` (computed
+  before it is written). A run whose anchor write fails is incomplete
+  (exit 1). The owner may delete it after `verify` and the evidence PR.
+
+`complete` (exit 0) counts the two skipped lock probes as recorded, and
+`passed` / the verifier's `passed` rule likewise (and requires a non-empty
+`anchor_objects`). `recommended_path` is unchanged. The plan (`--dry-run`
+without `--fixture`) lists the lock probes as `skipped (no_object_lock)`
+and names no lock call. Without the flag nothing changes: no
+`anchor_objects` key, the four-key `bucket_lock` read, and a 403 lock read
+is still exit 2 `bucket_lock_unreadable`.
+
+The verifier: `skipped` is valid only for the two lock probes of evidence
+whose `bucket_lock` is the owner-flag record (anything else is rejected,
+as is a lock probe recorded `pass`/`fail`/`error` in such evidence); a
+skipped row must be exactly the shape above; `anchor_objects` is required
+with the flag and forbidden without it.
+
+**`verify` on no-lock evidence.** There are no locked objects, so
+`verify_live` re-reads the anchor instead: for each anchor `head_object`
+and `get_object` with `Bucket`, `Key` and (only when the evidence has one)
+`VersionId`; it compares ETag, size, sha256 of the GET body and the version
+id (when recorded). The record also carries `path_verdict` (see "The L4
+gate on `--no-object-lock` evidence"). Then it lists the run root (`list_object_versions`,
+falling back to `list_objects_v2` when version listing fails): it must hold
+exactly the anchor keys. Codes: `no_anchor_objects` (empty / missing
+`anchor_objects`), `anchor_object_missing` (a read fails),
+`anchor_object_mismatch`, `run_root_not_clean`. There is no lock, so no
+expiry check. The record is the same `laned_w3a_verify/1` plus
+`"binding": "unlocked_anchor"`; its `objects[]` rows are the anchors with
+`mode: null`, `retain_until: null` and the HEAD/GET request ids.
+Evidence without the owner-flag record still needs its locked objects
+(`no_locked_objects`). This binding is **weaker** than a COMPLIANCE lock:
+an unlocked anchor could be planted by anyone holding the bucket's write
+key, so it proves "this bucket held these bytes at verify time", not
+"nobody could have written them". The owner accepted that (no lock
+exists); the owner runs `verify` and opens the evidence PR.
+
+**The decision record.** When the evidence's lock probes are `skipped`,
+the record must carry exactly one `No Object Lock:` line (optional list
+marker / `**` bold, colon inside the bold) that states kings are **not**
+locked (by copy at crowning) and that immutability comes from the
+content-addressed path, the ingest re-hash and the R2/HF mirrors (it must
+mention: king(s); `not`/`never` … `locked`; `content-address…`;
+`re-hash`/`rehash`; `mirror…`), and no other line may claim kings are
+locked (a line naming king(s) with `are/is/get/stay/remain/will be
+[COMPLIANCE-]locked`, or `locked by copy` / `locked at crowning` not
+preceded by `not`/`never`). The template's "Kings are locked by copy at
+crowning" bullet must therefore be rewritten by the owner in the live-run
+fill. With lock probes that ran, neither rule applies.
+
+### The L4 gate on `--no-object-lock` evidence (owner 2026-11-23, decision #717)
+
+On Hippius some probes that do not decide the upload path end in `error`
+(the owner's run: `single_put_limit` BrokenPipe on the 2.5 GiB PUT,
+`prefix_bucket_policy` GetBucketPolicy 403, `subtoken_scope`
+inconclusive), so the body's `passed` (every probe recorded, an `error` is
+not) is false and stays false: the body rule above is unchanged. The gate
+(`test_evidence_every_probe_has_a_live_result`, `helpers.gate_problems`)
+instead asks for what the Chosen path needs. For evidence whose
+`bucket_lock` is the owner-flag record:
+
+- both lock probes are `skipped` (`no_object_lock`), as pinned above;
+- every probe the decision's `Chosen path:` depends on is `pass`
+  (`helpers.PATH_PROBES`): `presigned_multipart` needs
+  `presigned_upload_part`, `single_presigned_put` needs `single_put_limit`,
+  and every path also needs `upload_part_copy_2_5gb` (the server-side king
+  copy at crowning, W6d);
+- any other probe may be `pass`, `fail` or `error`, but every probe's
+  result is recorded **exactly once, verbatim** in the decision's results
+  table (a row `` | `<probe>` | `<result>` | ... ``, backticks optional);
+- `verified_live.path_verdict` (below) is present, equal to the verdict
+  recomputed from the body, and `passed: true`.
+
+`path_verdict` is `{"path": <recommended_path, recomputed>, "required":
+[<PATH_PROBES[path]>], "passed": <bool>}`; `passed` is true iff the evidence
+is the owner-flag record with both lock probes `skipped`, every `required`
+probe `pass`, `cleanup.remaining_unlocked == []`, a non-empty
+`anchor_objects` and `source: "live"`. `storage_probe verify` writes it into
+the `unlocked_anchor` record (it never refuses for a false verdict; it
+records it), so it is recomputed read-only from an existing evidence file:
+re-running `verify` re-reads the anchor and rewrites only `verified_live`,
+never the hash-bound body. The offline verifier requires it on every
+`unlocked_anchor` record and refuses an edited one. Lock-enabled evidence
+is unchanged: the gate wants every probe `pass`/`fail` and `passed: true`,
+and its verify record carries no `path_verdict`.
+
+**`tool.git_dirty`.** `tool_info()` (the body's `tool` and the verify
+record's) counts a checkout dirty for any tracked change (modified, staged,
+deleted) and any untracked file **except** untracked files under
+`evidence/`, where the probe's `--out` and `verify`'s rewritten file live;
+so `verify --evidence evidence/w3a_probe.json` from a clean checkout
+records `git_dirty: false`.
+
 ## `storage_probe verify`: the check against the live resource (plan §17.1 L4)
 
 ```

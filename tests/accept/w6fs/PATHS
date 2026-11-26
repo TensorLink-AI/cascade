@@ -1,0 +1,7 @@
+# W6fs first-seen recording (plan §3.0 W6fs row, rev5 B12 attestation,
+# rev6.10 release-time record, rev6.11 (d) 3-hourly Merkle roots; README.md
+# has the contract).
+# The append-only ingest-log recorder, its 3-hourly Merkle roots, the reader
+# the pool_d builder uses, the per-feed mirror-lag measurement and the
+# snapshot verifier.
+cascade/pool/first_seen.py

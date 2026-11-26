@@ -388,7 +388,9 @@ operator's vault and the chain commit is a `vault/direct@sha256:…` ref — see
 
 A lane B generator uses the same repo layout and contract as above. You fund
 it with `POST /v1/lane-b/fund` (or `cascade lane-b fund`), naming the
-declared targets in `X-Lane-B-Targets`. This section covers the two
+declared targets in `X-Lane-B-Targets`. The CLI sends the declared rows
+header from `cascade lane-b fund --declared-rows rows.json`, and one suite
+target from `--target suite:gift`. This section covers the two
 additions to that request: optional declared expert rows, and the
 contamination check on the submitted tree. The settings and their defaults
 are listed in [MINER.md](MINER.md#lane-b-track-settings).
@@ -453,7 +455,9 @@ No lane B submission may ship public benchmark series. While
 tree after the identity check and scans it statically. It never runs the
 tree. `.py` files are parsed for number constants, `.json` files for
 numbers, and other files are read as raw numeric arrays and one-column text.
-Every sequence is matched against the pinned hash set. A tree that declares
+Every sequence is matched against the pinned hash set.
+`cascade lane-b verify-repo <dir>` runs the same scan locally, read-only and
+offline, and prints the same `contamination` receipt. A tree that declares
 a `suite:<suite>` target must also fit the size cap
 `suite_target_max_repo_mb` (default `8` MiB), or the request is refused with
 413 `repo_too_large` before the scan runs.
@@ -481,6 +485,27 @@ carry a `contamination` receipt with these keys:
 | `window_id` | That window's id, else null. |
 
 When no hash set is pinned, none of this applies and the reply is unchanged.
+
+## Lane D checkpoint interface (open weights)
+
+Lane D entries are weights, not generators; nothing above about generator
+code applies to them. A lane D entry is a `cascade_pyramid` checkpoint
+directory with exactly these files (`cascade/lane_d/intake.py`
+`ALLOWED_FILES`), and any other file is refused (`file_not_allowed`):
+
+| File | Must be |
+|---|---|
+| `config.json` | the contract's config: its `"moe"` object equals the contract's |
+| `model.py` | byte-identical to `cascade/trainer/pyramid_model.py` |
+| `forecast_wrapper.py` | byte-identical to `cascade/trainer/pyramid_wrapper.py` |
+| `weights.safetensors` | BF16 only (`[lane_d] dtypes`), the contract's tensor names and shapes, every value finite; F32 is refused (`dtype_mismatch`) |
+
+The entry digest is the sha256 of the canonical file manifest
+(`{"files": {name: {"sha256", "size"}}}`, sorted keys, compact). Context is
+declared at `ready` from `[lane_d] contexts`, not stored in the checkpoint.
+Nothing in an entry is ever imported or executed. Build and check one with
+`cascade lane-d export` and `cascade lane-d verify`; the full guide is
+[LANE_D.md](LANE_D.md).
 
 ## What good data looks like
 

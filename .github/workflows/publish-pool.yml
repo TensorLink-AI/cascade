@@ -1,4 +1,4 @@
-# Daily publish of the cascade held-out eval pool from the tsbench-forge mirror.
+# Hourly publish of the cascade held-out eval pool from the tsbench-forge mirror.
 #
 # The two-bucket relay (docs/EVAL_POOL.md): the forge scrape host mirrors raw
 # data to a PRIVATE forge bucket; this job syncs that down and builds + publishes
@@ -24,9 +24,11 @@
 #   HF_TOKEN                                        HF write token for HF_EVAL_REPO's org
 #   (repo var HF_EVAL_REPO, default Tensor-Link/cascade-eval-pool) — RETIRED
 #   snapshot tars are mirrored here byte-identically (sha256-verified against
-#   pool/index.json, the same hash round receipts pin). Only snapshots already
-#   superseded by a newer active one are revealed (~48h lag), so a revealed
-#   pool can never be selected by a current or future round. Unset HF_TOKEN =>
+#   pool/index.json, the same hash round receipts pin). Only snapshots built
+#   at least [lane_d] embargo_hours (48 h) before the reveal are revealed
+#   (--keep-newest 20, see the reveal step), so a revealed pool can never be
+#   selected by a current or future round and never exposes forge points lane
+#   D still scores as embargoed. Unset HF_TOKEN =>
 #   the reveal step is skipped and only the private publish runs.
 # OPTIONAL repo variables:
 #   TSFORGE_BUCKET        forge raw-data bucket   (default: tsbench-forge-sources)
@@ -42,7 +44,22 @@ name: Publish eval pool
 
 on:
   schedule:
-    - cron: "0 3 * * *"          # 03:00 UTC daily — active from the next round
+    # Hourly (owner 2026-11-24). Validators select one snapshot per 3 h epoch
+    # and a re-publish for the same effective_block REPLACES that index entry
+    # (publish_pool_snapshot is idempotent per block; validators cache by
+    # block + sha256), so the hourly runs keep refreshing the pending snapshot
+    # and the last one built before its epoch is the one scored. --round-buffer
+    # 2 (publish step) keeps that pending block at least one full epoch past
+    # any build, so a ~55 min build can never land on an epoch that started
+    # while it ran, i.e. on a boundary the trainer may already have pinned.
+    # FREEZE (consensus): publish_pool_snapshot refuses to change an entry
+    # that activates within one epoch of the chain head (estimated from the
+    # validator's status/chain.json; head unknown => no replacement at all),
+    # so the bytes the trainer signs into the manifest (eval_pool_sha256) and
+    # every validator re-resolves are final an epoch before activation. A
+    # refused replace is a logged warning, exit 0.
+    # The HF reveal still runs once a day (03:xx UTC runs only; see that step).
+    - cron: "0 * * * *"
   workflow_dispatch:
     inputs:
       network:
@@ -207,15 +224,32 @@ jobs:
           #   25 per feed (until 2026-10-03) still let 28 panel feeds supply ~26% of
           #   the series but only ~2.5% of the clusters, and transport filled its
           #   600 from ~50 sources. The KOTH bootstrap resamples whole feeds, so
-          #   evidence scales with distinct sources: 5 per feed makes the same caps
-          #   draw from ~2.4x more feeds and tightens the LCB.
-          # --max-series-per-domain-freq 400: balance by domain AND granularity —
+          #   evidence scales with distinct sources: 5 per feed made the same caps
+          #   draw from ~2.4x more feeds and tightened the LCB.
+          #   Raised 2026-11-23 (owner) 5 -> 20 with the domain caps below. The
+          #   bootstrap cluster key is the feed's source_family (pool metadata
+          #   `source`; cascade/pool/builder.py prepare_series, the default
+          #   --cluster-by source_family), and every panel row of one feed carries
+          #   the same family, so extra panel rows add series but no clusters.
+          #   --selection balanced still deals slots across sources first.
+          #   NOTE: the panel cap is not recorded in provenance.json, so a lane D
+          #   pool_d_build replay of a snapshot must pass the same
+          #   --max-panel-series-per-feed it was published with (20 from now on).
+          # --max-series-per-domain-freq 750: balance by domain AND granularity —
           #   no (domain, freq) cell can dominate, so an hourly flood inside a
           #   domain can't crowd out that domain's daily series either.
-          # --max-series-per-domain 800: outer bound — every domain is already
+          # --max-series-per-domain 1500: outer bound — every domain is already
           #   multi-granularity (4-9 freqs), so the cell cap alone would let one
-          #   domain span cells up to 400 x n_freqs; 800 absolute caps that.
-          #   Keep these overrides aligned with the reviewed CLI defaults.
+          #   domain span cells up to 750 x n_freqs; 1500 absolute caps that.
+          #   Raised 2026-11-23 (owner) from 800 / 400 for a ~10k-series
+          #   snapshot. This replaces the plan to hold the caps until the scarce
+          #   domains (sales) reached 800: small domains are already fully taken,
+          #   and the even-by-domain draw gives a scarce domain everything it
+          #   has and flows the surplus to the larger domains
+          #   (cascade/validator/windows.py, DEC-CA-0032), so higher caps add
+          #   series where the pool has them.
+          #   Keep these overrides aligned with the reviewed CLI defaults
+          #   (cascade/pool/cli.py; tests/unit/test_pool_publish_workflow.py).
           # --selection balanced: when a cap binds, deal its slots round-robin
           #   across SOURCES in an order seeded by the snapshot's effective block,
           #   and take a seeded sample of each feed's panel rows. First-come
@@ -231,11 +265,16 @@ jobs:
           TSFORGE_DIR=./tsforge cascade-pool publish \
             --chain-toml "$TOML" \
             --sources tsbench_forge \
-            --max-panel-series-per-feed 5 \
-            --max-series-per-domain-freq 400 \
-            --max-series-per-domain 800 \
+            --max-panel-series-per-feed 20 \
+            --max-series-per-domain-freq 750 \
+            --max-series-per-domain 1500 \
             --selection balanced \
+            --round-buffer 2 \
+            --max-keep 480 \
             --effective-block "$EFFECTIVE_BLOCK"
+          # --round-buffer 2: see the schedule comment (hourly publishes).
+          # --max-keep 480: one index entry per epoch now (8/day, not 1/day),
+          #   so 480 keeps the same ~60 days of history the default 60 kept.
 
       # MarketCast uses the separate bar/alpha recorder pipeline and
       # `cascade-pool publish --lane mkt`; the retired forge --lane c path
@@ -248,8 +287,12 @@ jobs:
       # whenever mirror partitions landed after the publish (observed live:
       # block-8740800 = 3,356 series vs its rebuild = 3,442). The newest two
       # snapshots are withheld (pending + possibly-active), so a revealed pool
-      # can never be selected by a current or future round; effective lag ~48h.
-      # Idempotent per snapshot — backlog backfills across runs (max 6/run).
+      # can never be selected by a current or future round. With hourly publishes
+      # the newest TWENTY are withheld: lane D's 48 h embargo (see --keep-newest).
+      # One snapshot per day (--newest-only), uploaded as ONE commit of the
+      # exact tar + POOL_SHA256 + small sidecars — not thousands of per-series
+      # .npy, whose presigned LFS URLs expired mid-commit (900 s) and failed
+      # every reveal from 2026-11-20 (run 45317813555). Idempotent per snapshot.
       # Skipped cleanly if HF_TOKEN isn't set.
       - name: Reveal retired snapshots to public HF  (exact bytes)
         if: env.HF_TOKEN != ''
@@ -264,9 +307,36 @@ jobs:
           BACKUP_S3_ACCESS_KEY: ${{ secrets.BACKUP_S3_ACCESS_KEY }}
           BACKUP_S3_SECRET_KEY: ${{ secrets.BACKUP_S3_SECRET_KEY }}
         run: |
+          # Once a day: a scheduled run reveals only at 03:xx UTC. A run queued
+          # past the hour is caught up next day (the reveal mirrors every
+          # retired snapshot not yet on HF). Dispatches always reveal.
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "$(date -u +%H)" != "03" ]; then
+            echo "Hourly run: the HF reveal runs once a day at 03:xx UTC; skipping."
+            exit 0
+          fi
           TOML=chain.toml
           [ "$NETWORK" = "testnet" ] && TOML=chain.testnet.toml
-          cascade-pool reveal --chain-toml "$TOML" --hf-repo "$HF_EVAL_REPO"
+          # --keep-newest 20 (2026-11-25; was 3 from #880): the reveal delay
+          #   must stay >= [lane_d] embargo_hours (48 h). Lane D scores forge
+          #   points first-seen inside the last 48 h as "embargoed" (not yet
+          #   public), and its series ARE lane A's (W6a join), so a lane A tar
+          #   revealed sooner hands miners those targets. Hourly publishes
+          #   fill every epoch boundary (900 blocks, at most one entry each),
+          #   so withholding K entries means: the revealed tar's effective
+          #   block E <= N - K*900, its bytes were built at head <= E, and the
+          #   reveal runs at head >= N - round_buffer*900 (N = newest entry).
+          #   Delay >= (K - round_buffer) * 900 blocks; 48 h = 14,400 blocks
+          #   => K >= 18. 20 keeps two epochs (6 h) of slack for block-time
+          #   drift. With 3 the delay was ~6-9 h (block 9579600, built ~19:30
+          #   UTC 11-24, went public 03:xx UTC 11-25). It also covers the
+          #   active + two pending entries (the old reason for 3). The
+          #   pinned bound is tests/unit/test_pool_publish_workflow.py.
+          # --newest-only --max-reveal 1 (owner 2026-11-24, option b): reveal
+          #   ONE snapshot per day — the newest retired one — so HF grows at
+          #   the old daily rate. The other ~7 retirees of the day stay in the
+          #   pool bucket only and are never backfilled.
+          cascade-pool reveal --chain-toml "$TOML" --hf-repo "$HF_EVAL_REPO" \
+            --keep-newest 20 --newest-only --max-reveal 1
           # DEC-CA-0056: the lane-C pool's retired snapshots, under pool_c/ in
           # the same dataset (inert until [lane_c] from_block is typed)
           if python -c "import sys; from cascade.shared.config import load_chain_config as l; sys.exit(0 if l('$TOML').lane_c.from_block else 1)"; then

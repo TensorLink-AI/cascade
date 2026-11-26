@@ -52,7 +52,6 @@ from .rounds import (
     effective_epoch_blocks,
 )
 from .scoring import _GIFT_GATE_MODES as _GIFT_GATE_MODES
-from .scoring import _INIT_GATE_MODES as _INIT_GATE_MODES
 from .scoring import _MARGIN_MODES as _MARGIN_MODES
 from .scoring import (
     SHARED_LADDER_QUANTILE_BATCH,
@@ -64,6 +63,7 @@ from .scoring import (
     cohort_maxt_increment_active,
     effective_margin_mode,
     effective_win_margin_start,
+    init_gate_mode_at,
     margin_v2_active,
     margin_v2_configured,
     mv_score_active,
@@ -72,7 +72,6 @@ from .scoring import (
     shared_ladder_quantile_batch,
 )
 from .scoring import _gift_gate_mode as _gift_gate_mode
-from .scoring import _init_gate_mode as _init_gate_mode
 from .scoring import _margin_mode as _margin_mode
 from .sections import (
     ActivationConfig,
@@ -230,6 +229,7 @@ __all__ = [
     "margin_v2_active",
     "margin_v2_configured",
     "mv_score_active",
+    "init_gate_mode_at",
     "parse_lane_b",
     "parse_lane_b_track",
     "parse_lane_c",

@@ -61,7 +61,7 @@ that its honest report PASSes.
 
 | fixture | what it is |
 |---|---|
-| `crown_chain` | W7a `two_settlements`: b1 = `ARM + 900`, X first-clears against the house H0 (`confirm_pending`); b2 = `ARM + 1800`, X confirms, passes the gate and is crowned (uid 6). Then b3 = `ARM + 2700` is settled twice from copies of the b2 state: `s3` judges nothing (X keeps KING_D); `s3d` is the same with X deregistered (its slot burns, `deregistered`) |
+| `crown_chain` | **(rev6.11)** W9's own copy of W7a's single-challenger chain: b1 = `ARM + 900`, X's first verdict against the house H0: clear, gate `pass`, crowned (uid 6); b2 = `ARM + 1800` judges nothing. Then b3 = `ARM + 2700` is settled twice from copies of the b2 state: `s3` judges nothing (X keeps KING_D); `s3d` is the same with X deregistered (its slot burns, `deregistered`) |
 | `snapshots` | b1 settled on W7a's snapshot 1 (`honest`) and on three defective copies of it: series `src5-s7` with `frontier` deleted (`frontier_absent`) or `null` (`frontier_null`), and feed `src5` removed from `feeds` (`unlisted_feed`). The producer fails those windows closed and judges the rest, so each report is genuine and PASSes the report-only audit |
 | `caps` | one b1 settlement, three entries A (T0), B (T0+60), C (T0+120). `cold`: `max_judged_per_coldkey_per_settlement = 1`, A and B on coldkey K1, C on K2, so A and C are judged and B is skipped `coldkey_cap_settlement`. `glob`: `max_entries_per_settlement = 2`, three coldkeys, so A and B are judged and C is skipped |
 
@@ -88,8 +88,8 @@ recorded at `ready`), `context`, `ready_block`, `reveal_block` and
    exactly the cohort members.
 2. Each `skipped[]` digest is a listed entry and appears once. Its `reason`
    equals that entry's `entries[].reason`.
-3. **No silent omission.** Every entry whose `status` is `pending` or
-   `confirm_pending` after the settlement is in `judged`, in `skipped`, or
+3. **No silent omission.** Every entry whose `status` is `pending` ~~or
+   `confirm_pending`~~ (rev6.11: no confirmation stage) after the settlement is in `judged`, in `skipped`, or
    has a gate result.
 4. **The caps, FIFO by T.** The *selection candidates* are the judged
    entries plus the entries skipped with `coldkey_cap_settlement`,
@@ -153,16 +153,68 @@ counts only if its signature verifies under `signer_hotkey` and its
     `reveal_block` and `reveal_ts` are identical.
 
 Each chain test's forgery PASSes the single-report audit (asserted, except
-the undo-crown case), so only the chain refutes it. The D20 confirmation
-rule end to end:
+the undo-crown case), so only the chain refutes it. ~~The D20 confirmation
+rule end to end~~ **(rev6.11 (b): no confirmation duel, no D20.)** Every
+verdict is a first verdict against `king_before`, and `king_before` is where
+the chain left KING_D (rule 9), so a crown can't rest on a stale king.
 
-- the first clear exists, is disjoint and was judged against the stated
-  king (W7a RV7, chain mode);
-- under `"restart"` the confirm cohort's king is `king_before` (W7a RV7);
-- `king_before` is where the chain left KING_D (rule 9).
+## rev6.11 / rev6.12 (`test_w9_rev611.py`, `test_w9_embargo.py`, `test_w9_windows.py`)
 
-Together these mean a king change between the first clear and the
-confirmation can't be hidden by restating `king_before`.
+Plan rev6.9 (W5i), rev6.10 (a)/(b), rev6.11 (a)/(b), rev6.12 (a)/(b) and
+the W9 row. Field names are the ones the W5j / W5i / W7a tests pin.
+
+- **Fixture.** `crown_chain` is now W9's own copy of W7a's single-challenger
+  chain (W7a's building blocks, not `two_settlements`, so a W7a fixture
+  change never reshapes W9): b1 is X's first verdict, crowned there; b2
+  judges nothing. Every W7a snapshot W9 settles on pins `embargo_hours = 48`
+  in each listed feed (`helpers.pin_embargo`, W6b). `test_w9_snapshot.py`'s
+  `FEEDS` pin `embargo_hours = 0`, so its cases stay the rev3 rule.
+- **No confirmation stage.** `check_lane_d` FAILs a report whose cohort or
+  verdict `stage` isn't `first`, a verdict with a `confirmation` block, or
+  an entry `confirm_pending`, with `confirmation_stage_present` in `detail`.
+  Rule 3 ("No silent omission") reads `pending` only.
+- **Crowning** is re-derived as first clear ∧ A10 not `fail` ∧ gate `pass`:
+  a crown with an A10 `fail`, no gate, or `cleared = false` FAILs. The honest
+  crown at a first verdict PASSes.
+- **`window_refusal(series, feeds, bound, cfg)`** takes `e = min(feeds[feed]
+  .embargo_hours, cfg.embargo_hours)` for every cadence (no `freq` term,
+  rev6.12 (a)) and applies the rev6.10 rule at the feed bound `bound − 3600
+  e`: first-seen `+ e > bound`, data time `> bound − e`, S0 and backfill at
+  `bound − e`, the §1.3 labels unchanged. A listed feed whose
+  `embargo_hours` is absent, not a number (bool and NaN included) or
+  negative is `unlisted_feed`. `e = 0` is the rev3 rule.
+- **`pool_dirs`:** a snapshot whose feed `e` is above `[lane_d]
+  embargo_hours`, or that carries a non-zero `e` on a publish-ahead feed (a
+  series point whose data time is after its first-seen time), FAILs; the
+  honest snapshot with `e = 48` PASSes.
+- **Report-only re-derivations.** `params` echoes `embargo_hours`,
+  `min_fresh_window_share` and `max_windows_per_settlement` (= `cfg`), and no
+  `embargo_window_share_cap`. Each judged window carries `embargo_hours`
+  (≤ the config), `embargo_window`, `freq`, `kind`, `timeframe` (= `freq`),
+  `bin`, `h`, `origin` (= `min_target_ts`); its clocks satisfy the rule at
+  its `e` against `b = t_max + margin`; `embargo_window` is true iff the
+  window fails the e = 0 rule. F / (F + E) ≥ `min_fresh_window_share` on
+  every judged set, else FAIL with `fresh_share_short` in `detail`. The draw
+  record (top-level `draw` or `cohorts[i].draw`) has `boundary_block_hash`
+  (the boundary's), `seed = f"{boundary_block_hash}:lane_d_windows"`,
+  `max_windows_per_settlement`, `quota` / `capacity` (`{"<timeframe>|<bin>":
+  int}`) and `embargo_windows`; a changed seed, block hash or quota FAILs,
+  and so does a drawn window dropped from the set. Under
+  `max_windows_per_settlement = 32` the b1 draw holds 24…32 windows, no
+  source above `max_source_share`, the same picks in two independent runs,
+  and PASSes.
+- **The clamp.** `cascade.audit.lane_d.combined_log_ratio(r_fwd, r_bt, *,
+  n_fwd, n_bt, cap, floor)` re-implements rev6.9's rule: `c = min(cap, n_bt
+  / (n_bt + n_fwd))` (0 without backtest windows), `log R = (1 − c) · log
+  r_fwd + c · log clamp(r_bt, floor, 1 / floor)`; exactly `log r_fwd` when
+  off; memorisation gains at most `1 − floor^cap`.
+- **Not pinned:** e = 0 on sub-hourly series (reversed by rev6.12 (a)); how
+  the audit treats a listed feed without `embargo_hours` in a snapshot W7a's
+  own fixture writes (W7a / W5a own that fixture).
+
+On main (`315d240`) 46 of the 137 tests fail, each on an `AssertionError` or
+on `ImportError: cannot import name 'combined_log_ratio' from
+'cascade.audit.lane_d'` (in PATHS); the other 91 pass.
 
 ### (rev6.1) Snapshots
 
@@ -254,8 +306,8 @@ code. The checks run in this order:
   pool `1 - b - c - d`, where `d = min(share, max(0, 1 - b - c))` for
   `takes_from = "lane_a"`. Lane D's part is added from the signed
   `pay.court` alone:
-  - slot `i` is worth `cfg.lane_d.king_decay ** i`, normalised over the
-    slots, times `pay.share`;
+  - slot `i` is worth `cfg.lane_d.court_weights[i]` (rev6.23: 0.80 /
+    0.15 / 0.05), normalised over the slots, times `pay.share`;
   - a slot whose `uid` is null, out of range or repeated burns to
     `cfg.scoring.burn_uid`;
   - an empty court burns the whole share.
@@ -353,3 +405,95 @@ main). That shows the contract can be built and that every honest fixture
 report PASSes.
 
 Run locally with `-m "not torch"`. Nothing here imports torch.
+
+## Scoring host (rev6.18)
+
+Tests: `test_w9_host.py`. `check_lane_d(..., scoring_envs=None)`: a report
+with `host` FAILs (`scoring host: ...`) unless `host_problem` holds at the
+report's boundary against `scoring_envs` (default: the committed
+`deploy/laned/scoring_envs.toml`). A report without
+`host` is unchanged. Refusal code `ld_host`, class **alert** (not one of
+the four B3 pay-stopping checks): logged and alerted, the signed court keeps
+being paid; an unreadable list is an `ld_host` finding too.
+
+## Multichannel windows (rev6.18 F2): `test_w9_multivariate.py`
+
+- `check_lane_d(..., max_channels=)`: `[generator] max_channels` at the
+  boundary (`derive_weights` passes it, `checks._lane_d_max_channels`).
+  Every judged window carrying the channel fields must carry all of them and
+  its `channels` must equal `channel_pick(draw.boundary_block_hash,
+  series_id, range(n_channels_raw) minus empty_channels, max_channels)` (the
+  rule re-stated in `cascade.audit.lane_d.channel_pick`, equal to the
+  producer's `cascade.eval.lane_d_channels.pick_channels` and the spec),
+  with `n_channels` and `channels_sha256` to match; an empty pick fails;
+  `max_channels=None` fails any multichannel window.
+- With `pool_dirs`: the scored snapshot's `hist.npz` series has
+  `n_channels_raw` channels and the window's `series_id`, every scored
+  channel holds a finite value, and a C >= 2 series is never recorded
+  univariate.
+
+On main these tests fail on the `settle_mv` / `max_channels` assertions or
+`cannot import name` (`channel_pick` from `cascade.audit.lane_d`,
+`_lane_d_max_channels` from `cascade.audit.checks`, both in PATHS).
+
+## rev6.20 (owner 2026-11-24): lane B stage `scored_weights`
+
+`checks.LANE_B_STAGES` gains `scored_weights` (a refusal stage; a passed
+row at it is flagged). `test_w9_lane_b_scored_weights.py`.
+
+## Public sources (rev6.18 F3): `test_w9_public.py`
+
+- `lane_d_findings` / `check_lane_d(..., public_indexes=)`:
+  `{source: index dir}`, the auditor's copies of the W6p indexes.
+- `ld_public_index` (ALERT): each source is a pinned one at its pinned
+  repo and revision (literals in `cascade/audit/lane_d.py`, never imported);
+  with the index: it verifies (canonical lines, `index_sha256` over the
+  uncompressed bytes, `files_sha256` over the manifest's file list) and its
+  revision / `index_sha256` / `files_sha256` are the report's.
+- `ld_draw` (ALERT): the seed is `<block hash>:lane_d_public:<source>` on
+  the report's block hash; the draw constants are the spec's (5000, 128,
+  `[lane_d] horizon`, `multi_window` per source); with the index the
+  capacity, quota and every drawn window are re-derived
+  (`cascade.audit.lane_d.public_redraw`, the W5k rule re-stated) and must
+  match.
+- Neither code burns: a mismatch is logged and alerted, lane D's court stays
+  paid (rev6.18 B3).
+
+On main these tests fail on the lazy fixture (`f3_fixture.py`: no
+`tests/accept/w7a/pub.py`), the `public_indexes` assertion or
+`cannot import name 'public_redraw'`.
+
+## Combined rule (rev6.18 F4)
+
+`check_lane_d` re-derives the A3 rule from the signed rows
+(`test_w9_combined.py`): the cohort's live rows plus `public.rows` on the
+kept public windows. Burn class (rev6.18 B3): `public.rows_sha256` not
+binding the rows is `ld_rows_sha256`; a missing / extra public model is
+`ld_rows_count`; a verdict whose `lcb`, `gain`, `cleared`, `halves`,
+`sources` or `domains` does not re-derive, or a report without its public
+half at `public_weight > 0`, is `ld_cohort`. The W5i `combined_log_ratio`
+and the A10 rule are removed (`test_w9_rev611.py` correction).
+
+## Correction (owner 2026-11-23): `min_fresh_window_share` default 0.5 -> 0.2
+
+Owner rule: "fresh data should always be in there, but trade off" and "first
+verdict ~6 h". The W1 forge measured ~250 fresh windows at T+6 h, so a 0.5
+share would hold verdicts ~24 h. The default (loader, both shipped files) is
+**0.2**; fresh windows are still drawn first and always included. The tests
+that pinned the 0.5 default now pin 0.2. Lane D is not rolled out, so there is
+no activation key.
+
+## rev6.22: lane B weights and slot rows (`test_w9_lane_b_slots.py`)
+
+One pay rule: every paid holder has multiplier 1.0 at any age (no TTL), the
+re-derived `age` and `since_era`, a finite `gain_lcb`, and equals its holder
+in `state_post`; tampering with any of them FAILs. A judged leg has one row
+per slot; `check_lane_b` re-derives each row for its family (`declared` at
+`gain_margin`, `undeclared` at `undeclared_gain_margin`) and binds one
+critical value per family. A wrong bar, family, declared flag, verdict, a
+second critical value in one family, or a missing slot FAILs. Rows come from
+the validator's `judgements_record` over a real `judge_expert_slots` verdict.
+
+## rev6.14 (a): judging start vs eligibility boundary (owner 2026-11-23)
+
+The audit re-derives the judging start (`frozen_before_eval_delay` FAILs, a judged cohort without `boundary_ts` FAILs) and judges eligibility at `b = T + forward_margin_hours` (default 0). `test_w9_rev614.py`.

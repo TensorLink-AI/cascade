@@ -302,6 +302,15 @@ def payout_terms(lb) -> dict:
     (``[[lcb_threshold, full_eras], ...]``; a win's own tier is on its
     payout record)."""
     out: dict = {"full_pay_tiers": full_pay_tiers_view(lb)}
+    if not hasattr(lb, "win_ttl_eras") and hasattr(lb, "undeclared_gain_margin"):
+        # LANE_D_PLAN rev6.22: lane B pays a held slot in full until replaced
+        out.update({"rule": "indefinite", "unit": "eras", "half_life": None,
+                    "floor": None, "ttl": None,
+                    "share": _finite(getattr(lb, "share", None)),
+                    "slots": len(_lb_targets(lb)),
+                    "remainder": str(getattr(lb, "remainder", "burn") or "burn"),
+                    "undeclared_gain_margin": _finite(lb.undeclared_gain_margin)})
+        return out
     # DEC-CA-0050 go-live: the decay is counted in ERAS (``half_life_rounds``
     # keeps its name) once the config carries the win TTL; the original build
     # counted settlements
@@ -629,14 +638,18 @@ def build_v2_status(cfg, *, block: int | None, state=None, health: dict | None =
                     era_index: int | None = None, king_pointer: str = "",
                     health_domains: int = 0, as_of: str | None = None,
                     lane_c_state=None, lane_c_trainer: dict | None = None,
-                    lane_a: dict | None = None, sentinel: dict | None = None) -> dict:
+                    lane_a: dict | None = None, sentinel: dict | None = None,
+                    lane_b_domains: list | None = None) -> dict:
     """The whole ``status/v2.json`` document. Pure given its inputs. The
     ``lane_c`` part appears once ``[lane_c] from_block`` is typed (an inert
     lane C leaves the document byte-identical); ``lane_a`` (the latest
     receipt's ladder / court / slash / king check, :func:`lane_a_view`)
     appears when given. ``sentinel`` (the era's non-gating sentinel board,
     :func:`cascade.shared.sentinel_board.build_sentinel_board`) is copied to
-    ``doc["sentinel"]`` when given; ``None`` (W-S1 unarmed) adds no key."""
+    ``doc["sentinel"]`` when given; ``None`` (W-S1 unarmed) adds no key.
+    ``lane_b_domains`` (the latest receipt's
+    :func:`~cascade.shared.lane_b_domains.lane_b_domain_tags`, display only)
+    lands in ``doc["lane_b"]["domain_tags"]`` when non-empty; otherwise no key."""
     lb = getattr(cfg, "lane_b", None)
     doc = {
         "schema": SCHEMA,
@@ -651,6 +664,8 @@ def build_v2_status(cfg, *, block: int | None, state=None, health: dict | None =
                                    if health else "")},
         "lane_b": lane_b_view(lb, state, block=block) if lb is not None else {},
     }
+    if lane_b_domains and lb is not None:
+        doc["lane_b"]["domain_tags"] = copy.deepcopy(list(lane_b_domains))
     if lane_a:
         doc["lane_a"] = dict(lane_a)
     lc = getattr(cfg, "lane_c", None)
@@ -894,6 +909,10 @@ def v2_index_fields(receipt) -> dict:
       vector: lane B = the paid domain wins, lane C = the paid target slots,
       lane A = the court (``reward_uids``) net of any lane-B/C pay on the same
       uid, burn = the rest;
+    * ``lane_b_domains`` — per judged generator, the slots it improved / did
+      not improve and the margin per slot
+      (:func:`cascade.shared.lane_b_domains.lane_b_domain_tags`; display
+      only, never signed or digested, absent when there are no rows);
     * ``ladder`` / ``king_check`` — the DEC-CA-0055 lane-A records
       (:func:`ladder_fields`, :func:`king_check_fields`), whenever present.
     """
@@ -938,6 +957,17 @@ def v2_index_fields(receipt) -> dict:
                 v["targets"] = list(r["targets"])
             vs.append(v)
         out["lane_b_verdicts"] = vs
+        # owner 2026-11-25: which domain evals each generator ACTUALLY improved,
+        # derived from the signed rows above. Display only: this unsigned index
+        # column feeds no weight, verdict or digest; readers tolerate absence.
+        from .lane_b_domains import lane_b_domain_tags
+
+        try:
+            tags = lane_b_domain_tags(rows)
+        except Exception:  # noqa: BLE001 — a display column never breaks the index row
+            tags = []
+        if tags:
+            out["lane_b_domains"] = tags
     if pay is not None:
         out["lane_b_pay"] = dict(pay)
     if pay is not None or c_pay is not None:
@@ -1023,6 +1053,21 @@ def publish_v2_status(store, doc: dict) -> str:
 _LAST: dict[int, tuple[float, str]] = {}
 
 
+def _receipt_domain_tags(receipt: dict | None) -> list:
+    """The latest receipt body's lane B domain tags (display only); ``[]``
+    when it has no lane B rows or they are unreadable."""
+    rows = receipt.get("lane_b") if isinstance(receipt, dict) else None
+    if not isinstance(rows, list):
+        return []
+    from .lane_b_domains import lane_b_domain_tags
+
+    try:
+        return lane_b_domain_tags(rows)
+    except Exception:  # noqa: BLE001 — presentational: never stall the status doc
+        log.debug("lane B domain tags unavailable")
+        return []
+
+
 def publish_trainer_v2_status(sched, block: int, *, min_interval_s: float = MIN_INTERVAL_S,
                               allow_probe: bool = True, clock=time.monotonic) -> bool:
     """The trainer hook: build + publish ``status/v2.json`` from a
@@ -1100,7 +1145,8 @@ def publish_trainer_v2_status(sched, block: int, *, min_interval_s: float = MIN_
                               lane_c_trainer=lc_status,
                               lane_c_state=lane_c_state_from_receipt(receipt),
                               lane_a=lane_a_view(lane_a_body if lane_a_body is not None
-                                                 else receipt))
+                                                 else receipt),
+                              lane_b_domains=_receipt_domain_tags(receipt))
         from .submission_progress import receipt_progress
 
         doc["submission_receipt"] = receipt_progress(receipt)

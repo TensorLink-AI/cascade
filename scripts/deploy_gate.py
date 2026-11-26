@@ -7,8 +7,17 @@ to external validators or miners (restarts with legs in flight, consensus
 changes without an activation block, stale code running after a merge,
 version skew, restarts inside the validator's scoring window):
 
-  deploy_gate.py check  --service SERVICE --from REV --to REV
+  deploy_gate.py check  --service SERVICE --from REV --to REV [--chain-toml FILE]
   deploy_gate.py verify --service SERVICE --release DIR
+
+The settlement window is placed on the grid of the chain config being deployed
+(``--chain-toml``, else ``<root>/chain.toml``; mainnet 900 blocks, testnet 150).
+With neither file the 900-block mainnet grid is assumed and a note says so.
+The blackout around a boundary (20 min before, 15 after on mainnet's 3 h
+settlement) scales down with a shorter settlement (testnet's 30 min: 3.3 / 2.5
+min), and the block clock is the newest sample of the validator log
+(``--validator-log``, default ``<root>/validator.log``) and ``trainer.log``; a
+sample older than 2 h is a ``clock`` REFUSE.
 
 SERVICE is trainer, validator, intake-laned (the lane D intake, cascade/lane_d/)
 or eval-host (the private eval pod running cascade/validator/private_worker.py).
@@ -27,14 +36,37 @@ import os
 import re
 import subprocess
 import sys
+import tomllib
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+# The mainnet settlement length. Used only when no chain config is given (no
+# --chain-toml and no <root>/chain.toml), and the gate then says so in a note:
+# testnet settles every 150 blocks (chain.testnet.toml [round] epoch_blocks).
 SETTLEMENT_BLOCKS = 900
 BLOCK_SECONDS = 12.0
 PRE_SETTLEMENT_MIN = 20          # owner rule: no restart in the ~20 min before a settlement
 POST_SETTLEMENT_MIN = 15         # manifest publish + validator pick-up after the boundary
+# The blackout scales with the settlement length in force (#787): the two
+# minute counts above are the mainnet values at its 3 h (900-block)
+# settlement, i.e. 1/9 before and 1/12 after a boundary. A shorter settlement
+# (testnet: 150 blocks = 30 min) gets the same fractions, so a restart window
+# always exists; a longer one keeps the fixed minutes (never more).
+REFERENCE_SETTLEMENT_MIN = SETTLEMENT_BLOCKS * BLOCK_SECONDS / 60      # 180
+# A block sample older than this is refused as `clock` (#787: a 3-day-old
+# trainer.log placed the window from a stale extrapolation). The validator logs
+# a block every weight re-assert (180 blocks, ~36 min), so 2 h leaves room
+# for a skipped re-assert or two.
+MAX_SAMPLE_AGE_MIN = 120
+
+
+def blackout_minutes(settlement_blocks: int) -> tuple[float, float]:
+    """(minutes refused before a boundary, minutes refused after it) for a
+    settlement of ``settlement_blocks`` blocks: the mainnet minutes scaled by
+    the settlement length, capped at the mainnet minutes."""
+    scale = min(1.0, settlement_blocks * BLOCK_SECONDS / 60 / REFERENCE_SETTLEMENT_MIN)
+    return PRE_SETTLEMENT_MIN * scale, POST_SETTLEMENT_MIN * scale
 
 # ── blast radius ─────────────────────────────────────────────────────────────
 
@@ -77,6 +109,9 @@ AREAS = {
     "trainer": (r"^cascade/(trainer|provision|funding|generation|direct)/",),
     "validator": (r"^cascade/validator/",),
     "lane_d_intake": (r"^cascade/lane_d/",),            # the intake-laned service
+    # Independent satellite replay of lane D receipts (W7d): run by satellite
+    # operators against our published reports, never by a box service.
+    "satellite": (r"^cascade/satellite/",),
     "pool": (r"^cascade/pool/",),                        # cascade-pool (eval pool builder)
     "miner_kit": (r"^cascade/miner/", r"^base_generator/"),
     "website": (r"^cascade/website/",),
@@ -89,6 +124,11 @@ AREAS = {
     # Lane D loop evidence (rv*.md review notes, s0b_notes.json, w*.json):
     # records read by people and the loop tools, never by a service — no restart.
     "evidence": (r"^evidence/",),
+    # Lane D public-source inputs (rev6.18 A5, F3: data/lane_d/rmisc_allowed.toml):
+    # read by the owner-run mirror/index tools only. Validators bind the
+    # resulting index by its hash in the signed report, never this file — no
+    # service restart.
+    "lane_d_data": (r"^data/lane_d/",),
 }
 SERVICES = ("trainer", "validator", "intake-laned", "eval-host")
 # Services that serve or depend on the validator's scoring: no restart while a
@@ -140,12 +180,91 @@ def last_block_sample(lines: list[str]) -> tuple[datetime, int] | None:
     return None
 
 
-def minutes_to_next_settlement(sample: tuple[datetime, int], now: datetime) -> tuple[float, float]:
+def freshest_block_sample(*line_sets: list[str]) -> tuple[datetime, int] | None:
+    """The NEWEST block sample over every log (#787: the trainer.log fallback
+    was used even when it was days older than the chain), None without one."""
+    samples = [s for s in (last_block_sample(ls) for ls in line_sets) if s is not None]
+    return max(samples, key=lambda s: s[0]) if samples else None
+
+
+@dataclass(frozen=True)
+class Grid:
+    """The settlement grid of the chain config being deployed: ``[round]``
+    ``epoch_blocks``, switched from ``epoch_blocks_prev`` at
+    ``epoch_activation_block`` (cascade.shared.config.rounds.effective_epoch_blocks:
+    the previous length strictly before the activation block)."""
+
+    epoch_blocks: int
+    epoch_blocks_prev: int = 0
+    activation_block: int = 0
+    source: str = ""                 # the config file it came from; "" = the default
+
+    def boundaries(self, block: int) -> tuple[int, int]:
+        """(the settlement boundary at or before ``block``, the next one after it)."""
+        act, prev_len = self.activation_block, self.epoch_blocks_prev
+        if act > 0 and prev_len > 0 and block < act:
+            start = block // prev_len * prev_len
+            return start, min(start + prev_len, act)
+        if act > 0 and block >= act:
+            start = act + (block - act) // self.epoch_blocks * self.epoch_blocks
+        else:
+            start = block // self.epoch_blocks * self.epoch_blocks
+        return start, start + self.epoch_blocks
+
+    def length_at(self, block: int) -> int:
+        """The settlement length (blocks) of the grid in force at ``block``."""
+        if self.activation_block > 0 and self.epoch_blocks_prev > 0 and block < self.activation_block:
+            return self.epoch_blocks_prev
+        return self.epoch_blocks
+
+
+DEFAULT_GRID = Grid(SETTLEMENT_BLOCKS)
+
+
+class GridError(ValueError):
+    pass
+
+
+def load_grid(path: Path) -> Grid | None:
+    """The settlement grid from a chain config file's ``[round]`` table; None
+    when the file sets no ``[round] epoch_blocks`` (the loader default applies)."""
+    try:
+        r = tomllib.loads(path.read_text()).get("round") or {}
+        if "epoch_blocks" not in r:
+            return None
+        ep = int(r.get("epoch_blocks") or 0)
+        prev = int(r.get("epoch_blocks_prev") or 0)
+        act = int(r.get("epoch_activation_block") or 0)
+    except (OSError, ValueError, TypeError) as e:
+        raise GridError(f"{path}: cannot read [round] epoch_blocks ({e})") from e
+    if ep <= 0 or prev < 0 or act < 0:
+        raise GridError(f"{path}: [round] epoch_blocks={ep} is not a positive block count")
+    return Grid(ep, prev, act, source=str(path))
+
+
+def resolve_grid(chain_toml: Path | None, root: Path) -> tuple[Grid, str]:
+    """(grid, note). ``--chain-toml`` wins; else ``<root>/chain.toml`` (the
+    deployed file); else the mainnet default, with a note saying so."""
+    path = chain_toml if chain_toml is not None else root / "chain.toml"
+    if chain_toml is None and not path.is_file():
+        return DEFAULT_GRID, (f"no chain config (no --chain-toml, no {path}): "
+                              f"assuming the mainnet {SETTLEMENT_BLOCKS}-block settlement grid")
+    g = load_grid(path)
+    if g is None:
+        return DEFAULT_GRID, (f"{path} sets no [round] epoch_blocks: assuming the mainnet "
+                              f"{SETTLEMENT_BLOCKS}-block settlement grid")
+    note = f"settlement grid: {g.epoch_blocks} blocks from {g.source}"
+    if g.activation_block and g.epoch_blocks_prev:
+        note += f" ({g.epoch_blocks_prev} before block {g.activation_block})"
+    return g, note
+
+
+def minutes_to_next_settlement(sample: tuple[datetime, int], now: datetime,
+                               grid: Grid = DEFAULT_GRID) -> tuple[float, float]:
     """(minutes until the next boundary, minutes since the previous one)."""
     ts, blk = sample
     now_blk = blk + (now - ts).total_seconds() / BLOCK_SECONDS
-    nxt = (int(now_blk) // SETTLEMENT_BLOCKS + 1) * SETTLEMENT_BLOCKS
-    prev = nxt - SETTLEMENT_BLOCKS
+    prev, nxt = grid.boundaries(int(now_blk))
     return ((nxt - now_blk) * BLOCK_SECONDS / 60, (now_blk - prev) * BLOCK_SECONDS / 60)
 
 
@@ -211,7 +330,7 @@ class Verdict:
 
 def gate(*, service: str, areas: dict[str, list[str]], diff_text: str, now: datetime,
          trainer_lines: list[str], validator_lines: list[str], work: Path,
-         on_main: bool, acks: set[str]) -> Verdict:
+         on_main: bool, acks: set[str], grid: Grid = DEFAULT_GRID) -> Verdict:
     v = Verdict()
     if not on_main:
         v.no("provenance", "target revision is not on origin/main — releases build from main only")
@@ -236,6 +355,9 @@ def gate(*, service: str, areas: dict[str, list[str]], diff_text: str, now: date
     if "lane_d_intake" in areas and service != "intake-laned":
         v.notes.append("cascade/lane_d changed: deploy the intake-laned service as well "
                        "(`check --service intake-laned`)")
+    if "satellite" in areas:
+        v.notes.append("cascade/satellite changed: satellite operators replay our lane D "
+                       "receipts with it — announce the release; no box restart applies")
     if "deploy" in areas:
         v.notes.append("deploy/ changed: pod bootstrap, systemd units and restart scripts apply "
                        "only when re-run or reinstalled, not through this restart")
@@ -249,15 +371,22 @@ def gate(*, service: str, areas: dict[str, list[str]], diff_text: str, now: date
                        "must reach validators via the signed overlay, not only our copy")
     if freeze_window(now):
         v.no("freeze", "Wed 22:00 – Thu 08:00 UTC: no restarts")
-    sample = last_block_sample(validator_lines) or last_block_sample(trainer_lines)
+    sample = freshest_block_sample(validator_lines, trainer_lines)
+    age_min = (now - sample[0]).total_seconds() / 60 if sample is not None else 0.0
     if sample is None:
         v.no("clock", "no recent chain block in the logs — cannot place the settlement window")
+    elif age_min > MAX_SAMPLE_AGE_MIN:
+        v.no("clock", f"newest chain block in the logs (block {sample[1]}) is {age_min:.0f} min "
+                      f"old (> {MAX_SAMPLE_AGE_MIN} min) — cannot place the settlement window; "
+                      "point --validator-log at the running validator's log")
     else:
-        to_next, since = minutes_to_next_settlement(sample, now)
-        if to_next < PRE_SETTLEMENT_MIN:
+        to_next, since = minutes_to_next_settlement(sample, now, grid)
+        now_blk = sample[1] + (now - sample[0]).total_seconds() / BLOCK_SECONDS
+        pre, post = blackout_minutes(grid.length_at(int(now_blk)))
+        if to_next < pre:
             v.no("settlement", f"settlement in {to_next:.0f} min (no restarts in the last "
-                               f"{PRE_SETTLEMENT_MIN} min before a boundary)")
-        elif since < POST_SETTLEMENT_MIN:
+                               f"{pre:.0f} min before a boundary)")
+        elif since < post:
             v.no("settlement", f"settlement {since:.0f} min ago — manifest publish / pick-up "
                                "still in progress")
         else:
@@ -388,6 +517,14 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("--root", type=Path, default=Path(os.environ.get("CASCADE_ROOT", "/root/cascade")))
     c.add_argument("--ack", action="append", default=[],
                    help="a REFUSE rule the owner explicitly accepted (never 'consensus')")
+    c.add_argument("--chain-toml", type=Path, default=None,
+                   help="the chain config being deployed, for the settlement grid ([round] "
+                        "epoch_blocks; testnet: chain.testnet.toml). Default <root>/chain.toml; "
+                        f"with neither, the mainnet {SETTLEMENT_BLOCKS}-block grid (noted)")
+    c.add_argument("--validator-log", type=Path, default=None,
+                   help="the running validator's log (block clock + scoring guard). Default "
+                        "<root>/validator.log; testnet's main validator logs elsewhere "
+                        "(e.g. val0.log)")
     vp = sub.add_parser("verify")
     vp.add_argument("--service", choices=SERVICES, required=True)
     vp.add_argument("--release", type=Path, required=True,
@@ -413,11 +550,17 @@ def main(argv: list[str] | None = None) -> int:
     except (subprocess.SubprocessError, OSError) as e:
         print(f"git failed: {e}", file=sys.stderr)
         return 2
+    try:
+        grid, grid_note = resolve_grid(a.chain_toml, a.root)
+    except GridError as e:
+        print(f"chain config: {e}", file=sys.stderr)
+        return 2
     areas = classify(paths)
     v = gate(service=a.service, areas=areas, diff_text=diff_text, now=now,
              trainer_lines=tail(a.root / "trainer.log"),
-             validator_lines=tail(a.root / "validator.log"),
-             work=a.root / "_train_work", on_main=on_main, acks=set(a.ack))
+             validator_lines=tail(a.validator_log or a.root / "validator.log"),
+             work=a.root / "_train_work", on_main=on_main, acks=set(a.ack), grid=grid)
+    v.notes.insert(0, grid_note)
     print(f"{a.service} {a.rev_from[:9]}..{a.rev_to[:9]}: {len(paths)} file(s); areas: "
           + (", ".join(f"{k}({len(x)})" for k, x in areas.items()) or "none"))
     for n in v.notes:

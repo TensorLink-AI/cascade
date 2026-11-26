@@ -1,0 +1,11 @@
+# Elastic lane D eval host on Lium (owner 2026-11-24; deploy/laned/elastic.toml):
+# 1x H200 141 GB running the release's pinned torch 2.4.1+cu124 (Hopper).
+# Serves forecasts, not the bench: no suite pins; the handshake is W4's.
+# disk: two checkpoints of headroom (9.2 GB) free on the release volume.
+schema = "laned_evalhost_profile/1"
+name = "elastic_h200"
+gpu_model = "NVIDIA H200"
+min_vram_mib = 140000
+min_driver = "550.54.14"           # CUDA 12.4 (cu124 wheels) minimum driver
+disk_path = "/root"
+min_disk_free_bytes = 9200000000

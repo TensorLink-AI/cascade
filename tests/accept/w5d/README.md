@@ -20,6 +20,7 @@ Accept: `scripts/laned/accept W5d` (CI, tiny model) and, for T7,
 | each `[lane_d] contexts` value is a declared scorer context; others are refused | `test_scorer_contexts_cover_every_lane_d_context`, `test_each_lane_d_context_is_a_declared_scorer_context`, `test_undeclared_context_is_refused`, `test_forecast_refuses_undeclared_context_before_loading` |
 | horizons ≤ 512 (16 CPM patches × 32) | `test_forecast_refuses_horizon_over_512_before_loading` |
 | no padding: model input length = available history (largest patch multiple), capped at context | `test_batch_plan_*`, `test_no_pad_model_input_is_real_history_capped_at_context` (torch, a forward pre-hook records the patch tensor), `test_no_pad_truncates_to_the_largest_patch_multiple` (torch) |
+| (#785) settlement-size micro-batching: deterministic window chunks under the CUDA grid limit; uncut inputs byte-identical, cut ones re-derivable per micro-batch | `test_forward_batch_size_is_tokens_over_patches`, `test_forward_batch_stays_under_the_grid_limit_at_every_context`, `test_forecast_refuses_a_non_positive_max_tokens_before_loading`, `test_micro_batched_forecast_is_deterministic_and_re_derivable` (torch) |
 | T7 CI half: a 4k checkpoint and its declared-128k copy score identically on ≤ 4096-history windows | `test_t7_4k_checkpoint_and_declared_128k_copy_identical_on_short_windows` (torch; also 8k and 16k) |
 | T7 pod half: wall time + memory per variant, armed only if it fits | `test_evidence_*` (read `$LANED_EVIDENCE`), `test_builder_*`, `test_verifier_*`, `test_measure_variant_and_short_window_check_on_a_tiny_model` (torch) |
 | (RV3) a variant row is only certified on inputs that exercise it: `input_len == variant`, every history ≥ variant, memory = the variant's own CUDA peak | `test_builder_row_records_the_input_that_ran`, `test_builder_row_refuses_*`, `test_builder_pod_evidence_refuses_process_peak_rss`, `test_builder_refuses_a_hand_edited_row`, `test_measure_variant_refuses_short_history_before_loading`, `test_verifier_rejects_*_that_did_not_exercise_its_variant`, the tiny-model test (torch; a forward pre-hook checks the model input really is 8192 points) |
@@ -49,9 +50,25 @@ Everything W1.5 pins stays (`SCORING_LEVELS`, `MEDIAN_INDEX`,
     `torch` is imported (the tests make `import torch` fail and pass a
     checkpoint dir that does not exist).
   - The model input of each window is its **last** `batch_plan` length
-    points, batched by `batch_plan` (one forward per length), plus
+    points, batched by `batch_plan` (one batch per length), plus
     `ceil(h/32)` masked horizon patches. No edge pad. So with history 330 the
     forecast equals that of its last 320 points.
+  - **(#785) Micro-batching.** Each length's batch runs as contiguous
+    micro-batches of `forward_batch_size(length, horizon, patch_size,
+    channels=1, max_tokens=MAX_FORWARD_TOKENS)` windows, in window order:
+    `max(1, max_tokens // (channels * (ceil(length/patch) +
+    ceil(h/patch))))`. `MAX_FORWARD_TOKENS == 32768`, a release constant
+    (half the ~65,536-row CUDA grid limit the pyramid's SDPA hit at
+    settlement size; never a runtime memory probe, so every validator cuts
+    the same micro-batches). `forecast_quantiles(..., max_tokens=)`
+    (keyword, default `MAX_FORWARD_TOKENS`) overrides it; a non-positive or
+    non-int value is a `ValueError` before anything loads. An input under
+    the cap is not cut: byte-identical to one forward per length (pre-#785).
+    A cut forecast is byte-identical to forecasting each micro-batch's
+    windows on their own (re-derivable from the cap) and agrees with the
+    uncut forecast to float rounding only (`rtol=1e-5`; CPU fp32 GEMM
+    blocking depends on the batch rows, measured in CI as a last-bit
+    difference). That is why the cap is a release constant.
   - Returns `(n, horizon, 9)` finite float64 at `SCORING_LEVELS`.
 
 Lane A equality (torch): the house (F32, median bias +3) on 12 windows with
@@ -59,6 +76,61 @@ history ≥ 4096, forecast at context 4096 and scored with `score_window`,
 equals `evaluate_checkpoint(..., quantile_head=True)` → `stack_components` →
 `wql_per_window` per window to `rel=1e-5` (MASE too). Different batching
 (lane A: one window per forward; lane D: by length) is why it is not exact.
+
+## Arming (rev6.6, owner 2026-11-23): `test_w5d_arming.py`
+
+Plan rev6.6 (§1.1 context bullet, §1.7 readiness, T7 row). `[lane_d] contexts`
+lists every variant from launch and is the set a miner may **declare**. A
+variant is **armed** at a settlement only when both gates pass. The armed set is
+computed here, in the numpy-free half of `lane_d_scorer.py`, so the box-side
+settlement (W7a) can call it. It is never read from `cfg.contexts`.
+
+- `GATE_MIN_SOURCES == 20` and `READINESS_SCHEMA == "laned_readiness/1"`.
+- `armed_record(contexts, *, readiness, t7, min_long_series) -> dict`.
+  `readiness` and `t7` are the pinned documents' **bytes**, or `None` when
+  absent. The record is
+  `{"armed_contexts": [...], "evidence": {"min_long_series", "min_sources",
+  "readiness_sha256", "t7_sha256", "variants": [{"context", "series",
+  "sources", "t7_fits", "armed"}, ...]}}`.
+  - `variants` has one entry per value of `contexts`, ascending.
+    `armed_contexts` holds the variants whose `armed` is true, ascending.
+  - `*_sha256` is the sha256 hex of the bytes given, or `null` for an absent
+    document.
+  - Gate 1 (readiness, W1/R16 per-rung counts) is
+    `{"schema": "laned_readiness/1", "rungs": [{"context", "series", "sources"}]}`.
+    It passes iff `series >= min_long_series` and `sources >= 20`. A variant
+    with no rung counts as `series = sources = 0`. A wrong schema, a missing
+    `rungs`, a non-int, bool or negative count, a rung context outside
+    `SCORER_CONTEXTS` or a duplicate rung is a `ValueError`.
+  - Gate 2 (T7) reads the `laned_t7/1` evidence. It passes for a variant iff
+    the document's `source` is `"pod"` and the variant's row has
+    `peak_mem_source == "cuda_max_allocated"` and fits its budget
+    (`wall_s <= budget.wall_s` and `peak_mem_gb <= budget.mem_gb`,
+    **recomputed**). A row whose stated `fits` disagrees with its numbers is a
+    `ValueError`, because a hand edit is refused and never trusted. Without a
+    row the gate fails. Unparseable bytes or a schema other than `laned_t7/1`
+    is a `ValueError`.
+  - `contexts` must be a non-empty subset of `SCORER_CONTEXTS`, else
+    `ValueError`. The record is deterministic: the same bytes give the same
+    record, whatever the order of `contexts`.
+- `effective_context(declared, armed_contexts) -> int | None` returns
+  `declared` when it is armed. Otherwise it returns the highest armed variant
+  **not above** `declared`. ~~When every armed variant is above `declared`,
+  the lowest armed one.~~ **(plan rev6.15, owner 2026-11-23: "Highest ≤
+  declared, else skip")** When every armed variant is above `declared` it
+  returns **`None`**: the entry is not scored that settlement (the settlement
+  skips it `context_below_armed`, W7a). A model is never run past the context
+  its miner declared. In the normal case the gates are monotone (a series
+  usable at 64k is usable at 32k), so 4096 is armed whenever anything is and
+  `None` is rare. The scored context
+  switches at the settlement where the declared variant arms. An
+  empty armed set, or a declared value that is not a scorer context (or is a
+  bool or str), is a `ValueError`.
+- `declared_context` and `forecast_quantiles(..., contexts=)` are unchanged.
+  The caller passes the context to forecast at (the effective one) and the
+  set it may run at (the armed set).
+
+On main these tests fail on the `_s()` assertion (the names are absent).
 
 ## Module contract: `cascade/eval/lane_d_t7.py`
 
@@ -151,3 +223,40 @@ keys also satisfy `accept`'s generic evidence step.
 - Tests marked `torch` need torch (CI: `uv sync --all-extras`). The
   production box runs only `-m 'not torch'`. `torch` is not registered in
   pyproject, so pytest warns about an unknown mark.
+
+## Multichannel windows (rev6.18 F2): `test_w5d_multivariate.py`
+
+Plan rev6.18 A4 (DEC-CA-0041 applied to lane D). A lane D window is either
+univariate (1-D history and target, as before) or multichannel: a `(C, L)`
+history with a `(C, horizon)` target, C >= 2, forecast jointly by one model
+call. A `(1, L)` series is the univariate window.
+
+- `cascade/eval/lane_d_channels.py` (numpy + hashlib) picks the channels a
+  multichannel window is scored on: `empty_channels(history)` (channels with
+  no finite history value) drop first; `pick_channels(block_hash, series_id,
+  candidates, max_channels)` keeps all when they fit, else the
+  `max_channels` with the smallest `sha256(seed + ":" + index)`, `seed =
+  sha256(block_hash + series_id + "lane_d_channels")`, ascending (`()`
+  without a block hash). `max_channels` is `[generator] max_channels`
+  (32), read from the config. `window_pick`, `channel_plan` (first version of
+  an id in pin order decides), `apply_pick` (one channel left gives 1-D
+  arrays; `(1, L)` is flattened; a univariate window is returned unchanged),
+  `channel_record` (`series_id, n_channels_raw, empty_channels, n_channels,
+  channels, channels_sha256`).
+- `score_window(q, target, history, sp)` with `q` of shape `(C, horizon,
+  9)`: each channel scored as a univariate window, `crps` averaged
+  (arithmetic) over the channels with `sum|y_c| > 0` (zero-target channels
+  masked from the quantile half only), `mase` over every channel;
+  `ValueError` when no channel has scale or a shape disagrees. A 2-D `q`
+  runs the pre-F2 path unchanged.
+- `forecast_quantiles` takes `(C, L)` histories and returns one row per
+  channel, window-major: `(sum forecast_rows(histories), horizon, 9)`.
+  Windows batch by (channel count, input length); univariate rows of a mixed
+  request are bit-identical to a univariate-only request (torch test).
+- Transport: `encode_request` keeps a `(C, L)` history 2-D (univariate
+  stays flat); `forecast_entry` wants `(sum rows, horizon, 9)`;
+  `SSHEvalHost._cut` cuts every channel along time.
+
+On main these tests fail on `No module named 'cascade.eval.lane_d_channels'`
+or on an assertion (scorer and transport refusals are re-raised as
+`AssertionError`).

@@ -31,8 +31,8 @@ from .helpers import (
     entry,
     fixture_key,
     lane_d_cfg,
+    loser_then_crown,
     settle,
-    two_settlements,
 )
 
 
@@ -101,7 +101,7 @@ def test_inv11_floor_miss_is_pending_floor_with_no_rows(scratch, tmp_path):
 
 
 def test_inv11_house_king_slot_burns_with_house_king(scratch):
-    built = two_settlements(scratch / "chain")
+    built = loser_then_crown(scratch / "chain")
     r = built["s1"].report
     _check_typed(r)
     assert [(c["uid"], c["burn_reason"]) for c in r["pay"]["court"]] == [(None, "house_king")]
@@ -109,7 +109,7 @@ def test_inv11_house_king_slot_burns_with_house_king(scratch):
 
 
 def test_inv11_deregistered_king_slot_burns_with_deregistered(scratch):
-    built = two_settlements(scratch / "chain")
+    built = loser_then_crown(scratch / "chain")
     _check_typed(built["s2"].report)
     # A third settlement after the crowned king's hotkey lost its UID (B8).
     s3 = settle(built["chain"], built["cfg"], built["state"], built["signer"],

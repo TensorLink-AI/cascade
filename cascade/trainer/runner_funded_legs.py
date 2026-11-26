@@ -398,6 +398,9 @@ class _FundedLegMixin:
         # the harvest of a payer pod: the miner controls it (review F7)
         _loc = self.__dict__.setdefault("_leg_local_obj", threading.local())
         _loc.harvest_pod_payer, _loc.leg_trained = True, False
+        # WB22: the rented layout, read by the lane B driver for the leg's
+        # recorded GPU count (gpu_n); nothing else reads it
+        _loc.funded_pod_sku = str(getattr(pod, "sku", "") or "")
 
         def release_pod() -> None:
             # Owner 2026-11-01: the harvested copy is verified (on the box, or
@@ -771,9 +774,15 @@ def _mkt_corpus(runner, role: str, finetune_recipe, corpus: dict) -> dict:
     as its ``corpus_files``; every other leg's corpus unchanged."""
     if role != "mkt_finetune" or not finetune_recipe or corpus:
         return corpus
-    from .marketcast_runner import mkt_relay_corpus
+    from .marketcast_runner import leg_mc, mkt_relay_corpus
 
-    return mkt_relay_corpus(runner.cfg, finetune_recipe)
+    # W-CMP2: the leg's own competition table (a spec instance's pool)
+    blk = None
+    try:
+        blk = int(runner.client.current_block()) if getattr(runner, "client", None) else None
+    except Exception:  # noqa: BLE001 — the latest snapshot then
+        blk = None
+    return mkt_relay_corpus(runner.cfg, finetune_recipe, mc=leg_mc(runner), block=blk)
 
 
 def _shards_leg(contract, corpus: dict) -> bool:

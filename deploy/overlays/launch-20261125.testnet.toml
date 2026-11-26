@@ -1,0 +1,37 @@
+# Wed 2026-11-25 launch rehearsal, STEP 2 of 2 (seq N+1; seq N =
+# launch-20261125.pre.testnet.toml), TESTNET (netuid 259): lane D armed at
+# testnet era start 8524200 (= 14207 x 600, the first testnet era boundary
+# after Wed 18:00 UTC, ~18:52 UTC at 12.0 s/block) plus a byte-identical
+# restatement of step 1 (R3 lint `non-lane-d`). Re-check the head first; if
+# 8524200 is under one era ahead, move BOTH steps to the next multiple of 600.
+#
+# PREREQUISITE: chain.testnet.toml ships [netconfig] owner_hotkey = "".
+#
+#   cascade-validator --chain-toml chain.testnet.toml \
+#     --netconfig-overlay deploy/overlays/launch-20261125.testnet.toml \
+#     --netconfig-effective-block 8524200
+#
+# Split A 0 / B 35 / C 15 / D 50 (lane C is off on testnet, so its 15 % stays
+# with lane A there). Overlays are SNAPSHOTS: restate every key later.
+
+[lane_b]
+share = 0.35
+
+[lane_c]
+share      = 0.15
+takes_from = "lane_a"
+
+[lane_d]
+from_block    = 8524200
+share         = 0.5
+takes_from    = "lane_a"
+# #894 (owner 2026-11-24): lane D launches LIVE-ONLY — the verdict is the
+# live half alone; no public index is drawn, scored or required. Raise it
+# later by overlay (W-OV bound [0, 1], the loader keeps it < 1).
+public_weight = 0.0
+# Owner 2026-11-25 (leak mitigation, OPSLOG + cascade#935): lane A pool data
+# up to snapshot block 9579600 (built ~19:30 UTC 11-24) is already revealed on
+# HF; a 24 h embargo keeps every lane D embargo window clear of it (48 h would
+# overlap). Restore 48 by overlay after ~2026-11-27 once cascade#935 is in
+# force (W-OV bound [0, 168]).
+embargo_hours = 24.0

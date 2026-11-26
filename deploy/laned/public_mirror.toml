@@ -1,0 +1,40 @@
+# Lane D public mirror on Hippius S3 (owner 2026-11-24, issue #894; F3 / W6p).
+# Read by the eval host's `python -m cascade.eval.lane_d_forecasts public`
+# (no --public-root) and written by `scripts/laned_public_mirror.py build`.
+# Names and locations only: credentials are env-only, by NAME
+# (<key_env>_ACCESS_KEY / <key_env>_SECRET_KEY). Without them on the eval host
+# the client is anonymous, which this bucket refuses (403): the eval host env
+# must carry HIPPIUS_PUBLIC_READ_ACCESS_KEY / _SECRET_KEY. Never consensus: the signed
+# report binds the W6p index (index_sha256, files_sha256), and every byte read
+# from here is checked against the sha256s of the index files it names.
+#
+# Layout: <prefix>/<source>/<revision>/index/<index_sha256>/{index.jsonl.gz,
+#         manifest.json, shards.json, shardmap.jsonl.gz} and .../shards/<sha256>.parquet
+schema = "laned_public_mirror/1"
+prefix = "lane_d_public"
+
+# The eval host's blob cache: the Lium persistent volume (elastic.toml
+# [eval_host] public_cache_mount = "/workspace"). A missing or wiped volume
+# refills from the stores; every cached blob is re-hashed on every read.
+# Fully warm = the whole compressed mirror (~0.4-0.65 TiB, measured by the
+# build's `estimate`); the budget below holds it on a 750 GB volume.
+cache_dir = "/workspace/lane_d_public_cache"
+cache_budget_bytes = 700000000000
+
+# Tried in order on a cache miss: Hippius (canonical), then R2 (backup copy).
+[[store]]
+name = "hippius"
+endpoint = "https://s3.hippius.com"
+region = "decentralized"
+bucket = "cascade-lane-d-public"
+# Owner 2026-11-25: a key scoped to this bucket (the general HIPPIUS_S3 key is
+# denied here and the bucket is not public-read). Readers (eval host,
+# fetch-index) only GET and verify every byte against the index sha256s.
+key_env = "HIPPIUS_PUBLIC_READ"
+
+[[store]]
+name = "r2"
+endpoint = "https://04128c0d5ba104eb6a6b77c898aed78e.r2.cloudflarestorage.com"
+region = "auto"
+bucket = "cascade-lane-d-public"
+key_env = "BACKUP_S3"

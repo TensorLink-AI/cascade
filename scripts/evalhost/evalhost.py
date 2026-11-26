@@ -10,7 +10,8 @@ Subcommands (contract: tests/accept/r12/README.md):
 * ``resolve-endpoint`` find the pod in CAPTURED ``lium ps`` JSON (Lium's NAT
   moves RUNNING pods; resolve before ever calling one dead).
 * ``sync``            copy the release (cascade/, benchmarks/, the lock) over a
-  pinned-key rsync, then ``uv sync --frozen`` on the host.
+  pinned-key rsync, then ``uv sync --frozen [--extra NAME]`` on the host
+  (plus the build inputs pyproject.toml names: README, hatch force-includes).
 * ``identities``      fold the pod's bench_identity + file-count captures into
   the identities JSON ``handshake`` reads.
 * ``handshake``       the four suite identities + the W4 code handshake.
@@ -180,8 +181,14 @@ def load_profile(path: str) -> dict:
     if not isinstance(bench_dir, str) or not bench_dir.startswith("/") \
             or not SAFE_PATH_RE.fullmatch(bench_dir):
         raise UsageError(f"profile {path}: bench_dir must be a plain absolute path")
+    extras = data.get("uv_extras", [])
+    if not isinstance(extras, list) or not all(
+            isinstance(e, str) and EXTRA_RE.fullmatch(e) for e in extras):
+        raise UsageError(f"profile {path}: uv_extras must be a list of optional-dependencies "
+                         "group names")
     data["suite_identities"] = dict(pins)
     data["bench_dir"] = bench_dir
+    data["uv_extras"] = list(dict.fromkeys(extras))
     return data
 
 
@@ -569,6 +576,74 @@ def is_secret_name(name: str) -> bool:
     return any(rx.search(low) for rx in SECRET_NAME_RES)
 
 
+def _release_pyproject(release: Path) -> dict:
+    try:
+        return tomllib.loads((release / "pyproject.toml").read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
+        raise UsageError(f"the release's pyproject.toml does not parse: {e}") from None
+
+
+def build_inputs(release: Path) -> list[str]:
+    """Every file outside the copied trees that the project's own build reads
+    (#784: the editable install of `uv sync --frozen` failed on a fresh pod
+    without them), derived from the release's pyproject.toml: ``[project]
+    readme`` (a path, or a table's ``file``) and the sources of
+    ``[tool.hatch.build.targets.wheel.force-include]``. Each must be a regular
+    file in the release (a directory source is walked like a copied tree)."""
+    data = _release_pyproject(release)
+    names: list[str] = []
+    readme = (data.get("project") or {}).get("readme")
+    if isinstance(readme, dict):
+        readme = readme.get("file")
+    if isinstance(readme, str) and readme:
+        names.append(readme)
+    wheel = ((((data.get("tool") or {}).get("hatch") or {}).get("build") or {})
+             .get("targets") or {}).get("wheel") or {}
+    force = wheel.get("force-include") or {}
+    if not isinstance(force, dict):
+        raise UsageError("pyproject.toml [tool.hatch.build.targets.wheel] force-include "
+                         "is not a table")
+    names.extend(str(k) for k in force)
+    out: list[str] = []
+    root = release.resolve()
+    for name in names:
+        rel = Path(name)
+        p = release / rel
+        if (rel.is_absolute() or ".." in rel.parts or not SAFE_PATH_RE.fullmatch(name)
+                or is_secret_name(rel.name)):
+            raise UsageError(f"pyproject.toml build input {name!r} is not a plain release path")
+        if p.is_symlink() or not (p.is_file() or p.is_dir()) \
+                or not p.resolve().is_relative_to(root):
+            raise UsageError(f"the release {release} has no regular {name} (the project build "
+                             "reads it: README / hatch force-include): refusing a sync whose "
+                             "`uv sync --frozen` would fail on the host")
+        if p.is_dir():
+            out.extend(_walk_tree(release, p))
+        else:
+            out.append(rel.as_posix())
+    return out
+
+
+def _walk_tree(release: Path, top: Path) -> list[str]:
+    files: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(top, followlinks=False):
+        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS
+                             and not is_secret_name(d)
+                             and not (Path(dirpath) / d).is_symlink())
+        for name in filenames:
+            p = Path(dirpath) / name
+            if name.endswith((".pyc", ".pyo")) or is_secret_name(name):
+                continue
+            try:
+                st = p.lstat()
+            except OSError:
+                continue
+            if not stat.S_ISREG(st.st_mode):
+                continue
+            files.append(p.relative_to(release).as_posix())
+    return files
+
+
 def release_files(release: Path) -> list[str]:
     for name in ROOT_REQUIRED:
         p = release / name
@@ -576,6 +651,7 @@ def release_files(release: Path) -> list[str]:
             raise UsageError(f"the release {release} has no regular {name}: refusing to sync "
                              "an unpinned environment")
     files = list(ROOT_REQUIRED)
+    files.extend(build_inputs(release))
     for name in ROOT_OPTIONAL:
         p = release / name
         if p.is_file() and not p.is_symlink():
@@ -584,22 +660,17 @@ def release_files(release: Path) -> list[str]:
         top = release / tree
         if top.is_symlink() or not top.is_dir():
             continue
-        for dirpath, dirnames, filenames in os.walk(top, followlinks=False):
-            dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS
-                                 and not is_secret_name(d)
-                                 and not (Path(dirpath) / d).is_symlink())
-            for name in filenames:
-                p = Path(dirpath) / name
-                if name.endswith((".pyc", ".pyo")) or is_secret_name(name):
-                    continue
-                try:
-                    st = p.lstat()
-                except OSError:
-                    continue
-                if not stat.S_ISREG(st.st_mode):
-                    continue
-                files.append(p.relative_to(release).as_posix())
+        files.extend(_walk_tree(release, top))
     return sorted(set(files))
+
+
+EXTRA_RE = re.compile(r"[a-z0-9][a-z0-9_-]*")
+
+
+def release_extras(release: Path) -> set[str]:
+    """The release's ``[project.optional-dependencies]`` names."""
+    opt = (_release_pyproject(release).get("project") or {}).get("optional-dependencies") or {}
+    return set(opt) if isinstance(opt, dict) else set()
 
 
 def ssh_base(port: int, known_hosts: str) -> list[str]:
@@ -608,13 +679,15 @@ def ssh_base(port: int, known_hosts: str) -> list[str]:
 
 
 def sync_commands(release: Path, user_host: str, port: int, known_hosts: str, dest: str,
-                  bench_venv: bool) -> list[list[str]]:
+                  bench_venv: bool, extras: tuple[str, ...] = ()) -> list[list[str]]:
     ssh = ssh_base(port, known_hosts)
+    extra = "".join(f" --extra {shlex.quote(e)}" for e in extras)
     cmds = [["rsync", "-a", "--from0", "--files-from=-", "-e", " ".join(ssh),
              f"{release}/", f"{user_host}:{dest}/"],
-            [*ssh, user_host, f"cd {shlex.quote(dest)} && uv sync --frozen"]]
+            [*ssh, user_host, f"cd {shlex.quote(dest)} && uv sync --frozen{extra}"]]
     if bench_venv:
         cmds.append([*ssh, user_host,
+                     # incident-ok: IR001 pre-existing sidecar sync (no fev/time extras); owner to decide
                      f"cd {shlex.quote(dest + '/benchmarks')} && uv sync --frozen"])
     return cmds
 
@@ -633,7 +706,14 @@ def cmd_sync(args) -> int:
     files = release_files(release)
     if args.bench_venv and "benchmarks/uv.lock" not in files:
         raise UsageError("--bench-venv needs benchmarks/uv.lock in the release")
-    cmds = sync_commands(release, args.host, port, known_hosts, dest, args.bench_venv)
+    extras = tuple(dict.fromkeys(args.extra or ()))
+    known = release_extras(release)
+    for e in extras:
+        if not EXTRA_RE.fullmatch(e) or e not in known:
+            raise UsageError(f"--extra {e!r} is not an optional-dependencies group of the "
+                             f"release's pyproject.toml ({sorted(known)})")
+    cmds = sync_commands(release, args.host, port, known_hosts, dest, args.bench_venv,
+                         extras)
     for rel in files:
         print(f"COPY {rel}")
     for cmd in cmds:
@@ -848,7 +928,7 @@ def cmd_evidence(args) -> int:
 
 PROFILE_INFO_KEYS = ("name", "gpu_model", "disk_path", "bench_dir", "suite_pins",
                      "smi_list_cmd", "smi_query_cmd", "df_cmd", "bench_identity_cmd",
-                     "bench_files_cmd", "hello_cmd")
+                     "bench_files_cmd", "hello_cmd", "uv_extras")
 
 
 def cmd_profile_info(args) -> int:
@@ -860,7 +940,8 @@ def cmd_profile_info(args) -> int:
             "df_cmd": df_cmd(profile["disk_path"]),
             "bench_identity_cmd": BENCH_IDENTITY_CMD.format(bench_dir=profile["bench_dir"]),
             "bench_files_cmd": BENCH_FILES_CMD.format(bench_dir=profile["bench_dir"]),
-            "hello_cmd": HELLO_CMD}
+            "hello_cmd": HELLO_CMD,
+            "uv_extras": " ".join(profile["uv_extras"])}
     if args.get:
         print(info[args.get])
     else:
@@ -912,6 +993,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dest", required=True)
     p.add_argument("--bench-venv", action="store_true",
                    help="also uv sync --frozen the benchmarks/ sidecar project")
+    p.add_argument("--extra", action="append", default=[],
+                   help="an optional-dependencies group to install (`uv sync --frozen "
+                        "--extra NAME`; repeatable). The owner scripts pass the profile's "
+                        "uv_extras (launch_eval: train, the pinned torch)")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(fn=cmd_sync)
 

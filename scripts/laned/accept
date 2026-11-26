@@ -14,27 +14,53 @@
         below), else exactly --expect-fail
     accept <WP> --tests-correction --base REF --head REF [--root R]
         tests-only PRs for a WP already built on BASE (see MODE rules below)
-    accept <WP> --check-pr --base REF --head REF [--pr-wps WP,WP...] [--root R]
+    accept <WP> --check-pr --base REF --head REF [--pr-wps WP,WP...] [--correction] [--root R]
         rule 1 and the WP's PATHS over `git diff --name-only BASE...HEAD`;
         prints the MODE the PR job runs next (rules below); --pr-wps names
-        every laned:<WP> label of the PR (BATCH and BATCH IMPLEMENTATION
-        rules below);
+        every laned:<WP> label of the PR (BATCH and FEATURE rules below);
+        --correction: the PR also carries laned:tests-correction;
         for a review WP RV<n>: MODE review iff the diff is exactly an add or
         modify of evidence/rv<n>.md (no tests run)
+    accept <WP> --combined --base REF --head REF [--correction] [--root R]
+        MODE combined (FEATURE rule): the WP's new/changed tests fail on
+        BASE's code for a right reason, then the full Accept passes on HEAD
     accept <WP>[,<WP>...] --cross --base REF --head REF [--root R]
         cross-WP regressions (CROSS rule below); prints `CROSS <WP> PASS|KNOWN|FAIL`
-    accept [<WP>] --freshness --base REF --head REF --main REF [--root R]
+    accept [<WP>] --freshness --base REF --head REF --main REF [--warn-only] [--root R]
         stale-base guard (FRESHNESS rule below); prints `FRESH ...` or
-        `STALE BASE: update-branch and re-run` (exit 1)
+        `STALE BASE: update-branch and re-run` (exit 1); with --warn-only
+        `WARNING STALE BASE ...` (exit 0)
+    accept --merge-group --base REF --head REF --group-labels FILE [--root R]
+        the merge queue's combined ref (MERGE-GROUP rule below); prints
+        `GROUP-OWN <WPs>`, `GROUP <WP> <mode> PASS|FAIL (#N)` and `GROUP PASS|FAIL`
     accept selftest
         offline check of the review, tests-correction, verification,
-        evidence, cross and freshness modes
+        evidence, cross, freshness and merge-group modes
     accept --gate <STAGE> [--root R]
         evidence/gates/<stage>.json: right stage, every check passed
 
 MODE rules of --check-pr (the PR job runs the named mode next):
-    MODE implementation   the diff has no tests/accept/ path and stays inside
-                          the WP's PATHS -> full Accept
+    MODE implementation   the diff has no tests/accept/<wp>/ path of this WP
+                          and stays inside the labelled WPs' PATHS -> full
+                          Accept
+    MODE combined         (rev6.17, FEATURE rule) the diff changes this WP's
+                          tests/accept/<wp>/ (PATHS included) together with
+                          code -> --combined: every NEW test (a test function
+                          absent on BASE) of the WP, taken from HEAD, runs
+                          against BASE's code (a temporary BASE worktree whose
+                          tests/accept/<wp>/ is HEAD's) and must fail there
+                          for a right reason (the expect-fail classifier); a
+                          new test passing on BASE proves nothing and fails
+                          the PR, unless the WP is a declared verification WP
+                          (scripts/laned/verification_wps at BASE). A CHANGED
+                          test (AST differs, or a helper / conftest / fixture
+                          in its closure changed) must not fail for a wrong
+                          reason there; at least one new or changed test must
+                          fail for a right reason (unless verification WP or
+                          laned:tests-correction). Then the full Accept
+                          (invariant10, pytest, stub_scan over HEAD's PATHS,
+                          e2e) must pass on HEAD. Ledger mode `combined` with
+                          `tests_tree` and the PR number.
     MODE tests-only       the diff touches only tests/accept/<wp>/ and BASE has
                           no implementation of the WP (no L2 commit on BASE's
                           first-parent line: a commit after the one adding
@@ -98,48 +124,73 @@ MODE rules of --check-pr (the PR job runs the named mode next):
                           not cover) -> FAIL evidence.
     MODE review           RV<n> label, the diff is exactly evidence/rv<n>.md
 
-BATCH rule (plan rev6.2 item (h)): a tests-only PR may carry several WPs'
-tests. When --pr-wps names more than one label and the diff is only under
+BATCH rule (plan rev6.2 item (h); rev6.17): a tests-only PR may carry several
+WPs' tests. When --pr-wps names more than one label and the diff is only under
 tests/accept/, check-pr requires: every path is inside some
 tests/accept/<wp>/ dir; each such dir belongs to a label of the set; each
-label's dir is in the diff; every label is a WP (no RV<n>); and either no WP
-of the set is built on BASE (L2 commit) -> `BATCH <WPs>` + `MODE tests-only`,
-or (plan rev6.3 (b)) every WP of the set is built and there are at most 3 ->
-`BATCH <WPs>` + `MODE tests-correction` (a batch of corrections, each WP run
-in --tests-correction on its own). Otherwise `FAIL rule1: batch-<reason>: ...`
-with reason non-wp-label, duplicate-label, stray-tests, unlabelled-tests,
-label-without-tests, built-wp (built and unbuilt WPs mixed) or too-many. The
-PR job then runs each WP's --verification (its own TESTS-TREE in the ledger)
-or --tests-correction separately and fails when any WP fails. Code + tests is
-still rule 1 (one diff never mixes them). A single label keeps the one-WP rule
-(another WP's tests dir fails rule 1).
+label's dir is in the diff; every label is a WP (no RV<n>). Since rev6.17
+there is no size cap and built and unbuilt WPs may mix: check-pr prints
+`BATCH <WPs>`, `WPMODE <WP> tests-only|tests-correction` per WP and `MODE`
+for the WP it was asked about (tests-correction when built on BASE, else
+tests-only). Refusals: `FAIL rule1: batch-<reason>: ...` with reason
+non-wp-label, duplicate-label, stray-tests, unlabelled-tests or
+label-without-tests. The PR job runs each WP's --verification (its own
+TESTS-TREE in the ledger) or --tests-correction separately and fails when any
+WP fails. A single label keeps the one-WP rule (another WP's tests dir fails
+rule 1). Tests-only and tests-correction PRs stay available; they are no
+longer required (FEATURE rule).
 
-BATCH IMPLEMENTATION rule (plan rev6.3 item (b)): when --pr-wps names more
-than one label and the diff has no tests/accept/ path, check-pr requires
-    at most 3 WPs (too-many), all laned:<WP> (non-wp-label), no two naming the
-    same dir (duplicate-label);
-    (3) every WP's tests are on BASE: tests/accept/<wp>/PATHS and a test file
-        (no-tests);
-    (2) no WP of the set depends on another, directly or transitively, by the
-        Depends cells of the §3.0 WP tables in the plan at BASE (dependency); a
-        WP whose row or table has no Depends column cannot be told and is
-        refused (deps-unknown);
-    (1) the WPs' PATHS sets (at BASE) are disjoint: no pair of entries can
-        match one path (globs judged conservatively) and no file at BASE or
-        HEAD matches two sets (overlapping-paths);
-    scope: every changed file is in exactly one batch WP's PATHS (a file in
-        none, a PROTECTED file, or a scripts/laned/ file outside W0c's ->
-        `FAIL paths: batch-out-of-scope`; a file in two -> `FAIL paths:
-        batch-ambiguous`), and every WP owns a changed file
-        (label-without-changes).
-Refusals print `FAIL rule1: batch-<reason>: ...` (scope ones `FAIL paths:`).
-When it holds check-pr prints `BATCH <WPs>`, `SCOPE <WP> <n> file(s)` per WP
-and `MODE implementation`, identically for each label; the PR job then runs
-each WP's own full Accept, records one ledger row per WP and runs CROSS with
-the whole set as the PR's own WPs. On main the squash merge is each WP's L2
-commit: lanedlib.impl_commit_index also takes a commit whose files are each
-matched exactly once by the WP's own PATHS and at most 2 other WPs' PATHS (at
-the ref), each matching some (lanedlib.is_batch_impl_commit).
+FEATURE rule (owner 2026-11-23, plan rev6.17: one PR per feature; tests +
+code together; PATHS ride along). It replaces the rev6.3 (b) BATCH
+IMPLEMENTATION rule (at most 3 WPs, disjoint PATHS, no in-batch Depends) and
+the COUPLED rule (scripts/laned/coupled_batches): neither cap nor refusal
+applies any more. It holds for a diff with code (a path outside
+tests/accept/) and either a tests/accept/ path or more than one label:
+    labels: laned:<WP> only (non-wp-label), no two naming the same dir
+        (duplicate-label); laned:tests-correction is a flag, never a WP;
+    tests: every tests/accept/ path is inside a labelled WP's dir
+        (stray-tests, unlabelled-tests); every WP has PATHS and a test file
+        at HEAD, on the base or added by this PR (no-tests);
+    PATHS ride along: a WP's scope is its BASE PATHS plus the entries this PR
+        adds (HEAD); an entry the PR removes still counts from BASE (a
+        removal never takes a changed file out of scope). `PATHS-ADDED` /
+        `PATHS-REMOVED <WP> <entry>` lines list them. An added entry matching
+        nearly everything (empty, `*`, starting with a glob) or inside another
+        WP's tests dir is refused (`FAIL paths: batch-paths-too-broad` /
+        `batch-paths-foreign-tests`);
+    scope: every changed code file is in some labelled WP's scope (a file in
+        several is owned by each); none, a PROTECTED file, or a scripts/laned/
+        file outside W0c's -> `FAIL paths: batch-out-of-scope`; every label
+        owns a changed file or test (label-without-changes);
+    weakening (anti-gaming): for each WP whose tests dir is in the diff,
+        check-pr compares BASE and HEAD: a deleted test (or asserting
+        helper) module, a removed test or asserting function, fewer
+        assertions (`assert`, pytest.raises/warns/fail, *.assert_*) in a
+        function or helper module, more skip/skipif/xfail/importorskip
+        markers, or a removed PATHS entry -> `weakened <WP>: ...` lines and
+        `FAIL weakened`, unless the PR also carries laned:tests-correction
+        (--correction), when they are printed as allowed.
+When it holds check-pr prints `BATCH <WPs>` (more than one label),
+`SCOPE <WP> <n> file(s)` per WP, `WPMODE <WP> combined|implementation` per WP
+(more than one label) and `MODE combined` (the WP's tests dir is in the diff)
+or `MODE implementation` for the WP it was asked about. The PR job runs each
+WP's own mode (--combined or the full Accept), one ledger row per WP (with
+the PR number) and CROSS with the whole set as the PR's own WPs.
+LABELLED L2 rule (status board, built_on, CROSS; lanedlib.impl_commit_index):
+a squash merge `... (#N)` whose PR labels are known is a WP's L2 commit iff
+PR N carried laned:<WP> AND the merge changes at least one non-test path
+(outside tests/) the WP's PATHS match. A known PR without the label is never
+the WP's L2, however its files sit in the WP's PATHS (#817 made W5i read L2
+through broad PATHS). Labels come from $LANED_PR_LABELS (the workflow writes
+`gh pr list --state merged --json number,labels`; the step fails closed) and
+the ledger's PR rows (one per laned:<WP> label, field `pr`; laned/build-state
+or $LANED_LEDGER). A green `combined` row also makes the merge that changes
+tests/accept/<wp>/ the WP's L1 (lanedlib.pr_merge_index). Only a commit
+with no PR number or unknown labels falls back to the git-only rules: a
+single-WP implementation commit, a rev6.3 batch commit
+(lanedlib.is_batch_impl_commit) and a declared coupled-set commit
+(lanedlib.is_coupled_impl_commit; coupled_batches is still read for that,
+nothing new is declared there).
 
 CROSS rule (the PR job runs it after the PR's own WP steps, every mode but
 review): a WP other than the PR's own WP(s) is re-accepted when
@@ -180,7 +231,44 @@ STALE when its diff (BASE...HEAD) and main's diff (MB..MAIN) interact, in the
 PR's tree or in MAIN's: a path both touch; a changed module of one side whose
 static import closure reaches a changed path of the other; or a WP test dir
 that depends (CROSS rule (b)) on both diffs. Unrelated main commits leave the
-PR fresh. The loop must update-branch and re-run a STALE PR before merging.
+PR fresh. Since the GitHub merge queue (ruleset 27870327, 2026-11-23) the
+pull_request job runs it with --warn-only: a stale PR gets a WARNING in the
+job summary, not a failure, so a green PR no longer chases main through
+update-branch / re-run loops. The gate moved to the queue (MERGE-GROUP rule).
+
+MERGE-GROUP rule (the merge_group run, owner 2026-11-24): HEAD is the queue's
+combined ref (its working tree at --root), BASE is merge_group.base_sha. Each
+first-parent commit C of BASE..HEAD is one queued PR (`... (#N)` squash or
+`Merge pull request #N ...`); --group-labels maps N to the PR's labels. For
+every laned:<WP> of N, `--check-pr --base C^1 --head C` names the mode and the
+WP's own run follows ON THE COMBINED TREE: implementation and combined -> the
+full Accept (the combined mode's base-failing half ran on the PR); tests-only
+-> --verification; tests-correction -> --tests-correction; evidence -> the full
+Accept with each EVIDENCE file; review -> nothing. A WP several queued PRs
+carry runs once. A commit naming no PR, a PR missing from the labels file, a
+check-pr failure or any failing run fails the group (closed). The CROSS rule
+then runs over BASE..HEAD excluding the `GROUP-OWN` WPs (their own Accept just
+ran). Nothing is ledger-recorded (the push job records after the merge).
+
+RETIRED rule (owner decision D24, plan rev6.18, 2026-11-24: W5i retired, not
+built): a WP listed in scripts/laned/retired_wps at BASE (`<WP> <owner
+decision reference>` per line; a bare id fails closed) was dropped by an owner
+decision. Read at BASE / the board ref only, never from the PR (only a W0c PR
+edits scripts/laned/), so a PR cannot retire its own WP.
+    scope: its PATHS never count. A PR needs no label of it for a file in
+        its PATHS; a file only a retired WP's PATHS match is out of scope.
+        Its label is inert: the other labels' check-pr runs judge the diff
+        without it and without its tests dir.
+    its tests dir: a PR may only delete files there (else `FAIL rule1:
+        retired-tests`), under its label (else `batch-unlabelled-tests`) and
+        with laned:tests-correction (else `FAIL weakened`).
+    check-pr for it prints `RETIRED <WP> <reference>` and `MODE retired`
+        (the PR job and the merge group run nothing for it: `GROUP <WP>
+        retired SKIP`); a PR whose only labels are retired may change nothing
+        but their tests dirs (`FAIL paths: retired-only`).
+    never a CROSS WP (built_wps_at skips it), never a freshness dependency;
+        the status board keeps it at L0 with side state `retired` and shows
+        RETIRED.
 
 The pytest command is `uv run --frozen pytest` unless LANED_PYTEST_CMD is set
 (shlex-split). It always runs with cwd = --root. Exit 0 means pass.
@@ -192,10 +280,12 @@ import argparse
 import ast
 import contextlib
 import io
+import json
 import os
 import posixpath
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -366,10 +456,11 @@ def classify(kind: str, text: str, paths: list[str]) -> tuple[bool, str]:
     return False, "failure that is not an assertion"
 
 
-def classify_run(root: Path, wp: str, paths: list[str],
-                 targets: list[str] | None = None) -> tuple[int, int, int, int] | str:
-    """Run pytest (whole test dir, or ``targets``) and classify every failure:
-    (collected, passed, right-reason, wrong-reason), or an error string."""
+def classify_cases(root: Path, wp: str, paths: list[str],
+                   targets: list[str] | None = None) -> list[tuple[str, str]] | str:
+    """Run pytest (whole test dir, or ``targets``: files or node ids) and
+    classify every junit case: ``[(case id, pass|skip|right|wrong)]`` (a case
+    with any wrong-reason failure is ``wrong``), or an error string."""
     with tempfile.TemporaryDirectory(prefix="laned-xf-") as tmp:
         junit = Path(tmp) / "junit.xml"
         proc = run_pytest(root, wp, [f"--junitxml={junit}", "--continue-on-collection-errors"],
@@ -379,24 +470,33 @@ def classify_run(root: Path, wp: str, paths: list[str],
             sys.stderr.write(proc.stderr[-5000:])
             return f"pytest wrote no report (exit {proc.returncode})"
         tree = ET.parse(junit)
-    cases = list(tree.iter("testcase"))
-    right = wrong = passed = 0
-    for case in cases:
+    out: list[tuple[str, str]] = []
+    for case in tree.iter("testcase"):
         name = f"{case.get('classname', '')}::{case.get('name', '')}"
         bad = [(child.tag, (child.get("message") or "") + "\n" + (child.text or ""))
                for child in case if child.tag in ("failure", "error")]
         if not bad:
-            if not any(child.tag == "skipped" for child in case):
-                passed += 1
+            out.append((name, "skip" if any(child.tag == "skipped" for child in case) else "pass"))
             continue
+        verdict = "right"
         for kind, text in bad:
             ok, why = classify(kind, text, paths)
             print(f"{'right' if ok else 'WRONG'} {kind} {name}: {why}")
-            if ok:
-                right += 1
-            else:
-                wrong += 1
-    return len(cases), passed, right, wrong
+            if not ok:
+                verdict = "wrong"
+        out.append((name, verdict))
+    return out
+
+
+def classify_run(root: Path, wp: str, paths: list[str],
+                 targets: list[str] | None = None) -> tuple[int, int, int, int] | str:
+    """Run pytest (whole test dir, or ``targets``) and classify every failure:
+    (collected, passed, right-reason, wrong-reason), or an error string."""
+    res = classify_cases(root, wp, paths, targets)
+    if isinstance(res, str):
+        return res
+    verdicts = [v for _, v in res]
+    return len(res), verdicts.count("pass"), verdicts.count("right"), verdicts.count("wrong")
 
 
 def cmd_expect_fail(root: Path, wp: str) -> int:
@@ -549,13 +649,14 @@ def cmd_check_pr_evidence(root: Path, wp: str, base: str, head: str,
     return None
 
 
-def cmd_check_pr_batch(root: Path, pr_wps: list[str], base: str,
+def cmd_check_pr_batch(root: Path, wp: str, pr_wps: list[str], base: str,
                        tests: list[str]) -> int:
     """BATCH rule (module docstring): a tests-only diff for the label set
     ``pr_wps`` (more than one WP). Each WP's tests dir is touched only under
-    its own label, every label has its tests dir in the diff, and no batched
-    WP is already built on BASE (that PR is a tests-correction: one WP per
-    PR). Fails closed with ``FAIL rule1: batch-<reason>: ...``."""
+    its own label and every label has its tests dir in the diff. Since
+    rev6.17 any number of WPs, built and unbuilt mixed: ``MODE`` is ``wp``'s
+    own (tests-correction when built on BASE, else tests-only). Fails closed
+    with ``FAIL rule1: batch-<reason>: ...``."""
     def refuse(reason: str, detail: str) -> int:
         return fail("rule1", f"batch-{reason}: {detail}")
 
@@ -589,173 +690,332 @@ def cmd_check_pr_batch(root: Path, pr_wps: list[str], base: str,
     if missing:
         return refuse("label-without-tests", "label(s) whose tests/accept/<wp>/ the diff does not touch: "
                       + " ".join(f"laned:{w}" for w in missing))
-    built = [w for w in pr_wps if built_on(root, base, w)]
-    if built and len(built) == len(pr_wps):
-        # plan rev6.3 (b): corrections for up to BATCH_IMPL_MAX built WPs,
-        # each run in tests-correction mode on its own
-        if len(pr_wps) > lanedlib.BATCH_IMPL_MAX:
-            return refuse("too-many", f"{len(pr_wps)} WPs ({' '.join(pr_wps)}); a tests-correction PR "
-                          f"batches at most {lanedlib.BATCH_IMPL_MAX}")
-        print("BATCH " + " ".join(pr_wps))
-        print("MODE tests-correction")
-        return 0
-    if built:
-        unbuilt = [w for w in pr_wps if w not in built]
-        return refuse("built-wp", f"{' '.join(built)} already built on {base} (L2 commit) but "
-                      f"{' '.join(unbuilt)} not: a batch is all tests-only (new WPs) or all "
-                      "tests-corrections (built WPs), never both")
+    # rev6.17: no size cap, built and unbuilt WPs may mix; each WP runs its
+    # own mode (tests-correction when built on BASE, else tests-only)
+    modes = {w: "tests-correction" if built_on(root, base, w) else "tests-only" for w in pr_wps}
     print("BATCH " + " ".join(pr_wps))
-    print("MODE tests-only")
+    for w in pr_wps:
+        print(f"WPMODE {w} {modes[w]}")
+    print(f"MODE {modes.get(wp, 'tests-only')}")
     return 0
 
 
-def _literal_prefix(entry: str) -> str:
-    k = min((entry.find(c) for c in lanedlib.GLOB_CHARS if c in entry), default=len(entry))
-    return entry[:k]
+# ---------------------------------------------------------------------------
+# weakened tests (a combined PR may not weaken its WPs' existing tests)
+# ---------------------------------------------------------------------------
+
+# calls that assert (pytest.raises / pytest.warns / pytest.fail, mock.assert_*)
+ASSERT_CALLS = frozenset({"raises", "warns", "fail", "deprecated_call"})
+SKIP_CALLS = frozenset({"skip", "skipif", "xfail", "importorskip"})
 
 
-def entries_overlap(a: str, b: str) -> bool:
-    """Can one path match both PATHS entries? Conservative for globs (fnmatch
-    ``*`` crosses ``/``): two globs overlap when one literal prefix extends
-    the other, a glob and a plain entry when either matches the other or the
-    glob's literal prefix lies inside the plain dir/ entry."""
-    ga = any(c in a for c in lanedlib.GLOB_CHARS)
-    gb = any(c in b for c in lanedlib.GLOB_CHARS)
-    if not ga and not gb:
-        return (lanedlib.path_matches(a.rstrip("/"), [b]) or lanedlib.path_matches(b.rstrip("/"), [a])
-                or (a.endswith("/") and b.startswith(a)) or (b.endswith("/") and a.startswith(b)))
-    if ga and gb:
-        pa, pb = _literal_prefix(a), _literal_prefix(b)
-        return pa.startswith(pb) or pb.startswith(pa)
-    glob, plain = (a, b) if ga else (b, a)
-    pre = _literal_prefix(glob)
-    if lanedlib.path_matches(plain.rstrip("/"), [glob]):
-        return True
-    if plain.endswith("/"):
-        return pre.startswith(plain) or plain.startswith(pre)
-    return False
+def _call_name(node: ast.AST) -> str:
+    f = node.func if isinstance(node, ast.Call) else node
+    if isinstance(f, ast.Attribute):
+        return f.attr
+    if isinstance(f, ast.Name):
+        return f.id
+    return ""
 
 
-def cmd_check_pr_impl_batch(root: Path, pr_wps: list[str], base: str, head: str,
-                            diff: list[str]) -> int:
-    """BATCH IMPLEMENTATION rule (module docstring; plan rev6.3 (b)): one
-    implementation PR for up to BATCH_IMPL_MAX WPs. Fails closed with
-    ``FAIL rule1: batch-<reason>: ...`` (or ``FAIL paths: batch-<reason>``
-    for a file in no, or more than one, batch WP's PATHS)."""
+def _assert_profile(text: str | None) -> dict[str, tuple[int, int]] | None:
+    """``{qualname: (assertions, skip/xfail markers)}`` for every function at
+    module level or in a class, plus ``<module>`` for the whole file. An
+    assertion is an ``assert`` statement or an asserting call (ASSERT_CALLS,
+    ``*.assert_*``); a marker is any skip / skipif / xfail / importorskip
+    name, call or attribute (decorators and ``pytestmark`` included). None
+    when the text does not parse."""
+    try:
+        tree = ast.parse(text or "")
+    except SyntaxError:
+        return None
+
+    def count(node: ast.AST) -> tuple[int, int]:
+        a = s = 0
+        for n in ast.walk(node):
+            if isinstance(n, ast.Assert):
+                a += 1
+            elif isinstance(n, ast.Call):
+                name = _call_name(n)
+                if name in ASSERT_CALLS or name.startswith("assert_"):
+                    a += 1
+            if isinstance(n, (ast.Attribute, ast.Name)) and _call_name(n) in SKIP_CALLS:
+                s += 1
+        return a, s
+
+    out: dict[str, tuple[int, int]] = {"<module>": count(tree)}
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            out[node.name] = count(node)
+        elif isinstance(node, ast.ClassDef):
+            for sub in node.body:
+                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    out[f"{node.name}.{sub.name}"] = count(sub)
+    return out
+
+
+def weakened_tests(root: Path, wp: str, base: str, head: str) -> list[str]:
+    """What the PR (BASE -> HEAD) removes from the WP's existing tests: a
+    deleted test or asserting module, a removed test (or asserting) function,
+    fewer assertions in a function or helper module, a new skip / xfail
+    marker, or a removed PATHS entry (it narrows stub_scan). Empty: nothing
+    weakened. A rename counts as a removal."""
+    d = f"tests/accept/{lanedlib.wp_dir(wp)}/"
+    files = lanedlib.git(root, "ls-tree", "-r", "--name-only", base, "--", d, check=False).stdout.split()
+    out: list[str] = []
+    for f in sorted(p for p in files if p.endswith(".py")):
+        bt = lanedlib.git(root, "show", f"{base}:{f}", check=False).stdout
+        hp_proc = lanedlib.git(root, "show", f"{head}:{f}", check=False)
+        bp = _assert_profile(bt) or {}
+        if hp_proc.returncode != 0:
+            if is_test_file(f) or bp.get("<module>", (0, 0))[0]:
+                out.append(f"deleted {f}")
+            continue
+        hp = _assert_profile(hp_proc.stdout)
+        if hp is None:
+            out.append(f"{f} no longer parses")
+            continue
+        if not is_test_file(f):
+            ba, ha = bp.get("<module>", (0, 0))[0], hp["<module>"][0]
+            if ha < ba:
+                out.append(f"fewer assertions in {f} ({ba} -> {ha})")
+            continue
+        for q, (a, s) in sorted(bp.items()):
+            if q == "<module>":
+                if hp["<module>"][1] > s:
+                    out.append(f"adds skip/xfail markers in {f} ({s} -> {hp['<module>'][1]})")
+                continue
+            if q not in hp:
+                if q.rsplit(".", 1)[-1].startswith("test") or a:
+                    out.append(f"removed {f}::{q.replace('.', '::')}")
+                continue
+            ha, hs = hp[q]
+            if ha < a:
+                out.append(f"fewer assertions in {f}::{q.replace('.', '::')} ({a} -> {ha})")
+    bpaths = paths_at_only(root, base, wp)
+    hpaths = paths_at_only(root, head, wp)
+    if bpaths is not None:
+        gone = [e for e in bpaths if e not in (hpaths or [])]
+        if gone:
+            out.append(f"removes PATHS entr{'y' if len(gone) == 1 else 'ies'} " + " ".join(gone))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# feature PRs (rev6.17): one PR per feature, tests + code, PATHS ride along
+# ---------------------------------------------------------------------------
+
+def paths_at_only(root: Path, ref: str, wp: str) -> list[str] | None:
+    """The WP's PATHS entries at ``ref`` (no working-tree fallback)."""
+    proc = lanedlib.git(root, "show", f"{ref}:tests/accept/{lanedlib.wp_dir(wp)}/PATHS", check=False)
+    return lanedlib.parse_paths(proc.stdout) if proc.returncode == 0 else None
+
+
+def _too_broad(entry: str) -> bool:
+    e = entry.strip().lstrip("./")
+    return not e or e[0] in lanedlib.GLOB_CHARS or e in ("*", "**")
+
+
+def cmd_check_pr_feature(root: Path, wp: str, pr_wps: list[str], base: str, head: str,
+                         diff: list[str], correction: bool = False) -> int:
+    """FEATURE rule (module docstring, rev6.17): a PR whose labels are all
+    laned:<WP> may change any of their tests/accept/<wp>/ dirs (PATHS
+    included) and code inside their PATHS, in one diff, for any number of
+    WPs, overlapping and dependent ones included. Fails closed with ``FAIL
+    rule1: batch-<reason>`` / ``FAIL paths: batch-<reason>`` / ``FAIL
+    weakened``. Prints ``MODE combined`` for ``wp`` when its tests dir is in
+    the diff, else ``MODE implementation``."""
     def refuse(reason: str, detail: str, step: str = "rule1") -> int:
         return fail(step, f"batch-{reason}: {detail}")
 
-    if len(pr_wps) > lanedlib.BATCH_IMPL_MAX:
-        return refuse("too-many", f"{len(pr_wps)} WPs ({' '.join(pr_wps)}); an implementation PR "
-                      f"batches at most {lanedlib.BATCH_IMPL_MAX}")
     non_wp = [w for w in pr_wps if REVIEW_WP.match(w)]
     if non_wp:
-        return refuse("non-wp-label", "a batch implementation PR carries only laned:<WP> labels; it also has: "
+        return refuse("non-wp-label", "a feature PR carries only laned:<WP> labels; it also has: "
                       + " ".join(f"laned:{w}" for w in non_wp))
-    seen: dict[str, str] = {}
+    by_dir: dict[str, str] = {}
     for w in pr_wps:
         d = lanedlib.wp_dir(w)
-        if d in seen:
-            return refuse("duplicate-label", f"laned:{seen[d]} and laned:{w} name the same tests/accept/{d}/")
-        seen[d] = w
-    # (3) each WP's tests are already on main (BASE): PATHS and a test file
-    sets: dict[str, list[str]] = {}
+        if d in by_dir:
+            return refuse("duplicate-label", f"laned:{by_dir[d]} and laned:{w} name the same tests/accept/{d}/")
+        by_dir[d] = w
+    tests_by_wp: dict[str, list[str]] = {w: [] for w in pr_wps}
+    stray: list[str] = []
+    unlabelled: set[str] = set()
+    for p in diff:
+        if not p.startswith("tests/accept/"):
+            continue
+        parts = p.split("/")
+        if len(parts) < 4:
+            stray.append(p)
+        elif parts[2] not in by_dir:
+            unlabelled.add(parts[2])
+        else:
+            tests_by_wp[by_dir[parts[2]]].append(p)
+    if stray:
+        return refuse("stray-tests", "paths under tests/accept/ outside every WP's tests dir: "
+                      + " ".join(sorted(stray)))
+    if unlabelled:
+        return refuse("unlabelled-tests", "tests dir(s) without their laned:<WP> label: "
+                      + " ".join(f"tests/accept/{d}/" for d in sorted(unlabelled)))
+    # every WP has tests at HEAD (PATHS and a test file; they may come in this PR)
+    scope: dict[str, list[str]] = {}
+    added: dict[str, list[str]] = {}
+    removed: dict[str, list[str]] = {}
     no_tests: list[str] = []
     for w in pr_wps:
         d = lanedlib.wp_dir(w)
-        proc = lanedlib.git(root, "show", f"{base}:tests/accept/{d}/PATHS", check=False)
-        listed = lanedlib.git(root, "ls-tree", "-r", "--name-only", base, "--",
+        hpaths = paths_at_only(root, head, w)
+        listed = lanedlib.git(root, "ls-tree", "-r", "--name-only", head, "--",
                               f"tests/accept/{d}/", check=False).stdout.split()
-        if proc.returncode != 0 or not any(is_test_file(p) for p in listed):
+        if hpaths is None or not any(is_test_file(p) for p in listed):
             no_tests.append(w)
             continue
-        sets[w] = lanedlib.parse_paths(proc.stdout)
+        bpaths = paths_at_only(root, base, w) or []
+        added[w] = [e for e in hpaths if e not in bpaths]
+        removed[w] = [e for e in bpaths if e not in hpaths]
+        # PATHS ride along: added entries count from HEAD, removed ones still
+        # count from BASE (a removal never takes a changed file out of scope)
+        scope[w] = list(dict.fromkeys([*bpaths, *hpaths]))
     if no_tests:
         return refuse("no-tests", f"{' '.join(no_tests)} has no tests/accept/<wp>/ (PATHS and a test file) "
-                      f"on {base}: its tests PR merges first")
-    # (2) no WP of the batch depends on another (plan §3.0 Depends at BASE, transitive)
-    plan = plan_at(root, base)
-    deps = lanedlib.plan_wp_depends(plan) if plan else {}
-    unknown = [w for w in pr_wps if deps.get(w) is None]
-    if unknown:
-        return refuse("deps-unknown", f"cannot tell the dependencies of {' '.join(unknown)} from the plan at "
-                      f"{base} (no §3.0 WP row with a Depends column); batch them in separate PRs")
-    ids = list(deps)
-
-    def direct(w: str) -> set[str]:
-        cell = deps.get(w) or ""
-        return {x for x in ids if x != w and lanedlib.has_token(cell, x)}
-
-    for a in pr_wps:
-        reach: set[str] = set()
-        todo = list(direct(a))
-        while todo:
-            x = todo.pop()
-            if x in reach:
-                continue
-            reach.add(x)
-            todo += list(direct(x) - reach)
-        hit = [b for b in pr_wps if b != a and b in reach]
-        if hit:
-            how = "" if hit[0] in direct(a) else " (transitively)"
-            return refuse("dependency", f"{a} depends on {hit[0]}{how} (plan §3.0 Depends): "
-                          "implement them in separate PRs, the dependency first")
-    # (1) PATHS sets disjoint (entry-wise, and over the files at BASE and HEAD)
-    files = set(lanedlib.git(root, "ls-tree", "-r", "--name-only", base).stdout.split())
-    files |= set(lanedlib.git(root, "ls-tree", "-r", "--name-only", head).stdout.split())
-    for i, a in enumerate(pr_wps):
-        for b in pr_wps[i + 1:]:
-            pairs = [f"{x} ~ {y}" for x in sets[a] for y in sets[b] if entries_overlap(x, y)]
-            both = sorted(f for f in files if lanedlib.path_matches(f, sets[a])
-                          and lanedlib.path_matches(f, sets[b]))
-            if pairs or both:
-                return refuse("overlapping-paths", f"the PATHS of {a} and {b} overlap: "
-                              + " ".join(pairs or both))
-    # scope: every changed file falls in exactly one batch WP's PATHS
+                      f"at {head}: a feature PR adds them or they are on the base")
+    for w in pr_wps:
+        own = f"tests/accept/{lanedlib.wp_dir(w)}/"
+        broad = [e for e in added[w] if _too_broad(e)]
+        if broad:
+            return refuse("paths-too-broad", f"{w} adds PATHS entr(y|ies) matching nearly everything: "
+                          + " ".join(broad), "paths")
+        foreign = [e for e in added[w] if e.startswith("tests/accept/") and not e.startswith(own)]
+        if foreign:
+            return refuse("paths-foreign-tests", f"{w} adds PATHS entr(y|ies) inside another WP's tests: "
+                          + " ".join(foreign), "paths")
     outside: list[str] = []
-    ambiguous: list[str] = []
-    owned: dict[str, list[str]] = {w: [] for w in pr_wps}
+    owned: dict[str, list[str]] = {w: list(tests_by_wp[w]) for w in pr_wps}
     for p in diff:
-        owners = [w for w in pr_wps if lanedlib.path_matches(p, sets[w])]
-        if p in PROTECTED or (p.startswith("scripts/laned/") and owners != [TOOLING_WP]) or not owners:
+        if p.startswith("tests/accept/"):
+            continue
+        owners = [w for w in pr_wps if lanedlib.path_matches(p, scope[w])]
+        if p in PROTECTED or (p.startswith("scripts/laned/") and TOOLING_WP not in owners) or not owners:
             outside.append(p)
-        elif len(owners) > 1:
-            ambiguous.append(f"{p} ({' '.join(owners)})")
-        else:
-            owned[owners[0]].append(p)
+            continue
+        for w in owners:
+            owned[w].append(p)
     if outside:
-        return refuse("out-of-scope", "outside every batch WP's PATHS: " + " ".join(sorted(outside)), "paths")
-    if ambiguous:
-        return refuse("ambiguous", "in more than one batch WP's PATHS: " + " ".join(sorted(ambiguous)), "paths")
+        return refuse("out-of-scope", "outside every labelled WP's PATHS (BASE + entries this PR adds): "
+                      + " ".join(sorted(outside)), "paths")
     idle = [w for w in pr_wps if not owned[w]]
     if idle:
-        return refuse("label-without-changes", "label(s) none of whose PATHS the diff touches: "
+        return refuse("label-without-changes", "label(s) none of whose PATHS or tests the diff touches: "
                       + " ".join(f"laned:{w}" for w in idle))
-    print("BATCH " + " ".join(pr_wps))
+    weak: list[str] = []
+    for w in pr_wps:
+        if tests_by_wp[w]:
+            weak += [f"{w}: {x}" for x in weakened_tests(root, w, base, head)]
+    if weak and not correction:
+        for x in weak:
+            print(f"weakened {x}")
+        return fail("weakened", f"{len(weak)} existing test assertion(s) deleted or weakened; only a PR "
+                    f"labelled laned:{lanedlib.CORRECTION_LABEL} may do that")
+    for x in weak:
+        print(f"weakened {x} (allowed: laned:{lanedlib.CORRECTION_LABEL})")
+    if len(pr_wps) > 1:
+        print("BATCH " + " ".join(pr_wps))
     for w in pr_wps:
         print(f"SCOPE {w} {len(owned[w])} file(s)")
-    print("MODE implementation")
+        for e in added[w]:
+            print(f"PATHS-ADDED {w} {e}")
+        for e in removed[w]:
+            print(f"PATHS-REMOVED {w} {e}")
+    modes = {w: "combined" if tests_by_wp[w] else "implementation" for w in pr_wps}
+    if len(pr_wps) > 1:
+        for w in pr_wps:
+            print(f"WPMODE {w} {modes[w]}")
+    print(f"MODE {modes[wp]}")
     return 0
 
 
+def check_pr_retired(root: Path, wp: str, base: str, head: str, diff: list[str], labels: list[str],
+                     retired: dict[str, str], correction: bool
+                     ) -> tuple[int | None, list[str], list[str]]:
+    """RETIRED rule (module docstring) for check-pr. Returns ``(rc, diff,
+    labels)``: ``rc`` is the check-pr exit code when the rule decides it
+    (``wp`` is retired, or the PR breaks the rule), else None and the diff /
+    labels the other rules judge: without the retired WPs' tests dirs (each
+    is judged by its own label's run) and without retired labels (inert:
+    their PATHS never count for scope)."""
+    rdirs = {lanedlib.wp_dir(w): w for w in retired}
+
+    def retired_dir(p: str) -> str | None:
+        parts = p.split("/")
+        return parts[2] if len(parts) >= 4 and p.startswith("tests/accept/") and parts[2] in rdirs else None
+
+    deleted = set(lanedlib.git(root, "diff", "--no-renames", "--name-only", "--diff-filter=D",
+                                   f"{base}...{head}").stdout.split())
+    changed = sorted(p for p in diff if retired_dir(p) and p not in deleted)
+    if changed:
+        return fail("rule1", "retired-tests: a retired WP's tests/accept/<wp>/ may only be deleted; "
+                    "the PR adds or changes " + " ".join(changed)), diff, labels
+    label_dirs = {lanedlib.wp_dir(w) for w in labels}
+    unlabelled = sorted({d for p in diff if (d := retired_dir(p)) and d not in label_dirs})
+    if unlabelled:
+        return fail("rule1", "batch-unlabelled-tests: tests dir(s) without their laned:<WP> label: "
+                    + " ".join(f"tests/accept/{d}/" for d in unlabelled)), diff, labels
+    live = [w for w in labels if lanedlib.wp_dir(w) not in rdirs]
+    own_dir = lanedlib.wp_dir(wp)
+    if own_dir in rdirs:
+        why = retired[rdirs[own_dir]]
+        own = [p for p in diff if retired_dir(p) == own_dir]
+        rest = [p for p in diff if retired_dir(p) != own_dir]
+        print(f"RETIRED {wp} {why}")
+        if rest and not live:
+            return fail("paths", f"retired-only: laned:{wp} is a retired WP's label and covers only deleting "
+                        f"tests/accept/{own_dir}/; the PR also changes " + " ".join(sorted(rest))
+                        + " with no live laned:<WP> label"), diff, labels
+        weak = weakened_tests(root, wp, base, head) if own else []
+        if weak and not correction:
+            for x in weak:
+                print(f"weakened {wp}: {x}")
+            return fail("weakened", f"deleting a retired WP's tests needs laned:{lanedlib.CORRECTION_LABEL} "
+                        f"(cite the owner decision: {why})"), diff, labels
+        for x in weak:
+            print(f"weakened {wp}: {x} (allowed: laned:{lanedlib.CORRECTION_LABEL})")
+        print("MODE retired")
+        return 0, diff, labels
+    return None, [p for p in diff if not retired_dir(p)], live
+
+
 def cmd_check_pr(root: Path, wp: str, base: str, head: str,
-                 pr_wps: list[str] | None = None) -> int:
+                 pr_wps: list[str] | None = None, correction: bool = False) -> int:
     m = REVIEW_WP.match(wp)
     if m:
         return cmd_check_pr_review(root, wp, m.group(1), base, head)
     diff = lanedlib.git(root, "diff", "--name-only", f"{base}...{head}").stdout.split()
     if not diff:
         return fail("paths", "the PR changes nothing")
+    # the tests-correction flag label is never a WP
+    labels = [w for w in dict.fromkeys([*(pr_wps or []), wp]) if w != lanedlib.CORRECTION_LABEL]
+    # RETIRED rule (module docstring): read at BASE, never from the PR
+    try:
+        retired = lanedlib.retired_wps_at(root, base)
+    except ValueError as e:
+        return fail("retired", str(e))
+    if retired:
+        rc, diff, labels = check_pr_retired(root, wp, base, head, diff, labels, retired, correction)
+        if rc is not None:
+            return rc
+        if not diff:
+            return fail("rule1", f"batch-label-without-changes: laned:{wp}: the PR changes only "
+                        "retired WPs' tests dirs")
     rc = cmd_check_pr_evidence(root, wp, base, head, diff)
     if rc is not None:
         return rc
     tests = [p for p in diff if p.startswith("tests/accept/")]
     others = [p for p in diff if not p.startswith("tests/accept/")]
     if tests and others:
-        return fail("rule1", "tests/accept/ edited together with: " + " ".join(others))
-    labels = list(dict.fromkeys([*(pr_wps or []), wp]))
+        # rev6.17 rule 1: tests + code together (FEATURE rule)
+        return cmd_check_pr_feature(root, wp, labels, base, head, diff, correction)
     if tests and len(labels) > 1:
-        return cmd_check_pr_batch(root, labels, base, tests)
+        return cmd_check_pr_batch(root, wp, labels, base, tests)
     if tests:
         own = f"tests/accept/{lanedlib.wp_dir(wp)}/"
         foreign = [p for p in tests if not p.startswith(own)]
@@ -766,7 +1026,9 @@ def cmd_check_pr(root: Path, wp: str, base: str, head: str,
         print("MODE tests-correction" if built_on(root, base, wp) else "MODE tests-only")
         return 0
     if len(labels) > 1:
-        return cmd_check_pr_impl_batch(root, labels, base, head, diff)
+        # rev6.17 rule 6/7: any number of laned:<WP> labels, overlapping or
+        # dependent PATHS (FEATURE rule; no tests in this diff)
+        return cmd_check_pr_feature(root, wp, labels, base, head, diff, correction)
     paths = paths_at(root, base, wp) or paths_at(root, head, wp)
     if not paths:
         return fail("paths", f"no tests/accept/{lanedlib.wp_dir(wp)}/PATHS")
@@ -793,8 +1055,27 @@ def built_on(root: Path, ref: str, wp: str) -> bool:
     if proc.returncode != 0:
         return False
     history = lanedlib.first_parent_history(root, ref)
-    others = lanedlib.other_paths(lanedlib.paths_sets_at(root, ref), wp)
-    return lanedlib.impl_commit_index(history, wp, lanedlib.parse_paths(proc.stdout), others) is not None
+    sets = lanedlib.paths_sets_at(root, ref)
+    others = lanedlib.other_paths(sets, wp)
+    coupled = lanedlib.coupled_paths(lanedlib.coupled_batches_at(root, ref), sets, wp)
+    paths = lanedlib.parse_paths(proc.stdout)
+    return lanedlib.impl_commit_index(history, wp, paths, others, coupled,
+                                      lanedlib.first_parent_subjects(root, ref), pr_labels(root)) is not None
+
+
+# (root, $LANED_LEDGER, $LANED_PR_LABELS) -> {PR: WPs}; one read per run
+_LEDGER: dict[tuple[str, str, str], dict[int, set[str]]] = {}
+
+
+def pr_labels(root: Path) -> dict[int, set[str]]:
+    """LABELLED L2 rule (lanedlib.impl_commit_index): the laned:<WP> labels
+    of merged PRs, from $LANED_PR_LABELS (the workflow writes it with `gh pr
+    list`) and the ledger's PR rows (laned/build-state, or $LANED_LEDGER)."""
+    key = (str(root), os.environ.get("LANED_LEDGER", ""), os.environ.get("LANED_PR_LABELS", ""))
+    if key not in _LEDGER:
+        _LEDGER[key] = lanedlib.merge_pr_labels(lanedlib.pr_labels_file(),
+                                                lanedlib.pr_labels_from_runs(lanedlib.ledger_runs(root)))
+    return _LEDGER[key]
 
 
 def is_test_file(rel: str) -> bool:
@@ -971,6 +1252,132 @@ def cmd_tests_correction(root: Path, wp: str, base: str, head: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# combined (rev6.17: a PR changing a WP's tests together with code)
+# ---------------------------------------------------------------------------
+
+def _test_functions(text: str | None) -> dict[str, str] | None:
+    """``{node-id suffix: ast dump}`` of the test functions of one module
+    (module-level ``test*`` and ``Test*`` class ``test*`` methods)."""
+    try:
+        tree = ast.parse(text or "")
+    except SyntaxError:
+        return None
+    out: dict[str, str] = {}
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test"):
+            out[node.name] = ast.dump(node)
+        elif isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
+            for sub in node.body:
+                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)) and sub.name.startswith("test"):
+                    out[f"{node.name}::{sub.name}"] = ast.dump(sub)
+    return out
+
+
+def new_and_changed_tests(root: Path, wp: str, base: str, diff: list[str]) -> tuple[list[str], list[str]]:
+    """(new, changed) pytest node ids of the WP's tests in the working tree
+    (HEAD) against BASE. New: a test function absent on BASE (a new file's
+    every test). Changed: one present on BASE whose AST differs, or every
+    test of a file whose static closure has a changed helper, conftest or
+    fixture (changed_test_files). A module that does not parse on HEAD is
+    taken whole as new (its collection error must be a right reason)."""
+    changed_files, indirect = changed_test_files(root, wp, diff)
+    new: list[str] = []
+    changed: list[str] = []
+    for t in changed_files:
+        head_fns = _test_functions((root / t).read_text(encoding="utf-8", errors="replace"))
+        proc = lanedlib.git(root, "show", f"{base}:{t}", check=False)
+        base_fns = _test_functions(proc.stdout) if proc.returncode == 0 else {}
+        if head_fns is None:
+            new.append(t)
+            continue
+        for name, dump in head_fns.items():
+            nid = f"{t}::{name}"
+            if base_fns is None or name not in base_fns:
+                new.append(nid)
+            elif t in indirect or base_fns[name] != dump:
+                changed.append(nid)
+    return new, changed
+
+
+def base_overlay_cases(root: Path, base: str, wp: str, paths: list[str],
+                       groups: list[list[str]]) -> list[list[tuple[str, str]] | str]:
+    """Run each group of node ids over a temporary detached worktree of BASE
+    whose tests/accept/<wp>/ is replaced by the working tree's (HEAD's): the
+    PR's tests against BASE's code. One classify_cases result per group."""
+    d = f"tests/accept/{lanedlib.wp_dir(wp)}"
+    with tempfile.TemporaryDirectory(prefix="laned-combined-base-") as tmp:
+        wt = Path(tmp) / "base"
+        proc = lanedlib.git(root, "worktree", "add", "--detach", "-q", str(wt), base, check=False)
+        if proc.returncode != 0:
+            return [f"no BASE worktree: {proc.stderr.strip()[:200]}" for _ in groups]
+        try:
+            shutil.rmtree(wt / d, ignore_errors=True)
+            shutil.copytree(root / d, wt / d, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+            print(f"+ the PR's {d}/ over BASE {base}", flush=True)
+            return [classify_cases(wt, wp, paths, targets=g) if g else [] for g in groups]
+        finally:
+            lanedlib.git(root, "worktree", "remove", "--force", str(wt), check=False)
+            lanedlib.git(root, "worktree", "prune", check=False)
+
+
+def cmd_combined(root: Path, wp: str, base: str, head: str, correction: bool = False) -> int:
+    """MODE combined (module docstring, FEATURE rule): the WP's new and
+    changed tests (from HEAD) run against BASE's code first. Every NEW test
+    must fail there for a right reason (a new test that already passes on
+    BASE proves nothing), unless the WP is a declared verification WP; a
+    CHANGED test must not fail for a wrong reason; at least one of them must
+    fail for a right reason, unless the WP is a verification WP or the PR
+    carries laned:tests-correction. Then the full Accept (invariant10,
+    pytest, stub_scan over HEAD's PATHS, e2e) must pass on HEAD."""
+    step = "combined"
+    tree = lanedlib.wp_tree_at(root, head, wp)
+    if tree:
+        print(f"TESTS-TREE {tree}")
+    if not test_dir(root, wp).is_dir():
+        return fail(step, f"no tests at tests/accept/{lanedlib.wp_dir(wp)}/")
+    paths = read_paths(root, wp)
+    if paths is None:
+        return fail(step, "no PATHS file")
+    if step_invariant10(root, wp):
+        return 1
+    diff = lanedlib.git(root, "diff", "--name-only", f"{base}...{head}").stdout.split()
+    new, changed = new_and_changed_tests(root, wp, base, diff)
+    verification = wp in lanedlib.verification_wps_at(root, base)
+    print(f"{step}: {len(new)} new and {len(changed)} changed test(s) run against BASE {base}"
+          + (" (verification WP: they may pass there)" if verification else ""))
+    right = 0
+    if new or changed:
+        res_new, res_changed = base_overlay_cases(root, base, wp, paths, [new, changed])
+        for res in (res_new, res_changed):
+            if isinstance(res, str):
+                return fail(step, f"BASE run: {res}")
+        if new and not res_new:
+            return fail(step, "BASE run: none of the new tests was collected")
+        wrong = [c for c, v in [*res_new, *res_changed] if v == "wrong"]
+        if wrong:
+            return fail(step, f"{len(wrong)} test(s) fail on BASE for a wrong reason: {_ids(set(wrong))}")
+        passing = [c for c, v in res_new if v in ("pass", "skip")]
+        if passing and not verification:
+            return fail(step, f"{len(passing)} new test(s) already pass on BASE, so they prove nothing "
+                        f"about this PR's code: {_ids(set(passing))}")
+        right = sum(v == "right" for _, v in [*res_new, *res_changed])
+        print(f"{step}: on BASE {right} fail for a right reason, "
+              f"{sum(v in ('pass', 'skip') for _, v in [*res_new, *res_changed])} pass or skip")
+        if not right and not verification and not correction:
+            return fail(step, "no new or changed test fails on BASE: the PR's test changes prove nothing "
+                        f"(label laned:{lanedlib.CORRECTION_LABEL} for a pure test fix)")
+    else:
+        print(f"{step}: no new or changed test function (PATHS, fixture or docs only)")
+    print(f"{step}: the full Accept on HEAD")
+    if cmd_accept(root, wp, None) != 0:
+        return fail(step, "the full Accept fails on HEAD")
+    print("LEDGER-MODE combined")
+    print(f"MODE combined PASS ({right} new/changed test(s) fail on BASE and pass on HEAD)")
+    print(f"PASS {wp} combined")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # cross (other built WPs whose tests depend on what the PR changes)
 # ---------------------------------------------------------------------------
 
@@ -1006,14 +1413,22 @@ def built_wps_at(root: Path, ref: str) -> list[tuple[str, list[str]]]:
     history = lanedlib.first_parent_history(root, ref)
     verification = lanedlib.verification_wps_at(root, ref)
     sets = lanedlib.paths_sets_at(root, ref)
+    coupled = lanedlib.coupled_batches_at(root, ref)
+    subjects = lanedlib.first_parent_subjects(root, ref)
+    labels = pr_labels(root)
+    retired = lanedlib.retired_dirs(lanedlib.retired_wps_at(root, ref))
     built: list[tuple[str, list[str]]] = []
     for d in sorted(out):
+        if d in retired:
+            continue  # RETIRED rule: never built, never a CROSS WP
         proc = lanedlib.git(root, "show", f"{ref}:tests/accept/{d}/PATHS", check=False)
         if proc.returncode != 0:
             continue
         wp = ids.get(d, d)
         paths = lanedlib.parse_paths(proc.stdout)
-        if lanedlib.impl_commit_index(history, wp, paths, lanedlib.other_paths(sets, d)) is not None or (
+        if lanedlib.impl_commit_index(history, wp, paths, lanedlib.other_paths(sets, d),
+                                      lanedlib.coupled_paths(coupled, sets, wp), subjects,
+                                      labels) is not None or (
                 wp in verification and not lanedlib.missing_paths_at(root, ref, paths)):
             built.append((wp, paths))
     return built
@@ -1299,12 +1714,14 @@ def _py_closure_hits(root: Path, start: list[str], targets: list[str]) -> list[s
     return sorted(t for t in targets if t in mods and t not in py)
 
 
-def stale_reasons(root: Path, pr_diff: list[str], main_diff: list[str]) -> list[str]:
+def stale_reasons(root: Path, pr_diff: list[str], main_diff: list[str],
+                  skip_dirs: set[str] | frozenset[str] = frozenset()) -> list[str]:
     """Why the PR's changes and main's changes since the tested base interact
     in the tree at ``root`` (empty: they don't). The cross dependency analysis:
     a path both touched; a changed module of one side importing (statically,
     transitively) a changed path of the other; or a WP whose tests depend
-    (cross_reasons) on both diffs."""
+    (cross_reasons) on both diffs. ``skip_dirs``: retired WPs' tests dirs
+    (RETIRED rule: never run, so never stale)."""
     why: list[str] = []
     both = sorted(set(pr_diff) & set(main_diff))
     if both:
@@ -1318,6 +1735,8 @@ def stale_reasons(root: Path, pr_diff: list[str], main_diff: list[str]) -> list[
     dirs = sorted(p.name for p in (root / "tests" / "accept").iterdir()
                   if (p / "PATHS").is_file()) if (root / "tests" / "accept").is_dir() else []
     for d in dirs:
+        if d in skip_dirs:
+            continue
         paths = lanedlib.parse_paths((root / "tests" / "accept" / d / "PATHS").read_text())
         on_pr = cross_reasons(root, d, paths, pr_diff)
         if not on_pr:
@@ -1329,50 +1748,198 @@ def stale_reasons(root: Path, pr_diff: list[str], main_diff: list[str]) -> list[
     return why
 
 
-def cmd_freshness(root: Path, base: str, head: str, main_ref: str) -> int:
+STALE_LINE = "STALE BASE: update-branch and re-run"
+STALE_WARN = "WARNING STALE BASE (not enforced on PRs: the merge queue re-runs the Accept on the combined ref)"
+
+
+def cmd_freshness(root: Path, base: str, head: str, main_ref: str, warn_only: bool = False) -> int:
     """The PR job's last step (RV5): the run tested HEAD against BASE (the
     merge commit's first parent, i.e. github.event.pull_request.base.sha's
     tree; HEAD must not itself contain main's newer commits, or they count
     as the PR's changes). When MAIN (origin/main fetched at job time) is BASE, the result is
     fresh. Otherwise the PR is STALE when its changes (BASE...HEAD) interact
     with main's commits since the merge-base of BASE and MAIN (stale_reasons,
-    in the PR's tree and in MAIN's tree); a stale PR must update-branch and
-    re-run before it merges. Unrelated main commits do not make it stale."""
+    in the PR's tree and in MAIN's tree). Unrelated main commits do not make
+    it stale. With ``warn_only`` (the pull_request job since the merge queue,
+    2026-11-24) a stale result prints STALE_WARN and exits 0: the merge
+    queue's --merge-group run re-accepts every queued WP on the combined ref,
+    so the PR need not chase main. Without it a stale result exits 1."""
+
+    def stale(detail: str = "") -> int:
+        if warn_only:
+            print(STALE_WARN + (f" ({detail})" if detail else ""))
+            return 0
+        print(STALE_LINE + (f" ({detail})" if detail else ""))
+        return 1
+
     b, m = _rev(root, base), _rev(root, main_ref)
     if b is None or m is None:
-        print(f"STALE BASE: update-branch and re-run (cannot resolve {base if b is None else main_ref})")
-        return 1
+        return stale(f"cannot resolve {base if b is None else main_ref}")
     if b == m:
         print(f"FRESH base {b[:12]} is {main_ref}")
         return 0
     mb = lanedlib.git(root, "merge-base", b, m, check=False).stdout.strip()
     if not mb:
-        print(f"STALE BASE: update-branch and re-run (no merge-base of {base} and {main_ref})")
-        return 1
+        return stale(f"no merge-base of {base} and {main_ref}")
     pr_diff = lanedlib.git(root, "diff", "--name-only", f"{b}...{head}").stdout.split()
     main_diff = lanedlib.git(root, "diff", "--name-only", f"{mb}..{m}").stdout.split()
     n = lanedlib.git(root, "rev-list", "--count", f"{mb}..{m}").stdout.strip()
     print(f"freshness: tested base {b[:12]}, {main_ref} {m[:12]} is {n} commit(s) past the merge-base "
           f"{mb[:12]}; main touched {len(main_diff)} path(s), the PR {len(pr_diff)}")
-    why = stale_reasons(root, pr_diff, main_diff)
+    try:
+        skip = lanedlib.retired_dirs(lanedlib.retired_wps_at(root, b))
+    except ValueError as e:
+        return stale(str(e))
+    why = stale_reasons(root, pr_diff, main_diff, skip)
     with tempfile.TemporaryDirectory(prefix="laned-fresh-") as tmp:
         wt = Path(tmp) / "main"
         proc = lanedlib.git(root, "worktree", "add", "--detach", "-q", str(wt), m, check=False)
         if proc.returncode != 0:
-            print(f"STALE BASE: update-branch and re-run (no worktree of {main_ref}: {proc.stderr.strip()[:200]})")
-            return 1
+            return stale(f"no worktree of {main_ref}: {proc.stderr.strip()[:200]}")
         try:
-            why += [f"at {main_ref}: {w}" for w in stale_reasons(wt, pr_diff, main_diff)]
+            why += [f"at {main_ref}: {w}" for w in stale_reasons(wt, pr_diff, main_diff, skip)]
         finally:
             lanedlib.git(root, "worktree", "remove", "--force", str(wt), check=False)
             lanedlib.git(root, "worktree", "prune", check=False)
     if why:
         for w in dict.fromkeys(why):
             print(f"stale: {w if len(w) <= 400 else w[:400] + ' ...'}")
-        print("STALE BASE: update-branch and re-run")
-        return 1
+        return stale()
     print(f"FRESH enough: no change on {main_ref} since {mb[:12]} touches or is imported by the PR's paths")
     return 0
+
+
+# ---------------------------------------------------------------------------
+# merge group (the GitHub merge queue's combined ref)
+# ---------------------------------------------------------------------------
+
+GROUP_PR_RE = (re.compile(r"\(#(\d+)\)$"), re.compile(r"^Merge pull request #(\d+) "))
+
+
+def group_prs(root: Path, base: str, head: str) -> list[tuple[str, int | None, str]]:
+    """``(commit, PR number or None, subject)`` for every first-parent commit
+    of BASE..HEAD, oldest first (a squash `... (#N)` or a merge commit
+    `Merge pull request #N ...`)."""
+    out = lanedlib.git(root, "log", "--first-parent", "--reverse", "--format=%H%x00%s",
+                       f"{base}..{head}").stdout
+    rows: list[tuple[str, int | None, str]] = []
+    for line in out.splitlines():
+        sha, _, subject = line.partition("\0")
+        n = None
+        for rx in GROUP_PR_RE:
+            mt = rx.search(subject.strip())
+            if mt:
+                n = int(mt.group(1))
+                break
+        rows.append((sha, n, subject))
+    return rows
+
+
+def read_group_labels(path: str) -> dict[int, list[str]]:
+    """--group-labels FILE: ``{"<PR>": ["laned:W0c", ...]}`` (the workflow
+    writes it with `gh pr view` for each queued PR)."""
+    raw = json.loads(Path(path).read_text())
+    if not isinstance(raw, dict):
+        raise ValueError("--group-labels must be a JSON object {PR: [labels]}")
+    return {int(k): [str(x) for x in (v or [])] for k, v in raw.items()}
+
+
+def group_wps(labels: list[str]) -> tuple[list[str], bool]:
+    """(the PR's WPs, carries laned:tests-correction) from its label names."""
+    names = [lab.split(":", 1)[1] for lab in labels if lab.startswith("laned:")]
+    correction = lanedlib.CORRECTION_LABEL in names
+    return [w for w in dict.fromkeys(names) if w != lanedlib.CORRECTION_LABEL], correction
+
+
+def group_own_wps(root: Path, base: str, head: str, labels: dict[int, list[str]]) -> list[str]:
+    """Every laned:<WP> of the queued PRs (the CROSS step excludes them:
+    --merge-group already ran their own Accept on the combined ref)."""
+    own: list[str] = []
+    for _, n, _ in group_prs(root, base, head):
+        if n is not None:
+            own += group_wps(labels.get(n, []))[0]
+    return list(dict.fromkeys(own))
+
+
+def cmd_merge_group(root: Path, base: str, head: str, labels: dict[int, list[str]]) -> int:
+    """MERGE-GROUP rule (module docstring). The working tree at ``root`` is
+    the queue's combined ref HEAD. For every queued PR commit C (BASE..HEAD,
+    first parent) and every laned:<WP> of its PR, the mode comes from
+    ``--check-pr --base C^1 --head C`` (the PR's own diff on top of the PRs
+    queued ahead of it), and the WP's own run follows on the combined tree:
+    implementation / combined -> the full Accept; tests-only ->
+    --verification; tests-correction -> --tests-correction; evidence -> the
+    full Accept with each EVIDENCE file; review -> nothing. A WP named by
+    several queued PRs runs its full Accept once. Prints ``GROUP <WP> <mode>
+    PASS|FAIL (#N)`` per run; any FAIL, a commit with no PR number, or a PR
+    without labels in the file fails closed (exit 1)."""
+    rows = group_prs(root, base, head)
+    if not rows:
+        print(f"GROUP FAIL: no commit in {base}..{head}")
+        return 1
+    own = group_own_wps(root, base, head, labels)
+    print(f"GROUP-OWN {' '.join(own) if own else 'none'}")
+    failed = False
+    done: set[tuple[str, str]] = set()
+    for sha, n, subject in rows:
+        if n is None:
+            print(f"GROUP FAIL: commit {sha[:12]} names no PR ({subject!r})")
+            failed = True
+            continue
+        if n not in labels:
+            print(f"GROUP FAIL: no labels for #{n} in --group-labels")
+            failed = True
+            continue
+        wps, correction = group_wps(labels[n])
+        if not wps:
+            print(f"GROUP #{n}: no laned:<WP> label (cross step only)")
+            continue
+        parent = f"{sha}^1"
+        for wp in wps:
+            with contextlib.redirect_stdout(io.StringIO()) as buf:
+                rc = cmd_check_pr(root, wp, parent, sha, wps, correction)
+            out = buf.getvalue()
+            sys.stdout.write(out)
+            if rc != 0:
+                print(f"GROUP {wp} check-pr FAIL (#{n})")
+                failed = True
+                continue
+            mode = next((ln[5:].strip() for ln in out.splitlines() if ln.startswith("MODE ")), "")
+            if mode == "review":
+                print(f"GROUP {wp} review PASS (#{n})")
+                continue
+            if mode == "retired":
+                # RETIRED rule: the label is inert, the WP has nothing to run
+                print(f"GROUP {wp} retired SKIP (#{n})")
+                continue
+            if mode == "evidence":
+                runs = [("evidence " + ln[9:].strip(), ln[9:].strip())
+                        for ln in out.splitlines() if ln.startswith("EVIDENCE ")]
+            elif mode in ("implementation", "combined"):
+                runs = [("accept", None)]
+            elif mode in ("tests-only", "tests-correction"):
+                runs = [(mode, None)]
+            else:
+                print(f"GROUP {wp} check-pr FAIL (#{n}): unknown MODE {mode!r}")
+                failed = True
+                continue
+            for label, ev in runs:
+                key = (wp, label)
+                if key in done:
+                    print(f"GROUP {wp} {label} already run on this ref (#{n})")
+                    continue
+                done.add(key)
+                print(f"group: {wp} ({mode} on #{n}) -> {label} on the combined ref", flush=True)
+                if label == "tests-only":
+                    rc = cmd_verification(root, wp, parent, sha)
+                elif label == "tests-correction":
+                    rc = cmd_tests_correction(root, wp, parent, sha)
+                else:
+                    rc = cmd_accept(root, wp, ev)
+                print(f"GROUP {wp} {label} {'PASS' if rc == 0 else 'FAIL'} (#{n})")
+                failed = failed or rc != 0
+    print("GROUP FAIL" if failed else "GROUP PASS")
+    return 1 if failed else 0
 
 
 # ---------------------------------------------------------------------------
@@ -1739,6 +2306,138 @@ def selftest_evidence(ident: tuple[str, ...]) -> list[str]:
     return failures
 
 
+def selftest_retired() -> list[str]:
+    """RETIRED rule: the retired_wps parser (reference required, comments
+    ignored) and this repo's own file (W5i, plan rev6.18 D24)."""
+    failures: list[str] = []
+    got = lanedlib.parse_retired_wps("# c\n\nW5i  plan rev6.18 (D24)  # note\nX1 decision D9\n")
+    if got != {"W5i": "plan rev6.18 (D24)", "X1": "decision D9"}:
+        failures.append(f"retired parse: {got}")
+    for bare in ("W5i\n", "W5i   # only a comment\n"):
+        try:
+            lanedlib.parse_retired_wps(bare)
+            failures.append(f"retired parse: {bare!r} without a reference was accepted")
+        except ValueError:
+            pass
+    if lanedlib.parse_retired_wps(None) != {}:
+        failures.append("retired parse: no file is not empty")
+    own = Path(__file__).resolve().parent / "retired_wps"
+    try:
+        mine = lanedlib.parse_retired_wps(own.read_text()) if own.is_file() else {}
+    except ValueError as e:
+        mine = {}
+        failures.append(f"retired: {own.name}: {e}")
+    if "D24" not in mine.get("W5i", ""):
+        failures.append(f"retired: {own.name} does not retire W5i citing D24: {mine}")
+    if lanedlib.retired_dirs(mine) != {lanedlib.wp_dir(w) for w in mine}:
+        failures.append("retired: retired_dirs")
+    return failures
+
+
+def selftest_w3a_nolock_evidence() -> list[str]:
+    """check_json_evidence: a no-lock W3a run is judged by its verified path
+    verdict; a lock-enabled W3a run and every other WP still need passed: true."""
+    failures: list[str] = []
+    nolock = {"lock_enabled": False, "asserted_by": "owner_flag"}
+    locked = {"lock_enabled": True, "asserted_by": "probe"}
+
+    def ev(wp: str, passed: bool, lock: dict | None, verified: bool | None, path_passed: bool | None) -> str:
+        data: dict = {"wp": wp, "passed": passed}
+        if lock is not None:
+            data["bucket_lock"] = lock
+        if verified is not None:
+            live: dict = {"verified": verified}
+            if path_passed is not None:
+                live["path_verdict"] = {"path": "presigned_multipart", "passed": path_passed}
+            data["verified_live"] = live
+        return json.dumps(data)
+
+    cases = [
+        ("w3a-nolock-path-passed", ev("W3a", False, nolock, True, True), "W3a", True),
+        ("w3a-nolock-path-failed", ev("W3a", False, nolock, True, False), "W3a", False),
+        ("w3a-nolock-path-missing", ev("W3a", False, nolock, True, None), "W3a", False),
+        ("w3a-nolock-not-verified", ev("W3a", False, nolock, False, True), "W3a", False),
+        ("w3a-nolock-no-live", ev("W3a", False, nolock, None, None), "W3a", False),
+        ("w3a-locked-passed-false", ev("W3a", False, locked, True, True), "W3a", False),
+        ("w3a-locked-passed-true", ev("W3a", True, locked, True, True), "W3a", True),
+        ("w3a-no-lock-key", ev("W3a", False, None, True, True), "W3a", False),
+        ("other-wp-nolock-shape", ev("W3b", False, nolock, True, True), "W3b", False),
+        ("other-wp-passed-false", ev("X1", False, None, None, None), "X1", False),
+        ("other-wp-passed-true", ev("X1", True, None, None, None), "X1", True),
+    ]
+    for name, text, wp, want in cases:
+        ok, why = lanedlib.check_json_evidence(text, wp)
+        if ok != want:
+            failures.append(f"w3a-evidence {name}: {'accepted' if ok else 'refused'} ({why}), "
+                            f"want {'accept' if want else 'refuse'}")
+    return failures
+
+
+def selftest_wb19_partial_evidence() -> list[str]:
+    """check_json_evidence (rev6.16): WB19 evidence with passed: false is
+    accepted only when coverage is its sole failing check, the coverage detail
+    names the missing SKUs (none of them measured) and body_sha256 matches."""
+    import copy
+    import hashlib
+
+    failures: list[str] = []
+
+    def seal(d: dict) -> dict:
+        d = {k: v for k, v in d.items() if k != "body_sha256"}
+        d["body_sha256"] = hashlib.sha256(json.dumps(
+            d, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+        return d
+
+    base = seal({
+        "schema": "laned_wb19/1", "wp": "WB19", "passed": False,
+        "checks": [{"name": "coverage", "passed": False,
+                    "detail": "missing expert runs: ['8xH100', '4xH200']"},
+                   {"name": "full_leg", "passed": True, "detail": "skipped"},
+                   {"name": "memory", "passed": True, "detail": "fits"}],
+        "runs": [], "table": {"rows": {"8xH200": {"steps_per_s": 0.05},
+                                       "8xRTX4090": {"steps_per_s": 0.13}}},
+        "lane_a_full_leg": None, "oa8_sha256": None})
+
+    def variant(edit, *, reseal: bool = True) -> str:
+        d = copy.deepcopy(base)
+        edit(d)
+        return json.dumps(seal(d) if reseal else d)
+
+    def check(i: int, **kw):
+        def f(d):
+            d["checks"][i].update(kw)
+        return f
+
+    cases = [
+        ("partial-coverage-only", json.dumps(base), "WB19", True),
+        ("partial-memory-also-fails", variant(check(2, passed=False)), "WB19", False),
+        ("partial-full-leg-fails", variant(check(1, passed=False)), "WB19", False),
+        ("partial-only-memory-fails", variant(lambda d: (d["checks"][0].update(
+            passed=True), d["checks"][2].update(passed=False))), "WB19", False),
+        ("partial-no-missing-named", variant(check(0, detail="missing expert runs: []")),
+         "WB19", False),
+        ("partial-detail-unparseable", variant(check(0, detail="some are missing")),
+         "WB19", False),
+        ("partial-names-a-measured-sku", variant(check(
+            0, detail="missing expert runs: ['8xH200', '8xH100']")), "WB19", False),
+        ("partial-no-rows", variant(lambda d: d["table"].update(rows={})), "WB19", False),
+        ("partial-checks-malformed", variant(lambda d: d.update(checks="coverage")),
+         "WB19", False),
+        ("partial-hand-edited", variant(lambda d: d["table"]["rows"]["8xH200"].update(
+            steps_per_s=9.9), reseal=False), "WB19", False),
+        ("partial-no-sha", variant(lambda d: d.pop("body_sha256"), reseal=False),
+         "WB19", False),
+        ("wb19-passed-true", json.dumps({"wp": "WB19", "passed": True}), "WB19", True),
+        ("other-wp-partial-shape", json.dumps({**base, "wp": "WB22"}), "WB22", False),
+    ]
+    for name, text, wp, want in cases:
+        ok, why = lanedlib.check_json_evidence(text, wp)
+        if ok != want:
+            failures.append(f"wb19-evidence {name}: {'accepted' if ok else 'refused'} ({why}), "
+                            f"want {'accept' if want else 'refuse'}")
+    return failures
+
+
 SELFTEST_CROSS_PLAN = """# plan
 
 | WP | What | Depends | Runs in | Accept |
@@ -1896,6 +2595,15 @@ def selftest_freshness(ident: tuple[str, ...]) -> list[str]:
             if (rc != 0) != want_stale or stale != want_stale or (want and want not in out):
                 failures.append(f"freshness {name}: rc={rc} stale={stale}, want stale={want_stale}"
                                 f"{' with ' + repr(want) if want else ''}: {out.strip()[-1500:]}")
+            # --warn-only (the pull_request job since the merge queue): the
+            # same analysis, but a stale base is a WARNING and never fails
+            with contextlib.redirect_stdout(io.StringIO()) as buf:
+                rc_w = cmd_freshness(root, base, head, main, warn_only=True)
+            out_w = buf.getvalue()
+            warned = STALE_WARN in out_w
+            if rc_w != 0 or warned != want_stale or STALE_LINE in out_w or (want and want not in out_w):
+                failures.append(f"freshness --warn-only {name}: rc={rc_w} warned={warned}, "
+                                f"want warned={want_stale} and rc 0: {out_w.strip()[-1500:]}")
 
         pr_a = branch("pr-a", base0, {"pkg_a.py": "A = 1\nEXTRA = 2\n"})
         # main has not moved -> fresh
@@ -1925,6 +2633,100 @@ def selftest_freshness(ident: tuple[str, ...]) -> list[str]:
         lanedlib.git(root, *ident, "merge", "-q", "--no-edit", "main")
         updated = lanedlib.git(root, "rev-parse", "HEAD").stdout.strip()
         case("second-pr-updated", main1, updated, main1, False, "FRESH base")
+    return failures
+
+
+def selftest_merge_group(ident: tuple[str, ...]) -> list[str]:
+    """The MERGE-GROUP rule on a real git repo (sys.executable -m pytest):
+    a queued W3 implementation green on an older base must FAIL on the
+    combined ref when a PR queued ahead of it (or merged since its base)
+    broke it; it passes alone; a PR missing from the labels file, a commit
+    naming no PR and a check-pr refusal fail closed; a tests-only PR runs
+    --verification (here --expect-fail) on the combined ref."""
+    failures: list[str] = []
+    saved = {k: os.environ.get(k) for k in ("LANED_PYTEST_CMD", "LANED_LEDGER", "LANED_PR_LABELS")}
+    os.environ["LANED_PYTEST_CMD"] = shlex.join([sys.executable, "-m", "pytest", "-p", "no:cacheprovider"])
+    os.environ.pop("LANED_PR_LABELS", None)
+    try:
+        with tempfile.TemporaryDirectory(prefix="laned-accept-selftest-group-") as tmp:
+            root = Path(tmp) / "repo"
+            root.mkdir()
+            os.environ["LANED_LEDGER"] = str(Path(tmp) / "no-ledger.json")
+
+            def commit(files: dict[str, str], msg: str) -> str:
+                for rel, text in files.items():
+                    (root / rel).parent.mkdir(parents=True, exist_ok=True)
+                    (root / rel).write_text(text)
+                lanedlib.git(root, "add", "-A")
+                lanedlib.git(root, *ident, "commit", "-q", "-m", msg)
+                return lanedlib.git(root, "rev-parse", "HEAD").stdout.strip()
+
+            lanedlib.git(root, "init", "-q")
+            base0 = commit({"README.md": "x\n", ".gitignore": "__pycache__/\n", "pkg_lib.py": "LIB = 1\n",
+                            "pkg_w3.py": "W3 = 0\n",
+                            "pkg_w4.py": "W4 = 0\n",
+                            "tests/accept/w3/PATHS": "pkg_w3.py\n",
+                            "tests/accept/w3/test_w3.py": "import pkg_lib\nimport pkg_w3\n\n\n"
+                                                          "def test_w3():\n    assert pkg_w3.W3 == pkg_lib.LIB\n",
+                            "tests/accept/w4/PATHS": "pkg_w4.py\n"}, "seed")
+
+            def queue(start: str, prs: list[tuple[dict[str, str], str]]) -> str:
+                lanedlib.git(root, "checkout", "-q", "--detach", start)
+                head = start
+                for files, msg in prs:
+                    head = commit(files, msg)
+                return head
+
+            def case(name: str, head: str, labels: dict[int, list[str]], want_ok: bool,
+                     want: tuple[str, ...] = ()) -> None:
+                lanedlib.git(root, "checkout", "-q", "--detach", head)
+                with contextlib.redirect_stdout(io.StringIO()) as buf:
+                    rc = cmd_merge_group(root, base0, head, labels)
+                out = buf.getvalue()
+                missing = [w for w in want if w not in out]
+                if (rc == 0) != want_ok or ("GROUP PASS" in out) != want_ok or missing:
+                    failures.append(f"merge-group {name}: rc={rc}, want ok={want_ok}"
+                                    f"{', missing ' + repr(missing) if missing else ''}: {out.strip()[-2000:]}")
+
+            impl = ({"pkg_w3.py": "W3 = 1\n"}, "w3 impl (#7)")
+            # W3's implementation alone: its own Accept runs on the combined ref
+            alone = queue(base0, [impl])
+            case("own-wp-passes", alone, {7: ["laned:W3"]}, True,
+                 ("GROUP-OWN W3", "GROUP W3 accept PASS (#7)", "PASS W3"))
+            # #6 queued ahead changes pkg_lib (W3 was green on base0 only): the
+            # CROSS over the group excludes W3, so only its own run catches it
+            broken = queue(base0, [({"pkg_lib.py": "LIB = 22\n"}, "lib bump (#6)"), impl])
+            case("own-wp-broken-by-group", broken, {6: [], 7: ["laned:W3"]}, False,
+                 ("GROUP #6: no laned:<WP> label", "GROUP W3 accept FAIL (#7)"))
+            # a stale-base PR the queue rebased onto a main that broke it
+            main1 = queue(base0, [({"pkg_lib.py": "LIB = 333\n"}, "lib on main (#5)")])
+            stale = queue(main1, [impl])
+            lanedlib.git(root, "checkout", "-q", "--detach", stale)
+            with contextlib.redirect_stdout(io.StringIO()) as buf:
+                rc = cmd_merge_group(root, main1, stale, {7: ["laned:W3"]})
+            if rc == 0 or "GROUP W3 accept FAIL (#7)" not in buf.getvalue():
+                failures.append(f"merge-group stale-base-broken: rc={rc}: {buf.getvalue().strip()[-2000:]}")
+            # fail closed: labels unknown, no PR number, check-pr refusal
+            case("labels-missing", alone, {}, False, ("GROUP FAIL: no labels for #7",))
+            nopr = queue(base0, [({"pkg_w3.py": "W3 = 1\n"}, "direct push")])
+            case("no-pr-number", nopr, {}, False, ("names no PR",))
+            outside = queue(base0, [({"pkg_w3.py": "W3 = 1\n", "README.md": "y\n"}, "w3 + readme (#8)")])
+            case("check-pr-refused", outside, {8: ["laned:W3"]}, False, ("GROUP W3 check-pr FAIL (#8)",))
+            # tests-only PR for unbuilt W4: --verification -> --expect-fail on the combined ref
+            tests_w4 = queue(base0, [({"tests/accept/w4/test_w4.py": "import pkg_w4\n\n\ndef test_w4():\n"
+                                                                     "    assert pkg_w4.W4 == 1\n"}, "w4 tests (#9)")])
+            case("tests-only", tests_w4, {9: ["laned:W4"]}, True,
+                 ("GROUP W4 tests-only PASS (#9)", "LEDGER-MODE expect-fail"))
+            # one WP on two queued PRs runs its full Accept once
+            twice = queue(base0, [({"pkg_w3.py": "W3 = 5\n"}, "w3 a (#10)"), impl])
+            case("dedupe", twice, {10: ["laned:W3"], 7: ["laned:W3"]}, True,
+                 ("GROUP W3 accept already run on this ref (#7)",))
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
     return failures
 
 
@@ -2007,9 +2809,16 @@ def selftest_batch(ident: tuple[str, ...]) -> list[str]:
             case("three", b_files(1, 2, 3), three, {"B1": True, "B2": True, "B3": True})
             # one WP's wrong-reason failure: that WP's run fails (the PR job fails), the others pass
             case("one-wrong-reason", b_files(1, 2, 3, wrong=2), three, {"B1": True, "B2": False, "B3": True})
-            # a batch including a WP already built on BASE (K, L2) -> refused for every label
-            case("built-wp", {**b_files(1, 2), "tests/accept/k/test_k_more.py": SELFTEST_PASSING},
-                 ["B1", "B2", "K"], "batch-built-wp")
+            # rev6.17: a batch mixing a WP built on BASE (K, L2) with new ones
+            # passes; each label gets its own MODE
+            lanedlib.git(root, "checkout", "-q", "-B", "built-wp", base)
+            head = commit({**b_files(1, 2), "tests/accept/k/test_k_more.py": SELFTEST_PASSING}, "built-wp")
+            for wp, mode in (("B1", "tests-only"), ("B2", "tests-only"), ("K", "tests-correction")):
+                with contextlib.redirect_stdout(io.StringIO()) as buf:
+                    rc = cmd_check_pr(root, wp, base, head, ["B1", "B2", "K"])
+                out = buf.getvalue()
+                if rc != 0 or f"MODE {mode}\n" not in out or "WPMODE K tests-correction\n" not in out:
+                    failures.append(f"batch built-wp: {wp} rc={rc}, want MODE {mode}: {out.strip()}")
             # a tests dir without its label -> refused
             case("unlabelled", b_files(1, 2, 3), ["B1", "B2"], "batch-unlabelled-tests")
             # a label without its tests dir -> refused
@@ -2019,12 +2828,12 @@ def selftest_batch(ident: tuple[str, ...]) -> list[str]:
             # a tests/accept/ file outside every WP dir -> refused
             case("stray", {**b_files(1, 2), "tests/accept/conftest.py": "\n"}, ["B1", "B2"],
                  "batch-stray-tests")
-            # code + tests in one batch diff: rule 1 as before
+            # code + tests in one batch diff: rev6.17 FEATURE rule (MODE combined)
             lanedlib.git(root, "checkout", "-q", "-B", "code-plus-tests", base)
             head = commit({**b_files(1, 2), "pkg_b1.py": "VALUE = 1\n"}, "code-plus-tests")
             with contextlib.redirect_stdout(io.StringIO()) as buf:
                 rc = cmd_check_pr(root, "B1", base, head, ["B1", "B2"])
-            if rc == 0 or "FAIL rule1: tests/accept/ edited together with: pkg_b1.py" not in buf.getvalue():
+            if rc != 0 or "MODE combined\n" not in buf.getvalue():
                 failures.append(f"batch code-plus-tests: rc={rc}: {buf.getvalue().strip()}")
             # one label, another WP's tests too: the single-WP rule is unchanged
             lanedlib.git(root, "checkout", "-q", "-B", "single-foreign", base)
@@ -2140,17 +2949,17 @@ def selftest_batch_impl(ident: tuple[str, ...]) -> list[str]:
 
             want_batch("two", impl("I1", "I2"), ["I1", "I2"], "implementation", base)
             head3 = want_batch("three", impl("I1", "I2", "I3"), ["I1", "I2", "I3"], "implementation", base)
-            want_refused("four", impl("I1", "I2", "I3", "I4"), ["I1", "I2", "I3", "I4"],
-                         "FAIL rule1: batch-too-many")
-            want_refused("overlap", impl("I1", "O1"), ["I1", "O1"], "FAIL rule1: batch-overlapping-paths")
-            want_refused("dep", impl("I1", "D1"), ["I1", "D1"], "FAIL rule1: batch-dependency: D1 depends on I1")
-            want_refused("dep-transitive", impl("I1", "D2"), ["D2", "I1"],
-                         "FAIL rule1: batch-dependency: D2 depends on I1 (transitively)")
+            # rev6.17 FEATURE rule: no size cap, overlap or dependency refusal
+            want_batch("four", impl("I1", "I2", "I3", "I4"), ["I1", "I2", "I3", "I4"], "implementation", base)
+            want_batch("overlap", impl("I1", "O1"), ["I1", "O1"], "implementation", base)
+            want_batch("dep", impl("I1", "D1"), ["I1", "D1"], "implementation", base)
+            want_batch("dep-transitive", impl("I1", "D2"), ["D2", "I1"], "implementation", base)
+            want_batch("deps-unknown", impl("I1", "X1"), ["I1", "X1"], "implementation", base)
             want_refused("no-tests", {**impl("I1"), "pkg/n1.py": "VALUE = 1\n"}, ["I1", "N1"],
                          "FAIL rule1: batch-no-tests")
-            want_refused("deps-unknown", impl("I1", "X1"), ["I1", "X1"], "FAIL rule1: batch-deps-unknown")
             want_refused("no-wp", {**impl("I1", "I2"), "README.md": "y\n"}, ["I1", "I2"],
-                         "FAIL paths: batch-out-of-scope: outside every batch WP's PATHS: README.md")
+                         "FAIL paths: batch-out-of-scope: outside every labelled WP's PATHS "
+                         "(BASE + entries this PR adds): README.md")
             want_refused("tooling", {**impl("I1", "I2"), "scripts/laned/x.py": "X = 1\n"}, ["I1", "I2"],
                          "FAIL paths: batch-out-of-scope")
             want_refused("idle-label", impl("I1"), ["I1", "I2"], "FAIL rule1: batch-label-without-changes")
@@ -2193,15 +3002,19 @@ def selftest_batch_impl(ident: tuple[str, ...]) -> list[str]:
                     rc = cmd_tests_correction(root, wp, merged, head)
                 if rc != 0:
                     failures.append(f"batch-impl tests-correction {wp} failed: {buf.getvalue().strip()[-1500:]}")
-            want_refused("mixed", {"tests/accept/i1/test_more_i1.py": SELFTEST_PASSING,
-                                   "tests/accept/d1/test_more_d1.py": SELFTEST_PASSING}, ["I1", "D1"],
-                         "FAIL rule1: batch-built-wp", merged)
+            # rev6.17: built (I1) and unbuilt (D1) WPs mix, each with its own MODE
+            for wp, mode in (("I1", "tests-correction"), ("D1", "tests-only")):
+                rc, out, _ = check(f"mixed-{wp}", {"tests/accept/i1/test_more_i1.py": SELFTEST_PASSING,
+                                                   "tests/accept/d1/test_more_d1.py": SELFTEST_PASSING},
+                                   ["I1", "D1"], wp, merged)
+                if rc != 0 or f"MODE {mode}\n" not in out:
+                    failures.append(f"batch-impl mixed: {wp} rc={rc}, want MODE {mode}: {out.strip()}")
             lanedlib.git(root, "checkout", "-q", "main")
             four_base = commit(impl("I4"), "feat: I4 (#3)")
-            want_refused("four-corrections",
-                         {f"tests/accept/{lanedlib.wp_dir(w)}/test_more.py": SELFTEST_PASSING
-                          for w in ("I1", "I2", "I3", "I4")},
-                         ["I1", "I2", "I3", "I4"], "FAIL rule1: batch-too-many", four_base)
+            want_batch("four-corrections",
+                       {f"tests/accept/{lanedlib.wp_dir(w)}/test_more.py": SELFTEST_PASSING
+                        for w in ("I1", "I2", "I3", "I4")},
+                       ["I1", "I2", "I3", "I4"], "tests-correction", four_base)
     finally:
         if saved is None:
             os.environ.pop("LANED_PYTEST_CMD", None)
@@ -2210,11 +3023,396 @@ def selftest_batch_impl(ident: tuple[str, ...]) -> list[str]:
     return failures
 
 
+SELFTEST_COUPLED_PLAN = """# selftest plan
+
+| WP | What | Depends | Runs in | Accept |
+|---|---|---|---|---|
+| C1 | producer | — | ci | `scripts/laned/accept C1` |
+| C2 | draw | C1 | ci | `scripts/laned/accept C2` |
+| C3 | report | — | ci | `scripts/laned/accept C3` |
+| C4 | replay | C3 | ci | `scripts/laned/accept C4` |
+| E1 | elsewhere | — | ci | `scripts/laned/accept E1` |
+"""
+
+
+def selftest_coupled(ident: tuple[str, ...]) -> list[str]:
+    """Legacy COUPLED sets under the FEATURE rule (rev6.17): the declared set,
+    subsets, supersets and undeclared sets all pass check-pr now (no size,
+    dependency or overlap refusal); scope and idle-label refusals stay; a
+    declared coupled-set squash merge is still each member's L2 commit
+    (built_on, git-only), a partial one is not."""
+    failures: list[str] = []
+    saved = os.environ.get("LANED_PYTEST_CMD")
+    os.environ["LANED_PYTEST_CMD"] = shlex.join([sys.executable, "-m", "pytest", "-p", "no:cacheprovider"])
+    # C1, C2 and C4 share pkg/core.py (overlapping PATHS); C2 depends on C1
+    # and C4 on C3.
+    wps = {"C1": ("pkg/core.py\npkg/c1.py\n", "pkg.c1"),
+           "C2": ("pkg/core.py\npkg/c2.py\n", "pkg.c2"),
+           "C3": ("pkg/c3.py\n", "pkg.c3"),
+           "C4": ("pkg/core.py\npkg/c4.py\n", "pkg.c4"),
+           "E1": ("pkg/e1.py\n", "pkg.e1")}
+    code = {f"pkg/{w.lower()}.py": "from pkg.core import VALUE  # noqa: F401\n" for w in wps}
+    code["pkg/core.py"] = "VALUE = 1\n"
+    members = ["C1", "C2", "C3", "C4"]
+    declared = "# selftest\nC1 C2 C3 C4  # the coupled set\nE1\n"
+    try:
+        with tempfile.TemporaryDirectory(prefix="laned-accept-selftest-coupled-") as tmp:
+            root = Path(tmp) / "repo"
+            root.mkdir()
+
+            def commit(files: dict[str, str], msg: str) -> str:
+                for rel, text in files.items():
+                    (root / rel).parent.mkdir(parents=True, exist_ok=True)
+                    (root / rel).write_text(text)
+                lanedlib.git(root, "add", "-A")
+                lanedlib.git(root, *ident, "commit", "-q", "-m", msg)
+                return lanedlib.git(root, "rev-parse", "HEAD").stdout.strip()
+
+            lanedlib.git(root, "init", "-q")
+            lanedlib.git(root, "checkout", "-q", "-b", "main")
+            commit({lanedlib.PLAN_PATH: SELFTEST_COUPLED_PLAN, ".gitignore": "__pycache__/\n",
+                    "README.md": "x\n", "pkg/__init__.py": ""}, "plan")
+            for w, (paths, mod) in wps.items():
+                d = lanedlib.wp_dir(w)
+                commit({f"tests/accept/{d}/PATHS": paths,
+                        f"tests/accept/{d}/test_{d}.py": f"import {mod}\n\n\ndef test_{d}():\n"
+                                                         f"    assert {mod}.VALUE == 1\n"}, f"tests {w}")
+            undeclared = lanedlib.git(root, "rev-parse", "HEAD").stdout.strip()
+            base = commit({lanedlib.COUPLED_BATCHES_PATH: declared}, "W0c: declare C1-C4 coupled")
+
+            def impl(*names: str) -> dict[str, str]:
+                out = {"pkg/core.py": code["pkg/core.py"]}
+                out.update({f"pkg/{n.lower()}.py": code[f"pkg/{n.lower()}.py"] for n in names})
+                return out
+
+            def check(name: str, files: dict[str, str], labels: list[str], wp: str,
+                      start: str) -> tuple[int, str, str]:
+                lanedlib.git(root, "checkout", "-q", "-B", name, start)
+                head = commit(files, name)
+                with contextlib.redirect_stdout(io.StringIO()) as buf:
+                    rc = cmd_check_pr(root, wp, start, head, labels)
+                return rc, buf.getvalue(), head
+
+            def want_ok(name: str, files: dict[str, str], labels: list[str], start: str = base) -> str:
+                head = ""
+                for wp in labels:
+                    rc, out, head = check(f"{name}-{wp}", files, labels, wp, start)
+                    lines = [ln for ln in out.splitlines() if ln.startswith(("BATCH ", "MODE "))]
+                    if rc != 0 or lines != ["BATCH " + " ".join(labels), "MODE implementation"] \
+                            or "COUPLED " in out:
+                        failures.append(f"coupled {name}: {wp} rc={rc}: {out.strip()}")
+                return head
+
+            def want_refused(name: str, files: dict[str, str], labels: list[str], want: str,
+                             start: str = base) -> None:
+                for wp in labels:
+                    rc, out, _ = check(f"{name}-{wp}", files, labels, wp, start)
+                    if rc == 0 or want not in out or "MODE " in out:
+                        failures.append(f"coupled {name}: {wp} rc={rc}, want {want}: {out.strip()}")
+
+            order = ["C3", "C1", "C4", "C2"]          # label order is free
+            head = want_ok("exact-set", impl(*members), order)
+            lanedlib.git(root, "checkout", "-q", head)
+            for wp in members:
+                with contextlib.redirect_stdout(io.StringIO()) as buf, \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    rc = cmd_accept(root, wp, None)
+                if rc != 0:
+                    failures.append(f"coupled accept {wp} failed: {buf.getvalue().strip()[-1500:]}")
+            # rev6.17: subsets, supersets and undeclared sets are feature PRs too
+            want_ok("subset-dependent", impl("C1", "C2"), ["C1", "C2"])
+            want_ok("subset-overlap", impl("C1", "C4"), ["C1", "C4"])
+            want_ok("superset", {**impl(*members), "pkg/e1.py": code["pkg/e1.py"]}, [*members, "E1"])
+            want_ok("undeclared", impl(*members), members, undeclared)
+            want_refused("out-of-scope", {**impl(*members), "README.md": "y\n"}, members,
+                         "FAIL paths: batch-out-of-scope: outside every labelled WP's PATHS")
+            want_refused("tooling", {**impl(*members), "scripts/laned/x.py": "X = 1\n"}, members,
+                         "FAIL paths: batch-out-of-scope")
+            want_refused("self-declared", {**impl(*members), lanedlib.COUPLED_BATCHES_PATH: declared},
+                         members, "FAIL paths: batch-out-of-scope", undeclared)
+            want_refused("idle-member", impl("C1", "C2", "C4"), members,
+                         "FAIL rule1: batch-label-without-changes: label(s) none of whose PATHS "
+                         "or tests the diff touches: laned:C3")
+            # the declared coupled-set squash merge is each member's L2 (git-only, legacy)
+            lanedlib.git(root, "checkout", "-q", "main")
+            lanedlib.git(root, "merge", "-q", "--squash", head)
+            merged = commit({}, "feat: C1 C2 C3 C4 (#9)")
+            built = [w for w in (*members, "E1") if built_on(root, merged, w)]
+            if built != members:
+                failures.append(f"coupled squash: built {built}, want {members}")
+            lanedlib.git(root, "checkout", "-q", "-B", "partial", base)
+            partial = commit({"pkg/core.py": "VALUE = 1\n", "pkg/c2.py": code["pkg/c2.py"],
+                              "pkg/c4.py": code["pkg/c4.py"]}, "partial")
+            if any(built_on(root, partial, w) for w in ("C1", "C3")):
+                failures.append("coupled: a merge missing members counted as their L2")
+            if lanedlib.parse_coupled_batches(declared) != [("C1", "C2", "C3", "C4")]:
+                failures.append(f"coupled parse: {lanedlib.parse_coupled_batches(declared)}")
+    finally:
+        if saved is None:
+            os.environ.pop("LANED_PYTEST_CMD", None)
+        else:
+            os.environ["LANED_PYTEST_CMD"] = saved
+    return failures
+
+
+def selftest_feature(ident: tuple[str, ...]) -> list[str]:
+    """The FEATURE rule (rev6.17) on a real git repo and real pytest: tests +
+    code in one PR (new failing-on-BASE test passing on HEAD -> PASS; a new
+    test already passing on BASE -> refused unless a verification WP; a
+    wrong-reason BASE failure -> refused), PATHS added in the same PR, a new
+    WP created with its code, a 6-WP overlapping feature batch whose squash
+    merge is each WP's L2 by the ledger (PR number), and a weakened or
+    removed assertion refused without laned:tests-correction."""
+    failures: list[str] = []
+    saved = {k: os.environ.get(k) for k in ("LANED_PYTEST_CMD", "LANED_LEDGER", "LANED_PR_LABELS")}
+    os.environ["LANED_PYTEST_CMD"] = shlex.join([sys.executable, "-m", "pytest", "-p", "no:cacheprovider"])
+    os.environ.pop("LANED_LEDGER", None)
+    os.environ.pop("LANED_PR_LABELS", None)
+    six = [f"F{n}" for n in range(1, 7)]
+    try:
+        with tempfile.TemporaryDirectory(prefix="laned-accept-selftest-feature-") as tmp:
+            root = Path(tmp) / "repo"
+            root.mkdir()
+
+            def commit(files: dict[str, str | None], msg: str) -> str:
+                for rel, text in files.items():
+                    if text is None:
+                        (root / rel).unlink()
+                        continue
+                    (root / rel).parent.mkdir(parents=True, exist_ok=True)
+                    (root / rel).write_text(text)
+                lanedlib.git(root, "add", "-A")
+                lanedlib.git(root, *ident, "commit", "-q", "--allow-empty", "-m", msg)
+                return lanedlib.git(root, "rev-parse", "HEAD").stdout.strip()
+
+            lanedlib.git(root, "init", "-q")
+            lanedlib.git(root, "checkout", "-q", "-b", "main")
+            commit({".gitignore": "__pycache__/\n", "README.md": "x\n", "pkg/__init__.py": "",
+                    "pkg/core.py": "VALUE = 1\n", "pkg/w1.py": "VALUE = 1\n", "pkg/v1.py": "VALUE = 1\n",
+                    lanedlib.VERIFICATION_WPS_PATH: "V1\n"}, "seed")
+            # W1 built (L2 by an implementation commit); V1 a declared verification WP
+            commit({"tests/accept/w1/PATHS": "pkg/w1.py\n",
+                    "tests/accept/w1/test_w1.py":
+                        "import pkg.w1\n\n\ndef test_w1():\n    assert pkg.w1.VALUE >= 1\n"
+                        "    assert isinstance(pkg.w1.VALUE, int)\n",
+                    "tests/accept/v1/PATHS": "pkg/v1.py\n",
+                    "tests/accept/v1/test_v1.py": "import pkg.v1\n\n\ndef test_v1():\n    assert pkg.v1.VALUE\n"},
+                   "tests W1 V1")
+            # the six feature WPs share pkg/core.py (overlapping PATHS)
+            commit({f"tests/accept/{w.lower()}/PATHS": f"pkg/core.py\npkg/{w.lower()}.py\n" for w in six}
+                   | {f"tests/accept/{w.lower()}/test_{w.lower()}.py":
+                      f"import pkg.{w.lower()}\n\n\ndef test_{w.lower()}():\n    assert pkg.{w.lower()}.VALUE\n"
+                      for w in six}
+                   | {"tests/accept/g1/PATHS": "pkg/core.py\n",
+                      "tests/accept/g1/test_g1.py": "import pkg.core\n\n\ndef test_g1():\n    assert pkg.core.VALUE\n"},
+                   "tests F1-F6, G1")
+            base = commit({"pkg/w1.py": "VALUE = 2\n"}, "impl W1")
+            w1_more = ("import pkg.w1\n\n\ndef test_w1_three():\n    assert pkg.w1.VALUE == 3\n")
+
+            def check(name: str, files: dict[str, str | None], labels: list[str], wp: str,
+                      correction: bool = False, start: str = base) -> tuple[int, str, str]:
+                lanedlib.git(root, "checkout", "-q", "-B", name, start)
+                head = commit(files, name)
+                with contextlib.redirect_stdout(io.StringIO()) as buf:
+                    rc = cmd_check_pr(root, wp, start, head, labels, correction)
+                return rc, buf.getvalue(), head
+
+            def combined(name: str, head: str, wp: str, want_ok: bool, want: str = "",
+                         correction: bool = False, start: str = base) -> None:
+                lanedlib.git(root, "checkout", "-q", head)
+                with contextlib.redirect_stdout(io.StringIO()) as buf, \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    rc = cmd_combined(root, wp, start, head, correction)
+                out = buf.getvalue()
+                ok = rc == 0 and f"PASS {wp} combined" in out and "LEDGER-MODE combined" in out
+                if ok != want_ok or (want and want not in out):
+                    failures.append(f"feature {name}: {wp} combined {'passed' if ok else 'failed'}, want "
+                                    f"{'pass' if want_ok else 'fail'} {want}: {out.strip()[-1500:]}")
+                lanedlib.git(root, "checkout", "-q", "main")
+
+            def checked(name: str, files: dict[str, str | None], labels: list[str], wp: str,
+                        mode: str, correction: bool = False) -> str:
+                rc, out, head = check(name, files, labels, wp, correction)
+                if rc != 0 or f"MODE {mode}\n" not in out:
+                    failures.append(f"feature {name}: {wp} check-pr rc={rc}, want MODE {mode}: {out.strip()}")
+                return head
+
+            # (1) tests + code in one PR: the new test fails on BASE for a right
+            # reason (assertion) and passes on HEAD -> PASS
+            head = checked("tests-plus-code", {"pkg/w1.py": "VALUE = 3\n",
+                                               "tests/accept/w1/test_w1_more.py": w1_more},
+                           ["W1"], "W1", "combined")
+            combined("tests-plus-code", head, "W1", True)
+            # ... but HEAD's code does not make it pass -> FAIL
+            head = checked("tests-plus-wrong-code", {"pkg/w1.py": "VALUE = 4\n",
+                                                     "tests/accept/w1/test_w1_more.py": w1_more},
+                           ["W1"], "W1", "combined")
+            combined("tests-plus-wrong-code", head, "W1", False, "the full Accept fails on HEAD")
+            # (2) a new test that already passes on BASE proves nothing -> refused
+            head = checked("new-test-passes-on-base",
+                           {"pkg/w1.py": "VALUE = 3\n", "tests/accept/w1/test_w1_more.py": w1_more,
+                            "tests/accept/w1/test_w1_old.py":
+                                "import pkg.w1\n\n\ndef test_w1_positive():\n    assert pkg.w1.VALUE > 0\n"},
+                           ["W1"], "W1", "combined")
+            combined("new-test-passes-on-base", head, "W1", False, "already pass on BASE")
+            # ... unless the WP is a declared verification WP
+            head = checked("verification-wp-passes-on-base",
+                           {"pkg/v1.py": "VALUE = 1  # documented\n",
+                            "tests/accept/v1/test_v1_more.py":
+                                "import pkg.v1\n\n\ndef test_v1_int():\n    assert isinstance(pkg.v1.VALUE, int)\n"},
+                           ["V1"], "V1", "combined")
+            combined("verification-wp-passes-on-base", head, "V1", True)
+            # a new test failing on BASE for a wrong reason (missing module outside PATHS) -> refused
+            head = checked("wrong-reason-on-base",
+                           {"pkg/w1.py": "VALUE = 3\n",
+                            "tests/accept/w1/test_w1_more.py":
+                                "import laned_no_such_dep\n\n\ndef test_x():\n    assert laned_no_such_dep\n"},
+                           ["W1"], "W1", "combined")
+            combined("wrong-reason-on-base", head, "W1", False, "wrong reason")
+            # (3) PATHS ride along: a new entry and its file in the same PR
+            files = {"tests/accept/w1/PATHS": "pkg/w1.py\npkg/w1_extra.py\n",
+                     "pkg/w1_extra.py": "EXTRA = 5\n",
+                     "tests/accept/w1/test_w1_extra.py":
+                         "import pkg.w1_extra\n\n\ndef test_extra():\n    assert pkg.w1_extra.EXTRA == 5\n"}
+            rc, out, head = check("paths-ride-along", files, ["W1"], "W1")
+            if rc != 0 or "PATHS-ADDED W1 pkg/w1_extra.py\n" not in out or "MODE combined\n" not in out:
+                failures.append(f"feature paths-ride-along: rc={rc}: {out.strip()}")
+            combined("paths-ride-along", head, "W1", True)
+            # ... a file outside BASE + HEAD PATHS is still out of scope
+            rc, out, _ = check("paths-ride-along-outside", {**files, "pkg/other.py": "X = 1\n"}, ["W1"], "W1")
+            if rc == 0 or "FAIL paths: batch-out-of-scope" not in out or "pkg/other.py" not in out:
+                failures.append(f"feature paths-ride-along-outside: rc={rc}: {out.strip()}")
+            # ... an added entry matching everything is refused
+            rc, out, _ = check("paths-too-broad", {**files, "tests/accept/w1/PATHS": "pkg/w1.py\n*\n"},
+                               ["W1"], "W1")
+            if rc == 0 or "FAIL paths: batch-paths-too-broad" not in out:
+                failures.append(f"feature paths-too-broad: rc={rc}: {out.strip()}")
+            # a brand-new WP: PATHS, tests and code in one PR
+            rc, out, head = check("new-wp", {"tests/accept/n1/PATHS": "pkg/n1.py\n",
+                                             "tests/accept/n1/test_n1.py":
+                                                 "import pkg.n1\n\n\ndef test_n1():\n    assert pkg.n1.VALUE == 7\n",
+                                             "pkg/n1.py": "VALUE = 7\n"}, ["N1"], "N1")
+            if rc != 0 or "PATHS-ADDED N1 pkg/n1.py\n" not in out or "MODE combined\n" not in out:
+                failures.append(f"feature new-wp: rc={rc}: {out.strip()}")
+            combined("new-wp", head, "N1", True)
+            # (4) weakened assertion without laned:tests-correction -> refused
+            weak = {"pkg/w1.py": "VALUE = 3\n", "tests/accept/w1/test_w1_more.py": w1_more,
+                    "tests/accept/w1/test_w1.py": "import pkg.w1\n\n\ndef test_w1():\n    assert pkg.w1.VALUE >= 1\n"}
+            rc, out, _ = check("weakened", weak, ["W1"], "W1")
+            if rc == 0 or "FAIL weakened" not in out or "fewer assertions in tests/accept/w1/test_w1.py::test_w1" \
+                    not in out or "MODE " in out:
+                failures.append(f"feature weakened: rc={rc}: {out.strip()}")
+            for name, extra in (("removed-test", {"tests/accept/w1/test_w1.py": None}),
+                                ("skip-added", {"tests/accept/w1/test_w1.py":
+                                                "import pytest\nimport pkg.w1\n\n\n@pytest.mark.skip\n"
+                                                "def test_w1():\n    assert pkg.w1.VALUE >= 1\n"
+                                                "    assert isinstance(pkg.w1.VALUE, int)\n"}),
+                                ("paths-removed", {"tests/accept/w1/PATHS": "pkg/w1_only.py\n",
+                                                   "pkg/w1_only.py": "X = 1\n"})):
+                rc, out, _ = check(name, {"pkg/w1.py": "VALUE = 3\n",
+                                          "tests/accept/w1/test_w1_more.py": w1_more, **extra}, ["W1"], "W1")
+                if rc == 0 or "FAIL weakened" not in out:
+                    failures.append(f"feature {name}: rc={rc}, want FAIL weakened: {out.strip()}")
+            # ... with the label it is allowed (printed) and the run goes on
+            rc, out, head = check("weakened-labelled", weak, ["W1", lanedlib.CORRECTION_LABEL], "W1",
+                                  correction=True)
+            if rc != 0 or "(allowed: laned:tests-correction)" not in out or "MODE combined\n" not in out:
+                failures.append(f"feature weakened-labelled: rc={rc}: {out.strip()}")
+            combined("weakened-labelled", head, "W1", True, correction=True)
+            # (5) a 6-WP overlapping feature batch (shared pkg/core.py), tests for
+            # two of them in the same PR: every label passes, each WP's own mode
+            feat = {"pkg/core.py": "VALUE = 2\n"}
+            feat.update({f"pkg/{w.lower()}.py": "from pkg.core import VALUE  # noqa: F401\n" for w in six})
+            feat["tests/accept/f1/test_f1_core.py"] = ("import pkg.core\n\n\ndef test_core_two():\n"
+                                                       "    assert pkg.core.VALUE == 2\n")
+            feat["tests/accept/f2/test_f2_core.py"] = ("import pkg.f2\n\n\ndef test_f2_two():\n"
+                                                       "    assert pkg.f2.VALUE == 2\n")
+            fhead = ""
+            for wp in six:
+                rc, out, fhead = check(f"six-{wp}", feat, six, wp)
+                mode = "combined" if wp in ("F1", "F2") else "implementation"
+                if rc != 0 or f"BATCH {' '.join(six)}\n" not in out or f"MODE {mode}\n" not in out \
+                        or any(f"WPMODE {w} " not in out for w in six):
+                    failures.append(f"feature six: {wp} check-pr rc={rc}, want MODE {mode}: {out.strip()}")
+            for wp in ("F1", "F2"):
+                combined(f"six-{wp}", fhead, wp, True)
+            lanedlib.git(root, "checkout", "-q", fhead)
+            for wp in six[2:]:
+                with contextlib.redirect_stdout(io.StringIO()) as buf, \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    rc = cmd_accept(root, wp, None)
+                if rc != 0:
+                    failures.append(f"feature six: accept {wp} failed: {buf.getvalue().strip()[-1500:]}")
+            lanedlib.git(root, "checkout", "-q", "main")
+            # the squash merge: git alone cannot attribute it (overlapping, 6 WPs) ...
+            lanedlib.git(root, "merge", "-q", "--squash", fhead)
+            merged = commit({}, "feat(laned): F1-F6 shared core (#77)")
+            if any(built_on(root, merged, w) for w in six[2:]):
+                failures.append("feature six: L2 without a ledger row")
+            # ... the ledger's PR rows (PR #77, one per laned:<WP> label) make it
+            # every labelled WP's L2 (LABELLED rule: label + a non-test PATHS file)
+            ledger = Path(tmp) / "ci_runs.json"
+            rows = [{"workflow": "laned-accept", "event": "pull_request", "wp": w, "pr": 77,
+                     "mode": "combined" if w in ("F1", "F2") else "accept", "head_sha": fhead,
+                     "conclusion": "success", "created_at": "2026-11-23T00:00:00Z"} for w in six]
+            rows.append({**rows[5], "conclusion": "failure", "created_at": "2026-11-23T01:00:00Z"})
+            ledger.write_text(json.dumps({"runs": rows}))
+            os.environ["LANED_LEDGER"] = str(ledger)
+            built = [w for w in six if built_on(root, merged, w)]
+            if built != six:
+                failures.append(f"feature six: built {built}, want {six}")
+            if lanedlib.green_pr_numbers(rows, "F6") or lanedlib.green_pr_numbers(rows, "F1") != {77}:
+                failures.append("green_pr_numbers: last row per PR decides")
+            # the #817 / W5i case: G1's broad PATHS (pkg/core.py) cover every
+            # file of #79, a merge labelled laned:F1 only. The git-only rule
+            # took it as G1's L2; with #79's labels known it is not. A merge
+            # labelled laned:G1 that changes only G1's tests (#80) is no L2.
+            core_only = commit({"pkg/core.py": "VALUE = 3\n"}, "fix(laned): F1 core (#79)")
+            g1_tests = commit({"tests/accept/g1/test_g1_more.py": SELFTEST_PASSING}, "tests(laned): G1 (#80)")
+            os.environ.pop("LANED_LEDGER", None)
+            if not built_on(root, core_only, "G1"):
+                failures.append("feature g1: the legacy git-only rule (no labels) no longer sees #79")
+            labels = Path(tmp) / "pr_labels.json"
+            labels.write_text(json.dumps([{"number": 79, "labels": [{"name": "laned:F1"}]},
+                                          {"number": 80, "labels": [{"name": "laned:G1"},
+                                                                    {"name": "laned:tests-correction"}]}]))
+            os.environ["LANED_PR_LABELS"] = str(labels)
+            if built_on(root, g1_tests, "G1"):
+                failures.append("feature g1: an unlabelled (#79) or tests-only labelled (#80) merge gave L2")
+            if lanedlib.parse_pr_labels(labels.read_text()) != {79: {"F1"}, 80: {"G1"}}:
+                failures.append(f"parse_pr_labels: {lanedlib.parse_pr_labels(labels.read_text())}")
+            os.environ.pop("LANED_PR_LABELS", None)
+            lanedlib.git(root, "reset", "-q", "--hard", merged)
+            os.environ["LANED_LEDGER"] = str(ledger)
+            # ... and a later tests-only PR for a feature-built WP is a tests-correction
+            rc, out, _ = check("after-feature", {"tests/accept/f3/test_f3_more.py":
+                                                 "import pkg.f3\n\n\ndef test_more():\n    assert pkg.f3.VALUE\n"},
+                               ["F3"], "F3", start=merged)
+            if rc != 0 or out != "MODE tests-correction\n":
+                failures.append(f"feature after-feature: rc={rc}: {out.strip()}")
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        _LEDGER.clear()
+    return failures
+
+
 def cmd_selftest() -> int:
     """Offline check of the RV<n> review mode of --check-pr and of the
     tests-only / tests-correction MODE rules."""
     failures: list[str] = []
     ident = ("-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false")
+    # fixture modules are rewritten within one second at the same size; a
+    # cached .pyc (mtime + size check) would then hide the change from the
+    # pytest subprocesses (seen on CI 2026-11-24): never write bytecode
+    os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+    # the fixture repos' `(#N)` subjects must never meet the real repo's PR
+    # labels or ledger (the PR job exports both)
+    for k in ("LANED_PR_LABELS", "LANED_LEDGER"):
+        os.environ.pop(k, None)
     with tempfile.TemporaryDirectory(prefix="laned-accept-selftest-") as tmp:
         root = Path(tmp) / "repo"
         root.mkdir()
@@ -2257,10 +3455,16 @@ def cmd_selftest() -> int:
     failures += selftest_tests_correction(ident)
     failures += selftest_verification(ident)
     failures += selftest_evidence(ident)
+    failures += selftest_w3a_nolock_evidence()
+    failures += selftest_retired()
+    failures += selftest_wb19_partial_evidence()
     failures += selftest_cross(ident)
     failures += selftest_freshness(ident)
+    failures += selftest_merge_group(ident)
     failures += selftest_batch(ident)
     failures += selftest_batch_impl(ident)
+    failures += selftest_coupled(ident)
+    failures += selftest_feature(ident)
     for f in failures:
         print(f"accept selftest: FAIL {f}", file=sys.stderr)
     if failures:
@@ -2295,9 +3499,23 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--freshness", action="store_true",
                     help="(needs --base/--head/--main) STALE BASE when main moved past the tested base "
                          "with changes the PR's paths touch or import")
+    ap.add_argument("--warn-only", action="store_true",
+                    help="--freshness: a stale base prints a WARNING and exits 0 (pull_request job; the "
+                         "merge queue's --merge-group run is the gate)")
+    ap.add_argument("--merge-group", action="store_true",
+                    help="(needs --base/--head/--group-labels) the merge queue's combined ref: every "
+                         "queued PR's own WP runs (MERGE-GROUP rule)")
+    ap.add_argument("--group-labels", metavar="FILE",
+                    help="--merge-group: JSON {PR number: [label names]} of the queued PRs")
     ap.add_argument("--pr-wps", metavar="WP[,WP...]",
                     help="--check-pr: every laned:<WP> label of the PR (BATCH rule for tests-only and "
-                         "tests-correction PRs, BATCH IMPLEMENTATION rule for implementation PRs)")
+                         "tests-correction PRs, FEATURE rule for any PR with code)")
+    ap.add_argument("--combined", action="store_true",
+                    help="MODE combined (needs --base/--head): the WP's new/changed tests fail on BASE "
+                         "for a right reason, then the full Accept passes on HEAD")
+    ap.add_argument("--correction", action="store_true",
+                    help=f"--check-pr / --combined: the PR carries laned:{lanedlib.CORRECTION_LABEL} "
+                         "(may delete or weaken existing assertions)")
     ap.add_argument("--base")
     ap.add_argument("--head")
     ap.add_argument("--main", metavar="REF", help="--freshness: main's current tip (origin/main)")
@@ -2309,7 +3527,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.freshness:
         if not (args.base and args.head and args.main):
             ap.error("--freshness needs --base, --head and --main")
-        return cmd_freshness(root, args.base, args.head, args.main)
+        return cmd_freshness(root, args.base, args.head, args.main, args.warn_only)
+    if args.merge_group:
+        if not (args.base and args.head and args.group_labels):
+            ap.error("--merge-group needs --base, --head and --group-labels")
+        try:
+            labels = read_group_labels(args.group_labels)
+        except (OSError, ValueError) as e:
+            print(f"GROUP FAIL: unreadable --group-labels: {e}")
+            return 1
+        return cmd_merge_group(root, args.base, args.head, labels)
     if args.cross:
         if not (args.wp and args.base and args.head):
             ap.error("--cross needs the PR's WP(s), --base and --head")
@@ -2320,7 +3547,11 @@ def main(argv: list[str] | None = None) -> int:
         if not (args.base and args.head):
             ap.error("--check-pr needs --base and --head")
         pr_wps = [w for w in re.split(r"[,\s]+", args.pr_wps or "") if w]
-        return cmd_check_pr(root, args.wp, args.base, args.head, pr_wps)
+        return cmd_check_pr(root, args.wp, args.base, args.head, pr_wps, args.correction)
+    if args.combined:
+        if not (args.base and args.head):
+            ap.error("--combined needs --base and --head")
+        return cmd_combined(root, args.wp, args.base, args.head, args.correction)
     if args.verification:
         if not (args.base and args.head):
             ap.error("--verification needs --base and --head")

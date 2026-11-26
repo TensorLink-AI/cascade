@@ -23,12 +23,21 @@
 #   dependency reports success. A skipped or cancelled shard therefore fails
 #   `test` and can never pass as skipped. `receipt-replay` is unchanged.
 #   Tuning: when the shards drift out of balance, download every shard log of
-#   one PR run (each prints --durations=0 --durations-min=0.05) and run
-#   `python3 scripts/ci_shard.py --refresh-weights <logs...>`.
+#   a few PR runs (each prints --durations=0 --durations-min=0.05) and run
+#   `python3 scripts/ci_shard.py --refresh-weights <logs...>`; it keeps each
+#   test's worst time, since runner speed varies a lot between jobs.
+#
+# Merge queue (2026-11-23): `merge_group` runs exactly what a PR runs, on the
+# queue's combined ref (base + every PR ahead of it in the group): `lint`, the
+# FULL unit suite in 6 shards, the `test` aggregator and `receipt-replay`. No
+# job is conditioned away on merge_group, so both required checks always
+# report there. The single-process `unit (1/1)` run stays on push only.
 name: CI
 
 on:
   pull_request:
+  merge_group:
+    types: [checks_requested]
   push:
     branches: [main, cascade-v2]
 
@@ -69,6 +78,11 @@ jobs:
       - name: Documentation interfaces and links
         run: uv run python scripts/check_docs.py
 
+      # One rule per incident a pattern could have caught (docs/INCIDENT_RULES.md).
+      # Stdlib only, no cascade imports, well under a second.
+      - name: Incident rules
+        run: uv run python scripts/check_incident_rules.py
+
       - name: Unit shard plan is a partition of tests/unit
         # Collect with pytest itself so a test the planner cannot see (e.g. one
         # not defined at module top level in a split file) fails here.
@@ -77,16 +91,17 @@ jobs:
           python3 scripts/ci_shard.py --verify --of 6 --collected "$RUNNER_TEMP/collected.txt"
 
   unit:
-    name: unit (${{ matrix.shard }}/${{ github.event_name == 'pull_request' && 6 || 1 }})
+    name: unit (${{ matrix.shard }}/${{ github.event_name != 'push' && 6 || 1 }})
     runs-on: ubuntu-latest
     timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
-        shard: ${{ fromJSON(github.event_name == 'pull_request' && '[1, 2, 3, 4, 5, 6]' || '[1]') }}
+        # pull_request and merge_group: 6 shards; push: one process
+        shard: ${{ fromJSON(github.event_name != 'push' && '[1, 2, 3, 4, 5, 6]' || '[1]') }}
     env:
       SHARD: ${{ matrix.shard }}
-      SHARDS: ${{ github.event_name == 'pull_request' && 6 || 1 }}
+      SHARDS: ${{ github.event_name != 'push' && 6 || 1 }}
     steps:
       - uses: actions/checkout@v4
 

@@ -63,7 +63,11 @@ def test_mainnet_ships_inert_with_the_v2_contract_scheduled(tmp_path):
                               # 2026-11-13 to free its note segment
                               image_decoupled_from_block=9493200)
     assert not before.v2.active(10**9)
-    assert before.training.at_block(10**9) is before.training
+    # no v2 switch: only the shipped DEC-CA-0047 budget switch (S0a B9) applies
+    late = before.training.at_block(10**9)
+    assert before.training.at_block(9165600 - 1) is before.training
+    assert (late.base_arch, late.budget_denomination) == (before.training.base_arch,
+                                                          "points+mv20")
     # 2026-11-13: main types the resolved launch; v2-derived blocks follow it
     assert cfg.v2 == replace(before.v2, from_block=9399600, commit_from_block=9395601,
                              bench_gate_v2_from_block=9399600,
@@ -74,14 +78,19 @@ def test_mainnet_ships_inert_with_the_v2_contract_scheduled(tmp_path):
     v2c = cfg.training.v2_contract
     assert v2c is not None and v2c.base_arch == "cascade_pyramid"
     assert (v2c.router_lr_scale, v2c.route_bias_rate_scale) == (0.1, 0.25)
-    # pre-v2 blocks resolve to the toto2 contract (same object), v2 blocks to v2's
-    assert cfg.training.at_block(9399600 - 1) is cfg.training
+    # pre-v2 blocks resolve to the toto2 contract (same object before the
+    # DEC-CA-0047 budget switch, typed S0a B9), v2 blocks to v2's
+    assert cfg.training.at_block(9165600 - 1) is cfg.training
+    v1_late = cfg.training.at_block(9399600 - 1)
+    assert (v1_late.base_arch, v1_late.budget_denomination) == ("toto2", "points+mv20")
     assert cfg.training.at_block(10**9).base_arch == "cascade_pyramid"
     assert cfg.lane_b.domains == ("econ_fin", "energy", "healthcare", "nature", "sales",
                                   "transport", "web_cloudops")
-    assert (cfg.lane_b.full_pay_tiers, cfg.lane_b.half_life_rounds, cfg.lane_b.floor,
-            cfg.lane_b.win_ttl_eras) == (((0.05, 10), (0.02, 5), (0.01, 2)), 1.0, 0.1, 28)
-    assert cfg.lane_b.replay_settlements == 29 * cfg.round.era_settlements
+    # LANE_D_PLAN rev6.22: lane B pays a held slot in full until replaced —
+    # the decay / TTL keys are retired, so there is no TTL-sized replay cover
+    assert not any(hasattr(cfg.lane_b, k) for k in ("full_pay_tiers", "half_life_rounds",
+                                                    "floor", "win_ttl_eras"))
+    assert cfg.lane_b.replay_settlements == 64
 
 
 def test_testnet_is_armed_on_its_era_grid():
@@ -135,6 +144,10 @@ def test_v2_needs_its_contract_and_the_same_seed_salt(tmp_path):
 
 def test_lane_b_can_stay_off_or_launch_after_lane_a():
     raw = tomllib.loads(_text("chain.testnet.toml"))
+    # testnet arms lane C (taken from lane B) at 8515800 (TESTNET-FAST, owner
+    # 2026-11-24 option A); this test is about lane B alone, so lane C is off
+    raw["lane_c"]["from_block"] = 0
+    raw["marketcast"]["from_block"] = 0
     n = raw["v2"]["from_block"]
     era = raw["round"]["epoch_blocks"] * raw["round"]["era_settlements"]
     raw["lane_b"].pop("from_block")

@@ -1,0 +1,14 @@
+# WB25: multi-GPU lane B expert legs (plan §3.0 lane B track, rev6.8,
+# owner 2026-11-23). README.md has the contract.
+#
+# train_pyramid: drop the `gang_size(...) if slices is None else 1` override,
+# hand the selection to the Gang, record `gpu_n` in a lane B leg's metrics.
+# The lane A path (no slices) stays byte-for-byte unchanged.
+cascade/trainer/pyramid_trainer.py
+# Gang / _follower: helper ranks build the same ExpertSlices leaves; the
+# optimizer sharding and the all-reduce cover only the selected rows; the
+# backend follows the device (nccl on CUDA, gloo on CPU: the CI test seam).
+cascade/trainer/pyramid_dp.py
+# Not in PATHS: cascade/trainer/expert_training.py (ExpertSlices is used as
+# is), cascade/trainer/expert_lane.py (selection and merge, unchanged),
+# cascade/trainer/pyramid_optimizer.py (assign_muon_owners is reused).

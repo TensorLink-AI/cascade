@@ -11,7 +11,7 @@ from pathlib import Path
 from .chain_config import ChainConfig
 from .generation import parse_generation
 from .lane_c import parse_lane_c
-from .lane_d import parse_lane_d
+from .lane_d import RETIRED_LANE_D_F4_KEYS, RETIRED_LANE_D_KEYS, parse_lane_d
 from .marketcast import check_marketcast_arming, parse_marketcast
 from .money import parse_money_safety, parse_validator_cache
 from .reliability import parse_reliability
@@ -22,7 +22,6 @@ from .scoring import (
     _bench_gate_tolerance,
     _bench_gate_win_rate,
     _gift_gate_mode,
-    _init_gate_mode,
     _margin_mode,
     check_margin_v2,
     check_shared_ladder,
@@ -98,9 +97,25 @@ RETIRED_KEYS: dict[str, frozenset[str]] = {
         "dedup_max_tokens", "duel_from_block", "funded_activation_block",
     }),
     "telemetry": frozenset({"scratch_shadow_every_rounds"}),
+    # rev6.18 B12: the DEC-CA-0034 init gate's mode / tolerance. Its legacy
+    # shadow window is [scoring] init_gate_retired_from_block.
+    "scoring": frozenset({"init_gate_mode", "init_gate_tolerance"}),
+    # rev6.18 B11: confirm_on_king_change and the DEC-CA-0062 keys; rev6.18
+    # F4 (A7, D24): the W5i backtest keys and the A10 slice.
+    "lane_d": RETIRED_LANE_D_KEYS | RETIRED_LANE_D_F4_KEYS,
     # Parsed by older releases (hf_cache_seconds was REQUIRED there), read by none.
     "eval": frozenset({"eval_source"}),
     "validator": frozenset({"hf_cache_seconds"}),
+    # DEC-CA-0073 (owner 2026-11-24): lane C / MarketCast pay is the
+    # gain-scaled full-pay duration ([lane_c] full_pay_min_days /
+    # full_pay_max_days / full_pay_max_gain); the gain-tiered period, its
+    # decay and the TTL are gone. Overlays naming these are refused.
+    "lane_c": frozenset({"full_pay_tiers", "half_life_rounds", "floor", "win_ttl_eras"}),
+    "marketcast": frozenset({"full_pay_tiers"}),
+    # LANE_D_PLAN rev6.22 (owner 2026-11-24): lane B slots pay in full until
+    # replaced, so the gain-tiered decay and the payout TTL are gone. Lane C
+    # keeps its own keys of the same names.
+    "lane_b": frozenset({"full_pay_tiers", "half_life_rounds", "floor", "win_ttl_eras"}),
 }
 
 
@@ -137,6 +152,29 @@ def parse_ckpt_transport(r: dict) -> dict:
     return {"funded_harvest_transport": transport, "ckpt_relay_host": relay.strip(),
             "min_free_disk_gb": float(gb), "ckpt_r2_bucket": bucket,
             "ckpt_r2_prefix": prefix}
+
+
+def _compile_spec_instance(spec, mc_raw: dict):
+    """W-CMP2: ``(instance MarketCastConfig, its competition table)`` of an
+    accepted non-``mkt`` spec; ``ValueError`` when it cannot run."""
+    from dataclasses import replace as _replace
+
+    from ..competition_spec import compile_instance
+    from .lane_c import register_spec_kind
+    from .marketcast import draw_problems, parse_marketcast
+
+    register_spec_kind(spec.id)
+    inst_raw, comp = compile_instance(spec, mc_raw)
+    mc_i = parse_marketcast(inst_raw, open_classes=True)
+    mc_i = _replace(mc_i, from_block=int(comp["from_block"]))
+    why = draw_problems(mc_i)
+    if not mc_i.base_sha256 or not mc_i.base_ref:
+        why = ["the base model is not pinned"] + list(why)
+    if why:
+        raise ValueError("; ".join(why))
+    import json as _json
+
+    return mc_i, comp, _json.dumps(inst_raw, sort_keys=True, separators=(",", ":"))
 
 
 def parse_chain_config(raw: dict) -> ChainConfig:
@@ -344,6 +382,20 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
         if _lb_from % _lb_era:
             raise ValueError(f"[lane_b] from_block={_lb_from} must be an era boundary "
                              f"(a multiple of {_lb_era})")
+    _lb_until = lb_raw.get("until_block", 0)
+    if type(_lb_until) is not int or _lb_until < 0:
+        raise ValueError("[lane_b] until_block must be an integer >= 0 (0 = no end)")
+    if _lb_until:
+        # containment kill switch (owner 2026-11-24): an era boundary after
+        # the launch; the settlement AT it is lane B's last paid one
+        if _lb_until <= _lb_from:
+            raise ValueError(f"[lane_b] until_block={_lb_until} must follow from_block="
+                             f"{_lb_from}")
+        _lbu_grid = _ebp if (_eab and _ebp and _lb_until < _eab) else _eb
+        _lbu_era = max(1, _lbu_grid) * max(1, _era_settlements)
+        if _lb_until % _lbu_era:
+            raise ValueError(f"[lane_b] until_block={_lb_until} must be an era boundary "
+                             f"(a multiple of {_lbu_era})")
     # Public launch blocks name era STARTS; the settlement AT that boundary
     # belongs to the preceding era. Keep LaneBConfig.active's inclusive API.
     lane_b = parse_lane_b(lb_raw, from_block=(_lb_from + 1 if _lb_from else 0),
@@ -381,8 +433,97 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
     # 2026-10-20: the shipped targets must load with it off; active_targets
     # then counts none of them and lane C's share burns). Its cross-table
     # arming checks run below.
-    marketcast = parse_marketcast(raw.get("marketcast", {}))
     lc_raw = raw.get("lane_c", {}) or {}
+    # DEC-CA-0075 (W-CMP): declarative lane-C competitions. A spec composed
+    # of registry blocks compiles onto its runner's tables (MarketCast:
+    # [marketcast] + [lane_c.competitions.mkt]) and is then parsed by the
+    # SAME parsers; a refused spec (unknown block, no runner) never raises —
+    # its competition is inert and its share burns (typed, logged).
+    from ..competition_spec import compile_marketcast, parse_specs
+
+    _specs_ok, _specs_bad = parse_specs(lc_raw.get("specs") if isinstance(lc_raw, dict)
+                                        else None)
+    mc_raw = raw.get("marketcast", {}) or {}
+    _mkt_spec = next((sp for sp in _specs_ok if sp.id == "mkt"), None)
+    if _mkt_spec is not None:
+        _comps = lc_raw.get("competitions") if isinstance(lc_raw, dict) else None
+        mc_raw, _mkt_comp = compile_marketcast(
+            _mkt_spec, mc_raw, (_comps or {}).get("mkt") if isinstance(_comps, dict) else None)
+        if _mkt_comp is not None:
+            lc_raw = {**lc_raw, "competitions": {**(_comps or {}), "mkt": _mkt_comp}}
+    for _r in _specs_bad:
+        import logging
+
+        logging.getLogger("cascade.config").error(
+            "lane-C competition spec %r REFUSED (%s): %s — it judges nothing and its share "
+            "burns", _r.id, _r.code, _r.reason)
+        if _r.id == "mkt":
+            mc_raw = {**mc_raw, "refused": _r.code}
+    marketcast = parse_marketcast(mc_raw)
+    # W-CMP2 (DEC-CA-0075): every other accepted spec is an INSTANCE of the
+    # multi-instance MarketCast runner — its own kind, targets, competition
+    # and compiled table (the legacy [marketcast] model pins and bounds, its
+    # own data / metrics / rules). One that cannot compile is refused (typed,
+    # its share burns), never a load failure.
+    _instances: list = []
+    _inst_targets: list = []
+    _inst_comps: dict = {}
+    _ok_after: list = []
+    _bad_after: list = list(_specs_bad)
+    for _sp in _specs_ok:
+        if _sp.id == "mkt":
+            _ok_after.append(_sp)
+            continue
+        try:
+            _mi = _compile_spec_instance(_sp, raw.get("marketcast", {}) or {})
+            # its start / end on the era grid, inside lane C (else the lane-C
+            # parser would refuse the whole table: a refusal, never a failure)
+            _fb_i = int(_mi[1]["from_block"])
+            _ub_i = int(_mi[1].get("until_block", 0) or 0)
+            for _nm, _b in (("from_block", _fb_i), ("until_block", _ub_i)):
+                _eb_i = max(1, _ebp if (_eab and _ebp and 0 < _b < _eab) else _eb) * max(
+                    1, _era_settlements)
+                if _b and _b % _eb_i:
+                    raise ValueError(f"{_nm}={_b} is not an era boundary (era {_eb_i})")
+            _lcf0 = int(lc_raw.get("from_block", 0) or 0) if isinstance(lc_raw, dict) else 0
+            if not _lcf0 or _fb_i < _lcf0:
+                raise ValueError(f"from_block={_fb_i} must be >= [lane_c] from_block "
+                                 f"({_lcf0 or 'unset'})")
+            if _ub_i and _ub_i <= _fb_i:
+                raise ValueError(f"until_block={_ub_i} must be after from_block={_fb_i}")
+        except ValueError as _exc:
+            from ..competition_spec import SpecRefusal
+
+            _r = SpecRefusal(_sp.id, "bad_value", f"instance does not compile: {_exc}")
+            import logging
+
+            logging.getLogger("cascade.config").error(
+                "lane-C competition spec %r REFUSED (%s): %s — it judges nothing and its share "
+                "burns", _r.id, _r.code, _r.reason)
+            _bad_after.append(_r)
+            continue
+        _mc_i, _comp_i, _tbl_i = _mi
+        _instances.append((_sp.id, _mc_i, _tbl_i))
+        _inst_targets += [f"{_sp.id}:{n}" for n in _mc_i.target_names]
+        _inst_comps[_sp.id] = _comp_i
+        _ok_after.append(_sp)
+    _specs_ok, _specs_bad = tuple(_ok_after), tuple(sorted(_bad_after, key=lambda r: r.id))
+    if _instances:
+        from .lane_c import DEFAULT_TARGETS as _LC_DEFAULT_TARGETS
+
+        _comps0 = lc_raw.get("competitions") if isinstance(lc_raw, dict) else None
+        _comps1 = dict(_comps0 or {})
+        if not _comps0:
+            # the derived default made explicit (one weight-1 competition per
+            # configured kind), so the instances can join it
+            _t0 = lc_raw.get("targets", _LC_DEFAULT_TARGETS) if isinstance(lc_raw, dict) else ()
+            for _k in sorted({str(t).partition(":")[0] for t in (_t0 or ())}):
+                _comps1.setdefault(_k, {})
+        _comps1.update(_inst_comps)
+        _t = list(lc_raw.get("targets", _LC_DEFAULT_TARGETS) if isinstance(lc_raw, dict)
+                  else _LC_DEFAULT_TARGETS)
+        lc_raw = {**lc_raw, "targets": _t + [t for t in _inst_targets if t not in _t],
+                  "competitions": _comps1}
     _lc_from = int(lc_raw.get("from_block", 0) or 0) if isinstance(lc_raw, dict) else 0
     _lc_grid = _ebp if (_eab and _ebp and 0 < _lc_from < _eab) else _eb
     lane_c = parse_lane_c(
@@ -397,14 +538,25 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
         # is an era boundary on the grid in force at it
         kind_from_blocks={"mkt": int(marketcast.from_block)},
         era_blocks_at=lambda b: max(1, _ebp if (_eab and _ebp and 0 < b < _eab) else _eb)
-        * max(1, _era_settlements))
-    # An mkt: win pays through a lane-C slot (lane C's TTL): its tiered
-    # full-pay period must not outlive it (checked armed or not, like lane C).
-    _lc_ttl = int(lane_c.win_ttl_eras)
-    if _lc_ttl and any(n > _lc_ttl for _, n in marketcast.full_pay_tiers):
-        raise ValueError(f"[marketcast] full_pay_tiers {list(marketcast.full_pay_tiers)}: "
-                         f"full_eras exceeds [lane_c] win_ttl_eras={_lc_ttl} (an mkt: win "
-                         "pays through a lane-C slot)")
+        * max(1, _era_settlements),
+        specs=(_specs_ok, _specs_bad), instances=tuple(_instances))
+    if int(lane_c.until_block):
+        # containment (owner 2026-11-24): a closed lane C closes MarketCast
+        # and every spec instance with it (derived; no [marketcast] key)
+        _ub_lc = int(lane_c.until_block)
+        marketcast = replace(marketcast, until_block=_ub_lc)
+        lane_c = replace(lane_c, instances=tuple(
+            (_k, replace(_mi, until_block=_ub_lc), _t) for _k, _mi, _t in lane_c.instances))
+    for _k, _mi, _t in lane_c.instances:
+        if not float(_mi.gain_margin) < float(lane_c.full_pay_max_gain):
+            raise ValueError(f"[lane_c.specs.{_k}] gain_margin={_mi.gain_margin} must be < "
+                             f"[lane_c] full_pay_max_gain={lane_c.full_pay_max_gain}")
+    # DEC-CA-0073: an mkt: win's pay-duration ramp starts at
+    # [marketcast] gain_margin, so it must lie below [lane_c] full_pay_max_gain
+    if not float(marketcast.gain_margin) < float(lane_c.full_pay_max_gain):
+        raise ValueError(f"[marketcast] gain_margin={marketcast.gain_margin} must be < "
+                         f"[lane_c] full_pay_max_gain={lane_c.full_pay_max_gain} (the mkt: "
+                         "pay-duration ramp runs from the margin to the max gain)")
 
     cfg = ChainConfig(
         schema_version=schema,
@@ -467,6 +619,7 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
             funded_bench_margin_seconds=max(0, int(r.get("funded_bench_margin_seconds", 0) or 0)),
             blocked_hotkeys=tuple(str(x) for x in r.get("blocked_hotkeys", ()) or ()),
             blocked_from_block=max(0, int(r.get("blocked_from_block", 0) or 0)),
+            lane_a_until_block=max(0, int(r.get("lane_a_until_block", 0) or 0)),
             one_submission_per_hotkey=bool(r.get("one_submission_per_hotkey", True)),
             commit_floor_block=int(r.get("commit_floor_block", 0)),
             submissions_db_path=str(r.get("submissions_db_path", "trainer_submissions.json")),
@@ -505,6 +658,10 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
                 else RoundConfig.funded_sku_wall_seconds),
             funded_sku_wall_measured_image=validate_measured_image(
                 r.get("funded_sku_wall_measured_image", "")),
+            unmeasured_image_wall_cap_seconds=validate_nonneg_seconds(
+                "unmeasured_image_wall_cap_seconds",
+                r.get("unmeasured_image_wall_cap_seconds",
+                      RoundConfig.unmeasured_image_wall_cap_seconds)),
             progress_watchdog_grace_seconds=validate_nonneg_seconds(
                 "progress_watchdog_grace_seconds",
                 r.get("progress_watchdog_grace_seconds",
@@ -641,10 +798,10 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
             # DEC-CA-0061 rule v2 thresholds
             bench_gate_tolerance=_bench_gate_tolerance(s.get("bench_gate_tolerance", 0.01)),
             bench_gate_min_win_rate=_bench_gate_win_rate(s.get("bench_gate_min_win_rate", 0.5)),
-            # DEC-CA-0034 (parsing added with DEC-CA-0035's loader sweep —
-            # same landed-without-parsing defect as the [training] knobs)
-            init_gate_mode=_init_gate_mode(s.get("init_gate_mode", "off")),
-            init_gate_tolerance=float(s.get("init_gate_tolerance", 0.0)),
+            # rev6.18 B12: the DEC-CA-0034 init gate is retired; its legacy
+            # shadow floor runs only on rounds before this block.
+            init_gate_retired_from_block=max(
+                0, int(s.get("init_gate_retired_from_block", 0) or 0)),
             margin_mode=_margin_mode(s.get("margin_mode", "level")),
             margin_increment_floor=float(s.get("margin_increment_floor", 0.01)),
             cascade_enabled=bool(s.get("cascade_enabled", False)),
@@ -813,6 +970,36 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
         if cfg.v2.from_block and _idb < int(cfg.v2.from_block):
             raise ValueError(f"[v2] image_decoupled_from_block={_idb} precedes [v2] "
                              f"from_block={cfg.v2.from_block}")
+    # W-IMG (plan rev6.24 (e)): the image-per-seed-epoch rule and the
+    # trainer's bound epoch block are era starts; the rule builds on the
+    # DEC-CA-0067 decoupled check (entries publish their image from it).
+    for _key in ("image_epoch_from_block", "image_after_epoch_block"):
+        _blk = int(getattr(cfg.v2, _key, 0) or 0)
+        if not _blk:
+            continue
+        _grid = _ebp if (_eab and _ebp and _blk < _eab) else _eb
+        if not _eab and _act_grid_after and cfg.activation.feature:
+            _grid = _act_grid_after
+        if _blk % (max(1, _grid) * max(1, _era_settlements)):
+            raise ValueError(f"[v2] {_key}={_blk} is not an era start "
+                             f"(era = {max(1, _grid) * max(1, _era_settlements)} blocks)")
+        if cfg.v2.from_block and _blk < int(cfg.v2.from_block):
+            raise ValueError(f"[v2] {_key}={_blk} precedes [v2] from_block={cfg.v2.from_block}")
+    _ieb = int(cfg.v2.image_epoch_from_block)
+    if _ieb:
+        if not (cfg.v2.image_decoupled_from_block or cfg.v2.image_decoupled_feature):
+            raise ValueError("[v2] image_epoch_from_block needs the DEC-CA-0067 image-decoupled "
+                             "check ([v2] image_decoupled_from_block or its v2b vote)")
+        if _idb and _ieb < _idb:
+            raise ValueError(f"[v2] image_epoch_from_block={_ieb} precedes [v2] "
+                             f"image_decoupled_from_block={_idb}")
+    _iab = int(cfg.v2.image_after_epoch_block)
+    if _iab:
+        if not _ieb or _iab < _ieb:
+            raise ValueError(f"[v2] image_after_epoch_block={_iab} needs [v2] "
+                             "image_epoch_from_block at or before it")
+        if not cfg.v2.train_image_digest_after:
+            raise ValueError("[v2] image_after_epoch_block needs the [v2] *_after release")
     # LANE_D_PLAN §16: the sentinel arms at an era boundary on the grid in
     # force at it, once the four-suite rule v2 is in force (0 = off).
     _sfb = int(cfg.v2.sentinel_from_block)

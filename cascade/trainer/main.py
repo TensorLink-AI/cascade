@@ -91,6 +91,11 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Run credential-free direct-MoE counter simulation into a NEW directory.")
     p.add_argument("--trainer", default=None, help="BaseTrainer as 'module:Class'.")
     p.add_argument("--work-root", type=Path, default=Path("./_train_work"))
+    p.add_argument(
+        "--lane-b-bench-hosts", type=Path, default=None,
+        help="#909: eval-hosts TOML ([[host]], re-read per bench; e.g. targon-eval.toml, "
+             "lane A's bench pod) where lane B's king / candidate / anchor public rows are "
+             "benched. Unset or empty = lane B fails closed: the trainer box never benches.")
     p.add_argument("--network", default="finney")
     p.add_argument("--wallet-name", default=None)
     p.add_argument("--wallet-hotkey", default=None)
@@ -107,7 +112,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--base-seed", type=int, default=0, help="Override round base seed (offline).")
     p.add_argument("--offline", action="store_true", help="No chain/GPU; print contract + seeds.")
     p.add_argument("--preflight-v2-baseline", metavar="IMMUTABLE_REF",
-                   help="Fetch and sandbox-verify the initial v2 king; record a local launch qualification. No rentals.")
+                   help="Fetch and sandbox-verify the initial v2 king; record a local launch qualification. "
+                        "No rentals. Exit 0 ready to launch, 3 qualified but still blocked "
+                        "(the printed blockers), 2 verification failed.")
+    p.add_argument("--preflight-v2-baseline-check", metavar="IMMUTABLE_REF",
+                   help="Read-only (dry-run) launch check of the initial v2 king: every blocker the "
+                        "first king leg would hit, as JSON. Fetches, writes and rents nothing. "
+                        "Exit 0 ready, 3 blocked, 2 error.")
     p.add_argument("--bench-suites", default="gift-eval,boom,time",
                    help="Suites the completion bench runs on each checkpoint's pod. "
                         "Lane A only for a trainer-sourced era: an era under [v2] "
@@ -137,6 +148,42 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--log-backups", type=int, default=10,
                    help="Rotated --log-file generations kept.")
     return p
+
+
+PREFLIGHT_READY, PREFLIGHT_ERROR, PREFLIGHT_BLOCKED = 0, 2, 3
+
+
+def _preflight_v2_baseline(cfg, args) -> int:
+    """``--preflight-v2-baseline`` (qualify, then report) and
+    ``--preflight-v2-baseline-check`` (report only). Both print JSON and end
+    with the read-only :func:`launch_preflight.preflight_report`, so a
+    qualification that leaves another blocker (no validator anchor, an
+    unqualified worker release) exits :data:`PREFLIGHT_BLOCKED`, never 0."""
+    import json
+
+    from .launch_preflight import preflight_report, qualify
+
+    log = logging.getLogger("cascade.trainer")
+    ref = args.preflight_v2_baseline or args.preflight_v2_baseline_check
+    out: dict = {}
+    if args.preflight_v2_baseline:
+        try:
+            out["qualification"] = qualify(cfg, ref, args.work_root)
+        except Exception as exc:
+            log.error("v2 baseline preflight failed: %s", exc)
+            return PREFLIGHT_ERROR
+    try:
+        report = preflight_report(cfg, ref, args.work_root)
+    except Exception as exc:
+        log.error("v2 baseline preflight check failed: %s", exc)
+        return PREFLIGHT_ERROR
+    out["preflight"] = report
+    print(json.dumps(out, allow_nan=False, sort_keys=True))
+    if report["ready"]:
+        log.info("v2 launch preflight ready: %s", ref)
+        return PREFLIGHT_READY
+    log.error("v2 launch preflight blocked: %s (%s)", ref, "; ".join(report["blockers"]))
+    return PREFLIGHT_BLOCKED
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -171,17 +218,8 @@ def main(argv: list[str] | None = None) -> int:
     _configure_logging(args.log_level, args.log_file, max_mb=args.log_max_mb,
                        backups=args.log_backups)
     cfg = load_chain_config(args.chain_toml)
-    if args.preflight_v2_baseline:
-        import json
-
-        from .launch_preflight import qualify
-
-        try:
-            print(json.dumps(qualify(cfg, args.preflight_v2_baseline, args.work_root), allow_nan=False))
-        except Exception as exc:
-            logging.getLogger("cascade.trainer").error("v2 baseline preflight failed: %s", exc)
-            return 2
-        return 0
+    if args.preflight_v2_baseline or args.preflight_v2_baseline_check:
+        return _preflight_v2_baseline(cfg, args)
     if getattr(getattr(cfg, "generator", None), "sandbox_strict", None) is False:
         logging.getLogger("cascade.trainer").warning(
             "sandbox_strict = false: a host without network namespaces runs the generator as a "
@@ -351,7 +389,8 @@ def main(argv: list[str] | None = None) -> int:
         from .lane_b_driver import LaneBDriver, RunnerLaneBOps
 
         runner.lane_b_driver = LaneBDriver(
-            cfg, RunnerLaneBOps(runner, client, window_source, device=_local_device()),
+            cfg, RunnerLaneBOps(runner, client, window_source, device=_local_device(),
+                                bench=_lane_b_bench(args, cfg, runner)),
             Path(args.work_root) / "lane_b_driver.json")
     if int(getattr(getattr(cfg, "lane_c", None), "from_block", 0) or 0) > 0:
         # DEC-CA-0056: the fine-tune lane rides the rolling scheduler the same
@@ -375,6 +414,23 @@ def main(argv: list[str] | None = None) -> int:
     install_generation_shutdown(runner)
     runner.run_forever(client)
     return 0
+
+
+def _lane_b_bench(args, cfg, runner):
+    """#909: the eval-pod lane-B bench, or None (no --lane-b-bench-hosts:
+    lane B fails closed — the trainer box never benches)."""
+    from .lane_b_bench import LaneBBench
+
+    log = logging.getLogger("cascade.trainer")
+    path = getattr(args, "lane_b_bench_hosts", None)
+    if path is None:
+        if cfg.lane_b.require_public:
+            log.error("lane B: no --lane-b-bench-hosts — lane-B settlements fail closed "
+                      "(public rows are benched only on an eval pod, never on this box)")
+        return None
+    log.info("lane B: public rows benched on the eval pod(s) in %s", path)
+    return LaneBBench(hosts_path=path, cache_dir=Path(args.work_root) / "lane_b_bench_rows",
+                      eval_cfg=cfg.eval, fetch=runner._fetch_checkpoint_dir)
 
 
 def _local_device() -> str:

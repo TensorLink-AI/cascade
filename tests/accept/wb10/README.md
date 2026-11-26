@@ -59,7 +59,7 @@ tuples, so either form is fine. `contamination_min_hits` is a TOML table
 | `open_rule` | `"cogate"` | §12b.4: "default `"cogate"`, so unarmed digests don't move" |
 | `sentinel_target_rule` | `"defer"` | D35 (a) |
 | `sentinel_max_defer_eras` | 4 | §12b.5 recommended |
-| `funded_pod_skus` | the same file's `[round] funded_pod_skus` | D42 (mainnet `["8xH200","8xH100","4xH200","4xH100"]`; read from the file) |
+| `funded_pod_skus` | the same file's `[round] funded_pod_skus` | D42 (mainnet `["8xH200","8xH100","4xH200","4xH100"]`; read from the file). **Tests-correction 2026-11-23:** this is the PARSER default (key absent). The SHIPPED value is WB22's (lane B's own GPU list, owner 2026-11-23), so the shipped-table and drop-when-default tests only require it to parse; it moves no consensus digest |
 | `max_leg_hours` | 6.0 | D42 |
 | `max_leg_seconds` | 27000 (6 h × 1.25) | §12b.6 |
 | `guard_factor` | 1.25 | §12b.6 recommended |
@@ -161,3 +161,53 @@ No `tests/unit` file pins behaviour WB10 changes:
   release-only tuple doesn't break it.
 
 None is listed in `PATHS`.
+
+## rev6.20 (owner 2026-11-24): the lane B leg contract
+
+No activation key (owner 2026-11-24: lanes B, C and D are not rolled out, so
+EMA / no cooldown is simply lane B). `lane_b_leg_contract(contract)` returns
+the leg contract with `lr_schedule = "warmup_constant_ema"` (cascade_pyramid
+only); `LANE_B_SCORED_EMA = "ema010"`. No `[lane_b]` key arms it, and the
+lane A contract digest is unchanged. `test_wb10_lane_b_leg_contract.py`.
+
+## rev6.22: the lane B slot rule (`test_wb10_lane_b_slots.py`)
+
+Owner 2026-11-24 (final): lane B is not rolled out, so there is no
+activation key. **Pay:** a held slot pays its full share every settlement,
+no decay, no TTL, until a newer merge takes it; empty slots burn. The four
+decay / TTL keys are in `RETIRED_KEYS["lane_b"]`: the shipped files drop
+them, and an older file carrying them loads to the same `LaneBConfig`.
+**Testing** (`judge_expert_slots`): every judged leg is tested on every
+slot; declared targets (`max_domains_per_leg` = 4) form one max-T family at
+`gain_margin`, every other slot a second max-T family at
+`undeclared_gain_margin` (0.02, validated `>= gain_margin`, overlay-settable).
+A slot clears on CRPS or MASE with the other metric non-inferior and every
+guard holding; each cleared slot is claimable, so one miner may hold every
+slot. The declared family's LCBs do not depend on the undeclared slots.
+Payouts, the take-all case, the replacement rule (only a newer accepted
+merge moves a slot) and inconclusive suites are pinned. PATHS gain the judge,
+validator rows, acceptance, the trainer call site, `v2_status.py` and the
+unit tests that pinned the retired rule.
+
+## Lane B domain tags (owner 2026-11-25, `test_wb10_domain_tags.py`)
+
+Records and display only. Each judged generator is tagged with the slots it
+actually improved, read from the signed verdict rows
+(`cascade/shared/lane_b_domains.py`). **Improved** means the slot cleared
+the `judge_expert_slots` gain test: it was conclusive, and for CRPS or MASE
+the family LCB is at least `gain_bar` with a positive point gain, while the
+other metric is non-inferior. A slot blocked by a guard is improved but has
+`claimed: false`. Each tag also records `margin = target_lcb - gain_bar`.
+The tags live in the `receipts/index.json` `lane_b_domains` column, in
+`status/v2.json` `lane_b.domain_tags`, in `cascade status` and in
+`cascade round`. The tests check:
+
+- the tags for a real verdict: an improved declared domain, a declared domain
+  that was not improved, an improved untargeted domain, an untargeted domain
+  that was not improved, and that the rule matches the judge;
+- the guard-blocked, inferior-other-metric, inconclusive and not-evaluated
+  cases;
+- that the signed receipt body, its digest and the weights are the same with
+  and without the tags, and that every other index column is unchanged;
+- that the status doc, the dashboard and `cascade status` accept the field
+  being absent.
