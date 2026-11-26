@@ -891,6 +891,11 @@ class _RollingMixin:
         _quarantine_lane_host(host, f"king pod {getattr(host, 'name', host)}: {reason}")
         for pod in pods:
             if instance_id and pod.instance_id == instance_id:
+                # 2026-11-26: the pod's evidence BEFORE it goes (bounded)
+                from .pod_postmortem import before_teardown
+
+                before_teardown(self, host, pod_name=str(instance_id),
+                                reason=f"king pod rotated (era {era.index}): {reason}")
                 self._teardown_operator_pod(pod)
         hosts = self.__dict__.get('_rolling_king_hosts', {})
         for index, value in list(hosts.items()):

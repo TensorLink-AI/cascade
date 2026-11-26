@@ -308,8 +308,13 @@ def rent_funded_pod(
     on_create_started: Callable[[], None] | None = None,
     gpu_health=None,
     ttl_seconds: float = 0.0,
+    before_cleanup: Callable[[Provider, str], None] | None = None,
 ) -> FundedRentResult:
     """Rent ONE pod for ``hotkey``'s challenger leg on ``hotkey``'s own key.
+
+    ``before_cleanup(provider, pod_id)`` (2026-11-26, best effort and
+    bounded by the caller) runs before a half-launched pod is terminated on
+    the failure path — the trainer's pod postmortem (lemon / not ready).
 
     Success returns the ledgered :class:`PodInstance` (stage ``"funded"``,
     ``payer_hotkey`` set — the caller appends it to the round ledger and saves
@@ -331,7 +336,9 @@ def rent_funded_pod(
             cpu_blocklist=cpu_blocklist, skus=skus, price_caps=price_caps,
             now_iso=now_iso, host_key_scanner=host_key_scanner, on_allocated=on_allocated,
             vault=vault, on_provider_selected=on_provider_selected,
-            gpu_health=gpu_health, ttl_seconds=ttl_seconds), rent_funded_pod)
+            gpu_health=gpu_health, ttl_seconds=ttl_seconds,
+            **({"before_cleanup": before_cleanup} if before_cleanup is not None else {})),
+            rent_funded_pod)
 
     def _fail(err: Exception | str, *, leaked_pod: str = "") -> FundedRentResult:
         msg = str(err)
@@ -556,6 +563,12 @@ def rent_funded_pod(
                     with contextlib.suppress(Exception):
                         provider.terminate(pid)
                     continue
+                if before_cleanup is not None:
+                    try:
+                        before_cleanup(provider, pid)
+                    except Exception as pe:  # noqa: BLE001 — evidence never blocks cleanup
+                        log.warning("funded cleanup of %s: postmortem hook failed: %s",
+                                    pid, pe)
                 if not terminate_verified(provider, pid):
                     raise ProvisionError("still listed live after terminate")
             except Exception as te:  # noqa: BLE001 — record loudly; never silent

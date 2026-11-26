@@ -167,6 +167,11 @@ class _OperatorPodMixin:
                     with contextlib.suppress(Exception):
                         strike(executor_id=str(provider.machine_of(pod_id) or ""),
                                ip=str(getattr(addr, "ip", "") or ""), reason=why)
+                # 2026-11-26: the pod's evidence BEFORE it goes (bounded)
+                from .pod_postmortem import before_teardown, provider_resolver
+
+                before_teardown(self, provider_resolver(provider, pod_id, profile),
+                                pod_name=str(pod_id), reason=f"king pod failed: {why}")
                 # Verified teardown, ledger row dropped only when CONFIRMED
                 # gone (bare terminate swallows a failed rm as success).
                 try:
@@ -619,6 +624,11 @@ class _OperatorPodMixin:
                 with contextlib.suppress(Exception):
                     strike(executor_id=str(provider.machine_of(pod_id) or ""),
                                ip=str(getattr(addr, "ip", "") or ""), reason=why)
+            # 2026-11-26: the pod's evidence BEFORE it goes (bounded)
+            from .pod_postmortem import before_teardown, provider_resolver
+
+            before_teardown(self, provider_resolver(provider, pod_id, profile),
+                            pod_name=str(pod_id), reason=f"operator leg pod failed: {why}")
             try:
                 if terminate_verified(provider, pod_id):
                     self._ledger_remove(pod_id)
@@ -933,6 +943,7 @@ class _OperatorPodMixin:
         from .harvest_release import arm_release, disarm_release
 
         armed = arm_release(self, release_pod)
+        succeeded = False              # the postmortem runs on every other exit
         try:
             from .progress import report_progress
 
@@ -965,7 +976,10 @@ class _OperatorPodMixin:
                 # The armed release (above) lets the pod go once the
                 # checkpoint is verified — on the box (ssh) or on R2 (r2
                 # transport) — before the Hippius push.
-                return self._harvest_funded_checkpoint(host, receipt, contract, seeds, suffix)
+                out = self._harvest_funded_checkpoint(host, receipt, contract, seeds, suffix)
+                succeeded = True
+                return out
+            succeeded = True
             return receipt
         except _FundedTamper as e:
             # The harvest hook's ingest guard: the same verdict as a payer leg.
@@ -1007,4 +1021,15 @@ class _OperatorPodMixin:
         finally:
             disarm_release(self, armed)
             if not released:
+                if not succeeded:
+                    # 2026-11-26: the pod's evidence BEFORE it goes (bounded)
+                    import sys
+
+                    from .pod_postmortem import before_teardown
+
+                    exc = sys.exc_info()[1]
+                    before_teardown(self, host, pod_name=str(pod_id),
+                                    reason=f"operator {role} leg {gen.hotkey[:12]}: "
+                                           f"{type(exc).__name__ if exc else 'aborted'}: "
+                                           f"{str(exc)[:500] if exc else ''}")
                 self._teardown_operator_pod(ledger_pod())
