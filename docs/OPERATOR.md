@@ -1000,6 +1000,20 @@ verified pending upload can still be reused; a required retrain follows the
 `operator_billed` rules below. An expired lane-B leg keeps its hotkey busy
 until its worker returns; scientific expiry does not terminate a GPU process.
 
+Lane B: all model work runs on the eval pod, never on the trainer box (owner
+rule 2026-11-26: no checkpoint download, torch model load or CPU forward
+there). The routing probe and the lineage-measurement read run on the pod(s)
+in `--lane-b-bench-hosts` (the bench's eval-hosts TOML, re-read per call;
+`cascade/trainer/lane_b_offload.py`): the pod pulls the checkpoint by digest
+into its own `_lane_b_offload/ckpt` cache, runs this release's code bundle
+(shipped by content hash) under `flock _lane_b_offload/.heavy.lock` in a
+uuid run dir, and returns the probe as byte-exact JSON. No host, an
+unreachable pod or a failed step raises `LaneBOffloadUnavailable`: the entry
+stays queued, nothing is charged, the next tick retries. `RunnerLaneBOps.fetch`,
+`judge` and `merge_scores` refuse on the box too (settlement waits until their
+offload lands). `CASCADE_LANE_B_LOCAL_EVAL=1` is the only local path (tests,
+dev boxes); never set it on the mainnet box.
+
 Required lane-B public suites must have `min_public_items` usable pairs for
 both CRPS and MASE. Different known data revisions, one missing revision pin,
 missing suites or insufficient required evidence hold trainer settlement or

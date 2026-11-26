@@ -850,7 +850,9 @@ class LaneBDriver:
                        if "tokens_seen" not in v]
         for epoch, binding in pending:
             try:
-                n = read_measurement(self.ops.fetch(binding["pointer"]), binding)
+                measure = getattr(self.ops, "lineage_measurement", None)
+                n = (measure(binding["pointer"], binding) if callable(measure)
+                     else read_measurement(self.ops.fetch(binding["pointer"]), binding))
             except (OSError, StorageError, ValueError, KeyError, TypeError) as e:
                 log.warning("lane B: lineage epoch %s unmeasured: %s", epoch, e)
                 continue
@@ -1005,8 +1007,14 @@ class LaneBDriver:
             may_open = open_rule_verdict(rule, self.st.lineage_tokens, lb, check)[0]
         probes: dict[str, RoutingProbe] = {}
         if want and (latched or may_open):
+            from .lane_b_offload import LaneBOffloadUnavailable
+
             for d in sorted(want):
-                probes[d] = self._probe(king_pointer, king_pointer, d, block)
+                try:
+                    probes[d] = self._probe(king_pointer, king_pointer, d, block)
+                except LaneBOffloadUnavailable as e:
+                    # no eval pod: its entries stay queued, uncharged (next tick)
+                    log.warning("lane B: %s routing probe deferred: %s", d, e)
         with self._lock:
             if routing:
                 self._record_routing(era_index, block, prev, king_pointer, routing)
@@ -1178,7 +1186,12 @@ class LaneBDriver:
             if hit is not None:
                 self._probes.move_to_end(key)
                 return hit
-        probe = _tel.probe_target_routing(self.ops.fetch(pointer), ctx, self.cfg.lane_b, domain)
+        remote = getattr(self.ops, "probe_routing", None)
+        if callable(remote):        # production: on the eval pod (never the trainer box)
+            probe = remote(pointer, ctx, domain)
+        else:
+            probe = _tel.probe_target_routing(self.ops.fetch(pointer), ctx, self.cfg.lane_b,
+                                              domain)
         with self._cache_lock:
             self._probes[key] = probe
             while len(self._probes) > 2 * self._cache_cap():
@@ -1868,11 +1881,16 @@ class RunnerLaneBOps:
     sidecar, and the rolling dispatcher (or a local train when the trainer
     runs without remote hosts)."""
 
-    def __init__(self, runner, client, window_source, *, device: str = "cpu", bench=None):
+    def __init__(self, runner, client, window_source, *, device: str = "cpu", bench=None,
+                 offload=None):
         self.r, self.client, self.source, self.device = runner, client, window_source, device
         # #909: the eval-pod lane-B bench (cascade.trainer.lane_b_bench.LaneBBench);
         # None = no --lane-b-bench-hosts: lane B fails closed, never benches here
         self.bench = bench
+        # model work (routing probe, lineage read) on the eval pod
+        # (cascade.trainer.lane_b_offload.LaneBPodRunner); None = refused
+        # unless CASCADE_LANE_B_LOCAL_EVAL=1 — never a local fallback
+        self.offload = offload
 
     # ── funding (DEC-CA-0059 item 8) ─────────────────────────────────────────
 
@@ -1936,7 +1954,38 @@ class RunnerLaneBOps:
         return affinity_contexts(self.r.cfg, self.source, domain, block=block)
 
     def fetch(self, pointer: str) -> Path:
+        """A checkpoint on THIS machine: refused on the trainer box (owner rule:
+        no checkpoint downloads, no torch there) unless CASCADE_LANE_B_LOCAL_EVAL=1."""
+        from .lane_b_offload import refuse_local
+
+        refuse_local(f"checkpoint download ({str(pointer)[-24:]})")
         return self.r._fetch_checkpoint_dir(pointer)
+
+    def _pod(self):
+        from .lane_b_offload import LaneBOffloadUnavailable
+
+        if self.offload is None:
+            raise LaneBOffloadUnavailable(
+                "lane B: no eval pod runner (--lane-b-bench-hosts) — model work never runs "
+                "on the trainer box; retried next tick")
+        return self.offload
+
+    def probe_routing(self, pointer: str, contexts: list, domain: str):
+        """The routing probe: on the eval pod; locally only under the opt-in."""
+        from .lane_b_offload import local_eval_allowed
+
+        lb = self.r.cfg.lane_b
+        if local_eval_allowed():
+            return _tel.probe_target_routing(self.fetch(pointer), contexts, lb, domain)
+        return self._pod().probe(pointer, contexts, int(lb.affinity_windows), domain)
+
+    def lineage_measurement(self, pointer: str, binding: dict) -> int:
+        from .lane_b_offload import local_eval_allowed
+        from .lineage import read_measurement
+
+        if local_eval_allowed():
+            return read_measurement(self.fetch(pointer), binding)
+        return self._pod().lineage(pointer, binding)
 
     def upload(self, ckpt_dir: Path, repo: str) -> str:
         from ..shared.hippius import upload_dir_to_hub_or_hf
@@ -2192,6 +2241,9 @@ class RunnerLaneBOps:
 
     def judge(self, manifest, round_id: str, block: int, sentinel: str | None = None,
               anchor_pointer: str | None = None) -> list:
+        from .lane_b_offload import refuse_local
+
+        refuse_local("judge (checkpoint evals)")
         from ..validator.evaluator import evaluate_checkpoint
         from ..validator.expert_lane import judge_manifest, verdict_windows
 
@@ -2225,6 +2277,9 @@ class RunnerLaneBOps:
                               **({"anchor_pointer": anchor_pointer} if anchor_pointer else {}))
 
     def merge_scores(self, pointer: str, block: int) -> list:
+        from .lane_b_offload import refuse_local
+
+        refuse_local("merge scores (checkpoint evals)")
         from ..validator.evaluator import evaluate_checkpoint
         from ..validator.expert_lane import verdict_windows
 
