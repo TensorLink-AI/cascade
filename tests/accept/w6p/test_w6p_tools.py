@@ -53,9 +53,13 @@ def test_rmisc_size_and_mirror_need_a_final_allowed_list(tmp_path):
     m = _load(MIRROR, "laned_public_mirror_accept2")
     root, _ = fx.rmisc_mirror(tmp_path)
     listing = _listing(tmp_path, root)
-    with pytest.raises(SystemExit, match="pending"):
-        m.main(["size", "--source", fx.RMISC, "--listing", str(listing)])
     idx = importlib.import_module("cascade.eval.lane_d_public_index")
+    # An explicit pending list (the repo's own list is final since 2026-11-26).
+    pending = tmp_path / "pending.toml"
+    pending.write_text(idx.render_allowed_list(status="pending", generated_by="t", folders=[]))
+    with pytest.raises(SystemExit, match="pending"):
+        m.main(["size", "--source", fx.RMISC, "--listing", str(listing),
+                "--allowed", str(pending)])
     allowed = tmp_path / "allowed.toml"
     allowed.write_text(idx.render_allowed_list(status="final", generated_by="t", folders=[
         {"name": "FewLong", "reason": "k", "licence": "MIT", "domain": "d", "freq": "h",
