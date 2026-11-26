@@ -45,6 +45,7 @@ real wiring (``RunnerLaneBOps``) stays a thin adapter.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -294,6 +295,19 @@ def _funded_leg_length(funding: dict, base):
     steps = min(int(funding.get("leg_steps", 0) or 0), reference_steps(base, hours))
     return LegLength(train_hours=hours, steps=max(1, steps),
                      guard_seconds=int(funding.get("leg_guard_seconds", 0) or 0))
+
+
+def _measured_rate_of(gpus, contract):
+    """``sku -> steps/s`` at ``contract``'s context from lane B's WB19 table
+    (measured at 4096; the WB27 context lever scales it like the intake
+    does), ``None`` for an unmeasured type."""
+    scale = 4096 / max(1, int(getattr(contract, "context_length", 4096) or 4096))
+
+    def rate_of(sku: str):
+        rate = gpus.rate(sku) if sku else None
+        return None if rate is None else float(rate.steps_per_s) * scale
+
+    return rate_of
 
 
 def _slice_digest(contexts: list) -> str:
@@ -2087,8 +2101,16 @@ class RunnerLaneBOps:
                     gpu=str(f.get("gpu", "") or ""),
                     allow_fallback=bool(f.get("gpu_allow_fallback", False)),
                     max_price_per_hour=float(f.get("gpu_max_price_per_hour", 0.0) or 0.0))
+                from .cost_guards import wall_bounded_leg
+
+                # 2026-11-26: a leg funded without train_hours is bounded by
+                # its wall (for_hours keeps lane A's step count): its
+                # watchdog judges the wall's worth of steps at the WB19 rate
+                # of the type it rents, never the contract's
+                wall_bounded = (wall_bounded_leg(self.r, _measured_rate_of(gpus, contract))
+                                if length is None else contextlib.nullcontext())
                 try:
-                    with rent_scope(self.r, gpus, only=own_risk):
+                    with rent_scope(self.r, gpus, only=own_risk), wall_bounded:
                         entry = self.r._run_funded_leg(
                             self.r._dispatcher(), gen, seeds, int(block), contract,
                             f"-x{label}-u{leg.sub.uid}", warm_start_ref=leg.base_king_ref,

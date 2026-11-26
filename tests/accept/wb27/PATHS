@@ -51,3 +51,5 @@ cascade/trainer/lane_b_bench.py
 cascade/trainer/merge_acceptance.py
 # 2026-11-26: own lane B model hosts, pod cache root, disk guard, selective fetch.
 cascade/shared/hippius.py
+# 2026-11-26: a lane B leg without train_hours is judged wall-bounded (watchdog).
+cascade/trainer/cost_guards.py
