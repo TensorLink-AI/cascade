@@ -153,9 +153,13 @@ def test_prebench_never_fetches_on_the_box_without_the_opt_in(tmp_path, monkeypa
     fetched = []
     lb, fake = _bench(tmp_path, fetch=lambda p: fetched.append(p) or _ckpt(tmp_path, p))
     lb.prebench("kingptr")
-    with pytest.raises(OSError, match="refused on the trainer box"):
+    refused = None
+    try:
         _drain(lb)
-    assert fetched == [] and fake.calls == []
+    except OSError as e:
+        refused = str(e)
+    assert fetched == [] and fake.calls == [], "checkpoint fetched / benched via the box"
+    assert refused is not None and "refused on the trainer box" in refused
 
 
 def test_runner_ops_without_bench_host_never_run_locally(caplog):
