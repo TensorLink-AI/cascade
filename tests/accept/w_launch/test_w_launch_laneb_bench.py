@@ -123,7 +123,10 @@ def test_every_failure_fails_closed_and_caches_nothing(tmp_path, why):
         assert fake.calls == []
 
 
-def test_prebench_fetches_on_the_worker_and_stops_once_cached(tmp_path):
+def test_prebench_fetches_on_the_worker_and_stops_once_cached(tmp_path, monkeypatch):
+    # the box-side fetch is the lane-B offload guard's local opt-in (2026-11-26;
+    # production stages pointer benches on the eval pod: test_lane_b_settle_on_pod)
+    monkeypatch.setenv("CASCADE_LANE_B_LOCAL_EVAL", "1")
     fetched = []
     root = tmp_path / "hub"
 
@@ -140,6 +143,23 @@ def test_prebench_fetches_on_the_worker_and_stops_once_cached(tmp_path):
     lb.prebench("kingptr")                        # cached: nothing queued
     assert lb.pending() == 0 and lb._q.empty()
     assert lb.rows(root / "kingptr") is not None
+
+
+def test_prebench_never_fetches_on_the_box_without_the_opt_in(tmp_path, monkeypatch):
+    """2026-11-26 (owner rule: no checkpoint download on the trainer box): with
+    no eval-pod runner the worker's box-side fetch is refused unless
+    CASCADE_LANE_B_LOCAL_EVAL=1 — the bench is never swept, nothing fetched."""
+    monkeypatch.delenv("CASCADE_LANE_B_LOCAL_EVAL", raising=False)
+    fetched = []
+    lb, fake = _bench(tmp_path, fetch=lambda p: fetched.append(p) or _ckpt(tmp_path, p))
+    lb.prebench("kingptr")
+    refused = None
+    try:
+        _drain(lb)
+    except OSError as e:
+        refused = str(e)
+    assert fetched == [] and fake.calls == [], "checkpoint fetched / benched via the box"
+    assert refused is not None and "refused on the trainer box" in refused
 
 
 def test_runner_ops_without_bench_host_never_run_locally(caplog):

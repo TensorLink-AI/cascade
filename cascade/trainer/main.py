@@ -430,13 +430,17 @@ def _lane_b_bench(args, cfg, runner):
                       "(public rows are benched only on an eval pod, never on this box)")
         return None
     log.info("lane B: public rows benched on the eval pod(s) in %s", path)
+    # pointer benches (#909 prebench) stage on the eval pod (fetch + content
+    # key + pin there); the box-side fetch is only the guarded local opt-in
     return LaneBBench(hosts_path=path, cache_dir=Path(args.work_root) / "lane_b_bench_rows",
-                      eval_cfg=cfg.eval, fetch=runner._fetch_checkpoint_dir)
+                      eval_cfg=cfg.eval, fetch=runner._fetch_checkpoint_dir,
+                      pod=_lane_b_offload(args))
 
 
 def _lane_b_offload(args):
-    """Lane B model work (routing probe, lineage read) on the same eval pod(s)
-    as the lane-B bench; None ⇒ refused (never run on the trainer box)."""
+    """Lane B model work (routing probe, lineage read, judge, settlement
+    rebase, era-init merges, bench staging) on the same eval pod(s) as the
+    lane-B bench; None ⇒ refused (never run on the trainer box)."""
     from .lane_b_offload import LaneBPodRunner
 
     path = getattr(args, "lane_b_bench_hosts", None)

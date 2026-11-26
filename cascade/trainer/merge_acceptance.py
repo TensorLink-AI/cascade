@@ -2,27 +2,26 @@
 
 from __future__ import annotations
 
-import shutil
 from dataclasses import asdict
 from pathlib import Path
 
 from ..shared.lane_b import DomainWin
 from ..validator.merge_acceptance import acceptance_seed, judge_acceptance
-from .expert_lane import apply_merges, merge_rows
+from .expert_lane import merge_rows
 
 
 class MergeAcceptancePending(TimeoutError):
     """Acceptance runs in the background; no new-init leg may start yet."""
 
 
-def accept_candidates(pending, *, init_pointer, init_dir, work_dir, block, ops, cfg, names, load):
-    from safetensors.torch import load_file
-
-    from .ckpt_digest import save_tensors_hashed
-    from .moe_model import MergeError
-
-    base = load_file(str(init_dir / "weights.safetensors"))
+def accept_candidates(pending, *, init_pointer, work_dir, block, ops, cfg, model):
+    """Accept the qualified merges one at a time. ``model`` (the driver's
+    :class:`~cascade.trainer.lane_b_model.LaneBModel` interface — the eval
+    pod for the trainer) stages each ``init + accepted + proposal`` and
+    uploads it; ``ops.merge_scores`` scores it (on the pod too). Torch-free
+    here: no checkpoint is read on the caller's machine."""
     from ..eval.public_guards import MissingPublicGuard, pair_public_rows
+    from .lane_b_model import MergeRefused
 
     def require_rows(left, right):
         try:
@@ -32,7 +31,7 @@ def accept_candidates(pending, *, init_pointer, init_dir, work_dir, block, ops, 
             raise OSError(f"acceptance public benchmarks unavailable or incompatible: {e}") from e
 
     anchor_scores = ops.merge_scores(init_pointer, block)
-    anchor_rows = ops.bench_rows(init_dir) or {}
+    anchor_rows = model.rows(init_pointer) or {}
     require_rows(anchor_rows, anchor_rows)
     before, before_scores, before_rows = init_pointer, anchor_scores, anchor_rows
     accepted, rejected, outcomes, taken, paid_targets = [], [], [], set(), set()
@@ -46,13 +45,11 @@ def accept_candidates(pending, *, init_pointer, init_dir, work_dir, block, ops, 
         if paid_targets & {w.domain for w in qualified}:
             continue  # a slot cannot replace another accepted miner in this batch
         proposal = dict(original)
-        stage = Path(work_dir) / f"acceptance-{block}-{i}"
-        stage.mkdir(parents=True, exist_ok=True)
-        for file in ("config.json", "model.py", "forecast_wrapper.py"):
-            shutil.copyfile(init_dir / file, stage / file)
         try:
-            state = apply_merges(base, accepted + [proposal], load, names, strict=True)
-        except MergeError as e:
+            pointer, handle = model.stage(init_pointer, accepted + [proposal],
+                                          out_dir=Path(work_dir) / f"acceptance-{block}-{i}",
+                                          repo=f"ckpt-acceptance-{block}-{i}", strict=True)
+        except MergeRefused as e:
             rejected.append(original)
             outcomes.append({**identity, "round_id": proposal["round_id"], "hotkey": qualified[0].hotkey,
                              "uid": qualified[0].uid, "domain": qualified[0].domain,
@@ -60,10 +57,8 @@ def accept_candidates(pending, *, init_pointer, init_dir, work_dir, block, ops, 
                              "outcome": "acceptance_rejected", "acceptance_block": block,
                              "detail": {"reason": str(e)}})
             continue
-        save_tensors_hashed(state, stage / "weights.safetensors")
-        pointer = ops.upload(stage, f"ckpt-acceptance-{block}-{i}")
         scores = ops.merge_scores(pointer, block)
-        rows = ops.bench_rows(stage) or {}
+        rows = model.bench(handle) or {}
         require_rows(before_rows, rows)
         require_rows(anchor_rows, rows)
         public = {"anchor": anchor_rows, "before": before_rows, "candidate": rows}
