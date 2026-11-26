@@ -107,3 +107,11 @@ cascade/pool/pool_d_build.py
 cascade/laned/elastic.py
 tests/unit/test_pool_d_snapshot_selection.py
 docs/EVAL_POOL.md
+
+# 2026-11-26 pool_d builder OOM (pool_d_build over a 20 GB / 7,002-feed
+# records.jsonl reached 39.3 GB RSS): FirstSeenLog.feed_index() streams the
+# log once and holds one feed at a time; pool_d_build and verify_snapshot use
+# it; answers and pool_d output pinned against the previous whole-log index().
+cascade/pool/first_seen.py
+cascade/pool/pool_d_build.py
+tests/unit/test_first_seen_index_memory.py

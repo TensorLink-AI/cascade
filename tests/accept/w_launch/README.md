@@ -147,3 +147,30 @@ the same way.
 with the feed count, on a baseline run and over a long history.
 `tests/unit/test_first_seen_record_memory.py` pins byte-identical logs
 against the previous implementation, kept verbatim in the test.
+
+## pool_d builder OOM: the first-seen index bounded by one feed (2026-11-26)
+
+`python -P -m cascade.pool.pool_d_build` over a 20 GB / 7,002-feed
+`records.jsonl` reached 39.3 GB RSS within 5 min on the 39 GB builder and
+filled swap. `FirstSeenLog.index()` held every record of the log and a
+`(feed, panel_json, ts) -> (seen, root, baseline)` dict of every committed
+point before the build looked at its first feed.
+
+- `FirstSeenLog.feed_index()` makes one streaming pass over `records.jsonl`.
+  It checks every committed root from 32-byte leaf hashes and keeps, per feed,
+  only the byte spans of the usable records. The errors, and which one wins,
+  are the previous `index()`'s.
+- The returned `FirstSeenFeedIndex` loads one feed's points on its first
+  lookup and drops the previous feed's. `pool_d_build` already walks feeds in
+  sorted order, so it takes each feed's lag and lookups from one load.
+  `verify_snapshot` checks series grouped by feed and reports them in order.
+- `index()` still returns the whole-log `FirstSeenIndex` and is now built
+  feed by feed from the same scan.
+- The output is byte-identical. Record, root and quarantine formats, schemas
+  and digests are unchanged.
+
+`test_w_launch_first_seen_index_memory.py` pins that the peak memory of the
+pool_d index walk and of `verify_snapshot` does not grow with the feed count.
+`tests/unit/test_first_seen_index_memory.py` pins identical lookups, lags,
+errors, `verify_snapshot` results and `pool_d_build` output files against the
+previous implementation, kept verbatim in the test.

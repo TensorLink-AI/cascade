@@ -296,12 +296,14 @@ def build_pool_d(*, forge_dir: Path | str, selection, first_seen_dir: Path | str
     from .first_seen import unreadable_limit
 
     fs_log = FirstSeenLog(first_seen_dir)
-    index = fs_log.index(until_ts=as_of_ts)
+    # One feed's first-seen points in memory at a time (2026-11-26: the
+    # whole-log index of a 20 GB records.jsonl reached 39.3 GB RSS); feeds
+    # are walked in order below and every lookup is for the current feed.
+    index = fs_log.feed_index(until_ts=as_of_ts)
     quarantined = fs_log.quarantined(until_ts=as_of_ts)
     quarantine_report = fs_log.quarantine_report(until_ts=as_of_ts)
     unreadable: list[list[str]] = []
     n_files_read = 0
-    lags = index.feed_lag()
     frontiers = _prior_frontiers(prior_dirs, as_of_ts)
     reader = TsbenchForgeSource(forge)
     as_of_day = dt.datetime.fromtimestamp(as_of_ts, tz=dt.UTC).date()
@@ -330,8 +332,9 @@ def build_pool_d(*, forge_dir: Path | str, selection, first_seen_dir: Path | str
         if entry is None or mapped is None:
             refused.update({s.pool_d_series_id: "not_in_forge" for s in sels})
             continue
-        lag = lags.get(feed, {"mirror_lag_hours": None, "max_lead_hours": None,
-                              "publish_ahead": False})
+        lag = index.feed_lag([feed]).get(feed, {"mirror_lag_hours": None,
+                                                "max_lead_hours": None,
+                                                "publish_ahead": False})
         emb = effective_embargo_hours(entry, global_hours=cfg.embargo_hours,
                                       publish_ahead=bool(lag["publish_ahead"]))
         if emb is None:
@@ -448,6 +451,7 @@ def build_pool_d(*, forge_dir: Path | str, selection, first_seen_dir: Path | str
         for base, sel_list in wanted.items():
             if base not in found:
                 refused.update({s.pool_d_series_id: "not_in_forge" for s in sel_list})
+    index.release()
 
     limit = unreadable_limit(n_files_read, max_files=cfg.max_unreadable_files,
                              max_frac=cfg.max_unreadable_frac)
