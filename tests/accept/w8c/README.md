@@ -172,6 +172,16 @@ forecast_entry(cache, digest, windows, *, context, horizon, contexts, grant=None
   a result that isn't `(len(windows), horizon, 9)` finite, is
   `forecast_malformed`. Any other exception is `forecast_failed`.
 - Torch-free at import (the scorer imports torch lazily).
+- Startup self-check (2026-11-26, `test_w8c_host_modules.py`):
+  `check_host_modules(cmd, *, hippius_mirror=False) -> str | None` looks up
+  `HOST_MODULES[cmd]` (`public`: torch, safetensors, pyarrow; `forecast`:
+  torch, safetensors; plus `MIRROR_MODULES` (boto3) for a `public` without
+  `--public-root`) with `importlib.util.find_spec` (nothing imported). `main`
+  runs it before reading stdin; a missing module exits
+  `EXIT_MISSING_MODULES` (3, a host failure, never a miner fault) with one
+  stderr line naming the module(s), their extras (`MODULE_EXTRAS`) and
+  `uv sync --frozen --extra train --extra hippius --extra chain --extra
+  pool-forge`. `hello` is not checked.
 
 ### The entry point (`cascade/validator/main.py`)
 

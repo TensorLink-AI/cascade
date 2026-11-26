@@ -12,6 +12,8 @@
 #   (OPSLOG 2026-11-22: 5.7 GB free is the failure class).
 # - /data/bench: 17747 files, suite identities gift 30841734 / boom 69325b54 /
 #   time 83e3d0b3 / fev 6de245af (cascade.validator.bench_identity).
+# No uv_extras: the gate host runs the bench in the benchmarks/ sidecar venv
+# (`sync --bench-venv`), not the lane D forecast worker.
 schema = "laned_evalhost_profile/1"
 name = "bench_gate"
 gpu_model = "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"

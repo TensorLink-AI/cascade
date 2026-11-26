@@ -1089,10 +1089,22 @@ def builder_run_steps(cfg: ElasticConfig, inst: Mapping, *, now_ts: int
                       remote=f"bash -c {shlex.quote(script)}"))]
 
 
+def profile_uv_extras(profile_path: str | Path) -> list[str]:
+    """The R12 profile's ``uv_extras`` (pyproject optional-dependencies groups
+    the eval host's release venv needs); ``[]`` when the profile has none."""
+    data = tomllib.loads(Path(profile_path).read_text(encoding="utf-8"))
+    extras = data.get("uv_extras", [])
+    if not isinstance(extras, list) or not all(isinstance(e, str) for e in extras):
+        raise ElasticError("usage", f"{profile_path}: uv_extras must be a list of names")
+    return list(dict.fromkeys(extras))
+
+
 def eval_bootstrap_steps(cfg: ElasticConfig, inst: Mapping, *, release_dir: str
                          ) -> list[tuple[str, list[str]]]:
     """Per host: pin the key, the R12 on-rent check against the candidate's
-    profile (GPU model / VRAM / driver / disk), then R12's release sync."""
+    profile (GPU model / VRAM / driver / disk), then R12's release sync with
+    the profile's ``uv_extras`` (2026-11-26: a sync without them left the host
+    without torch / pyarrow, so the lane D public half failed)."""
     e = cfg.eval_host
     kh = known_hosts_for(cfg, inst)
     cap = known_hosts_for(cfg, inst) + ".smi"
@@ -1109,7 +1121,9 @@ def eval_bootstrap_steps(cfg: ElasticConfig, inst: Mapping, *, release_dir: str
         ("venv_sync", tool + ["sync", "--release-dir", release_dir,
                               "--host", f"{inst['user']}@{inst['ip']}",
                               "--port", str(inst["port"]), "--known-hosts", kh,
-                              "--dest", "/root/cascade"]),
+                              "--dest", "/root/cascade"]
+         + [a for e in profile_uv_extras(f"{release_dir}/{inst['profile']}")
+            for a in ("--extra", e)]),
     ]
 
 
