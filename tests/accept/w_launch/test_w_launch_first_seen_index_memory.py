@@ -55,23 +55,29 @@ def _peak(fn) -> int:
         tracemalloc.stop()
 
 
-def _walk(fs, log_dir: Path) -> None:
-    """What pool_d_build does: feed by feed, the lag then point lookups."""
-    idx = fs.FirstSeenLog(log_dir).feed_index(until_ts=T0 + PERIOD)
-    for feed in idx.feeds():
-        assert idx.feed_lag([feed])[feed]["max_lead_hours"] is not None
+def _walk(fs, log_dir: Path, n_feeds: int) -> None:
+    """What pool_d_build does: feed by feed, the lag then point lookups (on
+    base, without ``feed_index``, over the whole-log ``index()`` it used)."""
+    log = fs.FirstSeenLog(log_dir)
+    lazy = hasattr(log, "feed_index")
+    idx = (log.feed_index if lazy else log.index)(until_ts=T0 + PERIOD)
+    for i in range(n_feeds):
+        feed = f"feed{i:03d}"
+        lag = idx.feed_lag([feed]) if lazy else idx.feed_lag()
+        assert lag[feed]["max_lead_hours"] is not None
         for j in range(0, 2 * POINTS, 97):
             assert idx.first_seen(feed, PANEL, T0 - 86400 * 30 + j * 600) is not None
             assert idx.root_for(feed, PANEL, T0 - 86400 * 30 + j * 600)
-    idx.release()
+    if lazy:
+        idx.release()
 
 
 def test_pool_d_index_walk_peak_does_not_grow_with_feed_count(tmp_path):
     from cascade.pool import first_seen as fs
 
     small, large = _log(fs, tmp_path / "s", 2), _log(fs, tmp_path / "l", 16)
-    p_small = _peak(lambda: _walk(fs, small))
-    p_large = _peak(lambda: _walk(fs, large))
+    p_small = _peak(lambda: _walk(fs, small, 2))
+    p_large = _peak(lambda: _walk(fs, large, 16))
     assert p_large < 2.0 * p_small, (
         f"the pool_d first-seen index peak grows with the feed count: {p_small} B over 2 "
         f"feeds, {p_large} B over 16 (every feed's points held at once)")
