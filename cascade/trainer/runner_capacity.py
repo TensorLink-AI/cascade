@@ -106,10 +106,15 @@ class _FundedCapacityMixin:
         contract = getattr(self.__dict__.get("_leg_local_obj"), "funded_contract", None)
         if contract is not None:
             default = int(getattr(contract, "max_train_seconds", default))
+        # 2026-11-26 audit: a lane B / MarketCast leg's per-leg cost is its
+        # own contract wall on every type, never lane A's full-budget table
+        # (a 12 h lane B leg passed the $/leg cap at lane A's 3.4 h)
+        walls = (() if _scoped_rent_skus(self) is not None
+                 else tuple(getattr(rnd, "funded_sku_wall_seconds", ()) or ()))
         return {
             "max_price_per_hour": float(getattr(rnd, "funded_max_price_per_hour", 0.0) or 0.0),
             "max_leg_cost_usd": float(getattr(rnd, "funded_max_leg_cost_usd", 0.0) or 0.0),
-            "sku_wall_seconds": tuple(getattr(rnd, "funded_sku_wall_seconds", ()) or ()),
+            "sku_wall_seconds": walls,
             "default_wall_seconds": float(default),
         }
 
@@ -190,9 +195,13 @@ class _FundedCapacityMixin:
         ucap = unmeasured_wall_cap(leg_round_view(self))
         if ucap > 0:
             return min(float(cap), ucap)
-        if _mkt_rent_skus(self) is not None:
+        if _scoped_rent_skus(self) is not None:
             # a MarketCast leg trains its recipe's wall (the contract's), on
-            # any GPU: lane A's full-budget wall table never applies to it
+            # any GPU: lane A's full-budget wall table never applies to it.
+            # 2026-11-26 audit: nor to a lane B leg — the table times lane A's
+            # 23,841-step leg (8xH200 12270 s), while a lane B leg's wall is its
+            # own contract's (3 h for_hours, up to 54000 s with train_hours):
+            # a 12 h leg was projected, approved and balance-checked at ~3.4 h
             return float(cap)
         walls = tuple(getattr(rnd, "funded_sku_wall_seconds", ()) or ())
         if sku:
