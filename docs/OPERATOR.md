@@ -1009,10 +1009,15 @@ into its own `_lane_b_offload/ckpt` cache, runs this release's code bundle
 (shipped by content hash) under `flock _lane_b_offload/.heavy.lock` in a
 uuid run dir, and returns the probe as byte-exact JSON. No host, an
 unreachable pod or a failed step raises `LaneBOffloadUnavailable`: the entry
-stays queued, nothing is charged, the next tick retries. `RunnerLaneBOps.fetch`,
-`judge` and `merge_scores` refuse on the box too (settlement waits until their
-offload lands). `CASCADE_LANE_B_LOCAL_EVAL=1` is the only local path (tests,
-dev boxes); never set it on the mainnet box.
+stays queued, nothing is charged, the next tick retries. The self-judge and
+merge-acceptance scores (`judge`, `merge_scores`) also run on the pod: the
+verdict windows are drawn on the box, `evaluate_checkpoint` runs on the pod
+(device `cpu` unless `CASCADE_LANE_B_POD_DEVICE` is set) and the judge's
+stage-`merge` check runs there through `judge_entry(merge_check=)`; scores
+return as exact JSON. `RunnerLaneBOps.fetch` refuses on the box, so the
+settlement rebase still fails closed until it is offloaded.
+`CASCADE_LANE_B_LOCAL_EVAL=1` is the only local path (tests, dev boxes);
+never set it on the mainnet box.
 
 Required lane-B public suites must have `min_public_items` usable pairs for
 both CRPS and MASE. Different known data revisions, one missing revision pin,

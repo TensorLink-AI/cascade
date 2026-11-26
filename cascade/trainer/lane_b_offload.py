@@ -55,7 +55,7 @@ LOCAL_EVAL_ENV = "CASCADE_LANE_B_LOCAL_EVAL"
 PROBE_SCHEMA = "lane-b-routing-probe/1"
 OFFLOAD_DIR = "_lane_b_offload"
 # pod-side checkpoint cache entries kept (this module's own dir only)
-CKPT_KEEP = 3
+CKPT_KEEP = 4
 CODE_KEEP = 3
 PROBE_TIMEOUT_S = 1800
 LOCK_WAIT_S = 1200
@@ -211,11 +211,12 @@ class LaneBPodRunner:
 
         return (self._run or run_ssh)(build_scp_argv(host, str(local), remote), timeout, "")
 
-    def _call(self, op: str, pointer: str, request: dict, contexts: list | None) -> dict:
+    def _call(self, op: str, pointer: str, request: dict, contexts: list | None,
+              payload: object = None, timeout_s: int | None = None) -> dict:
         import tempfile
 
         host = self.host()
-        deadline = time.monotonic() + self.timeout_s
+        deadline = time.monotonic() + int(timeout_s or self.timeout_s)
         q = shlex.quote
         root = f"{host.workdir}/{OFFLOAD_DIR}"
         run_dir = f"{root}/runs/{uuid.uuid4().hex}"
@@ -243,6 +244,11 @@ class LaneBPodRunner:
                     {**request, "op": op, "pointer": pointer}), encoding="utf-8")
                 if contexts is not None:
                     write_contexts(local / "contexts.npz", contexts)
+                if payload is not None:
+                    # box -> OUR pod only (the reply is JSON, never a pickle)
+                    import pickle
+
+                    (local / "payload.pkl").write_bytes(pickle.dumps(payload, protocol=4))
                 have = ok(self._ssh(host, f"umask 077 && mkdir -p {q(run_dir)} && "
                                     f"{{ test -f {q(code + '/.ok')} && echo HAVE_CODE || true; }}",
                                     left()), "run dir setup")
@@ -260,6 +266,9 @@ class LaneBPodRunner:
                 if contexts is not None:
                     ok(self._put(host, local / "contexts.npz", f"{run_dir}/contexts.npz",
                                  left()), "contexts upload")
+                if payload is not None:
+                    ok(self._put(host, local / "payload.pkl", f"{run_dir}/payload.pkl",
+                                 left()), "payload upload")
                 fwd = {k: os.environ[k] for k in _FORWARD_ENV if os.environ.get(k)}
                 src = "set -a && . /dev/stdin && set +a && " if fwd else ""
                 stdin = "".join(f"{k}={q(v)}\n" for k, v in fwd.items())
@@ -309,6 +318,81 @@ class LaneBPodRunner:
         return n
 
 
+    def evaluate(self, pointer: str, windows: list, *, num_samples: int, contract,
+                 quantile_head: bool, quantile_batch: int) -> list:
+        """The pod's :func:`validator.evaluator.evaluate_checkpoint` of
+        ``pointer`` on ``windows`` (device: :func:`pod_device`), decoded to
+        the same ``WindowScore`` list."""
+        doc = self._call("eval", pointer, {}, None, payload={
+            "windows": list(windows), "num_samples": int(num_samples), "contract": contract,
+            "quantile_head": bool(quantile_head), "quantile_batch": int(quantile_batch),
+            "device": pod_device()}, timeout_s=EVAL_TIMEOUT_S)
+        try:
+            return decode_scores(doc)
+        except (KeyError, TypeError, ValueError) as e:
+            raise LaneBOffloadUnavailable(f"lane B eval: malformed pod reply ({e})") from e
+
+    def merge_check(self, king_pointer: str, cand_pointer: str, selection: dict,
+                    strict: bool) -> str | None:
+        """The pod's :func:`validator.expert_lane.merge_check_dirs` of the two
+        checkpoints: None (mergeable) or the refusal reason."""
+        doc = self._call("merge_check", king_pointer, {"pointers": [king_pointer, cand_pointer]},
+                         None, payload={"selection": selection, "strict": bool(strict)})
+        if not isinstance(doc, dict) or "merge_error" not in doc:
+            raise LaneBOffloadUnavailable("lane B merge check: malformed pod reply")
+        err = doc["merge_error"]
+        if err is not None and not isinstance(err, str):
+            raise LaneBOffloadUnavailable("lane B merge check: malformed pod reply")
+        return err
+
+
+EVAL_TIMEOUT_S = 3 * 3600
+POD_DEVICE_ENV = "CASCADE_LANE_B_POD_DEVICE"
+SCORES_SCHEMA = "lane-b-window-scores/1"
+
+
+def pod_device() -> str:
+    """The pod-side eval device: ``cpu`` (the device the box path used, so the
+    scores are identical) unless ``CASCADE_LANE_B_POD_DEVICE`` says otherwise."""
+    return os.environ.get(POD_DEVICE_ENV, "").strip() or "cpu"
+
+
+def _num(x) -> float:
+    return float(x)
+
+
+def encode_scores(scores: list) -> dict:
+    """``WindowScore`` list as JSON: floats by ``float.hex`` (exact, NaN/inf
+    safe), arrays as raw bytes."""
+    rows = []
+    for s in scores:
+        rows.append({"series_id": str(s.series_id), "mase": _num(s.mase).hex(),
+                     "qloss_per_q": _enc_array(np.asarray(s.qloss_per_q)),
+                     "abs_target": _num(s.abs_target).hex(),
+                     "quantile_levels": [_num(q).hex() for q in s.quantile_levels],
+                     "channel": int(s.channel), "domain": str(s.domain),
+                     "source": None if s.source is None else str(s.source)})
+    return {"schema": SCORES_SCHEMA, "scores": rows}
+
+
+def decode_scores(doc: dict) -> list:
+    from ..eval.scoring import WindowScore
+
+    if not isinstance(doc, dict) or doc.get("schema") != SCORES_SCHEMA:
+        raise ValueError("lane B scores reply: unknown schema")
+    out = []
+    for r in doc["scores"]:
+        src = r["source"]
+        if src is not None and not isinstance(src, str):
+            raise ValueError("lane B scores reply: bad source")
+        out.append(WindowScore(
+            series_id=str(r["series_id"]), mase=float.fromhex(r["mase"]),
+            qloss_per_q=_dec_array(r["qloss_per_q"]), abs_target=float.fromhex(r["abs_target"]),
+            quantile_levels=tuple(float.fromhex(q) for q in r["quantile_levels"]),
+            channel=int(r["channel"]), domain=str(r["domain"]), source=src))
+    return out
+
+
 # ── pod side ─────────────────────────────────────────────────────────────────
 
 
@@ -355,7 +439,14 @@ def pod_main(argv: list[str] | None = None) -> int:
 
     with contextlib.suppress(OSError):
         _pod_prune_code(root, Path(__file__).resolve().parents[2])
-    ckpt = _pod_fetch(req["pointer"], root)
+    pointers = list(req.get("pointers") or [req["pointer"]])
+    dirs = [_pod_fetch(p, root) for p in pointers]
+    ckpt = dirs[0]
+    payload = None
+    if (run_dir / "payload.pkl").is_file():
+        import pickle
+
+        payload = pickle.loads((run_dir / "payload.pkl").read_bytes())  # noqa: S301 — from our box
     if op == "probe":
         from .expert_lane import probe_target_routing
 
@@ -370,6 +461,18 @@ def pod_main(argv: list[str] | None = None) -> int:
             out = {"tokens_seen": read_measurement(ckpt, req["binding"])}
         except (OSError, ValueError, KeyError, TypeError) as e:
             out = {"error": f"{type(e).__name__}: {e}"}
+    elif op == "eval":
+        from ..validator.evaluator import evaluate_checkpoint
+
+        out = encode_scores(evaluate_checkpoint(
+            ckpt, payload["windows"], num_samples=payload["num_samples"],
+            device=payload["device"], contract=payload["contract"],
+            quantile_head=payload["quantile_head"], quantile_batch=payload["quantile_batch"]))
+    elif op == "merge_check":
+        from ..validator.expert_lane import merge_check_dirs
+
+        out = {"merge_error": merge_check_dirs(dirs[0], dirs[1], payload["selection"],
+                                               strict=payload["strict"])}
     else:
         raise SystemExit(f"unknown op {op!r}")
     tmp = run_dir / "result.json.tmp"
