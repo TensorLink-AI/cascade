@@ -55,8 +55,20 @@ def _key(queue_name: str, hotkey: str) -> str:
     return f"{queue_name}:{hotkey}"
 
 
+def _bare_ref(ref) -> str:
+    """A generator ref without a lane B ``<domain>|`` prefix.
+
+    A lane B queue entry's ref is ``"<domain>|<generator ref>"`` while the
+    make-good request is filed under the generator ref alone (``gen.ref``):
+    comparing them raw meant no lane B approval ever matched (2026-11-26).
+    A generator ref never contains ``|``, so only that prefix is dropped."""
+    s = str(ref or "")
+    head, sep, tail = s.partition("|")
+    return tail if sep and "/" not in head and "@" not in head else s
+
+
 def _bound(r: dict, *, ref: str, funded_at: float | None) -> bool:
-    if r.get("ref") != ref:
+    if _bare_ref(r.get("ref")) != _bare_ref(ref):
         return False
     fa = r.get("funded_at")
     return fa is None or funded_at is None or float(fa) == float(funded_at)
