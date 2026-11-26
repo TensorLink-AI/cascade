@@ -60,6 +60,7 @@ import numpy as np
 from ..shared.atomic import read_text_with_backup, write_text_atomic
 from ..shared.era import image_record_at
 from . import expert_lane as _tel
+from . import leg_reattach as _reattach
 from .expert_lane import (
     GATE_TOKENS_SHORT,
     OPEN_RULE_COGATE,
@@ -73,6 +74,7 @@ from .expert_lane import (
     routing_metrics,
     routing_stale_union,
     settle_leg,  # noqa: F401 — the model's rebase calls it through this module
+    submission_key,
     union_selection,
 )
 from .row_claims import (
@@ -215,6 +217,15 @@ class LaneBDriverState:
     # so a restart never resets the ``sentinel_max_defer_eras`` bound; pruned
     # to the submissions still pending or open
     sentinel_deferrals: dict[str, list[int]] = field(default_factory=dict)
+    # 2026-11-26 re-attach (parity with lane A): leg key (:func:`_attach_key`)
+    # -> what a restarted process needs to re-attach a miner-funded open leg
+    # to its still-running pod worker instead of requeueing it: {hotkey,
+    # entry_ref, attempt_id, dispatch_block, era_index, dispatched_at,
+    # seen_at (the live process's heartbeat), base_seed, pod_name, tag,
+    # leg_pointer_repo}. The pod is re-found by its ledgered name and the run
+    # by its detached tag (both functions of the seed epoch and the hotkey),
+    # exactly as a lane A re-attach. Dropped when the leg returns.
+    attached: dict[str, dict] = field(default_factory=dict)
 
 
 SETTLED_KEEP = 256
@@ -296,6 +307,12 @@ def _funded_leg_length(funding: dict, base):
                      guard_seconds=int(funding.get("leg_guard_seconds", 0) or 0))
 
 
+def _attach_key(leg: OpenLeg) -> str:
+    """One open leg's identity in ``LaneBDriverState.attached``: the chain
+    commitment it trains and the era it was planned on."""
+    return f"{submission_key(leg.sub)}|{int(leg.base_era)}"
+
+
 def _slice_digest(contexts: list) -> str:
     h = hashlib.sha256()
     for c in contexts:
@@ -340,6 +357,11 @@ class LaneBDriver:
         # era), and the (submission, era) pairs whose past-bound start is logged
         self._sentinels: OrderedDict[int, str] = OrderedDict()
         self._bound_logged: set[tuple[str, int]] = set()
+        # 2026-11-26 re-attach: open legs the first tick keeps for a re-attach
+        # (dispatched right after its first locked section), and the wall
+        # clock heartbeats are stamped with (a test seam)
+        self._to_reattach: list[tuple[OpenLeg, dict]] = []
+        self.clock = _reattach._wall
 
     # ── persistence ──────────────────────────────────────────────────────────
 
@@ -379,16 +401,104 @@ class LaneBDriver:
             return
         self._recovered = True
         orphans = list(self.queue.open)
+        reattach = self._reattach_candidates()
         for leg in orphans:
+            key = _attach_key(leg)
+            if key in reattach:
+                # 2026-11-26: re-attach (lane A parity) — the leg stays open,
+                # its funded entry stays in flight (same attempt, no new
+                # charge); the funded path adopts the live ledgered pod and
+                # attaches to the running worker, or refuses (requeued then)
+                log.warning("lane B: open leg %s/%s (base era %d) has no thread in this process "
+                            "— re-attaching to its pod %s (heartbeat %.0fs ago)",
+                            leg.sub.hotkey[:8], leg.sub.domain, leg.base_era,
+                            reattach[key].get("pod_name", "?"),
+                            self.clock() - float(reattach[key].get("seen_at", 0.0)))
+                self._to_reattach.append((leg, dict(reattach[key])))
+                continue
+            rec = self.st.attached.pop(key, None)
             log.warning("lane B: open leg %s/%s (base era %d) has no thread in this process "
-                        "— requeued uncharged", leg.sub.hotkey[:8], leg.sub.domain,
-                        leg.base_era)
+                        "— requeued uncharged%s", leg.sub.hotkey[:8], leg.sub.domain,
+                        leg.base_era,
+                        "" if rec is None else " (re-attach grace expired or unsupported)")
             self.queue.requeue(leg)
             if leg.funding and fq is not None:
                 fq.requeue(leg.sub.hotkey, error="trainer restarted mid-leg — requeued",
                            error_class="no_capacity", burn_attempt=False, operator_billed=True)
         if orphans:
             self.save()
+
+    def _reattach_candidates(self) -> dict[str, dict]:
+        """Persisted open legs a restarted process may re-attach: miner-funded,
+        with a re-attach record whose heartbeat is within ``[round]
+        dispatch_reattach_grace_seconds``, and ops that can re-attach."""
+        if not callable(getattr(self.ops, "reattach_leg", None)):
+            return {}
+        grace = _reattach.grace_seconds(self.cfg)
+        now = self.clock()
+        out = {}
+        for leg in self.queue.open:
+            key = _attach_key(leg)
+            rec = self.st.attached.get(key)
+            if leg.funding and _reattach.fresh(rec, now, grace):
+                out[key] = rec
+        return out
+
+    def _heartbeat(self) -> None:
+        """Stamp ``seen_at`` on every leg this process runs (at most every
+        :data:`~cascade.trainer.leg_reattach.HEARTBEAT_SECONDS`) and drop
+        records of legs no longer open. Caller holds the lock and saves."""
+        if not self._recovered:
+            return
+        now = self.clock()
+        live = {_attach_key(leg) for leg in self._running.values()}
+        open_keys = {_attach_key(leg) for leg in self.queue.open}
+        for key in [k for k in self.st.attached if k not in open_keys]:
+            del self.st.attached[key]
+        for key in live:
+            rec = self.st.attached.get(key)
+            if rec is not None and now - float(rec.get("seen_at", 0.0) or 0.0) \
+                    >= _reattach.HEARTBEAT_SECONDS:
+                rec["seen_at"] = float(now)
+
+    def _record_attach(self, leg: OpenLeg, era_index: int, block: int) -> None:
+        """Persist what a restart needs to re-attach ``leg`` (miner-funded
+        legs only; the operator pool path keeps today's requeue)."""
+        if not leg.funding or not callable(getattr(self.ops, "reattach_leg", None)):
+            return
+        ident: dict = {}
+        fn = getattr(self.ops, "leg_identity", None)
+        if callable(fn):
+            try:
+                ident = dict(fn(leg) or {})
+            except Exception as e:  # noqa: BLE001 — a missing identity only loses re-attach
+                log.warning("lane B: leg %s identity unavailable (%s) — re-attach not "
+                            "recorded", leg.sub.hotkey[:8], e)
+                return
+        now = float(self.clock())
+        self.st.attached[_attach_key(leg)] = {
+            "hotkey": leg.sub.hotkey, "entry_ref": str(leg.funding.get("entry_ref", "") or ""),
+            "attempt_id": str(leg.funding.get("attempt_id", "") or ""),
+            "dispatch_block": int(block), "era_index": int(era_index),
+            "dispatched_at": now, "seen_at": now, **ident}
+
+    def _dispatch_reattach(self) -> list[OpenLeg]:
+        """Re-attach the legs :meth:`_recover_orphans` kept open. Outside the
+        lock (a synchronous failure calls :meth:`_leg_done`)."""
+        with self._lock:
+            todo, self._to_reattach = self._to_reattach, []
+            # a leg the same tick expired or requeued is not re-attached
+            todo = [(leg, rec) for leg, rec in todo if leg in self.queue.open]
+            for leg, _ in todo:
+                self._running[id(leg)] = leg
+        for leg, rec in todo:
+            try:
+                self.ops.reattach_leg(leg, int(rec.get("era_index", leg.base_era)),
+                                      int(rec.get("dispatch_block", 0) or 0), self._leg_done, rec)
+            except Exception as e:  # noqa: BLE001 — a failed re-attach requeues like before
+                self._leg_done(leg, None, failure=_reattach.refusal_failure(
+                    f"re-attach dispatch failed: {e}"))
+        return [leg for leg, _ in todo]
 
     # ── funding (DEC-CA-0059 item 8) ─────────────────────────────────────────
 
@@ -410,7 +520,11 @@ class LaneBDriver:
         lane-A pod sweep."""
         with self._lock:
             if not self._recovered:
-                return set()
+                # before the first tick: the legs it will try to re-attach keep
+                # their pods out of the restart sweep (2026-11-26)
+                keys = self._reattach_candidates()
+                return {leg.sub.hotkey for leg in self.queue.open
+                        if _attach_key(leg) in keys}
             return {leg.sub.hotkey for leg in [*self.queue.open, *self._running.values()]
                     if leg.funding}
 
@@ -895,6 +1009,7 @@ class LaneBDriver:
         sentinel = self._sentinel_target(int(block))
         with self._lock:
             self._recover_orphans(fq)
+            self._heartbeat()
             for leg in [x for x in self.queue.open
                         if x.funding and self.queue.stale(x, int(era_index), lb)]:
                 # a funded leg the trainer could not settle in time: the miner
@@ -977,6 +1092,7 @@ class LaneBDriver:
             want = {t for s in self.queue.next_dispatchable(lb, esft_eligible)
                     for t in s.declared}
             self.save()
+        self._dispatch_reattach()
         # WB17 (D41 / LB4): the configured opening rule; the co-gate is the
         # default and runs exactly as before
         rule = str(getattr(lb, "open_rule", OPEN_RULE_COGATE) or OPEN_RULE_COGATE)
@@ -1103,6 +1219,8 @@ class LaneBDriver:
                      leg.sub.domain, {k: len(v) for k, v in leg.selection.items()})
             with self._lock:
                 self._running[id(leg)] = leg
+                self._record_attach(leg, int(era_index), int(block))
+                self.save()
             try:
                 self.ops.dispatch_leg(leg, era_index, block, self._leg_done)
             except Exception as e:
@@ -1213,6 +1331,7 @@ class LaneBDriver:
         fq = self._funded_queue() if leg.funding else None
         with self._lock:
             self._running.pop(id(leg), None)
+            self.st.attached.pop(_attach_key(leg), None)
             if leg not in self.queue.open:
                 # expired (or requeued) while it ran: its slot is gone and a
                 # leg that old is dropped at settlement anyway
@@ -1231,7 +1350,10 @@ class LaneBDriver:
                 self.queue.requeue(leg)          # the funded entry bounds the retries
                 if fq is not None:
                     fq.requeue(leg.sub.hotkey, error=msg, error_class=cls,
-                               burn_attempt=bool(getattr(failure, "burn", False)))
+                               burn_attempt=bool(getattr(failure, "burn", False)),
+                               # a refused re-attach: exactly the restart requeue
+                               **({"operator_billed": True}
+                                  if getattr(failure, "operator_billed", False) else {}))
                 self._funded_outcome(leg.sub, FUNDED_REQUEUED, {"class": cls, "error": msg[:300]})
                 log.warning("lane B: funded leg %s/%s failed [%s] — requeued: %s",
                             leg.sub.hotkey[:8], leg.sub.domain, cls, msg[:200])
@@ -2021,7 +2143,37 @@ class RunnerLaneBOps:
             return
         self._dispatch_operator(leg, era_index, block, done)
 
-    def _dispatch_funded(self, leg: OpenLeg, block: int, done) -> None:
+    def leg_identity(self, leg: OpenLeg) -> dict:
+        """What a restart re-finds ``leg``'s run by (2026-11-26 re-attach): the
+        seed epoch, the pod's ledgered name and the detached run tag — the
+        same names lane A adopts by (``funded_pod_name`` / the dispatcher's
+        ``<role>-<hotkey12>-<seed>`` tag)."""
+        from ..provision.funded import funded_pod_name
+
+        seeds = self._seeds()
+        if seeds is None:
+            return {}
+        seed = str(seeds.base_seed)
+        hk = leg.sub.hotkey
+        return {"base_seed": seed,
+                "pod_name": funded_pod_name(seed, hk, self.r.cfg.subnet.netuid) + "-0",
+                "tag": f"expert-{hk[:12]}-{seed}"}
+
+    def reattach_leg(self, leg: OpenLeg, era_index: int, block: int, done, rec: dict) -> None:
+        """Re-attach a persisted open funded leg after a trainer restart: the
+        leg's own funded path at its ORIGINAL dispatch block, attach-only
+        (:mod:`cascade.trainer.leg_reattach`): its live ledgered pod is
+        adopted and the running worker attached to — no rent, no launch, no
+        queue mark (same attempt, no new charge). Anything else is a refusal
+        the driver requeues exactly as a restart requeue."""
+        if not leg.funding:
+            done(leg, None, failure=_reattach.refusal_failure("not a miner-funded leg"))
+            return
+        self._dispatch_funded(leg, int(block or leg.funding.get("started_block", 0) or 0),
+                              done, reattach=dict(rec or {}))
+
+    def _dispatch_funded(self, leg: OpenLeg, block: int, done, *,
+                         reattach: dict | None = None) -> None:
         """One lane-B leg on the MINER's key: the funded challenger path
         (``_run_funded_leg``: rent on the payer key → identity / runtime pins →
         the corpus (shards tier on a ``shards`` contract) → worker ``--role
@@ -2037,7 +2189,21 @@ class RunnerLaneBOps:
         from .lane_c_driver import LegFailure
         from .loop import ResolvedGenerator
 
+        if reattach is not None:
+            outer = done
+
+            def done(leg, ptr, *a, failure=None, **kw):     # noqa: F811 — the re-attach verdict
+                if failure is not None and _reattach.is_refusal(failure):
+                    failure = _reattach.refusal_failure(str(failure.msg))
+                outer(leg, ptr, *a, failure=failure, **kw)
+
         def _run():
+            if reattach is None:
+                return _body()
+            with _reattach.reattach_only():
+                return _body()
+
+        def _body():
             try:
                 seeds = self._seeds()
                 sched = self.r.__dict__.get("_rolling_sched")
@@ -2045,6 +2211,12 @@ class RunnerLaneBOps:
                 if seeds is None or era is None:
                     raise LegFailure("no era state yet", miner_fault=False,
                                      error_class="no_capacity", burn=False)
+                if reattach is not None and str(reattach.get("base_seed", "")) != str(
+                        seeds.base_seed):
+                    # another seed epoch: another pod name and run tag
+                    raise LegFailure(f"{_reattach.REATTACH_REFUSED}: the seed epoch moved "
+                                     f"({reattach.get('base_seed')} -> {seeds.base_seed})",
+                                     miner_fault=False, error_class="no_capacity", burn=False)
                 base = self.r.cfg.throne_contracts_at(int(era.start_block))[0]
                 f = leg.funding
                 length = _funded_leg_length(f, base)
@@ -2149,7 +2321,8 @@ class RunnerLaneBOps:
                     f"lane-B leg failed without a verdict (operator side): {e}",
                     miner_fault=False, error_class="operator_transient", burn=False))
 
-        threading.Thread(target=_run, name=f"laneb-{leg.sub.hotkey[:8]}", daemon=True).start()
+        threading.Thread(target=_run, name=f"laneb-{leg.sub.hotkey[:8]}"
+                         + ("-reattach" if reattach is not None else ""), daemon=True).start()
 
     def _dispatch_operator(self, leg: OpenLeg, era_index: int, block: int, done) -> None:
         """``[lane_b] leg_funding = "operator"`` only (retired; dev /

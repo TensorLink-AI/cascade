@@ -1277,6 +1277,16 @@ class _FundedPodMixin:
             prior_alloc = any(p.instance_id == expected_id for p in self._load_funded_ledger())
         except Exception:  # noqa: BLE001 — unreadable ledger: the guards apply
             prior_alloc = False
+        from .leg_reattach import rent_refusal
+
+        refused = "" if prior_alloc else rent_refusal(prior_alloc=False, pod_live=None)
+        if refused:
+            # attach-only (a lane B / C re-attach) and no ledgered pod: nothing rented
+            log.warning("funded leg %s: %s (%s) — nothing rented", gen.hotkey[:12], refused,
+                        expected_id)
+            self._record_funded_failure(gen.hotkey, refused, miner_fault=False,
+                                        error_class="no_capacity", burn=False)
+            raise _FundedLegSkip(gen.hotkey)
         why = "" if prior_alloc else measured_wall_refusal(rnd)
         if why:
             # No measured wall for the pinned image: every latest safe start
@@ -1323,6 +1333,15 @@ class _FundedPodMixin:
 
                 spend_end(self, gen.hotkey, expected_id, outcome="waste", at_last_seen=True,
                           reason="lost: not live at re-attach (closed at its last-seen time)")
+        refused = rent_refusal(prior_alloc=prior_alloc, pod_live=pod_live)
+        if refused:
+            # A lane B / lane C leg re-attached after a restart: adopt its live
+            # ledgered pod or nothing — never a fresh rent (the driver requeues).
+            log.warning("funded leg %s: %s (%s) — nothing rented", gen.hotkey[:12], refused,
+                        expected_id)
+            self._record_funded_failure(gen.hotkey, refused, miner_fault=False,
+                                        error_class="no_capacity", burn=False)
+            raise _FundedLegSkip(gen.hotkey)
         if lost_leg is not None:
             from ..funding.queue import OPERATOR_DISK_CLASS, OPERATOR_TRANSIENT_CLASS
 
@@ -1691,6 +1710,7 @@ class _FundedPodMixin:
                     on_allocated=on_allocated, vault=vault,
                     on_provider_selected=on_provider_selected, gpu_health=health_for(self),
                     ttl_seconds=provider_ttl_seconds(self, kind="leg"),
+                    before_cleanup=_lemon_postmortem(self, profile, gen.hotkey),
                 )
                 if not result.ok and not result.leaked_pod:
                     from .miner_spend_guard import MAKE_GOOD, spend_end
@@ -1832,6 +1852,14 @@ class _FundedPodMixin:
                             spend_end(self, gen.hotkey, result.pod.instance_id,
                                       outcome=MAKE_GOOD,
                                       reason=f"post-rent reject: {str(why)[:120]}")
+                        if result.pod is not None:
+                            # 2026-11-26: the pod's evidence BEFORE it goes
+                            # (bounded, best effort, never blocks the teardown)
+                            from .pod_postmortem import before_teardown
+
+                            before_teardown(self, _reject_host(result, profile),
+                                            pod_name=result.pod.instance_id,
+                                            reason=f"post-rent reject: {why}")
                         self._teardown_funded_pod(result.pod)
                         # A confirmed release permits the bounded replacement
                         # loop. An unconfirmed release must block another rent.
@@ -2372,6 +2400,41 @@ class _FundedPodMixin:
                 log.error("funded pod %s is gone but its ledger row could not be "
                           "removed (%s) — the startup sweep settles it",
                           pod.instance_id, e)
+
+
+def _lemon_postmortem(runner, profile, hotkey: str):
+    """``rent_funded_pod``'s ``before_cleanup``: the postmortem of a
+    half-launched pod (lemon / not ready / failed pin) before it is removed.
+    The provider lookup of its address runs inside the bounded capture."""
+
+    def hook(provider, pod_id: str) -> None:
+        from .pod_postmortem import before_teardown, provider_resolver
+
+        resolve = provider_resolver(provider, pod_id, profile)
+        before_teardown(runner, resolve, pod_name=str(pod_id),
+                        reason=f"funded rent failed before use (lemon / not ready) for "
+                               f"{str(hotkey)[:12]}")
+
+    return hook
+
+
+def _reject_host(result, profile):
+    """A read-only ssh view of a rented pod the rent path rejects (short pod,
+    stale image, slow host, NCCL preflight) — for its postmortem only; None
+    without an address."""
+    from .remote import RemoteHost
+
+    addr = getattr(result, "address", None)
+    if addr is None or not getattr(addr, "ip", ""):
+        return None
+    return RemoteHost(name=f"reject-{getattr(result.pod, 'instance_id', '')}"[:64],
+                      host=addr.ip, port=int(getattr(addr, "ssh_port", 22) or 22),
+                      user=getattr(profile, "user", "root"),
+                      key_path=getattr(profile, "key_path", None),
+                      workdir=getattr(profile, "workdir", "."),
+                      pinned_host_key=str(getattr(result, "host_key", "") or ""),
+                      ssh_options=tuple(getattr(profile, "ssh_options", ()) or ()),
+                      isolated=True)
 
 
 def worker_config_for_pod(runner, src, dest_name: str):

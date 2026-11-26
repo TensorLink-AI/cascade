@@ -692,6 +692,14 @@ def parse_progress(lines) -> dict | None:
     return None
 
 
+class ReattachMissing(RemoteDispatchError):
+    """An attach-only dispatch (a lane B / lane C leg re-attached after a
+    trainer restart, :func:`cascade.trainer.leg_reattach.reattach_only`) found
+    no live or cleanly finished run of the leg on the pod: nothing was
+    launched (a second worker would be a re-dispatch the miner did not pay
+    for). The driver requeues the leg as before."""
+
+
 class LegAborted(RemoteDispatchError):
     """The orchestrator aborted a running detached leg on purpose (the
     progress watchdog): the worker was killed, nothing about the run is the
@@ -2330,6 +2338,15 @@ class RemoteDispatcher:
                 import hashlib
                 tag += '-' + hashlib.sha256(json.dumps(argv).encode()).hexdigest()[:12]
             prior = find_detached_run(host, tag, runner=self._runner)
+            from .leg_reattach import REATTACH_REFUSED, attach_only
+
+            if prior is None and attach_only():
+                if mirror is not None:
+                    with contextlib.suppress(Exception):
+                        mirror.close()
+                raise ReattachMissing(
+                    f"{REATTACH_REFUSED}: no live or finished run of this {role} leg on "
+                    f"{host.name} — nothing relaunched")
             if prior:
                 log.warning("dispatch role=%s → %s: a run of this leg is already on the "
                             "pod (%s) — attaching, not relaunching", role, host.name, prior)
@@ -2356,6 +2373,11 @@ class RemoteDispatcher:
                 if mirror is not None:
                     mirror.close()
         else:
+            from .leg_reattach import REATTACH_REFUSED, attach_only
+
+            if attach_only():
+                raise ReattachMissing(f"{REATTACH_REFUSED}: attached dispatch cannot "
+                                      f"re-attach a running {role} leg on {host.name}")
             remote_cmd, stdin_env = build_remote_command(
                 host, argv, env, lane_count=lane_count, wrap=_arm_prefetch)
             ssh_argv = build_ssh_argv(host, remote_cmd)

@@ -51,3 +51,15 @@ cascade/trainer/lane_b_bench.py
 cascade/trainer/merge_acceptance.py
 # 2026-11-26: own lane B model hosts, pod cache root, disk guard, selective fetch.
 cascade/shared/hippius.py
+# 2026-11-26: lane B / lane C leg re-attach after a restart; pod postmortems
+# before teardown (funded, operator, lane B/C pods).
+cascade/trainer/leg_reattach.py
+cascade/trainer/pod_postmortem.py
+cascade/trainer/lane_c_driver.py
+cascade/trainer/runner_funded_legs.py
+cascade/trainer/runner_funded_pods.py
+cascade/trainer/runner_operator_pods.py
+cascade/trainer/runner_rolling.py
+cascade/provision/funded.py
+tests/unit/test_lane_b_reattach.py
+tests/unit/test_pod_postmortem.py
