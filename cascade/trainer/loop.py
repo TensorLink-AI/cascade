@@ -645,6 +645,14 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
             promo.round_cfg = cfg.round
         if promo is not None and hasattr(promo, "scoring_cfg"):
             promo.scoring_cfg = cfg.scoring
+        # 2026-11-26: the lane B / lane C drivers hold their own ChainConfig.
+        # Without this they kept the startup config (lanes off there; the
+        # owner's overlay turned them on), so `lane_b.active(block)` stayed
+        # False and a funded lane B entry was never seated.
+        for name in ("lane_b_driver", "lane_c_driver"):
+            drv = getattr(self, name, None)
+            if drv is not None and hasattr(drv, "cfg"):
+                drv.cfg = cfg
 
     def _activation_tick(self, client, block: int) -> None:
         """One resolver pass per poll (a chain read only at a new boundary or
