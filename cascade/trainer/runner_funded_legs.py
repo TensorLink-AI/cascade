@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -23,6 +24,7 @@ from .faults import (
 )
 from .harvest_release import release_after_verified_harvest
 from .progress import progress_binding, report_progress
+from .remote import ReattachMissing
 from .runner_common import (
     ResolvedGenerator,
     _add_seen_hotkeys,
@@ -173,6 +175,16 @@ class _FundedLegMixin:
                                 finetune_recipe=finetune_recipe, bench=bench, gpu_choice=gpu_choice,
                                 domain=domain, expert_selection=expert_selection)
                         except _FundedOperatorFallback as e:
+                            from .leg_reattach import REATTACH_REFUSED, attach_only
+
+                            if attach_only():
+                                # a re-attach never moves a leg onto operator
+                                # capacity (that is a new rent / dispatch)
+                                self._record_funded_failure(
+                                    gen.hotkey, f"{REATTACH_REFUSED}: the entry is routed to "
+                                    "operator capacity", miner_fault=False,
+                                    error_class="no_capacity", burn=False)
+                                raise _FundedLegSkip(gen.hotkey) from e
                             if role not in ("expert", "mkt_finetune") or bench:
                                 raise
                             if isinstance(e, _FundedOperatorRent):
@@ -389,6 +401,7 @@ class _FundedLegMixin:
             str(seeds.base_seed), gen,
             **({"gpu_choice": gpu_choice} if gpu_choice is not None else {}))
         keep = False
+        succeeded = False          # set at the leg's successful return (postmortem)
         # A harvest that failed on OUR side (disk/IO) with the run complete:
         # the pod is NEVER torn down for it (harvest_guard) — the requeued leg
         # re-attaches to its ledgered allocation and harvests again.
@@ -528,6 +541,7 @@ class _FundedLegMixin:
                     ("challenger", contract.arch_preset, gen.hotkey)] = host
                 keep = True
             _spend_result(self, gen.hotkey, pod)
+            succeeded = True
             return entry
         except _FundedTamper as e:
             self._record_funded_failure(gen.hotkey, f"pod identity: {e}",
@@ -582,6 +596,13 @@ class _FundedLegMixin:
             self._record_funded_failure(gen.hotkey, f"{DIVERGED_MARKER}: {e}",
                                         miner_fault=True, error_class="generator",
                                         burn=False)
+            raise
+        except ReattachMissing as e:
+            # A re-attach found the pod but no run of the leg on it: nothing
+            # was launched; the driver requeues (uncharged). The pod is torn
+            # down below (its worker is gone), after the postmortem.
+            self._record_funded_failure(gen.hotkey, str(e), miner_fault=False,
+                                        error_class="no_capacity", burn=False)
             raise
         except Exception as e:  # noqa: BLE001 — classify, record, re-raise for the drop
             from .faults import _transport_failure
@@ -670,6 +691,18 @@ class _FundedLegMixin:
         finally:
             self.__dict__["_leg_local_obj"].harvest_pod_payer = False
             if not keep and not released and not hold_pod:
+                failing = None if succeeded else sys.exc_info()[1]
+                if not succeeded:
+                    # 2026-11-26: the pod's own evidence (worker logs, progress,
+                    # nvidia-smi, dmesg) onto the box BEFORE the teardown —
+                    # bounded, best effort, never blocks it
+                    from .pod_postmortem import before_teardown
+
+                    before_teardown(self, host, pod_name=str(
+                        getattr(pod, "instance_id", "") or gen.hotkey[:12]),
+                        reason=f"{role} leg {gen.hotkey[:12]}: {type(failing).__name__}: "
+                               f"{str(failing)[:500]}" if failing is not None
+                        else f"{role} leg {gen.hotkey[:12]}: aborted")
                 verdict = self._funded_leg_failures.get(gen.hotkey)
                 if verdict is not None and (verdict[1] or verdict[2] == "payer_side"):
                     # a genuine miner fault: waste of THEIR making (no make-good)

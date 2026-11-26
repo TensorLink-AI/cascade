@@ -995,10 +995,58 @@ error. The validator entrypoint holds `<state_db>.lock` so two processes cannot
 write the same bundle. A fresh bundle still needs the historical evidence
 needed to reconstruct consensus state; it is not a substitute for backups.
 
-After a restart, persisted open B/C legs count as operator-side losses. A
-verified pending upload can still be reused; a required retrain follows the
-`operator_billed` rules below. An expired lane-B leg keeps its hotkey busy
-until its worker returns; scientific expiry does not terminate a GPU process.
+After a restart, persisted open miner-funded lane B and lane C legs
+re-attach to their pods, the same way lane A detached legs do (2026-11-26,
+`cascade/trainer/leg_reattach.py`). At dispatch the driver records the leg's
+seed epoch, its ledgered pod name (`funded_pod_name(...)-0`), the detached run
+tag (`expert-<hotkey12>-<seed>`), the funded attempt id and the dispatch block.
+Lane B keeps this in `lane_b_driver.json` under `attached`; lane C keeps a
+per-hotkey record in `lane_c_driver.json`, written only when non-empty. The
+live process stamps a heartbeat (`seen_at`) at most once a minute. On the
+first tick after a restart, each open leg whose heartbeat is within
+`[round] dispatch_reattach_grace_seconds` (900) is not requeued. Instead it
+re-runs its own funded path at its original dispatch block, in attach-only
+mode. The rent path may only adopt the leg's ledgered pod once the provider
+confirms it is live. It never rents a new one, and it never moves the leg
+onto operator capacity. The detached dispatcher may only attach to a live or
+cleanly finished run of the leg (`find_detached_run`). It never launches a
+second worker (`ReattachMissing`). The funded queue entry is not marked in
+flight again, so the attempt id and the charge stay those of the original
+dispatch. The progress watchdog, heartbeat and teardown work as for any
+leg. Before the first tick, those legs' hotkeys are reported live, so the
+restart's pod sweep keeps their pods. A leg is requeued exactly as before
+(uncharged, `no_capacity`, `operator_billed`) when any of these hold: the
+grace has expired, the pod is gone or of unknown liveness, no run of the leg
+is on the pod, or the seed epoch has moved. A verified pending upload can
+still be reused; a required retrain follows the `operator_billed` rules below.
+Operator-pool lane B legs (`leg_funding = "operator"`) keep the plain requeue.
+An expired lane-B leg keeps its hotkey busy until its worker returns;
+scientific expiry does not terminate a GPU process.
+
+Pod postmortems (2026-11-26, `cascade/trainer/pod_postmortem.py`). Before the
+trainer removes a pod on an abort or reject path, it copies the pod's evidence
+to `/root/cascade/_pod_postmortem/<pod-name>-<utc>/` on the box. That location
+is the work root's parent; set `CASCADE_POD_POSTMORTEM_DIR` to move it, or
+`CASCADE_POD_POSTMORTEM=0` to turn capture off. Capture is also off inside
+pytest runs unless the variable is set to `1`. The paths covered are:
+
+- a funded, lane B or lane C leg that fails for any reason (THROUGHPUT ABORT,
+  first-step deadline, worker crash, runtime or identity reject, refused
+  re-attach);
+- a post-rent reject (short pod, stale image, slow host, NCCL preflight);
+- a half-launched lemon or not-ready pod;
+- an operator-rented leg, a failed operator or king pod, and a rotated king
+  pod.
+
+The copy holds `stdout`, `stderr`, `progress.json`, `pid` and `exit_code` of
+the newest three detached run dirs, each tailed to 1/8 of the cap. It also
+holds `nvidia-smi`, `dmesg | tail -n 300` (or `journalctl -k`), uptime, memory
+and disk facts, and `meta.json` (reason, host, status). Only small text files
+are copied, never a checkpoint. One ssh session runs under a hard 60 s wall,
+and the box keeps at most 50 MB of what it sends. A slow, failed or
+unreachable capture is logged in `meta.json`, and the teardown then proceeds
+unchanged. The log line names the path. Postmortems older than 14 days are
+pruned on every capture.
 
 Lane B: all model work runs on the eval pod, never on the trainer box (owner
 rule 2026-11-26: no checkpoint download, torch model load or CPU forward

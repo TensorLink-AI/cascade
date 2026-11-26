@@ -66,6 +66,7 @@ from typing import Protocol
 from ..funding.queue import COMPETITION_ENDED_CLASS, OPERATOR_FAULT_CLASS, split_lane_c_ref
 from ..shared.atomic import read_text_with_backup, write_text_atomic
 from ..shared.era import image_record_at
+from . import leg_reattach as _reattach
 from .finetune import LegRecipe, RecipeError
 from .lane_c_competitions import trainer_competition
 
@@ -166,6 +167,12 @@ class LaneCDriverState:
     # every OTHER competition's awaited reports: {kind: [{"rid", "age"}]}
     # (persisted only when non-empty)
     awaits: dict = field(default_factory=dict)
+    # 2026-11-26 re-attach (lane A / lane B parity): hotkey -> {attempt_id,
+    # dispatched_at, seen_at} of an open leg this process runs; a restart
+    # re-attaches the leg to its pod's running worker while ``seen_at`` is
+    # within ``[round] dispatch_reattach_grace_seconds`` (persisted only when
+    # non-empty)
+    attached: dict = field(default_factory=dict)
 
 
 class LaneCDriver:
@@ -176,8 +183,11 @@ class LaneCDriver:
         self._lock = threading.RLock()
         self.st = self._load()
         # open legs persisted by an EARLIER process have no thread here: they
-        # are requeued (uncharged) on this process's first tick
+        # are re-attached (2026-11-26) or requeued (uncharged) on this
+        # process's first tick
         self._recovered = False
+        self._to_reattach: list[dict] = []
+        self.clock = _reattach._wall
 
     # ── persistence ──────────────────────────────────────────────────────────
 
@@ -198,7 +208,7 @@ class LaneCDriver:
 
     def save(self) -> None:
         d = asdict(self.st)
-        for k in ("mkt_await", "spent", "awaits"):
+        for k in ("mkt_await", "spent", "awaits", "attached"):
             if not d.get(k):
                 d.pop(k, None)
         write_text_atomic(self.path, json.dumps(d, sort_keys=True), backup=True)
@@ -215,7 +225,48 @@ class LaneCDriver:
         """Hotkeys with a lane-C leg running in THIS process (their payer pod
         must survive the lane-A pod sweep)."""
         with self._lock:
-            return {leg["hotkey"] for leg in self.st.open} if self._recovered else set()
+            if not self._recovered:
+                # before the first tick: the legs it will re-attach keep their
+                # pods out of the restart sweep
+                keys = self._reattach_candidates()
+                return {leg["hotkey"] for leg in self.st.open if leg["hotkey"] in keys}
+            return {leg["hotkey"] for leg in self.st.open}
+
+    # ── re-attach after a restart (2026-11-26) ───────────────────────────────
+
+    def _reattach_candidates(self) -> set[str]:
+        """Hotkeys of persisted open legs whose re-attach record is the leg's
+        own attempt with a heartbeat inside the grace (ops must support it)."""
+        if not getattr(self.ops, "supports_reattach", False):
+            return set()
+        grace = _reattach.grace_seconds(self.cfg)
+        now = self.clock()
+        out = set()
+        for leg in self.st.open:
+            rec = self.st.attached.get(leg["hotkey"])
+            if (isinstance(rec, dict) and rec.get("attempt_id") == leg.get("attempt_id")
+                    and _reattach.fresh(rec, now, grace)):
+                out.add(leg["hotkey"])
+        return out
+
+    def _record_attach(self, leg: dict) -> None:
+        if not getattr(self.ops, "supports_reattach", False):
+            return
+        now = float(self.clock())
+        self.st.attached[leg["hotkey"]] = {"attempt_id": leg.get("attempt_id"),
+                                           "dispatched_at": now, "seen_at": now}
+
+    def _heartbeat(self) -> None:
+        """Stamp ``seen_at`` on this process's open legs (at most every
+        HEARTBEAT_SECONDS); drop records of legs no longer open. Caller holds
+        the lock and saves."""
+        now = self.clock()
+        mine = {leg["hotkey"]: leg for leg in self.st.open}
+        for hk in [k for k in self.st.attached if k not in mine]:
+            del self.st.attached[hk]
+        for rec in self.st.attached.values():
+            if now - float(rec.get("seen_at", 0.0) or 0.0) >= _reattach.HEARTBEAT_SECONDS:
+                rec["seen_at"] = float(now)
 
     # ── orphans / expiry ─────────────────────────────────────────────────────
 
@@ -227,7 +278,14 @@ class LaneCDriver:
         ``mark_in_flight`` and the driver's save). Caller holds the lock."""
         n = 0
         if startup:
-            for leg in list(self.st.open):
+            keep = self._reattach_candidates()
+            for leg in [x for x in self.st.open if x["hotkey"] in keep]:
+                log.warning("lane C: open leg %s/%s (base era %d) has no thread in this "
+                            "process — re-attaching to its pod", leg["hotkey"][:8],
+                            leg["target"], int(leg["base_era"]))
+                self._to_reattach.append(leg)
+            for leg in [x for x in self.st.open if x["hotkey"] not in keep]:
+                self.st.attached.pop(leg["hotkey"], None)
                 log.warning("lane C: open leg %s/%s (base era %d) has no thread in this "
                             "process — requeued uncharged", leg["hotkey"][:8], leg["target"],
                             int(leg["base_era"]))
@@ -237,7 +295,7 @@ class LaneCDriver:
                                   operator_billed=True)
                 self._outcome(leg, "orphaned", "trainer restarted mid-leg")
                 n += 1
-            self.st.open = []
+            self.st.open = [x for x in self.st.open if x["hotkey"] in keep]
         if queue is not None:
             mine = ({leg["hotkey"] for leg in self.st.open}
                     | {f["leg"]["hotkey"] for f in self.st.finished})
@@ -267,7 +325,12 @@ class LaneCDriver:
             startup = not self._recovered
             self._recovered = True
             self.reconcile(queue, startup=startup)
+            self._heartbeat()
             self.save()
+            todo, self._to_reattach = self._to_reattach, []
+        for leg in todo:
+            self.ops.spawn(lambda leg=leg: self._run_leg(leg, reattach=True),
+                           f"lanec-{leg['target']}-{leg['hotkey'][:8]}-reattach")
         queue.expire_stale()
         latest = _latest_commitments(self.ops.commitments())
         started: list[dict] = []
@@ -362,6 +425,7 @@ class LaneCDriver:
                                 "gpu_allow_fallback": bool(e.gpu_allow_fallback),
                                 "gpu_max_price_per_hour": float(e.gpu_max_price_per_hour)})
                 self.st.open.append(leg)
+                self._record_attach(leg)
                 self.st.legs_started += 1
                 open_per[target] = open_per.get(target, 0) + 1
                 busy.add(e.hotkey)
@@ -377,7 +441,12 @@ class LaneCDriver:
 
     # ── one leg ──────────────────────────────────────────────────────────────
 
-    def _run_leg(self, leg: dict) -> None:
+    def _run_leg(self, leg: dict, *, reattach: bool = False) -> None:
+        """One leg; ``reattach`` (a persisted open leg after a restart) runs
+        the same path attach-only (:mod:`cascade.trainer.leg_reattach`)."""
+        if reattach:
+            with _reattach.reattach_only():
+                return self._run_leg(leg)
         try:
             # M12: the embargo is checked against the COMMIT time (the
             # commitment block on the dispatch clock) before any rent
@@ -430,6 +499,7 @@ class LaneCDriver:
                   failure: LegFailure | None = None) -> None:
         queue = self.ops.queue()
         with self._lock:
+            self.st.attached.pop(leg.get("hotkey", ""), None)
             if leg not in self.st.open:
                 # expired (or requeued at a restart) while it ran: its slot is
                 # gone and its entry already requeued
@@ -471,6 +541,10 @@ class LaneCDriver:
                     if f.miner_fault:
                         queue.fail(leg["hotkey"], error=f.msg, error_class=f.error_class,
                                    expect_ref=leg["entry_ref"])
+                    elif _reattach.is_refusal(f):
+                        # a refused re-attach: exactly the restart requeue
+                        queue.requeue(leg["hotkey"], error=f.msg, error_class="no_capacity",
+                                      burn_attempt=False, operator_billed=True)
                     else:
                         queue.requeue(leg["hotkey"], error=f.msg, error_class=f.error_class,
                                       burn_attempt=f.burn)
@@ -863,6 +937,9 @@ class RunnerLaneCOps:
     own machinery — chain commitments, the lane-C queue file, the Hub /
     vault fetch, the funded challenger leg path on the miner's key, the
     bench sidecar and the manifest bucket."""
+
+    # 2026-11-26: a restart re-attaches open legs (leg_reattach)
+    supports_reattach = True
 
     def __init__(self, runner, client, *, device: str = "cpu"):
         self.r, self.client, self.device = runner, client, device
