@@ -123,7 +123,10 @@ def test_every_failure_fails_closed_and_caches_nothing(tmp_path, why):
         assert fake.calls == []
 
 
-def test_prebench_fetches_on_the_worker_and_stops_once_cached(tmp_path):
+def test_prebench_fetches_on_the_worker_and_stops_once_cached(tmp_path, monkeypatch):
+    # the box-side fetch is the lane-B offload guard's local opt-in (2026-11-26;
+    # production stages pointer benches on the eval pod: test_lane_b_settle_on_pod)
+    monkeypatch.setenv("CASCADE_LANE_B_LOCAL_EVAL", "1")
     fetched = []
     root = tmp_path / "hub"
 

@@ -1014,10 +1014,30 @@ merge-acceptance scores (`judge`, `merge_scores`) also run on the pod: the
 verdict windows are drawn on the box, `evaluate_checkpoint` runs on the pod
 (device `cpu` unless `CASCADE_LANE_B_POD_DEVICE` is set) and the judge's
 stage-`merge` check runs there through `judge_entry(merge_check=)`; scores
-return as exact JSON. `RunnerLaneBOps.fetch` refuses on the box, so the
-settlement rebase still fails closed until it is offloaded.
-`CASCADE_LANE_B_LOCAL_EVAL=1` is the only local path (tests, dev boxes);
-never set it on the mainnet box.
+return as exact JSON. The settlement rebase, the era init's merge work and
+the bench's pointer path run on the pod too (`PodLaneBModel`, which drives
+`cascade/trainer/lane_b_model.py` in the pod worker): the rebase step pulls
+the king, the leg's base king and the leg there, reads the limits record,
+runs `settle_leg` and pushes the rebased checkpoint from the pod to the Hub
+(`upload_dir_to_hub_or_hf`, the same repo and HF fallback as the box used).
+The era init's non-finite checks, every acceptance stage and the merged init
+build (stable weights, optimizer reset and power-EMA shadows included) also
+run and push on the pod. Only pointers, the limits record and each pushed
+checkpoint's bench content key come back. Checkpoint bytes never pass
+through the box. Hub credentials (and `HF_TOKEN` for pushing steps) go to the
+pod over ssh stdin only, so the trainer's environment must carry
+`HIPPIUS_HUB_TOKEN` (or the username/password pair); a cached token file on
+the box is not forwarded. Lane-B bench rows are fetched by pointer: the pod
+pulls the checkpoint, computes the same content key the box used, which
+keeps the row cache valid, and hard-links the bench files into
+`_lane_b_offload/pinned/<uuid>`. The sidecar then sweeps that dir in place
+with the same command line and settings, and the pin is removed after the
+sweep (stale pins are pruned after 24 h). The pointer-to-key map persists in
+`lane_b_bench_rows/pointer-keys.json`. A pointer bench with no pod runner
+(`prebench`, #909) is refused by the same guard, and an unavailable pod
+fails the settlement closed: the legs stay finished and the next settlement
+retries. `CASCADE_LANE_B_LOCAL_EVAL=1` is the only local path (tests, dev
+boxes); never set it on the mainnet box.
 
 Required lane-B public suites must have `min_public_items` usable pairs for
 both CRPS and MASE. Different known data revisions, one missing revision pin,
