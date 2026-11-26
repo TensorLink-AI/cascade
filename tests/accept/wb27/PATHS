@@ -36,3 +36,6 @@ cascade/miner/cli.py
 docs/MINER.md
 chain.toml
 chain.testnet.toml
+
+# 2026-11-26 launch: overlay adoption must re-point the lane B/C drivers.
+tests/unit/test_lane_drivers_follow_overlay.py
