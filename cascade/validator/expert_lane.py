@@ -167,12 +167,35 @@ def _arrays(scores) -> dict:
     }
 
 
+def merge_check_dirs(kd: Path, cd: Path, selection: dict, *, strict: bool) -> str | None:
+    """Stage ``merge`` of :func:`judge_entry` on two fetched checkpoint dirs:
+    None when the candidate's selected rows merge onto the king (and, with
+    ``strict``, are finite), else the refusal reason."""
+    try:
+        from safetensors.torch import load_file
+
+        from ..trainer.expert_lane import _moe_names, check_finite_rows
+        from ..trainer.moe_model import merge_expert_slices
+
+        cand = load_file(str(cd / "weights.safetensors"))
+        names = _moe_names(kd)
+        merge_expert_slices(load_file(str(kd / "weights.safetensors")), cand,
+                            selection, names)
+        if strict:
+            check_finite_rows(cand, selection, names)
+    except Exception as e:  # noqa: BLE001 — any failure here refuses the entry
+        return f"{type(e).__name__}: {e}"
+    return None
+
+
 def judge_entry(entry: ExpertEntry, *, manifest: ExpertManifest, king_pointer: str,
                 king_scores, evaluate: Callable[[str], list], fetch_dir: Callable[[str], Path],
                 cfg, seed: str, recompute_selection: Callable | None = None,
                 strict: bool = False, sentinel: str | None = None,
                 contract=None, anchor_pointer: str | None = None,
-                anchor_scores: Callable[[], list] | None = None) -> ExpertJudgement:
+                anchor_scores: Callable[[], list] | None = None,
+                merge_check: Callable[[str, str, dict, bool], str | None] | None = None,
+                ) -> ExpertJudgement:
     """``sentinel`` is the settlement era's LANE_D_PLAN §16 suite (W-S2, D35):
     its ``<suite>_crps`` / ``<suite>_mase`` public guards are not built and
     ``require_public`` minus it is what must pair; every other guard is judged
@@ -191,7 +214,13 @@ def judge_entry(entry: ExpertEntry, *, manifest: ExpertManifest, king_pointer: s
     :func:`judge_manifest`) and paired on ``public_rows["anchor"]`` — all
     resolved lazily, only when a suite slot would be claimed. A missing
     anchor, anchor score or anchor row refuses the suite slots
-    (``anchor_missing``); domain and horizon slots are unaffected."""
+    (``anchor_missing``); domain and horizon slots are unaffected.
+
+    ``merge_check`` (trainer only; validators leave it None) replaces the
+    local fetch + :func:`merge_check_dirs` of stage ``merge`` with the same
+    check run elsewhere (the trainer's eval pod — the trainer box never loads
+    a checkpoint): ``(king, candidate, selection, strict) -> reason | None``.
+    A transport failure propagates, like a fetch failure."""
     if manifest.king_pointer != king_pointer:
         return ExpertJudgement(entry, False, "stale",
                                f"rebased onto {manifest.king_pointer}, king is {king_pointer}")
@@ -241,21 +270,13 @@ def judge_entry(entry: ExpertEntry, *, manifest: ExpertManifest, king_pointer: s
     # A FETCH failure propagates (a transient the caller retries): folding it
     # into a "merge" rejection would make one validator's network blip a
     # permanent verdict its peers never reached.
-    kd, cd = fetch_dir(king_pointer), fetch_dir(entry.rebased_pointer)
-    try:
-        from safetensors.torch import load_file
-
-        from ..trainer.expert_lane import _moe_names, check_finite_rows
-        from ..trainer.moe_model import merge_expert_slices
-
-        cand = load_file(str(cd / "weights.safetensors"))
-        names = _moe_names(kd)
-        merge_expert_slices(load_file(str(kd / "weights.safetensors")), cand,
-                            entry.selection, names)
-        if strict:
-            check_finite_rows(cand, entry.selection, names)
-    except Exception as e:  # noqa: BLE001 — any failure here refuses the entry
-        return ExpertJudgement(entry, False, "merge", f"{type(e).__name__}: {e}")
+    if merge_check is not None:
+        why = merge_check(king_pointer, entry.rebased_pointer, entry.selection, strict)
+    else:
+        why = merge_check_dirs(fetch_dir(king_pointer), fetch_dir(entry.rebased_pointer),
+                               entry.selection, strict=strict)
+    if why is not None:
+        return ExpertJudgement(entry, False, "merge", why)
 
     k = _arrays(king_scores)
     c = _arrays(evaluate(entry.rebased_pointer))

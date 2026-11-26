@@ -2241,9 +2241,10 @@ class RunnerLaneBOps:
 
     def judge(self, manifest, round_id: str, block: int, sentinel: str | None = None,
               anchor_pointer: str | None = None) -> list:
-        from .lane_b_offload import refuse_local
+        from .lane_b_offload import local_eval_allowed
 
-        refuse_local("judge (checkpoint evals)")
+        local = local_eval_allowed()
+        pod = None if local else self._pod()     # refuses before any window draw
         from ..validator.evaluator import evaluate_checkpoint
         from ..validator.expert_lane import judge_manifest, verdict_windows
 
@@ -2264,6 +2265,10 @@ class RunnerLaneBOps:
         qbatch = shared_ladder_quantile_batch(cfg.eval, int(block)) if quantile_head else 1
 
         def _eval(pointer: str):
+            if pod is not None:                  # on the eval pod, never the box
+                return pod.evaluate(pointer, windows, num_samples=cfg.eval.num_samples,
+                                    contract=contract, quantile_head=quantile_head,
+                                    quantile_batch=qbatch)
             return evaluate_checkpoint(self.fetch(pointer), windows,
                                        num_samples=cfg.eval.num_samples, device=self.device,
                                        contract=contract, quantile_head=quantile_head,
@@ -2272,14 +2277,15 @@ class RunnerLaneBOps:
         return judge_manifest(manifest, king_pointer=manifest.king_pointer,
                               king_scores=_eval(manifest.king_pointer), evaluate=_eval,
                               fetch_dir=self.fetch, cfg=cfg.lane_b, seed=str(round_id),
+                              **({"merge_check": pod.merge_check} if pod is not None else {}),
                               strict=cfg.lane_b.merge_guard_at_settlement(int(block)),
                               sentinel=sentinel,
                               **({"anchor_pointer": anchor_pointer} if anchor_pointer else {}))
 
     def merge_scores(self, pointer: str, block: int) -> list:
-        from .lane_b_offload import refuse_local
+        from .lane_b_offload import local_eval_allowed
 
-        refuse_local("merge scores (checkpoint evals)")
+        pod = None if local_eval_allowed() else self._pod()
         from ..validator.evaluator import evaluate_checkpoint
         from ..validator.expert_lane import verdict_windows
 
@@ -2288,11 +2294,16 @@ class RunnerLaneBOps:
         from ..shared.config import shared_ladder_quantile_batch
 
         quantile_head = bool(cfg.quantile_head_at(int(block)))
+        contract = cfg.training.at_block(int(block)).primary_size
+        qbatch = shared_ladder_quantile_batch(cfg.eval, int(block)) if quantile_head else 1
+        if pod is not None:                      # on the eval pod, never the box
+            return pod.evaluate(pointer, windows, num_samples=cfg.eval.num_samples,
+                                contract=contract, quantile_head=quantile_head,
+                                quantile_batch=qbatch)
         return evaluate_checkpoint(
             self.fetch(pointer), windows, num_samples=cfg.eval.num_samples,
-            device=self.device, contract=cfg.training.at_block(int(block)).primary_size,
-            quantile_head=quantile_head,
-            quantile_batch=shared_ladder_quantile_batch(cfg.eval, int(block)) if quantile_head else 1)
+            device=self.device, contract=contract,
+            quantile_head=quantile_head, quantile_batch=qbatch)
 
 
 def lane_b_queue_of(runner):
