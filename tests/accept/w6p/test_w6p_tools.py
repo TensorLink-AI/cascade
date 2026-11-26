@@ -53,9 +53,13 @@ def test_rmisc_size_and_mirror_need_a_final_allowed_list(tmp_path):
     m = _load(MIRROR, "laned_public_mirror_accept2")
     root, _ = fx.rmisc_mirror(tmp_path)
     listing = _listing(tmp_path, root)
-    with pytest.raises(SystemExit, match="pending"):
-        m.main(["size", "--source", fx.RMISC, "--listing", str(listing)])
     idx = importlib.import_module("cascade.eval.lane_d_public_index")
+    # An explicit pending list (the repo's own list is final since 2026-11-26).
+    pending = tmp_path / "pending.toml"
+    pending.write_text(idx.render_allowed_list(status="pending", generated_by="t", folders=[]))
+    with pytest.raises(SystemExit, match="pending"):
+        m.main(["size", "--source", fx.RMISC, "--listing", str(listing),
+                "--allowed", str(pending)])
     allowed = tmp_path / "allowed.toml"
     allowed.write_text(idx.render_allowed_list(status="final", generated_by="t", folders=[
         {"name": "FewLong", "reason": "k", "licence": "MIT", "domain": "d", "freq": "h",
@@ -195,6 +199,21 @@ def test_datacompare_compares_data_not_names(tmp_path, capsys):
     assert a.main(args) == 0
     doc = json.loads(out.read_text())
     assert doc["schema"] == a.DATACOMPARE_SCHEMA
+    # W-LAUNCH: the process pools and the candidate cache change nothing
+    assert hasattr(a, "_cand_job"), "W-LAUNCH: datacompare has no --workers/--candidate-cache pool"
+    import sys
+    sys.modules[a.__name__] = a           # pool jobs pickle by module name (as __main__ does)
+    out2 = tmp_path / "dc2.json"
+    fast = [x if x != str(out) else str(out2) for x in args] + [
+        "--workers", "2", "--candidate-workers", "2", "--candidate-cache", str(tmp_path / "cc")]
+    assert a.main(fast) == 0 and a.main(fast) == 0          # second run: cache hits
+    assert json.loads(out2.read_text())["folders"] == doc["folders"]
+    # --candidate-agg: built once, then loaded without the RMISC data
+    agg = tmp_path / "agg.npz"
+    assert a.main(fast + ["--candidate-agg", str(agg), "--candidates-only"]) == 0 and agg.is_file()
+    nodata = [x if x != str(rm) else str(tmp_path / "gone") for x in fast]
+    assert a.main(nodata + ["--candidate-agg", str(agg)]) == 0
+    assert json.loads(out2.read_text())["folders"] == doc["folders"]
     v = {f["name"]: f for f in doc["folders"]}
     assert v["Renamed"]["verdict"] == "duplicate" and v["Renamed"]["hits"]["gift_eval_pretrain"]
     assert v["Fresh"]["verdict"] == "pass"
@@ -220,3 +239,95 @@ def test_finalize_writes_a_valid_final_list(tmp_path):
     p = tmp_path / "allowed.toml"
     p.write_text(text)
     assert a.main(["validate", str(p)]) == 0
+
+
+def test_noncommercial_licences_never_reach_the_public_mirror(tmp_path):
+    """Owner 2026-11-26: CC BY-NC* / "non-commercial" folders are dropped even when
+    their data compare passes, and even when an older candidates file marked them
+    "ok" (finalize re-derives the class from the licence text)."""
+    a = _load(ALLOW, "laned_rmisc_allowlist_accept_nc")
+    idx = importlib.import_module("cascade.eval.lane_d_public_index")
+    for lic in ("CC BY-NC 4.0", "CC-BY-NC-SA 4.0", "cc by-nc-nd", "Non-commercial use only"):
+        assert a.licence_class(lic) == "noncommercial", lic
+    for lic in ("CC BY 4.0", "CC BY-SA 4.0", "Apache-2.0", "MIT", "CC0", "GPL-3.0"):
+        assert a.licence_class(lic) == "ok", lic
+    cands = {"schema": a.CANDIDATES_SCHEMA, "candidates": [
+        {"name": n, "domain": "Energy", "freq": "h", "licence": lic, "licence_class": "ok",
+         "source_url": "", "near": []}
+        for n, lic in (("Open", "CC BY 4.0"), ("NonCom", "CC BY-NC 4.0"))]}
+    dc = {"schema": a.DATACOMPARE_SCHEMA, "params": {}, "folders": [
+        {"name": n, "verdict": "pass", "max_hit_fraction": 0.0} for n in ("Open", "NonCom")]}
+    text = a.finalize(cands, dc, allow_unknown_licence=True, generated_by="t")
+    assert idx.parse_allowed_list(text)["names"] == ["Open"]
+
+
+def test_datacompare_vectorised_scan_equals_the_reference_channels(tmp_path):
+    """W-LAUNCH: `file_hits` (Arrow buffers, batch by batch, the --workers /
+    --stream path) hits exactly the hashes the reference `iter_channels` +
+    `kgram_hashes` loop hits: flat and nested list columns, nulls, empty rows,
+    channels past max_points, scalar numeric columns, arrow and parquet."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    a = _load(ALLOW, "laned_rmisc_allowlist_accept5")
+    assert hasattr(a, "file_hits"), "W-LAUNCH: the vectorised file_hits scan is missing"
+    rng = np.random.default_rng(7)
+    k, mod, maxp = 4, 2, 50
+    flat = [list(np.round(rng.normal(size=n), 2)) for n in (0, 3, 30, 80, 200)]
+    flat[2][5] = None
+    nested = [[list(np.round(rng.normal(size=n), 1)) for n in (10, 60)], [], None,
+              [list(np.round(rng.normal(size=70), 1))]]
+    scalar = np.round(rng.normal(size=4000), 1)
+    t = pa.table({"target": pa.array(flat + [None], type=pa.list_(pa.float64())),
+                  "multi": pa.array(nested + [None, [[1.0, 2.0, 3.0, 4.0, 5.0]]],
+                                    type=pa.list_(pa.list_(pa.float32()))),
+                  "start": pa.array([f"s{i}" for i in range(6)])})
+    pq.write_table(t, str(tmp_path / "x.parquet"), row_group_size=2)
+    with pa.OSFile(str(tmp_path / "x.arrow"), "wb") as sink, \
+            pa.ipc.new_stream(sink, t.schema) as w:
+        for b in t.to_batches(max_chunksize=2):
+            w.write_batch(b)
+    pq.write_table(pa.table({"v": pa.array(scalar), "i": pa.array(np.arange(4000))}),
+                   str(tmp_path / "long.parquet"), row_group_size=333)
+    for name in ("x.parquet", "x.arrow", "long.parquet"):
+        p = tmp_path / name
+        ref = [a.kgram_hashes(ch, k, mod) for ch in a.iter_channels(p, maxp)]
+        ref = np.unique(np.concatenate(ref)) if ref else np.empty(0, dtype=np.uint64)
+        assert ref.size > 10, name
+        half = np.sort(ref[::2])                           # a candidate set: half of them
+        decoy = np.sort(np.concatenate([half, np.asarray([1, 3, 2**63 + 1], dtype=np.uint64)]))
+        got = a.file_hits(p, decoy, k, mod, maxp)
+        assert got.tolist() == half.tolist(), name
+
+
+def test_datacompare_candidate_hashing_equals_the_reference(tmp_path):
+    """W-LAUNCH: the Arrow candidate path (`index_in`, run on --workers)
+    samples the same series and hashes the same values as the reference
+    per-row path: string and dictionary<string> names with nulls, int names,
+    no name column."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from cascade.eval.lane_d_public_index import RMISC_SERIES_COLUMN as SC
+
+    a = _load(ALLOW, "laned_rmisc_allowlist_accept6")
+    assert hasattr(a, "cand_file_hashes"), "W-LAUNCH: cand_file_hashes is missing"
+    rng = np.random.default_rng(11)
+    n = 3000
+    names = [None if i % 97 == 0 else f"s{i % 41}" for i in range(n)]
+    cases = {
+        "str.parquet": {SC: pa.array(names), "v": pa.array(np.round(rng.normal(size=n), 1)),
+                        "t": pa.array(np.arange(n))},
+        "dict.parquet": {SC: pa.array(names).dictionary_encode(),
+                         "v": pa.array(np.round(rng.normal(size=n), 1))},
+        "int.parquet": {SC: pa.array(np.arange(n) % 13), "v": pa.array(rng.normal(size=n))},
+        "none.parquet": {"v": pa.array(np.round(rng.normal(size=n), 2))},
+    }
+    for fn, cols in cases.items():
+        p = tmp_path / fn
+        pq.write_table(pa.table(cols), str(p), row_group_size=700)
+        for sample in (5, 64):
+            ref = a.cand_file_hashes(p, sample, 50, 4, 2, reference=True)
+            got = a.cand_file_hashes(p, sample, 50, 4, 2)
+            assert got[0] == ref[0] and got[1].tolist() == ref[1].tolist(), (fn, sample)
+            assert ref[1].size > 0
