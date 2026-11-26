@@ -55,6 +55,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -68,6 +69,10 @@ CANDIDATES_SCHEMA = "lane-d-rmisc-candidates/1"
 DATACOMPARE_SCHEMA = "lane-d-rmisc-datacompare/1"
 RMISC_REPO = "nju-zhangsq/RMISC"
 RMISC_REVISION = "d0cdd935300ca9b3b2d6f23e6085db24cb7560c2"
+# Stream batch downloads: retries per batch and linear backoff (seconds x attempt).
+DOWNLOAD_ATTEMPTS = 5
+DOWNLOAD_BACKOFF_S = 30
+
 # key -> (repo, pinned revision). GiftEval / BOOM / TIME are the revisions
 # the bench sidecar pins (benchmarks/cascade_benchmark/datasets.py); the
 # others were the repos' heads when F3 pinned them.
@@ -594,8 +599,21 @@ def _stream_source(key: str, stream_dir: Path, budget: int, workers: int = 16):
                 d = stream_dir / key / f"b{i:05d}"
                 if d.exists():
                     shutil.rmtree(d)
-                snapshot_download(repo_id=repo, repo_type="dataset", revision=rev,
-                                  local_dir=str(d), allow_patterns=paths, max_workers=workers)
+                # A transient HF/network error (e.g. "[Errno 9] Bad file descriptor",
+                # 2026-11-26 00:05) must not kill a multi-hour scan: retry the batch.
+                # snapshot_download skips files already complete in local_dir.
+                for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+                    try:
+                        snapshot_download(repo_id=repo, repo_type="dataset", revision=rev,
+                                          local_dir=str(d), allow_patterns=paths,
+                                          max_workers=workers)
+                        break
+                    except Exception as e:  # noqa: BLE001 — retried, then re-raised
+                        if attempt == DOWNLOAD_ATTEMPTS:
+                            raise
+                        print(f"stream {key}: batch {i} download attempt {attempt} failed "
+                              f"({e}); retrying", flush=True)
+                        time.sleep(DOWNLOAD_BACKOFF_S * attempt)
                 q.put((d, [d / p for p in paths]))
             q.put(None)
         except BaseException as e:  # noqa: BLE001 — re-raised in the consumer
