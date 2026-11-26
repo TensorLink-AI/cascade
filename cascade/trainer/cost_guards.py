@@ -27,7 +27,9 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 import time
+from contextlib import contextmanager
 
 log = logging.getLogger("cascade.trainer")
 
@@ -71,7 +73,8 @@ class ProgressWatchdog:
                  max_train_seconds: float, end_wall: float | None, grace_seconds: float,
                  tolerance: float = 1.5, clock=time.time, key_check=None,
                  key_check_seconds: float = 0.0, early_seconds: float = 0.0,
-                 first_step_seconds: float = 0.0, host: str = "") -> None:
+                 first_step_seconds: float = 0.0, host: str = "",
+                 step_credit: int = 0) -> None:
         self.label, self.hotkey, self.pod_name = label, hotkey, pod_name
         self.host = str(host or "")
         self.training_steps = int(training_steps or 0)
@@ -80,6 +83,10 @@ class ProgressWatchdog:
         self.grace = float(grace_seconds or 0.0)
         self.early = float(early_seconds or 0.0)
         self.first_step = float(first_step_seconds or 0.0)
+        # steps credited to the post-grace judge too (0 = lane A, unchanged):
+        # a wall-bounded lane B leg's 50-step records are ~15 min apart, so
+        # the record can lag the leg by a whole grace window
+        self.step_credit = max(0, int(step_credit or 0))
         self.tolerance = max(1.0, float(tolerance or 1.0))
         self.clock = clock
         self.key_check = key_check
@@ -167,7 +174,10 @@ class ProgressWatchdog:
             rate = (max(0, step - s0) + PROGRESS_STEP_QUANTUM) / elapsed
             early = f"early judge, optimistic rate {rate:.3f} steps/s; "
         else:
-            rate = max(0.0, (step - s0) / elapsed) if elapsed > 0 else 0.0
+            rate = (max(0.0, (step - s0 + self.step_credit) / elapsed) if elapsed > 0
+                    else 0.0)
+            if self.step_credit:
+                early = f"credited {self.step_credit} unreported steps; "
         total, why = self._bound_breaks(rate, step, now)
         if not why:
             return None
@@ -205,15 +215,75 @@ def leg_watchdog(runner, *, gen, pod, contract, key_check=None,
         # W-IMG: an unmeasured image's leg is held to the cap (never above
         # the contract's own wall)
         wall = min(wall, capped) if wall > 0 else capped
+    steps = int(getattr(contract, "training_steps", 0) or 0)
+    rate_of = getattr(local, "wall_bounded_rate_of", None)
+    if rate_of is not None:
+        sku = str(getattr(pod, "sku", "") or getattr(local, "funded_pod_sku", "") or "")
+        try:
+            rate = rate_of(sku)
+        except Exception:  # noqa: BLE001 — an unreadable rate turns the judge off
+            rate = None
+        judged = wall_bounded_steps(steps, wall, rate)
+        log.info("funded leg %s: wall-bounded lane B leg on %s — throughput judged on %d "
+                 "steps (%.0fs wall x %s steps/s measured), not the contract's %d%s",
+                 gen.hotkey[:12], sku or "?", judged, wall,
+                 "?" if rate is None else f"{float(rate):.4f}", steps,
+                 "" if judged else " (no measured rate: throughput judge off, the "
+                 "first-step deadline and the wall still bound the leg)")
+        steps = judged
+        credit = PROGRESS_STEP_QUANTUM
+    else:
+        credit = 0
     return ProgressWatchdog(
         label=f"funded leg {gen.hotkey[:12]}", hotkey=gen.hotkey,
         pod_name=str(getattr(pod, "instance_id", "?")),
-        training_steps=int(getattr(contract, "training_steps", 0) or 0),
+        training_steps=steps,
         max_train_seconds=wall,
         end_wall=None if end is None else float(end), grace_seconds=grace,
         tolerance=float(getattr(rnd, "progress_watchdog_tolerance", 1.5) or 1.5),
         key_check=key_check, key_check_seconds=key_every, early_seconds=early,
-        first_step_seconds=first, host=str(host or ""))
+        first_step_seconds=first, host=str(host or ""), step_credit=credit)
+
+
+def wall_bounded_steps(training_steps: int, wall_seconds: float, steps_per_s) -> int:
+    """The steps a WALL-BOUNDED leg is judged on: what ``wall_seconds`` buys at
+    the measured ``steps_per_s``, never more than the contract's
+    ``training_steps``; 0 (the throughput judge off) without a usable rate.
+
+    2026-11-26 (first mainnet lane B leg, aborted twice at "step 1/23841"): a
+    lane B leg funded without ``train_hours`` trains ``[lane_b] leg_hours``
+    through ``for_hours`` — the LANE A step count (23,841) behind a 3 h wall.
+    The expert-only step runs at the WB19-measured rate (8xH200: 0.055
+    steps/s, ~18 s/step), so the leg is wall-capped by design (~600 steps,
+    ``deadline_hit``) and its first progress record after step 1 lands at
+    step 50, ~15 min in. Projected against 23,841 steps every such leg read
+    as an 80 h run and was aborted at the 10-minute early judge — on any
+    host. Judged on its wall's worth of steps, the same bound
+    (``tolerance`` x the wall) aborts only a host slower than the measured
+    rate / ``tolerance``."""
+    try:
+        rate = float(steps_per_s)
+    except (TypeError, ValueError):
+        return 0
+    if not math.isfinite(rate) or rate <= 0 or float(wall_seconds or 0) <= 0:
+        return 0
+    bound = max(1, math.floor(float(wall_seconds) * rate))
+    return min(int(training_steps), bound) if int(training_steps or 0) > 0 else bound
+
+
+@contextmanager
+def wall_bounded_leg(runner, rate_of):
+    """While the block runs on this thread, :func:`leg_watchdog` judges the
+    leg as wall-bounded (:func:`wall_bounded_steps`): ``rate_of(sku)`` is the
+    measured steps/s of the rented GPU type (``None`` = unmeasured). The
+    lane B driver opens it around a leg funded without ``train_hours``."""
+    loc = runner.__dict__.setdefault("_leg_local_obj", threading.local())
+    prev = getattr(loc, "wall_bounded_rate_of", None)
+    loc.wall_bounded_rate_of = rate_of
+    try:
+        yield loc
+    finally:
+        loc.wall_bounded_rate_of = prev
 
 
 # ── 2. measured-wall gate ────────────────────────────────────────────────────
