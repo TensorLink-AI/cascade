@@ -39,3 +39,9 @@ chain.testnet.toml
 
 # 2026-11-26 launch: overlay adoption must re-point the lane B/C drivers.
 tests/unit/test_lane_drivers_follow_overlay.py
+
+# 2026-11-26: lane B model work on the eval pod, refused on the trainer box.
+cascade/trainer/lane_b_offload.py
+cascade/trainer/main.py
+docs/OPERATOR.md
+tests/unit/test_lane_b_offload.py

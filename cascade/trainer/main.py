@@ -390,7 +390,8 @@ def main(argv: list[str] | None = None) -> int:
 
         runner.lane_b_driver = LaneBDriver(
             cfg, RunnerLaneBOps(runner, client, window_source, device=_local_device(),
-                                bench=_lane_b_bench(args, cfg, runner)),
+                                bench=_lane_b_bench(args, cfg, runner),
+                                offload=_lane_b_offload(args)),
             Path(args.work_root) / "lane_b_driver.json")
     if int(getattr(getattr(cfg, "lane_c", None), "from_block", 0) or 0) > 0:
         # DEC-CA-0056: the fine-tune lane rides the rolling scheduler the same
@@ -431,6 +432,20 @@ def _lane_b_bench(args, cfg, runner):
     log.info("lane B: public rows benched on the eval pod(s) in %s", path)
     return LaneBBench(hosts_path=path, cache_dir=Path(args.work_root) / "lane_b_bench_rows",
                       eval_cfg=cfg.eval, fetch=runner._fetch_checkpoint_dir)
+
+
+def _lane_b_offload(args):
+    """Lane B model work (routing probe, lineage read) on the same eval pod(s)
+    as the lane-B bench; None ⇒ refused (never run on the trainer box)."""
+    from .lane_b_offload import LaneBPodRunner
+
+    path = getattr(args, "lane_b_bench_hosts", None)
+    if path is None:
+        logging.getLogger("cascade.trainer").error(
+            "lane B: no --lane-b-bench-hosts — routing probes are refused (model work runs "
+            "only on an eval pod, never on this box)")
+        return None
+    return LaneBPodRunner.from_hosts_path(path)
 
 
 def _local_device() -> str:
