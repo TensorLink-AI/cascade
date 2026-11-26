@@ -115,3 +115,13 @@ docs/EVAL_POOL.md
 cascade/pool/first_seen.py
 cascade/pool/pool_d_build.py
 tests/unit/test_first_seen_index_memory.py
+
+# 2026-11-26 pool_d builder state-push EntityTooLarge (records.jsonl 20 GB /
+# 7,002 feeds sent as one PutObject, read whole first): the pool store streams
+# (multipart above one part, aborted on failure; streamed download; sha256 +
+# size of the bytes sent), state-push proves append-only from HEAD's sha256
+# without downloading, skips unchanged files, HEAD.json gains sizes.
+cascade/pool/pool_d_publish.py
+cascade/laned/elastic.py
+tests/unit/test_pool_d_state_streaming.py
+docs/OPERATOR.md
