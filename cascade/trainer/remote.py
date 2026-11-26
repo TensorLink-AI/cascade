@@ -194,6 +194,10 @@ class RemoteHost:
     allocation_id: str = ""
     allocation_provider: str = ""
     allocation_incident: str = ""
+    # Pod-side root for lane B's offload cache (``<cache_root>/_lane_b_offload``:
+    # checkpoint cache, code bundles, run dirs, bench pins), e.g. a Lium
+    # volume at /workspace. "" = ``workdir`` (the old behaviour).
+    cache_root: str = ""
 
 
 def load_hosts(path: Path | str) -> list[RemoteHost]:
@@ -214,6 +218,7 @@ def load_hosts(path: Path | str) -> list[RemoteHost]:
         stage = "any"       # "final" | "any" (operator lane); "init" = init-build-only
                             # lane (never a leg); "heat" is accepted, unused
         sku = "L40S"        # optional: the lane's GPU type (per-SKU latest safe start)
+        cache_root = "/workspace"  # optional: lane B's _lane_b_offload root (default workdir)
         isolated = true     # optional: the pod receives NOTHING from the orchestrator's
                             # environment (forward_env ignored); its legs train
                             # --local-only and the orchestrator harvests, verifies and
@@ -260,6 +265,7 @@ def load_hosts(path: Path | str) -> list[RemoteHost]:
                 profile_only=bool(h.get("profile_only", False)),
                 sku=str(h.get("sku", "") or "").strip(),
                 isolated=bool(h.get("isolated", False)),
+                cache_root=str(h.get("cache_root", "") or "").strip(),
             )
         )
     return hosts

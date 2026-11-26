@@ -1039,6 +1039,34 @@ fails the settlement closed: the legs stay finished and the next settlement
 retries. `CASCADE_LANE_B_LOCAL_EVAL=1` is the only local path (tests, dev
 boxes); never set it on the mainnet box.
 
+Lane B pod hosts and disk (2026-11-26: the 14 GB king filled the shared 43 GB
+eval pod to 98%). `--lane-b-model-hosts PATH` (same eval-hosts schema,
+re-read per call) moves the MODEL work (probe, lineage read, judge evals and
+merge checks, settlement rebase, era-init merges) off the validator's eval
+pod; unset, it runs on the `--lane-b-bench-hosts` pod as before. Bench
+staging stays on `--lane-b-bench-hosts`, because the pin it writes is
+pod-local and the sidecar sweeps it on the same host. A host entry's optional
+`cache_root` (for example `/workspace` on a Lium volume) holds
+`_lane_b_offload` (checkpoint cache, code bundles, run dirs and pins); the
+default is `workdir`. Each step fetches only the files it reads. Lineage
+pulls the JSON files only. Probe, judge, merge checks, rebase, the non-finite
+checks, acceptance stages, bench staging and every merge record in the
+merged-init build pull the weights, config and model code. They skip
+`optimizer.safetensors`, `weights_stable.safetensors` and
+`power_ema.safetensors`. Only the merged-init build's INIT is pulled whole,
+because those files go into the pushed init. Pushed bytes and bench content
+keys are unchanged. Partial copies live in `ckpt/<digest>~weights` and
+`~meta`, and a whole copy serves every profile. Before each pull the pod
+checks free space on the cache filesystem for the pull size (from the
+registry manifest; unknown sizes use 16 GB) plus `--lane-b-pod-headroom-gb`
+(default 10). When space is short, it evicts least recently used
+`_lane_b_offload/ckpt` entries that the current step does not hold, plus stale
+fetch temp dirs. If space is still short, it refuses the step: the box logs
+`refused on <host>: pod disk short ...` and raises `LaneBOffloadUnavailable`
+(transient: nothing charged, retried next tick). Nothing outside
+`_lane_b_offload/ckpt` is ever evicted. Trainer restarts must follow the
+`lane_b_driver.json` rule: only after the leg's `done` has landed.
+
 Required lane-B public suites must have `min_public_items` usable pairs for
 both CRPS and MASE. Different known data revisions, one missing revision pin,
 missing suites or insufficient required evidence hold trainer settlement or

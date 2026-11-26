@@ -40,6 +40,13 @@ pod(s) named by the same eval-hosts TOML as the lane-B bench
   with no lock. Every call uses a uuid-unique run dir (removed afterwards);
   the only cache evicted is this module's own ``_lane_b_offload/ckpt``; the
   heavy step runs under a pod-side ``flock`` (lane B serialises with itself).
+* **Own hosts, own disk.** ``--lane-b-model-hosts`` names the pod(s) for the
+  model work (default: the bench hosts); bench staging stays with the bench
+  sidecar. A host's ``cache_root`` roots ``_lane_b_offload`` (e.g. a volume).
+  Each step fetches only the files it reads (:data:`LINEAGE_FILES` are
+  skipped except for the merged init's init), and every pull is disk-guarded
+  (:func:`_ensure_room`: LRU-evict unneeded cache entries, else refuse —
+  transient).
 
 Torch-free on the box: the pod-side half (:func:`pod_main`) imports torch only
 on the pod.
@@ -86,6 +93,42 @@ UPLOAD_OPS = frozenset({"rebase", "merge_stage", "merge_build"})
 MODEL_TIMEOUT_S = 3600
 # pinned bench dirs older than this are abandoned (a box that died mid-sweep)
 PIN_STALE_S = 24 * 3600
+
+# ── selective fetch + disk guard (2026-11-26: the 14 GB king filled the shared
+# 43 GB eval pod to 98% — optimizer.safetensors alone is ~5 GB) ─────────────
+# What each pod step reads of a checkpoint (traced in code):
+#   META    lineage: lineage.read_measurement reads training_measurement.json.
+#   WEIGHTS probe (expert_lane.load_king: config.json + model code + weights),
+#           eval (evaluator.load_*forecaster), merge_check (merge_check_dirs),
+#           rebase (settle_leg + leg_actuals: config.json, model.py,
+#           forecast_wrapper.py, weights.safetensors — and it WRITES only
+#           those), merge_finite / merge_stage (weights + CODE_FILES), every
+#           merge record's pointers in merge_build (LaneBModel._load: weights),
+#           bench_stage (content_key / pin: BENCH_UPLOAD_FILES).
+#   FULL    merge_build's INIT only: it carries optimizer.safetensors (moments
+#           reset), weights_stable.safetensors and power_ema.safetensors
+#           (deltas applied) into the pushed init.
+# The lineage files skipped below are never read by a WEIGHTS step, so the
+# bytes a step pushes and the bench content keys are unchanged.
+FETCH_FULL, FETCH_WEIGHTS, FETCH_META = "full", "weights", "meta"
+LINEAGE_FILES = ("optimizer.safetensors", "weights_stable.safetensors",
+                 "power_ema.safetensors")
+# strongest first: an entry of a stronger profile serves every weaker one
+_PROFILES = (FETCH_FULL, FETCH_WEIGHTS, FETCH_META)
+_PROFILE_PATTERNS = {
+    FETCH_FULL: (None, None),
+    FETCH_WEIGHTS: (None, list(LINEAGE_FILES)),
+    FETCH_META: (["*.json"], None),
+}
+# free space kept on the cache filesystem beyond the pull (configurable:
+# ``--lane-b-pod-headroom-gb``); the validator's evals share this disk
+DISK_HEADROOM_BYTES = 10 * 10**9
+# expected pull size when the registry cannot say (hf: / vault refs, a
+# registry error): one full Cascade MoE checkpoint
+SIZE_FALLBACK_BYTES = 16 * 10**9
+# a hidden fetch temp dir this old is a killed step's leftover (steps hold the
+# heavy flock, so a live one is never this old)
+FETCH_TMP_STALE_S = 2 * 3600
 
 
 class LaneBOffloadUnavailable(OSError):
@@ -193,12 +236,18 @@ class LaneBPodRunner:
     """Runs lane B model work on the eval pod named by ``host_fn``."""
 
     def __init__(self, host_fn: Callable[[], object] | None, *, run=None, scp=None,
-                 timeout_s: int = PROBE_TIMEOUT_S, bundle: Callable[[], tuple] | None = None):
+                 timeout_s: int = PROBE_TIMEOUT_S, bundle: Callable[[], tuple] | None = None,
+                 headroom_bytes: int = DISK_HEADROOM_BYTES,
+                 size_fallback_bytes: int = SIZE_FALLBACK_BYTES,
+                 source: str = "--lane-b-bench-hosts"):
         self._host_fn = host_fn
         self._run = run
         self._scp = scp
         self.timeout_s = int(timeout_s)
         self._bundle = bundle or code_bundle
+        self.headroom_bytes = max(0, int(headroom_bytes))
+        self.size_fallback_bytes = max(0, int(size_fallback_bytes))
+        self.source = str(source)
 
     @classmethod
     def from_hosts_path(cls, path: Path | str | None, **kw) -> LaneBPodRunner:
@@ -213,9 +262,15 @@ class LaneBPodRunner:
         host = self._host_fn() if self._host_fn is not None else None
         if host is None:
             raise LaneBOffloadUnavailable(
-                "lane B: no eval pod configured/listed (--lane-b-bench-hosts) — model work "
+                f"lane B: no eval pod configured/listed ({self.source}) — model work "
                 "never runs on the trainer box; retried next tick")
         return host
+
+    @staticmethod
+    def root_of(host) -> str:
+        """``<cache_root or workdir>/_lane_b_offload`` on ``host``."""
+        base = (getattr(host, "cache_root", "") or "").strip() or host.workdir
+        return f"{base.rstrip('/') or '/'}/{OFFLOAD_DIR}"
 
     # transport (injectable)
     def _ssh(self, host, command: str, timeout: float, stdin_text: str = ""):
@@ -239,7 +294,7 @@ class LaneBPodRunner:
         host = host if host is not None else self.host()
         deadline = time.monotonic() + int(timeout_s or self.timeout_s)
         q = shlex.quote
-        root = f"{host.workdir}/{OFFLOAD_DIR}"
+        root = self.root_of(host)
         run_dir = f"{root}/runs/{uuid.uuid4().hex}"
         sha, blob = self._bundle()
         code = f"{root}/code/{sha}"
@@ -262,7 +317,10 @@ class LaneBPodRunner:
             with tempfile.TemporaryDirectory(prefix="cascade-laneb-offload-") as td:
                 local = Path(td)
                 (local / "request.json").write_text(json.dumps(
-                    {**request, "op": op, "pointer": pointer}), encoding="utf-8")
+                    {**request, "op": op, "pointer": pointer,
+                     "disk": {"headroom_bytes": self.headroom_bytes,
+                              "size_fallback_bytes": self.size_fallback_bytes}}),
+                    encoding="utf-8")
                 if contexts is not None:
                     write_contexts(local / "contexts.npz", contexts)
                 if payload is not None:
@@ -303,9 +361,16 @@ class LaneBPodRunner:
                        f"cat {q(run_dir + '/result.json')}")
                 proc = ok(self._ssh(host, cmd, left(), stdin), "worker")
                 try:
-                    return json.loads(proc.stdout)
+                    doc = json.loads(proc.stdout)
                 except ValueError as e:
                     raise LaneBOffloadUnavailable(f"lane B {op}: pod reply is not JSON") from e
+                if isinstance(doc, dict) and "offload_unavailable" in doc:
+                    # the pod refused the step itself (disk guard): transient
+                    msg = str(doc["offload_unavailable"])
+                    log.error("lane B %s: refused on %s: %s — nothing charged, retried next "
+                              "tick", op, getattr(host, "name", host), msg)
+                    raise LaneBOffloadUnavailable(f"lane B {op}: {msg}")
+                return doc
         except LaneBOffloadUnavailable:
             raise
         except Exception as e:  # noqa: BLE001 — any transport failure is transient
@@ -438,7 +503,7 @@ class LaneBPodRunner:
         old key) and its bench files hard-linked into a pinned dir on that
         host for the sidecar. The caller removes the pin (``unpin``)."""
         host = self.host()
-        pin = f"{host.workdir}/{OFFLOAD_DIR}/pinned/{uuid.uuid4().hex}"
+        pin = f"{self.root_of(host)}/pinned/{uuid.uuid4().hex}"
         doc = self._call("bench_stage", pointer, {"settings": settings, "pin": pin}, None,
                          timeout_s=MODEL_TIMEOUT_S, host=host)
         key = doc.get("content_key") if isinstance(doc, dict) else None
@@ -576,27 +641,129 @@ def decode_scores(doc: dict) -> list:
 # ── pod side ─────────────────────────────────────────────────────────────────
 
 
-def _pod_fetch(pointer: str, root: Path, keep: set | None = None) -> Path:
-    """``pointer`` in this module's pod cache. ``keep`` (one pod step's own
+class PodDiskShort(OSError):
+    """Pod side: the cache filesystem cannot take a pull even after evicting
+    every unneeded ``_lane_b_offload/ckpt`` entry. Reported to the box as
+    ``offload_unavailable`` (transient: :class:`LaneBOffloadUnavailable`)."""
+
+
+def _entry_name(digest_name: str, profile: str) -> str:
+    # FULL keeps the old name (existing cache entries stay valid)
+    return digest_name if profile == FETCH_FULL else f"{digest_name}~{profile}"
+
+
+def _complete(d: Path) -> bool:
+    from ..shared.hippius import FETCH_COMPLETE_MARKER
+
+    return (d / FETCH_COMPLETE_MARKER).is_file()
+
+
+def _cached(ckpt: Path, digest_name: str, profile: str) -> Path | None:
+    """A complete cache entry of ``profile`` or any stronger one."""
+    for prof in _PROFILES[: _PROFILES.index(profile) + 1]:
+        d = ckpt / _entry_name(digest_name, prof)
+        if _complete(d):
+            return d
+    return None
+
+
+def _ensure_room(ckpt: Path, need: int, protect: set, *, what: str,
+                 disk_usage: Callable | None = None) -> None:
+    """Free ``need`` bytes on ``ckpt``'s filesystem: if short, evict LRU
+    entries of THIS cache dir (``_lane_b_offload/ckpt``) that are not in
+    ``protect`` (the step's own checkpoints), stale fetch temp dirs first;
+    still short ⇒ :class:`PodDiskShort`. Never touches anything else."""
+    import shutil
+
+    du = disk_usage or shutil.disk_usage
+    ckpt.mkdir(parents=True, exist_ok=True)
+    free = int(du(str(ckpt)).free)
+    if free >= need:
+        return
+    now = time.time()
+    held = {Path(p).resolve() for p in protect}
+
+    def mtime(p: Path) -> float:
+        try:
+            return p.stat().st_mtime
+        except OSError:
+            return now
+
+    stale_tmp, entries = [], []
+    for p in ckpt.iterdir():
+        if not p.is_dir() or p.is_symlink() or p.resolve() in held \
+                or p.resolve().parent != ckpt.resolve():
+            continue
+        if p.name.startswith("."):
+            if ".fetch-" in p.name and now - mtime(p) > FETCH_TMP_STALE_S:
+                stale_tmp.append(p)
+            continue
+        entries.append(p)
+    for p in stale_tmp + sorted(entries, key=mtime):
+        log.warning("lane B pod cache: evicting %s for %s (free %.1f GB < need %.1f GB)",
+                    p.name, what, free / 1e9, need / 1e9)
+        shutil.rmtree(p, ignore_errors=True)
+        free = int(du(str(ckpt)).free)
+        if free >= need:
+            return
+    msg = (f"pod disk short for {what}: {free / 1e9:.1f} GB free on the lane B cache "
+           f"filesystem < {need / 1e9:.1f} GB needed (pull + headroom) after evicting every "
+           f"unneeded {OFFLOAD_DIR}/ckpt entry")
+    log.error("lane B: %s", msg)
+    raise PodDiskShort(msg)
+
+
+def _pod_fetch(pointer: str, root: Path, keep: set | None = None, *,
+               profile: str = FETCH_FULL, disk: dict | None = None,
+               size_fn: Callable | None = None, disk_usage: Callable | None = None) -> Path:
+    """``pointer`` in this module's pod cache, fetching only ``profile``'s
+    files (see :data:`LINEAGE_FILES`). ``keep`` (one pod step's own
     fetches) is never evicted: a merge step holds more than :data:`CKPT_KEEP`
-    checkpoints at once (steps are serialised by the heavy flock)."""
-    from ..shared.hippius import HubRef, fetch_from_hub
+    checkpoints at once (steps are serialised by the heavy flock). Before a
+    pull the disk guard (:func:`_ensure_room`) checks the cache filesystem
+    for the pull's size plus ``disk["headroom_bytes"]``."""
+    import shutil
+
+    from ..shared import hippius
     from ..shared.manifest import parse_trained_pointer
 
+    if profile not in _PROFILE_PATTERNS:
+        raise ValueError(f"unknown fetch profile {profile!r}")
     ref = parse_trained_pointer(pointer) or pointer
-    dest = root / "ckpt" / HubRef.parse(ref).digest.replace(":", "-")
-    fetch_from_hub(ref, dest)
-    os.utime(dest)
+    digest_name = hippius.HubRef.parse(ref).digest.replace(":", "-")
+    ckpt = root / "ckpt"
     held = set(keep or ())
+    dest = _cached(ckpt, digest_name, profile)
+    if dest is None:
+        dest = ckpt / _entry_name(digest_name, profile)
+        allow, ignore = _PROFILE_PATTERNS[profile]
+        disk = disk or {}
+        headroom = int(disk.get("headroom_bytes", DISK_HEADROOM_BYTES))
+        size = (size_fn or hippius.hub_snapshot_bytes)(
+            ref, allow_patterns=allow, ignore_patterns=ignore)
+        if size is None:
+            size = int(disk.get("size_fallback_bytes", SIZE_FALLBACK_BYTES))
+            log.warning("lane B pod cache: size of %s unknown — guarding with %.1f GB",
+                        digest_name[-16:], size / 1e9)
+        if dest.exists():
+            shutil.rmtree(dest, ignore_errors=True)     # an incomplete leftover
+        _ensure_room(ckpt, int(size) + headroom, held, what=f"{digest_name[-16:]} ({profile})",
+                     disk_usage=disk_usage)
+        hippius.fetch_from_hub(ref, dest, allow_patterns=allow, ignore_patterns=ignore)
+        if profile == FETCH_FULL:
+            # the lighter copies of the same digest are now redundant
+            for prof in _PROFILES[1:]:
+                p = ckpt / _entry_name(digest_name, prof)
+                if p.is_dir() and p not in held:
+                    shutil.rmtree(p, ignore_errors=True)
+    os.utime(dest)
     if keep is not None:
         keep.add(dest)
     # bounded: evict only this module's own cache entries (never hidden temp dirs)
-    entries = sorted((p for p in (root / "ckpt").iterdir()
+    entries = sorted((p for p in ckpt.iterdir()
                       if p.is_dir() and not p.name.startswith(".") and p != dest
                       and p not in held),
                      key=lambda p: p.stat().st_mtime, reverse=True)
-    import shutil
-
     for p in entries[CKPT_KEEP - 1:]:
         shutil.rmtree(p, ignore_errors=True)
     return dest
@@ -680,16 +847,21 @@ def _pod_model_op(op: str, req: dict, run_dir: Path, root: Path) -> dict:
     from .lane_b_model import LaneBModel, MergeRefused
 
     keep: set = set()
+    disk = req.get("disk") or {}
 
     def fetch(p: str) -> Path:
-        return _pod_fetch(p, root, keep=keep)
+        # every read but merge_build's init needs weights + config/code only
+        return _pod_fetch(p, root, keep=keep, profile=FETCH_WEIGHTS, disk=disk)
+
+    def fetch_full(p: str) -> Path:
+        return _pod_fetch(p, root, keep=keep, profile=FETCH_FULL, disk=disk)
 
     push = _pod_push(req["push"]) if op in UPLOAD_OPS else None
 
     def no_push(local, repo):
         raise RuntimeError(f"lane B {op}: this step does not push")
 
-    model = LaneBModel(fetch, push or no_push)
+    model = LaneBModel(fetch, push or no_push, fetch_full=fetch_full)
     settings = req.get("bench_settings")
     if op == "rebase":
         sel = {int(k): [int(x) for x in v] for k, v in req["selection"].items()}
@@ -744,7 +916,6 @@ MODEL_OPS = frozenset({"rebase", "merge_finite", "merge_stage", "merge_build", "
 def pod_main(argv: list[str] | None = None) -> int:
     """``python -m cascade.trainer.lane_b_offload <op> <run_dir> <root>`` (pod)."""
     import sys
-    from types import SimpleNamespace
 
     op, run_dir, root = (argv if argv is not None else sys.argv[1:])[:3]
     run_dir, root = Path(run_dir), Path(root)
@@ -757,14 +928,32 @@ def pod_main(argv: list[str] | None = None) -> int:
         _pod_prune_code(root, Path(__file__).resolve().parents[2])
     with contextlib.suppress(OSError):
         _pod_prune_pins(root)
+    try:
+        out = _pod_op(op, req, run_dir, root)
+    except PodDiskShort as e:
+        out = {"offload_unavailable": str(e)}
+    tmp = run_dir / "result.json.tmp"
+    tmp.write_text(json.dumps(out), encoding="utf-8")
+    tmp.replace(run_dir / "result.json")
+    return 0
+
+
+# what the non-model ops read of their checkpoints (see LINEAGE_FILES)
+OP_PROFILE = {"probe": FETCH_WEIGHTS, "lineage": FETCH_META, "eval": FETCH_WEIGHTS,
+              "merge_check": FETCH_WEIGHTS}
+
+
+def _pod_op(op: str, req: dict, run_dir: Path, root: Path) -> dict:
+    from types import SimpleNamespace
+
     if op in MODEL_OPS:
-        out = _pod_model_op(op, req, run_dir, root)
-        tmp = run_dir / "result.json.tmp"
-        tmp.write_text(json.dumps(out), encoding="utf-8")
-        tmp.replace(run_dir / "result.json")
-        return 0
+        return _pod_model_op(op, req, run_dir, root)
+    if op not in OP_PROFILE:
+        raise SystemExit(f"unknown op {op!r}")
     pointers = list(req.get("pointers") or [req["pointer"]])
-    dirs = [_pod_fetch(p, root) for p in pointers]
+    keep: set = set()
+    dirs = [_pod_fetch(p, root, keep=keep, profile=OP_PROFILE[op], disk=req.get("disk"))
+            for p in pointers]
     ckpt = dirs[0]
     payload = None
     if (run_dir / "payload.pkl").is_file():
@@ -799,10 +988,7 @@ def pod_main(argv: list[str] | None = None) -> int:
                                                strict=payload["strict"])}
     else:
         raise SystemExit(f"unknown op {op!r}")
-    tmp = run_dir / "result.json.tmp"
-    tmp.write_text(json.dumps(out), encoding="utf-8")
-    tmp.replace(run_dir / "result.json")
-    return 0
+    return out
 
 
 if __name__ == "__main__":

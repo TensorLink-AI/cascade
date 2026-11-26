@@ -610,8 +610,53 @@ def upload_dir_to_hub_or_hf(
 FETCH_COMPLETE_MARKER = ".fetch_complete"
 
 
-def fetch_from_hub(ref: HubRef | str, dest_dir: Path | str, hub: HubConfig | None = None) -> Path:
+def _fetch_patterns(allow_patterns, ignore_patterns) -> tuple[list[str], list[str]]:
+    """The (allow, ignore) a fetch passes: :data:`ALLOW_PATTERNS` unless
+    narrowed; :data:`UNPUBLISHED_PATTERNS` are ALWAYS ignored."""
+    allow = list(ALLOW_PATTERNS if allow_patterns is None else allow_patterns)
+    ignore = list(UNPUBLISHED_PATTERNS) + [p for p in (ignore_patterns or ())
+                                           if p not in UNPUBLISHED_PATTERNS]
+    return allow, ignore
+
+
+def hub_snapshot_bytes(ref: HubRef | str, *, allow_patterns: list[str] | None = None,
+                       ignore_patterns: list[str] | None = None) -> int | None:
+    """Best effort: the bytes :func:`fetch_from_hub` would write for ``ref``
+    with these patterns (sum of the OCI manifest's matching layer sizes).
+    None when unknown (an ``hf:`` / vault ref, no ``hippius_hub``, any
+    registry error) — the caller then uses its own estimate."""
+    try:
+        ref = ref if isinstance(ref, HubRef) else HubRef.parse(ref)
+        if ref.digest.startswith("hf:") or ref.repo == "vault/direct":
+            return None
+        from hippius_hub._oci import fetch_manifest, iter_titled_layers
+        from hippius_hub.auth import get_oci_bearer_token
+        from hippius_hub.constants import resolve_registry
+        from hippius_hub.file_download import _oci_repo_path
+        from huggingface_hub.utils import filter_repo_objects
+
+        allow, ignore = _fetch_patterns(allow_patterns, ignore_patterns)
+        oci_repo = _oci_repo_path(ref.repo, None)
+        token = get_oci_bearer_token(
+            oci_repo, _resolve_hub_token_for_pull(f"Sizing {ref.immutable_ref}"))
+        manifest = fetch_manifest(resolve_registry(None), oci_repo, ref.digest, token).manifest
+        sizes = dict((t, int(layer.get("size", 0))) for t, layer in iter_titled_layers(manifest))
+        keep = filter_repo_objects(items=list(sizes), allow_patterns=allow,
+                                   ignore_patterns=ignore)
+        return sum(sizes[t] for t in keep)
+    except Exception:  # noqa: BLE001 — sizing is advisory, never fatal
+        return None
+
+
+def fetch_from_hub(ref: HubRef | str, dest_dir: Path | str, hub: HubConfig | None = None, *,
+                   allow_patterns: list[str] | None = None,
+                   ignore_patterns: list[str] | None = None) -> Path:
     """Download an immutable Hub (or ``hf:``) snapshot into ``dest_dir``.
+
+    ``allow_patterns`` / ``ignore_patterns`` narrow the file set (default
+    :data:`ALLOW_PATTERNS`; :data:`UNPUBLISHED_PATTERNS` are always ignored).
+    The completion marker does not record the patterns: a caller that
+    narrows them must give the partial snapshot its own ``dest_dir``.
 
     ``ref`` may be a :class:`HubRef` or a ``repo@digest`` string. The OCI digest
     pins the content, so no separate integrity check is needed on fetch — a Hub
@@ -625,6 +670,7 @@ def fetch_from_hub(ref: HubRef | str, dest_dir: Path | str, hub: HubConfig | Non
     and a sibling lane reading the same dir is never pulled out from under.
     """
     ref = ref if isinstance(ref, HubRef) else HubRef.parse(ref)
+    allow, ignore = _fetch_patterns(allow_patterns, ignore_patterns)
     dest = Path(dest_dir)
     if (dest / FETCH_COMPLETE_MARKER).exists():
         return dest
@@ -646,7 +692,7 @@ def fetch_from_hub(ref: HubRef | str, dest_dir: Path | str, hub: HubConfig | Non
             _retry_hub_op(
                 lambda: hf_snapshot_download(
                     repo_id=ref.repo, revision=ref.digest[3:], local_dir=str(tmp),
-                    allow_patterns=ALLOW_PATTERNS, ignore_patterns=UNPUBLISHED_PATTERNS,
+                    allow_patterns=allow, ignore_patterns=ignore,
                     token=hf_token,
                 ),
                 f"fetch of {ref.immutable_ref}",
@@ -663,7 +709,7 @@ def fetch_from_hub(ref: HubRef | str, dest_dir: Path | str, hub: HubConfig | Non
                 _retry_hub_op(
                     lambda: snapshot_download(
                         repo_id=ref.repo, revision=ref.digest, local_dir=str(tmp),
-                        allow_patterns=ALLOW_PATTERNS, ignore_patterns=UNPUBLISHED_PATTERNS,
+                        allow_patterns=allow, ignore_patterns=ignore,
                         token=hub_token,
                     ),
                     f"fetch of {ref.immutable_ref}",

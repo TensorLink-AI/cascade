@@ -49,3 +49,5 @@ tests/unit/test_lane_b_offload.py
 cascade/trainer/lane_b_model.py
 cascade/trainer/lane_b_bench.py
 cascade/trainer/merge_acceptance.py
+# 2026-11-26: own lane B model hosts, pod cache root, disk guard, selective fetch.
+cascade/shared/hippius.py

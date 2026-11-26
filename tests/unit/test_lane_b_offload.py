@@ -64,8 +64,11 @@ class FakePod:
                                workdir=str(self.workdir), remote_python="python")
         ckpts = tmp / "registry"
 
-        def pod_fetch(pointer, root):
+        self.profiles: list[str] = []
+
+        def pod_fetch(pointer, root, keep=None, **kw):
             self.fetched.append(pointer)
+            self.profiles.append(kw.get("profile"))
             d = ckpts / pointer.split("@")[-1].replace(":", "-")
             d.mkdir(parents=True, exist_ok=True)
             (d / "weights.safetensors").write_bytes(pointer.encode()[-8:])
@@ -357,7 +360,7 @@ def test_real_probe_local_equals_pod_worker_roundtrip(tmp_path, monkeypatch):
         {"op": "probe", "pointer": KING, "target": "energy", "affinity_windows": 16}))
     off.write_contexts(run / "contexts.npz", ctx)
     (tmp_path / "root" / "code").mkdir(parents=True)
-    monkeypatch.setattr(off, "_pod_fetch", lambda p, root: tmp_path / "king")
+    monkeypatch.setattr(off, "_pod_fetch", lambda p, root, keep=None, **kw: tmp_path / "king")
     assert off.pod_main(["probe", str(run), str(tmp_path / "root")]) == 0
     remote = off.decode_probe(json.loads((run / "result.json").read_text()))
     assert _same(local, remote)
@@ -690,9 +693,11 @@ def pod_env(tmp_path, monkeypatch):
 
     pod.run, pod.scp = run, scp
     fetched_on_pod = []
+    profiles_on_pod = []
 
-    def pod_fetch(pointer, root, keep=None):
+    def pod_fetch(pointer, root, keep=None, **kw):
         fetched_on_pod.append(pointer)
+        profiles_on_pod.append((pointer, kw.get("profile")))
         d = reg.dir_of(pointer)
         if keep is not None:
             keep.add(d)
@@ -705,7 +710,8 @@ def pod_env(tmp_path, monkeypatch):
     moe.MergeError = type("MergeError", (ValueError,), {})
     monkeypatch.setitem(sys.modules, "cascade.trainer.moe_model", moe)
     monkeypatch.delenv(off.LOCAL_EVAL_ENV, raising=False)
-    return SimpleNamespace(pod=pod, reg=reg, fetched=fetched_on_pod, tmp=tmp_path)
+    return SimpleNamespace(pod=pod, reg=reg, fetched=fetched_on_pod, tmp=tmp_path,
+                           profiles=profiles_on_pod)
 
 
 def _push(repo):
@@ -875,11 +881,14 @@ def test_merge_steps_run_on_the_pod_and_match_the_local_model(pod_env, monkeypat
 def test_pod_fetch_never_evicts_the_steps_own_checkpoints(tmp_path, monkeypatch):
     import cascade.shared.hippius as hip
 
-    def fetch_from_hub(ref, dest, hub=None):
+    def fetch_from_hub(ref, dest, hub=None, **kw):
         Path(dest).mkdir(parents=True, exist_ok=True)
+        (Path(dest) / hip.FETCH_COMPLETE_MARKER).touch()
         return Path(dest)
 
     monkeypatch.setattr(hip, "fetch_from_hub", fetch_from_hub)
+    monkeypatch.setattr(hip, "hub_snapshot_bytes", lambda ref, **kw: 0)
+    monkeypatch.setattr(off, "DISK_HEADROOM_BYTES", 0)
     root = tmp_path / "root"
     keep: set = set()
     ptrs = [f"cascade/m{i}@sha256:{i:064x}" for i in range(off.CKPT_KEEP + 3)]
@@ -1239,7 +1248,7 @@ def test_real_rebase_and_build_pod_worker_equal_local(tmp_path, monkeypatch):
         shutil.rmtree(d)
         shutil.copytree(tmp_path / "king", d)
     pod = FakePod(tmp_path, monkeypatch)
-    monkeypatch.setattr(off, "_pod_fetch", lambda p, root, keep=None: reg.dir_of(p))
+    monkeypatch.setattr(off, "_pod_fetch", lambda p, root, keep=None, **kw: reg.dir_of(p))
     monkeypatch.setattr(hip, "upload_dir_to_hub_or_hf", reg.push)
     model = off.PodLaneBModel(pod.runner(), None, _push)
     sel = {0: [1, 2]}
@@ -1378,3 +1387,373 @@ def test_restart_between_finish_and_settle_settles_once_without_redispatch(tmp_p
     ws2.settle(sc, tmp_path)
     assert len(sc.ops.published) == 1
     assert len(sc.ops.dispatched) == n_dispatched
+
+
+# ── own model hosts, cache root, disk guard, selective fetch (2026-11-26) ────
+# The 14 GB king (optimizer.safetensors 4.97 GB) filled the shared 43 GB eval
+# pod to 98%; lane B settlement pulls king + base + leg there.
+
+
+def _hosts_toml(path: Path, name: str, workdir: Path, cache_root: str | None = None) -> Path:
+    extra = f'cache_root = "{cache_root}"\n' if cache_root is not None else ""
+    path.write_text(f'[[host]]\nname = "{name}"\nhost = "203.0.113.7"\nstage = "final"\n'
+                    f'workdir = "{workdir}"\n{extra}', encoding="utf-8")
+    return path
+
+
+def test_model_hosts_flag_routes_model_work_bench_stays_on_bench_hosts(tmp_path):
+    from cascade.trainer import main as tm
+
+    bench = _hosts_toml(tmp_path / "bench.toml", "valeval-bench", tmp_path / "b")
+    model = _hosts_toml(tmp_path / "model.toml", "lium-volume", tmp_path / "m", "/workspace")
+    args = tm._build_parser().parse_args(["--lane-b-bench-hosts", str(bench),
+                                          "--lane-b-model-hosts", str(model),
+                                          "--lane-b-pod-headroom-gb", "12.5"])
+    r = tm._lane_b_offload(args)
+    assert r.host().name == "lium-volume" and r.source == "--lane-b-model-hosts"
+    assert r.headroom_bytes == 12_500_000_000
+    assert off.LaneBPodRunner.root_of(r.host()) == "/workspace/" + off.OFFLOAD_DIR
+    # bench staging + its sidecar stay on the bench hosts (the pin is pod-local)
+    cfg = SimpleNamespace(lane_b=SimpleNamespace(require_public=True),
+                          eval=SimpleNamespace(cascade_bench_max_series=0,
+                                               gift_gate_data_dir="", bench_workers="1"))
+    args.work_root = tmp_path / "work"
+    lb = tm._lane_b_bench(args, cfg, SimpleNamespace(_fetch_checkpoint_dir=None))
+    assert lb._pod.host().name == "valeval-bench" and lb._pod.headroom_bytes == 12_500_000_000
+    # unset ⇒ the bench hosts, as before; default headroom 10 GB
+    args = tm._build_parser().parse_args(["--lane-b-bench-hosts", str(bench)])
+    r = tm._lane_b_offload(args)
+    assert r.host().name == "valeval-bench" and r.source == "--lane-b-bench-hosts"
+    assert r.headroom_bytes == 10 * 10**9
+    assert off.LaneBPodRunner.root_of(r.host()) == f"{tmp_path / 'b'}/{off.OFFLOAD_DIR}"
+    assert tm._lane_b_offload(tm._build_parser().parse_args([])) is None
+
+
+def test_cache_root_holds_the_offload_dir(tmp_path, monkeypatch):
+    import dataclasses
+
+    from cascade.trainer.remote import load_hosts
+
+    vol = tmp_path / "volume"
+    h = load_hosts(_hosts_toml(tmp_path / "h.toml", "x", tmp_path, str(vol)))[0]
+    assert h.cache_root == str(vol)
+    assert load_hosts(_hosts_toml(tmp_path / "g.toml", "y", tmp_path))[0].cache_root == ""
+    pod = FakePod(tmp_path, monkeypatch)
+    pod.host = dataclasses.replace(pod.host, cache_root=str(vol))
+    pod.runner().probe(KING, CTX, 4, "energy")
+    assert (vol / off.OFFLOAD_DIR / "code").is_dir()
+    assert not (pod.workdir / off.OFFLOAD_DIR).exists()
+    worker = [c for c in pod.commands if "-m cascade.trainer.lane_b_offload" in c][-1]
+    assert f"{vol}/{off.OFFLOAD_DIR}" in worker and f"cd {pod.workdir}" in worker
+
+
+# a checkpoint with its lineage files (the king's 14 GB shape, scaled down)
+_CKPT_FILES = {"config.json": 10, "model.py": 10, "forecast_wrapper.py": 10,
+               "training_measurement.json": 5, "weights.safetensors": 100,
+               "weights_stable.safetensors": 100, "optimizer.safetensors": 300,
+               "power_ema.safetensors": 50}
+
+
+class FilteringHub:
+    """``fetch_from_hub`` / ``hub_snapshot_bytes`` over digest-named dirs,
+    honouring allow/ignore patterns exactly like the registry pull."""
+
+    def __init__(self, tmp: Path):
+        self.root = tmp / "filtering-hub"
+        self.pulls: list[tuple[str, list[str]]] = []
+
+    def add(self, pointer: str, files: dict | None = None, seed: bytes = b"") -> str:
+        d = self.root / pointer.rsplit("@", 1)[-1].replace(":", "-")
+        d.mkdir(parents=True, exist_ok=True)
+        for name, n in (files or _CKPT_FILES).items():
+            if name == "config.json":
+                (d / name).write_text(json.dumps({"arch": "moe", "pad": "x" * n}))
+            else:
+                (d / name).write_bytes((seed + name.encode()) * n)
+        return pointer
+
+    def _names(self, ref, allow, ignore):
+        import fnmatch
+
+        import cascade.shared.hippius as hip
+
+        allow, ignore = hip._fetch_patterns(allow, ignore)
+        d = self.root / str(ref).rsplit("@", 1)[-1].replace(":", "-")
+        return d, [p.name for p in sorted(d.iterdir())
+                   if any(fnmatch.fnmatchcase(p.name, a) for a in allow)
+                   and not any(fnmatch.fnmatchcase(p.name, i) for i in ignore)]
+
+    def fetch(self, ref, dest, hub=None, *, allow_patterns=None, ignore_patterns=None):
+        import cascade.shared.hippius as hip
+
+        src, names = self._names(ref, allow_patterns, ignore_patterns)
+        dest = Path(dest)
+        dest.mkdir(parents=True, exist_ok=True)
+        for n in names:
+            shutil.copyfile(src / n, dest / n)
+        (dest / hip.FETCH_COMPLETE_MARKER).touch()
+        self.pulls.append((str(ref), names))
+        return dest
+
+    def size(self, ref, *, allow_patterns=None, ignore_patterns=None):
+        src, names = self._names(ref, allow_patterns, ignore_patterns)
+        return sum((src / n).stat().st_size for n in names)
+
+
+def _du(disk: Path, cap: int):
+    def used() -> int:
+        return sum(p.stat().st_size for p in disk.rglob("*") if p.is_file())
+
+    return lambda path: SimpleNamespace(free=cap - used())
+
+
+def _entry(ckpt: Path, name: str, nbytes: int, age: float) -> Path:
+    import os
+    import time
+
+    d = ckpt / name
+    d.mkdir(parents=True)
+    (d / "weights.safetensors").write_bytes(b"x" * nbytes)
+    t = time.time() - age
+    os.utime(d, (t, t))
+    return d
+
+
+def test_disk_guard_evicts_lru_unneeded_entries_only(tmp_path, monkeypatch):
+    import cascade.shared.hippius as hip
+
+    hub = FilteringHub(tmp_path)
+    monkeypatch.setattr(hip, "fetch_from_hub", hub.fetch)
+    disk = tmp_path / "disk"
+    root = disk / off.OFFLOAD_DIR
+    ckpt = root / "ckpt"
+    oldest = _entry(ckpt, "sha256-" + "1" * 64, 400, age=300)
+    older = _entry(ckpt, "sha256-" + "2" * 64, 400, age=200)
+    mine = _entry(ckpt, "sha256-" + "3" * 64, 400, age=900)     # this step holds it
+    newest = _entry(ckpt, "sha256-" + "4" * 64, 400, age=10)
+    stale_tmp = _entry(ckpt, ".sha256-x.fetch-1-ab", 50, age=3 * 3600)
+    validator = disk / "_eval_offload" / "cache" / "k"           # the validator's cache
+    validator.mkdir(parents=True)
+    (validator / "w").write_bytes(b"v" * 400)
+    pin = root / "pinned" / "p1"
+    pin.mkdir(parents=True)
+    (pin / "w").write_bytes(b"p" * 100)
+    ptr = hub.add("cascade/leg@sha256:" + "e" * 64)
+    need = hub.size(ptr, ignore_patterns=list(off.LINEAGE_FILES))     # weights profile
+    # room for the pull + 50 B headroom only after evicting the stale temp + 2 LRU
+    cap = sum(p.stat().st_size for p in disk.rglob("*") if p.is_file()) - 850 + need + 50
+    keep = {mine}
+    d = off._pod_fetch(ptr, root, keep=keep, profile=off.FETCH_WEIGHTS,
+                       disk={"headroom_bytes": 50}, size_fn=hub.size, disk_usage=_du(disk, cap))
+    assert d.name.endswith("~weights") and mine in keep and d in keep
+    assert not stale_tmp.exists() and not oldest.exists() and not older.exists()
+    assert newest.exists() and mine.exists()                   # LRU stopped once it fit
+    assert (validator / "w").exists() and (pin / "w").exists()  # never outside ckpt/
+    assert not (d / "optimizer.safetensors").exists()
+
+
+def test_disk_guard_refuses_when_still_short_and_never_touches_outside(tmp_path, monkeypatch):
+    import cascade.shared.hippius as hip
+
+    hub = FilteringHub(tmp_path)
+    monkeypatch.setattr(hip, "fetch_from_hub", hub.fetch)
+    disk = tmp_path / "disk"
+    root = disk / off.OFFLOAD_DIR
+    mine = _entry(root / "ckpt", "sha256-" + "3" * 64, 400, age=900)
+    other = _entry(root / "ckpt", "sha256-" + "5" * 64, 100, age=900)
+    outside = disk / "uv-cache" / "big"
+    outside.parent.mkdir(parents=True)
+    outside.write_bytes(b"u" * 5000)
+    ptr = hub.add("cascade/king@sha256:" + "b" * 64)
+    with pytest.raises(off.PodDiskShort, match="pod disk short"):
+        off._pod_fetch(ptr, root, keep={mine}, profile=off.FETCH_FULL,
+                       disk={"headroom_bytes": 10**6}, size_fn=hub.size,
+                       disk_usage=_du(disk, 6000))
+    assert mine.exists() and outside.exists() and not other.exists()
+    assert hub.pulls == []                                     # nothing pulled
+    # unknown size ⇒ the configured fallback guards the pull
+    with pytest.raises(off.PodDiskShort):
+        off._pod_fetch(ptr, root, profile=off.FETCH_META,
+                       disk={"headroom_bytes": 0, "size_fallback_bytes": 10**9},
+                       size_fn=lambda ref, **kw: None, disk_usage=_du(disk, 6000))
+    assert hub.pulls == [] and outside.exists()
+
+
+def test_disk_short_on_the_pod_is_a_transient_refusal(tmp_path, monkeypatch, caplog):
+    import cascade.shared.hippius as hip
+
+    pod = FakePod(tmp_path, monkeypatch)
+    monkeypatch.undo()                     # the real _pod_fetch, a real pull path
+    monkeypatch.setattr(tel, "probe_target_routing", _fake_forward)
+    hub = FilteringHub(tmp_path)
+    hub.add(KING)
+    monkeypatch.setattr(hip, "fetch_from_hub", hub.fetch)
+    monkeypatch.setattr(hip, "hub_snapshot_bytes", lambda ref, **kw: 10**15)   # 1 PB
+    with caplog.at_level("ERROR"), pytest.raises(off.LaneBOffloadUnavailable,
+                                                 match="pod disk short"):
+        pod.runner(headroom_bytes=0).probe(KING, CTX, 4, "energy")
+    assert hub.pulls == [] and "pod disk short" in caplog.text
+    assert not any((pod.workdir / off.OFFLOAD_DIR / "runs").iterdir())     # cleaned up
+
+
+def _real_fetch_pod(tmp_path, monkeypatch):
+    """A FakePod over the REAL _pod_fetch and a FilteringHub (the selective
+    fetch end to end), Hub push = the Registry, settle_leg stubbed."""
+    import sys
+    import types
+
+    import cascade.shared.hippius as hip
+    from cascade.trainer import lane_b_driver
+
+    pod = FakePod(tmp_path, monkeypatch)
+    monkeypatch.undo()
+    monkeypatch.setattr(tel, "probe_target_routing", _fake_forward)
+    hub = FilteringHub(tmp_path)
+    for ptr, seed in ((KING, b"K"), (BASE, b"B"), (LEG, b"L")):
+        hub.add(ptr, seed=seed)
+    reg = Registry(tmp_path)
+    for ptr in (KING, BASE, LEG):          # the Registry's copies = the full checkpoints
+        shutil.rmtree(reg.dir_of(ptr))
+        shutil.copytree(hub.root / ptr.rsplit("@", 1)[-1].replace(":", "-"), reg.dir_of(ptr))
+    monkeypatch.setattr(hip, "fetch_from_hub", hub.fetch)
+    monkeypatch.setattr(hip, "hub_snapshot_bytes", hub.size)
+    monkeypatch.setattr(hip, "upload_dir_to_hub_or_hf", reg.push)
+    monkeypatch.setattr(lane_b_driver, "settle_leg", _fake_settle_leg)
+    moe = types.ModuleType("cascade.trainer.moe_model")
+    moe.MergeError = type("MergeError", (ValueError,), {})
+    monkeypatch.setitem(sys.modules, "cascade.trainer.moe_model", moe)
+    monkeypatch.delenv(off.LOCAL_EVAL_ENV, raising=False)
+    return pod, hub, reg
+
+
+def _pulled(hub, ptr):
+    return [names for r, names in hub.pulls if r.endswith(ptr.rsplit("@", 1)[-1])]
+
+
+def test_selective_fetch_rebase_skips_lineage_files_same_bytes_and_key(tmp_path, monkeypatch):
+    from cascade.trainer.lane_b_bench import content_key
+
+    pod, hub, reg = _real_fetch_pod(tmp_path, monkeypatch)
+    r = pod.runner(headroom_bytes=0)
+    model = off.PodLaneBModel(r, SimpleNamespace(settings=SETTINGS), _push)
+    res = model.rebase(king_pointer=KING, base_pointer=BASE, leg_pointer=LEG,
+                       selection={0: [1]}, out_dir=tmp_path / "x", repo="rb",
+                       refuse_nonfinite=True, limits=False)
+    for ptr in (KING, BASE, LEG):
+        (names,) = _pulled(hub, ptr)
+        assert not set(names) & set(off.LINEAGE_FILES) and "weights.safetensors" in names
+    pushed = reg.pushes[-1]["files"]
+    local = _local_model(reg, tmp_path).rebase(       # the full checkpoints, box path
+        king_pointer=KING, base_pointer=BASE, leg_pointer=LEG, selection={0: [1]},
+        out_dir=tmp_path / "lr", repo="rb", refuse_nonfinite=True, limits=False)
+    assert reg.pushes[-1]["files"] == pushed and res.pointer == local.pointer
+    assert res.bench.content_key == content_key(tmp_path / "lr", SETTINGS)
+    # the bench stage of a full checkpoint: the same key from the weights-only copy
+    host, key, pin = r.bench_stage(KING, SETTINGS)
+    assert key == content_key(reg.dir_of(KING), SETTINGS)
+    r.unpin(host, pin)
+    assert len(_pulled(hub, KING)) == 1                       # cached, not pulled again
+
+
+def test_selective_fetch_profiles_per_op(tmp_path, monkeypatch):
+    import cascade.trainer.lineage as lin
+    import cascade.validator.expert_lane as vel
+
+    pod, hub, reg = _real_fetch_pod(tmp_path, monkeypatch)
+    r = pod.runner(headroom_bytes=0)
+    monkeypatch.setattr(lin, "read_measurement", lambda d, b: sorted(
+        p.name for p in Path(d).iterdir() if not p.name.startswith(".")).__len__())
+    # lineage reads training_measurement.json only ⇒ JSON files only
+    assert r.lineage(KING, {}) == 2
+    assert _pulled(hub, KING) == [["config.json", "training_measurement.json"]]
+    seen = {}
+
+    def merge_check_dirs(kd, cd, sel, *, strict):
+        seen["dirs"] = (kd.name, cd.name)
+        return None
+
+    monkeypatch.setattr(vel, "merge_check_dirs", merge_check_dirs)
+    assert r.merge_check(KING, LEG, {0: [1]}, True) is None
+    assert all(n.endswith("~weights") for n in seen["dirs"])
+    # a weights fetch after the meta one pulls the weights; the probe reuses it
+    r.probe(KING, CTX, 4, "energy")
+    assert len(_pulled(hub, KING)) == 2
+    ckpt = pod.workdir / off.OFFLOAD_DIR / "ckpt"
+    assert not any((d / f).exists() for d in ckpt.iterdir() for f in off.LINEAGE_FILES)
+
+
+def test_selective_fetch_merge_build_init_full_merges_weights(tmp_path, monkeypatch):
+    import inspect
+
+    from cascade.trainer import lane_b_model as lbm
+
+    # the real build reads the init's lineage files through fetch_full
+    src = inspect.getsource(lbm.LaneBModel.build)
+    assert "init_dir = self._fetch_full(init_pointer)" in src
+    assert "self._fetch(init_pointer)" not in src.split("init_dir = self._fetch_full", 1)[0]
+    pod, hub, reg = _real_fetch_pod(tmp_path, monkeypatch)
+    got = {}
+
+    def build(self, init_pointer, chosen, *, out_dir, repo, strict, era_index):
+        got["init"] = sorted(p.name for p in self._fetch_full(init_pointer).iterdir())
+        got["merge"] = sorted(p.name for p in self._fetch(chosen[0]["rebased_pointer"])
+                              .iterdir())
+        got["init_again"] = self._fetch(init_pointer).name
+        return "cascade/mi@sha256:" + "a" * 64
+
+    monkeypatch.setattr(lbm.LaneBModel, "build", build)
+    r = pod.runner(headroom_bytes=0)
+    assert r.merge_build(KING, [{"rebased_pointer": LEG, "king_pointer": KING,
+                                 "selection": {"0": [1]}, "round_id": "r1"}],
+                         strict=True, push=_push("mi"), era_index=2).startswith("cascade/mi@")
+    assert set(off.LINEAGE_FILES) <= set(got["init"])          # the init carries them
+    assert not set(off.LINEAGE_FILES) & set(got["merge"])
+    assert "~" not in got["init_again"]                      # the full copy serves weights
+
+
+def test_full_fetch_drops_the_redundant_light_copy(tmp_path, monkeypatch):
+    import cascade.shared.hippius as hip
+
+    hub = FilteringHub(tmp_path)
+    monkeypatch.setattr(hip, "fetch_from_hub", hub.fetch)
+    hub.add(KING)
+    root = tmp_path / "pod" / off.OFFLOAD_DIR
+    kw = {"disk": {"headroom_bytes": 0}, "size_fn": hub.size}
+    light = off._pod_fetch(KING, root, profile=off.FETCH_WEIGHTS, **kw)
+    full = off._pod_fetch(KING, root, profile=off.FETCH_FULL, **kw)
+    assert not light.exists() and (full / "optimizer.safetensors").is_file()
+    assert off._pod_fetch(KING, root, profile=off.FETCH_META, **kw) == full
+    assert len(hub.pulls) == 2
+
+
+def test_hub_snapshot_bytes_sums_the_matching_layers(monkeypatch):
+    pytest.importorskip("hippius_hub")
+    import hippius_hub._oci as oci
+    import hippius_hub.auth as auth
+
+    import cascade.shared.hippius as hip
+
+    layers = [{"size": n, "annotations": {"org.opencontainers.image.title": name}}
+              for name, n in _CKPT_FILES.items()]
+    layers.append({"size": 7, "annotations": {"org.opencontainers.image.title":
+                                              "weights_ema_0.99.safetensors"}})
+    seen = {}
+
+    def fetch_manifest(registry, repo, rev, token, **kw):
+        seen["rev"] = rev
+        return SimpleNamespace(manifest={"layers": layers}, digest=rev)
+
+    monkeypatch.setattr(oci, "fetch_manifest", fetch_manifest)
+    monkeypatch.setattr(oci, "iter_titled_layers", lambda m: (
+        (lay["annotations"]["org.opencontainers.image.title"], lay) for lay in m["layers"]))
+    monkeypatch.setattr(auth, "get_oci_bearer_token", lambda repo, token, **kw: "t")
+    monkeypatch.setattr(hip, "_resolve_hub_token_for_pull", lambda action: False)
+    total = sum(_CKPT_FILES.values())
+    assert hip.hub_snapshot_bytes(KING) == total              # UNPUBLISHED never counted
+    assert seen["rev"] == "sha256:" + "b" * 64
+    assert hip.hub_snapshot_bytes(KING, ignore_patterns=list(off.LINEAGE_FILES)) == \
+        total - 300 - 100 - 50
+    assert hip.hub_snapshot_bytes(KING, allow_patterns=["*.json"]) == 15
+    assert hip.hub_snapshot_bytes("cascade/x@hf:" + "a" * 40) is None
+    monkeypatch.setattr(oci, "fetch_manifest", lambda *a, **k: 1 / 0)
+    assert hip.hub_snapshot_bytes(KING) is None               # advisory, never raises

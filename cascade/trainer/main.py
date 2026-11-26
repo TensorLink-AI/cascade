@@ -96,6 +96,19 @@ def _build_parser() -> argparse.ArgumentParser:
         help="#909: eval-hosts TOML ([[host]], re-read per bench; e.g. targon-eval.toml, "
              "lane A's bench pod) where lane B's king / candidate / anchor public rows are "
              "benched. Unset or empty = lane B fails closed: the trainer box never benches.")
+    p.add_argument(
+        "--lane-b-model-hosts", type=Path, default=None,
+        help="Eval-hosts TOML (same schema, re-read per call) for lane B MODEL work on a "
+             "pod: routing probe, lineage read, judge evals + merge checks, settlement "
+             "rebase, era-init merges. Unset = the --lane-b-bench-hosts pod (the old "
+             "behaviour). Bench staging stays with the bench sidecar on "
+             "--lane-b-bench-hosts (its pinned dir is pod-local). A host's optional "
+             "cache_root (e.g. /workspace on a Lium volume) holds _lane_b_offload.")
+    p.add_argument(
+        "--lane-b-pod-headroom-gb", type=float, default=10.0,
+        help="Free space (GB) a lane B pod-side checkpoint pull must leave on the cache "
+             "filesystem; short ⇒ evict unneeded _lane_b_offload/ckpt entries (LRU), "
+             "else refuse the step (transient, retried).")
     p.add_argument("--network", default="finney")
     p.add_argument("--wallet-name", default=None)
     p.add_argument("--wallet-hotkey", default=None)
@@ -432,24 +445,36 @@ def _lane_b_bench(args, cfg, runner):
     log.info("lane B: public rows benched on the eval pod(s) in %s", path)
     # pointer benches (#909 prebench) stage on the eval pod (fetch + content
     # key + pin there); the box-side fetch is only the guarded local opt-in
+    # bench staging (pointer fetch + content key + pin) runs where the sidecar
+    # sweeps the pin: the bench hosts, never --lane-b-model-hosts
     return LaneBBench(hosts_path=path, cache_dir=Path(args.work_root) / "lane_b_bench_rows",
                       eval_cfg=cfg.eval, fetch=runner._fetch_checkpoint_dir,
-                      pod=_lane_b_offload(args))
+                      pod=_lane_b_pod_runner(args, path, "--lane-b-bench-hosts"))
+
+
+def _lane_b_pod_runner(args, path, source: str):
+    from .lane_b_offload import LaneBPodRunner
+
+    gb = getattr(args, "lane_b_pod_headroom_gb", None)
+    kw = {} if gb is None else {"headroom_bytes": int(float(gb) * 10**9)}
+    return LaneBPodRunner.from_hosts_path(path, source=source, **kw)
 
 
 def _lane_b_offload(args):
     """Lane B model work (routing probe, lineage read, judge, settlement
-    rebase, era-init merges, bench staging) on the same eval pod(s) as the
-    lane-B bench; None ⇒ refused (never run on the trainer box)."""
-    from .lane_b_offload import LaneBPodRunner
-
-    path = getattr(args, "lane_b_bench_hosts", None)
+    rebase, era-init merges) on the --lane-b-model-hosts pod(s), else the
+    lane-B bench pod(s); None ⇒ refused (never run on the trainer box)."""
+    log = logging.getLogger("cascade.trainer")
+    path = getattr(args, "lane_b_model_hosts", None)
+    source = "--lane-b-model-hosts"
     if path is None:
-        logging.getLogger("cascade.trainer").error(
-            "lane B: no --lane-b-bench-hosts — routing probes are refused (model work runs "
-            "only on an eval pod, never on this box)")
+        path, source = getattr(args, "lane_b_bench_hosts", None), "--lane-b-bench-hosts"
+    if path is None:
+        log.error("lane B: no --lane-b-model-hosts / --lane-b-bench-hosts — routing probes "
+                  "are refused (model work runs only on an eval pod, never on this box)")
         return None
-    return LaneBPodRunner.from_hosts_path(path)
+    log.info("lane B: model work on the pod(s) in %s (%s)", path, source)
+    return _lane_b_pod_runner(args, path, source)
 
 
 def _local_device() -> str:
