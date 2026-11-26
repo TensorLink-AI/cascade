@@ -26,7 +26,11 @@ H200_RATE = 0.05547751688587357   # evidence/wb19.json, 8xH200 expert run
 
 def _guards():
     with h.torch_blocked():
-        return importlib.import_module("cascade.trainer.cost_guards")
+        cg = importlib.import_module("cascade.trainer.cost_guards")
+    # Fails by assertion (not AttributeError) on a base without the fix.
+    assert hasattr(cg, "wall_bounded_steps") and hasattr(cg, "wall_bounded_leg"), \
+        "WB27: cost_guards lacks the wall-bounded expert-leg watchdog"
+    return cg
 
 
 def _runner():
@@ -146,6 +150,7 @@ def _ops(cfg, tmp_path, monkeypatch, seen):
 
 def test_the_driver_opens_the_scope_only_for_a_leg_without_train_hours(cfg, tmp_path,
                                                                        monkeypatch):
+    _guards()                       # by assertion on a base without the fix
     from cascade.trainer.expert_lane import LaneBSubmission, OpenLeg
 
     seen: list = []
