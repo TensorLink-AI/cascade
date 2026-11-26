@@ -61,8 +61,13 @@ class LaneBModel:
     One instance per settlement / era init: loaded states are cached on it."""
 
     def __init__(self, fetch: Callable[[str], Path], upload: Callable[[Path, str], str],
-                 bench_rows: Callable[[Path], dict | None] | None = None):
+                 bench_rows: Callable[[Path], dict | None] | None = None, *,
+                 fetch_full: Callable[[str], Path] | None = None):
+        # ``fetch`` may skip a checkpoint's lineage files (optimizer /
+        # weights_stable / power_ema: the pod's selective fetch); only
+        # :meth:`build`'s init reads them, through ``fetch_full``
         self._fetch, self._upload, self._bench_rows = fetch, upload, bench_rows
+        self._fetch_full = fetch_full or fetch
         self._states: dict[str, dict] = {}
 
     # ── bench rows ───────────────────────────────────────────────────────────
@@ -170,7 +175,7 @@ class LaneBModel:
         from .moe_trainer import POWER_EMA_FILE
         from .toto2_trainer import OPTIM_STATE_FILE, STABLE_WEIGHTS_FILE
 
-        init_dir = self._fetch(init_pointer)
+        init_dir = self._fetch_full(init_pointer)
         names = self._names(init_pointer)
         state = apply_merges(load_file(str(init_dir / "weights.safetensors")), chosen,
                              self._load, names, strict=strict)
