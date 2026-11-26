@@ -587,3 +587,750 @@ def test_runner_judge_refuses_without_pod_before_drawing_windows(monkeypatch):
         ops.judge(m, "7", 100)
     with pytest.raises(off.LaneBOffloadUnavailable):
         ops.merge_scores(ptr, 100)
+
+
+# ── settlement rebase / era-init merges / bench staging on the pod ───────────
+#
+# Owner rule (ABSOLUTE): the trainer box never downloads a checkpoint nor loads
+# torch. The rebase, the era init's merge checks / acceptance stages / merged
+# build and the bench's pointer staging are pod steps; their pushes go pod →
+# Hub. Torch-free here: the torch functions are stubbed with byte-deterministic
+# stand-ins run by the SAME LaneBModel code on both sides (local and pod), so
+# the bytes compare; the real-torch equivalence is CI-only (importorskip).
+
+import hashlib  # noqa: E402
+import json  # noqa: E402
+
+BASE = "cascade/base@sha256:" + "c" * 64
+LEG = "cascade/leg@sha256:" + "e" * 64
+SETTINGS = {"suites": ["gift-eval", "boom", "time", "fev"], "max_series": 0,
+            "data_dir": "/data/bench", "num_samples": 100, "batch_size": 512}
+
+
+def _mk_ckpt(d: Path, payload: bytes, leg_rec: dict | None = None) -> Path:
+    d.mkdir(parents=True, exist_ok=True)
+    cfg = {"arch": "moe"}
+    if leg_rec is not None:
+        cfg["lane_b_leg"] = leg_rec
+    (d / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+    (d / "model.py").write_text("# model\n", encoding="utf-8")
+    (d / "forecast_wrapper.py").write_text("# fw\n", encoding="utf-8")
+    (d / "weights.safetensors").write_bytes(payload)
+    return d
+
+
+class Registry:
+    """The Hub stand-in: digest-named dirs; ``push`` records what was pushed
+    (bytes + target + which side pushed) and returns a content pointer."""
+
+    def __init__(self, tmp: Path, leg_rec: dict | None = None):
+        self.root = tmp / "hub"
+        self.pushes: list[dict] = []
+        _mk_ckpt(self.root / ("sha256-" + "b" * 64), b"KING" * 4)
+        _mk_ckpt(self.root / ("sha256-" + "c" * 64), b"BASE" * 4)
+        _mk_ckpt(self.root / ("sha256-" + "e" * 64), b"LEGW" * 4, leg_rec)
+
+    def dir_of(self, pointer: str) -> Path:
+        return self.root / pointer.rsplit("@", 1)[-1].replace(":", "-")
+
+    def push(self, local, full, hub=None, *, hf_repo=None, hf_token=None):
+        files = {p.name: p.read_bytes() for p in sorted(Path(local).iterdir()) if p.is_file()}
+        h = hashlib.sha256(b"".join(k.encode() + v for k, v in files.items())).hexdigest()
+        dest = self.root / f"sha256-{h}"
+        if not dest.exists():
+            shutil.copytree(local, dest)
+        self.pushes.append({"full": full, "hf_repo": hf_repo, "files": files,
+                            "namespace": getattr(hub, "namespace", None)})
+        return SimpleNamespace(ref=SimpleNamespace(immutable_ref=f"{full}@sha256:{h}"),
+                               size_bytes=sum(map(len, files.values())))
+
+
+def _fake_settle_leg(king, base, leg, sel, out, *, refuse_nonfinite=False):
+    """Byte-deterministic stand-in for expert_lane.settle_leg."""
+    if refuse_nonfinite and sel == {0: [9]}:
+        from cascade.trainer.moe_model import MergeError
+
+        raise MergeError("non-finite delta on MoE layer 0 expert row 9")
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
+    for f in ("config.json", "model.py", "forecast_wrapper.py"):
+        shutil.copyfile(Path(king) / f, out / f)
+    w = hashlib.sha256(b"|".join((Path(d) / "weights.safetensors").read_bytes()
+                                 for d in (king, base, leg)) + repr(sorted(
+                                     (int(k), list(v)) for k, v in sel.items())).encode())
+    (out / "weights.safetensors").write_bytes(w.digest() * 8)
+    return out
+
+
+@pytest.fixture
+def pod_env(tmp_path, monkeypatch):
+    """A FakePod whose Hub pull/push is the Registry; settle_leg stubbed; a
+    torch-free ``moe_model`` stand-in (its MergeError) for the refusal path."""
+    import sys
+    import types
+
+    import cascade.shared.hippius as hip
+    from cascade.trainer import lane_b_driver
+
+    reg = Registry(tmp_path, leg_rec={"steps": 10, "tokens": 640, "stop": "tokens"})
+    pod = FakePod(tmp_path, monkeypatch)
+    pod.stdins = []
+    pod.scps = []
+    orig_run, orig_scp = pod.run, pod.scp
+
+    def run(argv, timeout, stdin_text=""):
+        if "-m cascade.trainer.lane_b_offload" in argv[-1]:
+            pod.stdins.append((argv[-1].split("-m cascade.trainer.lane_b_offload", 1)[1]
+                               .split()[0], stdin_text))
+        return orig_run(argv, timeout, stdin_text)
+
+    def scp(host, local, remote, timeout):
+        pod.scps.append(Path(local).name)
+        return orig_scp(host, local, remote, timeout)
+
+    pod.run, pod.scp = run, scp
+    fetched_on_pod = []
+
+    def pod_fetch(pointer, root, keep=None):
+        fetched_on_pod.append(pointer)
+        d = reg.dir_of(pointer)
+        if keep is not None:
+            keep.add(d)
+        return d
+
+    monkeypatch.setattr(off, "_pod_fetch", pod_fetch)
+    monkeypatch.setattr(hip, "upload_dir_to_hub_or_hf", reg.push)
+    monkeypatch.setattr(lane_b_driver, "settle_leg", _fake_settle_leg)
+    moe = types.ModuleType("cascade.trainer.moe_model")
+    moe.MergeError = type("MergeError", (ValueError,), {})
+    monkeypatch.setitem(sys.modules, "cascade.trainer.moe_model", moe)
+    monkeypatch.delenv(off.LOCAL_EVAL_ENV, raising=False)
+    return SimpleNamespace(pod=pod, reg=reg, fetched=fetched_on_pod, tmp=tmp_path)
+
+
+def _push(repo):
+    full = f"cascade/{repo}"
+    return {"full": full, "hf_repo": f"hfns/{repo}", "registry_url": "https://r",
+            "namespace": "cascade"}
+
+
+def _local_model(reg, tmp):
+    from cascade.trainer.lane_b_model import LaneBModel
+
+    def upload(d, repo):
+        full = _push(repo)["full"]
+        up = reg.push(d, full, SimpleNamespace(namespace="cascade"), hf_repo=f"hfns/{repo}")
+        from cascade.shared.manifest import format_trained_pointer
+
+        return format_trained_pointer(up.ref.immutable_ref)
+
+    return LaneBModel(reg.dir_of, upload)
+
+
+def test_rebase_runs_on_the_pod_and_pushes_pod_to_hub(pod_env, monkeypatch):
+    from cascade.trainer.lane_b_bench import content_key
+
+    monkeypatch.setenv("HF_TOKEN", "hf_secret_value")
+    monkeypatch.setenv("HIPPIUS_HUB_TOKEN", "hub_secret_value")
+    env = pod_env
+    r = env.pod.runner()
+    model = off.PodLaneBModel(r, SimpleNamespace(settings=SETTINGS), _push)
+    res = model.rebase(king_pointer=KING, base_pointer=BASE, leg_pointer=LEG,
+                       selection={0: [1, 2], 3: [4]}, out_dir=env.tmp / "never-used",
+                       repo="ckpt-r1-expert-energy-u7", refuse_nonfinite=True, limits=True)
+    assert env.fetched == [KING, LEG, BASE]                       # pulled ON the pod
+    assert res.actuals == {"steps": 10, "tokens": 640, "stop": "tokens"}
+    pod_push = env.reg.pushes[-1]
+    assert pod_push["full"] == "cascade/ckpt-r1-expert-energy-u7"
+    assert pod_push["hf_repo"] == "hfns/ckpt-r1-expert-energy-u7"
+    # the local path (same LaneBModel code, same inputs) pushes the same bytes
+    local = _local_model(env.reg, env.tmp).rebase(
+        king_pointer=KING, base_pointer=BASE, leg_pointer=LEG, selection={0: [1, 2], 3: [4]},
+        out_dir=env.tmp / "local-rebased", repo="ckpt-r1-expert-energy-u7",
+        refuse_nonfinite=True, limits=True)
+    assert env.reg.pushes[-1]["files"] == pod_push["files"]
+    assert res.pointer == local.pointer and res.actuals == local.actuals
+    # the bench key the pod computed == the box's old content key of those bytes
+    assert isinstance(res.bench, off.PodCkpt) and res.bench.pointer == res.pointer
+    assert res.bench.content_key == content_key(env.tmp / "local-rebased", SETTINGS)
+    # nothing but code / request JSON ever left the box; no checkpoint left on the pod
+    assert set(env.pod.scps) <= {"code.tgz", "request.json"}
+    assert not any((env.pod.workdir / off.OFFLOAD_DIR / "runs").iterdir())
+    assert not (env.tmp / "never-used").exists()
+    # credentials over stdin only (the HF fallback token only for pushing steps)
+    op, stdin = env.pod.stdins[-1]
+    assert op == "rebase" and "HF_TOKEN=" in stdin and "HIPPIUS_HUB_TOKEN=" in stdin
+    assert all("secret_value" not in c for c in env.pod.commands)
+    env.pod.runner().probe(KING, CTX, 4, "energy")
+    assert env.pod.stdins[-1][0] == "probe" and "HF_TOKEN" not in env.pod.stdins[-1][1]
+
+
+def test_rebase_limits_leg_without_record_is_not_rebased(tmp_path, pod_env):
+    env = pod_env
+    _mk_ckpt(env.reg.dir_of(LEG), b"LEGW" * 4)                  # no lane_b_leg record
+    model = off.PodLaneBModel(env.pod.runner(), None, _push)
+    res = model.rebase(king_pointer=KING, base_pointer=BASE, leg_pointer=LEG,
+                       selection={0: [1]}, out_dir=tmp_path / "x", repo="r",
+                       refuse_nonfinite=False, limits=True)
+    assert (res.actuals, res.pointer, res.bench) == ({}, None, None)
+    assert env.reg.pushes == [] and BASE not in env.fetched
+
+
+def test_rebase_refusal_comes_back_as_merge_refused(pod_env):
+    from cascade.trainer.lane_b_model import MergeRefused
+
+    model = off.PodLaneBModel(pod_env.pod.runner(), None, _push)
+    with pytest.raises(MergeRefused, match="non-finite"):
+        model.rebase(king_pointer=KING, base_pointer=BASE, leg_pointer=LEG, selection={0: [9]},
+                     out_dir=pod_env.tmp / "x", repo="r", refuse_nonfinite=True, limits=False)
+    assert pod_env.reg.pushes == []
+
+
+def test_model_steps_refuse_without_a_pod(tmp_path):
+    from cascade.trainer.lane_b_model import RebaseResult  # noqa: F401 — import is torch-free
+
+    for host_fn in (None, lambda: None):
+        model = off.PodLaneBModel(off.LaneBPodRunner(host_fn), None, _push)
+        with pytest.raises(off.LaneBOffloadUnavailable):
+            model.rebase(king_pointer=KING, base_pointer=BASE, leg_pointer=LEG,
+                         selection={0: [1]}, out_dir=tmp_path, repo="r",
+                         refuse_nonfinite=False, limits=False)
+        with pytest.raises(off.LaneBOffloadUnavailable):
+            model.finite(KING, [{}])
+        with pytest.raises(off.LaneBOffloadUnavailable):
+            model.stage(KING, [], out_dir=tmp_path, repo="r", strict=True)
+        with pytest.raises(off.LaneBOffloadUnavailable):
+            model.build(KING, [], out_dir=tmp_path, repo="r", strict=True, era_index=1)
+
+
+def _stub_merge_math(monkeypatch):
+    """Byte-deterministic stand-ins for LaneBModel's torch methods (they still
+    fetch and push through the model's own fetch / upload)."""
+    from cascade.trainer import lane_b_model as lbm
+
+    def finite(self, init_pointer, merges):
+        self._fetch(init_pointer)
+        return ["legnan" not in str(m["rebased_pointer"]) for m in merges]
+
+    def _write(self, init_pointer, merges, out_dir, tag):
+        init = self._fetch(init_pointer)
+        out = Path(out_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        for f in lbm.CODE_FILES:
+            shutil.copyfile(init / f, out / f)
+        parts = [(init / "weights.safetensors").read_bytes()]
+        parts += [(self._fetch(m["rebased_pointer"]) / "weights.safetensors").read_bytes()
+                  + json.dumps(m["selection"], sort_keys=True).encode() for m in merges]
+        (out / "weights.safetensors").write_bytes(
+            hashlib.sha256(tag + b"|".join(parts)).digest() * 4)
+        return out
+
+    def stage(self, init_pointer, merges, *, out_dir, repo, strict):
+        if strict and len(merges) > 1 and merges[0]["selection"] == merges[-1]["selection"]:
+            raise lbm.MergeRefused("lane-B merges overlap on MoE layer 0 expert row 1")
+        out = _write(self, init_pointer, merges, out_dir, b"stage")
+        return self._upload(out, repo), out
+
+    def build(self, init_pointer, chosen, *, out_dir, repo, strict, era_index):
+        return self._upload(_write(self, init_pointer, chosen, out_dir, b"build"), repo)
+
+    monkeypatch.setattr(lbm.LaneBModel, "finite", finite)
+    monkeypatch.setattr(lbm.LaneBModel, "stage", stage)
+    monkeypatch.setattr(lbm.LaneBModel, "build", build)
+
+
+def _merge(ptr, rows, rid="r1"):
+    return {"rebased_pointer": ptr, "king_pointer": KING,
+            "selection": {"0": list(rows)}, "round_id": rid}
+
+
+def test_merge_steps_run_on_the_pod_and_match_the_local_model(pod_env, monkeypatch):
+    _stub_merge_math(monkeypatch)
+    env = pod_env
+    r = env.pod.runner()
+    m1, m2 = _merge(LEG, [1]), _merge(BASE, [2])
+    assert r.merge_finite(KING, [m1, m2]) == [True, True]
+    ptr, key = r.merge_stage(KING, [m1], strict=True, push=_push("ckpt-acceptance-20-0"),
+                             bench_settings=SETTINGS)
+    staged = env.reg.pushes[-1]
+    local_ptr, local_dir = _local_model(env.reg, env.tmp).stage(
+        KING, [m1], out_dir=env.tmp / "local-stage", repo="ckpt-acceptance-20-0", strict=True)
+    assert ptr == local_ptr and env.reg.pushes[-1]["files"] == staged["files"]
+    from cascade.trainer.lane_b_bench import content_key
+
+    assert key == content_key(local_dir, SETTINGS)
+    from cascade.trainer.lane_b_model import MergeRefused
+
+    with pytest.raises(MergeRefused, match="overlap"):
+        r.merge_stage(KING, [m1, dict(m1)], strict=True, push=_push("x"), bench_settings=None)
+    built = r.merge_build(KING, [m1, m2], strict=True, push=_push("ckpt-era2-merged-init"),
+                          era_index=2)
+    assert built == _local_model(env.reg, env.tmp).build(
+        KING, [m1, m2], out_dir=env.tmp / "local-build", repo="ckpt-era2-merged-init",
+        strict=True, era_index=2)
+    assert set(env.pod.scps) <= {"code.tgz", "request.json"}
+    assert not any((env.pod.workdir / off.OFFLOAD_DIR / "runs").iterdir())
+
+
+def test_pod_fetch_never_evicts_the_steps_own_checkpoints(tmp_path, monkeypatch):
+    import cascade.shared.hippius as hip
+
+    def fetch_from_hub(ref, dest, hub=None):
+        Path(dest).mkdir(parents=True, exist_ok=True)
+        return Path(dest)
+
+    monkeypatch.setattr(hip, "fetch_from_hub", fetch_from_hub)
+    root = tmp_path / "root"
+    keep: set = set()
+    ptrs = [f"cascade/m{i}@sha256:{i:064x}" for i in range(off.CKPT_KEEP + 3)]
+    dirs = [off._pod_fetch(p, root, keep=keep) for p in ptrs]
+    assert all(d.is_dir() for d in dirs) and keep == set(dirs)
+    off._pod_fetch("cascade/z@sha256:" + "f" * 64, root)        # another step evicts again
+    assert len([p for p in (root / "ckpt").iterdir()]) == off.CKPT_KEEP
+
+
+# ── the driver end to end on the pod model (no box fetch, no box torch) ──────
+
+
+class PodOps:
+    """Driver ops whose model work is the pod (fetch / upload / bench_rows
+    on the box are test failures)."""
+
+    def __init__(self, model):
+        self.model, self.published = model, []
+
+    def lane_b_model(self):
+        return self.model
+
+    def fetch(self, p):
+        raise AssertionError(f"checkpoint fetched on the box: {p}")
+
+    def upload(self, d, repo):
+        raise AssertionError("checkpoint uploaded from the box")
+
+    def bench_rows(self, d):
+        raise AssertionError("bench rows read from a box dir")
+
+    def prebench(self, pointer):
+        pass
+
+    def publish_expert_manifest(self, m):
+        self.published.append(m)
+
+    def judge(self, m, round_id, block, **kw):
+        return []
+
+    def commitments(self):
+        return []
+
+    def merge_scores(self, pointer, block):
+        return ["scores-of", pointer]
+
+
+class RowsBench:
+    """LaneBBench stand-in: rows by pointer / content key."""
+
+    settings = SETTINGS
+
+    def __init__(self, ready=True):
+        self.asked, self.ready = [], ready
+
+    def rows_remote(self, pointer, key=None):
+        from cascade.eval.benchmarks import item_rows_from_report
+
+        self.asked.append((pointer, key))
+        if not self.ready:
+            return None
+        return item_rows_from_report({
+            "suites": [{"suite": s, "status": "ok",
+                        "rows": [{"full": f"{s}/i{i}", "CRPS": 0.4, "MASE": 1.0}
+                                 for i in range(12)]} for s in SETTINGS["suites"]],
+            "data_revisions": {s: "r1" for s in SETTINGS["suites"]}})
+
+
+def _settle_driver(tmp_path, ops, *, require_public=True, king=KING):
+    from cascade.shared.config import parse_lane_b
+    from cascade.trainer.expert_lane import LaneBSubmission, OpenLeg
+    from cascade.trainer.lane_b_driver import FinishedExpertLeg, LaneBDriver
+
+    spec = {"from_block": 1, "domains": ["energy", "web"], "open_tokens": 0,
+            "merge_guard_from_block": 1}
+    if require_public:
+        spec.update(require_public=["gift", "boom", "time", "fev"], min_public_items=10)
+    cfg = SimpleNamespace(lane_b=parse_lane_b(spec))
+    drv = LaneBDriver(cfg, ops, tmp_path / "lane_b.json")
+    fins = []
+    for hk, dom, sel in (("alice", "energy", {0: [1, 2]}), ("bob", "web", {0: [9]})):
+        leg = OpenLeg(sub=LaneBSubmission(hk, 7, GEN, dom, 5), selection=sel,
+                      base_king_ref=king, base_era=0)
+        fins.append(asdict_(FinishedExpertLeg(leg=asdict_(leg), leg_pointer=LEG,
+                                              corpus_digest="c", train_block=3)))
+    drv.st.finished = fins
+    drv.save()
+    return drv
+
+
+def asdict_(x):
+    from dataclasses import asdict
+
+    return asdict(x)
+
+
+def test_settlement_rebases_on_the_pod_and_never_touches_the_box(pod_env, monkeypatch):
+    from cascade.shared.manifest import format_trained_pointer
+
+    env = pod_env
+    king = format_trained_pointer(KING)
+    bench = RowsBench()
+    model = off.PodLaneBModel(env.pod.runner(), bench, _push)
+    ops = PodOps(model)
+    drv = _settle_driver(env.tmp, ops, king=king)
+    drv.settle(round_id="r1", block=20, era_index=0, king_pointer=king,
+               work_dir=env.tmp / "w")
+    assert len(ops.published) == 1
+    entries = ops.published[0].entries
+    # alice rebased + pushed from the pod; bob's refused rebase dropped
+    assert [e.miner_hotkey for e in entries] == ["alice"]
+    assert entries[0].rebased_pointer == "metro-v1:trained:hippius:" + \
+        env.reg.pushes[-1]["full"] + "@" + entries[0].rebased_pointer.rsplit("@", 1)[-1]
+    assert [o["outcome"] for o in drv.st.outcomes if o.get("hotkey") == "bob"] == \
+        ["merge_refused"]
+    # king rows by pointer; the candidate's rows by the pod-computed content key
+    assert bench.asked[0] == (king, None)
+    assert bench.asked[1][0] == entries[0].rebased_pointer and bench.asked[1][1]
+    assert set(env.pod.scps) <= {"code.tgz", "request.json"}
+
+
+def test_settlement_without_a_pod_fails_closed_and_keeps_the_legs(tmp_path, monkeypatch):
+    from cascade.trainer.lane_b_driver import RunnerLaneBOps
+
+    monkeypatch.delenv(off.LOCAL_EVAL_ENV, raising=False)
+    runner = SimpleNamespace(cfg=SimpleNamespace(), _fetch_checkpoint_dir=lambda p: pytest.fail(
+        "box fetch"))
+    ops = RunnerLaneBOps(runner, None, None, bench=RowsBench(), offload=None)
+    drv = _settle_driver(tmp_path, ops)
+    before = list(drv.st.finished)
+    with pytest.raises(off.LaneBOffloadUnavailable):
+        drv.settle(round_id="r1", block=20, era_index=0, king_pointer=KING,
+                   work_dir=tmp_path / "w")
+    assert drv.st.finished == before and "r1" not in drv.st.settled
+
+
+def test_runner_ops_model_is_the_pod_by_default_local_only_with_env(monkeypatch):
+    from cascade.trainer.lane_b_driver import RunnerLaneBOps
+    from cascade.trainer.lane_b_model import LaneBModel
+
+    hub = SimpleNamespace(namespace="cascade", registry_url="https://r")
+    runner = SimpleNamespace(cfg=SimpleNamespace(), hub=lambda: hub,
+                             _hf_ckpt_repo=lambda full: "hfns/" + full.rsplit("/", 1)[-1],
+                             _fetch_checkpoint_dir=lambda p: pytest.fail("box fetch"))
+    monkeypatch.delenv(off.LOCAL_EVAL_ENV, raising=False)
+    pod = object()
+    ops = RunnerLaneBOps(runner, None, None, offload=pod)
+    m = ops.lane_b_model()
+    assert isinstance(m, off.PodLaneBModel) and m.runner is pod
+    assert ops.push_target("ckpt-x") == {"full": "cascade/ckpt-x", "hf_repo": "hfns/ckpt-x",
+                                         "registry_url": "https://r", "namespace": "cascade"}
+    with pytest.raises(off.LaneBOffloadUnavailable):
+        RunnerLaneBOps(runner, None, None, offload=None).lane_b_model()
+    monkeypatch.setenv(off.LOCAL_EVAL_ENV, "1")
+    assert isinstance(RunnerLaneBOps(runner, None, None).lane_b_model(), LaneBModel)
+
+
+def _pending_driver(tmp_path, ops, *, acceptance):
+    from cascade.shared.config import parse_lane_b
+    from cascade.trainer.lane_b_driver import LaneBDriver
+
+    spec = {"from_block": 1, "domains": ["energy", "web"]}
+    if acceptance:
+        spec["acceptance_from_block"] = 1
+    return LaneBDriver(SimpleNamespace(lane_b=parse_lane_b(spec)), ops, tmp_path / "d.json")
+
+
+def test_era_init_merges_on_the_pod_legacy_path(pod_env, monkeypatch):
+    _stub_merge_math(monkeypatch)
+    env = pod_env
+    model = off.PodLaneBModel(env.pod.runner(), None, _push)
+    ops = PodOps(model)
+    drv = _pending_driver(env.tmp, ops, acceptance=False)
+    bad = _merge("cascade/legnan@sha256:" + "d" * 64, [5])
+    _mk_ckpt(env.reg.dir_of(bad["rebased_pointer"]), b"NANS")
+    good, overlap = _merge(LEG, [1]), _merge(BASE, [1])
+    drv.st.pending_merges = [good, overlap, bad]
+    ptr, merges = drv.init_for(2, KING, env.tmp / "w", era_start=20)
+    assert merges == [good]
+    assert env.reg.pushes[-1]["full"] == "cascade/ckpt-era2-merged-init"
+    assert ptr.endswith(ptr.rsplit("@", 1)[-1]) and "ckpt-era2-merged-init" in ptr
+    assert drv.st.pending_merges == [overlap]          # the overlap waits; NaN dropped
+    assert drv.init_for(2, KING, env.tmp / "w", era_start=20) == (ptr, merges)
+
+
+def test_era_init_acceptance_stages_on_the_pod(pod_env, monkeypatch):
+    import cascade.eval.public_guards as pg
+    import cascade.trainer.merge_acceptance as tma
+
+    _stub_merge_math(monkeypatch)
+    monkeypatch.setattr(pg, "pair_public_rows", lambda *a, **k: None)
+    judged = []
+
+    def judge_acceptance(qualified, **kw):
+        judged.append(kw)
+        return list(qualified), {"ok": True}
+
+    monkeypatch.setattr(tma, "judge_acceptance", judge_acceptance)
+    env = pod_env
+    bench = RowsBench()
+    model = off.PodLaneBModel(env.pod.runner(), bench, _push)
+    ops = PodOps(model)
+    drv = _pending_driver(env.tmp, ops, acceptance=True)
+    win = {"hotkey": "alice", "uid": 7, "domain": "energy", "gen_ref": GEN, "commit_block": 5,
+           "round_id": "r1", "merge_block": 10, "rebased_pointer": LEG,
+           "king_pointer": KING, "selection": {"0": [1]}}
+    from cascade.shared.lane_b import DomainWin
+
+    fields = set(DomainWin.__dataclass_fields__)
+    win = {k: v for k, v in win.items() if k in fields}
+    m = {**_merge(LEG, [1]), "qualified_wins": [win]}
+    drv.st.pending_merges = [m]
+    ptr, merges = drv.init_for(2, KING, env.tmp / "w", era_start=20)
+    assert [x["rebased_pointer"] for x in merges] == [LEG]
+    stage_ptr = merges[0]["acceptance"]["candidate"]
+    assert "ckpt-acceptance-20-0" in stage_ptr and "ckpt-era2-merged-init" in ptr
+    assert judged[0]["candidate_scores"] == ["scores-of", stage_ptr]
+    assert bench.asked[0] == (KING, None)                  # anchor rows by pointer
+    assert bench.asked[1][0] == stage_ptr and bench.asked[1][1]     # stage by content key
+    assert set(env.pod.scps) <= {"code.tgz", "request.json"}
+
+
+# ── bench: pointer benches stage on the pod, under the guard ─────────────────
+
+
+def _lb_bench(tmp_path, **kw):
+    from cascade.trainer.lane_b_bench import LaneBBench
+
+    ecfg = SimpleNamespace(cascade_bench_max_series=0, gift_gate_data_dir="/data/bench",
+                           bench_workers="auto")
+    return LaneBBench(hosts_path=tmp_path / "targon-eval.toml", cache_dir=tmp_path / "rows",
+                      eval_cfg=ecfg, start_worker=False, **kw)
+
+
+def _bench_report(status="ok"):
+    return {"suites": [{"suite": s, "status": status,
+                        "rows": [{"full": f"{s}/i{i}", "CRPS": 0.4, "MASE": 1.0}
+                                 for i in range(12)]} for s in SETTINGS["suites"]],
+            "data_revisions": {s: "r1" for s in SETTINGS["suites"]}}
+
+
+def _drain(lb):
+    while not lb._q.empty():
+        tag, item = lb._q.get()
+        lb.run_one(item)
+        lb._pending.discard(tag)
+
+
+def test_prebench_without_pod_is_refused_never_fetched(tmp_path, monkeypatch):
+    monkeypatch.delenv(off.LOCAL_EVAL_ENV, raising=False)
+    fetched = []
+    lb = _lb_bench(tmp_path, fetch=lambda p: fetched.append(p) or tmp_path,
+                   host_fn=lambda: "pod", bench_fn=lambda *a, **k: pytest.fail("benched"))
+    lb.prebench(KING)
+    tag, item = lb._q.get()
+    with pytest.raises(off.LaneBOffloadUnavailable):
+        lb.run_one(item)
+    assert fetched == []
+
+
+def test_pointer_bench_stages_on_the_pod_and_sweeps_in_place(tmp_path, pod_env):
+    env = pod_env
+    r = env.pod.runner()
+    swept = []
+
+    def pinned(host, pin, **kw):
+        assert sorted(p.name for p in Path(pin).iterdir()) == [
+            "config.json", "forecast_wrapper.py", "model.py", "weights.safetensors"]
+        swept.append((host.name, pin, kw))
+        return _bench_report()
+
+    lb = _lb_bench(tmp_path, fetch=lambda p: pytest.fail("box fetch"), pod=r,
+                   pinned_bench_fn=pinned)
+    assert lb.rows_remote(KING) is None                   # queued, never inline
+    _drain(lb)
+    assert len(swept) == 1 and swept[0][2]["settings"] == lb.settings
+    assert not Path(swept[0][1]).exists()                 # pin removed after the sweep
+    from cascade.trainer.lane_b_bench import content_key
+
+    key = content_key(env.reg.dir_of(KING), lb.settings)
+    assert lb.cached(key) is not None and lb.rows_remote(KING) is not None
+    # a restarted trainer: the persisted pointer → key map, no re-stage
+    lb2 = _lb_bench(tmp_path, pod=SimpleNamespace(
+        bench_stage=lambda *a: pytest.fail("re-staged")))
+    assert lb2.rows_remote(KING) is not None
+    lb2.prebench(KING)
+    assert lb2._q.empty()
+    # a pod-computed key (a rebased candidate) hits the cache without a stage
+    assert lb2.rows_remote("cascade/other@sha256:" + "9" * 64, key=key) is not None
+    assert set(env.pod.scps) <= {"code.tgz", "request.json"}
+
+
+def test_bench_pinned_runs_the_upload_paths_command_on_the_pin(tmp_path):
+    from cascade.trainer.lane_b_bench import bench_pinned
+    from cascade.trainer.remote import RemoteHost
+    from cascade.validator.eval_offload import build_bench_remote_command
+
+    host = RemoteHost(name="valeval", host="203.0.113.9", workdir="/w", remote_python="python")
+    cmds = []
+
+    def run(argv, timeout, stdin=""):
+        cmd = argv[-1]
+        cmds.append(cmd)
+        if cmd.startswith("cat "):
+            return subprocess.CompletedProcess(argv, 0, json.dumps(_bench_report()), "")
+        return subprocess.CompletedProcess(argv, 0, "CASCADE_FREE=999999999999\n", "")
+
+    pin = "/w/_lane_b_offload/pinned/abc"
+    rep = bench_pinned(host, pin, settings=SETTINGS, workers="auto", timeout_s=9000,
+                       label="laneb-x", run=run)
+    assert rep == _bench_report()
+    sweep = [c for c in cmds if "cascade-benchmark" in c]
+    assert len(sweep) == 1
+    report = shlex.split(sweep[0].split("cascade-benchmark", 1)[1])[1]
+    assert sweep[0] == build_bench_remote_command(
+        host, pin, report, suites="gift-eval,boom,time,fev", num_samples=100, batch_size=512,
+        max_series=0, data_dir="/data/bench", device="cuda", workers="auto",
+        timeout_s=9000 - 15)
+    assert cmds[-1].startswith("rm -rf ") and "pinned" not in cmds[-1]
+
+
+def test_bench_stage_pins_hardlinks_and_matches_the_box_key(pod_env):
+    from cascade.trainer.lane_b_bench import content_key
+
+    env = pod_env
+    r = env.pod.runner()
+    host, key, pin = r.bench_stage(KING, SETTINGS)
+    src = env.reg.dir_of(KING)
+    assert key == content_key(src, SETTINGS)
+    assert (Path(pin) / "weights.safetensors").read_bytes() == \
+        (src / "weights.safetensors").read_bytes()
+    assert (Path(pin) / "weights.safetensors").stat().st_ino == \
+        (src / "weights.safetensors").stat().st_ino            # a link, not a copy
+    r.unpin(host, pin)
+    assert not Path(pin).exists()
+
+
+# ── CI only (real torch): the pod worker's bytes equal the local model's ─────
+
+
+def test_real_rebase_and_build_pod_worker_equal_local(tmp_path, monkeypatch):
+    """CI: a tiny real MoE king; the rebase and the merged-init build run by
+    the pod worker (``pod_main``; Hub pull/push stubbed to dirs) push the
+    same bytes as the local LaneBModel (JSON round trip of the selection and
+    merge records included). Never run on the trainer box (loads torch)."""
+    pytest.importorskip("torch")
+    import dataclasses
+
+    import cascade.shared.hippius as hip
+
+    from .test_moe_trainer import _C, _train
+
+    _train(tmp_path / "king", dataclasses.replace(_C(), copula_loss_cap=0.0), budget=600)
+    reg = Registry(tmp_path)
+    for name in ("b", "c", "e"):
+        d = reg.root / ("sha256-" + name * 64)
+        shutil.rmtree(d)
+        shutil.copytree(tmp_path / "king", d)
+    pod = FakePod(tmp_path, monkeypatch)
+    monkeypatch.setattr(off, "_pod_fetch", lambda p, root, keep=None: reg.dir_of(p))
+    monkeypatch.setattr(hip, "upload_dir_to_hub_or_hf", reg.push)
+    model = off.PodLaneBModel(pod.runner(), None, _push)
+    sel = {0: [1, 2]}
+    res = model.rebase(king_pointer=KING, base_pointer=BASE, leg_pointer=LEG, selection=sel,
+                       out_dir=tmp_path / "x", repo="rb", refuse_nonfinite=True, limits=False)
+    pushed = reg.pushes[-1]["files"]
+    local = _local_model(reg, tmp_path).rebase(
+        king_pointer=KING, base_pointer=BASE, leg_pointer=LEG, selection=sel,
+        out_dir=tmp_path / "lr", repo="rb", refuse_nonfinite=True, limits=False)
+    assert reg.pushes[-1]["files"] == pushed and res.pointer == local.pointer
+    merge = {"rebased_pointer": LEG,
+             "king_pointer": KING, "selection": {"0": [1, 2]}, "round_id": "r1"}
+    assert model.finite(KING, [merge]) == _local_model(reg, tmp_path).finite(KING, [merge])
+    built = model.build(KING, [merge], out_dir=tmp_path / "y", repo="mi", strict=True,
+                        era_index=2)
+    pod_files = reg.pushes[-1]["files"]
+    assert built == _local_model(reg, tmp_path).build(
+        KING, [merge], out_dir=tmp_path / "ly", repo="mi", strict=True, era_index=2)
+    assert reg.pushes[-1]["files"] == pod_files
+
+
+_TORCH_FREE_SCRIPT = r'''
+import sys
+class _Block:
+    def find_spec(self, name, path=None, target=None):
+        if name.split(".")[0] in ("torch", "safetensors") or name == "cascade.trainer.moe_model":
+            raise ModuleNotFoundError(f"blocked: {name}", name=name)
+sys.meta_path.insert(0, _Block())
+from pathlib import Path
+from types import SimpleNamespace
+from dataclasses import asdict
+from cascade.shared.config import parse_lane_b
+from cascade.shared.manifest import format_trained_pointer
+from cascade.trainer.expert_lane import LaneBSubmission, OpenLeg
+from cascade.trainer.lane_b_driver import FinishedExpertLeg, LaneBDriver
+from cascade.trainer.lane_b_model import MergeRefused, RebaseResult
+from cascade.trainer.lane_b_offload import PodCkpt
+
+tmp = Path(sys.argv[1])
+KING = format_trained_pointer("cascade/king@sha256:" + "b" * 64)
+GEN = "alice/metro-gen@sha256:" + "a" * 64
+
+class Model:
+    def rows(self, p): return None
+    def bench(self, h): return None
+    def rebase(self, *, selection, **kw):
+        if selection == {0: [9]}:
+            raise MergeRefused("refused")
+        p = format_trained_pointer("cascade/rb@sha256:" + "d" * 64)
+        return RebaseResult({}, p, PodCkpt(p, "k" * 64))
+    def finite(self, init, merges): return [True] * len(merges)
+    def build(self, init, chosen, **kw):
+        return format_trained_pointer("cascade/mi@sha256:" + "f" * 64)
+
+class Ops:
+    published = []
+    def lane_b_model(self): return Model()
+    def fetch(self, p): raise AssertionError("box fetch")
+    def publish_expert_manifest(self, m): self.published.append(m)
+    def judge(self, m, rid, block, **kw): return []
+    def commitments(self): return []
+
+cfg = SimpleNamespace(lane_b=parse_lane_b({"from_block": 1, "domains": ["energy", "web"],
+                                           "open_tokens": 0}))
+ops = Ops()
+drv = LaneBDriver(cfg, ops, tmp / "d.json")
+for hk, dom, sel in (("alice", "energy", {0: [1]}), ("bob", "web", {0: [9]})):
+    leg = OpenLeg(sub=LaneBSubmission(hk, 7, GEN, dom, 5), selection=sel,
+                  base_king_ref=KING, base_era=0)
+    drv.st.finished.append(asdict(FinishedExpertLeg(leg=asdict(leg), leg_pointer=KING,
+                                                     corpus_digest="c", train_block=3)))
+drv.settle(round_id="r1", block=20, era_index=0, king_pointer=KING, work_dir=tmp / "w")
+assert len(ops.published) == 1 and len(ops.published[0].entries) == 1
+drv.st.pending_merges = [{"rebased_pointer": KING, "king_pointer": KING,
+                          "selection": {"0": [1]}, "round_id": "r1"}]
+ptr, merges = drv.init_for(1, KING, tmp / "w", era_start=20)
+assert "mi@" in ptr and len(merges) == 1
+assert not any(m.split(".")[0] in ("torch", "safetensors") for m in sys.modules)
+print("TORCH_FREE_OK")
+'''
+
+
+def test_settlement_and_era_init_are_torch_free_on_the_box(tmp_path):
+    """In a fresh interpreter with torch / safetensors / moe_model import-
+    blocked, a settlement (one rebase, one refused) and a legacy era init run
+    through a pod model — the box path imports none of them."""
+    import sys
+
+    proc = subprocess.run([sys.executable, "-P", "-c", _TORCH_FREE_SCRIPT, str(tmp_path)],
+                          capture_output=True, text=True, timeout=300,
+                          cwd=str(Path(__file__).resolve().parents[2]),
+                          env={**__import__("os").environ,
+                               "PYTHONPATH": str(Path(__file__).resolve().parents[2])})
+    assert "TORCH_FREE_OK" in proc.stdout, proc.stderr[-3000:]

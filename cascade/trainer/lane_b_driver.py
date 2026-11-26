@@ -72,7 +72,7 @@ from .expert_lane import (
     open_rule_verdict,
     routing_metrics,
     routing_stale_union,
-    settle_leg,
+    settle_leg,  # noqa: F401 — the model's rebase calls it through this module
     union_selection,
 )
 from .row_claims import (
@@ -1247,7 +1247,21 @@ class LaneBDriver:
                             " — entry ended (miner fault)" if leg.funding else "")
             self.save()
 
-    def _anchor_bench_rows(self, anchor_pointer: str, require: tuple[str, ...]) -> dict:
+    def _model(self):
+        """The model-work object (:class:`~cascade.trainer.lane_b_model.LaneBModel`
+        interface): ``ops.lane_b_model()`` when the ops offer one (the trainer's
+        :class:`RunnerLaneBOps`: the eval pod), else a local one over
+        ``ops.fetch`` / ``ops.upload`` / ``ops.bench_rows`` (tests, dev)."""
+        make = getattr(self.ops, "lane_b_model", None)
+        if callable(make):
+            return make()
+        from .lane_b_model import LaneBModel
+
+        return LaneBModel(self.ops.fetch, self.ops.upload,
+                          getattr(self.ops, "bench_rows", None))
+
+    def _anchor_bench_rows(self, anchor_pointer: str, require: tuple[str, ...],
+                           model=None) -> dict:
         """WB26: the anchor king's public bench rows, swept once per anchor.
         Unavailable or incomplete rows raise OSError (the settlement retries,
         as for the king's and the candidates' rows)."""
@@ -1255,7 +1269,7 @@ class LaneBDriver:
 
         rows = self._anchor_rows.get(anchor_pointer)
         if rows is None:
-            rows = self.ops.bench_rows(self.ops.fetch(anchor_pointer)) or {}
+            rows = (model or self._model()).rows(anchor_pointer) or {}
             try:
                 pair_public_rows(rows, rows, require=require,
                                  min_items=self.cfg.lane_b.min_public_items)
@@ -1294,7 +1308,7 @@ class LaneBDriver:
         ``public_rows["anchor"]`` (benched once per anchor), and the
         self-judge is guarded against the same anchor."""
         from ..shared.expert_manifest import ExpertEntry, ExpertManifest, leg_label
-        from .moe_model import MergeError
+        from .lane_b_model import MergeRefused
 
         lb = self.cfg.lane_b
         if not lb.active(block):
@@ -1310,8 +1324,10 @@ class LaneBDriver:
         sentinel = self._settlement_sentinel(int(block)) if todo else None
         require = (tuple(lb.require_public) if sentinel is None
                    else tuple(b for b in lb.require_public if b != sentinel))
-        king_dir = self.ops.fetch(king_pointer) if todo else None
-        king_rows = (self.ops.bench_rows(king_dir)
+        # model work (rebase, bench rows) through the model object: on the
+        # eval pod for the trainer (never a checkpoint on the box)
+        model = self._model() if todo else None
+        king_rows = (model.rows(king_pointer)
                      if todo and lb.require_public else None)
         if todo and lb.require_public:
             from ..eval.public_guards import MissingPublicGuard, pair_public_rows
@@ -1360,36 +1376,38 @@ class LaneBDriver:
             declared = tuple(sub.get("targets") or (sub["domain"],))
             label = leg_label(declared)          # == the domain for a single target
             out = Path(work_dir) / f"rebased-{rid}-{sub['hotkey'][:12]}-{label}"
-            leg_dir = self.ops.fetch(f["leg_pointer"])
             # WB27 (plan rev6.21): the levers the leg trained (recorded at
             # dispatch; {} = every default) — the EMA choice picks the width
             levers = dict((leg.get("funding") or {}).get("levers") or {})
             fund = leg.get("funding") or {}
             limits = (int(fund.get("train_tokens", 0) or 0) > 0
                       or fund.get("gpu_measured") is False)
-            actual = leg_actuals(leg_dir) if limits else {}
-            if limits and not actual:
-                log.warning("lane B: %s/%s limits leg without its lane_b_leg record — dropped",
-                            sub["hotkey"][:8], sub["domain"])
-                _drop(f, "leg_record_missing", {"train_block": int(f["train_block"])})
-                continue
             # plan rev6.20: the receipt check (receipt_contract_ok) bound the pod
             # to the lane B EMA leg contract, so it scored its (chosen) EMA
             scored = _scored_weights_for(lb, levers)
+            # the limits record read, the rebase and its upload: one model
+            # step (on the eval pod, pod → Hub; never bytes through the box)
             try:
-                rebased = settle_leg(king_dir, self.ops.fetch(leg["base_king_ref"]),
-                                     leg_dir, sel, out,
-                                     refuse_nonfinite=lb.merge_guard_at_settlement(block))
-            except MergeError as e:
+                res = model.rebase(king_pointer=king_pointer,
+                                   base_pointer=leg["base_king_ref"],
+                                   leg_pointer=f["leg_pointer"], selection=sel, out_dir=out,
+                                   repo=f"ckpt-r{rid}-expert-{label}-u{sub['uid']}",
+                                   refuse_nonfinite=lb.merge_guard_at_settlement(block),
+                                   limits=limits)
+            except MergeRefused as e:
                 log.warning("lane B: %s/%s refused at settlement: %s", sub["hotkey"][:8],
                             sub["domain"], e)
                 _drop(f, "merge_refused", str(e))
                 continue
-            ptr = self.ops.upload(rebased, f"ckpt-r{rid}-expert-{label}"
-                                           f"-u{sub['uid']}")
+            if res.pointer is None:
+                log.warning("lane B: %s/%s limits leg without its lane_b_leg record — dropped",
+                            sub["hotkey"][:8], sub["domain"])
+                _drop(f, "leg_record_missing", {"train_block": int(f["train_block"])})
+                continue
+            actual, ptr = dict(res.actuals or {}), res.pointer
             rows = {}
             if king_rows is not None:
-                rows = {"king": king_rows, "candidate": self.ops.bench_rows(rebased) or {}}
+                rows = {"king": king_rows, "candidate": model.bench(res.bench) or {}}
                 try:
                     pair_public_rows(rows["king"], rows["candidate"], require=require,
                                      min_items=lb.min_public_items)
@@ -1398,7 +1416,8 @@ class LaneBDriver:
                         f"lane-B candidate public benchmarks unavailable: {e}")
                 if anchor_pointer:
                     try:
-                        rows["anchor"] = self._anchor_bench_rows(anchor_pointer, require)
+                        rows["anchor"] = self._anchor_bench_rows(anchor_pointer, require,
+                                                                 model)
                     except OSError as e:
                         bench_err = bench_err or e
             entries.append(ExpertEntry(
@@ -1708,31 +1727,11 @@ class LaneBDriver:
             pending = [dict(m) for m in self.st.pending_merges]
         if not pending:
             return init_pointer, []
-        import torch
-        from safetensors.torch import load_file
+        # every checkpoint read, merge and upload through the model object:
+        # on the eval pod for the trainer (pod → Hub), never on the box
+        from .expert_lane import merge_rows
 
-        from .ckpt_digest import save_tensors_hashed
-        from .expert_lane import (
-            _moe_names,
-            apply_merge_deltas,
-            apply_merges,
-            merge_deltas,
-            merge_power_ema,
-            merge_rows,
-            reset_optimizer_rows,
-        )
-        from .moe_trainer import POWER_EMA_FILE
-        from .toto2_trainer import OPTIM_STATE_FILE, STABLE_WEIGHTS_FILE
-
-        init_dir = self.ops.fetch(init_pointer)
-        names = _moe_names(init_dir)
-        cache: dict[str, dict] = {}
-
-        def _load(p: str) -> dict:
-            if p not in cache:
-                cache[p] = load_file(str(self.ops.fetch(p) / "weights.safetensors"))
-            return cache[p]
-
+        model = self._model()
         chosen, dropped, taken = [], [], set()
         acceptance_outcomes = []
         acceptance = self.cfg.lane_b.acceptance_at_era(era_start)
@@ -1748,17 +1747,18 @@ class LaneBDriver:
             from .merge_acceptance import accept_candidates
 
             chosen, dropped, acceptance_outcomes = accept_candidates(
-                pending, init_pointer=init_pointer, init_dir=init_dir,
-                work_dir=Path(work_dir), block=int(era_start), ops=self.ops,
-                cfg=self.cfg.lane_b, names=names, load=_load)
+                pending, init_pointer=init_pointer, work_dir=Path(work_dir),
+                block=int(era_start), ops=self.ops, cfg=self.cfg.lane_b, model=model)
             pending = []  # accepted/rejected decisions replace the legacy loop
-        for m in pending:
+        # per merge (independent of the others): its delta is finite
+        finite = model.finite(init_pointer, pending) if pending else []
+        for m, ok in zip(pending, finite, strict=True):
             cells = merge_rows(m)
             if cells & taken:
                 log.warning("lane B: merge %s overlaps an earlier merge's rows — waits for the "
                             "next era init", m.get("rebased_pointer"))
                 continue
-            if any(not bool(torch.isfinite(d).all()) for _, _, d in merge_deltas([m], _load, names)):
+            if not ok:
                 log.error("lane B: merge %s carries a non-finite delta — dropped",
                           m.get("rebased_pointer"))
                 dropped.append(m)
@@ -1776,32 +1776,11 @@ class LaneBDriver:
                     self.st.outcomes = self.st.outcomes[-OUTCOMES_KEEP:]
                     self.save()
             return init_pointer, []
-        state = apply_merges(
-            load_file(str(init_dir / "weights.safetensors")), chosen, _load, names,
-            strict=self.cfg.lane_b.merge_guard_at_era(era_start))
-        deltas = merge_deltas(chosen, _load, names)
-        out = Path(work_dir) / f"merged-init-era{era_index}"
-        out.mkdir(parents=True, exist_ok=True)
-        import shutil
-
-        for f in ("config.json", "model.py", "forecast_wrapper.py"):
-            shutil.copyfile(init_dir / f, out / f)
-        save_tensors_hashed(state, out / "weights.safetensors")
-        # the lineage files follow the same merge (see expert_lane "state at merge")
-        if (init_dir / STABLE_WEIGHTS_FILE).is_file():
-            save_tensors_hashed(apply_merge_deltas(
-                load_file(str(init_dir / STABLE_WEIGHTS_FILE)), deltas),
-                out / STABLE_WEIGHTS_FILE)
-        if (init_dir / OPTIM_STATE_FILE).is_file():
-            flat, n = reset_optimizer_rows(load_file(str(init_dir / OPTIM_STATE_FILE)),
-                                           chosen, names)
-            save_tensors_hashed(flat, out / OPTIM_STATE_FILE)
-            log.info("lane B: era %d init — optimizer moments reset on %d merged expert "
-                     "tensor(s)", era_index, n)
-        if (init_dir / POWER_EMA_FILE).is_file():
-            save_tensors_hashed(merge_power_ema(load_file(str(init_dir / POWER_EMA_FILE)),
-                                                deltas), out / POWER_EMA_FILE)
-        ptr = self.ops.upload(out, f"ckpt-era{era_index}-merged-init")
+        ptr = model.build(init_pointer, chosen,
+                          out_dir=Path(work_dir) / f"merged-init-era{era_index}",
+                          repo=f"ckpt-era{era_index}-merged-init",
+                          strict=self.cfg.lane_b.merge_guard_at_era(era_start),
+                          era_index=int(era_index))
         if _stage_only:
             return _PreparedInit(ptr, chosen, dropped, acceptance_outcomes)
         with self._lock:
@@ -1986,6 +1965,30 @@ class RunnerLaneBOps:
         if local_eval_allowed():
             return read_measurement(self.fetch(pointer), binding)
         return self._pod().lineage(pointer, binding)
+
+    def push_target(self, repo: str) -> dict:
+        """Where a checkpoint named ``repo`` is pushed — :meth:`upload`'s Hub
+        repo and HF fallback, for a push made on the eval pod."""
+        hub = self.r.hub()
+        full = f"{hub.namespace}/{repo}"
+        return {"full": full, "hf_repo": self.r._hf_ckpt_repo(full),
+                "registry_url": hub.registry_url, "namespace": hub.namespace}
+
+    def lane_b_model(self):
+        """The driver's model object: the eval pod
+        (:class:`~cascade.trainer.lane_b_offload.PodLaneBModel` — settlement
+        rebase, era-init merges and their pushes run on the pod, pod → Hub);
+        the box-local :class:`~cascade.trainer.lane_b_model.LaneBModel` only
+        under ``CASCADE_LANE_B_LOCAL_EVAL=1``. No pod runner ⇒
+        ``LaneBOffloadUnavailable`` (transient: the settlement / era init
+        retries; nothing falls back to the box)."""
+        from .lane_b_offload import PodLaneBModel, local_eval_allowed
+
+        if local_eval_allowed():
+            from .lane_b_model import LaneBModel
+
+            return LaneBModel(self.fetch, self.upload, self.bench_rows)
+        return PodLaneBModel(self._pod(), self.bench, self.push_target)
 
     def upload(self, ckpt_dir: Path, repo: str) -> str:
         from ..shared.hippius import upload_dir_to_hub_or_hf

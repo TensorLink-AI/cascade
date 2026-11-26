@@ -17,6 +17,19 @@ pod(s) named by the same eval-hosts TOML as the lane-B bench
   object is byte-identical to what the pod computed.
 * **Lineage measurement** (:meth:`LaneBPodRunner.lineage`): the checkpoint's
   measurement JSON is read on the pod; only the integer returns.
+* **Settlement / era-init model work** (:class:`PodLaneBModel`, WB27
+  follow-up): the lane B settlement rebase (king / base / leg fetched on the
+  pod, ``settle_leg``, the limits record read), the era init's merge checks,
+  acceptance stages and the merged init build all run as pod steps whose
+  worker drives :class:`cascade.trainer.lane_b_model.LaneBModel` over the
+  pod's own Hub pull and Hub PUSH — a rebased / staged / merged checkpoint
+  goes from the pod to the Hub directly (credentials over ssh stdin), and
+  only its pointer and bench content key come back. Never checkpoint bytes
+  through the box.
+* **Bench staging** (:meth:`LaneBPodRunner.bench_stage`): the lane-B bench's
+  pointer path (#909 prebench) fetches on the pod, computes the same bench
+  content key the box computed, and hard-links the bench files into a pinned
+  dir the sidecar sweeps in place (no upload from the box).
 * **Hard guard.** No hosts file, no host, an unreachable pod or a failed pod
   step raises :class:`LaneBOffloadUnavailable` (an ``OSError``: the driver
   treats it like any transient I/O failure — the entry stays queued, nothing
@@ -65,6 +78,14 @@ STDERR_TAIL = 800
 _FORWARD_ENV = ("HIPPIUS_HUB_TOKEN", "HIPPIUS_TOKEN", "CASCADE_HIPPIUS_TOKEN",
                 "HIPPIUS_HUB_USERNAME", "HIPPIUS_REGISTRY_USERNAME",
                 "HIPPIUS_HUB_PASSWORD", "HIPPIUS_REGISTRY_PASSWORD")
+# ops that PUSH a checkpoint from the pod also get the HF fallback token
+# (``upload_dir_to_hub_or_hf``), again over stdin only
+_UPLOAD_FORWARD_ENV = ("HF_TOKEN", "HUGGINGFACE_API_KEY")
+UPLOAD_OPS = frozenset({"rebase", "merge_stage", "merge_build"})
+# rebase / merge steps: three checkpoint pulls + one push, CPU arithmetic
+MODEL_TIMEOUT_S = 3600
+# pinned bench dirs older than this are abandoned (a box that died mid-sweep)
+PIN_STALE_S = 24 * 3600
 
 
 class LaneBOffloadUnavailable(OSError):
@@ -212,10 +233,10 @@ class LaneBPodRunner:
         return (self._run or run_ssh)(build_scp_argv(host, str(local), remote), timeout, "")
 
     def _call(self, op: str, pointer: str, request: dict, contexts: list | None,
-              payload: object = None, timeout_s: int | None = None) -> dict:
+              payload: object = None, timeout_s: int | None = None, host=None) -> dict:
         import tempfile
 
-        host = self.host()
+        host = host if host is not None else self.host()
         deadline = time.monotonic() + int(timeout_s or self.timeout_s)
         q = shlex.quote
         root = f"{host.workdir}/{OFFLOAD_DIR}"
@@ -269,7 +290,8 @@ class LaneBPodRunner:
                 if payload is not None:
                     ok(self._put(host, local / "payload.pkl", f"{run_dir}/payload.pkl",
                                  left()), "payload upload")
-                fwd = {k: os.environ[k] for k in _FORWARD_ENV if os.environ.get(k)}
+                names = _FORWARD_ENV + (_UPLOAD_FORWARD_ENV if op in UPLOAD_OPS else ())
+                fwd = {k: os.environ[k] for k in names if os.environ.get(k)}
                 src = "set -a && . /dev/stdin && set +a && " if fwd else ""
                 stdin = "".join(f"{k}={q(v)}\n" for k, v in fwd.items())
                 py = (f"env PYTHONPATH={q(code)} OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 "
@@ -345,6 +367,164 @@ class LaneBPodRunner:
             raise LaneBOffloadUnavailable("lane B merge check: malformed pod reply")
         return err
 
+    # ── settlement / era init (pod → Hub; only pointers come back) ───────────
+
+    def _model_call(self, op: str, pointer: str, request: dict) -> dict:
+        doc = self._call(op, pointer, request, None, timeout_s=MODEL_TIMEOUT_S)
+        if not isinstance(doc, dict):
+            raise LaneBOffloadUnavailable(f"lane B {op}: malformed pod reply")
+        if "merge_error" in doc:
+            from .lane_b_model import MergeRefused
+
+            if not isinstance(doc["merge_error"], str):
+                raise LaneBOffloadUnavailable(f"lane B {op}: malformed pod reply")
+            raise MergeRefused(doc["merge_error"])
+        return doc
+
+    @staticmethod
+    def _pushed(doc: dict, op: str) -> tuple[str, str | None]:
+        ptr, key = doc.get("pointer"), doc.get("content_key")
+        if not isinstance(ptr, str) or not ptr or (key is not None and not isinstance(key, str)):
+            raise LaneBOffloadUnavailable(f"lane B {op}: malformed pod reply")
+        return ptr, key
+
+    def rebase(self, *, king_pointer: str, base_pointer: str, leg_pointer: str,
+               selection: dict, refuse_nonfinite: bool, limits: bool, push: dict,
+               bench_settings: dict | None) -> dict:
+        """The pod's :meth:`LaneBModel.rebase` (pushed from the pod to the Hub
+        as ``push``): ``{"actuals", "pointer" (None = limits record missing),
+        "content_key"}``. A refused rebase raises ``MergeRefused``."""
+        doc = self._model_call("rebase", king_pointer, {
+            "king": king_pointer, "base": base_pointer, "leg": leg_pointer,
+            "selection": {str(k): [int(x) for x in v] for k, v in selection.items()},
+            "refuse_nonfinite": bool(refuse_nonfinite), "limits": bool(limits),
+            "push": push, "bench_settings": bench_settings})
+        actuals = doc.get("actuals")
+        if not isinstance(actuals, dict):
+            raise LaneBOffloadUnavailable("lane B rebase: malformed pod reply")
+        if doc.get("pointer") is None:
+            return {"actuals": actuals, "pointer": None, "content_key": None}
+        ptr, key = self._pushed(doc, "rebase")
+        return {"actuals": actuals, "pointer": ptr, "content_key": key}
+
+    def merge_finite(self, init_pointer: str, merges: list[dict]) -> list[bool]:
+        """The pod's :meth:`LaneBModel.finite` (one bool per merge)."""
+        doc = self._model_call("merge_finite", init_pointer, {"merges": list(merges)})
+        got = doc.get("finite")
+        if not isinstance(got, list) or len(got) != len(merges) \
+                or any(type(x) is not bool for x in got):
+            raise LaneBOffloadUnavailable("lane B merge_finite: malformed pod reply")
+        return got
+
+    def merge_stage(self, init_pointer: str, merges: list[dict], *, strict: bool, push: dict,
+                    bench_settings: dict | None) -> tuple[str, str | None]:
+        """The pod's :meth:`LaneBModel.stage`: ``(pointer, content_key)``."""
+        doc = self._model_call("merge_stage", init_pointer, {
+            "merges": list(merges), "strict": bool(strict), "push": push,
+            "bench_settings": bench_settings})
+        return self._pushed(doc, "merge_stage")
+
+    def merge_build(self, init_pointer: str, chosen: list[dict], *, strict: bool, push: dict,
+                    era_index: int) -> str:
+        """The pod's :meth:`LaneBModel.build`: the merged init's pointer."""
+        doc = self._model_call("merge_build", init_pointer, {
+            "merges": list(chosen), "strict": bool(strict), "push": push,
+            "era_index": int(era_index)})
+        return self._pushed(doc, "merge_build")[0]
+
+    def bench_stage(self, pointer: str, settings: dict) -> tuple[object, str, str]:
+        """``(host, content_key, pinned dir)``: ``pointer`` fetched on the pod,
+        its bench content key (:func:`lane_b_bench.content_key`, the box's
+        old key) and its bench files hard-linked into a pinned dir on that
+        host for the sidecar. The caller removes the pin (``unpin``)."""
+        host = self.host()
+        pin = f"{host.workdir}/{OFFLOAD_DIR}/pinned/{uuid.uuid4().hex}"
+        doc = self._call("bench_stage", pointer, {"settings": settings, "pin": pin}, None,
+                         timeout_s=MODEL_TIMEOUT_S, host=host)
+        key = doc.get("content_key") if isinstance(doc, dict) else None
+        if not isinstance(key, str) or not key or doc.get("pin") != pin:
+            self.unpin(host, pin)
+            raise LaneBOffloadUnavailable("lane B bench_stage: malformed pod reply")
+        return host, key, pin
+
+    def unpin(self, host, pin: str) -> None:
+        if f"/{OFFLOAD_DIR}/pinned/" not in pin:
+            return
+        try:
+            self._ssh(host, f"rm -rf {shlex.quote(pin)}", 30)
+        except Exception:  # noqa: BLE001 — the pod prunes stale pins itself
+            log.warning("lane B: removing the bench pin %s on %s failed", pin,
+                        getattr(host, "name", host))
+
+
+class PodCkpt:
+    """A checkpoint that exists only on the Hub / the eval pod: its pointer
+    and (when the pod computed it) its bench content key — the bench handle
+    of :class:`PodLaneBModel`."""
+
+    __slots__ = ("pointer", "content_key")
+
+    def __init__(self, pointer: str, content_key: str | None):
+        self.pointer, self.content_key = pointer, content_key
+
+    def __repr__(self) -> str:
+        return f"PodCkpt({self.pointer!r}, {self.content_key!r})"
+
+
+class PodLaneBModel:
+    """The driver's model object on the eval pod (the trainer's production
+    path; :class:`cascade.trainer.lane_b_model.LaneBModel` interface). Every
+    checkpoint read, rebase, merge and push is a pod step; the box holds only
+    pointers. ``push_target(repo) -> {"full", "hf_repo", "registry_url",
+    "namespace"}`` names where the pod pushes; ``bench`` is the lane-B bench
+    (pointer path) or None (no rows: settlement fails closed, as before)."""
+
+    def __init__(self, runner: LaneBPodRunner, bench, push_target: Callable[[str], dict]):
+        self.runner, self._bench, self._push = runner, bench, push_target
+
+    def _settings(self) -> dict | None:
+        return getattr(self._bench, "settings", None) if self._bench is not None else None
+
+    def rows(self, pointer: str) -> dict | None:
+        if self._bench is None:
+            log.error("lane B bench: no --lane-b-bench-hosts configured — lane-B public rows "
+                      "are never benched on the trainer box; settlement fails closed")
+            return None
+        return self._bench.rows_remote(pointer)
+
+    def bench(self, handle) -> dict | None:
+        if handle is None:
+            return None
+        if self._bench is None:
+            return self.rows(handle.pointer)
+        return self._bench.rows_remote(handle.pointer, key=handle.content_key)
+
+    def rebase(self, *, king_pointer, base_pointer, leg_pointer, selection, out_dir, repo,
+               refuse_nonfinite, limits):
+        from .lane_b_model import RebaseResult
+
+        got = self.runner.rebase(king_pointer=king_pointer, base_pointer=base_pointer,
+                                 leg_pointer=leg_pointer, selection=selection,
+                                 refuse_nonfinite=refuse_nonfinite, limits=limits,
+                                 push=self._push(repo), bench_settings=self._settings())
+        if got["pointer"] is None:
+            return RebaseResult(dict(got["actuals"]), None, None)
+        return RebaseResult(dict(got["actuals"]), got["pointer"],
+                            PodCkpt(got["pointer"], got["content_key"]))
+
+    def finite(self, init_pointer, merges):
+        return self.runner.merge_finite(init_pointer, merges)
+
+    def stage(self, init_pointer, merges, *, out_dir, repo, strict):
+        ptr, key = self.runner.merge_stage(init_pointer, merges, strict=strict,
+                                           push=self._push(repo),
+                                           bench_settings=self._settings())
+        return ptr, PodCkpt(ptr, key)
+
+    def build(self, init_pointer, chosen, *, out_dir, repo, strict, era_index):
+        return self.runner.merge_build(init_pointer, chosen, strict=strict,
+                                       push=self._push(repo), era_index=era_index)
+
 
 EVAL_TIMEOUT_S = 3 * 3600
 POD_DEVICE_ENV = "CASCADE_LANE_B_POD_DEVICE"
@@ -396,7 +576,10 @@ def decode_scores(doc: dict) -> list:
 # ── pod side ─────────────────────────────────────────────────────────────────
 
 
-def _pod_fetch(pointer: str, root: Path) -> Path:
+def _pod_fetch(pointer: str, root: Path, keep: set | None = None) -> Path:
+    """``pointer`` in this module's pod cache. ``keep`` (one pod step's own
+    fetches) is never evicted: a merge step holds more than :data:`CKPT_KEEP`
+    checkpoints at once (steps are serialised by the heavy flock)."""
     from ..shared.hippius import HubRef, fetch_from_hub
     from ..shared.manifest import parse_trained_pointer
 
@@ -404,9 +587,13 @@ def _pod_fetch(pointer: str, root: Path) -> Path:
     dest = root / "ckpt" / HubRef.parse(ref).digest.replace(":", "-")
     fetch_from_hub(ref, dest)
     os.utime(dest)
+    held = set(keep or ())
+    if keep is not None:
+        keep.add(dest)
     # bounded: evict only this module's own cache entries (never hidden temp dirs)
     entries = sorted((p for p in (root / "ckpt").iterdir()
-                      if p.is_dir() and not p.name.startswith(".") and p != dest),
+                      if p.is_dir() and not p.name.startswith(".") and p != dest
+                      and p not in held),
                      key=lambda p: p.stat().st_mtime, reverse=True)
     import shutil
 
@@ -425,6 +612,135 @@ def _pod_prune_code(root: Path, keep: Path) -> None:
         shutil.rmtree(p, ignore_errors=True)
 
 
+def _pod_push(push: dict) -> Callable[[Path, str], str]:
+    """The pod's Hub push for one step: exactly ``RunnerLaneBOps.upload``
+    (``upload_dir_to_hub_or_hf`` to ``push["full"]``, HF fallback
+    ``push["hf_repo"]``), credentials from the stdin-sourced env."""
+    def upload(local: Path, repo: str) -> str:
+        from ..shared.hippius import HubConfig, upload_dir_to_hub_or_hf
+        from ..shared.manifest import format_trained_pointer
+
+        full = str(push["full"])
+        if full.rsplit("/", 1)[-1] != str(repo):
+            raise ValueError(f"push target {full!r} does not name repo {repo!r}")
+        hub = HubConfig(registry_url=str(push.get("registry_url") or HubConfig.registry_url),
+                        namespace=str(push.get("namespace") or HubConfig.namespace))
+        up = upload_dir_to_hub_or_hf(Path(local), full, hub,
+                                     hf_repo=push.get("hf_repo") or None)
+        return format_trained_pointer(up.ref.immutable_ref)
+
+    return upload
+
+
+def _content_key(d: Path, settings: dict | None) -> str | None:
+    if settings is None:
+        return None
+    from .lane_b_bench import content_key
+
+    return content_key(Path(d), settings)
+
+
+def _pin_bench_files(src: Path, pin: Path) -> None:
+    """Hard-link (copy across filesystems) the bench files into ``pin``: a
+    later cache eviction of ``src`` cannot pull them from under a sweep."""
+    import shutil
+
+    from ..validator.eval_offload import bench_upload_files
+
+    files = bench_upload_files(src)
+    if not files:
+        raise FileNotFoundError(f"{src}: no bench files")
+    part = pin.with_name(pin.name + ".part")
+    part.mkdir(parents=True, exist_ok=False)
+    for f in files:
+        try:
+            os.link(f, part / f.name)
+        except OSError:
+            shutil.copy2(f, part / f.name)
+    part.replace(pin)
+
+
+def _pod_prune_pins(root: Path) -> None:
+    import shutil
+
+    pins = root / "pinned"
+    if not pins.is_dir():
+        return
+    now = time.time()
+    for p in pins.iterdir():
+        try:
+            if now - p.stat().st_mtime > PIN_STALE_S:
+                shutil.rmtree(p, ignore_errors=True)
+        except OSError:
+            pass
+
+
+def _pod_model_op(op: str, req: dict, run_dir: Path, root: Path) -> dict:
+    """The settlement / era-init / bench-stage steps (pod side)."""
+    from .lane_b_model import LaneBModel, MergeRefused
+
+    keep: set = set()
+
+    def fetch(p: str) -> Path:
+        return _pod_fetch(p, root, keep=keep)
+
+    push = _pod_push(req["push"]) if op in UPLOAD_OPS else None
+
+    def no_push(local, repo):
+        raise RuntimeError(f"lane B {op}: this step does not push")
+
+    model = LaneBModel(fetch, push or no_push)
+    settings = req.get("bench_settings")
+    if op == "rebase":
+        sel = {int(k): [int(x) for x in v] for k, v in req["selection"].items()}
+        repo = str(req["push"]["full"]).rsplit("/", 1)[-1]
+        try:
+            res = model.rebase(king_pointer=req["king"], base_pointer=req["base"],
+                               leg_pointer=req["leg"], selection=sel,
+                               out_dir=run_dir / "rebased", repo=repo,
+                               refuse_nonfinite=bool(req["refuse_nonfinite"]),
+                               limits=bool(req["limits"]))
+        except MergeRefused as e:
+            return {"merge_error": str(e)}
+        if res.pointer is None:
+            return {"actuals": dict(res.actuals), "pointer": None}
+        return {"actuals": dict(res.actuals), "pointer": res.pointer,
+                "content_key": _content_key(res.bench, settings)}
+    if op == "merge_finite":
+        return {"finite": [bool(x) for x in model.finite(req["pointer"], req["merges"])]}
+    if op == "merge_stage":
+        repo = str(req["push"]["full"]).rsplit("/", 1)[-1]
+        try:
+            ptr, stage = model.stage(req["pointer"], req["merges"], out_dir=run_dir / "stage",
+                                     repo=repo, strict=bool(req["strict"]))
+        except MergeRefused as e:
+            return {"merge_error": str(e)}
+        return {"pointer": ptr, "content_key": _content_key(stage, settings)}
+    if op == "merge_build":
+        from .moe_model import MergeError
+
+        repo = str(req["push"]["full"]).rsplit("/", 1)[-1]
+        try:
+            ptr = model.build(req["pointer"], req["merges"], out_dir=run_dir / "merged",
+                              repo=repo, strict=bool(req["strict"]),
+                              era_index=int(req["era_index"]))
+        except MergeError as e:
+            return {"merge_error": str(e)}
+        return {"pointer": ptr}
+    if op == "bench_stage":
+        d = fetch(req["pointer"])
+        key = _content_key(d, req["settings"])
+        pin = Path(req["pin"])
+        if pin.parent != root / "pinned":
+            raise SystemExit("bench pin outside this module's dir")
+        _pin_bench_files(d, pin)
+        return {"content_key": key, "pin": str(pin)}
+    raise SystemExit(f"unknown op {op!r}")
+
+
+MODEL_OPS = frozenset({"rebase", "merge_finite", "merge_stage", "merge_build", "bench_stage"})
+
+
 def pod_main(argv: list[str] | None = None) -> int:
     """``python -m cascade.trainer.lane_b_offload <op> <run_dir> <root>`` (pod)."""
     import sys
@@ -439,6 +755,14 @@ def pod_main(argv: list[str] | None = None) -> int:
 
     with contextlib.suppress(OSError):
         _pod_prune_code(root, Path(__file__).resolve().parents[2])
+    with contextlib.suppress(OSError):
+        _pod_prune_pins(root)
+    if op in MODEL_OPS:
+        out = _pod_model_op(op, req, run_dir, root)
+        tmp = run_dir / "result.json.tmp"
+        tmp.write_text(json.dumps(out), encoding="utf-8")
+        tmp.replace(run_dir / "result.json")
+        return 0
     pointers = list(req.get("pointers") or [req["pointer"]])
     dirs = [_pod_fetch(p, root) for p in pointers]
     ckpt = dirs[0]
