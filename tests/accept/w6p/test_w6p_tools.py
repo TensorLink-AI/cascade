@@ -196,6 +196,7 @@ def test_datacompare_compares_data_not_names(tmp_path, capsys):
     doc = json.loads(out.read_text())
     assert doc["schema"] == a.DATACOMPARE_SCHEMA
     # W-LAUNCH: the process pools and the candidate cache change nothing
+    assert hasattr(a, "_cand_job"), "W-LAUNCH: datacompare has no --workers/--candidate-cache pool"
     import sys
     sys.modules[a.__name__] = a           # pool jobs pickle by module name (as __main__ does)
     out2 = tmp_path / "dc2.json"
@@ -265,6 +266,7 @@ def test_datacompare_vectorised_scan_equals_the_reference_channels(tmp_path):
     import pyarrow.parquet as pq
 
     a = _load(ALLOW, "laned_rmisc_allowlist_accept5")
+    assert hasattr(a, "file_hits"), "W-LAUNCH: the vectorised file_hits scan is missing"
     rng = np.random.default_rng(7)
     k, mod, maxp = 4, 2, 50
     flat = [list(np.round(rng.normal(size=n), 2)) for n in (0, 3, 30, 80, 200)]
@@ -305,6 +307,7 @@ def test_datacompare_candidate_hashing_equals_the_reference(tmp_path):
     from cascade.eval.lane_d_public_index import RMISC_SERIES_COLUMN as SC
 
     a = _load(ALLOW, "laned_rmisc_allowlist_accept6")
+    assert hasattr(a, "cand_file_hashes"), "W-LAUNCH: cand_file_hashes is missing"
     rng = np.random.default_rng(11)
     n = 3000
     names = [None if i % 97 == 0 else f"s{i % 41}" for i in range(n)]
