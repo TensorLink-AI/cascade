@@ -36,10 +36,7 @@ def test_a_lane_b_entry_ref_matches_its_approved_request(tmp_path):
     # the bare generator ref (lane A, the request side) still matches
     assert store.check(Q, HK, ref=GEN, attempt_id="a2", kind="",
                        funded_at=FUNDED_AT) == "approved"
-
-
-def test_another_generator_or_funding_never_matches(tmp_path):
-    store = _approved_store(tmp_path)
+    # ...but another generator or another funding never matches
     other = GEN.replace("574ca46dc640", "000000000000")
     assert store.check(Q, HK, ref=f"energy|{other}", attempt_id="a2", kind="",
                        funded_at=FUNDED_AT) == "none"
