@@ -40,6 +40,11 @@ remains unspecified and blocked.
 
 ## Before go-live / before a testnet cycle
 
+Before any upgrade, image repin or lane overlay, run the
+[pre-upgrade checklist](launch-lessons-2026-11.md#pre-upgrade-checklist) in
+[launch-lessons-2026-11.md](launch-lessons-2026-11.md): every failure class of the
+2026-11 lane B/C/D launch, its fix and the CI guard that now catches it.
+
 Mainnet Lane A targets **30 October 2026, 12:00 UTC**. With `from_block = 0`,
 `[v2] launch_at_utc` resolves the first era boundary at or after the target
 from finalized chain timestamps. A typed block is an explicit override. A

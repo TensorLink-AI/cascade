@@ -193,3 +193,27 @@ add `# incident-ok: IR007 runtime-only: <who sets it>` on the field.
 
 **Limits.** This is a presence check. A field whose name happens to be some
 other key's string passes. The round-trip test is still the real guard.
+
+## IR008 — remote python over ssh with no on-host `timeout`
+
+**Incident.** 2026-11-27, PR #969. `SSHEvalHost._ssh` (lane D eval host)
+passed `timeout=` to `subprocess.run`. That kills only the local `ssh`. The
+remote `lane_d_forecasts public` kept running on the 4090, and each retry
+started another copy beside it (three were stacked; two orphans were killed by
+hand at 01:15). #969 bounds the request on the host with `timeout -k 30
+<T-30>` and serialises it with `flock`.
+
+**Rule.** In `cascade/`, a function that reads `.remote_python` and builds a
+`-m <module>` command must also carry a `timeout` command token, or launch
+detached (`nohup`/`setsid`) with its own deadline. Reviewed builders that
+cannot outlive their caller (a `--help` probe, a stdin `--serve` session, the
+detached leg launch) are listed with a reason in `IR008_REVIEWED` in the
+checker; open ones say `KNOWN VIOLATION pending owner` there
+(`lane_d_bench_host.SSHBenchHost.__call__`, `r2_transfer.relay_command`).
+
+**Fix.** Wrap the remote argv in `timeout -k <grace> <T - grace>` as
+`SSHEvalHost.remote_command` does, and take a `flock` when a retry must never
+run beside an orphan.
+
+**Limits.** The check is per function: a command built in one helper and sent
+in another is checked where the `-m` string is built.

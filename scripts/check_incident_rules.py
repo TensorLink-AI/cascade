@@ -463,6 +463,64 @@ def check_ir007(files: dict[str, str]) -> list[tuple[str, int, str]]:
     return hits
 
 
+# ── IR008: remote python over ssh with no on-host bound ───────────────────────
+
+# A `-m` argument (the remote `python -m <module>` launch), a `timeout`
+# command token, a detached launch.
+IR008_M = re.compile(r"(?:^|\s)-m(?:\s|$)")
+IR008_TIMEOUT = re.compile(r"(?:^|[\s\"'(;&|])timeout(?:\s|$)")
+IR008_DETACHED = re.compile(r"\b(?:nohup|setsid)\b")
+# Reviewed builders, keyed "<path>::<function>". Each reason says why the
+# remote process cannot outlive its caller, or names the open follow-up.
+IR008_REVIEWED = {
+    "cascade/trainer/remote.py::worker_argv":
+        "legs launch detached (run_detached: nohup + kill on its own deadline); the "
+        "synchronous path only runs with [round] detached_dispatch = false",
+    "cascade/trainer/remote.py::probe_worker_runtime":
+        "`worker --help` exits in seconds and starts no work",
+    "cascade/validator/validator_bench.py::_vbench_current_data_revisions":
+        "bench_identity reads file revisions and exits; no GPU, no long work",
+    "cascade/validator/mkt_offload.py::start":
+        "a --serve session over stdin: the worker returns at stdin EOF (after its current "
+        "frame) once the ssh dies",
+    "cascade/validator/lane_d_bench_host.py::__call__":
+        "KNOWN VIOLATION pending owner: the lane D bench sweep has the pre-#969 "
+        "SSHEvalHost shape (named as a follow-up in #969)",
+    "cascade/trainer/r2_transfer.py::relay_command":
+        "KNOWN VIOLATION pending owner: the operator R2 relay push (4 h local timeout) "
+        "is not bounded on the relay",
+}
+
+
+def _ir008_strings(fn: ast.AST) -> list[str]:
+    return [n.value for n in ast.walk(fn) if isinstance(n, ast.Constant) and isinstance(n.value, str)]
+
+
+def check_ir008(rel: str, text: str) -> list[tuple[int, str]]:
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return []
+    hits = []
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if f"{rel}::{fn.name}" in IR008_REVIEWED:
+            continue
+        if not any(isinstance(n, ast.Attribute) and n.attr == "remote_python" for n in ast.walk(fn)):
+            continue
+        strings = _ir008_strings(fn)
+        if not any(IR008_M.search(s) for s in strings):
+            continue
+        if any(IR008_TIMEOUT.search(s) or IR008_DETACHED.search(s) for s in strings):
+            continue
+        hits.append((fn.lineno,
+                     f"{fn.name}() builds a remote `<remote_python> -m …` command with no on-host "
+                     "`timeout`: subprocess.run(timeout=) kills only the local ssh, the remote "
+                     "process keeps running and every retry stacks another one"))
+    return hits
+
+
 # ── the rule table ─────────────────────────────────────────────────────────────
 
 RULES: tuple[Rule, ...] = (
@@ -506,6 +564,13 @@ RULES: tuple[Rule, ...] = (
          "`# incident-ok: IR007 runtime-only: <who sets it>`",
          ("cascade/shared/config/*.py",),
          check_tree=check_ir007),
+    Rule("IR008", "remote python over ssh with no on-host `timeout`",
+         "2026-11-27 #969: lane D eval-host forecasts orphaned on the 4090 after the local "
+         "ssh timeout; retries stacked three copies on the GPU",
+         "wrap the remote command in `timeout -k <grace> <T - grace>` (see "
+         "SSHEvalHost.remote_command), or launch it detached with its own deadline",
+         ("cascade/*.py",),
+         check_file=check_ir008),
 )
 RULE_IDS = {r.id for r in RULES}
 
