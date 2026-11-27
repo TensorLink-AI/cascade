@@ -225,6 +225,32 @@ def test_keep_warm_keeps_the_vm_after_a_good_build(tmp_path):
     assert again["up"]["reused"] and len(fake.posts) == 1
 
 
+def test_every_build_refreshes_the_mirror_and_priors_first(tmp_path):
+    """2026-11-27: a warm (keep_warm) builder ran `run` 3-hourly after ONE
+    bootstrap, so its forge mirror froze at 2026-11-25 17:59 and it never
+    pulled priors (empty frontier). Every build now pulls both first."""
+    m = mod()
+    cfg = config(tmp_path)
+    inst = {"id": "sf-1", "ip": "203.0.113.5", "port": 22, "user": "shadeform"}
+    names = [n for n, _ in m.builder_run_steps(cfg, inst, now_ts=T0)]
+    assert names == ["state_pull", "mirror_sync", "pool_d_build_publish"]
+    joined = [" ".join(a) for _, a in m.builder_run_steps(cfg, inst, now_ts=T0)]
+    assert "state-pull" in joined[0] and "--prior-root" in joined[0]
+    assert "mirror-sync" in joined[1]
+    # bootstrap no longer duplicates them (a cycle pulls once per build)
+    assert not {"state_pull", "mirror_sync"} & {n for n, _ in m.builder_bootstrap_steps(cfg, inst)}
+    cfg = replace(cfg, builder=replace(cfg.builder, keep_warm=True))
+    fake = FakeShadeform()
+    log = []
+    for _ in range(2):
+        m.cycle(cfg, _client(m, cfg, fake), dry_run=False, runner=_runner(log),
+                clock=FakeClock())
+    flat = [" ".join(a) for a in log]
+    syncs = [i for i, j in enumerate(flat) if "mirror-sync" in j]
+    builds = [i for i, j in enumerate(flat) if "pool_d_publish publish" in j]
+    assert len(syncs) == len(builds) == 2 and all(s < b for s, b in zip(syncs, builds, strict=True))
+
+
 def test_env_template_names_only_mode_600(tmp_path):
     m = mod()
     p = tmp_path / "pool-d.env"

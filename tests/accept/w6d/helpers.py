@@ -32,13 +32,14 @@ def series_values(sid: str, n: int) -> np.ndarray:
     return (30.0 + 4.0 * np.sin(2 * np.pi * t / 24) + rng.normal(0, 0.4, n)).astype(np.float32)
 
 
-def series_record(sid: str, feed: str, hist_len: int, *, end: int = T0 - HOUR) -> dict:
+def series_record(sid: str, feed: str, hist_len: int, *, end: int = T0 - HOUR,
+                  first_seen: int = T0 + 600) -> dict:
     ts = [end - HOUR * (HORIZON - 1 - i) for i in range(HORIZON)]
     return {
         "series_id": sid, "pool_series_id": sid.split("~")[0], "source": f"curated:{feed}",
         "feed": feed, "panel": {}, "channel": 0, "column": "v", "freq": "H",
         "seasonal_period": 24, "domain": "energy", "history_len": hist_len,
-        "target_ts": ts, "first_seen_ts": [T0 + 600] * HORIZON,
+        "target_ts": ts, "first_seen_ts": [first_seen] * HORIZON,
         "first_target_ts": ts[0], "end_ts": ts[-1], "frontier": [],
     }
 
@@ -49,11 +50,16 @@ SERIES = (("tsforge__meter~meter.c0", "meter", 4000),
 
 
 def write_pool_d(d: Path, *, snapshot: str | None = None, as_of: int = AS_OF,
-                 series=SERIES, shift: float = 0.0) -> Path:
+                 series=SERIES, shift: float = 0.0, first_seen: int | None = None) -> Path:
+    """``first_seen`` (the newest first-seen time) defaults to ``as_of`` minus
+    the pre-existing fixture gap (T0 + 600 at AS_OF), so a later ``as_of``
+    carries newer data, as a healthy builder's does."""
     d.mkdir(parents=True, exist_ok=True)
+    if first_seen is None:
+        first_seen = as_of - (AS_OF - (T0 + 600))
     recs, hist, tgt = [], {}, {}
     for sid, feed, n in series:
-        recs.append(series_record(sid, feed, n))
+        recs.append(series_record(sid, feed, n, first_seen=first_seen))
         full = series_values(sid, n + HORIZON) + np.float32(shift)
         hist[sid], tgt[sid] = full[:n], full[n:]
     feeds = {f: {"mirror_lag_hours": 0.5, "max_lead_hours": -0.5, "publish_ahead": False,

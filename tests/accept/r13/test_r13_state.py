@@ -44,6 +44,37 @@ def test_round_trip_and_append_only(tmp_path):
     assert store.get_bytes("pool_d/_builder/first_seen/records.jsonl") == b'{"r":1}\n{"r":2}\n'
 
 
+def test_warm_builder_pull_keeps_a_log_ahead_of_head_and_skips_known_priors(tmp_path):
+    """state-pull now runs before every build: a build that failed after
+    `first_seen record` (log ahead of HEAD) must not wedge the next pull, and
+    the prior metadata (15 MB each) is fetched once per snapshot."""
+    m = mod()
+    store = _store(tmp_path)
+    a = tmp_path / "vm" / "first_seen"
+    prior = tmp_path / "vm" / "prior"
+    m.state_pull(store, prefix="pool_d", log_dir=a, prior_root=prior)
+    (a / "records.jsonl").write_text('{"r":1}\n')
+    _snapshot(tmp_path / "vm" / "out", "pool_d_1")
+    m.state_push(store, prefix="pool_d", log_dir=a, pool_d=tmp_path / "vm" / "out")
+    store.put_bytes("pool_d/index.json", json.dumps(
+        {"snapshots": [{"snapshot": "pool_d_1", "as_of_ts": 1}]}).encode())
+    assert m.state_pull(store, prefix="pool_d", log_dir=a, prior_root=prior)["prior"] \
+        == ["pool_d_1"]
+    (a / "records.jsonl").write_text('{"r":1}\n{"r":2}\n')     # recorded, push never ran
+    store.put_bytes("pool_d/_builder/prior/pool_d_1/metadata.json", b"not refetched")
+    got = m.state_pull(store, prefix="pool_d", log_dir=a, prior_root=prior)
+    assert "records.jsonl" in got["kept"] and got["prior"] == ["pool_d_1"]
+    assert (a / "records.jsonl").read_text() == '{"r":1}\n{"r":2}\n'
+    assert json.loads((prior / "pool_d_1" / "metadata.json").read_text())["snapshot"] == "pool_d_1"
+    m.state_push(store, prefix="pool_d", log_dir=a, pool_d=None)
+    assert store.get_bytes("pool_d/_builder/first_seen/records.jsonl") == b'{"r":1}\n{"r":2}\n'
+    # a local log that is NOT an extension of HEAD is still refused
+    (a / "records.jsonl").write_text('{"r":"forked"}\n{"r":2}\n{"r":3}\n')
+    with pytest.raises(m.ElasticError) as ei:
+        m.state_pull(store, prefix="pool_d", log_dir=a, prior_root=prior)
+    assert ei.value.code == "state_conflict"
+
+
 def test_rewritten_log_is_refused(tmp_path):
     m = mod()
     store = _store(tmp_path)
