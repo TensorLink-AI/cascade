@@ -539,17 +539,20 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
         return kept
 
     def _maybe_publish_champion(self, king: ResolvedGenerator, round_id: str) -> None:
-        """Run the champion-publication policy for this round's resolved king.
+        """Run the champion-publication policy for this round's resolved king
+        and for every lane B slot winner merged into it.
 
-        Best-effort by contract (a bucket must never sink a round) and inert
-        unless BOTH ``[round] champion_publish`` and ``submission_vault_dir``
-        are set. State (reign counter, published flag) lives in
-        ``champion_publisher.json`` under work_root.
+        Best-effort by contract (a bucket must never sink a round). Lane A is
+        inert unless BOTH ``[round] champion_publish`` and
+        ``submission_vault_dir`` are set; lane B (owner 2026-11-27) needs only
+        the policy and a lane B driver (a Hub-ref winner is public already; a
+        vault-ref one needs the vault). State (reign counters, published
+        flags) lives in ``champion_publisher.json`` under work_root.
         """
         policy = self.cfg.round.champion_publish
-        store = self._submission_store()
-        if policy == "off" or store is None:
+        if policy == "off":
             return
+        store = self._submission_store()
         try:
             from ..funding.champion import ChampionPublisher
 
@@ -558,11 +561,38 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
                 delay_rounds=self.cfg.round.champion_publish_delay_rounds,
                 state_path=self.work_root / "champion_publisher.json",
             )
-            published = publisher.note_king(king.hotkey, king.ref, round_id)
-            for digest in published:
-                log.info("round %s: champion code published (%s)", round_id, digest)
         except Exception as e:  # noqa: BLE001 — publication must never sink the round
             log.warning("champion publication step failed (retries next round): %s", e)
+            return
+        if store is not None:
+            try:
+                published = publisher.note_king(king.hotkey, king.ref, round_id)
+                for digest in published:
+                    log.info("round %s: champion code published (%s)", round_id, digest)
+            except Exception as e:  # noqa: BLE001 — publication must never sink the round
+                log.warning("champion publication step failed (retries next round): %s", e)
+        self._maybe_publish_lane_b_champions(publisher, round_id)
+
+    def _maybe_publish_lane_b_champions(self, publisher, round_id: str) -> None:
+        """Publish lane B slot winners: every merge the lane B driver composed
+        into a king init (``merged_inits``), under the lane A policy."""
+        drv = getattr(self, "lane_b_driver", None)
+        st = getattr(drv, "st", None)
+        if st is None:
+            return
+        try:
+            import contextlib
+            import copy
+
+            from ..funding.champion import lane_b_wins
+
+            lock = getattr(drv, "_lock", None)
+            with lock if lock is not None else contextlib.nullcontext():
+                merged = copy.deepcopy(dict(getattr(st, "merged_inits", {}) or {}))
+            for key in publisher.note_lane_b(lane_b_wins(merged), round_id):
+                log.info("round %s: lane B slot winner code published (%s)", round_id, key)
+        except Exception as e:  # noqa: BLE001 — publication must never sink the round
+            log.warning("lane B champion publication failed (retries next round): %s", e)
 
     # ── stake-weighted activation (DEC-CA-0045) ─────────────────────────────
 
