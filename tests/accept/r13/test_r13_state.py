@@ -62,7 +62,10 @@ def test_warm_builder_pull_keeps_a_log_ahead_of_head_and_skips_known_priors(tmp_
         == ["pool_d_1"]
     (a / "records.jsonl").write_text('{"r":1}\n{"r":2}\n')     # recorded, push never ran
     store.put_bytes("pool_d/_builder/prior/pool_d_1/metadata.json", b"not refetched")
-    got = m.state_pull(store, prefix="pool_d", log_dir=a, prior_root=prior)
+    try:
+        got = m.state_pull(store, prefix="pool_d", log_dir=a, prior_root=prior)
+    except m.ElasticError as e:
+        raise AssertionError(f"state-pull wedged on a log ahead of HEAD: {e}") from e
     assert "records.jsonl" in got["kept"] and got["prior"] == ["pool_d_1"]
     assert (a / "records.jsonl").read_text() == '{"r":1}\n{"r":2}\n'
     assert json.loads((prior / "pool_d_1" / "metadata.json").read_text())["snapshot"] == "pool_d_1"

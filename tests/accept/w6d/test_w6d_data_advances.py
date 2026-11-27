@@ -19,8 +19,20 @@ PREFIX = "pool_d"
 STEP = 10_800
 
 
-def _store(tmp_path):
+def _guarded_mod():
+    """The module under test; on a base without the guard every test fails
+    here by assertion, not by an AttributeError / TypeError further down."""
     mod = pub_mod()
+    for name in ("check_data_advances", "max_first_seen_ts", "MAX_DATA_AGE_SECONDS"):
+        assert hasattr(mod, name), f"pool_d_publish has no {name}: no stale-data guard"
+    import inspect
+    for fn, arg in ((mod.publish_snapshot, "allow_stale"), (mod.sync_pins, "refused")):
+        assert arg in inspect.signature(fn).parameters, f"{fn.__name__} takes no {arg}="
+    return mod
+
+
+def _store(tmp_path):
+    mod = _guarded_mod()
     return mod, Recording(mod.FsPoolStore(tmp_path / "bucket"))
 
 
@@ -73,7 +85,7 @@ def test_publish_refuses_data_older_than_the_age_limit(tmp_path):
 
 
 def test_cli_publish_exits_nonzero_on_stale_data(tmp_path):
-    mod = pub_mod()
+    mod = _guarded_mod()
     bucket = tmp_path / "bucket"
     frozen = AS_OF - 2 * HOUR
     for k in range(2):
