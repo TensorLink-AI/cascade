@@ -1335,6 +1335,7 @@ th, td, .stat .v, .tile .v, .gate-cell .v { font-variant-numeric:tabular-nums; }
     <button class="btn active" data-ptab="main">Lane A &middot; king</button>
     <button class="btn" data-ptab="laneb">Lane B &middot; experts</button>
     <button class="btn" data-ptab="lanec">Lane C &middot; MarketCast</button>
+    <button class="btn" data-ptab="laned">Lane D &middot; open weights</button>
     <button class="btn" data-ptab="train">Benchmarks</button>
   </div>
 
@@ -1458,6 +1459,11 @@ th, td, .stat .v, .tile .v, .gate-cell .v { font-variant-numeric:tabular-nums; }
       <div id="lb-domains"><div class="empty">Loading&hellip;</div></div>
     </div>
 
+    <div>
+      <div class="section-label"><span>Queue and legs</span><span id="lb-queue-when" class="muted"></span></div>
+      <div class="panel" id="lb-queue"><div class="empty">Loading&hellip;</div></div>
+    </div>
+
     <div class="grid-2">
       <div>
         <div class="section-label"><span id="lb-pay-title">Payout schedule</span><span id="lb-pay-when" class="muted"></span></div>
@@ -1496,7 +1502,32 @@ th, td, .stat .v, .tile .v, .gate-cell .v { font-variant-numeric:tabular-nums; }
       <div class="panel" id="lc-queue"><div class="empty">Loading&hellip;</div></div>
     </div>
 
+    <div>
+      <div class="section-label"><span>Settlements</span><span id="lc-settle-when" class="muted"></span></div>
+      <div class="panel" id="lc-settle"><div class="empty">Loading&hellip;</div></div>
+    </div>
+
   </div><!-- /page-lanec -->
+
+  <!-- LANE_D_PLAN W17: status/lane_d.json (validator) + the signed lane-d/reports -->
+  <div id="page-laned" hidden>
+
+    <div>
+      <div class="section-label"><span id="ld-title">Lane D throne</span><span id="ld-throne-when" class="muted"></span></div>
+      <div class="panel" id="ld-throne"><div class="empty">Loading&hellip;</div></div>
+    </div>
+
+    <div>
+      <div class="section-label"><span>Entries</span><span id="ld-queue-when" class="muted"></span></div>
+      <div class="panel" id="ld-queue"><div class="empty">Loading&hellip;</div></div>
+    </div>
+
+    <div>
+      <div class="section-label"><span>Settlements</span><span id="ld-settle-when" class="muted"></span></div>
+      <div class="panel" id="ld-settle"><div class="empty">Loading&hellip;</div></div>
+    </div>
+
+  </div><!-- /page-laned -->
 
 
 
@@ -2526,7 +2557,7 @@ function renderWarmHistory(){
     '<div class="scroll-box"><table><thead><tr><th>Round</th><th>Warm-start init</th><th>When</th></tr></thead>'+
     '<tbody>'+rows+'</tbody></table></div>';
 }
-function renderAll(){ renderStatus(); renderHeader(); renderV2Strip(); renderVerdict(); renderCohort(); renderChart(); renderReigns(); renderField(); renderHeat(); renderWarm(); renderRounds(); renderCountdown(); renderStage(); renderSubs(); renderLaneALadder(); if(_page==="laneb") renderLaneB(); if(_page==="lanec") renderLaneC(); }
+function renderAll(){ renderStatus(); renderHeader(); renderV2Strip(); renderVerdict(); renderCohort(); renderChart(); renderReigns(); renderField(); renderHeat(); renderWarm(); renderRounds(); renderCountdown(); renderStage(); renderSubs(); renderLaneALadder(); if(_page==="laneb") renderLaneB(); if(_page==="lanec") renderLaneC(); if(_page==="laned") renderLaneD(); }
 // ── v2 (DEC-CA-0050): Cascade MoE Base + the domain-expert lane ──────────────
 // status/v2.json is the trainer's unsigned, presentational view (go-live
 // state, lane-B driver state, the king's routing health; built by
@@ -3087,9 +3118,204 @@ function renderLcQueue(){
   if(outs.length) html+='<div class="lb-note" style="margin-top:10px">Recent outcomes: '+outs.slice(-6).map(function(o){ return esc((o.target||"")+" "+(o.outcome||o.kind||"")+(o.hotkey?" · "+shortHk(o.hotkey):"")); }).join(" &middot; ")+'</div>';
   el.innerHTML=html;
 }
-function renderLaneC(){ renderLcStatus(); renderLcTargets(); renderLcQueue(); }
-function renderLaneB(){ renderLbGate(); renderLbSat(); renderLbDomains(); renderLbPay(); renderLbEnter(); renderLbMoe(); }
-function renderV2(){ renderV2Strip(); renderHeader(); renderLaneALadder(); renderSentinel(); if(_page==="laneb") renderLaneB(); if(_page==="lanec") renderLaneC(); }
+// ── shared lane formatting (UTC times, units, rounding) ─────────────────────
+// One spelling per kind of value across the B/C/D tabs: wall-clock times are
+// UTC minutes ("2026-11-27 10:04 UTC"), money is whole dollars, shares are
+// percentages (two decimals below 10%), digests are 12 hex characters.
+function fmtUtc(v){
+  if(v==null||v==="") return "--";
+  var t=typeof v==="number"?(v<1e12?v*1000:v):new Date(String(v)).getTime();
+  if(!isFinite(t)) return "--";
+  return new Date(t).toISOString().slice(0,16).replace("T"," ")+" UTC";
+}
+function fmtUsd(v){ if(v==null||v===""||!isFinite(v)) return "--"; return "$"+Math.round(Number(v)); }
+function pctFine(x){ if(x==null||x===""||!isFinite(x)) return "--"; x=Number(x)*100; return (Math.abs(x)<10?x.toFixed(2):x.toFixed(1))+"%"; }
+function fmtCount(v){ return (v==null||v===""||!isFinite(v))?"--":String(Math.round(Number(v))); }
+function shortDigest(d){ d=String(d||""); return d?d.slice(0,12):"--"; }
+function laneRows(v){ return Array.isArray(v)?v.filter(function(x){ return x&&typeof x==="object"; }):[]; }
+function statCell(k,v,s){ return '<div class="gate-cell"><div class="k">'+k+'</div><div class="v">'+v+'</div><div class="s">'+(s||"")+'</div></div>'; }
+function laneTable(head, rows, empty){
+  if(!rows.length) return '<div class="row"><span class="muted">'+empty+'</span></div>';
+  return '<div class="scroll-box"><table><thead><tr>'+head.map(function(h){ return '<th'+(h.charAt(0)==="#"?' class="num">'+h.slice(1):'>'+h)+'</th>'; }).join("")+'</tr></thead><tbody>'+rows.join("")+'</tbody></table></div>';
+}
+function minerCell(hk, uid){ return '<td title="'+esc(hk||"")+'">'+(uid!=null&&uid!==""?'uid '+esc(uid)+' · ':'')+esc(shortHk(hk))+'</td>'; }
+function targetTags(ts){ ts=Array.isArray(ts)?ts:(ts?[ts]:[]); return ts.length?ts.map(function(t){ return '<span class="heat-pill wait">'+esc(targetName(t))+'</span>'; }).join(" "):'<span class="muted">--</span>'; }
+
+// ── lane B: funded queue, legs in flight and outcomes (status/lane_b.json) ──
+// The trainer's public, unsigned lane-B driver view (cascade.trainer.
+// lane_b_driver.publish_lane_b_status): the funded queue, the open legs with
+// their declared targets, finished legs awaiting a settlement and the recent
+// outcomes. Discovery only: verdicts and pay stay on the signed receipts.
+var _lb = null;
+function renderLbQueue(){
+  var el=document.getElementById("lb-queue"), when=document.getElementById("lb-queue-when"); if(!el) return;
+  var d=_lb;
+  if(!d||typeof d!=="object"){
+    when.textContent="";
+    lbPending(el,"No lane B queue published",lbDoc().active?"The trainer publishes <code>status/lane_b.json</code> while lane B runs; no entries yet.":lbNotLiveText());
+    return;
+  }
+  when.textContent="status/lane_b.json at block "+(d.block!=null?d.block:"--")+(d.as_of?" · "+timeAgo(d.as_of):"");
+  var q=(d.queue&&typeof d.queue==="object")?d.queue:{}, ents=laneRows(q.entries), open=laneRows(d.open),
+      outs=laneRows(d.outcomes).slice(-8).reverse(), def=laneRows(d.deferred);
+  var queued=q.queued_depth!=null?q.queued_depth:ents.filter(function(e){ return e.status!=="in_flight"; }).length;
+  var html='<div class="gate-row">'+
+    statCell("Queued", esc(fmtCount(queued)), "funded entries waiting for a lane"+(q.pending_reveal_count?" &middot; "+esc(fmtCount(q.pending_reveal_count))+" awaiting reveal":""))+
+    statCell("In flight", esc(fmtCount(open.length)), esc(fmtCount(d.legs_per_domain))+" leg(s) per target &middot; "+(d.leg_hours!=null?esc(fmt(d.leg_hours,1))+" h legs":"--"))+
+    statCell("Awaiting settlement", esc(fmtCount(d.finished)), esc(fmtCount(d.pending_merges))+" pending merge(s) &middot; "+esc(fmtCount(def.length))+" deferred")+
+  '</div>';
+  html+='<div class="sec-k" style="margin-top:14px">Legs in flight</div>'+laneTable(["Miner","Targets","#Base era","#Experts","GPU","#Leg"],
+    open.map(function(l){
+      var leg=Number(l.steps)>0?fmtSteps(l.steps):(Number(l.train_hours)>0?fmt(l.train_hours,1)+" h":"--");
+      return '<tr>'+minerCell(l.hotkey,l.uid)+'<td>'+targetTags(l.targets)+'</td><td class="num">'+esc(fmtCount(l.base_era))+'</td><td class="num">'+esc(fmtCount(l.experts))+'</td><td>'+esc(l.gpu||"--")+'</td><td class="num">'+esc(leg)+'</td></tr>';
+    }), "no legs in flight");
+  html+='<div class="sec-k" style="margin-top:14px">Funded queue</div>'+laneTable(["Miner","Targets","Status","GPU","Funded","#Spend"],
+    ents.map(function(e){
+      return '<tr>'+minerCell(e.hotkey,e.uid)+'<td>'+targetTags(e.targets)+'</td><td>'+esc(String(e.phase||e.status||"--").replace(/_/g," "))+'</td><td>'+esc(e.gpu||"--")+'</td><td>'+esc(fmtUtc(e.funded_at))+'</td><td class="num">'+esc(fmtUsd(e.spend_usd))+'</td></tr>';
+    }), "no entries yet");
+  html+='<div class="sec-k" style="margin-top:14px">Recent outcomes</div>'+laneTable(["Miner","Target","Outcome","Class"],
+    outs.map(function(o){
+      var cls=(o.detail&&typeof o.detail==="object"&&o.detail.class)||"";
+      return '<tr>'+minerCell(o.hotkey,o.uid)+'<td>'+targetTags(o.domain||o.targets)+'</td><td>'+esc(String(o.outcome||"--").replace(/_/g," "))+'</td><td class="muted">'+esc(cls||"--")+'</td></tr>';
+    }), "no outcomes yet");
+  el.innerHTML=html;
+}
+
+// ── lane C: settlements (status/lane_c.json, else status/v2.json lane_c.trainer)
+function renderLcSettle(){
+  var el=document.getElementById("lc-settle"), when=document.getElementById("lc-settle-when"); if(!el) return;
+  var c=lcDoc();
+  if(!c){ when.textContent=""; lbPending(el,"Lane C not live",lcNotLiveText()); return; }
+  var src=(_lc&&Array.isArray(_lc.settlements))?_lc.settlements:((c.trainer&&c.trainer.settlements)||[]);
+  var rows=laneRows(src).slice(-8).reverse();
+  when.textContent=rows.length?rows.length+" newest settlement record"+(rows.length===1?"":"s"):"";
+  el.innerHTML=laneTable(["Round","#Entries","Record"],
+    rows.map(function(s){
+      return '<tr><td title="'+esc(s.round_id||"")+'">'+esc(shortRoundId(s.round_id)||"--")+'</td><td class="num">'+esc(fmtCount(s.entries))+'</td><td>'+(s.key?'<code title="'+esc(s.digest||"")+'">'+esc(s.key)+'</code>':'<span class="muted">no lane C record</span>')+'</td></tr>';
+    }), "no settlements yet");
+}
+
+// ── lane D: open weights (status/lane_d.json + the signed lane-d reports) ──
+// status/lane_d.json is the validator's presentational view (cascade.
+// validator.lane_d_status.build_lane_d_status): throne, house, prior kings,
+// the FIFO entry queue with typed reasons and the latest board. The crown
+// bar, armed contexts and court pay come from the SIGNED report of that
+// boundary (lane-d/reports/lane_d_report_<boundary>.json); the latest receipt
+// (lane-d/receipts/latest.json) says whether the newest settlement published.
+var _ld=null, _ldReceipt=null, _ldReports={}, _ldMissing={}, _ldInflight={};
+var LD_REPORTS_SHOWN=4;
+function ldEpochBlocks(){ var c=_status; return (c&&Number(c.epoch_blocks)>0)?Number(c.epoch_blocks):900; }
+function ldBoundaries(){
+  var b=_ld&&Number(_ld.boundary), out=[]; if(!(b>0)) return out;
+  for(var i=0;i<LD_REPORTS_SHOWN;i++) if(b-i*ldEpochBlocks()>0) out.push(b-i*ldEpochBlocks());
+  return out;
+}
+function loadLdReports(){
+  ldBoundaries().forEach(function(b){
+    var k=String(b);
+    if(_ldReports[k]||_ldInflight[k]) return;
+    if(_ldMissing[k]&&Date.now()-_ldMissing[k]<POLL_MS) return;
+    _ldInflight[k]=true;
+    fetchJSON("lane-d/reports/lane_d_report_"+k+".json",{bust:false})
+      .then(function(r){ delete _ldInflight[k]; delete _ldMissing[k]; if(r&&typeof r==="object") _ldReports[k]=r; if(_page==="laned") renderLaneD(); })
+      .catch(function(){ delete _ldInflight[k]; _ldMissing[k]=Date.now(); });
+  });
+}
+function loadLaneD(){
+  fetchJSON("status/lane_d.json").then(function(d){ _ld=(d&&typeof d==="object")?d:null; loadLdReports(); if(_page==="laned") renderLaneD(); }).catch(function(){});
+  fetchJSON("lane-d/receipts/latest.json").then(function(d){ _ldReceipt=(d&&typeof d==="object")?d:null; if(_page==="laned") renderLaneD(); }).catch(function(){});
+}
+function ldReport(b){ return (b!=null&&_ldReports[String(b)])||null; }
+function ldNotLiveText(){
+  return "The validator publishes <code>status/lane_d.json</code> once lane D is armed (a signed overlay at an era boundary). Nothing is published yet, so there are no entries to show.";
+}
+function ldKingLabel(k){
+  if(!k||typeof k!=="object") return '<span class="muted">--</span>';
+  if(k.house) return '<b>the house</b>';
+  return '<b title="'+esc(k.hotkey||"")+'">'+esc(shortHk(k.hotkey))+'</b> <span class="muted" title="'+esc(k.digest||"")+'">'+esc(shortDigest(k.digest))+'</span>';
+}
+function renderLdThrone(){
+  var el=document.getElementById("ld-throne"), when=document.getElementById("ld-throne-when"); if(!el) return;
+  document.getElementById("ld-title").innerHTML="Lane D throne"+infoTip("Lane D","Submit miner-trained BF16 weights for the fixed cascade_pyramid architecture. An entry is judged against the lane D king on forward-only private windows and is crowned when its gain LCB clears the crown bar. Before the first crown the house (a BF16 cast of the frozen lane A king) holds the throne.");
+  var d=_ld;
+  if(!d){ when.textContent=""; lbPending(el,"Lane D not live",ldNotLiveText()); return; }
+  var rep=ldReport(d.boundary), p=(rep&&rep.params)||{}, k=d.king||{}, eb=ldEpochBlocks(), fl=d.floors||{};
+  when.textContent="status/lane_d.json at block "+(d.block!=null?d.block:"--")+(rep&&rep.boundary_ts?" · settled "+fmtUtc(rep.boundary_ts):"");
+  var state=d.lane==="open"?'<span class="heat-pill adv">● open</span>':'<span class="heat-pill nofit">'+esc(d.lane||"--")+'</span>';
+  var tenure=rep&&rep.crown_bar&&rep.crown_bar.tenure!=null?Number(rep.crown_bar.tenure):(k.tenure_blocks!=null?Math.floor(Number(k.tenure_blocks)/eb):null);
+  var kingSub=k.house?"BF16 cast of the frozen lane A king; no miner crowned yet":("crowned at block "+esc(k.since_boundary)+(tenure!=null?" &middot; tenure "+esc(tenure)+" settlement"+(tenure===1?"":"s"):""));
+  var bar=rep&&rep.crown_bar?pctFine(rep.crown_bar.margin):"--";
+  var barSub=rep?("gain LCB to take the throne at tenure "+esc(tenure)+(p.d_margin_start!=null?" &middot; falls "+pctFine(p.d_margin_start)+" &rarr; "+pctFine(p.d_margin)+" over "+esc(fmtCount(p.d_margin_warmup_settlements))+" settlements":"")):"awaiting the signed report of block "+esc(d.boundary);
+  var share=rep&&rep.pay&&rep.pay.share!=null?rep.pay.share:p.share;
+  var court=Array.isArray(p.court_weights)?p.court_weights.map(function(w){ return Math.round(Number(w)*100); }).join("/"):"";
+  var armed=rep&&Array.isArray(rep.armed_contexts)?rep.armed_contexts:null;
+  el.innerHTML='<div class="gate-row">'+
+    statCell("State", state, "era "+esc(fmtCount(d.era))+" &middot; last settlement block "+esc(fmtCount(d.boundary)))+
+    statCell("King", ldKingLabel(k), kingSub)+
+    statCell("Crown bar", esc(bar), barSub)+
+    statCell("Share", esc(share!=null?pct(share):"--"), "of emission"+(court?" &middot; court "+esc(court)+" (king, prior kings)":""))+
+    statCell("Armed contexts", armed&&armed.length?esc(armed.join(" · ")):'<span class="muted">--</span>', Array.isArray(p.contexts)?"declarable: "+esc(p.contexts.join(", ")):"from the signed report")+
+    statCell("Floors", esc(fmtCount(fl.min_windows))+' <span class="muted" style="font-size:13px">windows</span> &middot; '+esc(fmtCount(fl.min_clusters))+' <span class="muted" style="font-size:13px">clusters</span>', "eligible windows an entry needs before it is judged")+
+  '</div>';
+  var cs=rep&&rep.pay?laneRows(rep.pay.court):[];
+  var priors=laneRows(d.prior_kings);
+  el.innerHTML+='<div class="sec-k" style="margin-top:14px">Court</div>'+laneTable(["Seat","Checkpoint","Miner","Paid"],
+    cs.map(function(s,i){
+      return '<tr><td>'+(i===0?'&#9819; king':'prior '+i)+'</td><td title="'+esc(s.digest||"")+'">'+esc(shortDigest(s.digest))+'</td>'+minerCell(s.hotkey,s.uid)+'<td>'+(s.uid!=null?'<span class="heat-pill adv">uid '+esc(s.uid)+'</span>':'<span class="heat-pill wait" title="no miner is paid for this seat">'+esc(String(s.burn_reason||"unpaid").replace(/_/g," "))+'</span>')+'</td></tr>';
+    }), priors.length?priors.length+" prior king(s); court pay appears with the signed report":"no prior kings yet");
+}
+function renderLdQueue(){
+  var el=document.getElementById("ld-queue"), when=document.getElementById("ld-queue-when"); if(!el) return;
+  var d=_ld;
+  if(!d){ when.textContent=""; lbPending(el,"No lane D entries",ldNotLiveText()); return; }
+  var q=laneRows(d.queue);
+  when.textContent=q.length+" open entr"+(q.length===1?"y":"ies")+" · FIFO by reveal";
+  el.innerHTML=laneTable(["Entry","Miner","#Context","Status","Reason","#Windows","#Clusters","Revealed","#Reveal deadline"],
+    q.map(function(e){
+      var pr=e.progress||{};
+      return '<tr><td title="'+esc(e.digest||"")+'">'+esc(shortDigest(e.digest))+'</td>'+minerCell(e.hotkey,null)+'<td class="num">'+esc(fmtCount(e.context))+'</td>'+
+        '<td><span class="heat-pill '+(e.status==="pending"?'wait':'nofit')+'">'+esc(e.status||"--")+'</span></td><td><code>'+esc(e.reason||"--")+'</code></td>'+
+        '<td class="num">'+esc(fmtCount(pr.windows))+' / '+esc(fmtCount(pr.min_windows))+'</td><td class="num">'+esc(fmtCount(pr.clusters))+' / '+esc(fmtCount(pr.min_clusters))+'</td>'+
+        '<td>'+esc(fmtUtc(e.reveal_ts))+'</td><td class="num">block '+esc(fmtCount(e.reveal_deadline_block))+'</td></tr>';
+    }), "no entries yet &mdash; the lane D queue is empty");
+}
+function ldOutcomePill(o){
+  var cls=o==="crowned"?"adv":(o==="cleared"?"wait":"nofit");
+  return '<span class="heat-pill '+cls+'">'+esc(o||"--")+'</span>';
+}
+function renderLdSettle(){
+  var el=document.getElementById("ld-settle"), when=document.getElementById("ld-settle-when"); if(!el) return;
+  var d=_ld, rc=_ldReceipt;
+  if(!d&&!rc){ when.textContent=""; lbPending(el,"No lane D settlements",ldNotLiveText()); return; }
+  var html="";
+  if(rc){
+    var ok=rc.status!=="absent";
+    html+='<div class="row"><span>Latest settlement</span><span>block '+esc(fmtCount(rc.boundary))+' &middot; <span class="heat-pill '+(ok?'adv':'wait')+'">'+esc(rc.status||"--")+'</span>'+(rc.reason?' <code>'+esc(rc.reason)+'</code>':'')+'</span></div>';
+  }
+  var board=d&&d.board;
+  if(board){
+    var vs=laneRows(board.verdicts), sk=laneRows(board.skipped);
+    html+='<div class="sec-k" style="margin-top:14px">Verdicts at block '+esc(fmtCount(board.boundary))+(board.crowned?' &middot; crowned <span title="'+esc(board.crowned)+'">'+esc(shortDigest(board.crowned))+'</span>':'')+'</div>'+
+      laneTable(["Entry","Against","Outcome","#Gain LCB","#Gain"],
+        vs.map(function(v){
+          return '<tr><td title="'+esc(v.digest||"")+'">'+esc(shortDigest(v.digest))+'</td><td title="'+esc(v.king_digest||"")+'">'+esc(shortDigest(v.king_digest))+'</td><td>'+ldOutcomePill(v.outcome)+'</td><td class="num">'+esc(pctFine(v.lcb))+'</td><td class="num">'+esc(pctFine(v.gain))+'</td></tr>';
+        }), "no entries judged at this settlement");
+    if(sk.length) html+='<div class="lb-note" style="margin-top:8px">Skipped: '+sk.slice(0,12).map(function(s){ return esc(shortDigest(s.digest))+' <code>'+esc(s.reason||"--")+'</code>'; }).join(" &middot; ")+'</div>';
+  }
+  var reps=ldBoundaries().map(ldReport).filter(function(r){ return !!r; });
+  when.textContent=reps.length?reps.length+" signed report"+(reps.length===1?"":"s"):"";
+  html+='<div class="sec-k" style="margin-top:14px">Recent signed reports</div>'+laneTable(["#Block","Settled","King after","#Entries","#Judged","#Skipped","#Crown bar","Armed contexts"],
+    reps.map(function(r){
+      return '<tr><td class="num">'+esc(fmtCount(r.boundary))+'</td><td>'+esc(fmtUtc(r.boundary_ts))+'</td><td>'+ldKingLabel(r.king_after)+(r.crowned?' <span class="crown" title="crowned this settlement">&#9819;</span>':'')+'</td>'+
+        '<td class="num">'+esc(fmtCount(laneRows(r.entries).length))+'</td><td class="num">'+esc(fmtCount((r.judged||[]).length))+'</td><td class="num">'+esc(fmtCount(laneRows(r.skipped).length))+'</td>'+
+        '<td class="num">'+esc(r.crown_bar?pctFine(r.crown_bar.margin):"--")+'</td><td>'+esc(Array.isArray(r.armed_contexts)?r.armed_contexts.join(", "):"--")+'</td></tr>';
+    }), d?"no signed reports loaded yet":"waiting for status/lane_d.json");
+  el.innerHTML=html;
+}
+function renderLaneD(){ renderLdThrone(); renderLdQueue(); renderLdSettle(); }
+function renderLaneC(){ renderLcStatus(); renderLcTargets(); renderLcQueue(); renderLcSettle(); }
+function renderLaneB(){ renderLbGate(); renderLbSat(); renderLbDomains(); renderLbQueue(); renderLbPay(); renderLbEnter(); renderLbMoe(); }
+function renderV2(){ renderV2Strip(); renderHeader(); renderLaneALadder(); renderSentinel(); if(_page==="laneb") renderLaneB(); if(_page==="lanec") renderLaneC(); if(_page==="laned") renderLaneD(); }
 (function(){
   var bs=document.querySelectorAll("[data-satm]");
   for(var i=0;i<bs.length;i++) bs[i].addEventListener("click", function(){
@@ -3167,9 +3393,11 @@ function setPage(p){
   document.getElementById("page-train").hidden = p!=="train";
   document.getElementById("page-laneb").hidden = p!=="laneb";
   document.getElementById("page-lanec").hidden = p!=="lanec";
+  document.getElementById("page-laned").hidden = p!=="laned";
   if(p==="train") loadBench();
   if(p==="laneb") renderLaneB();
   if(p==="lanec") renderLaneC();
+  if(p==="laned") renderLaneD();
 }
 (function(){
   var tabs=document.querySelectorAll(".page-tabs .btn");
@@ -3795,6 +4023,10 @@ function poll(){
   fetchJSON("status/v2.json").then(function(d){ _v2=d; if(_rawIndex&&v2FromBlock()!==(_index&&_index.v2_from_block)){ _index=v2Scope(_rawIndex); renderAll(); } renderV2(); renderTrain(); renderWarm(); renderWarmHistory(); }).catch(function(){});
   // lane-C queue (trainer, unsigned; absent while lane C is off)
   fetchJSON("status/lane_c.json").then(function(d){ _lc=d; if(_page==="lanec") renderLaneC(); }).catch(function(){});
+  // lane-B funded queue + legs (trainer, unsigned; absent while lane B is off)
+  fetchJSON("status/lane_b.json").then(function(d){ _lb=d; if(_page==="laneb") renderLaneB(); }).catch(function(){});
+  // lane D (validator): status/lane_d.json, its signed reports, the latest receipt
+  loadLaneD();
 }
 poll();
 setInterval(function(){ if(!document.hidden) poll(); }, POLL_MS);

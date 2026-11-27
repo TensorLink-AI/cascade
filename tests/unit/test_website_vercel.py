@@ -38,7 +38,7 @@ def fetched_prefixes() -> set[str]:
     found: set[str] = set()
     for name in PAGES:
         html = (WEBSITE / name).read_text(encoding="utf-8")
-        found |= set(re.findall(r'fetchJSON\(\s*"([a-z_]+)/', html))
+        found |= set(re.findall(r'fetchJSON\(\s*"([a-z_-]+)/', html))
     return found
 
 
@@ -46,8 +46,9 @@ def test_pages_fetch_the_prefixes_we_think_they_do():
     # Guards the regex above: if a page starts fetching a prefix by some other
     # spelling, this test — not a dark tile in production — is what notices.
     # bench_v: the main validator's bench reports (DEC-CA-0063)
+    # lane-d: the lane D tab's signed reports and latest receipt (LANE_D_PLAN W17)
     assert fetched_prefixes() == {"receipts", "status", "benchmarks", "bench_v", "promotions",
-                                  "funded", "training"}
+                                  "funded", "training", "lane-d"}
 
 
 @pytest.mark.parametrize("prefix", sorted(fetched_prefixes()))
