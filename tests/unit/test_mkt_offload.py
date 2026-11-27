@@ -216,6 +216,7 @@ def _publisher(tmp_path, *, host="HOST", have=(), publish=None):
     v.mkt_eval_hosts = tmp_path / "mkt_hosts.toml"
     v.mkt_lease_fn, v.mkt_session_fn = _Lease, _Sess
     v._mkt_store_obj = _Store(have)
+    v._mkt_round_ready = lambda item: True          # the pod-free prechecks pass
 
     def _pub(item, *, holders=None):
         events.append(("publish", item["round_id"], "_mkt_sess" in v.__dict__))

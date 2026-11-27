@@ -39,7 +39,7 @@ from .core import (
 )
 from .health import PROVISIONED_SENTINEL, HealthGate, HealthReport, _sha256_of
 from .loop import PodProfile, ProvisionerLoop, RenderSettings
-from .policy import ProvisionPolicy, SkuCandidate, StagePolicy
+from .policy import MKT_DEFAULT_LADDER, ProvisionPolicy, SkuCandidate, StagePolicy
 
 log = logging.getLogger("cascade.provision.main")
 
@@ -112,11 +112,19 @@ def build_policy(raw: dict) -> ProvisionPolicy:
     if ttl_epochs < 1:
         raise ProvisionError(f"ttl_epochs must be >= 1; got {ttl_epochs}")
     mkt_sp = build_stage_policy(top["mkt"], "mkt") if "mkt" in top else None
+    if mkt_sp is not None and "candidate" not in top["mkt"]:
+        # the RTX 3090 pool is often empty: fall back up the shipped ladder
+        # (``candidate = []`` opts out)
+        mkt_sp = replace(mkt_sp, candidates=MKT_DEFAULT_LADDER)
     lease = float(top.get("mkt_lease_hours", 3.0))
     if not 0 < lease <= 24:
         raise ProvisionError(f"mkt_lease_hours must be in (0, 24]; got {lease}")
+    lease_max = float(top.get("mkt_lease_max_hours", max(6.0, lease)))
+    if not lease <= lease_max <= 24:
+        raise ProvisionError(f"mkt_lease_max_hours must be in [mkt_lease_hours ({lease:g}), 24]; "
+                             f"got {lease_max}")
     return ProvisionPolicy(max_spend_per_round=max_spend, ttl_epochs=ttl_epochs, eval=eval_sp,
-                           mkt=mkt_sp, mkt_lease_hours=lease)
+                           mkt=mkt_sp, mkt_lease_hours=lease, mkt_lease_max_hours=lease_max)
 
 
 def provider_names(raw: dict, policy: ProvisionPolicy) -> list[str]:

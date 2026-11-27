@@ -250,7 +250,7 @@ cascade lane-c commit --target mkt:market --ref <data.ref from upload> \
 ```bash
 cascade preflight ./my-mkt --lane c --targets mkt:market --hotkey HOTKEY \
     --ref <ref> --max-price RATE --max-spend TOTAL --json
-export LIUM_API_KEY=...            # or SHADEFORM / VAST / RUNPOD
+export LIUM_API_KEY=...            # Lium only: lane C legs never rent elsewhere
 cascade lane-c fund https://<intake> --target mkt:market --ref <ref> \
     --wallet-name W --wallet-hotkey H --gpu RTX3090 --max-price 0.5 --yes
 ```
@@ -259,8 +259,10 @@ cascade lane-c fund https://<intake> --target mkt:market --ref <ref> \
   burned. Add `--allow-fallback` to take other allowed types.
 - `--max-price` caps the hourly rate. Preflight's `--max-spend` is a review
   number, not an enforced cap — the enforced cap is the budget on your key.
-- `--provider-key-env PROVIDER=ENV_NAME` (repeatable) gives an ordered
-  fallback across providers.
+- Lane C rents on **Lium only**. A payer bundle
+  (`--provider-key-env PROVIDER=ENV_NAME`) is reduced to its Lium key, and the
+  intake refuses a bundle with no Lium key (`marketcast_lium_only`).
+  Shadeform, Vast and RunPod keys are never used for lane C.
 - Funding rents nothing by itself; the trainer rents your pod when your leg
   is admitted. `cascade lane-c fund --withdraw ...` pulls a still-queued entry.
 

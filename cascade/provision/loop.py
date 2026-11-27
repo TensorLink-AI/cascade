@@ -1120,22 +1120,37 @@ class ProvisionerLoop:
 
         return request_path_for(self.mkt_hosts_path) if self.mkt_hosts_path else None
 
+    def _mkt_request_age(self) -> float | None:
+        """Seconds since the freshest request file (any competition sharing
+        the pod) was touched; None = no request file."""
+        if self.mkt_request_path is None:
+            return None
+        from ..validator.mkt_offload import request_paths
+
+        ages = []
+        for p in request_paths(self.mkt_hosts_path):   # every competition sharing the pod
+            try:
+                ages.append(self.clock() - p.stat().st_mtime)
+            except OSError:
+                continue
+        return min(ages) if ages else None
+
     def _mkt_requested(self) -> bool:
         """The main validator's MarketCast request is live: the file exists and
         was touched within ``mkt_request_stale_s`` (a crashed validator's
         leftover never rents)."""
-        if self.mkt_request_path is None:
-            return False
-        from ..validator.mkt_offload import request_paths
+        age = self._mkt_request_age()
+        return age is not None and age <= float(self.mkt_request_stale_s)
 
-        for p in request_paths(self.mkt_hosts_path):   # every competition sharing the pod
-            try:
-                age = self.clock() - p.stat().st_mtime
-            except OSError:
-                continue
-            if age <= float(self.mkt_request_stale_s):
-                return True
-        return False
+    def _mkt_heartbeat_fresh(self) -> bool:
+        """The validator is beating its request NOW (within
+        :data:`~cascade.provision.policy.MKT_HEARTBEAT_FRESH_S`): a run still
+        computing, whose pod's lease extends up to ``mkt_lease_max_hours``."""
+        from .policy import MKT_HEARTBEAT_FRESH_S
+
+        age = self._mkt_request_age()
+        return age is not None and age <= min(MKT_HEARTBEAT_FRESH_S,
+                                              float(self.mkt_request_stale_s))
 
     def _maybe_provision_mkt(self) -> None:
         """Rent the MarketCast pod while the validator's request is live and
@@ -1156,7 +1171,8 @@ class ProvisionerLoop:
                       "wait (retried in %.0fs)", self.mkt_retry_s)
             return
         prov, price, cand, pods = picked
-        worst = price * pods * float(self.policy.mkt_lease_hours)
+        # worst case = the whole extended lease (a long run keeps the pod)
+        worst = price * pods * self.policy.mkt_ttl_hours(heartbeat_fresh=True)
         if worst > self.policy.max_spend_per_round:
             log.warning("marketcast pod: skipped by budget — $%.2f > cap $%.2f",
                         worst, self.policy.max_spend_per_round)
@@ -1228,12 +1244,15 @@ class ProvisionerLoop:
             latest = self._latest_round_id()
             newer = (bool(self._last_evaled_round) and latest is not None
                      and latest != self._last_evaled_round)
-        mkt_idle = (any(i.stage == "mkt" for i in self._state.instances)
-                    and not self._mkt_inflight and not self._mkt_requested())
+        has_mkt = any(i.stage == "mkt" for i in self._state.instances)
+        mkt_idle = has_mkt and not self._mkt_inflight and not self._mkt_requested()
+        # a forecast run longer than mkt_lease_hours keeps its pod while the
+        # validator heartbeats (bounded by mkt_lease_max_hours)
+        mkt_ttl = self.policy.mkt_ttl_hours(
+            heartbeat_fresh=has_mkt and self._mkt_heartbeat_fresh())
         dead: set[str] = set()
         for inst in self._state.instances:
-            ttl = (float(self.policy.mkt_lease_hours) if inst.stage == "mkt"
-                   else self.ttl_hours)
+            ttl = mkt_ttl if inst.stage == "mkt" else self.ttl_hours
             if not teardown_due(inst.stage, receipt_seen=receipt, newer_manifest=newer,
                                 mkt_idle=mkt_idle, rented_at=_iso_ts(inst.rented_at_iso),
                                 now=now, ttl_hours=ttl):

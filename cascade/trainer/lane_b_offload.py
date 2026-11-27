@@ -99,7 +99,8 @@ PIN_STALE_S = 24 * 3600
 # What each pod step reads of a checkpoint (traced in code):
 #   META    lineage: lineage.read_measurement reads training_measurement.json.
 #   WEIGHTS probe (expert_lane.load_king: config.json + model code + weights),
-#           eval (evaluator.load_*forecaster), merge_check (merge_check_dirs),
+#           eval (evaluator.load_*forecaster), merge_check (merge_check_dirs), merge_verify
+#           (merged_rebuild_check: weights + config.json of every pointer),
 #           rebase (settle_leg + leg_actuals: config.json, model.py,
 #           forecast_wrapper.py, weights.safetensors — and it WRITES only
 #           those), merge_finite / merge_stage (weights + CODE_FILES), every
@@ -239,7 +240,7 @@ class LaneBPodRunner:
                  timeout_s: int = PROBE_TIMEOUT_S, bundle: Callable[[], tuple] | None = None,
                  headroom_bytes: int = DISK_HEADROOM_BYTES,
                  size_fallback_bytes: int = SIZE_FALLBACK_BYTES,
-                 source: str = "--lane-b-bench-hosts"):
+                 source: str = "--lane-b-bench-hosts", where: str = "the trainer box"):
         self._host_fn = host_fn
         self._run = run
         self._scp = scp
@@ -248,6 +249,7 @@ class LaneBPodRunner:
         self.headroom_bytes = max(0, int(headroom_bytes))
         self.size_fallback_bytes = max(0, int(size_fallback_bytes))
         self.source = str(source)
+        self.where = str(where)
 
     @classmethod
     def from_hosts_path(cls, path: Path | str | None, **kw) -> LaneBPodRunner:
@@ -263,7 +265,7 @@ class LaneBPodRunner:
         if host is None:
             raise LaneBOffloadUnavailable(
                 f"lane B: no eval pod configured/listed ({self.source}) — model work "
-                "never runs on the trainer box; retried next tick")
+                f"never runs on {self.where}; retried next tick")
         return host
 
     @staticmethod
@@ -431,6 +433,23 @@ class LaneBPodRunner:
         if err is not None and not isinstance(err, str):
             raise LaneBOffloadUnavailable("lane B merge check: malformed pod reply")
         return err
+
+    def merge_verify(self, base_pointer: str, merges: list, target_pointer: str, *,
+                     strict: bool) -> dict:
+        """The pod's :func:`validator.expert_lane.merged_rebuild_check`: is
+        ``target`` = ``base`` + ``merges``, tensor for tensor? Exactly one of
+        ``{"equal": bool}``, ``{"merge_error": str}``, ``{"value_error": str}``
+        (the validator's merged-init / acceptance verification)."""
+        doc = self._call("merge_verify", base_pointer,
+                         {"base": base_pointer, "merges": list(merges),
+                          "target": target_pointer, "strict": bool(strict)},
+                         None, timeout_s=MODEL_TIMEOUT_S)
+        if isinstance(doc, dict) and len(doc) == 1:
+            ((k, v),) = doc.items()
+            if (k == "equal" and type(v) is bool) or (
+                    k in ("merge_error", "value_error") and isinstance(v, str)):
+                return {k: v}
+        raise LaneBOffloadUnavailable("lane B merge verify: malformed pod reply")
 
     # ── settlement / era init (pod → Hub; only pointers come back) ───────────
 
@@ -948,6 +967,14 @@ def _pod_op(op: str, req: dict, run_dir: Path, root: Path) -> dict:
 
     if op in MODEL_OPS:
         return _pod_model_op(op, req, run_dir, root)
+    if op == "merge_verify":
+        from ..validator.expert_lane import merged_rebuild_check
+
+        keep: set = set()
+        return merged_rebuild_check(
+            lambda p: _pod_fetch(p, root, keep=keep, profile=FETCH_WEIGHTS,
+                                 disk=req.get("disk")),
+            req["base"], list(req["merges"]), req["target"], strict=bool(req["strict"]))
     if op not in OP_PROFILE:
         raise SystemExit(f"unknown op {op!r}")
     pointers = list(req.get("pointers") or [req["pointer"]])

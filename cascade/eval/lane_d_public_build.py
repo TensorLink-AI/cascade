@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
 import shutil
 import time
@@ -45,6 +46,8 @@ import numpy as np
 
 from . import lane_d_public_index as idx
 from . import lane_d_public_mirror as pm
+
+log = logging.getLogger("cascade.eval.lane_d_public_build")
 
 STATE_DIR = "state"
 SCRATCH_DIR = "scratch"
@@ -264,7 +267,27 @@ class S3PutStore:
             return None
 
     def put_file(self, key: str, path: Path) -> None:
-        self.client().upload_file(str(path), self.spec.bucket, key)
+        """Upload ``path`` PUBLIC-READ (external validators fetch the mirror
+        anonymously to reproduce the public half); a store without canned
+        object ACLs (R2) gets the bytes without one."""
+        put_public_read(self.client(), self.spec.bucket, key, path)
+
+
+PUBLIC_READ = {"ACL": "public-read"}
+
+
+def put_public_read(client, bucket: str, key: str, path: Path) -> bool:
+    """``upload_file`` with ``ACL public-read``; retried without the ACL when
+    the store refuses it (R2 rejects canned object ACLs: the backup copy
+    matters more than its ACL). True when the ACL was applied."""
+    try:
+        client.upload_file(str(path), bucket, key, ExtraArgs=dict(PUBLIC_READ))
+        return True
+    except Exception as e:  # noqa: BLE001 — retried without the ACL
+        log.warning("lane_d_public_upload_acl_refused %s (%s): uploading without an ACL",
+                    key, type(e).__name__)
+    client.upload_file(str(path), bucket, key)
+    return False
 
 
 def upload(stores: Sequence, key: str, path: Path) -> list[str]:

@@ -653,7 +653,9 @@ def test_driver_records_report_arbiters_and_requeues_infra_drops(tmp_path):
     the exact text the trainer read, or "absent" after report_timeout
     settlements — publishing a manifest even with no legs; an entry the main
     validator dropped past max_infra_deferrals is requeued uncharged. Inert:
-    nothing recorded, the driver state is byte-identical."""
+    nothing recorded, the driver state is byte-identical. 2026-11-27: only a
+    settlement that can carry MarketCast candidates is awaited (r1, r2 carry
+    an entry; r3 waits on the still-awaited r2)."""
     from dataclasses import replace
 
     from cascade.funding.queue import LaneCQueue
@@ -693,13 +695,24 @@ def test_driver_records_report_arbiters_and_requeues_infra_drops(tmp_path):
             return reports.get(rid)
 
     drv = LaneCDriver(cfg, Ops(), tmp_path / "drv.json")
-    assert drv.settle(round_id="r1", block=FROM + 7200, era_index=1, base_pointer=king) == ""
-    assert drv.st.mkt_await == [{"rid": "r1", "age": 0}] and not published
+
+    def _finish(hk, n):
+        drv.st.finished.append({
+            "leg": {"hotkey": hk, "uid": n, "target": "mkt:returns", "ref": ref,
+                    "entry_ref": "", "started_block": FROM + n},
+            "trained_pointer": format_trained_pointer(f"cascade/ckpt@sha256:{n:064x}"),
+            "train_block": FROM + n})
+
+    _finish("BRAVO", 1)
+    assert drv.settle(round_id="r1", block=FROM + 7200, era_index=1, base_pointer=king)
+    assert drv.st.mkt_await == [{"rid": "r1", "age": 0, "entries": 1}]
     rep = MktReport("r1", 1, {}, (MktEntryRows("ALFA", ft, "mkt:returns", "judge", 1.0),))
     reports["r1"] = rep.to_json()
+    _finish("CHARLIE", 2)
     d2 = drv.settle(round_id="r2", block=FROM + 2 * 7200, era_index=1, base_pointer=king)
     m2 = load_lane_c_manifest(published[-1][1])
-    assert d2 and m2.entries == () and m2.mkt_reports == {"r1": mkt_text_digest(reports["r1"])}
+    assert d2 and len(m2.entries) == 1
+    assert m2.mkt_reports == {"r1": mkt_text_digest(reports["r1"])}
     assert [a["rid"] for a in drv.st.mkt_await] == ["r2"]
     drv.settle(round_id="r3", block=FROM + 3 * 7200, era_index=1, base_pointer=king)
     m4 = drv.settle(round_id="r4", block=FROM + 4 * 7200, era_index=1, base_pointer=king)

@@ -89,3 +89,13 @@ tests/accept/wb27/test_wb27_gang_ranks.py
 # MarketCast leg's payer balance is projected at its own rent cap.
 cascade/provision/main.py
 tests/accept/wb27/test_wb27_lane_c_launch.py
+
+# 2026-11-27 owner sweep: the VALIDATOR's lane B weight checks (judge stage
+# merge, merged-init and acceptance rebuilds) run on its --eval-hosts pod;
+# none in the validator process; no host = INFRA transient.
+cascade/validator/lane_b.py
+cascade/validator/era_gate.py
+cascade/validator/merge_acceptance.py
+cascade/validator/loop.py
+tests/unit/test_lane_b_multi_target.py
+tests/accept/wb27/test_wb27_validator_remote.py

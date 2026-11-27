@@ -83,6 +83,7 @@ def test_w_cmp_publisher_keeps_the_request_fresh_inside_a_long_round(tmp_path):
     v.mkt_host_wait_s = 1.0
     v.mkt_lease_fn, v.mkt_session_fn = _mk, _Sess
     v._mkt_store_obj = _Store()
+    v._mkt_round_ready = lambda item: True          # the pod-free prechecks pass
     fresh = []
 
     def _pub(item, *, holders=None):

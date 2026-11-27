@@ -24,6 +24,10 @@ PATTERNS=(
   'cascade-provisioner'
   '-m cascade\.provision(\.main)?([[:space:]]|$)'
 )
+# The MarketCast offload provisioner (cascade-mkt-provisioner.service, its own
+# config provision.mkt.toml) matches the same module pattern but is a separate
+# service: never stop it from here (2026-11-27: the pattern matched it too).
+EXCLUDE_RE='provision\.mkt\.toml'
 
 DRY_RUN="${DRY_RUN:-0}"
 [ "${1:-}" = "--dry-run" ] && DRY_RUN=1
@@ -31,12 +35,15 @@ DRY_RUN="${DRY_RUN:-0}"
 # Union of pids matching any shape, excluding this script's own shell and its
 # parent (so the script can never kill itself).
 collect_pids() {
-  local pat pids=""
+  local pat pid pids=""
   for pat in "${PATTERNS[@]}"; do
     pids="$pids $(pgrep -f -- "$pat" || true)"
   done
-  echo "$pids" | tr ' ' '\n' | sed '/^$/d' | sort -un \
-    | grep -v -x -e "$$" -e "$PPID" || true
+  for pid in $(echo "$pids" | tr ' ' '\n' | sed '/^$/d' | sort -un \
+      | grep -v -x -e "$$" -e "$PPID" || true); do
+    tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -qE -- "$EXCLUDE_RE" && continue
+    echo "$pid"
+  done
 }
 
 OLD_PIDS="$(collect_pids)"
