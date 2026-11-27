@@ -126,9 +126,8 @@ def test_infra_faults_keep_the_retry_while_the_recipe_oom_does_not(tmp_path):
 
 
 def _intake(tmp_path, recipe=RECIPE):
-    from tests.unit.test_mkt_gpus import _mkt_intake
-
     from cascade.shared.config import load_chain_config
+    from tests.unit.test_mkt_gpus import _mkt_intake
 
     intake = _mkt_intake(tmp_path)
     intake.fetch_mkt_recipe = lambda ref: recipe
