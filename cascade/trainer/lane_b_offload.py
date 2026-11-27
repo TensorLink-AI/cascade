@@ -69,6 +69,12 @@ from pathlib import Path
 
 import numpy as np
 
+from ..shared.pod_data_root import (
+    alternatives_text,
+    local_alternatives,
+    place_on_data_mount_command,
+)
+
 log = logging.getLogger("cascade.trainer.lane_b_offload")
 
 LOCAL_EVAL_ENV = "CASCADE_LANE_B_LOCAL_EVAL"
@@ -330,7 +336,11 @@ class LaneBPodRunner:
                     import pickle
 
                     (local / "payload.pkl").write_bytes(pickle.dumps(payload, protocol=4))
-                have = ok(self._ssh(host, f"umask 077 && mkdir -p {q(run_dir)} && "
+                # 2026-11-27: <workdir>/_lane_b_offload lands on the pod's
+                # large data mount (/workspace), not a small root overlay
+                place = ("" if (getattr(host, "cache_root", "") or "").strip()
+                         else place_on_data_mount_command(root) + "; ")
+                have = ok(self._ssh(host, f"{place}umask 077 && mkdir -p {q(run_dir)} && "
                                     f"{{ test -f {q(code + '/.ok')} && echo HAVE_CODE || true; }}",
                                     left()), "run dir setup")
                 if "HAVE_CODE" not in (have.stdout or ""):
@@ -727,7 +737,8 @@ def _ensure_room(ckpt: Path, need: int, protect: set, *, what: str,
             return
     msg = (f"pod disk short for {what}: {free / 1e9:.1f} GB free on the lane B cache "
            f"filesystem < {need / 1e9:.1f} GB needed (pull + headroom) after evicting every "
-           f"unneeded {OFFLOAD_DIR}/ckpt entry")
+           f"unneeded {OFFLOAD_DIR}/ckpt entry"
+           + alternatives_text(local_alternatives(str(ckpt), disk_usage=disk_usage), need))
     log.error("lane B: %s", msg)
     raise PodDiskShort(msg)
 

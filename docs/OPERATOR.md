@@ -1101,7 +1101,14 @@ staging stays on `--lane-b-bench-hosts`, because the pin it writes is
 pod-local and the sidecar sweeps it on the same host. A host entry's optional
 `cache_root` (for example `/workspace` on a Lium volume) holds
 `_lane_b_offload` (checkpoint cache, code bundles, run dirs and pins); the
-default is `workdir`. Each step fetches only the files it reads. Lineage
+default is `workdir`. Without `cache_root`, `<workdir>/_lane_b_offload`,
+`_eval_offload` and `_private_eval_offload` are placed on the pod's largest
+writable data mount when they are created (2026-11-27: a 43 GB `/` overlay
+filled while `/workspace` had 159 GB free). If the dir does not exist yet, or
+is empty, and `/workspace` is a different filesystem with more free space,
+the dir becomes a symlink into it. `deploy/bench_pod_bootstrap.sh` does the
+same (`CASCADE_DATA_MOUNTS`). A non-empty dir is never moved. A disk-short
+refusal names the larger mount and the `cache_root` line to set. Each step fetches only the files it reads. Lineage
 pulls the JSON files only. Probe, judge, merge checks, rebase, the non-finite
 checks, acceptance stages, bench staging and every merge record in the
 merged-init build pull the weights, config and model code. They skip

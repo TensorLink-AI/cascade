@@ -25,6 +25,14 @@ from dataclasses import asdict, replace
 from pathlib import Path
 
 from ..eval.benchmarks import bench_uv_args, bench_workers_arg, gift_rows_from_report
+from ..shared.pod_data_root import (
+    DATA_MOUNT_CANDIDATES,
+    alternative_mounts_command,
+    alternatives_text,
+    base_dir,
+    parse_alternatives,
+    place_on_data_mount_command,
+)
 from ..trainer.remote import (
     RemoteDispatchError,
     RemoteHost,
@@ -218,8 +226,11 @@ def forecasts_via_host(host, checkpoint, windows, *, contract, num_samples,
         cache_root = f"{host.workdir}/{PRIVATE_CACHE_DIR}"
         cached = f"{cache_root}/{key}"
         part = f"{cached}.part-{uuid.uuid4().hex[:12]}"
-        setup = step(build_ssh_argv(host, private_cache_setup_command(base, cache_root, key)),
-                     "workdir setup")
+        # the worker runs from the workdir on relative paths: the dir stays
+        # <workdir>/_private_eval_offload, linked onto the data mount
+        setup = step(build_ssh_argv(host, _placement(
+            host, f"{host.workdir}/_private_eval_offload", always=True)
+            + private_cache_setup_command(base, cache_root, key)), "workdir setup")
         if parse_sha256sum(setup.stdout) == hashes:
             log.info("private eval: checkpoint %s already on %s (sha256 verified) — upload skipped",
                      key[:16], host.name)
@@ -592,7 +603,7 @@ def bench_make_room_command(cache: str, keep: list[str], need_bytes: int) -> str
             f"[ \"${{f:-0}}\" -ge {int(need_bytes)} ] && break; "
             f"v=$(ls -1tr | grep -v -e '\\.part-' | grep -vxF {excl} | head -n 1); "
             "[ -n \"$v\" ] || break; rm -rf -- \"$v\"; done; "
-            f"echo {_FREE_TAG}$({avail})")
+            f"{alternative_mounts_command('.')}; echo {_FREE_TAG}$({avail})")
 
 
 def bench_free_bytes(stdout: str | None) -> int | None:
@@ -607,13 +618,27 @@ def bench_free_bytes(stdout: str | None) -> int | None:
     return None
 
 
+def _placement(host: RemoteHost, link: str, *, always: bool = False) -> str:
+    """The pod-side step putting ``link`` on the pod's large data mount
+    (none when the host names its own ``cache_root`` — the paths are rooted
+    there — unless ``always``: then the host's ``cache_root`` is the
+    preferred mount)."""
+    root = str(getattr(host, "cache_root", "") or "").strip()
+    if root and not always:
+        return ""
+    cands = ((root,) if root else ()) + DATA_MOUNT_CANDIDATES
+    return place_on_data_mount_command(link, candidates=cands) + "; "
+
+
 def _room_ok(host: RemoteHost, proc, need_bytes: int, what: str) -> bool:
     free = bench_free_bytes(getattr(proc, "stdout", ""))
     if getattr(proc, "returncode", 1) != 0 or free is None or free >= need_bytes:
         return True
+    alt = alternatives_text(parse_alternatives(getattr(proc, "stdout", "")), need_bytes)
     log.error("BENCH DISK SHORT on %s before %s: %.1f GB free after evicting the "
-              "bench cache, need %.1f GB — clean the pod (non-cascade files?) "
-              "and re-run the settlement", host.name, what, free / 1e9, need_bytes / 1e9)
+              "bench cache, need %.1f GB%s — clean the pod (non-cascade files?) "
+              "and re-run the settlement", host.name, what, free / 1e9, need_bytes / 1e9,
+              alt)
     return False
 
 
@@ -720,8 +745,11 @@ def run_bench_via_host_many(
             raise TimeoutError("public benchmark offload deadline expired")
         return run(argv, min(remaining, cap) if cap else remaining)
     name = Path(str(ckpt_dirs[0])).name or "ckpt"
-    base = f"{host.workdir}/_eval_offload/{name}-{uuid.uuid4().hex}" + (f"-paired{n}" if n > 1 else "")
-    cache = f"{host.workdir}/_eval_offload/cache"
+    # 2026-11-27: the cache dirs live on the pod's large data mount — the
+    # host's cache_root, else <workdir>/<dir> linked onto /workspace
+    parent = f"{base_dir(host)}/_eval_offload"
+    base = f"{parent}/{name}-{uuid.uuid4().hex}" + (f"-paired{n}" if n > 1 else "")
+    cache = f"{parent}/cache"
     tag = uuid.uuid4().hex[:12]
     keys = [Path(str(d)).name if _cacheable(d) else "" for d in ckpt_dirs]
     if n == 1:
@@ -734,15 +762,16 @@ def run_bench_via_host_many(
         # prep: the run dir, the cache, and a prune of old cache entries /
         # abandoned partial uploads (never the ones this sweep uses)
         keep = " ".join(f"-e {shlex.quote(k)}" for k in keys if k) or "-e ''"
-        parent = f"{host.workdir}/_eval_offload"
         prune = (f"cd {shlex.quote(cache)} && rm -rf -- *.part-* && "
                  f"ls -1t | grep -vxF {keep} | tail -n +{BENCH_CACHE_KEEP} "
                  "| xargs -r rm -rf -- ; "
-                 f"find {shlex.quote(parent)} -mindepth 1 -maxdepth 1 ! -name cache "
+                 # trailing slash: find descends a symlinked parent too
+                 f"find {shlex.quote(parent + '/')} -mindepth 1 -maxdepth 1 ! -name cache "
                  f"! -path {shlex.quote(base)} -mmin +{BENCH_STALE_RUN_MINUTES} "
                  "-exec rm -rf -- {} +")
         prep = step(build_ssh_argv(
-            host, f"rm -rf {shlex.quote(base)} && mkdir -p {shlex.quote(base)} "
+            host, _placement(host, parent)
+            + f"rm -rf {shlex.quote(base)} && mkdir -p {shlex.quote(base)} "
             + " ".join(shlex.quote(c) for k, c in zip(keys, ckpts, strict=True) if not k)
             + f" {shlex.quote(cache)} && ({prune} || true)"), 120)
         if prep.returncode != 0:
