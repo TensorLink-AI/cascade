@@ -62,7 +62,8 @@ def test_failed_record_put_is_publish_failed_and_the_court_holds(tmp_path):
         raise AssertionError("W3b6b: a failed bench record PUT must be publish_failed")
     assert w8b.wiring().report_key(w8b.B2) not in rig.store.objects, \
         "no report is published while its records are not"
-    assert rig.step.court_for(w8b.B2) == before
+    assert rig.step.court_for(w8b.B2) is None, "an unpublished settlement reached the court"
+    assert rig.step.court_for(w8b.B1) == before
     rig.store.fail_put = None
     rig.step(w8b.B2)
     rep = rig.published_report(w8b.B2)

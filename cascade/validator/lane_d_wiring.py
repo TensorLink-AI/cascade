@@ -30,8 +30,9 @@ step, in order:
 FAIL CLOSED: any unreadable input in 2-6 raises :class:`LaneDWiringError`
 before anything is written, published or swept; the W19 worker retries the
 boundary at a later tick. Lane D pay reaches the weights only through
-:meth:`LaneDStep.court_for`, which answers from the settlements this step has
-PUBLISHED (memory only, no I/O). A status failure never withholds pay.
+:meth:`LaneDStep.court_for`, which answers from the settlement this step has
+PUBLISHED at exactly the vector's boundary (memory only, no I/O; none there
+burns lane D's share, as the audit expects). A status failure never withholds pay.
 
 RESTART-SAFE (W7c): a re-call at a settled boundary re-scores nothing and
 calls no bench; a settlement saved but not yet published is published on the
@@ -62,10 +63,17 @@ from typing import Any
 from ..shared.bench_report import VALIDATOR_BENCH_PREFIX
 from ..shared.hippius import ObjectNotFound
 from ..shared.sentinel import sentinel_armed, sentinel_for_era, settlement_era_start
-from .lane_d import BENCH_ROWS_ROLES, LaneDSettlement, bench_rows_dir, settle_lane_d
+from .lane_d import (
+    BENCH_ROWS_ROLES,
+    LaneDSettlement,
+    absent_settlement,
+    bench_rows_dir,
+    settle_lane_d,
+)
 from .lane_d_report import canonical_json
 from .lane_d_sentinel import sweep_and_publish
 from .lane_d_state import (
+    INFRA_DEFERRED,
     LaneDReceiptError,
     LaneDStateError,
     load_state,
@@ -242,14 +250,18 @@ class LaneDStep:
     # ── the weight fold's read ──────────────────────────────────────────────
 
     def court_for(self, boundary: int) -> list[int | None] | None:
-        """The court uids of the latest settlement this step PUBLISHED at a
-        boundary ``<= boundary`` (``None`` before any). Memory only; never
-        raises."""
+        """The court uids of the settlement this step PUBLISHED (or followed)
+        at EXACTLY ``boundary`` (``None`` when there is none: lane D's share
+        burns). Exact, never the latest one at or before ``boundary``: the
+        audit (``cascade.audit.checks.lane_d_pay``) pays only a record at the
+        settlement's own boundary, and a restarted node, a satellite and CI
+        hold no older court, so a carried-forward court would fork a running
+        node from them. Memory only; never raises."""
         try:
             b = int(boundary)
             with self._lock:
-                done = [k for k in self._courts if k <= b]
-                return list(self._courts[max(done)]) if done else None
+                court = self._courts.get(b)
+                return None if court is None else list(court)
         except Exception as e:  # noqa: BLE001 — the weight loop never sees a lane D error
             log.warning("lane D court_for(%r) failed: %s", boundary, e)
             return None
@@ -257,12 +269,11 @@ class LaneDStep:
     def genesis_for(self, boundary: int) -> bool:
         """DEC-CA-0076: whether the settlement :meth:`court_for` answers from
         has the house as KING_D (lane D's genesis: no miner has ever held
-        it). False before any publication. Memory only; never raises."""
+        it). False when none is published at ``boundary``. Memory only; never raises."""
         try:
             b = int(boundary)
             with self._lock:
-                done = [k for k in self._courts if k <= b]
-                return bool(done) and self._genesis.get(max(done), False)
+                return b in self._courts and bool(self._genesis.get(b, False))
         except Exception as e:  # noqa: BLE001 — the weight loop never sees a lane D error
             log.warning("lane D genesis_for(%r) failed: %s", boundary, e)
             return False
@@ -507,6 +518,59 @@ class LaneDStep:
         self._check_prior(s, latest)
         self._publish(settled, s)
         self._request_publication(settled, s, None)
+        return s.receipt
+
+    def _absent_house(self) -> dict | None:
+        """The house an absent record's prior state is loaded with: the
+        inputs source's cheap ``house()`` (the signed pointer, no eval host),
+        else the persisted state's own house; ``None`` when neither exists."""
+        house_of = getattr(self._inputs, "house", None)
+        if callable(house_of):
+            return dict(house_of())
+        if self.state_path.is_file():
+            return dict(json.loads(self.state_path.read_text(encoding="ascii"))["house"])
+        return None
+
+    def abandon(self, boundary: int) -> dict | None:
+        """The W19 worker moved past ``boundary`` without settling it (every
+        try raised and the head reached the next boundary): publish the W14
+        absent record (``reason = INFRA_DEFERRED``) at ``boundary`` and move
+        the latest pointer to it, so the boundary has a receipt — its share
+        burns, as the audit expects for it — and CI receipt replay verifies it
+        instead of skipping it as pending forever. Only the producing node
+        (signer and inputs wired) records it; nothing is recorded when the
+        boundary is unarmed, already published (or a later one is), settled
+        or persisted locally (W7c recovery adopts it, ``absent_settlement``
+        refuses). Returns the published absent record, else ``None``. Never
+        raises."""
+        try:
+            b = int(boundary)
+            cfg = self._cfg_at(b) if self._cfg_at is not None else self.cfg
+            if not cfg.lane_d.active(b) or self.signer is None or self._inputs is None:
+                return None
+            latest = self._latest_receipt()
+            if latest is not None and int(latest["boundary"]) >= b:
+                return None
+            house = self._absent_house()
+            if house is None:
+                log.warning("lane D settlement %d: abandoned unsettled, but no house to "
+                            "record it absent with", b)
+                return None
+            s = absent_settlement(cfg=cfg.lane_d, boundary=b, state_path=self.state_path,
+                                  house=house, reason=INFRA_DEFERRED,
+                                  expect_prior_sha256=(None if latest is None
+                                                       else latest["posterior_state_sha256"]))
+            if s.receipt is None:
+                return None
+            text = receipt_text(s.receipt)
+            self._put(receipt_key(b), text)
+            self._put(RECEIPT_LATEST_KEY, text)
+        except Exception as e:  # noqa: BLE001 — recording an orphan never blocks the next one
+            log.warning("lane D settlement %s: abandoned unsettled and NOT recorded absent "
+                        "(%s)", boundary, e)
+            return None
+        log.warning("lane D settlement %d: abandoned unsettled; published the absent record "
+                    "(%s): lane D's share burns at %d", b, INFRA_DEFERRED, b)
         return s.receipt
 
     def __call__(self, boundary: int) -> LaneDSettlement | None:

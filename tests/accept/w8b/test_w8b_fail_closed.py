@@ -50,7 +50,7 @@ def _after_b1(tmp_path, **kw):
 def test_boundary_hash_unreadable_is_no_settlement(tmp_path):
     rig = _after_b1(tmp_path)
     rig.factory.reader.fail = {h.B2}
-    _refused(rig, h.B2, "block_hash_unreadable", court_before=[None])
+    _refused(rig, h.B2, "block_hash_unreadable", court_before=None)
     rig.factory.reader.fail = set()
     _healthy_retry(rig)
 
@@ -58,7 +58,7 @@ def test_boundary_hash_unreadable_is_no_settlement(tmp_path):
 def test_malformed_boundary_hash_is_never_used(tmp_path):
     rig = _after_b1(tmp_path)
     rig.factory.reader.malformed = {h.B2}
-    _refused(rig, h.B2, "block_hash_unreadable", court_before=[None])
+    _refused(rig, h.B2, "block_hash_unreadable", court_before=None)
     rig.factory.reader.malformed = set()
     _healthy_retry(rig)
 
@@ -89,7 +89,7 @@ def test_era_start_hash_unreadable_with_ws1_armed_is_no_settlement(tmp_path):
 def test_inputs_unreadable_is_no_settlement(tmp_path):
     rig = _after_b1(tmp_path)
     rig.inputs.fail = True
-    _refused(rig, h.B2, "inputs_unavailable", court_before=[None])
+    _refused(rig, h.B2, "inputs_unavailable", court_before=None)
     rig.inputs.fail = False
     _healthy_retry(rig)
 
@@ -170,7 +170,7 @@ def test_tampered_state_file_is_refused(tmp_path):
     rig = _after_b1(tmp_path)
     raw = rig.state_path.read_bytes()
     rig.state_path.write_bytes(raw + b" ")
-    _refused(rig, h.B2, "settle_refused", court_before=[None])
+    _refused(rig, h.B2, "settle_refused", court_before=None)
 
 
 # ── pay moves only via the published report ─────────────────────────────────
@@ -183,7 +183,7 @@ def test_report_publish_failure_withholds_the_new_court(tmp_path):
     with pytest.raises(Exception) as ei:
         rig.step(h.B2)
     h.assert_wiring_error(ei.value, "publish_failed")
-    assert rig.step.court_for(h.B2) == [None], "pay moved without a published report"
+    assert rig.step.court_for(h.B2) is None, "pay moved without a published report"
     assert w.receipt_key(h.B2) not in rig.store.objects
     swept = len(rig.host.calls)
     rig.store.fail_put = None
@@ -202,7 +202,7 @@ def test_receipt_publish_failure_withholds_the_new_court(tmp_path):
     with pytest.raises(Exception) as ei:
         rig.step(h.B2)
     h.assert_wiring_error(ei.value, "publish_failed")
-    assert rig.step.court_for(h.B2) == [None]
+    assert rig.step.court_for(h.B2) is None
     assert rig.store.objects[w.RECEIPT_LATEST_KEY] == b1_latest
     rig.store.fail_put = None
     rig.step(h.B2)

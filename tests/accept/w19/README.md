@@ -70,6 +70,12 @@ imports and import-by-string literals).
   this worker. A boundary whose step **raised** is not completed (fail-closed:
   retried at a later submit, W8b "retry next tick"); the exception is kept as
   `last_error`, which a later successful step resets to `None`.
+- `LaneDWorker(step, on_abandon=None)` (2026-11-27): a raised boundary
+  followed by a submit of a LATER boundary is given up (never run again)
+  and `on_abandon(boundary)` runs on the new step's thread before the later
+  step; a raising `on_abandon` is logged and the later step still runs. The
+  loop passes the step's `abandon` (W8b: the W14 absent `infra_deferred`
+  record), so a boundary moved past always leaves a lane D receipt.
 
 ### `ValidatorRunner` (`cascade/validator/loop.py`)
 

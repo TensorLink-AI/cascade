@@ -305,6 +305,11 @@ class LaneDInputsSource:
                                    f"registered hotkeys unreadable ({e})") from e
         return {hk: uid for uid, hk in enumerate(hotkeys)}
 
+    def house(self) -> dict:
+        """The house record alone (the signed W5f pointer; no eval host): the
+        prior state of an absent record (:meth:`LaneDStep.abandon`)."""
+        return self._house()
+
     def _house(self) -> dict:
         from .lane_d_house import LaneDHouseError, load_house_pointer
 
@@ -839,6 +844,13 @@ class VaultGetGrants:
                 "files": {name: self._url(prefix + name) for name in sorted(row["files"])}}
 
 
+# The eval host bounds its own request (``timeout -k`` grace, seconds) and
+# serialises the GPU requests on one lock under the cache root (see
+# :meth:`SSHEvalHost.remote_command`).
+REMOTE_KILL_GRACE_S = 30
+REMOTE_LOCK_NAME = ".lane_d_eval.lock"
+
+
 class SSHEvalHost:
     """The lane D eval host over SSH: ``hello()`` and ``forecast(...)`` run
     ``python -m cascade.eval.lane_d_forecasts`` on the first ``[[host]]`` of
@@ -884,17 +896,41 @@ class SSHEvalHost:
                                f"{self.host_name or '(any/final stage)'}")
         return hosts[0]
 
-    def _ssh(self, host, args: list[str], payload: bytes) -> str:
-        from ..trainer.remote import build_ssh_argv
+    def remote_command(self, host, args: list[str]) -> str:
+        """The remote shell command of one eval-host request.
 
+        A local ``subprocess.run(timeout=)`` kills only the local ``ssh``; the
+        remote ``lane_d_forecasts`` would keep running and every retry would
+        add another one on the GPU (three were piled up on the 4090 on
+        2026-11-27). So the remote process is bounded ON the host by
+        ``timeout -k 30 <T-30>`` (``T`` = ``eval_timeout_seconds``: it is gone
+        by the time the local call gives up), and a ``forecast`` / ``public``
+        request takes an exclusive ``flock`` on ``<cache_dir>/.lane_d_eval.lock``
+        inside that bound, so a retry waits for (and outlives) an orphan, never
+        runs beside it. ``hello`` (no GPU, no cache) takes no lock."""
         env = ""
         if host.cuda_device is not None:
             env = f"CUDA_VISIBLE_DEVICES={shlex.quote(host.cuda_device)} "
-        cmd = (f"cd {shlex.quote(host.workdir)} && {env}"
-               + " ".join(shlex.quote(a) for a in
-                          [host.remote_python, "-m", "cascade.eval.lane_d_forecasts", *args]))
+        bound = max(1, int(self.timeout_s) - REMOTE_KILL_GRACE_S)
+        argv = ["timeout", "-k", str(REMOTE_KILL_GRACE_S), str(bound)]
+        prep = ""
+        if args and args[0] != "hello":
+            lock = f"{self.cache_dir.rstrip('/') or '/'}/{REMOTE_LOCK_NAME}"
+            prep = f"mkdir -p {shlex.quote(self.cache_dir)} && "
+            argv += ["flock", lock]
+        argv += [host.remote_python, "-m", "cascade.eval.lane_d_forecasts", *args]
+        return (f"cd {shlex.quote(host.workdir)} && {prep}{env}"
+                + " ".join(shlex.quote(a) for a in argv))
+
+    def _ssh(self, host, args: list[str], payload: bytes) -> str:
+        from ..trainer.remote import build_ssh_argv
+
+        cmd = self.remote_command(host, args)
         proc = self._run(build_ssh_argv(host, cmd), input=payload, capture_output=True,
                          timeout=self.timeout_s, check=False)
+        if proc.returncode == 124:
+            raise RuntimeError(f"{host.name}: lane D eval host request timed out on the host "
+                               f"(timeout {max(1, int(self.timeout_s) - REMOTE_KILL_GRACE_S)}s)")
         err = (proc.stderr or b"").decode("utf-8", "replace")[-600:]
         if proc.returncode != 0:
             raise RuntimeError(f"{host.name}: lane D eval host exited {proc.returncode}: {err}")
