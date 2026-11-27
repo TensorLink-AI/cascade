@@ -366,6 +366,35 @@ class ValidatorRunner(
     # None ⇒ no lane D work at all (the poll loop is unchanged).
     lane_d_step: Callable[[int], object] | None = None
     _lane_d_worker: LaneDWorker | None = field(default=None, repr=False)
+    # Lane B weight-level checks (the judge's stage ``merge``, the merged-init
+    # and acceptance rebuilds): injected in tests; None ⇒ a
+    # ``lane_b_offload.LaneBPodRunner`` on the ``--eval-hosts`` host
+    # (``eval_host_fn``, re-resolved per call). See _lane_b_merge_ops.
+    lane_b_merge_ops: object | None = None
+
+    def _lane_b_merge_ops(self, fetch_dir):
+        """The validator NEVER loads checkpoint weights in this process (a
+        7 GB CPU box; a model load OOM-killed every service on 2026-10-31):
+        lane B's weight-level checks run on the eval host named by
+        ``--eval-hosts`` — the same pod the trainer's lane B uses — through
+        :class:`~cascade.trainer.lane_b_offload.LaneBPodRunner` (the same
+        functions, this release's code shipped by content hash). No host
+        configured / listed / reachable ⇒ ``LaneBOffloadUnavailable`` at the
+        check: an INFRA transient (the settlement / era gate retries; never a
+        miner fault, no verdict, nothing burnt). ``fetch_dir`` is unused here
+        (the pod fetches the digest-pinned checkpoints itself); the explicit
+        opt-in ``CASCADE_LANE_B_LOCAL_EVAL=1`` (dev/test boxes) runs them
+        locally over it instead."""
+        if self.lane_b_merge_ops is not None:
+            return self.lane_b_merge_ops
+        from ..trainer.lane_b_offload import LaneBPodRunner, local_eval_allowed
+
+        if local_eval_allowed():
+            from .expert_lane import LocalLaneBMergeOps
+
+            return LocalLaneBMergeOps(fetch_dir)
+        return LaneBPodRunner(self._eval_host, source="--eval-hosts",
+                              where="the validator box (INFRA: not a miner fault)")
 
     def process_round(
         self,

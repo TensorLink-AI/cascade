@@ -2763,13 +2763,17 @@ hold a pod, the provisioner rents a cheap one on demand:
 
 ```toml
 # provision.toml (beside the validator)
-mkt_hosts_path  = "/root/cascade/mkt_hosts.toml"
-mkt_lease_hours = 3.0
+mkt_hosts_path      = "/root/cascade/mkt_hosts.toml"
+mkt_lease_hours     = 3.0     # TTL of a pod nobody heartbeats
+mkt_lease_max_hours = 6.0     # extension cap while the validator's heartbeat is fresh
 [provisioner]
 image = "<[marketcast] pod_image from chain.toml>"   # NOT the fleet's funded_pod_image
 [provisioner.mkt]
 sku = "NVIDIA GeForce RTX 3090"; market_sku = "RTX3090"   # Lium's listing name: no space
 max_pods = 1; providers = ["lium"]; max_price_hr = 0.40
+# No [[provisioner.mkt.candidate]] ⇒ the shipped fallback ladder applies:
+#   RTX 4090 (RTX4090) ≤ $0.80/h, then RTX A6000 (A6000) ≤ $0.60/h.
+# List your own candidates to replace it, or `candidate = []` for 3090 only.
 ```
 
 The pod runs `cascade.validator.mkt_worker`, which only ships in the
@@ -2780,7 +2784,7 @@ also serves stages on the fleet image. With `[marketcast] pod_image` empty,
 use the fleet image only when that image already carries MarketCast.
 
 ```bash
-cascade-validator ... --mkt-eval-hosts /root/cascade/mkt_hosts.toml   # --mkt-host-wait 1800
+cascade-validator ... --mkt-eval-hosts /root/cascade/mkt_hosts.toml   # --mkt-host-wait 5400
 ```
 
 How it runs:
@@ -2796,12 +2800,31 @@ How it runs:
   content-addressed cache on the pod (`_mkt_offload/cache`, sha256-checked
   before every load). It forecasts through it. Only contexts and covariates
   cross; targets, losses, the verdict, the report and the wallet stay local.
+- Before it requests a pod the run checks, pod-free, that each round's
+  `pool_mkt` snapshot is published and its block hash readable. A round that
+  fails is retried at the next settlement without renting anything.
 - When the run ends the request is removed and the pod is torn down. The TTL
-  `mkt_lease_hours` backstops a validator that keeps it alive.
+  `mkt_lease_hours` backstops a validator that keeps it alive. While the
+  validator's heartbeat is fresh (touched within 5 minutes), a long run keeps
+  its pod past that TTL, up to `mkt_lease_max_hours`. The budget check
+  prices the whole extended lease.
+- `--mkt-host-wait` defaults to the provisioner's worst-case boot (5400 s:
+  provider-ready 900 + ssh 300 + key auth 900 + gate 600, plus one
+  replacement pod). A shorter wait releases the request mid-boot and the new
+  pod is torn down unused, so the validator warns at startup.
 - No pod within `--mkt-host-wait`, or a pod or transport failure mid-run: the
   round is simply not published yet and is retried at the next settlement.
   Nothing is infra-deferred and no miner is charged. The trainer records a
-  report `"absent"` only after `report_timeout_settlements` (8 = 24 h).
+  report `"absent"` only after `report_timeout_settlements` (8 = 24 h) of
+  CONFIRMED misses (404 / NoSuchKey). A read error during a Hippius outage
+  does not count. A round with no MarketCast entries is not awaited at all,
+  unless a report is being recorded that settlement or an earlier round is
+  still awaited. Recording `"absent"` for a round with entries logs an
+  ERROR, which cascade-ops `mkt_legs` surfaces, because its entries now defer
+  as infra.
+- The MarketCast provisioner runs as its own service
+  (`cascade-mkt-provisioner`, `--config provision.mkt.toml`).
+  `deploy/restart_provisioner.sh` leaves it running.
 
 The worker image must carry the `marketcast` extra. Qualify a pod before
 enabling (remote vs local CPU quantiles within the audit's re-forecast
@@ -3857,6 +3880,80 @@ trainer (no legs in flight).
 `[lane_d] max_coldkey_unresolved_settlements` settlements. Alerts reach a
 webhook only when `/etc/cascade-ops.env` is filled; otherwise they reach only
 `alerts.jsonl`.
+
+### Lane D public half: warm the mirror before raising `public_weight`
+
+The public half draws 5000 windows from each public source per settlement
+(10,000 in total; the draw is consensus and does not change). The eval host
+reads each drawn series' row group from the Hippius mirror (`deploy/laned/public_mirror.toml`,
+about 588 GiB of shards) and caches it on the Lium volume
+(`/workspace/lane_d_public_cache`). Read serially from a cold cache, the
+4090 measured 31-45 blobs/min (2026-11-27), so one digest's public pass takes
+about 3.7-5.4 h against a 3600 s eval timeout. Every needed digest gets its
+own pass. Do not raise `public_weight` above 0 until the cache is warm.
+
+What helps:
+
+- **Warm sweep.** `python -m cascade.eval.lane_d_forecasts warm-public` walks
+  each source's shard map. It coalesces adjacent row groups into ranged GETs
+  of up to 64 MiB, verifies every blob's sha256 and caches it. It never
+  evicts. It stops at `--fill-bytes` or at the cache budget and reports
+  `fits=False` if it cannot fit everything. It is resumable: rerun the same
+  command and it fetches only what is still missing.
+- **Parallel reads.** The settlement's read path runs on a bounded pool
+  (`read_workers = 16` in the mirror config, or `public --public-workers N`).
+  A warm cache serves from disk, and a cold cache degrades to roughly
+  `read_workers` × the serial rate instead of failing outright.
+- **Score cache.** Public scores are cached in the validator's
+  `score_cache_dir`, keyed by host identity, code, digest, context, horizon
+  and the draw. A retry of the same settlement does not repeat the pass.
+- **Anonymous reads.** Uploads are `public-read`. External validators can
+  reproduce the half without a key once the objects uploaded earlier have had
+  the one-shot ACL sweep (below).
+
+**Runbook.**
+
+1. Deploy the release that carries `warm-public` to the eval host. Before
+   that, the host's release does not have the command.
+2. Dry run on the eval host. It needs the read key; the wrapper loads it.
+
+       /root/cascade/lane_d_py.sh -P -m cascade.eval.lane_d_forecasts warm-public \
+         --index gift_eval_pretrain=c96f91727c145a94abef6a6f7cc12ba00cebf884202a0358f74ccae0b80f1f6d \
+         --index rmisc=d218b21a072a5bcedd99c1d8391f3cd6ed213e0ba8419e70cf89467de523528e \
+         --public-cache-dir /workspace/lane_d_public_cache \
+         --public-cache-budget-bytes 900000000000 --dry-run
+
+   The `PLAN` lines give `blobs`, `cached`, `missing_gib` and `fits` for
+   each source. The index sha256s are the box's `public_indexes` manifests
+   (`/root/cascade-state/lane-d/public_indexes/<source>/manifest.json`). If
+   `fits=False`, the volume is too small: grow it first. A partial fill only
+   helps the windows that land in the warmed shards.
+3. Fill. Drop `--dry-run`, add `--workers 16`, and run it under
+   `nohup … > warm.log 2>&1 &` (stdout is line-buffered). Each `WARM` line
+   reports `rate_mib_s` and `eta_s`. Expected time is about 588 GiB ÷ the
+   measured rate; for example, 1.7 h at 100 MiB/s or 5.6 h at 30 MiB/s.
+   Record the measured rate in OPSLOG. The target cache fill is `cached` =
+   `blobs` with `missing_gib=0.00` for both sources (a second `--dry-run`
+   confirms it). Do not run the fill inside a settlement's scoring window:
+   it competes for the host's network and disk.
+4. Measure one public pass on the warm cache. Run one testnet settlement, or
+   one `public` request by hand, and take the time from the request to the
+   `lane_d_public_ok` log line. Record that time and the cohort size in
+   OPSLOG. Raise `public_weight` (Approve-tier, signed overlay, testnet first)
+   only if the cohort's passes together fit inside the 3600 s eval timeout
+   with headroom. Keep the cache warm: the sweep is idempotent, so rerun it
+   after any volume loss and after any new `index_sha256`.
+5. ACL sweep (Approve-tier, writes ACLs on Hippius; the owner runs it once).
+   Run it on the builder, never the box, with `HIPPIUS_S3_*` write keys in
+   the environment:
+
+       python -P scripts/laned_public_mirror.py fix-acl --source gift_eval_pretrain --dry-run
+       python -P scripts/laned_public_mirror.py fix-acl --source gift_eval_pretrain
+       python -P scripts/laned_public_mirror.py fix-acl --source rmisc
+
+   It prints `ACL_DONE … failed=0`. Then check that an anonymous GET of a
+   shard returns 200 instead of 403. R2 does not support canned object ACLs,
+   so the sweep targets `hippius` only.
 
 ### Elastic lane D hosts (`cascade-laned elastic`)
 

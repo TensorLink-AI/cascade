@@ -205,6 +205,18 @@ class LaneBMixin:
                 raise LaneBTransient(str(e)) from e
         return result
 
+    def _lane_b_merge_ops(self, fetch_dir):
+        """Where lane B's weight-level checks run (the judge's stage
+        ``merge``, the merged-init and acceptance rebuilds): here, the
+        in-process :class:`~cascade.validator.expert_lane.LocalLaneBMergeOps`
+        over ``fetch_dir`` — the bare-mixin path of unit / acceptance
+        stand-ins. The production :class:`~cascade.validator.loop.
+        ValidatorRunner` overrides this: its checks run on its eval host and
+        fail closed (transient, never a verdict) when none is configured."""
+        from .expert_lane import LocalLaneBMergeOps
+
+        return LocalLaneBMergeOps(fetch_dir)
+
     def _lane_b_judge_experts(self, manifest: TrainingManifest) -> _LaneBRound:
         """Fetch + verify ``manifest``'s bound expert manifest and judge it.
         Deterministic given the bytes; any READ / scoring failure raises
@@ -251,12 +263,16 @@ class LaneBMixin:
 
         training = self._training_for(manifest)
         sentinel_kw = self._lane_b_sentinel_kw(manifest)
+        fetch_dir = lambda p: self._fetch_checkpoint_dir(_as_entry(p))  # noqa: E731
         try:
+            # stage ``merge`` runs where _lane_b_merge_ops says (the validator:
+            # its eval host — this process never loads a checkpoint's weights)
+            merge_check = self._lane_b_merge_ops(fetch_dir).merge_check
             king_scores = self._evaluate(king, windows, training, block=block)
             js = judge_manifest(
                 em, king_pointer=king.trained_pointer, king_scores=king_scores,
                 evaluate=lambda p: self._evaluate(_as_entry(p), windows, training, block=block),
-                fetch_dir=lambda p: self._fetch_checkpoint_dir(_as_entry(p)),
+                fetch_dir=fetch_dir, merge_check=merge_check,
                 cfg=self.cfg.lane_b, seed=str(base_seed),
                 # DEC-CA-0050 merge guards: refuse a non-finite expert delta
                 strict=self.cfg.lane_b.merge_guard_at_settlement(block),

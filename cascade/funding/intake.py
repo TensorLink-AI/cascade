@@ -1358,6 +1358,17 @@ class FundingIntake:
             return 400, {"code": "missing_lium_api_key",
                          "message": "a funded fine-tune leg needs your Lium API key "
                                     "as X-Lium-Api-Key"}
+        from .mkt_gpus import LIUM_ONLY, lium_only_key
+
+        if not lium_only_key(api_key):
+            # the trainer rents every lane-C leg on the payer's Lium credential
+            # only (lium_only_key): a bundle without one could never rent
+            return 400, {"code": LIUM_ONLY,
+                         "message": "lane C fine-tune legs rent on Lium only — the payer "
+                                    "credentials carry no Lium key (Shadeform / Vast / "
+                                    "RunPod keys are not used for lane C). Send your Lium "
+                                    "key as X-Lium-Api-Key (or include a lium entry in the "
+                                    "bundle)"}
         label, label_err = submission_label(headers)
         if label_err is not None:
             return 400, label_err

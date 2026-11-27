@@ -108,12 +108,8 @@ def verify_acceptance(runner, manifest):
     import hashlib
     import json
 
-    import torch
-    from safetensors.torch import load_file
-
     from ..shared.hippius import StorageError
     from ..shared.lane_b import merge_identity
-    from ..trainer.expert_lane import _moe_names, apply_merges
     from .expert_lane import verdict_windows
     from .lane_b import LaneBTransient
 
@@ -139,8 +135,21 @@ def verify_acceptance(runner, manifest):
     def directory(pointer):
         return runner._fetch_checkpoint_dir(replace(king, trained_pointer=pointer))
 
-    def load(pointer):
-        return load_file(str(directory(pointer) / "weights.safetensors"))
+    # Each step's rebuild (base + accepted + this merge == its candidate,
+    # tensor for tensor) runs where _lane_b_merge_ops says — the validator's
+    # eval host; this process never loads the weights (merged_rebuild_check).
+    ops = runner._lane_b_merge_ops(directory)
+
+    def rebuilt_equal(merges, candidate) -> bool:
+        try:
+            got = ops.merge_verify(manifest.warm_start_base, merges, candidate, strict=True)
+        except Exception as e:  # noqa: BLE001 — unreadable / no eval host: transient
+            raise StorageError(f"acceptance rebuild unavailable: {type(e).__name__}: {e}") from e
+        if "merge_error" in got or "value_error" in got:
+            # the local rebuild raised these (MergeError is a ValueError):
+            # the caller's deterministic refusal, message unchanged
+            raise ValueError(got.get("merge_error", got.get("value_error")))
+        return bool(got.get("equal"))
 
     source = runner._lane_b_window_source
     if source is None:
@@ -164,8 +173,6 @@ def verify_acceptance(runner, manifest):
                         raise StorageError(f"acceptance scoring unavailable: {e}") from e
                 return scores_cache[pointer]
 
-            base = load(manifest.warm_start_base)
-            names = _moe_names(directory(manifest.warm_start_base))
             anchor_scores = scores(manifest.warm_start_base)
             for merge in manifest.warm_start_merges:
                 proof = merge.get("acceptance") or {}
@@ -197,9 +204,7 @@ def verify_acceptance(runner, manifest):
                     raise ValueError("acceptance candidates are not in commit order")
                 previous_order = order
                 candidate = str(proof.get("candidate", ""))
-                want = apply_merges(base, accepted + [merge], load, names, strict=True)
-                got = load(candidate)
-                if want.keys() != got.keys() or any(not torch.equal(want[n], got[n]) for n in want):
+                if not rebuilt_equal(accepted + [merge], candidate):
                     raise ValueError("acceptance intermediate checkpoint differs from its deltas")
                 wins, detail = judge_acceptance(
                     qualified, anchor_scores=anchor_scores, before_scores=scores(before),

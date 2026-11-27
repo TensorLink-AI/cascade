@@ -153,7 +153,7 @@ def test_a_second_competition_dispatches_trains_and_records_its_reports(tmp_path
     (e,) = m1.entries
     assert (e.target, e.competition, e.marketcast) == (T, {"model": "toy-1", "seed": 7}, {})
     assert m1.reports == {} and drv.st.awaits == {TOY: [{"rid": "1", "age": 0}]}
-    assert drv.st.mkt_await == [{"rid": "1", "age": 0}]           # MarketCast's own path
+    assert drv.st.mkt_await == []      # MarketCast's own path: no MarketCast entry, no wait
     # the main validator's toy report for round 1 lands; round 2 records it
     ops.reports[_report_key("1")] = '{"rows": []}'
     drv.settle(round_id="2", block=FROM + 1800, era_index=10, base_pointer=KING)
