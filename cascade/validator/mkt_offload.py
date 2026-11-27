@@ -11,7 +11,11 @@ forecasts on a cheap elastic pod instead of its own ``--device``.
 * **Session.** One ssh process per publish run runs
   :mod:`cascade.validator.mkt_worker`; checkpoints (the pinned base, each
   fine-tune) are uploaded once into a content-addressed cache on the pod and
-  sha256-verified there before every load. :class:`RemoteForecaster` stands
+  sha256-verified there before every load. The cache lives on the pod's
+  large data mount (2026-11-27, as lane B's #982): the host's ``cache_root``
+  roots it, else ``<workdir>/_mkt_offload`` is linked onto ``/workspace``
+  (:mod:`cascade.shared.pod_data_root`); a disk-short upload names the
+  alternative mount. :class:`RemoteForecaster` stands
   in for :class:`~cascade.eval.timestral_adapter.TimestralQuantileForecaster`
   (``quantile_levels`` + ``forecast_batch``), so the rows code is unchanged.
   Contexts and covariates cross; window targets, losses, the verdict, the
@@ -41,16 +45,25 @@ from pathlib import Path
 
 import numpy as np
 
+from ..shared.pod_data_root import (
+    alternative_mounts_command,
+    alternatives_text,
+    base_dir,
+    parse_alternatives,
+)
 from .mkt_worker import _LEN, FRAME_MAX, SCHEMA, decode_frame, encode_frame
 
 log = logging.getLogger("cascade.validator.mkt_offload")
 
-CACHE_DIR = "_mkt_offload/cache"
+OFFLOAD_DIR = "_mkt_offload"
+CACHE_DIR = f"{OFFLOAD_DIR}/cache"
 CACHE_KEEP = 8
 CKPT_FILES = ("config.json", "model.safetensors")
 CALL_TIMEOUT_S = 600.0
 UPLOAD_TIMEOUT_S = 1800.0
 TOUCH_EVERY_S = 60.0
+# free bytes an upload needs beyond the checkpoint itself
+UPLOAD_HEADROOM_BYTES = 1 << 30
 
 
 class MktOffloadError(ConnectionError):
@@ -190,9 +203,21 @@ class RemoteForecaster:
                                    past_covariates=pc, future_covariates=kc)[0]
 
 
+def cache_root_of(host) -> str:
+    """The pod's MarketCast checkpoint cache (the worker's ``--root``):
+    ``<cache_root>/_mkt_offload/cache`` when the host names a ``cache_root``,
+    else ``<workdir>/_mkt_offload/cache`` (linked onto the data mount by
+    :meth:`MktSession.start`)."""
+    return f"{base_dir(host)}/{CACHE_DIR}"
+
+
 def cache_setup_command(cache_root: str, key: str) -> str:
     """Make the cache, prune it to the most recently used entries plus
-    ``key`` (and stale partials), then print ``key``'s sha256sums if cached."""
+    ``key`` (and stale partials), then print ``key``'s sha256sums if cached,
+    the data mounts on another filesystem (``CASCADE_ALT=``) and the cache
+    filesystem's free bytes (``CASCADE_FREE=``)."""
+    from .eval_offload import _FREE_TAG
+
     q = shlex.quote
     files = " ".join(q(f) for f in CKPT_FILES)
     prune = (f"cd {q(cache_root)} && "
@@ -201,7 +226,9 @@ def cache_setup_command(cache_root: str, key: str) -> str:
              f"| tail -n +{CACHE_KEEP} | xargs -r rm -rf --")
     return (f"umask 077 && mkdir -p {q(cache_root)} && {{ ( {prune} ) || true; }} && "
             f"{{ cd {q(cache_root + '/' + key)} 2>/dev/null && touch . && "
-            f"sha256sum -- {files} 2>/dev/null || true; }}")
+            f"sha256sum -- {files} 2>/dev/null || true; }}; "
+            f"{alternative_mounts_command(cache_root)}; "
+            f"echo {_FREE_TAG}$(df -PB1 {q(cache_root)} 2>/dev/null | awk 'NR==2{{print $4}}')")
 
 
 class MktSession:
@@ -222,14 +249,22 @@ class MktSession:
 
     def start(self) -> dict:
         from ..trainer.remote import build_ssh_argv
+        from .eval_offload import _placement
 
         h = self.host
         env = ("OMP_NUM_THREADS=2 "
                + (f"CUDA_VISIBLE_DEVICES={shlex.quote(h.cuda_device)} "
                   if getattr(h, "cuda_device", None) else ""))
-        cmd = (f"cd {shlex.quote(h.workdir)} && {env}exec {shlex.quote(h.remote_python)} -m "
+        # 2026-11-27: the checkpoint cache sits on the pod's large data mount
+        # (the root overlay may be 43 GB beside an empty /workspace): placed
+        # BEFORE the worker resolves its --root, so the worker's containment
+        # check runs on the real location
+        root = cache_root_of(h)
+        cmd = (f"{_placement(h, f'{base_dir(h)}/{OFFLOAD_DIR}')}"
+               f"mkdir -p {shlex.quote(root)} && "
+               f"cd {shlex.quote(h.workdir)} && {env}exec {shlex.quote(h.remote_python)} -m "
                f"cascade.validator.mkt_worker --serve --device {shlex.quote(self.device)} "
-               f"--root .")
+               f"--root {shlex.quote(root)}")
         self._err = tempfile.TemporaryFile()  # noqa: SIM115 — lives as long as the session
         try:
             self.proc = self.popen(build_ssh_argv(h, cmd), stdin=subprocess.PIPE,
@@ -326,28 +361,45 @@ class MktSession:
     # checkpoints
 
     def upload(self, local_dir) -> tuple[str, str]:
-        """``(dir relative to the pod workdir, weights sha256)`` of
+        """``(dir relative to the worker's --root, weights sha256)`` of
         ``local_dir`` in the pod's content-addressed cache (uploaded only
-        when no sha256-identical copy is there)."""
+        when no sha256-identical copy is there). A cache filesystem without
+        room for it fails before the copy, naming the alternative mount."""
         from ..trainer.remote import build_ssh_argv
-        from .eval_offload import build_scp_argv, parse_sha256sum, private_cache_key
+        from .eval_offload import (
+            bench_free_bytes,
+            build_scp_argv,
+            parse_sha256sum,
+            private_cache_key,
+        )
 
         d = Path(local_dir)
         hashes = checkpoint_hashes(d)
         key = private_cache_key(hashes)
-        root = f"{self.host.workdir}/{CACHE_DIR}"
-        rel = f"{CACHE_DIR}/{key}"
+        root = cache_root_of(self.host)
+        rel = key
+
+        alt = ""
 
         def step(argv, what, timeout):
             proc = self.run(argv, timeout)
             if proc.returncode:
                 raise MktOffloadError(f"{self.host.name}: {what} failed (exit "
-                                      f"{proc.returncode}): {(proc.stderr or '')[-300:]}")
+                                      f"{proc.returncode}): {(proc.stderr or '')[-300:]}{alt}")
             return proc
 
         got = step(build_ssh_argv(self.host, cache_setup_command(root, key)), "cache setup", 120)
         if parse_sha256sum(got.stdout) == hashes:
             return rel, hashes["model.safetensors"]
+        need = sum((d / n).stat().st_size for n in CKPT_FILES) + UPLOAD_HEADROOM_BYTES
+        alt = alternatives_text(parse_alternatives(got.stdout), need)
+        free = bench_free_bytes(got.stdout)
+        if free is not None and free < need:
+            msg = (f"{self.host.name}: pod disk short for checkpoint upload: "
+                   f"{free / 1e9:.1f} GB free on the MarketCast cache filesystem ({root}) "
+                   f"< {need / 1e9:.1f} GB needed{alt}")
+            log.error("marketcast offload: %s", msg)
+            raise MktOffloadError(msg)
         part = f"{root}/{key}.part-{uuid.uuid4().hex[:12]}"
         started = time.monotonic()
         step(build_ssh_argv(self.host, f"umask 077 && mkdir -p {shlex.quote(part)}"),
