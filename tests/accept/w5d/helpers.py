@@ -36,7 +36,7 @@ HEAD_LEVELS = (0.01, *(i / 20 for i in range(1, 20)), 0.99)
 PATCH = 32                     # pyramid_model patch_size (§1.1)
 TRAINED_CONTEXT = 4096         # 128 patches: the training row length (§1.1, rev5)
 HORIZON = 64                   # lane D scores h = 64 at launch (§1.1)
-MAX_HORIZON = 512              # 16 CPM patches x 32 (§1.1 rev5 hard limit)
+MAX_HORIZON = 2048             # 64 patches x 32: the band cap (owner 2026-11-27; was 512)
 LAUNCH_CONTEXTS = (4096, 8192, 16384)
 ALL_CONTEXTS = (4096, 8192, 16384, 32768, 65536, 131072)
 DECLARED_128K = 131072
@@ -72,7 +72,8 @@ def lane_d_cfg(**over):
     from cascade.shared.config.lane_d import parse_lane_d
 
     raw = {"from_block": 2700 * 3600, "share": 0.25, "takes_from": "lane_a",
-           "remainder": "burn", "contexts": list(LAUNCH_CONTEXTS), "horizon": HORIZON}
+           "remainder": "burn", "contexts": list(LAUNCH_CONTEXTS), "horizon": HORIZON,
+           "horizon_bands": []}  # owner 2026-11-27: the fixed-horizon rule
     return parse_lane_d({**raw, **over}, era_blocks_at=lambda _block: 3600)
 
 

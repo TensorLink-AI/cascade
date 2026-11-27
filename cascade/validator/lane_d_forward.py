@@ -8,8 +8,9 @@ For an entry E and the king K it is judged against, the bound is
 (unix seconds; T is the reveal time). A ``pool_d/1`` window is eligible only
 if, in this order (the first failing rule names the refusal):
 
-1. ``missing_clock``: ``target_ts`` and ``first_seen_ts`` each hold
-   ``cfg.horizon`` points and ``end_ts`` is set and equals ``target_ts[-1]``;
+1. ``missing_clock``: ``target_ts`` and ``first_seen_ts`` each hold the
+   window's ``h`` points (its band horizon; ``cfg.horizon`` under the fixed
+   rule) and ``end_ts`` is set and equals ``target_ts[-1]``;
 1a. ``unlisted_feed``: the window's feed (its ``feed``, else its ``source``)
    has an entry in the pool's top-level ``feeds`` block. An unlisted feed, or
    a pool with no ``feeds`` block, cannot be judged on rules 2 and 3, so it
@@ -107,6 +108,18 @@ def _clocks_recorded(w: dict, horizon: int) -> bool:
             and int(end) == int(ts[-1]))
 
 
+def window_horizon(w: dict, cfg) -> int:
+    """The window's own ``h`` (owner 2026-11-27: per-window band horizons),
+    else ``[lane_d] horizon`` (the fixed rule)."""
+    h = w.get("h")
+    return int(cfg.horizon) if h is None else int(h)
+
+
+def _lo(x) -> int:
+    """``min`` of a clock list or (band windows) an int64 array view."""
+    return int(x.min()) if hasattr(x, "min") else int(min(x))
+
+
 def _s0_end(frontier, bound: float) -> float | None:
     """``end_ts`` of S0, the earliest frontier record with ``as_of_ts > bound``."""
     after = sorted((float(a), float(e)) for a, e in frontier if float(a) > bound)
@@ -132,7 +145,7 @@ def window_reason(w: dict, feeds: dict, bound: float, cfg, *,
     are judged at the feed bound ``bound - 3600 * e`` and a listed feed without
     a valid ``embargo_hours`` is ``unlisted_feed``; without it (e = 0) this is
     the rev3 rule byte for byte."""
-    if not _clocks_recorded(w, int(cfg.horizon)):
+    if not _clocks_recorded(w, window_horizon(w, cfg)):
         return RefusalReason.MISSING_CLOCK
     feed = feeds.get(w.get("feed") or w["source"])
     if not isinstance(feed, dict):
@@ -147,8 +160,8 @@ def window_reason(w: dict, feeds: dict, bound: float, cfg, *,
     lag = feed.get("mirror_lag_hours")
     if lag is not None and float(lag) > float(cfg.max_mirror_lag_hours):
         return RefusalReason.OVER_LAG
-    data_ok = min(w["target_ts"]) > bound
-    seen_ok = min(w["first_seen_ts"]) > bound
+    data_ok = _lo(w["target_ts"]) > bound
+    seen_ok = _lo(w["first_seen_ts"]) > bound
     if not data_ok and not seen_ok:
         return RefusalReason.BEFORE_MARGIN
     if not seen_ok:
@@ -159,7 +172,7 @@ def window_reason(w: dict, feeds: dict, bound: float, cfg, *,
     s0_end = _s0_end(w.get("frontier") or (), bound)
     if s0_end is None:
         return RefusalReason.ABSENT_FROM_S0
-    if min(w["target_ts"]) <= s0_end:
+    if _lo(w["target_ts"]) <= s0_end:
         return RefusalReason.BACKFILL
     return None
 
@@ -185,4 +198,4 @@ def eligible_windows(pool: dict, *, t_entry: int, t_king: int, cfg) -> Iterator[
 
 
 __all__ = ["REFUSAL_REASONS", "RefusalReason", "WindowVerdict", "eligible_windows",
-           "forward_bound", "window_reason"]
+           "forward_bound", "window_horizon", "window_reason"]

@@ -60,6 +60,7 @@ FORBIDDEN_STEMS = ("cascade.validator.lane_d_", "cascade.eval.lane_d_", "cascade
 # satellite replay, moved into the audit; its own imports are pinned by
 # tests/accept/w7d/test_w7d_import_graph.py).
 LANE_D_AUDIT_ALLOWED = ("cascade.eval.bootstrap", "cascade.shared.sr25519",
+                        "cascade.shared.lane_d_horizons",
                         "cascade.shared.config.lane_d", "cascade.audit.checks",
                         "cascade.audit.lane_d_chain")
 

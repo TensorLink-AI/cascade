@@ -999,7 +999,11 @@ share           = 0.0            # of the total, carved from takes_from (D1: 0.2
 takes_from      = "lane_b"       # lane_a | lane_b | lane_c
 remainder       = "burn"         # release-only burn destination (D21)
 contexts        = [4096, 8192, 16384, 32768, 65536, 131072]  # D2 rev6.6: declarable from launch (cap 131072); each arms per settlement on its gates
-horizon         = 64             # points; <= 512 (§1.1)
+horizon         = 64             # points; <= 512 (§1.1); the fixed rule when horizon_bands = []
+horizon_bands   = ["short", "medium", "long"]  # owner 2026-11-27: GIFT-Eval terms per window ([] = fixed)
+max_horizon     = 2048
+band_slots      = 1
+min_cell_windows = 50
 dtypes          = ["BF16"]       # D14: BF16 only
 forward_margin_hours = 0.0       # D5; rev6.14 (a): the eligibility / fresh boundary b = T + this (6 -> 0)
 eval_delay_hours = 0.5           # TESTNET-FAST (2026-11-24): 6.0 (judging start j = T + this; one testnet settlement)

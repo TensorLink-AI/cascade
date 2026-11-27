@@ -71,6 +71,9 @@ BENCH_ITEMS = 40
 # (a floor far below any fixture ratio), so their pre-F4 numbers stand. F4's
 # own tests (tests/accept/w5e/test_w5e_combined.py) pin the combined rule.
 LIVE_ONLY = {"public_weight": 0.0, "window_ratio_floor": 1e-9}
+# Owner 2026-11-27: these fixtures pin the fixed [lane_d] horizon rule (their
+# pools hold fixed-length targets); tests/accept/w_hz pins the band rule.
+FIXED_HORIZON = {"horizon_bands": []}
 
 
 def lane_d_cfg(**over):
@@ -83,7 +86,7 @@ def lane_d_cfg(**over):
            "forward_margin_hours": MARGIN_H, "max_mirror_lag_hours": 6.0,
            "min_windows": 24, "min_clusters": 4, "bootstrap_B": 200,
            "reward_prior_kings": 2, "court_weights": [0.80, 0.15, 0.05]}
-    return parse_lane_d({**raw, **LIVE_ONLY, **over}, era_blocks_at=lambda _block: ERA)
+    return parse_lane_d({**raw, **LIVE_ONLY, **FIXED_HORIZON, **over}, era_blocks_at=lambda _block: ERA)
 
 
 def unarmed_cfg():

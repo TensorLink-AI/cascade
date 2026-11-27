@@ -702,21 +702,24 @@ def _check_public(report: dict) -> None:
             k = f"{w['family']}|{w['freq']}"
             count[k] = count.get(k, 0) + 1
             cut = int(w["cut"])
+            # owner 2026-11-27: a band window's h is its band's (the source
+            # record's ``horizon`` stays the fixed one)
+            hw = int(w["h"]) if "band" in w else h
             head = f"{src}:"
-            tail = f":{cut}:h{h}"
+            tail = f":{cut}:h{hw}"
             wid = w["window_id"]
-            if (w["h"] != h or not wid.startswith(head) or not wid.endswith(tail)
+            if (w["h"] != hw or not wid.startswith(head) or not wid.endswith(tail)
                     or len(wid) <= len(head) + len(tail)):
                 raise ReportSchemaError("bad_value", _join(wat, "window_id"),
                                         "not <source>:<series_id>:<cut>:h<horizon>")
-            if not int(s["min_history"]) <= cut <= int(w["length"]) - h:
+            if not int(s["min_history"]) <= cut <= int(w["length"]) - hw:
                 raise ReportSchemaError("bad_value", _join(wat, "cut"),
                                         "outside [min_history, length - h]")
             sid = wid[len(head):-len(tail)]
-            if any(cut < e and a < cut + h for a, e in spans.get(sid, ())):
+            if any(cut < e and a < cut + hw for a, e in spans.get(sid, ())):
                 raise ReportSchemaError("bad_value", _join(wat, "cut"),
                                         "target overlaps another window of its series")
-            spans.setdefault(sid, []).append((cut, cut + h))
+            spans.setdefault(sid, []).append((cut, cut + hw))
         for k, n in count.items():
             if n > s["quota"].get(k, 0):
                 raise ReportSchemaError("bad_value", _join(_join(at, "quota"), k),

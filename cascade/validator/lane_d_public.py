@@ -80,10 +80,39 @@ PUBLIC_MIN_HISTORY = 128
 PUBLIC_MAX_HISTORY = 131072
 DROP_REASONS = ("public_nonfinite_target", "public_short_history", "public_no_channel",
                 "public_no_scale")
+# Owner 2026-11-27: a kept public window left out by the box so every
+# (frequency class, band) cell of the public half holds the same count.
+BALANCE_DROP = "public_cell_balance"
 
 
 def public_seed(boundary_block_hash: str, source: str) -> str:
     return f"{boundary_block_hash}:{PUBLIC_SEED_TAG}:{source}"
+
+
+def balance_public(windows: list[dict], *, boundary_block_hash: str, min_cell: int
+                   ) -> tuple[list[dict], list[dict]]:
+    """Owner 2026-11-27: equal counts per ``(frequency class, band)`` cell of
+    the kept public windows (``{window_id, freq, band, ...}``): a cell below
+    ``min_cell`` is left out, every other keeps its ``m`` windows ranked first
+    by ``sha256(<block hash>:lane_d_public:balance:<window_id>)``.
+    ``(kept, [{window_id, reason: BALANCE_DROP}])``, both by window id."""
+    from ..shared.lane_d_horizons import cell_class
+
+    seed = public_seed(str(boundary_block_hash), "balance")
+    by: dict[str, list[dict]] = {}
+    for w in windows:
+        by.setdefault(f"{cell_class(w['freq'])}|{w['band']}", []).append(w)
+    big = {k: v for k, v in by.items() if len(v) >= int(min_cell)}
+    m = min((len(v) for v in big.values()), default=0)
+    keep = set()
+    for v in big.values():
+        ranked = sorted(v, key=lambda w: (hashlib.sha256(
+            f"{seed}:{w['window_id']}".encode()).hexdigest(), w["window_id"]))
+        keep |= {w["window_id"] for w in ranked[:m]}
+    kept = sorted((w for w in windows if w["window_id"] in keep), key=lambda w: w["window_id"])
+    gone = sorted(({"window_id": w["window_id"], "reason": BALANCE_DROP} for w in windows
+                   if w["window_id"] not in keep), key=lambda x: x["window_id"])
+    return kept, gone
 
 
 def series_slots(length: int, horizon: int, min_history: int) -> int:
@@ -111,12 +140,34 @@ def cell_of(row: Mapping) -> str:
     return f"{row['family']}|{row['freq']}"
 
 
+def series_band(seed: str, row: Mapping, bands, *, min_history: int,
+                max_horizon: int) -> tuple[str, int] | None:
+    """Owner 2026-11-27: the series' drawn band and its ``h``: uniform over
+    the GIFT-Eval bands of its ``freq`` that fit its length (at least one
+    target slot after ``min_history``; the whole history is public, so every
+    band that fits is allowed), by ``H(":band:", ordinal, 0)``; ``None``
+    when none fits."""
+    from ..shared.lane_d_horizons import bands_for
+
+    fits = [(b, h) for b, h in bands_for(row["freq"], bands, max_horizon=max_horizon).items()
+            if series_slots(row["length"], h, min_history) >= 1]
+    if not fits:
+        return None
+    return fits[_hint(seed, "band", int(row["ordinal"]), 0) % len(fits)]
+
+
 def draw_public(index_dir, *, source: str, boundary_block_hash: str, horizon: int,
                 n_windows: int = PUBLIC_WINDOWS_PER_SOURCE,
-                min_history: int = PUBLIC_MIN_HISTORY) -> dict:
+                min_history: int = PUBLIC_MIN_HISTORY, bands=None,
+                max_horizon: int = 2048) -> dict:
     """The settlement's public draw for ``source`` from its index at
     ``index_dir`` (two streaming passes: cells, then the drawn rows). Plain
-    JSON; ``windows`` sorted by ``window_id``."""
+    JSON; ``windows`` sorted by ``window_id``.
+
+    ``bands`` (owner 2026-11-27; ``None`` = every window at ``horizon``):
+    each series first draws its band (:func:`series_band`); its slots,
+    capacity and cuts then use that band's ``h`` (the record's ``horizon``
+    stays ``[lane_d] horizon``; each window carries its ``h`` and ``band``)."""
     spec = PUBLIC_SOURCES[source]
     manifest = load_manifest(index_dir)
     if manifest["source"] != source:
@@ -124,11 +175,21 @@ def draw_public(index_dir, *, source: str, boundary_block_hash: str, horizon: in
     h, m, multi = int(horizon), int(min_history), bool(spec.multi_window)
     seed = public_seed(str(boundary_block_hash), source)
     cells: dict[str, list[tuple[int, int]]] = {}
+    band_of: dict[int, tuple[str, int]] = {}
     for row in iter_index(index_dir):
-        k = series_slots(row["length"], h, m)
+        if bands:
+            got = series_band(seed, row, bands, min_history=m, max_horizon=int(max_horizon))
+            if got is None:
+                continue
+            band_of[int(row["ordinal"])] = got
+        k = series_slots(row["length"], band_of.get(int(row["ordinal"]), (None, h))[1], m)
         if k >= 1:
             cells.setdefault(cell_of(row), []).append((int(row["ordinal"]), int(row["length"])))
-    caps = {c: (sum(series_slots(L, h, m) for _, L in ms) if multi else len(ms))
+
+    def h_of(o: int) -> int:
+        return band_of[o][1] if bands else h
+
+    caps = {c: (sum(series_slots(L, h_of(o), m) for o, L in ms) if multi else len(ms))
             for c, ms in cells.items()}
     quota = split_quota(caps, int(n_windows))
     picks: dict[int, list[int]] = {}
@@ -138,12 +199,12 @@ def draw_public(index_dir, *, source: str, boundary_block_hash: str, horizon: in
         remaining, r = int(quota.get(cell, 0)), 1
         while remaining > 0:
             pool = [o for o, L in members
-                    if len(picks.get(o, ())) == r - 1 and series_slots(L, h, m) >= r]
+                    if len(picks.get(o, ())) == r - 1 and series_slots(L, h_of(o), m) >= r]
             if not pool:
                 break
             ranked = sorted(pool, key=lambda o: (_hint(seed, "pick", o, r), o))
             for o in ranked[:remaining]:
-                cut = pick_cut(seed, o, r, length[o], h, m, multi, picks.get(o, []))
+                cut = pick_cut(seed, o, r, length[o], h_of(o), m, multi, picks.get(o, []))
                 picks.setdefault(o, []).append(cut)
                 remaining -= 1
             if not multi:
@@ -153,11 +214,13 @@ def draw_public(index_dir, *, source: str, boundary_block_hash: str, horizon: in
     for row in iter_index(index_dir):
         o = int(row["ordinal"])
         for cut in picks.get(o, ()):
-            windows.append({"window_id": f"{source}:{row['series_id']}:{cut}:h{h}",
+            hw = h_of(o)
+            windows.append({"window_id": f"{source}:{row['series_id']}:{cut}:h{hw}",
                             "ordinal": o, "series_id": row["series_id"],
                             "dataset": row["dataset"], "family": row["family"],
-                            "freq": row["freq"], "cut": int(cut), "h": h,
-                            "length": int(row["length"]), "n_channels": int(row["n_channels"])})
+                            "freq": row["freq"], "cut": int(cut), "h": hw,
+                            "length": int(row["length"]), "n_channels": int(row["n_channels"]),
+                            **({"band": band_of[o][0]} if bands else {})})
     windows.sort(key=lambda w: w["window_id"])
     return {"source": source, "repo": spec.repo, "revision": spec.revision,
             "index_sha256": manifest["index_sha256"], "files_sha256": manifest["files_sha256"],
@@ -173,13 +236,13 @@ def public_record(draws: list[dict], dropped: Mapping[str, list[dict]] | None = 
     drawn window ids (with their cell, cut and series length, so the audit
     re-derives the draw from the index), plus the windows dropped at read
     time (``{window_id, reason}``)."""
-    keep = ("window_id", "ordinal", "family", "freq", "cut", "h", "length")
+    keep = ("window_id", "ordinal", "family", "freq", "cut", "h", "length", "band")
     out = []
     for d in sorted(draws, key=lambda d: d["source"]):
         out.append({**{k: d[k] for k in ("source", "repo", "revision", "index_sha256",
                                           "files_sha256", "seed", "n_windows", "horizon",
                                           "min_history", "multi_window", "capacity", "quota")},
-                    "windows": [{k: w[k] for k in keep} for w in d["windows"]],
+                    "windows": [{k: w[k] for k in keep if k in w} for w in d["windows"]],
                     "dropped": sorted((dict(x) for x in (dropped or {}).get(d["source"], [])),
                                       key=lambda x: x["window_id"])})
     return {"schema": PUBLIC_SCHEMA, "sources": out}
@@ -338,7 +401,7 @@ def score_public_windows(windows: list[dict], forecasts: Mapping[str, Mapping]) 
     return out
 
 
-__all__ = ["DROP_REASONS", "PUBLIC_MAX_HISTORY", "PUBLIC_MIN_HISTORY", "PUBLIC_SCHEMA",
+__all__ = ["BALANCE_DROP", "DROP_REASONS", "balance_public", "series_band", "PUBLIC_MAX_HISTORY", "PUBLIC_MIN_HISTORY", "PUBLIC_SCHEMA",
            "PUBLIC_SEED_TAG", "PUBLIC_WINDOWS_PER_SOURCE", "build_window", "cell_of",
            "draw_public", "pick_cut", "public_record", "public_seed", "read_public_windows",
            "score_public_windows", "seasonal_period", "series_slots"]

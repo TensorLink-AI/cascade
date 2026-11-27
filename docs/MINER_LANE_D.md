@@ -97,8 +97,14 @@ blocks, about 24 h) of `submit`, or the entry expires (`ready_expired`).
 ## How it is scored
 
 - **Metric.** The geometric mean of the CRPS and MASE ratios against the
-  king, on 64-step forecasts (`horizon`). Each window's ratio is clamped to
-  [0.5, 2] and log-averaged. A paired cluster bootstrap over sources gives a
+  king. Each window has its own horizon: one of GIFT-Eval's short, medium
+  and long terms for its frequency (1x, 10x and 15x GIFT's base horizon,
+  rounded up to 32-point patches, at most 2048 points; hourly 64 / 480 /
+  736, daily 32 / 320 / 480; the table is in `docs/LANE_D.md`). Your model
+  predicts the whole horizon in one pass after its declared context, so a
+  model that only forecasts well 64 steps ahead loses on the long cells.
+  Every (frequency class, band) cell counts equally. Each window's ratio is
+  clamped to [0.5, 2] and log-averaged. A paired cluster bootstrap over sources gives a
   one-sided lower confidence bound (LCB) at `alpha` = 0.05.
 - **Live windows.** Forward windows from the private live pool. A window is
   *fresh* when all its target data arrived after your entry, or *embargo*
@@ -220,6 +226,47 @@ deleted after `loser_ttl_eras` (4).
 - **Timing:** committing after `ready_ttl_blocks` (`ready_expired`).
 
 Full lists: [LANE_D.md](LANE_D.md#lane-d-faq).
+
+## Past evaluations
+
+Lane D publishes one signed report per settlement boundary in the public
+`cascade-manifests` bucket (`https://s3.hippius.com/cascade-manifests/<key>`,
+no keys needed):
+
+| What | Key | Notes |
+|---|---|---|
+| Latest receipt | `lane-d/receipts/latest.json` | Its `boundary` is the newest settlement. `status: "absent"` with a `reason` (for example `infra_deferred`) means that boundary published no report |
+| One boundary's receipt | `lane-d/receipts/lane_d_receipt_<boundary>.json` | Binds the report by `report_sha256` and chains the state hashes |
+| One boundary's report | `lane-d/reports/lane_d_report_<boundary>.json` | Signed by the validator (`signer`, `signature`) |
+| Spent windows | `lane-d/spent/<boundary>/` (coming) | The windows a boundary used, with per-window scores |
+| Live lane D board | `status/lane_d.json` | King, prior kings, queue, latest board and verdicts |
+
+A boundary is a block number that is a multiple of 900 (`epoch_blocks`,
+about 3 h). Read `boundary` from `lane-d/receipts/latest.json` and step back
+by 900 for earlier ones. Not every boundary has a report: deferred ones have
+none.
+
+**Am I competitive?** In the report, `crown_bar.margin` is the bar in force
+(3% against a fresh king, decaying to 1%). `king_before` / `king_after` name
+the king (`house: true` = the lane A house model). Each `verdicts` row is one
+judged entry: `outcome` (`lost`, `cleared`, `crowned`), its `lcb` against
+the king, the `fresh` and `embargo` sub-scores, and `cells` (your point
+gain per `live|<frequency class>|<band>` and `public|...` cell; each window
+in `windows` names its `band` and `h`). `entries` and `skipped`
+give each entry's status and reason code (the codes are in `reason_enum` of
+`status/lane_d.json`), and `windows` and `cohorts` show what was drawn.
+
+**No miner entry has been judged yet** (checked 2026-11-27): the house still
+holds the crown and every published report has empty `entries` and
+`verdicts`. Examples:
+
+- Report, boundary 9,593,100 (2026-11-26 19:27 UTC):
+  <https://s3.hippius.com/cascade-manifests/lane-d/reports/lane_d_report_9593100.json>
+- Its receipt:
+  <https://s3.hippius.com/cascade-manifests/lane-d/receipts/lane_d_receipt_9593100.json>
+- A deferred boundary, 9,595,800 (2026-11-27):
+  <https://s3.hippius.com/cascade-manifests/lane-d/receipts/lane_d_receipt_9595800.json>
+- Latest: <https://s3.hippius.com/cascade-manifests/lane-d/receipts/latest.json>
 
 ## FAQ
 

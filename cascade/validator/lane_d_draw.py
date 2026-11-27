@@ -188,5 +188,124 @@ def draw_windows(cells, *, boundary_block_hash: str, cfg, budget: int | None = N
             "deferred": None}
 
 
-__all__ = ["DEFERRED_BUDGET", "SHORT_FRESH", "cell_capacity", "cell_key", "draw_seed",
-           "draw_windows", "fresh_keep", "split_quota"]
+# ── per-window horizon bands (owner 2026-11-27) ─────────────────────────────
+
+
+def balance_cells(ws: list[dict], min_cell: int) -> tuple[list[dict], dict, dict]:
+    """Equal weight per ``(frequency class, band)`` cell by equal counts:
+    a cell with fewer than ``min_cell`` windows is left out, every other cell
+    keeps its first ``m`` windows in draw order (``m`` = the smallest kept
+    cell's count). ``(kept in draw order, {cell: n kept}, {cell: n dropped
+    cell})``. Equal counts make the unweighted per-window mean (the statistic
+    every checker re-derives from the rows) the equal-weight-per-cell mean."""
+    by: dict[str, list[dict]] = {}
+    for w in ws:
+        by.setdefault(w["cell"], []).append(w)
+    small = {k: len(v) for k, v in by.items() if len(v) < int(min_cell)}
+    big = {k: v for k, v in by.items() if k not in small}
+    if not big:
+        return [], {}, dict(sorted(small.items()))
+    m = min(len(v) for v in big.values())
+    keep = {w["window_id"] for v in big.values() for w in v[:m]}
+    return ([w for w in ws if w["window_id"] in keep], {k: m for k in sorted(big)},
+            dict(sorted(small.items())))
+
+
+def draw_band_windows(cands: list[dict], *, boundary_block_hash: str, cfg,
+                      budget: int | None = None) -> dict:
+    """The seeded draw of a cohort's band candidates (owner 2026-11-27).
+
+    ``cands``: ``{"window_id", "series_id", "source", "freq", "band", "h",
+    "t0", "t1", "embargo_window"}`` (``t0`` / ``t1`` the target's first / last
+    data time). Steps, one ``np.random.default_rng(_seed_to_int(seed))``
+    stream, ``seed = draw_seed(boundary_block_hash)``:
+
+    1. cells ``"<frequency class>|<band>"``; capacity = candidates; budget <
+       ``min_windows`` draws nothing;
+    2. quota: :func:`split_quota` (the live draw's even split);
+    3. per cell, ONE permutation of its fresh candidates then one of its
+       embargo candidates (cells in key order); picks go round-robin over the
+       cells in key order, each taking its next candidate whose target does
+       not overlap (in data time) a window already drawn from that series
+       (any band): fresh first, the band and the cut of every window are thus
+       the block hash's;
+    4. the source cap (:func:`cap_source_share`), then :func:`balance_cells`
+       and the minimum fresh share (:func:`fresh_keep`, the last-drawn embargo
+       windows dropped first), repeated until neither changes the set;
+    5. the floors after.
+    """
+    from ..shared.lane_d_horizons import cell_class
+
+    seed = draw_seed(boundary_block_hash)
+    max_w = int(cfg.max_windows_per_settlement)
+    total = max_w if budget is None else int(budget)
+    by_cell: dict[str, list[dict]] = {}
+    for c in sorted(cands, key=lambda c: str(c["window_id"])):
+        cell = f"{cell_class(c['freq'])}|{c['band']}"
+        by_cell.setdefault(cell, []).append({**c, "cell": cell})
+    caps = {k: len(v) for k, v in sorted(by_cell.items())}
+    out = {"seed": seed, "boundary_block_hash": str(boundary_block_hash),
+           "max_windows_per_settlement": max_w, "capacity": caps}
+    if total < int(cfg.min_windows):
+        return {**out, "quota": {k: 0 for k in caps}, "windows": [], "fresh_windows": 0,
+                "embargo_windows": 0, "meets_floors": False, "short_reason": None,
+                "deferred": DEFERRED_BUDGET, "cells": {}, "cells_dropped": {}}
+    quota = split_quota(caps, total)
+    rng = np.random.default_rng(_seed_to_int(seed))
+    queues = {}
+    for k in sorted(by_cell):
+        fresh = [c for c in by_cell[k] if not c["embargo_window"]]
+        emb = [c for c in by_cell[k] if c["embargo_window"]]
+        queues[k] = ([fresh[i] for i in rng.permutation(len(fresh))]
+                     + [emb[i] for i in rng.permutation(len(emb))])
+    pos = {k: 0 for k in queues}
+    left = {k: int(quota[k]) for k in queues}
+    taken: dict[str, list[tuple[int, int]]] = {}
+    picks: list[dict] = []
+    live = [k for k in sorted(queues) if left[k] > 0]
+    while live:
+        nxt = []
+        for k in live:
+            q = queues[k]
+            while pos[k] < len(q):
+                c = q[pos[k]]
+                pos[k] += 1
+                spans = taken.get(c["series_id"], ())
+                a, b = int(c["t0"]), int(c["t1"])
+                if any(a <= e and s <= b for s, e in spans):
+                    continue
+                taken.setdefault(c["series_id"], []).append((a, b))
+                picks.append(c)
+                left[k] -= 1
+                break
+            if left[k] > 0 and pos[k] < len(q):
+                nxt.append(k)
+        live = nxt
+    kept_ids = {w["window_id"] for w in cap_source_share(
+        [{"window_id": w["window_id"], "source": w["source"]} for w in picks],
+        max_share=float(cfg.max_source_share), seed=seed)}
+    kept = [w for w in picks if w["window_id"] in kept_ids]           # draw order
+    share = float(cfg.min_fresh_window_share)
+    ws, cells, dropped = kept, {}, {}
+    while True:
+        ws, cells, dropped_now = balance_cells(ws, int(cfg.min_cell_windows))
+        dropped.update({k: max(v, dropped.get(k, 0)) for k, v in dropped_now.items()})
+        emb = [w for w in ws if w["embargo_window"]]
+        fresh_w = [w for w in ws if not w["embargo_window"]]
+        k_emb = fresh_keep(len(emb), len(fresh_w), share)
+        if k_emb == len(emb):
+            break
+        gone = {w["window_id"] for w in emb[k_emb:]}
+        ws = [w for w in ws if w["window_id"] not in gone]
+    final = sorted(ws, key=lambda w: w["window_id"])
+    meets = _floors(final, cfg)
+    short = SHORT_FRESH if not meets and _floors(kept, cfg) else None
+    n_emb = sum(1 for w in final if w["embargo_window"])
+    return {**out, "quota": quota, "windows": [{k: v for k, v in w.items()} for w in final],
+            "fresh_windows": len(final) - n_emb, "embargo_windows": n_emb,
+            "meets_floors": meets, "short_reason": short, "deferred": None,
+            "cells": cells, "cells_dropped": dict(sorted(dropped.items()))}
+
+
+__all__ = ["DEFERRED_BUDGET", "SHORT_FRESH", "balance_cells", "cell_capacity", "cell_key",
+           "draw_band_windows", "draw_seed", "draw_windows", "fresh_keep", "split_quota"]

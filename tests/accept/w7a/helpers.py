@@ -123,7 +123,8 @@ TOP_LEVEL_REQUIRED = ("schema", "boundary", "signer", "signature", "scoring_meth
 # rev6.18 B7: `host`, present iff the settlement was handed the eval host's
 # verified record (README "Scoring host"). rev6.14 (a): `boundary_ts`.
 TOP_LEVEL_OPTIONAL = ("extensions", "gate", "armed_contexts", "armed_evidence", "draw",
-                      "public", "boundary_ts", "host")   # F3 public; rev6.14 (a) boundary_ts; B7 host
+                      "public", "boundary_ts", "host",   # F3 public; rev6.14 (a) boundary_ts; B7 host
+                      "horizon_bands")   # owner 2026-11-27: the per-window horizon rule (an extra)
 PARAMS_FIELDS = ("share", "takes_from", "remainder", "horizon", "horizons", "contexts",
                  "forward_margin_hours", "max_mirror_lag_hours", "min_windows", "min_clusters",
                  "d_margin", "alpha", "bootstrap_B", "reward_prior_kings",
@@ -211,13 +212,16 @@ FRONTIER_END_LAG = HOUR
 # (a floor far below any fixture ratio), so their pre-F4 numbers stand. F4's
 # own tests (tests/accept/w5e/test_w5e_combined.py) pin the combined rule.
 LIVE_ONLY = {"public_weight": 0.0, "window_ratio_floor": 1e-9}
+# Owner 2026-11-27: these fixtures pin the fixed [lane_d] horizon rule (their
+# pools hold fixed-length targets); tests/accept/w_hz pins the band rule.
+FIXED_HORIZON = {"horizon_bands": []}
 
 
 def lane_d_cfg(**over):
     """The real W2 parse of ``ARMED`` with ``over`` applied."""
     from cascade.shared.config.lane_d import parse_lane_d
 
-    return parse_lane_d({**ARMED, **LIVE_ONLY, **over}, era_blocks_at=lambda _block: ERA)
+    return parse_lane_d({**ARMED, **LIVE_ONLY, **FIXED_HORIZON, **over}, era_blocks_at=lambda _block: ERA)
 
 
 def text_digest(text: str) -> str:

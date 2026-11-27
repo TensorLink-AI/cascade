@@ -109,9 +109,13 @@ arming gates measure.
   model and the same bytes declared at 16k score identically on windows with
   4096 points of history or less. A long context gains only where long
   history exists.
-- Lane D scores horizon `horizon = 64` only. There is one lane D board across
-  all contexts: king and challenger are each scored at their own declared
-  context on identical targets.
+- Each lane D window is scored at its own horizon (see "Per-window
+  horizons" below): up to 2048 points, drawn per window from GIFT-Eval's
+  short / medium / long terms of the series' frequency. There is one lane D
+  board across all contexts: king and challenger are each scored at their
+  own declared context on identical targets at the same horizon. A long
+  horizon does not shorten the context: the model reads up to its declared
+  context and predicts `ceil(h / 32)` masked patches after it in one pass.
 
 ## Export, verify, submit, ready, commit
 
@@ -202,13 +206,59 @@ The forward-only rule sets the expected latency, and latency depends on data
 frequency. Evidence accumulates over every daily `pool_d` snapshot since T
 and freezes at the first settlement that meets the floors, `min_windows`
 (1000) and `min_clusters` (20 sources). Five-minute and hourly feeds fill the
-floors in days; daily and slower series rarely reach a forward-only set at
-h = 64. The embargo top-up (`embargo_hours`: 24 h from the launch overlay,
+floors in days; daily and slower series rarely reach a forward-only set even
+at their 32-point short band. The embargo top-up (`embargo_hours`: 24 h from the launch overlay,
 48 h in the template and once a later overlay restores it) fills the live half
 sooner: at least `min_fresh_window_share` (0.2) of the live windows are fresh,
 and the rest may be embargo windows. Judging starts no earlier than
 `eval_delay_hours` (6 h) after max(T_E, T_K), and the crown is decided at the
 first verdict (FAQ).
+
+**Per-window horizons** (`[lane_d] horizon_bands`, owner 2026-11-27). The
+horizon of a window is a band horizon of its series' frequency, from
+GIFT-Eval's own definitions (`SalesforceAIResearch/gift-eval`,
+`src/gift_eval/data.py`): the base horizon `PRED_LENGTH_MAP` (M 12, W 8,
+D 30, H 48, T (minutely) 48, S (secondly) 60; quarterly 8 and yearly 6 from
+`M4_PRED_LENGTH_MAP`) times `Term.multiplier` (short 1, medium 10, long 15),
+rounded up to whole 32-point patches and capped at `max_horizon` (2048):
+
+| freq | short | medium | long |
+|---|---|---|---|
+| secondly (S) | 64 | 608 | 928 |
+| minutely (T), hourly (H) | 64 | 480 | 736 |
+| daily (D) | 32 | 320 | 480 |
+| weekly (W) | 32 | 96 | 128 |
+| monthly (M) | 32 | 128 | 192 |
+| quarterly (Q) | 32 | 96 | 128 |
+| yearly (A) | 32 | 64 | 96 |
+
+A pool frequency is normalised as GIFT-Eval does (`5min` is minutely,
+`W-SUN` weekly) after writing a tick in its largest exact unit (`21600S` is
+6-hourly, so hourly; `150S` stays secondly). Live windows: each `pool_d`
+snapshot stores every series' newest target region (the longest band of its
+frequency) with both clocks per point, and offers per band its newest
+`band_slots` (1) target(s); the history of a window is every point before its
+cut. A band exists for a series when every point of its target is unseen by
+the entry: arrived after max(T_E, T_K), or arrived before it but still held
+back by the feed's embargo (a target may be part embargo-held and part
+fresh). A feed public at its source has no embargo, so no credit. Public
+windows: each series draws one band among those its length fits, then its
+cut. The settlement's seeded draw (the boundary block hash, the same for
+the king and every entry) picks the windows round-robin over the
+(frequency class, band) cells, never two overlapping targets of one series,
+and keeps the same number of windows in every cell (a cell below
+`min_cell_windows`, 50, is left out). Equal counts make the per-window mean
+weight every cell equally, in both halves; the verdict's `cells` lists the
+point gain per cell. `horizon_bands = []` is the fixed `horizon` (64) rule.
+
+At the first settlement an entry can be judged (6 h after it), the unseen
+span is about the embargo plus 3 to 6 h. With `embargo_hours` 24 (launch
+overlay) the live cells are secondly feeds (all three bands), 150 s
+(short, medium), minutely (all three), 4-, 5- and 6-minutely (short), 10-
+and 15-minutely (short); 30-minutely and slower have none yet. At 48 h
+(template) 150 s and 4-minutely add long, 5- and 6-minutely add medium and
+30-minutely adds short; hourly and slower still have none (64 h for the
+hourly short band). Later settlements add the rest as data arrives.
 
 **Live half and public half.** The score has a live half (the forward
 windows above) and an optional public half: 5000 windows each from

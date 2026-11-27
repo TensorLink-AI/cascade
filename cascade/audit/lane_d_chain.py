@@ -86,6 +86,7 @@ from types import MappingProxyType
 import numpy as np
 
 from cascade.eval.bootstrap import _seed_to_int, clamped_log_ratios, log_gain, parts_maxt_lcbs
+from cascade.shared.lane_d_horizons import bands_for, bands_on
 from cascade.shared.sr25519 import SignatureVerifierUnavailable, verify_hotkey
 
 MATCH = "MATCH"
@@ -127,6 +128,10 @@ _WINDOW_KEYS = frozenset({"window_id", "source", "feed", "min_target_ts", "min_f
                           # W5j draw cell
                           "freq", "embargo_hours", "min_release_ts", "rule", "embargo_window",
                           "timeframe", "bin", "kind", "freq_class", "h", "origin"})
+# Owner 2026-11-27 (per-window horizons): optional extras of a band report.
+_WINDOW_BAND_KEYS = frozenset({"band"})
+_COHORT_BAND_KEYS = frozenset({"cells", "cells_dropped"})
+_VERDICT_BAND_KEYS = frozenset({"cells"})
 _COHORT_KEYS = frozenset({"index", "king_digest", "king_reveal_ts", "stage", "members", "t_max",
                           "window_ids", "set_sha256", "first_seen_roots", "refused",
                           "fresh_windows", "embargo_windows"})
@@ -1084,7 +1089,7 @@ class _Settlement:
         max_lag = float(self.cfg.max_mirror_lag_hours)
         for k, w in enumerate(ws):
             at = f"windows[{k}]"
-            if not isinstance(w, dict) or set(w) != _WINDOW_KEYS \
+            if not isinstance(w, dict) or set(w) - _WINDOW_BAND_KEYS != _WINDOW_KEYS \
                     or not isinstance(w.get("window_id"), str):
                 self.d.add(at)
                 continue
@@ -1112,6 +1117,11 @@ class _Settlement:
         """rev6.10 (a) / rev6.12 / W5j: the window's own embargo record and
         draw cell (eligibility at the cohort's bound is the cohort's check)."""
         d, h = self.d, int(self.cfg.horizon)
+        if "band" in w:
+            # a band window's h is its band horizon under the config's rule
+            h = (bands_for(w["freq"], self.cfg.horizon_bands,
+                           max_horizon=int(self.cfg.max_horizon)).get(w["band"], -1)
+                 if bands_on(self.cfg) else -1)
         e = w["embargo_hours"]
         if not _is_num(e) or not _finite(e) or float(e) < 0 \
                 or float(e) > float(self.cfg.embargo_hours):
@@ -1307,7 +1317,7 @@ class _Settlement:
             return 0
         bars_house = self.house["digest"]
         for k in sorted(set(c) ^ (_COHORT_KEYS | {"house_digest"})):
-            if k != "house_digest":
+            if k != "house_digest" and k not in _COHORT_BAND_KEYS:
                 d.add(_key(at, k))
         if c.get("index") != i:
             d.add(f"{at}.index")
@@ -1465,7 +1475,8 @@ class _Settlement:
         d = self.d
         keys = _VERDICT_KEYS | ({"house"} if vs_house is not None else set())
         for k in sorted(set(v) ^ keys):
-            d.add(_key(at, k))
+            if k not in _VERDICT_BAND_KEYS:
+                d.add(_key(at, k))
         if v.get("king_digest") != kd:
             d.add(f"{at}.king_digest")
         if v.get("stage") != stage:
