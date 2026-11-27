@@ -84,6 +84,11 @@ tests/accept/wb27/test_wb27_approval_skus.py
 cascade/trainer/gang_ranks.py
 cascade/trainer/pyramid_dp.py
 tests/accept/wb27/test_wb27_gang_ranks.py
+# 2026-11-27 owner bug sweep, lane C launch readiness: the mkt health gate pins
+# [marketcast] pod_image / worker_code_fingerprint (not the fleet release); a
+# MarketCast leg's payer balance is projected at its own rent cap.
+cascade/provision/main.py
+tests/accept/wb27/test_wb27_lane_c_launch.py
 
 # 2026-11-27 owner sweep: the VALIDATOR's lane B weight checks (judge stage
 # merge, merged-init and acceptance rebuilds) run on its --eval-hosts pod;
