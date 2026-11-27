@@ -143,3 +143,4 @@ cascade/validator/eval_offload.py
 deploy/bench_pod_bootstrap.sh
 tests/accept/wb27/test_wb27_reattach_finished_and_cache_disk.py
 tests/accept/wb27/fixtures/reattach_5gmzsp/
+tests/accept/wb27/test_wb27_pod_reply_json.py
