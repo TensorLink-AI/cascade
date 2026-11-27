@@ -135,7 +135,10 @@ ARMED_LANE_D = {"from_block": ARM_BLOCK, "share": 0.25, "takes_from": "lane_a",
                 "remainder": "burn", "contexts": [4096, 8192, 16384],
                 "horizon": w7c.HORIZON, "forward_margin_hours": w7c.MARGIN_H,
                 "max_mirror_lag_hours": 6.0, "min_windows": 24, "min_clusters": 4,
-                "bootstrap_B": 200, **LIVE_ONLY}
+                "bootstrap_B": 200, **LIVE_ONLY,
+                # owner 2026-11-27: the W7c pools hold fixed 64-point targets,
+                # so these fixtures pin the fixed horizon rule (W-HZ pins bands)
+                "horizon_bands": []}
 
 
 def chain_cfg(*, armed: bool = True, sentinel: bool = False, **lane_over):

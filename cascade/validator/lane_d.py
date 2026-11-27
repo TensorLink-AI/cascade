@@ -937,7 +937,10 @@ def _drawn(picked: list[tuple[dict, dict, object]], cfg, block_hash: str | None,
     if block_hash is None:
         ws = picked[:max(0, int(budget))]
         return ws, None, _meets_floors([w for w, _, _ in ws], cfg)
-    if bands_on(cfg):
+    # owner 2026-11-27: the band draw for band windows (a pool loaded under
+    # the band rule); windows without a band (a miner's own series in the
+    # preview) keep the fixed-horizon draw
+    if bands_on(cfg) and all("band" in w for w, _, _ in picked):
         d = draw_band_windows([_band_cand(w, v) for w, _, v in picked],
                               boundary_block_hash=str(block_hash), cfg=cfg, budget=int(budget))
         by_id = {w["window_id"]: (w, pool, v) for w, pool, v in picked}

@@ -28,5 +28,7 @@ cascade/eval/lane_d_forecasts.py
 # unchanged and stays compatible).
 cascade/audit/lane_d.py
 cascade/audit/lane_d_chain.py
+# The miner preview mirrors the validator (band pools, one forecast per h).
+cascade/miner/lane_d_preview.py
 docs/LANE_D.md
 docs/MINER_LANE_D.md
