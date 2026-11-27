@@ -109,7 +109,7 @@ def _dispatch(disp, host, *, contract_block: int):
 # ── 1. the finished run is found and harvested ───────────────────────────────
 
 
-def test_live_identity_hash_drifts_with_the_era_contract_block(tmp_path):
+def _check_identity_hash_drifts_with_the_era_contract_block():
     """The root cause, pinned: the run dir's hash is the continuation key of
     the dispatch-era identity (contract block 9594000); the current era's
     9597600 hashes elsewhere."""
@@ -151,11 +151,16 @@ def test_reattach_harvests_the_finished_expert_run_on_the_live_dispatch_dir(tmp_
     assert [(r.checkpoint_dir, r.miner_hotkey, sfx) for r, sfx in harvested] == \
         [(CKPT, HK, "-xenergy-u171")]                           # harvested, not requeued
     assert not any("setsid nohup" in c for c in calls)          # nothing relaunched
+    # the cause pinned (dispatch-era hash != current-era hash), and the stable
+    # name lookup still refuses an empty pod / another leg's finished run
+    _check_identity_hash_drifts_with_the_era_contract_block()
+    _check_reattach_still_refuses_without_a_run(tmp_path / "empty", monkeypatch)
+    _check_reattach_refuses_another_legs_finished_run(tmp_path / "other", monkeypatch)
     assert (work / "_train_work" / "_dispatch" / RUN / "exit_code").exists()
     assert (work / CKPT / "weights.safetensors").exists()       # the pod was not touched
 
 
-def test_reattach_still_refuses_when_the_pod_holds_no_run_of_the_leg(tmp_path, monkeypatch):
+def _check_reattach_still_refuses_without_a_run(tmp_path, monkeypatch):
     with torch_blocked():
         from cascade.trainer import leg_reattach, remote
     work = _pod(tmp_path, finished=False)
@@ -170,7 +175,7 @@ def test_reattach_still_refuses_when_the_pod_holds_no_run_of_the_leg(tmp_path, m
     assert not any("setsid nohup" in c for c in calls)
 
 
-def test_reattach_refuses_another_legs_finished_run(tmp_path, monkeypatch):
+def _check_reattach_refuses_another_legs_finished_run(tmp_path, monkeypatch):
     """A run found by its stable name whose receipt is another leg's (another
     domain suffix of the same miner) is refused, never harvested as this one."""
     with torch_blocked():
@@ -286,9 +291,11 @@ def test_a_failed_leg_keeps_a_pod_holding_a_finished_unharvested_run(tmp_path, m
     assert torn == [], "the pod holding the finished run was removed"
     held = getattr(runner_operator_pods, "unharvested_finished_run", None)
     assert held is not None and RUN in held(SimpleNamespace(), _host(work, remote))
+    # a pod WITHOUT a finished run is still torn down as before
+    _check_failed_leg_without_a_finished_run_is_torn_down(tmp_path / "bare", monkeypatch)
 
 
-def test_a_failed_leg_on_a_pod_without_a_finished_run_is_still_torn_down(tmp_path, monkeypatch):
+def _check_failed_leg_without_a_finished_run_is_torn_down(tmp_path, monkeypatch):
     with torch_blocked():
         from cascade.trainer import remote
     run, _ = _local_pod(monkeypatch)
