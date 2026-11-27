@@ -417,13 +417,20 @@ def _lb(tmp_path):
 
 
 def test_bench_method_is_in_the_row_cache_key(tmp_path):
-    from cascade.eval.benchmarks import BENCH_METHOD, LEGACY_BENCH_METHOD, item_rows_from_report
+    from cascade.eval.benchmarks import (
+        BENCH_METHOD,
+        BENCH_METHODS,
+        LEGACY_BENCH_METHOD,
+        item_rows_from_report,
+    )
     from cascade.trainer import lane_b_bench
 
     rows_key = getattr(lane_b_bench, "rows_key", None)
     assert rows_key is not None, "lane_b_bench has no rows_key: bench_method is not in the key"
     assert rows_key("a" * 64, LEGACY_BENCH_METHOD) == "a" * 64        # pre-stamp files stay
     assert rows_key("a" * 64, BENCH_METHOD) != "a" * 64
+    # every stamped method has its own key (observed_mask/1 vs /2, #988)
+    assert len({rows_key("a" * 64, m) for m in BENCH_METHODS}) == len(BENCH_METHODS)
     lb = _lb(tmp_path)
     legacy = item_rows_from_report(_report_of(b"king"))               # unstamped = impute/0
     lb._store("a" * 64, legacy, "king")
@@ -450,3 +457,10 @@ def test_mixed_bench_methods_never_pair():
     assert pair_public_rows(old, stamped_legacy, require=("gift",)).missing == []
     assert pair_public_rows(new, item_rows_from_report(_report_of(b"x", BENCH_METHOD)),
                             require=("gift",)).missing == []
+    # observed_mask/1 rows never pair with observed_mask/2 ones (#988)
+    v1 = item_rows_from_report(_report_of(b"cand", "observed_mask/1"))
+    assert BENCH_METHOD != "observed_mask/1"
+    assert set(pair_public_rows(new, v1).missing) == {"gift", "boom", "time", "fev"}
+    from cascade.eval import public_guards
+
+    assert public_guards.LEGACY_BENCH_METHOD == LEGACY_BENCH_METHOD

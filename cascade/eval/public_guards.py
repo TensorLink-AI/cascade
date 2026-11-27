@@ -81,11 +81,14 @@ def sentinel_pairing_kw(
     return {"require": tuple(b for b in require if b != s), "benchmarks": sorted(names)}
 
 
+# == cascade.eval.benchmarks.LEGACY_BENCH_METHOD (not imported: this module
+# stays a satellite primitive whose static closure reaches no producer, W7d)
+LEGACY_BENCH_METHOD = "impute/0"
+
+
 def _bench_method(suite: Mapping) -> str:
     """The bench method one suite's rows were swept with (#973): its stamp,
     else the legacy method (rows swept before the stamp)."""
-    from .benchmarks import LEGACY_BENCH_METHOD
-
     m = suite.get("bench_method")
     return str(m) if isinstance(m, str) and m else LEGACY_BENCH_METHOD
 
