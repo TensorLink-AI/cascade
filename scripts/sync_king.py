@@ -40,6 +40,53 @@ def sh(argv, **kw):
     return subprocess.run(argv, check=True, capture_output=True, text=True, **kw)
 
 
+def scan_gate(tree: Path) -> tuple[list, list]:
+    """Static security scan of a fetched generator BEFORE anything lands in
+    the repo: ``(findings, high)``. The code is untrusted competitor code; the
+    subnet only ever runs it sandboxed, but an archived copy can be run by a
+    human on a real machine. Callers refuse on ``high`` unless told otherwise.
+    Shared by the lane A king sync and the lane B slot sync."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from scan_generator import scan as scan_tree
+
+    findings = scan_tree(tree)
+    high = [f for f in findings if f["severity"] == "high"]
+    for f in findings:
+        print(f"scan [{f['severity'].upper()}] {f['path']}: {f['finding']}")
+    return findings, high
+
+
+def write_scanned_copy(src: Path, dest: Path, findings: list, provenance: dict) -> None:
+    """Replace ``dest`` with ``src`` plus ``SCAN.json`` and ``PROVENANCE.json``.
+
+    Staged BESIDE the destination, then swapped: a copy that dies mid-way
+    (disk full) must not leave a half-replaced tree behind. Symlinks are
+    dropped from the copy UNCONDITIONALLY — the scan flags them high, but an
+    --allow-findings run (accepting some unrelated finding) must never let
+    copytree's default dereference commit HOST file contents into a public
+    repo."""
+    def _drop_symlinks(dirpath, names):
+        return [n for n in names if (Path(dirpath) / n).is_symlink()]
+
+    high = sum(1 for f in findings if f["severity"] == "high")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    staged = dest.parent / f".{dest.name}.staging"
+    if staged.exists():
+        shutil.rmtree(staged)
+    shutil.copytree(src, staged, ignore=_drop_symlinks)
+    (staged / "SCAN.json").write_text(json.dumps({
+        "high": high,
+        "warn": sum(1 for f in findings if f["severity"] == "warn"),
+        "findings": findings,
+        "note": "static scan only — NEVER run this code outside a sandbox "
+                "regardless of a clean scan",
+    }, indent=2, default=str) + "\n")
+    (staged / "PROVENANCE.json").write_text(json.dumps(provenance, indent=2) + "\n")
+    if dest.exists():
+        shutil.rmtree(dest)
+    staged.rename(dest)
+
+
 def _anchor_receipt_king(args, get_text=None) -> dict | None:
     """Fetch + signature-verify the anchor validator's latest receipt (public
     read) and resolve the king by :func:`champions_archive.king_from_receipt`.
@@ -184,56 +231,21 @@ def main() -> int:
             print(f"king unchanged ({ref}) — nothing to commit")
             return 0
 
-        # Static security scan BEFORE anything lands in the repo: the king is
-        # untrusted competitor code; the subnet only ever runs it sandboxed,
-        # but an archived copy can be run by a human on a real machine. High
-        # findings block the archive unless --allow-findings; every scan is
-        # recorded beside the provenance either way.
-        sys.path.insert(0, str(Path(__file__).resolve().parent))
-        from scan_generator import scan as scan_tree
-
-        findings = scan_tree(out)
-        high = [f for f in findings if f["severity"] == "high"]
-        for f in findings:
-            print(f"scan [{f['severity'].upper()}] {f['path']}: {f['finding']}")
+        findings, high = scan_gate(out)
         if high and not args.allow_findings:
             print(f"REFUSING to archive: {len(high)} high-severity finding(s) "
                   "— rerun with --allow-findings to archive anyway",
                   file=sys.stderr)
             return 1
 
-        # Stage the full replacement BESIDE the destination, then swap: a
-        # copy that dies mid-way (disk full) must not leave a half-replaced
-        # champions/king/ behind. Symlinks are dropped
-        # from the copy UNCONDITIONALLY — the scan flags them high, but an
-        # --allow-findings run (accepting some unrelated finding) must never
-        # let copytree's default dereference commit HOST file contents into
-        # a public repo.
-        def _drop_symlinks(dirpath, names):
-            return [n for n in names if (Path(dirpath) / n).is_symlink()]
-
-        staged = DEST.parent / ".king.staging"
-        if staged.exists():
-            shutil.rmtree(staged)
-        shutil.copytree(out, staged, ignore=_drop_symlinks)
-        (staged / "SCAN.json").write_text(json.dumps({
-            "high": len(high),
-            "warn": sum(1 for f in findings if f["severity"] == "warn"),
-            "findings": findings,
-            "note": "static scan only — NEVER run this code outside a sandbox "
-                    "regardless of a clean scan",
-        }, indent=2, default=str) + "\n")
-        (staged / "PROVENANCE.json").write_text(json.dumps({
+        write_scanned_copy(out, DEST, findings, {
             "ref": ref, "digest": digest, "network": args.network,
             "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "previous_digest": prev.get("digest", ""),
             "note": "archived by scripts/sync_king.py — read-only fetch; "
                     "verify against the on-chain commitment and the round "
                     "receipts (cascade-audit)",
-        }, indent=2) + "\n")
-        if DEST.exists():
-            shutil.rmtree(DEST)
-        staged.rename(DEST)
+        })
 
         sh(["git", "-C", str(REPO), "add", str(DEST)])
         # champions/archive/: the same tree filed under its reign number, so

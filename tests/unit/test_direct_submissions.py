@@ -540,7 +540,8 @@ def _hook_runner(tmp_path, **round_kw):
 
     rnd = RoundConfig(**round_kw)
     fake = SimpleNamespace(cfg=SimpleNamespace(round=rnd), work_root=tmp_path)
-    for name in ("_submission_store", "_verify_vault_ownership", "_maybe_publish_champion"):
+    for name in ("_submission_store", "_verify_vault_ownership", "_maybe_publish_champion",
+                 "_maybe_publish_lane_b_champions"):
         setattr(fake, name, getattr(TrainerRunner, name).__get__(fake))
     return fake
 

@@ -1,7 +1,9 @@
 name: king-sync
 
 # Archives the subnet's current best generator (the king) into
-# champions/king/ — one commit per reign, scan-gated, provenance-stamped.
+# champions/king/ — one commit per reign, scan-gated, provenance-stamped —
+# and every lane B slot winner into champions/lane_b/ (the hashed
+# champions/lane_b/index.json the trainer publishes).
 #
 # Every run: resolve the king by the TRAINER's rule — the anchor validator's
 # latest signed receipt ([manifest] validator_hotkey; signature verified),
@@ -67,7 +69,18 @@ jobs:
           python scripts/sync_king.py --python "$(which python)" \
             ${{ inputs.allow_findings && '--allow-findings' || '' }}
 
+      # Lane B slot winners (owner 2026-11-27): the generators whose experts
+      # were merged into the king, published by the trainer's champion step
+      # (champions/lane_b/index.json, public-read) — same scan gate, same
+      # provenance, same push. Runs even when the lane A sync failed.
+      - name: Sync the lane B slot champions
+        if: ${{ !cancelled() }}
+        run: |
+          python scripts/sync_lane_b_champions.py \
+            ${{ inputs.allow_findings && '--allow-findings' || '' }}
+
       - name: Push the reign commit (if any)
+        if: ${{ !cancelled() }}
         run: |
           if [ "$(git rev-parse HEAD)" != "$(git rev-parse '@{u}')" ]; then
             git push

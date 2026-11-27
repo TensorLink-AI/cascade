@@ -144,3 +144,17 @@ deploy/bench_pod_bootstrap.sh
 tests/accept/wb27/test_wb27_reattach_finished_and_cache_disk.py
 tests/accept/wb27/fixtures/reattach_5gmzsp/
 tests/accept/wb27/test_wb27_pod_reply_json.py
+# 2026-11-27 owner ("if they become king it should be published, probably in
+# the repo"): a lane B slot winner (experts accepted into the king's init)
+# publishes its generator through the lane A ChampionPublisher and policy
+# (no WP owns the publisher: DEC-CA-0036, tests/unit/test_direct_submissions.py);
+# the king-sync workflow copies it into champions/lane_b/ with the lane A scan
+# gate and provenance writer, plus the hashed champions/lane_b/index.json.
+cascade/funding/champion.py
+scripts/sync_king.py
+scripts/sync_lane_b_champions.py
+.github/workflows/king-sync.yml
+champions/README.md
+docs/MINER_LANE_B.md
+tests/unit/test_direct_submissions.py
+tests/accept/wb27/test_wb27_lane_b_champions.py
