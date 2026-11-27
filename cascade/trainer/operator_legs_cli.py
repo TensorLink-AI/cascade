@@ -9,6 +9,14 @@
     cascade-trainer block-executor       <executor-id | ip> [--days N] [--reason TEXT]
     cascade-trainer unblock-executor     <executor-id | ip>
     cascade-trainer rebuild-init-pointer [--reason TEXT]
+    cascade-trainer make-good-ledger     [--json]
+    cascade-trainer make-good-paid       <hotkey> --note TEXT [--usd AMOUNT]
+
+``make-good-ledger`` lists what the operator owes miners for lemons and
+post-rent rejects on their own keys (owed, paid, outstanding per hotkey;
+``_train_work/make_good_ledger.json``). ``make-good-paid`` records a payment
+back to a miner (default: everything outstanding) — bookkeeping only, it
+moves no money.
 
 ``rebuild-init-pointer`` asks the running trainer to retry the seed epoch's
 random-init pointer build NOW (the DEC-CA-0063 "init" entry the validators'
@@ -55,9 +63,9 @@ QUEUE_FILE = "funded_queue.json"
 
 COMMANDS = ("list-operator-legs", "approve-operator-leg", "deny-operator-leg",
             "resume-operator-leg", "rent-status", "resume-rents", "block-executor",
-            "unblock-executor", "rebuild-init-pointer")
+            "unblock-executor", "rebuild-init-pointer", "make-good-ledger", "make-good-paid")
 _NO_QUEUE = ("rent-status", "resume-rents", "block-executor", "unblock-executor",
-             "rebuild-init-pointer")
+             "rebuild-init-pointer", "make-good-ledger", "make-good-paid")
 # The request file ``rebuild-init-pointer`` writes under the work root; the
 # scheduler (``RollingScheduler._consume_init_pointer_rebuild``) removes it.
 INIT_POINTER_REBUILD_FILE = "init_pointer_rebuild.json"
@@ -135,7 +143,13 @@ def _parser() -> argparse.ArgumentParser:
         elif cmd == "rebuild-init-pointer":
             s.add_argument("--reason", default="owner request",
                            help="why (logged by the trainer when it picks the request up)")
-        elif cmd not in ("list-operator-legs", "rent-status", "resume-rents"):
+        elif cmd == "make-good-paid":
+            s.add_argument("hotkey")
+            s.add_argument("--usd", type=float, default=None,
+                           help="amount paid back (default: all outstanding)")
+            s.add_argument("--note", required=True, help="how it was paid (logged)")
+        elif cmd not in ("list-operator-legs", "rent-status", "resume-rents",
+                         "make-good-ledger"):
             s.add_argument("hotkey")
             s.add_argument("--queue", default=None,
                            help="queue file name when the hotkey has entries in several lanes")
@@ -152,7 +166,7 @@ def _parser() -> argparse.ArgumentParser:
                                 "to the pinned types' projection at dispatch")
             s.add_argument("--kind", default="", choices=KINDS,
                            help="a pre-approval (no pending request) for this kind only")
-        if cmd in ("list-operator-legs", "rent-status"):
+        if cmd in ("list-operator-legs", "rent-status", "make-good-ledger"):
             s.add_argument("--json", action="store_true")
         if cmd == "resume-operator-leg":
             s.add_argument("--reset-spend", action="store_true",
@@ -194,6 +208,8 @@ def main(argv: list[str]) -> int:
         return _rents(args, wr)
     if args.cmd == "rebuild-init-pointer":
         return _rebuild_init_pointer(args, wr)
+    if args.cmd in ("make-good-ledger", "make-good-paid"):
+        return _make_good(args, wr)
     if args.cmd == "list-operator-legs":
         pending = store.pending()
         paused = [{"queue": q.path.name, "hotkey": e.hotkey, "ref": e.ref, "status": e.status,
@@ -373,6 +389,31 @@ def _short_pod_lines(work_root: Path) -> list[str]:
         out.append(f"  short-pod blacklist {k}: strikes={v.get('strikes')} for "
                    f"{(float(v['until']) - now) / 3600:.0f} h more — {str(v.get('reason'))[:120]}")
     return out
+
+
+def _make_good(args, work_root: Path) -> int:
+    from ..funding.make_good_ledger import MakeGoodLedger, MakeGoodUnknown
+
+    led = MakeGoodLedger.for_work_root(work_root)
+    try:
+        if args.cmd == "make-good-paid":
+            paid = led.mark_paid(args.hotkey, args.usd, note=args.note)
+            print(f"recorded ${paid:.2f} paid back to {args.hotkey}" if paid else
+                  f"nothing outstanding for {args.hotkey} — nothing recorded")
+            return 0
+        v = led.view()
+    except (MakeGoodUnknown, ValueError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    if getattr(args, "json", False):
+        print(json.dumps(v, indent=2, default=str))
+        return 0
+    print(f"make-good: owed ${v['owed_usd']:.2f}, paid ${v['paid_usd']:.2f}, "
+          f"OUTSTANDING ${v['outstanding_usd']:.2f}")
+    for m in v["miners"]:
+        print(f"  {m['hotkey']}: owed ${m['owed_usd']:.2f} ({m['pods']} pod(s)), paid "
+              f"${m['paid_usd']:.2f}, outstanding ${m['outstanding_usd']:.2f}")
+    return 0
 
 
 def _rents(args, work_root: Path) -> int:

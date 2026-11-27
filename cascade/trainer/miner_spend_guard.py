@@ -263,6 +263,60 @@ def trip(runner, gen, entry, s, cap: float) -> None:
                          "re-fund or contact the operator — your submission is kept"))
 
 
+def make_good_over_cap(runner, hotkey: str) -> tuple[bool, float, float]:
+    """``(over, make_good_usd, cap)`` — whether ``hotkey``'s current
+    submission's lemons / post-rent rejects on the MINER's key reached
+    ``[round] miner_make_good_cap_usd`` (0 = off; never over). An unreadable
+    ledger is not over here (:func:`waste_cap_check` fails closed on it)."""
+    cap = float(getattr(runner.cfg.round, "miner_make_good_cap_usd", 0.0) or 0.0)
+    if cap <= 0 or not hotkey:
+        return False, 0.0, cap
+    led, e = _ledger(runner), _entry(runner, hotkey)
+    if led is None or e is None:
+        return False, 0.0, cap
+    try:
+        owed = float(led.summary(hotkey, ref=e.ref, funded_at=e.funded_at).make_good_usd)
+    except SpendUnknown:
+        return False, 0.0, cap
+    return owed >= cap, owed, cap
+
+
+def note_make_good_cap(runner, hotkey: str, owed: float, cap: float) -> None:
+    """ONE critical alert: the submission's make-good on the miner's key hit
+    the cap; the leg is operator-billed from here (approval-gated)."""
+    from .money_guard import alert
+
+    alert(runner, "miner_make_good_cap", hotkey[:16],
+          f"{hotkey[:12]}: ${owed:.2f} of the MINER's money went to lemons / post-rent "
+          f"rejects (cap ${cap:.2f}) — no further pod on their key; the leg is "
+          "OPERATOR-billed and waits for `cascade-trainer approve-operator-leg "
+          f"{hotkey}` (or deny)", severity="critical", make_good_usd=owed)
+    log.error("miner make-good cap: %s at $%.2f >= $%.2f — operator-billed, approval-gated",
+              hotkey[:12], owed, cap)
+
+
+def make_good_cap_check(runner, gen) -> None:
+    """Before ANY rent on a miner's key (a lemon re-rent included): at the
+    per-submission make-good cap the entry is flagged operator-billed and the
+    leg requeued unburned — its next try is the approval-gated operator
+    make-good, never another pod on the miner's key."""
+    over, owed, cap = make_good_over_cap(runner, gen.hotkey)
+    if not over:
+        return
+    q = runner._funded_queue()
+    if q is not None:
+        q.set_operator_billed(gen.hotkey, True)
+    note_make_good_cap(runner, gen.hotkey, owed, cap)
+    from ..funding.queue import OPERATOR_TRANSIENT_CLASS
+
+    runner._record_funded_failure(
+        gen.hotkey, f"${owed:.0f} of your funds were lost to bad pods on our side (cap "
+        f"${cap:.0f}); the rest of this leg runs on the operator's account once approved — "
+        "your key is not charged again", miner_fault=False, error_class=OPERATOR_TRANSIENT_CLASS,
+        burn=False)
+    raise _FundedLegSkip(gen.hotkey)
+
+
 def budget_check(runner, gen, gpu_choice=None) -> None:
     """Before ANY rent on a miner's key: the miner's own TOTAL budget
     (``max_total_spend_usd``) must cover all spend so far (success included)
@@ -320,6 +374,7 @@ def capped(runner, gen) -> bool:
 
 
 __all__ = ["INFRA", "MAKE_GOOD", "MINER", "RESULT", "WASTE", "budget_check", "capped",
-           "early_make_good", "fallback_rate", "note_make_good",
+           "early_make_good", "fallback_rate", "make_good_cap_check", "make_good_over_cap",
+           "note_make_good",
            "spend_end",
            "spend_start", "trip", "waste_cap_check"]

@@ -90,6 +90,19 @@ tests/accept/wb27/test_wb27_gang_ranks.py
 cascade/provision/main.py
 tests/accept/wb27/test_wb27_lane_c_launch.py
 
+# 2026-11-27 owner ("fix all those things"), money/pod safety: the runway burns
+# every pod the operator account lists (table = fallback), per-type operator
+# leg projection + landed-type ceiling, the persistent make-good owed→paid
+# ledger (trainer status + owner CLI), the per-submission make-good cap on the
+# miner's key ([round] miner_make_good_cap_usd), the real operator-leg reason.
+cascade/trainer/money_watch.py
+cascade/trainer/miner_spend_guard.py
+cascade/funding/miner_spend.py
+cascade/funding/make_good_ledger.py
+cascade/shared/v2_status.py
+cascade/shared/config/money.py
+cascade/shared/config/rounds.py
+tests/accept/wb27/test_wb27_money_guard.py
 # 2026-11-27 owner sweep: the VALIDATOR's lane B weight checks (judge stage
 # merge, merged-init and acceptance rebuilds) run on its --eval-hosts pod;
 # none in the validator process; no host = INFRA transient.
