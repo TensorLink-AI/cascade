@@ -291,9 +291,13 @@ def leaf_sources(slices, optimizer) -> list[int]:
             for p in slices.parameters()]
 
 
+@torch.no_grad()
 def sync_leaves(dist, slices, sources, device) -> None:
     """Every rank's selected leaves from their owners, then into the
-    canonical expert rows (``ExpertSlices.sync``). Identical on every rank."""
+    canonical expert rows (``ExpertSlices.sync``). Identical on every rank.
+    Under ``no_grad``: the leaves require grad, and an in-place broadcast
+    into them with grad mode on goes through autograd (``c10d::broadcast_``
+    has no autograd kernel: a warning and a hook per leaf per step)."""
     broadcast_from_sources(dist, list(slices.parameters()), sources, device)
     slices.sync()
 

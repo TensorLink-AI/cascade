@@ -116,7 +116,13 @@ class ExpertSlices:
     selected endpoint too. All other model parameters remain frozen.
     """
 
-    def __init__(self, model, selection):
+    def __init__(self, model, selection, *, fast_kernels=True):
+        """``fast_kernels``: on a pyramid model, bind lane A's training
+        kernels in their lane-B form (``pyramid_fast.accelerate_experts``:
+        load-binned dispatch through the selected-row matmul, im2col conv
+        embed); the same operators, the reference forwards stay on the
+        classes. Every rank of a gang builds its slices here, so every rank
+        runs the same kernels. ``False`` keeps the reference forwards."""
         self.weights, self.rows, self.leaves = {}, {}, {}
         for p in model.parameters():
             p.requires_grad_(False)
@@ -138,6 +144,10 @@ class ExpertSlices:
                 self.rows[key], self.leaves[key] = rows, leaf
         if not self.leaves:
             raise ValueError("an expert leg must select at least one existing expert row")
+        if fast_kernels and any(isinstance(m, PyramidFFN) for _, m in layers):
+            from .pyramid_fast import accelerate_experts
+
+            accelerate_experts(model)
 
     def named_parameters(self):
         return iter(self.leaves.items())
