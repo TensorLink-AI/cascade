@@ -1,6 +1,11 @@
-"""Public-data preparation for local MarketCast experiments; never rents compute."""
+"""Public-data preparation for local MarketCast experiments; never rents compute.
+
+``cascade lane-c data`` downloads the public post-embargo bar history
+(:mod:`cascade.shared.marketcast_public`) from the HF dataset, falling back to
+the Hippius mirror; ``snapshot`` / ``fetch-base`` build local snapshots."""
 from __future__ import annotations
 
+import argparse
 import json
 import time
 from dataclasses import replace
@@ -21,6 +26,148 @@ def add_data_commands(sub):
     b.add_argument("--out", type=Path, required=True)
     b.add_argument("--chain-toml", type=Path, default=None)
     b.set_defaults(func=cmd_fetch_base, command="lane-c fetch-base")
+    d = sub.add_parser("data", help="Download the public post-embargo MarketCast bar history "
+                                    "(Parquet, sha256-checked; no keys).")
+    d.add_argument("--symbols", required=True, type=_csv,
+                   help="Comma-separated symbols, e.g. BTC,ETH,SP500.")
+    d.add_argument("--timeframes", type=_csv, default=["1h"],
+                   help="Comma-separated: 1m,5m,15m,1h and/or funding (default 1h).")
+    d.add_argument("--start", type=_day, default=None, help="First day wanted (YYYY-MM-DD).")
+    d.add_argument("--end", type=_day, default=None, help="Last day wanted (YYYY-MM-DD).")
+    d.add_argument("--out", type=Path, required=True, help="Download directory (resumable).")
+    d.add_argument("--source", choices=("hf", "hippius"), default="hf",
+                   help="hf (default; falls back to hippius) or hippius only.")
+    d.add_argument("--hf-repo", default=None, help="Override the HF dataset id.")
+    d.add_argument("--chain-toml", type=Path, default=None)
+    d.set_defaults(func=cmd_data, command="lane-c data")
+
+
+def _csv(s: str) -> list[str]:
+    out = [x.strip() for x in str(s).split(",") if x.strip()]
+    if not out:
+        raise argparse.ArgumentTypeError("expected a comma-separated list")
+    return out
+
+
+def _day(s: str):
+    from ..shared.marketcast_public import parse_day
+    try:
+        return parse_day(s)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+# ── cascade lane-c data: the public post-embargo history ─────────────────────
+
+
+def _http_get(url: str) -> bytes:
+    import urllib.request
+
+    with urllib.request.urlopen(url, timeout=60) as resp:  # noqa: S310 — https public mirror
+        return resp.read()
+
+
+class PublicBars:
+    """Read side of the public dataset: ``index()`` and ``get(path)`` from HF
+    (anonymous) or the Hippius mirror (anonymous HTTPS)."""
+
+    def __init__(self, source: str, *, hf_repo: str, hippius_base: str, http_get=_http_get,
+                 hf_download=None):
+        self.source, self.hf_repo, self.hippius_base = source, hf_repo, hippius_base.rstrip("/")
+        self._http_get, self._hf_download = http_get, hf_download
+
+    def _hf(self, path: str) -> bytes:
+        dl = self._hf_download
+        if dl is None:
+            from huggingface_hub import hf_hub_download as dl
+        return Path(dl(self.hf_repo, path, repo_type="dataset", token=False)).read_bytes()
+
+    def get(self, path: str) -> bytes:
+        if self.source == "hf":
+            return self._hf(path)
+        return self._http_get(f"{self.hippius_base}/{path}")
+
+
+def fetch_public_bars(args, *, sources: list[PublicBars]) -> dict:
+    """Download the selected files into ``args.out``; tries each source in
+    order (index and every file), verifies each sha256, skips files already
+    present with the right hash. Returns a summary dict."""
+    import hashlib
+
+    from ..shared.marketcast_public import INDEX_NAME, parse_index, select_files
+
+    index, errors = None, []
+    for src in sources:
+        try:
+            index = parse_index(src.get(INDEX_NAME))
+            break
+        except Exception as exc:  # noqa: BLE001 — next source
+            errors.append(f"{src.source}: {type(exc).__name__}")
+    if index is None:
+        raise RuntimeError("index unavailable from " + ", ".join(errors))
+    paths = select_files(index, symbols=args.symbols, timeframes=args.timeframes,
+                         start=args.start, end=args.end)
+    got, skipped = [], []
+    for p in paths:
+        want = index["files"][p]["sha256"]
+        dest = args.out / p
+        if dest.is_file() and hashlib.sha256(dest.read_bytes()).hexdigest() == want:
+            skipped.append(p)
+            continue
+        data = None
+        for src in sources:
+            try:
+                b = src.get(p)
+            except Exception:  # noqa: BLE001 — next source
+                continue
+            if hashlib.sha256(b).hexdigest() == want:
+                data = b
+                break
+        if data is None:
+            raise RuntimeError(f"{p}: no source served bytes matching the index sha256")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_suffix(".part")
+        tmp.write_bytes(data)
+        tmp.replace(dest)
+        got.append(p)
+    args.out.mkdir(parents=True, exist_ok=True)
+    (args.out / INDEX_NAME).write_text(json.dumps(
+        {**index, "files": {p: index["files"][p] for p in paths}}, indent=1))
+    return {"files": paths, "downloaded": got, "already_present": skipped,
+            "public_before": index.get("public_before"), "embargo_days": index.get("embargo_days")}
+
+
+def cmd_data(args):
+    from ..shared.config import load_chain_config
+    from ..shared.marketcast_public import (
+        FUNDING,
+        HF_REPO,
+        HIPPIUS_PREFIX,
+        TIMEFRAMES,
+        hippius_public_url,
+    )
+
+    out = reporter(args)
+    bad = [t for t in args.timeframes if t not in TIMEFRAMES and t != FUNDING]
+    if bad or (args.start and args.end and args.start > args.end):
+        return out.fail("bad_data_options", f"Timeframes are {', '.join([*TIMEFRAMES, FUNDING])}; "
+                        "--start must not be after --end.", USAGE)
+    st = load_chain_config(args.chain_toml).storage
+    base = hippius_public_url(str(st.s3_endpoint or "https://s3.hippius.com"),
+                              str(st.manifest_bucket), HIPPIUS_PREFIX)
+    kw = {"hf_repo": args.hf_repo or HF_REPO, "hippius_base": base}
+    order = ["hf", "hippius"] if args.source == "hf" else ["hippius"]
+    try:
+        res = fetch_public_bars(args, sources=[PublicBars(s, **kw) for s in order])
+    except Exception as exc:  # noqa: BLE001 — public endpoints only, no secrets
+        return out.fail("market_data_unavailable", f"Public bar download failed: {exc}", NETWORK)
+    out.info(f"{len(res['files'])} files in {args.out} ({len(res['downloaded'])} downloaded, "
+             f"{len(res['already_present'])} already present); public history ends before "
+             f"{res['public_before']} ({res['embargo_days']}-day embargo).")
+    if not res["files"]:
+        out.info("Nothing matched: check the symbols/timeframes/dates against index.json.")
+    out.result(path=str(args.out), **res)
+    return OK
 
 
 def cmd_fetch_base(args):

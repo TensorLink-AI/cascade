@@ -119,6 +119,38 @@ guaranteed live value. Check `cascade rules c` for `share`. A holder
 confirmed at LCB 0.03 receives **15% of emissions for 25 eras (12.5 days)**,
 then nothing. At LCB 0.05 or more it is 15% for 40 eras (20 days).
 
+## Historical data
+
+The recorder's MarketCast bars are published once they are older than the
+training embargo, so you can try recipes locally and compare them with
+prior rounds:
+
+- **HF dataset:** [tensorlink-dev/cascade-marketcast-bars](https://huggingface.co/datasets/tensorlink-dev/cascade-marketcast-bars)
+- **Hippius mirror:** <https://s3.hippius.com/cascade-manifests/marketcast/public-bars/index.json> (anonymous HTTPS, same files)
+
+Only days strictly before `today - embargo_days` (30) are public; the last
+30 days stay private, because the eval draws its windows from the
+`embargo_eval_days` (28) before each leg's dispatch and your recipe's
+training data must end `embargo_days` before submission. The layout is
+`data/<class>/<SYMBOL>/<tf>/<YYYY-MM>.parquet` with `tf` one of `1m`, `5m`,
+`15m`, `1h` or `funding`: columns `timestamp` (UTC, bar open) and float64
+`open`, `high`, `low`, `close`, `volume` (funding: `rate`, `premium`). A
+bar nobody recorded is an absent row. Aggregate 1h bars for 4h and 1d.
+`index.json` lists every file's sha256. The data is Hyperliquid perpetuals
+(core dex for crypto, the `xyz` dex for equities, FX, metals and
+commodities), redistributed under Hyperliquid's terms; the dataset card has
+the details. It updates daily.
+
+```bash
+cascade lane-c data --symbols BTC,ETH,SP500 --timeframes 1m,1h,funding \
+    --start 2026-10-01 --end 2026-10-31 --out ./bars
+cascade lane-c data --symbols GOLD --out ./bars --source hippius
+```
+
+The download needs no keys, verifies every file's sha256 and resumes. The
+default source is `hf`, falling back to the Hippius mirror. Validators score
+on the private signed snapshot, never on this dataset.
+
 ## Strategies worth trying
 
 - **Regime-aware data.** Markets switch between calm, trending and crisis
