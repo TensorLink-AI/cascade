@@ -218,7 +218,7 @@ funded_entry_ttl_hours = 36.0   # keep equal to cascade-intake --ttl-hours
 # rents ONE pod on its payer's own Lium key, dispatches there, and tears it
 # down when the leg ends (the era king stays operator-funded). Consensus-inert.
 funded_pods = "rent"   # FUNDED-TEST phase 3 (live wiring validation)
-payer_vault_dir = "/root/cascade-main/.claude/worktrees/funded-release/_payer_vault"  # FUNDED-TEST (rehearsal intake vault)
+payer_vault_dir = "payer_vault" # cascade-intake --vault-dir (work_root-relative, as chain.toml; #907: was one worktree's absolute path)
 funded_pod_sku = "RTX4090"      # FUNDED-TEST
 funded_pod_image = "ghcr.io/tensorlink-ai/cascade-worker:worker-v0.8.1@sha256:d9001d0d0e3f1a40504b2bdd06782157ce96539b7bc6b99971e5a5646580e89b"  # FUNDED-TEST: v0.8.1 rehearsal build (armed testnet toml baked); mainnet stays on v0.8.0
 funded_ready_timeout_seconds = 900.0
@@ -1086,7 +1086,7 @@ coarse_history_days = 1372                      # hourly bank: 32768 h (1365 d) 
 report_timeout_settlements = 8                  # trainer records a missing report "absent" after this
 max_infra_deferrals = 8                         # main-validator compute failures before an uncharged drop
 cluster_block_hours = 6                         # bootstrap clusters = asset class x 6 h block
-min_time_blocks    = 8                          # >= 2 days of distinct 6 h blocks before a verdict
+min_time_blocks    = 1                          # TESTNET-FAST (2026-11-25, #914): 8 (>= 2 days of distinct 6 h blocks before a verdict)
 min_bar_coverage   = 0.8                        # live-bar share in the 24 h before a window
 min_dollar_volume_24h = 1000000.0               # USD traded in the 24 h before a window (0 = off)
 coverage_tolerance_over = 0.10                  # gated levels also fail above nominal + this
