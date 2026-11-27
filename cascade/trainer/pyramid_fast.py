@@ -12,6 +12,14 @@ checkpoint are untouched.
   every production call on 2026-10-31) and an optional deferred balance term.
 * :func:`conv_embed_forward` — ``DilatedConvEmbed.forward`` with each causal
   dilated conv as one im2col matmul (cuDNN picks a ~10x slower kernel).
+
+Lane B (role=expert, 2026-11-27): :func:`accelerate_experts` binds the same
+two kernels onto an expert leg's model, the MoE one as
+:func:`selected_moe_forward` (the load-binned dispatch through the
+selected-row matmul, so only the selected leaves get weight gradients).
+Without it an expert leg ran the reference per-expert loop: ~5x slower per
+step than lane A on 8xH200. :func:`accelerate` and the lane A kernels are
+unchanged.
 """
 from __future__ import annotations
 
@@ -167,3 +175,128 @@ def finish_aux(model: CascadeMoEModel, pending, loads) -> torch.Tensor:
     for layer, kept, load in zip(layers, pending, loads, strict=True):
         aux = aux + finish_balance(layer, kept, load)
     return aux / len(layers)
+
+
+# ── lane B (role=expert): the same kernels on an ExpertSlices model ──────────
+
+
+def accelerate_experts(model: CascadeMoEModel) -> CascadeMoEModel:
+    """Bind the fast forwards onto a lane-B expert leg's model, after
+    :class:`~.expert_training.ExpertSlices` swapped its selected layers in:
+    each selected layer gets :func:`selected_moe_forward`, each frozen MoE
+    layer :func:`moe_forward`, the conv embed :func:`conv_embed_forward`.
+
+    ``fast_training`` is NOT set: an expert leg keeps the counting pre-pass of
+    :func:`~.pyramid_dp.micro_batch_pass` (one micro-batch graph alive at a
+    time, the memory its context-length lever was measured at) and the
+    routing (``route``, ``_aux_loss``) is the layer's own, called unchanged.
+    :func:`accelerate` (lane A) is not touched by this function."""
+    from .expert_training import _SelectedPyramidFFN
+
+    for module in model.modules():
+        kind = type(module)
+        if kind is _SelectedPyramidFFN:
+            module.forward = types.MethodType(selected_moe_forward, module)
+        elif kind is MoEFFN:
+            module.forward = types.MethodType(moe_forward, module)
+        elif kind is DilatedConvEmbed:
+            module.forward = types.MethodType(conv_embed_forward, module)
+    model.fast_experts = True
+    return model
+
+
+def selected_binned_experts(self, x, tok, counts):
+    """:func:`binned_experts` for a lane-B selected layer. The bins, the one
+    host sync and the one index upload are lane A's; each bin's two matmuls
+    go through :class:`~.expert_training._ExpertMatmul` with the bin's
+    selected members' compact leaves, so a weight gradient reaches only the
+    selected leaves (the frozen canonical rows carry none), exactly as the
+    reference dispatch. A bin without a selected member is a plain ``bmm`` on
+    frozen rows (input gradient only)."""
+    from .expert_training import _ExpertMatmul
+
+    sizes = counts.tolist()                       # the layer's one host sync
+    total = sum(sizes)
+    if not total:
+        return x.new_zeros(0, x.shape[1])
+    ranked = sorted((e for e, n in enumerate(sizes) if n), key=lambda e: (-sizes[e], e))
+    bins, current = [], []
+    for e in ranked:
+        if current and 2 * sizes[e] < sizes[current[0]]:
+            bins.append(current)
+            current = []
+        current.append(e)
+    bins.append(current)
+    pick = self.selected_index                   # canonical row -> leaf index
+    n_of = np.asarray(sizes, dtype=np.int64)
+    first = np.cumsum(n_of) - n_of
+    slot, src, ids, local, leaf, shape = [], [], [], [], [], []
+    for members in bins:
+        m = np.asarray(members, dtype=np.int64)
+        n = n_of[m]
+        within = np.arange(int(n.sum())) - np.repeat(np.cumsum(n) - n, n)
+        slot.append(np.repeat(np.arange(len(m)) * int(n[0]), n) + within)
+        src.append(np.repeat(first[m], n) + within)
+        ids.append(m)
+        chosen = [(j, pick[e]) for j, e in enumerate(members) if e in pick]
+        local.append(np.asarray([j for j, _ in chosen], dtype=np.int64))
+        leaf.append(np.asarray([i for _, i in chosen], dtype=np.int64))
+        shape.append((len(m), int(n[0]), int(n.sum()), len(chosen)))
+    index = torch.from_numpy(np.concatenate([*slot, *src, *ids, *local, *leaf])).to(x.device)
+    n_ids = sum(k for k, _, _, _ in shape)
+    n_sel = sum(s for _, _, _, s in shape)
+    slot_t, src_t = index[:total], index[total:2 * total]
+    at = 2 * total
+    ids_t, local_t, leaf_t = (index[at:at + n_ids], index[at + n_ids:at + n_ids + n_sel],
+                              index[at + n_ids + n_sel:])
+    per_bin = [k for k, _, _, _ in shape]
+    per_sel = [s for _, _, _, s in shape]
+    _, leaf_in, leaf_out = self.slices
+    x_bins = x[tok[src_t]].split([n for _, _, n, _ in shape])
+    w_in = self.w_in.index_select(0, ids_t).split(per_bin)
+    w_out = self.w_out.index_select(0, ids_t).split(per_bin)
+    s_in = leaf_in.index_select(0, leaf_t).split(per_sel)
+    s_out = leaf_out.index_select(0, leaf_t).split(per_sel)
+    local_bins = local_t.split(per_sel)
+
+    def mm(h, frozen, selected, rows):
+        frozen = frozen.to(h.dtype)
+        if not rows.numel():
+            return torch.bmm(h, frozen)
+        return _ExpertMatmul.apply(h, frozen, selected.to(h.dtype), rows)
+
+    parts, at = [], 0
+    for (k, cap, n, _), xb, wi, wo, si, so, rows_local in zip(
+            shape, x_bins, w_in, w_out, s_in, s_out, local_bins, strict=True):
+        rows = slot_t[at:at + n]
+        buf = xb.new_zeros(k * cap, xb.shape[1]).index_put((rows,), xb).view(k, cap, -1)
+        hid = F.gelu(mm(buf, wi, si, rows_local))
+        out = mm(hid, wo, so, rows_local)
+        parts.append(out.reshape(k * cap, -1)[rows])
+        at += n
+    out = torch.cat(parts)
+    return out.new_zeros(total, out.shape[1]).index_put((src_t,), out)
+
+
+def selected_moe_forward(self, x: torch.Tensor, seq_len: int) -> torch.Tensor:
+    """``_SelectedPyramidFFN.forward`` with :func:`selected_binned_experts`:
+    the same ``route`` (top-k picks, gate weights), the same stable combine,
+    the same ``_aux_loss`` (``balance_load_override`` from the pre-pass) and
+    the same differentiable zero on the leaves (zero, never ``None``,
+    gradients when no token reaches a selected expert)."""
+    N, d = x.shape
+    K = self.cfg.top_k
+    idx, w, s, logits = self.route(x)
+    flat_e = idx.reshape(-1)                                  # (N·K,)
+    order = torch.argsort(flat_e, stable=True)
+    counts = torch.bincount(flat_e, minlength=self.num_experts)
+    tok = order // K
+    y_sorted = selected_binned_experts(self, x, tok, counts)
+    inv = torch.empty_like(order)
+    inv[order] = torch.arange(order.numel(), device=x.device)
+    y = y_sorted[inv].view(N, K, d)
+    y = (y * w.to(y.dtype).unsqueeze(-1)).sum(dim=1) + self.shared(x)
+    self.last_load, self.last_topk = counts.detach(), idx.detach()
+    self.last_aux = self._aux_loss(idx, s, logits, seq_len) if self.training else None
+    _, wi, wo = self.slices
+    return y + 0 * (wi.reshape(-1)[0] + wo.reshape(-1)[0])

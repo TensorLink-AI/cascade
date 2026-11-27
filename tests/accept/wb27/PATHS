@@ -112,3 +112,11 @@ cascade/validator/merge_acceptance.py
 cascade/validator/loop.py
 tests/unit/test_lane_b_multi_target.py
 tests/accept/wb27/test_wb27_validator_remote.py
+# 2026-11-27 owner ("stop now, fix first"): lane B expert legs ran lane A's
+# reference MoE loop (~5x slower per step). ExpertSlices binds the lane B form
+# of lane A's training kernels (accelerate_experts: load-binned dispatch
+# through the selected-row matmul, im2col conv embed); sync_leaves under
+# no_grad. Lane A's kernels and step are untouched.
+cascade/trainer/pyramid_fast.py
+cascade/trainer/expert_training.py
+tests/accept/wb27/test_wb27_expert_fast_path.py
