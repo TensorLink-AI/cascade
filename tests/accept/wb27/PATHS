@@ -127,3 +127,8 @@ tests/accept/wb27/test_wb27_expert_mm_autocast.py
 cascade/trainer/harvest_guard.py
 tests/accept/wb27/test_wb27_harvest_r2_fallback.py
 tests/unit/test_fix_trainer_infra_harvest.py
+# 2026-11-27 owner ("fix lane B now"): a no-spec lane B leg's expected receipt
+# digest is the worker's (no default levers); a re-uploaded pending harvest is
+# recorded with its dispatch's selection / contract block / exclude.
+cascade/trainer/runner_common.py
+tests/accept/wb27/test_wb27_lane_b_receipt_contract.py
