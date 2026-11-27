@@ -138,6 +138,44 @@ refunded.
 
 See [failure classes](MINER.md#8-failure-classes) for the full list.
 
+## Past evaluations
+
+Every settlement's lane A result is public and anonymously readable (no
+keys) in the `cascade-manifests` bucket at
+`https://s3.hippius.com/cascade-manifests/<key>`. Settlements are about 3 h
+apart. A round id is a seed, not a counter, so find rounds through the index
+rather than computing them.
+
+| What | Key | Notes |
+|---|---|---|
+| Round index | `receipts/index.json` | Rolling list of the last 400 settlements, oldest first. Each row has `round_id`, `published_at`, `status`, `reject_reason`, `receipt_key`, and the verdict summary. Mirrored at the HF dataset [`tensorlink-dev/cascade-backup`](https://huggingface.co/datasets/tensorlink-dev/cascade-backup/resolve/main/receipts/index.json) |
+| Latest receipt | `receipts/latest.json`, or `receipts/<validator_hotkey>/latest.json` | The newest signed receipt |
+| One round's receipt | `receipts/<validator_hotkey>/round-<round_id>.json` | Signed. Carries the full verdict, the per-window `entry_scores`, the round `manifest` inline, the `eval_context` (pool snapshot, window ids) and the weights |
+| Public bench report | `bench_v/round-<round_id>.json` | Signed by the main validator. GIFT-Eval, BOOM, TIME and FEV CRPS/MASE per checkpoint (`role` = `king`, `challenger` or `init`). It is empty (`entries: []`) when nothing was benched that settlement. Per-task rows are at each entry's `rows_key` |
+
+The trainer's own `manifests/round-<id>.json` and `benchmarks/round-<id>.json`
+are not public. Each receipt embeds the round manifest it judged.
+
+**Am I competitive?** In a `status: "scored"` row of `receipts/index.json` (or
+the receipt's `verdict`), compare `chal_geomean` with `king_geomean` (lower is
+better), and `lcb` with `margin`. You dethrone only when `lcb` clears
+`margin` and `dethroned` is true. `cohort_lcbs` gives one LCB per challenger
+when several were judged. `per_domain` and `per_horizon` (receipt `verdict`
+fields `cohort_per_domain` / `cohort_per_horizon`) show where you won or lost.
+Rows with `reject_reason: "no_king_challenger_pair"` were king-only
+settlements: nothing was judged.
+
+Examples (all verified readable on 2026-11-27):
+
+- Last scored duel, 2026-11-25 07:41 UTC (king uid 164 held against uid 107,
+  `lcb` −0.47 vs `margin` 0.01):
+  <https://s3.hippius.com/cascade-manifests/receipts/5FcCsoB2R5M55RdrNrvPQv7xmLJRFzs7R7C73UUSxgUCyfsw/round-764824171903801846.json>
+- A king-only settlement, 2026-11-27 07:34 UTC:
+  <https://s3.hippius.com/cascade-manifests/receipts/5FcCsoB2R5M55RdrNrvPQv7xmLJRFzs7R7C73UUSxgUCyfsw/round-13004096062141715539.json>
+- Last non-empty bench report (king vs init), 2026-11-24 13:43 UTC:
+  <https://s3.hippius.com/cascade-manifests/bench_v/round-13058784948867351860.json>
+- Index: <https://s3.hippius.com/cascade-manifests/receipts/index.json>
+
 ## FAQ
 
 **Is lane A still open?** No. It takes no new challengers from block

@@ -119,6 +119,38 @@ guaranteed live value. Check `cascade rules c` for `share`. A holder
 confirmed at LCB 0.03 receives **15% of emissions for 25 eras (12.5 days)**,
 then nothing. At LCB 0.05 or more it is 15% for 40 eras (20 days).
 
+## Historical data
+
+The recorder's MarketCast bars are published once they are older than the
+training embargo, so you can try recipes locally and compare them with
+prior rounds:
+
+- **HF dataset:** [tensorlink-dev/cascade-marketcast-bars](https://huggingface.co/datasets/tensorlink-dev/cascade-marketcast-bars)
+- **Hippius mirror:** <https://s3.hippius.com/cascade-manifests/marketcast/public-bars/index.json> (anonymous HTTPS, same files)
+
+Only days strictly before `today - embargo_days` (30) are public; the last
+30 days stay private, because the eval draws its windows from the
+`embargo_eval_days` (28) before each leg's dispatch and your recipe's
+training data must end `embargo_days` before submission. The layout is
+`data/<class>/<SYMBOL>/<tf>/<YYYY-MM>.parquet` with `tf` one of `1m`, `5m`,
+`15m`, `1h` or `funding`: columns `timestamp` (UTC, bar open) and float64
+`open`, `high`, `low`, `close`, `volume` (funding: `rate`, `premium`). A
+bar nobody recorded is an absent row. Aggregate 1h bars for 4h and 1d.
+`index.json` lists every file's sha256. The data is Hyperliquid perpetuals
+(core dex for crypto, the `xyz` dex for equities, FX, metals and
+commodities), redistributed under Hyperliquid's terms; the dataset card has
+the details. It updates daily.
+
+```bash
+cascade lane-c data --symbols BTC,ETH,SP500 --timeframes 1m,1h,funding \
+    --start 2026-10-01 --end 2026-10-31 --out ./bars
+cascade lane-c data --symbols GOLD --out ./bars --source hippius
+```
+
+The download needs no keys, verifies every file's sha256 and resumes. The
+default source is `hf`, falling back to the Hippius mirror. Validators score
+on the private signed snapshot, never on this dataset.
+
 ## Strategies worth trying
 
 - **Regime-aware data.** Markets switch between calm, trending and crisis
@@ -179,6 +211,34 @@ memory or crashes.
   revenue restriction that extends to derivatives. Check those terms before
   you reuse its outputs elsewhere. Its outputs may not be used as a lane D
   teacher.
+
+## Past evaluations
+
+MarketCast evidence is published in the public `cascade-manifests` bucket
+(`https://s3.hippius.com/cascade-manifests/<key>`, no keys needed):
+
+| What | Key | Notes |
+|---|---|---|
+| Per-window report | `marketcast/round-<round_id>.json` | Signed by the main validator. One entry per judged fine-tune and phase (`judge` / `confirm`): per-window base and fine-tune losses, guard losses (MASE, QLIKE, tails), coverage counts, the slot `holder` comparison, and `status` (`infra_deferred` = retried later). Float32 quantile sidecars sit under `marketcast/round-<round_id>/` |
+| Verdict summary | `receipts/index.json` | `lane_c_verdicts` (per entry: `hotkey`, `target`, `stage`, `passed`, `reason`, `gain_lcb`, `gain`, `phase`, `outcome`) and `lane_c_pay` (the slot holder) |
+| One round's receipt | `receipts/<validator_hotkey>/round-<round_id>.json` | Signed. `lane_c` holds the verdict rows |
+| Live lane C state | `status/v2.json`, key `lane_c` | Holder, queued and finished legs per target, settlements |
+
+Find a round through `receipts/index.json` (round ids are seeds, not
+counters). The trainer's lane C manifests (`lane_c/round-<id>.json`) are
+written private, so they are not readable anonymously.
+
+**Am I competitive?** `gain_lcb` must be at least `gain_margin` (1%) with a
+positive `gain`, and `passed` true on both stages. To take the slot you also
+need a strictly higher LCB than the current holder (`holder` in the report).
+
+**No MarketCast entry has been judged yet** (checked 2026-11-27): no
+`marketcast/round-*.json` report exists, every `lane_c_verdicts` list is empty
+and `lane_c_pay.wins` is `[]` since lane C opened at block 9,586,800. There
+is no past score to compare against yet. Example of a receipt that carries
+the (empty) lane C pay record, 2026-11-27 04:31 UTC:
+<https://s3.hippius.com/cascade-manifests/receipts/5FcCsoB2R5M55RdrNrvPQv7xmLJRFzs7R7C73UUSxgUCyfsw/round-12135123300179706659.json>.
+Live state: <https://s3.hippius.com/cascade-manifests/status/v2.json>.
 
 ## FAQ
 

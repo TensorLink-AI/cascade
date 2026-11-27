@@ -97,6 +97,7 @@ Percentages are shares of total emissions. A lane's pool is its budget; miners r
 - [Lane D past evaluations](docs/MINER_LANE_D.md): see its "Past evaluations" section for earlier lane D settlements.
 - [Public receipt index](https://s3.hippius.com/cascade-manifests/receipts/index.json): every recorded settlement with its verdicts and weights.
 - [Public eval pool](https://huggingface.co/datasets/Tensor-Link/cascade-eval-pool): lagged reveals of retired validator snapshots, byte-identical to what was scored; an evaluation set, never training data.
+- [MarketCast bar history (HF)](https://huggingface.co/datasets/tensorlink-dev/cascade-marketcast-bars): post-embargo (older than 30 days) 1m–1h bars and funding for every scored MarketCast asset, Parquet; also at https://s3.hippius.com/cascade-manifests/marketcast/public-bars/index.json; download with `cascade lane-c data`.
 
 ## Dashboard and live data
 
