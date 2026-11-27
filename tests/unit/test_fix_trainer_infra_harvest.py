@@ -27,6 +27,9 @@ def _tar_bytes() -> bytes:
 def _py_ssh(monkeypatch, script: str) -> None:
     monkeypatch.setattr(remote_mod, "build_ssh_argv",
                         lambda host, cmd: [sys.executable, "-c", script])
+    # a watchdog breach now asks the pod whether it still holds the run
+    # (HarvestStreamSlow.keep_pod, 2026-11-27): answer offline
+    monkeypatch.setattr(remote_mod, "remote_dir_reachable", lambda host, d: True)
 
 
 def test_a_stalled_stream_is_killed_and_raises(tmp_path, monkeypatch):

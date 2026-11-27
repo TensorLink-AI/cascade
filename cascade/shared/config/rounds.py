@@ -408,6 +408,9 @@ class RoundConfig:
     # Then released with a critical priced alert (money safety II).
     harvest_keep_max_seconds: int = 10800
     harvest_keep_cost_fraction: float = 0.5
+    # An ssh harvest averaging below 1 MB/s after this many seconds switches
+    # to the pod → R2 transport (when R2 is configured). 0 = off.
+    harvest_ssh_probe_seconds: int = 600
     # Miner waste cap (cascade.funding.miner_spend): pods on a miner's key
     # that produced nothing, summed per submission (ref + funding), at or
     # above this pause the entry ("paused_spend_cap": never failed, burned,

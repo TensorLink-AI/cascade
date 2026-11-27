@@ -121,3 +121,9 @@ cascade/trainer/pyramid_fast.py
 cascade/trainer/expert_training.py
 tests/accept/wb27/test_wb27_expert_fast_path.py
 tests/accept/wb27/test_wb27_expert_mm_autocast.py
+# 2026-11-27 (owner: "should we have that safeguard?"): a slow / stalled ssh
+# harvest of a FINISHED leg switches to pod -> R2 (harvest_ssh_probe_seconds),
+# keeps the pod unburned if R2 fails; a ledgered operator leg re-attaches.
+cascade/trainer/harvest_guard.py
+tests/accept/wb27/test_wb27_harvest_r2_fallback.py
+tests/unit/test_fix_trainer_infra_harvest.py
