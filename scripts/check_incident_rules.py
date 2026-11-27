@@ -521,6 +521,102 @@ def check_ir008(rel: str, text: str) -> list[tuple[int, str]]:
     return hits
 
 
+# ── IR009: an ssh reply's raw stdout parsed as JSON ────────────────────────────
+
+# A pod command whose stdout is parsed as JSON shares that stdout with every
+# library the remote process imports: on 2026-11-27 hippius_hub printed
+# "Downloading <file> (parallel)..." ahead of the `cat`ed result.json and the
+# lane B settlement rebase failed "pod reply is not JSON" (#983). Safe shapes:
+# a reply from a separate `cat <file>`-only ssh command, a last-line parse
+# (`.splitlines()[-1]`), or a tolerant parser (lane_b_offload.pod_reply_json).
+IR009_SSH_CALL = re.compile(r"ssh", re.IGNORECASE)
+IR009_CAT_ONLY = re.compile(r"^\s*cat\s")
+IR009_CHAIN = re.compile(r"&&|\|\||;|\|")
+
+
+def _call_name(node: ast.AST) -> str:
+    f = node.func if isinstance(node, ast.Call) else None
+    if isinstance(f, ast.Name):
+        return f.id
+    if isinstance(f, ast.Attribute):
+        return f.attr
+    return ""
+
+
+def _first_text(node: ast.AST) -> str | None:
+    """The leading literal text of a str constant or an f-string."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.JoinedStr):
+        lit = []
+        for part in node.values:
+            if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                lit.append(part.value)
+            else:
+                lit.append("\0")
+        return "".join(lit)
+    return None
+
+
+def _cat_only(value: ast.AST) -> bool:
+    """``value`` (an ssh call) carries a literal ``cat <file>`` command and nothing else."""
+    for n in ast.walk(value):
+        text = _first_text(n)
+        if text is not None and IR009_CAT_ONLY.match(text):
+            return not IR009_CHAIN.search(text.replace("\0", ""))
+    return False
+
+
+def _stdout_owner(arg: ast.AST) -> str | None:
+    """``X`` when ``arg`` is ``X.stdout`` or ``X.stdout.strip()`` (no last-line pick)."""
+    if any(isinstance(n, ast.Attribute) and n.attr == "splitlines" for n in ast.walk(arg)):
+        return None
+    node = arg
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+            and node.func.attr in ("strip", "rstrip", "lstrip"):
+        node = node.func.value
+    if isinstance(node, ast.Attribute) and node.attr == "stdout":
+        return node.value.id if isinstance(node.value, ast.Name) else ""
+    return None
+
+
+def check_ir009(rel: str, text: str) -> list[tuple[int, str]]:
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return []
+    hits: dict[int, str] = {}
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call)]
+        if not any(IR009_SSH_CALL.search(_call_name(c)) for c in calls):
+            continue
+        assigned: dict[str, list[ast.AST]] = {}
+        for n in ast.walk(fn):
+            if isinstance(n, ast.Assign):
+                for t in n.targets:
+                    if isinstance(t, ast.Name):
+                        assigned.setdefault(t.id, []).append(n.value)
+        for c in calls:
+            f = c.func
+            if not (isinstance(f, ast.Attribute) and f.attr == "loads"
+                    and isinstance(f.value, ast.Name) and f.value.id == "json" and c.args):
+                continue
+            owner = _stdout_owner(c.args[0])
+            if owner is None:
+                continue
+            sources = assigned.get(owner or "", [])
+            if sources and all(_cat_only(v) for v in sources):
+                continue
+            hits[c.lineno] = (
+                "json.loads() over an ssh reply's raw stdout: library chatter on the pod "
+                "(hippius_hub's 'Downloading …' line, #983) breaks the parse. Read the reply "
+                "with a separate `cat <file>` ssh call, parse its last line, or use "
+                "lane_b_offload.pod_reply_json")
+    return sorted(hits.items())
+
+
 # ── the rule table ─────────────────────────────────────────────────────────────
 
 RULES: tuple[Rule, ...] = (
@@ -571,6 +667,14 @@ RULES: tuple[Rule, ...] = (
          "SSHEvalHost.remote_command), or launch it detached with its own deadline",
          ("cascade/*.py",),
          check_file=check_ir008),
+    Rule("IR009", "ssh reply stdout parsed as JSON whole",
+         "2026-11-27 #983: hippius_hub printed 'Downloading <file> (parallel)...' to the pod's "
+         "stdout ahead of the cat'd result.json; the lane B settlement rebase failed "
+         "'pod reply is not JSON' and the 19:27 settlement published without lane B",
+         "read the reply with its own `cat <file>`-only ssh call, parse the last line "
+         "(`.splitlines()[-1]`), or use `lane_b_offload.pod_reply_json`",
+         ("cascade/*.py", "scripts/*.py"),
+         check_file=check_ir009),
 )
 RULE_IDS = {r.id for r in RULES}
 
