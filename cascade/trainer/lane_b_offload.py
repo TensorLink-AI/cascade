@@ -501,6 +501,46 @@ class LaneBPodRunner:
         ptr, key = self._pushed(doc, "rebase")
         return {"actuals": actuals, "pointer": ptr, "content_key": key}
 
+    def rebase_stage(self, *, king_pointer: str, base_pointer: str, leg_pointer: str,
+                     selection: dict, refuse_nonfinite: bool, limits: bool,
+                     bench_settings: dict, merge_strict: bool, host=None) -> dict:
+        """Prepare-ahead (:mod:`cascade.trainer.lane_b_prepare`): the pod's
+        :meth:`LaneBModel.rebase` with NO push — the same inputs as
+        :meth:`rebase`, so the same bytes and bench content key — its bench
+        files pinned on the pod for the sidecar, and the judge's merge check
+        (:func:`~cascade.validator.expert_lane.merge_check_dirs`, ``strict`` =
+        ``merge_strict``) of those bytes onto the king. ``{"host", "actuals",
+        "content_key", "pin", "merge_error"}``; ``content_key`` None = a
+        limits leg without its record (nothing pinned). A refused rebase
+        raises ``MergeRefused``; the caller removes the pin (``unpin``)."""
+        host = host if host is not None else self.host()
+        pin = f"{self.root_of(host)}/pinned/{uuid.uuid4().hex}"
+        doc = self._call("rebase_stage", king_pointer, {
+            "king": king_pointer, "base": base_pointer, "leg": leg_pointer,
+            "selection": {str(k): [int(x) for x in v] for k, v in selection.items()},
+            "refuse_nonfinite": bool(refuse_nonfinite), "limits": bool(limits),
+            "bench_settings": bench_settings, "pin": pin, "merge_strict": bool(merge_strict)},
+            None, timeout_s=MODEL_TIMEOUT_S, host=host)
+        if isinstance(doc, dict) and "merge_error" in doc and "actuals" not in doc:
+            from .lane_b_model import MergeRefused
+
+            if not isinstance(doc["merge_error"], str):
+                raise LaneBOffloadUnavailable("lane B rebase_stage: malformed pod reply")
+            raise MergeRefused(doc["merge_error"])
+        actuals = doc.get("actuals") if isinstance(doc, dict) else None
+        if not isinstance(actuals, dict):
+            raise LaneBOffloadUnavailable("lane B rebase_stage: malformed pod reply")
+        if doc.get("content_key") is None:
+            return {"host": host, "actuals": actuals, "content_key": None, "pin": None,
+                    "merge_error": None}
+        key, err = doc.get("content_key"), doc.get("merge_error")
+        if not isinstance(key, str) or not key or doc.get("pin") != pin or (
+                err is not None and not isinstance(err, str)):
+            self.unpin(host, pin)
+            raise LaneBOffloadUnavailable("lane B rebase_stage: malformed pod reply")
+        return {"host": host, "actuals": actuals, "content_key": key, "pin": pin,
+                "merge_error": err}
+
     def merge_finite(self, init_pointer: str, merges: list[dict]) -> list[bool]:
         """The pod's :meth:`LaneBModel.finite` (one bool per merge)."""
         doc = self._model_call("merge_finite", init_pointer, {"merges": list(merges)})
@@ -889,6 +929,8 @@ def _pod_model_op(op: str, req: dict, run_dir: Path, root: Path) -> dict:
     push = _pod_push(req["push"]) if op in UPLOAD_OPS else None
 
     def no_push(local, repo):
+        if op == "rebase_stage":
+            return "prepare-ahead:not-pushed"      # staged on the pod, never pushed
         raise RuntimeError(f"lane B {op}: this step does not push")
 
     model = LaneBModel(fetch, push or no_push, fetch_full=fetch_full)
@@ -908,6 +950,31 @@ def _pod_model_op(op: str, req: dict, run_dir: Path, root: Path) -> dict:
             return {"actuals": dict(res.actuals), "pointer": None}
         return {"actuals": dict(res.actuals), "pointer": res.pointer,
                 "content_key": _content_key(res.bench, settings)}
+    if op == "rebase_stage":
+        # prepare-ahead: rebase exactly as ``rebase`` (no push), pin the
+        # bench files, merge-check the bytes onto the king
+        sel = {int(k): [int(x) for x in v] for k, v in req["selection"].items()}
+        pin = Path(req["pin"])
+        if pin.parent != root / "pinned":
+            raise SystemExit("bench pin outside this module's dir")
+        try:
+            res = model.rebase(king_pointer=req["king"], base_pointer=req["base"],
+                               leg_pointer=req["leg"], selection=sel,
+                               out_dir=run_dir / "rebased", repo="prepare-ahead",
+                               refuse_nonfinite=bool(req["refuse_nonfinite"]),
+                               limits=bool(req["limits"]))
+        except MergeRefused as e:
+            return {"merge_error": str(e)}
+        if res.pointer is None:
+            return {"actuals": dict(res.actuals), "content_key": None}
+        from ..validator.expert_lane import merge_check_dirs
+
+        key = _content_key(res.bench, settings)
+        err = merge_check_dirs(fetch(req["king"]), Path(res.bench), sel,
+                               strict=bool(req["merge_strict"]))
+        _pin_bench_files(Path(res.bench), pin)
+        return {"actuals": dict(res.actuals), "content_key": key, "pin": str(pin),
+                "merge_error": err}
     if op == "merge_finite":
         return {"finite": [bool(x) for x in model.finite(req["pointer"], req["merges"])]}
     if op == "merge_stage":
@@ -940,7 +1007,8 @@ def _pod_model_op(op: str, req: dict, run_dir: Path, root: Path) -> dict:
     raise SystemExit(f"unknown op {op!r}")
 
 
-MODEL_OPS = frozenset({"rebase", "merge_finite", "merge_stage", "merge_build", "bench_stage"})
+MODEL_OPS = frozenset({"rebase", "rebase_stage", "merge_finite", "merge_stage", "merge_build",
+                       "bench_stage"})
 
 
 def pod_main(argv: list[str] | None = None) -> int:

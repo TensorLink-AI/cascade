@@ -81,6 +81,15 @@ def sentinel_pairing_kw(
     return {"require": tuple(b for b in require if b != s), "benchmarks": sorted(names)}
 
 
+def _bench_method(suite: Mapping) -> str:
+    """The bench method one suite's rows were swept with (#973): its stamp,
+    else the legacy method (rows swept before the stamp)."""
+    from .benchmarks import LEGACY_BENCH_METHOD
+
+    m = suite.get("bench_method")
+    return str(m) if isinstance(m, str) and m else LEGACY_BENCH_METHOD
+
+
 def pair_public_rows(
     king: Mapping[str, Mapping] | None,
     chal: Mapping[str, Mapping] | None,
@@ -90,6 +99,10 @@ def pair_public_rows(
     min_items: int = 1,
 ) -> PairedPublic:
     """Build the paired ``public`` mapping from two item-row results.
+
+    A benchmark pairs only when both sides are ``ok`` with the same
+    ``data_revision`` and the same ``bench_method`` (#973; unstamped =
+    the legacy method); otherwise it is ``missing``.
 
     ``benchmarks`` restricts which guard keys are built (default: every
     benchmark present on either side). ``require`` lists benchmark keys that
@@ -110,6 +123,11 @@ def pair_public_rows(
         # datasets or silently drop the pin from one side of a comparison.
         kr, cr = k.get("data_revision"), c.get("data_revision")
         if (kr or cr) and kr != cr:
+            out.missing.append(b)
+            continue
+        # #973: rows swept with different context conventions never pair (an
+        # unstamped suite is the legacy method, exactly as the audit reads it)
+        if _bench_method(k) != _bench_method(c):
             out.missing.append(b)
             continue
         k_by, k_dup = _index(k.get("rows") or [])

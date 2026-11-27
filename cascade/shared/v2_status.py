@@ -1167,6 +1167,16 @@ def publish_trainer_v2_status(sched, block: int, *, min_interval_s: float = MIN_
                               lane_a=lane_a_view(lane_a_body if lane_a_body is not None
                                                  else receipt),
                               lane_b_domains=_receipt_domain_tags(receipt))
+        # 2026-11-27: the lane B verdict prepared ahead (per leg: step, state,
+        # attempts, last error) — cascade-ops reads lane_b.prepare
+        prep = getattr(drv, "prepare_status", None) if drv is not None else None
+        if callable(prep) and isinstance(doc.get("lane_b"), dict):
+            try:
+                got = prep()
+                if got:
+                    doc["lane_b"]["prepare"] = got
+            except Exception as e:  # noqa: BLE001 — presentational
+                log.debug("v2 status: lane B prepare status unavailable: %s", e)
         from .submission_progress import receipt_progress
 
         doc["submission_receipt"] = receipt_progress(receipt)

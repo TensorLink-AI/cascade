@@ -144,3 +144,11 @@ deploy/bench_pod_bootstrap.sh
 tests/accept/wb27/test_wb27_reattach_finished_and_cache_disk.py
 tests/accept/wb27/fixtures/reattach_5gmzsp/
 tests/accept/wb27/test_wb27_pod_reply_json.py
+# 2026-11-27 owner ("have the lane B verdict prepared as soon as a leg
+# finishes"): a background worker rebases (no push), benches the candidate and
+# merge-checks it on the eval pod right after the leg finishes, with fast
+# bounded retries and lane_b.prepare in status/v2.json; the settlement reuses
+# the caches. The bench method (#973) is in the row-cache key and pairing.
+cascade/trainer/lane_b_prepare.py
+cascade/eval/public_guards.py
+tests/accept/wb27/test_wb27_lane_b_prepare_ahead.py

@@ -360,6 +360,21 @@ def _slice_digest(contexts: list) -> str:
     return h.hexdigest()
 
 
+def _pauses_prepare(fn):
+    """The prepare-ahead worker pauses while ``fn`` (the settlement) runs."""
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(self, *a, **kw):
+        self._settling.set()
+        try:
+            return fn(self, *a, **kw)
+        finally:
+            self._settling.clear()
+
+    return wrapper
+
+
 class LaneBDriver:
     def __init__(self, cfg, ops: LaneBOps, state_path: Path):
         self.cfg = cfg                 # ChainConfig
@@ -400,6 +415,9 @@ class LaneBDriver:
         # clock heartbeats are stamped with (a test seam)
         self._to_reattach: list[tuple[OpenLeg, dict]] = []
         self.clock = _reattach._wall
+        # 2026-11-27 prepare-ahead: set while a settlement runs (the
+        # prepare-ahead worker pauses; the settlement's pod steps go first)
+        self._settling = threading.Event()
 
     # ── persistence ──────────────────────────────────────────────────────────
 
@@ -1039,6 +1057,16 @@ class LaneBDriver:
                 pre(king_pointer)
             except Exception as e:  # noqa: BLE001 — a prebench never fails the tick
                 log.warning("lane B: king prebench not queued: %s", e)
+        # 2026-11-27 (owner): the verdict prepared AHEAD — each finished leg's
+        # rebase, candidate bench and merge check against this king run on a
+        # background worker now, not inside the next settlement
+        prep = getattr(self.ops, "prepare_ahead", None)
+        if callable(prep):
+            try:
+                prep(self.prepare_specs(int(block), int(era_index), king_pointer),
+                     paused=self._settling.is_set)
+            except Exception as e:  # noqa: BLE001 — prepare-ahead never fails the tick
+                log.warning("lane B: prepare-ahead not submitted: %s", e)
         miner = self._miner_funded()
         fq = self._funded_queue() if miner else None
         if fq is not None:
@@ -1456,6 +1484,45 @@ class LaneBDriver:
 
     # ── settlement ───────────────────────────────────────────────────────────
 
+    def rebase_inputs(self, f: dict, block: int, king_pointer: str) -> dict:
+        """The settlement rebase's model inputs of finished leg ``f`` — exactly
+        what :meth:`settle` passes ``model.rebase`` (minus the round-named
+        out dir / repo) — shared with the prepare-ahead worker so a prepared
+        rebase has the settlement's bytes."""
+        lb = self.cfg.lane_b
+        leg = f["leg"]
+        fund = leg.get("funding") or {}
+        return {"king_pointer": king_pointer, "base_pointer": leg["base_king_ref"],
+                "leg_pointer": f["leg_pointer"],
+                "selection": {int(k): v for k, v in leg["selection"].items()},
+                "refuse_nonfinite": lb.merge_guard_at_settlement(block),
+                "limits": (int(fund.get("train_tokens", 0) or 0) > 0
+                           or fund.get("gpu_measured") is False)}
+
+    def prepare_specs(self, block: int, era_index: int, king_pointer: str) -> list[dict]:
+        """One prepare-ahead spec per finished leg the next settlement would
+        rebase onto ``king_pointer`` (a leg it drops as stale is skipped);
+        ``merge_strict`` = the self-judge's strictness. Block-gated flags are
+        read at ``block`` — a flip before the settlement only makes the
+        prepared result a cache miss (the settlement recomputes)."""
+        lb = self.cfg.lane_b
+        if not lb.require_public or not king_pointer:
+            return []
+        with self._lock:
+            todo = [dict(f) for f in self.st.finished]
+        out = []
+        for f in todo:
+            leg = f["leg"]
+            if era_index - int(leg["base_era"]) > lb.max_base_age_eras:
+                continue
+            sub = leg["sub"]
+            spec = self.rebase_inputs(f, int(block), king_pointer)
+            spec["merge_strict"] = bool(lb.merge_guard_at_settlement(int(block)))
+            spec["label"] = f"{sub['hotkey'][:8]}/{sub['domain']}"
+            out.append(spec)
+        return out
+
+    @_pauses_prepare
     def settle(self, *, round_id: str, block: int, era_index: int, king_pointer: str,
                work_dir: Path, anchor_pointer: str | None = None) -> list:
         """Rebase every finished leg onto this settlement's king, publish the
@@ -1530,7 +1597,8 @@ class LaneBDriver:
                          sub["domain"], leg["base_era"])
                 _drop(f, "stale", {"base_era": int(leg["base_era"]), "era": int(era_index)})
                 continue
-            sel = {int(k): v for k, v in leg["selection"].items()}
+            rin = self.rebase_inputs(f, int(block), king_pointer)
+            sel = rin["selection"]
             if leg["base_king_ref"] != king_pointer:
                 # computed outside ``_lock`` (settle never holds it here)
                 stale, detail = self._routing_stale(leg, sel, king_pointer, int(block))
@@ -1548,19 +1616,18 @@ class LaneBDriver:
             # dispatch; {} = every default) — the EMA choice picks the width
             levers = dict((leg.get("funding") or {}).get("levers") or {})
             fund = leg.get("funding") or {}
-            limits = (int(fund.get("train_tokens", 0) or 0) > 0
-                      or fund.get("gpu_measured") is False)
+            limits = rin["limits"]
             # plan rev6.20: the receipt check (receipt_contract_ok) bound the pod
             # to the lane B EMA leg contract, so it scored its (chosen) EMA
             scored = _scored_weights_for(lb, levers)
             # the limits record read, the rebase and its upload: one model
             # step (on the eval pod, pod → Hub; never bytes through the box)
             try:
-                res = model.rebase(king_pointer=king_pointer,
-                                   base_pointer=leg["base_king_ref"],
-                                   leg_pointer=f["leg_pointer"], selection=sel, out_dir=out,
+                res = model.rebase(king_pointer=rin["king_pointer"],
+                                   base_pointer=rin["base_pointer"],
+                                   leg_pointer=rin["leg_pointer"], selection=sel, out_dir=out,
                                    repo=f"ckpt-r{rid}-expert-{label}-u{sub['uid']}",
-                                   refuse_nonfinite=lb.merge_guard_at_settlement(block),
+                                   refuse_nonfinite=rin["refuse_nonfinite"],
                                    limits=limits)
             except MergeRefused as e:
                 log.warning("lane B: %s/%s refused at settlement: %s", sub["hotkey"][:8],
@@ -1770,7 +1837,21 @@ class LaneBDriver:
                 "outcomes": list(self.st.outcomes[-16:]),
                 # WB15: declared claims waiting on held rows (``rows_held``)
                 "deferred": [dict(r) for r in self._deferred],
+                # 2026-11-27: the verdict prepared ahead, per finished leg
+                **({"prepare": self.prepare_status()}
+                   if callable(getattr(self.ops, "prepare_status", None)) else {}),
             }
+
+    def prepare_status(self) -> dict:
+        """The prepare-ahead worker's per-leg step states ({} = none)."""
+        fn = getattr(self.ops, "prepare_status", None)
+        if not callable(fn):
+            return {}
+        try:
+            return dict(fn() or {})
+        except Exception as e:  # noqa: BLE001 — a status read never raises
+            log.debug("lane B prepare status unavailable: %s", e)
+            return {}
 
     def expert_manifest_digest(self, round_id: str) -> str:
         """The digest the lane-A manifest of ``round_id`` binds ("" = none)."""
@@ -2517,6 +2598,30 @@ class RunnerLaneBOps:
         if self.bench is not None:
             self.bench.prebench(pointer)
 
+    # ── prepare-ahead (2026-11-27, cascade.trainer.lane_b_prepare) ───────────
+
+    def preparer(self):
+        """The prepare-ahead worker over the bench pod (pin and sweep on the
+        same host); None without a bench or its pod runner."""
+        prep = getattr(self, "_preparer", None)
+        if prep is None:
+            pod = getattr(self.bench, "_pod", None) if self.bench is not None else None
+            if pod is None or not callable(getattr(pod, "rebase_stage", None)):
+                return None
+            from .lane_b_prepare import LaneBPrepare
+
+            prep = self._preparer = LaneBPrepare(pod, self.bench)
+        return prep
+
+    def prepare_ahead(self, specs: list[dict], paused=None) -> None:
+        prep = self.preparer()
+        if prep is not None:
+            prep.submit(specs, paused=paused)
+
+    def prepare_status(self) -> dict:
+        prep = self.preparer()
+        return prep.status() if prep is not None else {}
+
     def publish_expert_manifest(self, manifest) -> None:
         from ..shared.expert_manifest import expert_manifest_key, sign_expert_manifest
 
@@ -2565,10 +2670,17 @@ class RunnerLaneBOps:
         return judge_manifest(manifest, king_pointer=manifest.king_pointer,
                               king_scores=_eval(manifest.king_pointer), evaluate=_eval,
                               fetch_dir=self.fetch, cfg=cfg.lane_b, seed=str(round_id),
-                              **({"merge_check": pod.merge_check} if pod is not None else {}),
+                              **({"merge_check": self._merge_check(pod)}
+                                 if pod is not None else {}),
                               strict=cfg.lane_b.merge_guard_at_settlement(int(block)),
                               sentinel=sentinel,
                               **({"anchor_pointer": anchor_pointer} if anchor_pointer else {}))
+
+    def _merge_check(self, pod):
+        """The pod's merge check, reusing a prepared "mergeable" answer."""
+        from .lane_b_prepare import merge_check_with
+
+        return merge_check_with(getattr(self, "_preparer", None), self.bench, pod.merge_check)
 
     def merge_scores(self, pointer: str, block: int) -> list:
         from .lane_b_offload import local_eval_allowed
