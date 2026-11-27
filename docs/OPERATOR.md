@@ -2763,13 +2763,17 @@ hold a pod, the provisioner rents a cheap one on demand:
 
 ```toml
 # provision.toml (beside the validator)
-mkt_hosts_path  = "/root/cascade/mkt_hosts.toml"
-mkt_lease_hours = 3.0
+mkt_hosts_path      = "/root/cascade/mkt_hosts.toml"
+mkt_lease_hours     = 3.0     # TTL of a pod nobody heartbeats
+mkt_lease_max_hours = 6.0     # extension cap while the validator's heartbeat is fresh
 [provisioner]
 image = "<[marketcast] pod_image from chain.toml>"   # NOT the fleet's funded_pod_image
 [provisioner.mkt]
 sku = "NVIDIA GeForce RTX 3090"; market_sku = "RTX3090"   # Lium's listing name: no space
 max_pods = 1; providers = ["lium"]; max_price_hr = 0.40
+# No [[provisioner.mkt.candidate]] ⇒ the shipped fallback ladder applies:
+#   RTX 4090 (RTX4090) ≤ $0.80/h, then RTX A6000 (A6000) ≤ $0.60/h.
+# List your own candidates to replace it, or `candidate = []` for 3090 only.
 ```
 
 The pod runs `cascade.validator.mkt_worker`, which only ships in the
@@ -2780,7 +2784,7 @@ also serves stages on the fleet image. With `[marketcast] pod_image` empty,
 use the fleet image only when that image already carries MarketCast.
 
 ```bash
-cascade-validator ... --mkt-eval-hosts /root/cascade/mkt_hosts.toml   # --mkt-host-wait 1800
+cascade-validator ... --mkt-eval-hosts /root/cascade/mkt_hosts.toml   # --mkt-host-wait 5400
 ```
 
 How it runs:
@@ -2796,12 +2800,31 @@ How it runs:
   content-addressed cache on the pod (`_mkt_offload/cache`, sha256-checked
   before every load). It forecasts through it. Only contexts and covariates
   cross; targets, losses, the verdict, the report and the wallet stay local.
+- Before it requests a pod the run checks, pod-free, that each round's
+  `pool_mkt` snapshot is published and its block hash readable. A round that
+  fails is retried at the next settlement without renting anything.
 - When the run ends the request is removed and the pod is torn down. The TTL
-  `mkt_lease_hours` backstops a validator that keeps it alive.
+  `mkt_lease_hours` backstops a validator that keeps it alive. While the
+  validator's heartbeat is fresh (touched within 5 minutes), a long run keeps
+  its pod past that TTL, up to `mkt_lease_max_hours`. The budget check
+  prices the whole extended lease.
+- `--mkt-host-wait` defaults to the provisioner's worst-case boot (5400 s:
+  provider-ready 900 + ssh 300 + key auth 900 + gate 600, plus one
+  replacement pod). A shorter wait releases the request mid-boot and the new
+  pod is torn down unused, so the validator warns at startup.
 - No pod within `--mkt-host-wait`, or a pod or transport failure mid-run: the
   round is simply not published yet and is retried at the next settlement.
   Nothing is infra-deferred and no miner is charged. The trainer records a
-  report `"absent"` only after `report_timeout_settlements` (8 = 24 h).
+  report `"absent"` only after `report_timeout_settlements` (8 = 24 h) of
+  CONFIRMED misses (404 / NoSuchKey). A read error during a Hippius outage
+  does not count. A round with no MarketCast entries is not awaited at all,
+  unless a report is being recorded that settlement or an earlier round is
+  still awaited. Recording `"absent"` for a round with entries logs an
+  ERROR, which cascade-ops `mkt_legs` surfaces, because its entries now defer
+  as infra.
+- The MarketCast provisioner runs as its own service
+  (`cascade-mkt-provisioner`, `--config provision.mkt.toml`).
+  `deploy/restart_provisioner.sh` leaves it running.
 
 The worker image must carry the `marketcast` extra. Qualify a pod before
 enabling (remote vs local CPU quantiles within the audit's re-forecast

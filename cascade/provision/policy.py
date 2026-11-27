@@ -114,6 +114,44 @@ class ProvisionPolicy:
     # TTL (a MarketCast round is minutes of GPU, never an epoch).
     mkt: StagePolicy | None = None
     mkt_lease_hours: float = 3.0
+    # The lease EXTENSION bound: a mkt pod past ``mkt_lease_hours`` lives on
+    # while the validator's request heartbeat is fresh (a forecast run longer
+    # than the lease was killed mid-run and retried forever), up to this hard
+    # cap. ``mkt_lease_hours`` stays the TTL of a pod nobody heartbeats.
+    mkt_lease_max_hours: float = 6.0
+
+    def mkt_ttl_hours(self, *, heartbeat_fresh: bool) -> float:
+        """The mkt pod's TTL now: the extension cap while the validator's
+        heartbeat is fresh, else the base lease."""
+        if heartbeat_fresh:
+            return max(float(self.mkt_lease_hours), float(self.mkt_lease_max_hours))
+        return float(self.mkt_lease_hours)
+
+
+# The heartbeat the lease extension trusts: the validator touches its request
+# every ``mkt_offload.TOUCH_EVERY_S`` (60 s) while it waits or computes, so a
+# request older than five beats belongs to a validator that stopped.
+MKT_HEARTBEAT_FRESH_S = 300.0
+
+# Worst-case provisioner boot of ONE mkt pod (the validator's --mkt-host-wait
+# must cover it, or the request is released mid-boot and the fresh pod torn
+# down as idle — every settlement): provider-ready (core.DEFAULT_READY_TIMEOUT
+# 900 s) + the TCP ssh probe (300 s) + key-injection auth wait (900 s) + the
+# health gate and config push (600 s budget), twice — a failed pod gets ONE
+# replacement, which boots from scratch.
+MKT_BOOT_STEPS_S = (900.0, 300.0, 900.0, 600.0)
+MKT_BOOT_WORST_S = 2 * sum(MKT_BOOT_STEPS_S)
+
+# The default MarketCast SKU ladder after the configured primary (RTX 3090 on
+# the deployment): a [provisioner.mkt] table without ``candidate`` entries gets
+# these rungs; ``candidate = []`` opts out. Caps keep a 6 h extended lease
+# inside a $5 ``max_spend_per_round``.
+MKT_DEFAULT_LADDER = (
+    SkuCandidate(sku="NVIDIA GeForce RTX 4090", market_sku="RTX4090", gpus_per_pod=1,
+                 max_price_hr=0.80),
+    SkuCandidate(sku="NVIDIA RTX A6000", market_sku="A6000", gpus_per_pod=1,
+                 max_price_hr=0.60),
+)
 
 
 def pods_for_slots(slots: int, gpus_per_pod: int, max_pods: int) -> int:

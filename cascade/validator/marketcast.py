@@ -879,7 +879,7 @@ class MarketCastMixin:
     # --device); how long one publish run waits for the pod; injectable
     # lease / session factories (tests)
     mkt_eval_hosts: Path | None = None
-    mkt_host_wait_s: float = 1800.0
+    mkt_host_wait_s: float = 5400.0       # = provision.policy.MKT_BOOT_WORST_S
     mkt_lease_fn: Callable | None = None
     mkt_session_fn: Callable | None = None
 
@@ -1578,6 +1578,10 @@ class MarketCastMixin:
             except Exception as e:  # noqa: BLE001 — unknown: retried next settlement
                 log.warning("marketcast round=%s: report existence unreadable (%s)",
                             item["round_id"], e)
+        # the pod-free prechecks BEFORE the lease: a round whose snapshot or
+        # block hash is unavailable would only fail inside the session, so a
+        # missing pool_mkt snapshot rented (and paid for) a pod every settlement
+        need = [item for item in need if self._mkt_round_ready(item)]
         if not need:
             return 0
         rid0 = str(need[0]["round_id"])
@@ -1608,6 +1612,30 @@ class MarketCastMixin:
         finally:
             lease.release()
         return published
+
+    def _mkt_round_ready(self, item: dict) -> bool:
+        """Whether round ``item`` can be computed at all — its snapshot is
+        published and its block hash readable — checked WITHOUT a pod (the
+        same reads :meth:`_mkt_publish_round` repeats inside the session).
+        False ⇒ logged and retried at the next settlement; never raises."""
+        rid = str(item.get("round_id", ""))
+        try:
+            got = self._mkt_snapshot(int(item["block"]))
+        except Exception as e:  # noqa: BLE001
+            log.error("marketcast round=%s: snapshot unavailable (%s); no offload pod "
+                      "requested — retried at the next settlement", rid, e)
+            return False
+        if got is None:
+            log.error("marketcast round=%s: no pool_mkt snapshot for block %s; no offload "
+                      "pod requested — retried at the next settlement", rid, item["block"])
+            return False
+        try:
+            self._mkt_block_hash(int(item["block"]))
+        except Exception as e:  # noqa: BLE001 — a chain read: retried next settlement
+            log.error("marketcast round=%s: block %s hash unreadable (%s); no offload pod "
+                      "requested — retried at the next settlement", rid, item["block"], e)
+            return False
+        return True
 
     def _mkt_publish_round(self, item: dict, *, holders: dict | None = None) -> bool:
         """Main validator: compute + sign + publish round ``item``'s report

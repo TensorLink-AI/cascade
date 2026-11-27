@@ -44,3 +44,20 @@ tests/unit/test_marketcast_paths.py
 tests/unit/test_marketcast_flex_recipe.py
 # #908: the offload lease heartbeat (the request stays fresh for the whole run).
 cascade/validator/mkt_offload.py
+
+# 2026-11-27 lane C eval-offload robustness (owner "fix all those things"):
+# pod-free prechecks before the mkt lease, the heartbeat lease extension
+# (mkt_lease_max_hours), --mkt-host-wait covering the worst-case boot, the
+# mkt SKU ladder, the trainer's report wait (no-entry rounds, confirmed 404s
+# only, ERROR on absent), the fleet restart script sparing the mkt
+# provisioner, and lane C refusing a bundle without a Lium key.
+cascade/provision/policy.py
+cascade/provision/main.py
+cascade/provision/loop.py
+cascade/validator/main.py
+deploy/restart_provisioner.sh
+docs/MARKETCAST.md
+docs/OPERATOR.md
+tests/unit/test_mkt_offload.py
+tests/unit/test_mkt_offload_provision.py
+tests/unit/test_lane_c_plugin.py
