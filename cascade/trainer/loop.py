@@ -241,6 +241,13 @@ def upload_harvested_checkpoint(runner, record: dict, *, base_seed) -> TrainedEn
             if i + 1 < HARVEST_UPLOAD_ATTEMPTS:
                 sleep(HARVEST_UPLOAD_BACKOFF_SECONDS * (2 ** i))
     if up is None:
+        # a lane B expert leg: the record carries its dispatch's selection,
+        # contract block and exclude (set by the lane B driver on this leg's
+        # thread) — the requeued leg re-uploads under THOSE. setdefault: a
+        # re-upload of an existing record never takes the current tick's.
+        lane_b = getattr(runner.__dict__.get("_leg_local_obj"), "lane_b_dispatch", None)
+        for key, value in dict(lane_b or {}).items():
+            record.setdefault(key, value)
         write_pending_upload(runner.work_root, base_seed, hotkey, record)
         where = "kept on R2" if r2 else "kept"
         raise StorageFault(
