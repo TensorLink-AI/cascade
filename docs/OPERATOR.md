@@ -2810,7 +2810,11 @@ How it runs:
 - The run opens one ssh session to `python -m cascade.validator.mkt_worker
   --serve`. It uploads the pinned base and each fine-tune once into a
   content-addressed cache on the pod (`_mkt_offload/cache`, sha256-checked
-  before every load). It forecasts through it. Only contexts and covariates
+  before every load). The cache sits on the pod's large data mount: a host's
+  `cache_root` in the hosts toml roots it, else `<workdir>/_mkt_offload` is
+  linked onto `/workspace` when that dir is missing or empty (as lane B's
+  caches). An upload whose cache filesystem is short fails before the copy
+  and names the alternative mount. It forecasts through it. Only contexts and covariates
   cross; targets, losses, the verdict, the report and the wallet stay local.
 - Before it requests a pod the run checks, pod-free, that each round's
   `pool_mkt` snapshot is published and its block hash readable. A round that

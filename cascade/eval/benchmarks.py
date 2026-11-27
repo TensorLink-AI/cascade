@@ -293,9 +293,12 @@ def item_rows_from_report(report: dict | None) -> dict | None:
 
 # #972 (W-BMASK): the sidecar's context conventions. Rows without a
 # ``bench_method`` stamp were swept before it, with the legacy one.
-BENCH_METHOD = "observed_mask/1"
+# observed_mask/2 (owner 2026-11-27): + leading-pad patches are never
+# attention keys; observed_mask/1 rows stay reproducible with their method.
+BENCH_METHOD = "observed_mask/2"
+OBSERVED_MASK_V1 = "observed_mask/1"
 LEGACY_BENCH_METHOD = "impute/0"
-BENCH_METHODS = (BENCH_METHOD, LEGACY_BENCH_METHOD)
+BENCH_METHODS = (BENCH_METHOD, OBSERVED_MASK_V1, LEGACY_BENCH_METHOD)
 
 
 def rows_bench_method(rows: dict | None) -> str | None:

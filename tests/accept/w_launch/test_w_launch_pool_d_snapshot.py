@@ -54,8 +54,19 @@ def _main(world, tmp_path, lane_a, out_name="out", extra=()):
         "--as-of-ts", str(AS2), "--prior-dir", str(world["d1"]), *extra])
 
 
+# #981 (per-window horizons): the CLI build reads [lane_d] horizon_bands from
+# chain.toml and adds the target-region fields; W6b's replay world is built
+# with the library default (no bands). Those fields are a horizon setting, not
+# a lane A selection difference, so they are compared apart from it.
+HORIZON_KEYS = ("clocks", "horizon_bands", "max_horizon")
+
+
 def _strip(meta):
-    return {k: v for k, v in meta.items() if k not in ("selection_sha256", "lane_a_selection")}
+    out = {k: v for k, v in meta.items()
+           if k not in ("selection_sha256", "lane_a_selection", *HORIZON_KEYS)}
+    out["series"] = [{k: v for k, v in s.items() if k != "target_points"}
+                     for s in meta.get("series", [])]
+    return out
 
 
 def test_drifted_snapshot_builds_the_replay_series(world, tmp_path):

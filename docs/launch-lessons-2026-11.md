@@ -44,6 +44,58 @@ is listed under [Pre-upgrade checklist](#pre-upgrade-checklist).
 | 25 | Knobs that silently do nothing (risk with each new cap: #966 `miner_make_good_cap_usd`, #968 `mkt_lease_max_hours`). | A dataclass field with no `load_chain_config` parse. | #966 and #968 each shipped the parse + a round-trip test | IR007 (every config dataclass field is parsed somewhere). checklist: a loader round-trip test per knob. |
 | 26 | Lane D's share burns at a validator restart before its first publication. | The court is memory-only. | operational rule | checklist: restart a validator only right after a lane D publish, never near a boundary. |
 
+## 2026-11-27 root-cause analysis
+
+Owner, 2026-11-27 ~20:50: "run a subagent for root cause analysis, make sure
+we have patches, and add any lessons to lint". Sources: the OPSLOG entries of
+2026-11-27 and PRs #960–#983. Every fix PR below was checked: it is merged on
+`origin/main` and ships a test. Root-cause lines are given at the parent of
+the fix commit. The guards marked **new** are added in this PR.
+
+### OPEN (no merged fix + test)
+
+- **MarketCast eval-pod cache on the root overlay.** This one is latent: no
+  incident yet. `cascade/validator/mkt_offload.py:338` (`upload`) caches
+  checkpoints under `<workdir>/_mkt_offload/cache` without the #982
+  data-mount placement, so it has the same failure class as row 33. It is
+  pinned as a `KNOWN GAP` in
+  `tests/unit/test_eval_pod_cache_dirs_on_data_mount.py`.
+- **Validator RSS growth.** 2026-11-27 09:22, 3.7 → 4.5 GB with 3.1 GB of swap
+  in use. It was handled by a restart only, and no cause was found (a lane D
+  retry loop is suspected).
+- **pool_d pin sync pins nothing and logs no reason.** Seen 18:20 at
+  09f19baa, after the #976 fresh-sync build. There is no fix and no test.
+- **No pool_d DATA-age health check.** cascade-ops `pool_d_stale` reads the
+  snapshot's age. The 11-26 freeze renamed the same data every 3 h, so that
+  check stayed green. #976 refuses non-advancing snapshots at publish. The
+  wanted cascade-ops check (max `first_seen` age, WARN > 9 h, CRIT > 12 h) is
+  not built.
+- **rc15 → main bitwise qualification FAIL at world 8.** This carries over
+  from row 10. The numerics change since 5e3fade has not been found, and the
+  repin ran on the owner's override.
+
+### Incidents
+
+| # | Symptom | Root cause (file:line) | Fix | Guard |
+|---|---|---|---|---|
+| 27 | Expert legs trained on 1 of 8 GPUs (about 8× slow). A make-good was aborted. | The pinned worker image rc15 (5e3fade, 10-31) has `world = gang_size(...) if slices is None else 1` at `cascade/trainer/pyramid_trainer.py:192`. #748 fixed it on main, but no image carrying the fix was pinned. | #960 (rank rule + `GangShortfall`), image rc3 | test `tests/accept/wb27/test_wb27_gang_ranks.py`. `scripts/check_image_freshness.py` (row 8). checklist 1, 14. |
+| 28 | The lane B leg ran at 0.34 steps/s against lane A's ~1.9, with GPUs ~20% busy. | Expert legs skip `accelerate()` (`cascade/trainer/pyramid_dp.py:598-600`, "lane A only"), so `MoEFFN.forward` runs a per-expert Python loop with `.item()` syncs (`cascade/trainer/pyramid_model.py:289`). | #970 (lane B fast path + parity test) | test `tests/accept/wb27/test_wb27_expert_fast_path.py`. checklist 12. |
+| 29 | The first rc4 leg died in its first backward: "expected scalar type Float but found BFloat16". About 5 min of 8xH200 was lost. | `_ExpertMatmul.backward` (`cascade/trainer/expert_training.py:31`) mixed the bf16 autocast forward with fp32 leaves. #970's tests ran in fp32 only. | #974 | test `tests/accept/wb27/test_wb27_expert_mm_autocast.py` (CPU bf16 autocast). **new** `tests/unit/test_autograd_functions_have_bf16_tests.py`: every custom `autograd.Function` in `cascade/` needs a bf16-autocast backward test. It fails on the #974 parent. checklist 14. |
+| 30 | A finished 14 GB leg was harvested over tar-over-ssh Australia → NYC at ~0.5 MB/s. The 1 h stall watchdog would have torn the pod down and burned the run. It was rescued by hand through presigned R2. | The harvest stall path (`cascade/trainer/remote.py:1810` → `cascade/trainer/runner_funded_legs.py:611-680`) treated a slow transfer of a finished run as a failed leg: teardown, burn. | #979 (stall → pod → R2 fallback, pod kept, unburned) | test `tests/accept/wb27/test_wb27_harvest_r2_fallback.py`. |
+| 31 | The leg's checkpoint was rejected after harvest: expected `ebfed637…`, receipt `a3ea79b2…`. | Trainer vs worker lane B contract. `apply_spec_levers` (`cascade/shared/lane_b_levers.py:371`) folded the default levers into a no-spec leg. The worker folds them only `if lane_b_spec:` (`cascade/trainer/worker.py:305`). | #980 | test `tests/accept/wb27/test_wb27_lane_b_receipt_contract.py`. **new** `tests/unit/test_lane_b_trainer_worker_contract_parity.py`: runs the worker's own expert-contract block (AST-extracted, torch-free) on the dispatch's exact `--recipe-json` for no-spec, `train_hours`, levers, and `train_hours` + levers. It fails on the #980 parent with the live diff (`power_ema_*`). |
+| 32 | A trainer restart did not re-attach the finished leg ("ReattachMissing"). It removed the 8xH200 and requeued the leg, so the approval would have retrained it (~$100). | Re-attach re-derived the era from the current scheduler (`cascade/trainer/lane_b_driver.py:2231`, `era = sched.state.current`) and its contract block (`:2322`). 9594000 → 9597600 changed the run tag, so the finished run was "not found". It also did not recognise a finished run (progress.json + "worker done" + checkpoint). | #982 (`_dispatch_era`; finished-run harvest) | tests `tests/accept/wb27/test_wb27_reattach_finished_and_cache_disk.py::test_lane_b_reattach_rederives_the_dispatch_era`, `::test_reattach_harvests_the_finished_expert_run_on_the_live_dispatch_dir`, `::test_a_requeued_fresh_dispatch_harvests_the_finished_run_instead_of_retraining` (the 5GMzsP fixture). checklist 15. |
+| 33 | The 16:27 lane B settlement failed: "pod disk short … 6.8 GB free < 26.0 GB needed". The 43 GB `/` was at 86% while a 159 GB `/workspace` sat empty. | `OFFLOAD_DIR = "_lane_b_offload"` under `<workdir>` (`cascade/trainer/lane_b_offload.py:76`, also `eval_offload` / `lane_b_bench`) went on the root overlay. | #982 (`cascade/shared/pod_data_root.py`) | test `…/test_wb27_reattach_finished_and_cache_disk.py::test_offload_dir_is_linked_onto_the_larger_data_mount`. **new** `tests/unit/test_eval_pod_cache_dirs_on_data_mount.py`: an AST inventory of `f"{host.workdir}/…"` paths in the eval-pod modules. Each must be placed or reviewed. It fails on the #982 parent. |
+| 34 | The 19:27 settlement rebase failed: "pod reply is not JSON". The settlement published without lane B. | `json.loads(proc.stdout)` (`cascade/trainer/lane_b_offload.py:376`) over `<worker> && cat result.json`. `hippius_hub/file_download.py:392` printed "Downloading … (parallel)..." to stdout first. | #983 (`pod_reply_json`) | test `tests/accept/wb27/test_wb27_pod_reply_json.py`. **new IR009**: `json.loads` of an ssh reply's raw stdout. Cat-only reply, last-line parse or tolerant parser only. It flags the #983 parent at line 376. |
+| 35 | Lane D pool_d was frozen from 11-26 00:00: every snapshot had the same data and an empty `frontier`, so no window could be drawn. | The builder ran `state_pull` + `mirror_sync` only at bootstrap (`cascade/laned/elastic.py:1026-1033`), never per build. Its forge mirror froze at 11-25 17:59. | #976 (sync every build; publish/pin refuse non-advancing snapshots) | tests `tests/accept/w6d/test_w6d_data_advances.py`, `tests/accept/r13/test_r13_builder.py`, `test_r13_state.py`. OPEN: a cascade-ops data-age check. |
+| 36 | The lane D public half timed out (3600 s) on every retry, and its 0.5 share burned. | See row 13. | #967 | row 13 tests. |
+| 37 | The money guard said "fine" against a real $15/h burn. Per-type pricing was wrong. | See rows 16–17 (`operator_standing_pods_usd_per_hour`; one rate × one wall). | #966 | `tests/accept/wb27/test_wb27_money_guard.py`. |
+| 38 | Every mkt eval pod failed its health gate. | See row 18 (fleet pins for `[marketcast] pod_image` pods). | #964 | `tests/unit/test_stage_pods_gate_on_their_own_pins.py`, `tests/accept/wb27/test_wb27_lane_c_launch.py`. |
+| 39 | The validator lane B judge, merged-init and acceptance checks loaded checkpoints on the 7 GB box. | See row 3. | #965 | `tests/accept/wb27/test_wb27_validator_remote.py`, `tests/unit/test_box_side_torch_free.py`. |
+| 40 | `receipt-replay` crashed on lane D receipts that were not yet readable (pending), which blocked #960/#961/#963. | `scripts/replay_mainnet_receipts.py` treated a pending or unreadable receipt as a failure. | #962 | test `tests/unit/test_replay_pending_receipts.py`. |
+| 41 | Process: rc4 was deployed to a paid leg with only fp32 tests of its new kernel. | No production-dtype test and no real-environment smoke run before a paid leg. | rc5 got a 2xRTX4090 30-step smoke run (owner ask) | **new** bf16 guard (row 29). checklist 14. |
+| 42 | Process: the trainer was restarted mid-harvest without checking that the re-attach would recognise the finished run. The pod was removed. | Restart discipline covered "legs in flight" but not "finished, unharvested or unuploaded runs". | #982 (re-attach of finished runs) | checklist 15. |
+| 43 | Process: Claude suggested re-running a finished paid leg whose checkpoint existed (owner: no re-run). | Recovery was framed as a retrain, not a rescue of the verified checkpoint (receipt digests, pending re-upload). | operator rescue via `_reupload_pending` (12:15 entry) | checklist 16. |
+
 ## Pre-upgrade checklist
 
 Run it before any release, image repin or overlay that changes a lane.
@@ -91,6 +143,22 @@ Run it before any release, image repin or overlay that changes a lane.
     for it.
 13. **Restart windows.** No trainer restart with legs in flight. No validator
     restart in a scoring window, or before lane D's first publish.
+14. **Before a paid leg on a new image or kernel.** Do a short
+    real-environment smoke run of any new image before a paid leg: the real
+    `worker.main` role with the leg's own args, a few dozen steps, on the
+    target GPU type, checking all GPUs busy, no dtype error and the expected
+    steps/s. New kernels also need a CI test in the production dtype and
+    autocast path (bf16), not only fp32 (rows 29, 41).
+15. **Before a trainer restart.** List finished but unharvested or unuploaded
+    runs (`lane_b_driver.json` "finished", `_funded_harvest/*.pending.json`,
+    live pods holding a done worker). Confirm that the restarted code's
+    re-attach recognises each one under its DISPATCH era and contract block,
+    never the current one. If it does not, wait or rescue the run first
+    (row 32).
+16. **A finished paid leg is never retrained.** When a leg's checkpoint
+    exists and its receipt digests match, rescue it: R2 or presigned copy,
+    then sha256 against the receipt, then the pending re-upload. Withdraw or
+    cap the approval first so that no re-rent can pass (row 43).
 
 ## Not automated (and why)
 

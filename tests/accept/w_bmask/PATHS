@@ -12,3 +12,6 @@ benchmarks/cascade_benchmark/suites/fev_bench.py
 benchmarks/cascade_benchmark/cli.py
 cascade/eval/benchmarks.py
 cascade/audit/bench_reproduce.py
+# observed_mask/2 (owner 2026-11-27): leading-padding patches are never
+# attention keys, applied by the sidecar to the loaded model's attention
+# instances (pinned model.py untouched); bench_method bumped.

@@ -150,6 +150,41 @@ is queued at the first settlement after it finishes, on an eval pod, and the
 leg is judged at a later settlement once those rows exist. A settlement whose
 bench rows are missing keeps the leg and publishes nothing for it.
 
+## Where winners are published
+
+When your leg **wins its slot** (its experts are accepted into the king's
+init at a warm start), its generator is published the same way a lane A king
+is, under the same `[round] champion_publish` policy (`crown` today: at
+once; `delay`: after `champion_publish_delay_rounds` rounds of holding the
+slot; `dethrone`: when a newer leg takes the slot). Under every policy a
+displaced holder whose code is still private publishes at the hand-off. A leg
+that only qualified, was refused at acceptance or never merged is never
+published.
+
+- **Public bucket.** A vault submission's ZIP goes up at
+  `champions/<digest>.zip` (the lane A key; `cascade fetch <ref>` reads it).
+  A Hub ref is public already. The index is
+  `champions/lane_b/index.json` in the public manifest bucket.
+- **This repo.** The king-sync workflow copies each published winner into
+  `champions/lane_b/<domain>/<slot>/` (`generator.py`, `config.json`,
+  `requirements.txt`, `PROVENANCE.json`, `SCAN.json`). `<domain>` is the
+  target (`energy`, `horizon-720`, `suite-gift`) and `<slot>` names the
+  expert rows you trained (`rows-<12 hex>`). When the target is won again,
+  the previous holder moves to
+  `champions/lane_b/archive/<domain>/<slot>/<round>/`. The same static scan
+  as the lane A king applies: a high-severity finding keeps the code out of
+  the repo.
+- **The index binds the repos together.** For each slot it records the
+  target, the expert rows per layer, your hotkey and uid, the generator ref
+  and digest, the king checkpoint your experts were merged into (Hippius
+  `repo@sha256`), the lane A king checkpoint at the time, the settlement
+  round and merge block. `composed` lists every lane B generator in the
+  current king checkpoint's lineage, and `archive` the displaced holders.
+  Each entry carries the generator's content digest, and `sha256` covers the
+  whole body (`cascade.funding.champion.verify_lane_b_index`). Check a merge
+  against the era manifest's `warm_start_merges` and the round receipts
+  (`cascade-audit`).
+
 ## Strategies worth trying
 
 - **Target where the king is weakest.** The receipts' `per_domain` numbers
