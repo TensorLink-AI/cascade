@@ -112,7 +112,7 @@ class FakeChain:
 
 def test_shipped_values_parse_and_default_off(tmp_path):
     shipped = load_chain_config(DEFAULT_CHAIN_TOML)
-    assert shipped.eval.shared_ladder_windows == 4000          # the owner's count
+    assert shipped.eval.shared_ladder_windows == 5000          # the owner's count (4000 → 5000, 2026-11-23)
     # typed by the owner: the first settlement of the era starting 9493200 —
     # the same settlement the DEC-CA-0067 quantile head starts at
     assert shipped.eval.shared_ladder_from_block == 9494100
@@ -131,8 +131,9 @@ def test_shipped_values_parse_and_default_off(tmp_path):
     assert live.quantile_head_at(9494100) and not live.quantile_head_at(9493200)
     assert not A.shared_ladder_feature(shipped).decided_on_chain   # typed: nothing signalled
     # The vote's name is pinned: a changed count or ladder is a FRESH vote.
-    assert A.shared_ladder_feature_name(4000, HORIZONS) == "lad-556b1b98"
-    assert A.shared_ladder_feature(shipped).name == "lad-556b1b98"
+    assert A.shared_ladder_feature_name(4000, HORIZONS) == "lad-556b1b98"   # the 2026-11-13 rule
+    assert A.shared_ladder_feature_name(5000, HORIZONS) == "lad-ca8d69b3"
+    assert A.shared_ladder_feature(shipped).name == "lad-ca8d69b3"
 
     src = re.sub(r"^shared_ladder_(windows|from_block)\s*=.*$", "",
                  DEFAULT_CHAIN_TOML.read_text(), flags=re.M)
@@ -664,7 +665,7 @@ def _edit(tmp_path, pattern, repl):
 
 def test_release_config_loads_with_the_pin(voting):
     c = load_chain_config(DEFAULT_CHAIN_TOML)
-    assert c.eval.shared_ladder_feature == "lad-556b1b98"
+    assert c.eval.shared_ladder_feature == "lad-ca8d69b3"
     assert c.eval.shared_ladder_feature == A.shared_ladder_feature(c).name
     load_chain_config(REPO / "chain.testnet.toml")              # no ladder there: exempt
 
@@ -678,7 +679,7 @@ def test_a_deployed_config_without_the_keys_refuses_to_start(tmp_path, voting):
 
 def test_a_missing_pin_refuses(tmp_path, voting):
     p = _edit(tmp_path, r"^shared_ladder_feature\s*=.*$", "")
-    with pytest.raises(ValueError, match="shared_ladder_feature is not pinned.*lad-556b1b98"):
+    with pytest.raises(ValueError, match="shared_ladder_feature is not pinned.*lad-ca8d69b3"):
         load_chain_config(p)
 
 
