@@ -87,7 +87,8 @@ def test_slow_stream_on_an_unreachable_pod_is_not_kept(tmp_path, monkeypatch):
     kind, e = _outcome(lambda: remote.harvest_remote_dir(
         remote.RemoteHost(name="p", host="h"), "/w/ck", tmp_path / "out",
         stall_timeout=0.4))
-    assert kind == "raised" and not getattr(e, "keep_pod", False)
+    assert kind == "raised" and getattr(e, "harvest_slow", False) is True
+    assert getattr(e, "pod_reachable", None) is False and not getattr(e, "keep_pod", False)
 
 
 def test_early_slow_probe_abandons_a_trickle_well_before_the_wall(tmp_path, monkeypatch):
@@ -148,15 +149,9 @@ def test_r2_failure_after_a_slow_stream_keeps_the_pod_and_burns_nothing(tmp_path
         verdict = classify_leg_exception(r, gen, SimpleNamespace(base_seed=7), e, rc=None,
                                          text=str(e), stalled_before=False, shards_leg=False)
         assert verdict == (False, "operator", False)   # never a miner burn
-
-
-def test_the_kept_pod_is_held_for_the_priced_keep(tmp_path):
-    """The kept pod's budget is the priced keep, capped at
-    ``harvest_keep_max_seconds`` (a finished 12 h leg: the 3 h cap)."""
-    with torch_blocked():
-        from cascade.trainer import harvest_guard
-    r = _runner(tmp_path, harvest_keep_max_seconds=10800, harvest_keep_cost_fraction=0.5)
-    assert harvest_guard.keep_budget_seconds(r, {"trained_seconds": 12 * 3600}) == 10800
+    # held for the priced keep, capped at harvest_keep_max_seconds
+    assert harvest_guard.keep_budget_seconds(r, {"trained_seconds": 12 * 3600}) == \
+        r.cfg.round.harvest_keep_max_seconds
 
 
 # ── the knob: loader parse + round trip ─────────────────────────────────────
