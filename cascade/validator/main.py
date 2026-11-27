@@ -47,9 +47,15 @@ def _build_parser() -> argparse.ArgumentParser:
                    "provisioner's [provisioner.mkt] stage publishes to this hosts file "
                    "(requested via <file>.request while rows are due; off the settlement "
                    "thread). Unset = MarketCast forecasts on --device")
-    p.add_argument("--mkt-host-wait", type=float, default=1800.0,
+    from ..provision.policy import MKT_BOOT_WORST_S
+
+    # default = the provisioner's worst-case boot of the mkt pod (one
+    # replacement included): a shorter wait released the request mid-boot and
+    # the fresh pod was torn down as idle — every settlement
+    p.add_argument("--mkt-host-wait", type=float, default=MKT_BOOT_WORST_S,
                    help="seconds one MarketCast publish run waits for its pod before the "
-                   "rounds are retried at the next settlement")
+                   "rounds are retried at the next settlement (default: the provisioner's "
+                   f"worst-case mkt pod boot, {MKT_BOOT_WORST_S:.0f} s)")
     p.add_argument("--eval-hosts", type=Path, default=None,
                    help="hosts.toml with a GPU pod to offload the public-benchmark "
                         "evals to — the GIFT-Eval gate and, on the main validator, "
@@ -452,6 +458,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.mkt_eval_hosts is not None:
         runner.mkt_eval_hosts = Path(args.mkt_eval_hosts)
         runner.mkt_host_wait_s = float(args.mkt_host_wait)
+        from ..provision.policy import MKT_BOOT_WORST_S
+
+        if runner.mkt_host_wait_s < MKT_BOOT_WORST_S:
+            logging.getLogger("cascade.validator").warning(
+                "marketcast offload: --mkt-host-wait %.0fs is shorter than the provisioner's "
+                "worst-case mkt pod boot (%.0fs) — a slow boot releases the request and the "
+                "pod is torn down unused", runner.mkt_host_wait_s, MKT_BOOT_WORST_S)
         logging.getLogger("cascade.validator").info(
             "marketcast offload: rows forecast on the pod published to %s (request %s.request, "
             "wait %.0fs)", args.mkt_eval_hosts, args.mkt_eval_hosts, args.mkt_host_wait)

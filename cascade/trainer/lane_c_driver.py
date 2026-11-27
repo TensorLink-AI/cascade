@@ -65,6 +65,7 @@ from typing import Protocol
 
 from ..funding.queue import COMPETITION_ENDED_CLASS, OPERATOR_FAULT_CLASS, split_lane_c_ref
 from ..shared.atomic import read_text_with_backup, write_text_atomic
+from ..shared.config.lane_c import is_mkt_target
 from ..shared.era import image_record_at
 from . import leg_reattach as _reattach
 from .finetune import LegRecipe, RecipeError
@@ -593,7 +594,8 @@ class LaneCDriver:
                 self.save()
             if pend is None:
                 todo = list(self.st.finished)   # DEC-CA-0064: the pinned base never moves
-                mkt_reports, mkt_await = self._mkt_arbiters(rid, block)
+                mkt_reports, mkt_await = self._mkt_arbiters(
+                    rid, block, entries=sum(is_mkt_target(f["leg"]["target"]) for f in todo))
                 reports, awaits = self._arbiters(rid, block)
                 if not todo and not mkt_reports and not reports:
                     self.st.settled[rid] = {"digest": "", "key": "", "entries": 0}
@@ -670,14 +672,20 @@ class LaneCDriver:
                  rid, len(pointers), pend["key"], str(pend["digest"])[:16])
         return str(pend["digest"])
 
-    def _mkt_arbiters(self, rid: str, block: int) -> tuple[dict, list]:
+    def _mkt_arbiters(self, rid: str, block: int, *, entries: int = 1) -> tuple[dict, list]:
         """``(mkt_reports, next mkt_await)`` for settlement ``rid``: every
         earlier awaited settlement whose report the trainer can now read is
-        recorded by the sha256 of the exact text, every one awaited for
-        ``report_timeout_settlements`` settlements as ``"absent"``; ``rid``
-        itself joins the awaited list (its report is published while the
-        validators judge it). Inert ⇒ ``({}, [])`` and nothing is read.
-        Caller holds the lock."""
+        recorded by the sha256 of the exact text, every one CONFIRMED missing
+        (404 / NoSuchKey) at ``report_timeout_settlements`` settlements as
+        ``"absent"`` — a read ERROR (a Hippius outage) is not a miss and never
+        ages the wait; ``rid`` itself joins the awaited list (its report is
+        published while the validators judge it) unless the main validator
+        can have no MarketCast candidate for it: none of its ``entries`` is a
+        MarketCast entry, this settlement records no report (no carry) and no
+        earlier round is still awaited (no validator-side expiry carry). The
+        validator only queues a round with candidates, so an arbiter of a
+        candidate-less round is never read — skipping it changes no verdict.
+        Inert ⇒ ``({}, [])`` and nothing is read. Caller holds the lock."""
         from ..shared.marketcast_report import REPORT_ABSENT, mkt_text_digest
 
         mc = getattr(self.cfg, "marketcast", None)
@@ -687,24 +695,40 @@ class LaneCDriver:
         out: dict = {}
         keep: list[dict] = []
         for a in self.st.mkt_await:
-            r, age = str(a["rid"]), int(a.get("age", 0)) + 1
-            text = None
+            r, age = str(a["rid"]), int(a.get("age", 0))
+            text, missing = None, True
             if read is not None:
                 try:
                     text = read(r)
-                except Exception as e:  # noqa: BLE001 — unreadable now: still awaited
-                    log.warning("lane C: MarketCast report of %s unreadable (%s)", r, e)
+                except Exception as e:  # noqa: BLE001 — unreadable now: still awaited, unaged
+                    missing = False
+                    log.warning("lane C: MarketCast report of %s unreadable (%s) — not counted "
+                                "as missing (%d/%d confirmed)", r, e, age,
+                                int(mc.report_timeout_settlements))
             if text is not None:
                 out[r] = mkt_text_digest(text)
                 self._mkt_infra_requeue(text)
-            elif age >= int(mc.report_timeout_settlements):
+                continue
+            age += int(missing)
+            n = a.get("entries")
+            if missing and age >= int(mc.report_timeout_settlements):
                 out[r] = REPORT_ABSENT
-                log.warning("lane C: MarketCast report of %s absent after %d settlement(s) — "
-                            "recorded absent (its entries defer as infra)", r, age)
+                if n is None or int(n) > 0:
+                    # ALERT: the round HAS candidates; every one now defers as
+                    # infra — a chain of these runs max_infra_deferrals days
+                    log.error("lane C: MarketCast report of %s absent after %d settlement(s) — "
+                              "recorded absent; its %s MarketCast entr(ies) defer as infra. "
+                              "The main validator never published it: check its MarketCast "
+                              "offload (mkt pod / snapshot / block hash)", r, age,
+                              "?" if n is None else int(n))
+                else:
+                    log.warning("lane C: MarketCast report of %s absent after %d settlement(s) "
+                                "— recorded absent (no MarketCast entry of its own)", r, age)
             else:
-                keep.append({"rid": r, "age": age})
-        if not any(a["rid"] == str(rid) for a in keep):
-            keep.append({"rid": str(rid), "age": 0})
+                keep.append({**a, "rid": r, "age": age})
+        if (entries > 0 or out or keep) and not any(a["rid"] == str(rid) for a in keep):
+            keep.append({"rid": str(rid), "age": 0, **({"entries": int(entries)}
+                                                         if entries > 0 else {})})
         return out, keep
 
     def _arbiters(self, rid: str, block: int) -> tuple[dict, dict]:
@@ -738,7 +762,12 @@ class LaneCDriver:
                     try:
                         text = read(comp.report_key(r))
                     except Exception as e:  # noqa: BLE001 — unreadable now: still awaited
-                        log.warning("lane C: %s report of %s unreadable (%s)", kind, r, e)
+                        # a read ERROR is not a confirmed miss: the wait does not age
+                        age -= 1
+                        log.warning("lane C: %s report of %s unreadable (%s) — not counted as "
+                                    "missing", kind, r, e)
+                        keep.append({**a, "rid": r, "age": age})
+                        continue
                 if text is not None:
                     out[r] = comp.report_digest(text)
                     try:

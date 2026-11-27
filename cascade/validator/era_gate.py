@@ -350,31 +350,28 @@ class EraGateMixin:
             if not _recorded(m):
                 return (f"era_init_mismatch: merge {m.get('rebased_pointer')!r} is not a "
                         "lane-B win this validator recorded")
-        try:
-            import torch
-            from safetensors.torch import load_file
-
-            from ..trainer.expert_lane import _moe_names, apply_merges
-
-            king = next(e for e in manifest.entries if e.role == "king")
-
-            def _load_dir(p):
-                return self._fetch_checkpoint_dir(replace(king, trained_pointer=p))
-
-            base_dir = _load_dir(manifest.warm_start_base)
-            want = apply_merges(
-                load_file(str(base_dir / "weights.safetensors")), list(manifest.warm_start_merges),
-                lambda p: load_file(str(_load_dir(p) / "weights.safetensors")),
-                _moe_names(base_dir), strict=strict)
-            got = load_file(str(_load_dir(manifest.warm_start_ckpt) / "weights.safetensors"))
-        except StopIteration:
+        king = next((e for e in manifest.entries if e.role == "king"), None)
+        if king is None:
             return "era_init_mismatch: merged init declared without a king entry"
-        except _merge_error_type() as e:
-            # deterministic: a merge touching rows outside its selection
-            return f"era_init_mismatch: {e}"
-        except Exception as e:  # noqa: BLE001 — unreadable ⇒ transient (retried in grace)
+
+        def _load_dir(p):
+            return self._fetch_checkpoint_dir(replace(king, trained_pointer=p))
+
+        # The rebuild (member + Σ deltas == declared init, tensor for tensor)
+        # runs where _lane_b_merge_ops says — the validator's eval host; this
+        # process never loads the weights (merged_rebuild_check, same bytes).
+        try:
+            got = self._lane_b_merge_ops(_load_dir).merge_verify(
+                manifest.warm_start_base, list(manifest.warm_start_merges),
+                manifest.warm_start_ckpt, strict=strict)
+        except Exception as e:  # noqa: BLE001 — unreadable / no host ⇒ transient (retried in grace)
             raise StorageError(f"era_init_unverifiable: {type(e).__name__}: {e}") from e
-        if want.keys() != got.keys() or any(not torch.equal(want[k], got[k]) for k in want):
+        if "merge_error" in got:
+            # deterministic: a merge touching rows outside its selection
+            return f"era_init_mismatch: {got['merge_error']}"
+        if "value_error" in got:   # not a MergeError: transient, as it always was
+            raise StorageError(f"era_init_unverifiable: ValueError: {got['value_error']}")
+        if not got.get("equal"):
             return "era_init_mismatch: merged init bytes differ from member + recorded merges"
         self._merged_init_ok.add(cache_key)
         return None

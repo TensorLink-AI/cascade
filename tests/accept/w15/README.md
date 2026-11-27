@@ -182,3 +182,11 @@ Tests: `test_w15_score_cache.py`.
   whole cohort. `load_inputs_services` always loads the list (optional
   `scoring_envs` path key) and builds the cache from the optional
   `score_cache_dir` key.
+
+## Public half in the score cache (owner 2026-11-27)
+
+The eval host's public replies (`{scores, dropped}`) are cached in the B6
+namespace, keyed `(digest, context, horizon, public_key(draws, block_hash,
+max_channels))`; a retry of the same settlement asks the host for nothing, a
+host change re-scores the cohort. The live `retain` never drops them;
+`retain_public` keeps the current run's. `test_w15_public_score_cache.py`.

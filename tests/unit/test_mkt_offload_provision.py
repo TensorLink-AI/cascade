@@ -103,8 +103,19 @@ def test_the_lease_ttl_backstops_a_request_kept_alive(tmp_path):
     _request(loop)
     _cycle(loop)
     clock.t += 3 * 3600 + 1                                     # mkt_lease_hours = 3
-    _request(loop)
+    _request(loop, age_s=600)                                   # live, but no heartbeat
     loop.run_once()                                             # teardown before the re-rent
+    assert prov.terminated == [f"cascade-{int(T0)}-mkt-0"]
+
+
+def test_the_max_lease_backstops_a_heartbeat_kept_alive(tmp_path):
+    clock = Clock(T0)
+    loop, prov = _loop(tmp_path, clock=clock)
+    _request(loop)
+    _cycle(loop)
+    clock.t += 6 * 3600 + 1                                     # mkt_lease_max_hours = 6
+    _request(loop)
+    loop.run_once()
     assert prov.terminated == [f"cascade-{int(T0)}-mkt-0"]
 
 

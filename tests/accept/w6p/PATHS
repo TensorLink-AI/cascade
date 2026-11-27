@@ -17,3 +17,6 @@ data/lane_d/rmisc_allowed.toml
 cascade/eval/lane_d_public_mirror.py
 cascade/eval/lane_d_public_build.py
 deploy/laned/public_mirror.toml
+# 2026-11-27: the mirror's warm sweep, the thread-safe O(1)-per-put blob
+# cache, single-flight blob reads, read_workers, public-read uploads and the
+# fix-acl sweep (scripts/laned_public_mirror.py fix-acl).

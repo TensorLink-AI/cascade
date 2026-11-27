@@ -188,6 +188,66 @@ def merge_check_dirs(kd: Path, cd: Path, selection: dict, *, strict: bool) -> st
     return None
 
 
+def merged_rebuild_check(load_dir: Callable[[str], Path], base_pointer: str, merges: list,
+                         target_pointer: str, *, strict: bool) -> dict:
+    """Does ``target_pointer``'s ``weights.safetensors`` equal ``base`` +
+    :func:`~cascade.trainer.expert_lane.apply_merges` of ``merges``, tensor
+    for tensor? The weight-level half of the validator's merged-init check
+    (``EraGateMixin._verify_merged_init``) and of each acceptance step
+    (``merge_acceptance.verify_acceptance``), in one function so the eval pod
+    (``lane_b_offload`` op ``merge_verify``) and a local stand-in run the same
+    bytes. ``load_dir(pointer)`` returns a fetched checkpoint dir.
+
+    Returns exactly one of ``{"equal": bool}``, ``{"merge_error": str}`` (a
+    ``moe_model.MergeError``: a deterministic merge refusal) or
+    ``{"value_error": str}`` (any other ``ValueError`` — the callers kept
+    their own classification of it: transient at the era gate, a refusal in
+    acceptance). Anything else raises (transient)."""
+    import torch
+    from safetensors.torch import load_file
+
+    from ..trainer.expert_lane import _moe_names, apply_merges
+    from ..trainer.moe_model import MergeError
+
+    def load(pointer: str) -> dict:
+        return load_file(str(Path(load_dir(pointer)) / "weights.safetensors"))
+
+    try:
+        base_dir = Path(load_dir(base_pointer))
+        want = apply_merges(load_file(str(base_dir / "weights.safetensors")), list(merges),
+                            load, _moe_names(base_dir), strict=strict)
+        got = load(target_pointer)
+    except MergeError as e:
+        return {"merge_error": str(e)}
+    except ValueError as e:
+        return {"value_error": str(e)}
+    equal = want.keys() == got.keys() and all(torch.equal(want[k], got[k]) for k in want)
+    return {"equal": bool(equal)}
+
+
+class LocalLaneBMergeOps:
+    """Lane B's weight-level checks IN THIS PROCESS over ``fetch_dir``: the
+    path of a bare ``LaneBMixin`` / ``EraGateMixin`` (unit and acceptance
+    stand-ins, ``cascade-audit``-style replays). The production
+    ``ValidatorRunner`` never uses it — it routes these checks to its eval
+    host (``ValidatorRunner._lane_b_merge_ops``) unless the explicit local
+    opt-in ``CASCADE_LANE_B_LOCAL_EVAL=1`` is set. Same interface as
+    :class:`cascade.trainer.lane_b_offload.LaneBPodRunner`."""
+
+    def __init__(self, fetch_dir: Callable[[str], Path]):
+        self._fetch_dir = fetch_dir
+
+    def merge_check(self, king_pointer: str, cand_pointer: str, selection: dict,
+                    strict: bool) -> str | None:
+        return merge_check_dirs(self._fetch_dir(king_pointer), self._fetch_dir(cand_pointer),
+                                selection, strict=strict)
+
+    def merge_verify(self, base_pointer: str, merges: list, target_pointer: str, *,
+                     strict: bool) -> dict:
+        return merged_rebuild_check(self._fetch_dir, base_pointer, merges, target_pointer,
+                                    strict=strict)
+
+
 def judge_entry(entry: ExpertEntry, *, manifest: ExpertManifest, king_pointer: str,
                 king_scores, evaluate: Callable[[str], list], fetch_dir: Callable[[str], Path],
                 cfg, seed: str, recompute_selection: Callable | None = None,
@@ -216,11 +276,11 @@ def judge_entry(entry: ExpertEntry, *, manifest: ExpertManifest, king_pointer: s
     anchor, anchor score or anchor row refuses the suite slots
     (``anchor_missing``); domain and horizon slots are unaffected.
 
-    ``merge_check`` (trainer only; validators leave it None) replaces the
-    local fetch + :func:`merge_check_dirs` of stage ``merge`` with the same
-    check run elsewhere (the trainer's eval pod — the trainer box never loads
-    a checkpoint): ``(king, candidate, selection, strict) -> reason | None``.
-    A transport failure propagates, like a fetch failure."""
+    ``merge_check`` replaces the local fetch + :func:`merge_check_dirs` of
+    stage ``merge`` with the same check run elsewhere (the trainer's and the
+    validator's eval pod — neither box loads a checkpoint):
+    ``(king, candidate, selection, strict) -> reason | None``. A transport
+    failure propagates, like a fetch failure."""
     if manifest.king_pointer != king_pointer:
         return ExpertJudgement(entry, False, "stale",
                                f"rebased onto {manifest.king_pointer}, king is {king_pointer}")

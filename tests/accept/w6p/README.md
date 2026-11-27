@@ -119,3 +119,18 @@ change**: the streaming build writes the very `index.jsonl.gz` /
 | draw → fetch touches only the drawn series | `test_draw_then_fetch_touches_only_the_drawn_series` |
 | resumable, idempotent, parallel build | `test_the_build_resumes_by_shard_and_is_idempotent`, `test_parallel_workers_build_the_same_mirror` |
 | box index fetch, estimate, config | `test_fetch_index_gives_the_box_a_verified_index`, `test_estimate_extrapolates_the_measured_ratio`, `test_mirror_config_names_stores_and_the_volume_cache` |
+
+## Public half throughput (owner 2026-11-27)
+
+One settlement draws 10,000 public windows; serial ranged reads measured
+31-45 blobs/min against a ~588 GiB mirror, so the 3600 s eval timeout could
+never be met. `test_w6p_public_warm.py` (no pyarrow: opaque synthetic shards
+over W7a's index-only fixture):
+
+| Contract | Tests |
+|---|---|
+| `PublicMirror.warm` / `warm_plan`: every blob of the shard map + tails, verified, one ranged GET per run of adjacent row groups (≤ `span_bytes`), resumable | `test_warm_fills_every_blob_with_few_ranged_gets_and_a_rerun_fetches_nothing`, `test_warm_spans_are_capped_so_memory_stays_bounded`, `test_an_interrupted_warm_resumes` |
+| byte budget without eviction; a tampered span falls back per blob (R2) | `test_warm_respects_the_fill_budget_and_never_evicts`, `test_warm_verifies_every_blob_and_falls_back_per_blob` |
+| `python -m cascade.eval.lane_d_forecasts warm-public --index SOURCE=SHA [--dry-run]` | `test_warm_public_cli_plans_and_fills` |
+| `BlobCache.put` under budget does not scan the blob tree; one shard tail is fetched once by concurrent readers; `read_workers` config | `test_a_put_under_budget_does_not_scan_the_blob_tree`, `test_concurrent_readers_of_one_shard_fetch_its_tail_once`, `test_read_workers_come_from_the_mirror_config` |
+| uploads `public-read` (R2 without the ACL), `fix-acl` sweep | `test_uploads_are_public_read_and_r2_falls_back_without_the_acl`, `test_fix_acl_sweeps_every_object_under_the_prefix` |
