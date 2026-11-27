@@ -158,14 +158,44 @@ def _after_release_gate(cfg) -> dict:
             "alt_code_fingerprint": v2.worker_code_fingerprint_after}
 
 
+def stage_gate_pins(cfg) -> dict:
+    """Per-stage health-gate pins for stages that boot their own release.
+
+    MarketCast pods (stage ``mkt``) boot ``[marketcast] pod_image`` with its
+    ``worker_code_fingerprint`` — a different digest and fingerprint from the
+    fleet's ``[training] train_image_digest`` / ``[round]
+    worker_code_fingerprint``. Gating them on the fleet pins failed every mkt
+    pod (replace → terminate → retry every 600 s; mkt_hosts.toml never
+    written). Each field falls back to the fleet pin only when the
+    ``[marketcast]`` one is empty; no ``pod_image`` ⇒ no override (the mkt
+    pods run the fleet image)."""
+    from .core import image_digest_of
+
+    mc = getattr(cfg, "marketcast", None)
+    pod_image = str(getattr(mc, "pod_image", "") or "")
+    if not pod_image:
+        return {}
+    digest = image_digest_of(pod_image) or cfg.training.train_image_digest
+    fp = (str(getattr(mc, "worker_code_fingerprint", "") or "")
+          or cfg.round.worker_code_fingerprint)
+    return {"mkt": (digest, fp)}
+
+
 def make_health_check(policy: ProvisionPolicy, render: RenderSettings, *,
                       image_digest: str, min_disk_gb: float,
                       hippius_probe, code_fingerprint: str = "",
-                      alt_image_digest: str = "", alt_code_fingerprint: str = "") -> callable:
+                      alt_image_digest: str = "", alt_code_fingerprint: str = "",
+                      stage_pins: dict | None = None) -> callable:
     """Bind the pure :class:`HealthGate` to a real ``ssh`` transport per pod.
 
     Gates are built lazily per ``(stage, provider)``: the pod's user/workdir/
-    python differ by provider (lium=root, shadeform=the ``shadeform`` user)."""
+    python differ by provider (lium=root, shadeform=the ``shadeform`` user).
+
+    ``stage_pins`` (stage → ``(image_digest, code_fingerprint)``) overrides the
+    fleet pins for a stage whose pods boot a different release — MarketCast
+    pods run ``[marketcast] pod_image`` (see :func:`stage_gate_pins`). A
+    pinned stage does not admit the fleet's DEC-CA-0067 after-release alts."""
+    pins = dict(stage_pins or {})
     from ..trainer.remote import RemoteHost, build_ssh_argv, run_ssh
 
     gates: dict = {}
@@ -183,14 +213,20 @@ def make_health_check(policy: ProvisionPolicy, render: RenderSettings, *,
         gate_gpus = gpus or (sp.gpus_per_pod if sp is not None else 1)
         key = (stage, provider, gate_sku, gate_gpus)
         if key not in gates:
+            if stage in pins:
+                gate_digest, gate_fp = pins[stage]
+                alts: dict = {}
+            else:
+                gate_digest, gate_fp = image_digest, code_fingerprint
+                alts = ({"alt_image_digest": alt_image_digest,
+                         "alt_code_fingerprint": alt_code_fingerprint}
+                        if alt_code_fingerprint else {})
             gates[key] = HealthGate(
                 sku=gate_sku, gpus=gate_gpus,
                 remote_python=prof.remote_python, workdir=prof.workdir,
-                image_digest=image_digest, min_disk_gb=min_disk_gb,
-                code_fingerprint=code_fingerprint,
-                **({"alt_image_digest": alt_image_digest,
-                    "alt_code_fingerprint": alt_code_fingerprint}
-                   if alt_code_fingerprint else {}),
+                image_digest=gate_digest, min_disk_gb=min_disk_gb,
+                code_fingerprint=gate_fp,
+                **alts,
                 hippius_probe=hippius_probe,
                 home_dir=("/root" if prof.user == "root" else f"/home/{prof.user}"),
             )
@@ -726,6 +762,9 @@ def _run(args) -> int:
             # once that release is QUALIFIED (owner rule; see
             # cascade.shared.image_qualification)
             **_after_release_gate(cfg),
+            # MarketCast pods boot [marketcast] pod_image: gate them on ITS
+            # digest + fingerprint, not the fleet's
+            stage_pins=stage_gate_pins(cfg),
         ),
         bootstrap=bootstrap,
         prewarm=make_config_push(render, box_chain_toml=str(args.chain_toml),

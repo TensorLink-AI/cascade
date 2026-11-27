@@ -204,6 +204,33 @@ def _kept_past_budget(runner, pod_id: str, now: float) -> bool:
         return False
 
 
+
+def payer_projection_rate(rnd, gpu_choice, *, marketcast: bool = False) -> float:
+    """The $/h the pre-rent payer-balance check projects a leg at.
+
+    Lane A/B (unchanged): ``max([round] payer_projected_rate_per_hour, the
+    chosen type's rate)`` — a chosen type at the miner's ``max_price_per_hour``
+    or, uncapped, ``[round] funded_max_price_per_hour``.
+
+    MarketCast (owner bug sweep 2026-11-27): the lane A knob ($15/h, sized for
+    an 8-GPU lane A leg) never applies — a 1xRTX3090 leg capped at $0.5/h with
+    $5 on Lium was refused for wanting $15+ and requeued until its TTL. The
+    leg is projected at the cap its rent applies (runner_capacity): the
+    miner's ``max_price_per_hour`` for a chosen type, else the operator
+    ceiling over ``[marketcast] funded_pod_skus``
+    (``funded_max_price_per_hour``). Only when no cap exists at all does the
+    knob stand in (a balance check must project at some rate)."""
+    knob = float(getattr(rnd, "payer_projected_rate_per_hour", 0.0) or 0.0)
+    ceiling = float(getattr(rnd, "funded_max_price_per_hour", 0.0) or 0.0)
+    own = float(getattr(gpu_choice, "max_price_per_hour", 0.0) or 0.0)
+    chosen = bool(str(getattr(gpu_choice, "gpu", "") or "").strip())
+    if marketcast:
+        if chosen and own > 0:
+            return own
+        return ceiling or knob
+    chosen_rate = (own or ceiling) if chosen else 0.0
+    return max(knob, chosen_rate)
+
 class _FundedPodMixin:
     """Per-payer funded pods (DEC-CA-0036, ``[round] funded_pods = "rent"``)."""
 
@@ -1440,15 +1467,17 @@ class _FundedPodMixin:
             from ..funding.queue import PAYER_BALANCE_CLASS
             from .money_guard import payer_balance_refusal
 
-            # A miner-chosen type is projected at the miner's own cap (an
-            # 8xH200 at $30+/h must not be under-projected at the knob) or,
-            # uncapped, at the operator's funded ceiling.
-            knob = float(getattr(rnd, "payer_projected_rate_per_hour", 0.0) or 0.0)
-            chosen_rate = (float(getattr(gpu_choice, "max_price_per_hour", 0.0) or 0.0)
-                           or float(getattr(rnd, "funded_max_price_per_hour", 0.0) or 0.0)
-                           ) if getattr(gpu_choice, "gpu", "") else 0.0
+            # Lane A/B: a miner-chosen type is projected at the miner's own
+            # cap (an 8xH200 at $30+/h must not be under-projected at the
+            # knob) or, uncapped, at the operator's funded ceiling. A
+            # MarketCast leg (one process on cuda:0, any Lium GPU) is
+            # projected at the cap its rent actually applies, never the lane
+            # A knob (see payer_projection_rate).
+            rate = payer_projection_rate(rnd, gpu_choice,
+                                         marketcast=getattr(local, "mkt_rent_skus",
+                                                            None) is not None)
             poor = payer_balance_refusal(self, api_key, hours=self._leg_wall_seconds() / 3600.0,
-                                         rate=max(knob, chosen_rate), who=gen.hotkey[:12])
+                                         rate=rate, who=gen.hotkey[:12])
             if poor:
                 # nothing rented, requeued with a backoff — never terminal,
                 # never a burn, never counted against any cap
