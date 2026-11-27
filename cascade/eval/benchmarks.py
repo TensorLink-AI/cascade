@@ -281,10 +281,42 @@ def item_rows_from_report(report: dict | None) -> dict | None:
             revision = (report.get("data_revisions") or {}).get(s.get("suite"))
             if revision:
                 out[key]["data_revision"] = str(revision)
+            method = report.get("bench_method")
+            if isinstance(method, str) and method:
+                # #972: how the contexts were built; an auditor re-sweeps with it
+                out[key]["bench_method"] = method
     except Exception as e:  # noqa: BLE001 — best-effort parse, never fatal
         log.warning("benchmarks: could not parse item rows: %s", e)
         return None
     return out
+
+
+# #972 (W-BMASK): the sidecar's context conventions. Rows without a
+# ``bench_method`` stamp were swept before it, with the legacy one.
+BENCH_METHOD = "observed_mask/1"
+LEGACY_BENCH_METHOD = "impute/0"
+BENCH_METHODS = (BENCH_METHOD, LEGACY_BENCH_METHOD)
+
+
+def rows_bench_method(rows: dict | None) -> str | None:
+    """The bench method published item ``rows`` were swept with:
+    :data:`LEGACY_BENCH_METHOD` when no suite carries a stamp, the stamp when
+    every stamped suite agrees, ``None`` when stamps disagree."""
+    stamps = {str(v.get("bench_method")) for v in (rows or {}).values()
+              if isinstance(v, dict) and v.get("bench_method")}
+    if not stamps:
+        return LEGACY_BENCH_METHOD
+    return stamps.pop() if len(stamps) == 1 else None
+
+
+def bench_method_arg(method: str | None) -> list[str]:
+    """``--bench-method`` for the sidecar, only when one is asked for (None =
+    the sidecar's default, :data:`BENCH_METHOD`)."""
+    if method is None:
+        return []
+    if method not in BENCH_METHODS:
+        raise ValueError(f"bench method {method!r}: expected one of {BENCH_METHODS}")
+    return ["--bench-method", method]
 
 
 def run_item_rows(
@@ -323,17 +355,20 @@ def run_bench_report(
     timeout_s: int = DEFAULT_TIMEOUT_S,
     uv_bin: str | None = None,
     workers: str | int | None = None,
+    bench_method: str | None = None,
 ) -> dict | None:
     """Run the sidecar on ``suites`` and return its RAW report (both the
     suite-level numbers :func:`extract_bench_scores` reads and the per-item
     rows :func:`item_rows_from_report` reads), or ``None`` on any failure.
     The DEC-CA-0063 validator sweep and :func:`run_item_rows` share it.
     ``workers`` = the sidecar's ``--workers`` (``"auto"`` / N; the report is
-    identical for every value)."""
+    identical for every value). ``bench_method`` = the sidecar's
+    ``--bench-method`` (None = its default; the audit passes a published
+    report's own method)."""
     return run_bench_reports(
         [checkpoint_dir], project_dir=project_dir, suites=suites, num_samples=num_samples,
         batch_size=batch_size, max_series=max_series, device=device, data_dir=data_dir,
-        timeout_s=timeout_s, uv_bin=uv_bin, workers=workers)[0]
+        timeout_s=timeout_s, uv_bin=uv_bin, workers=workers, bench_method=bench_method)[0]
 
 
 def run_bench_reports(
@@ -349,6 +384,7 @@ def run_bench_reports(
     timeout_s: int = DEFAULT_TIMEOUT_S,
     uv_bin: str | None = None,
     workers: str | int | None = None,
+    bench_method: str | None = None,
 ) -> list[dict | None]:
     """:func:`run_bench_report` for several checkpoints in ONE paired sidecar
     pass (the DEC-CA-0063 challenger + king / king + init sweeps): one RAW
@@ -363,6 +399,7 @@ def run_bench_reports(
     if data_dir:
         tail += ["--data-dir", data_dir]
     tail += bench_workers_arg(workers)
+    tail += bench_method_arg(bench_method)
     if len(checkpoint_dirs) == 1:
         return [_invoke_sidecar(checkpoint_dirs[0], project_dir, tail,
                                 timeout_s=timeout_s, uv_bin=uv_bin)]
