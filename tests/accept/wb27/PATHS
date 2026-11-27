@@ -120,3 +120,4 @@ tests/accept/wb27/test_wb27_validator_remote.py
 cascade/trainer/pyramid_fast.py
 cascade/trainer/expert_training.py
 tests/accept/wb27/test_wb27_expert_fast_path.py
+tests/accept/wb27/test_wb27_expert_mm_autocast.py

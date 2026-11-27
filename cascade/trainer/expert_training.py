@@ -29,13 +29,22 @@ class _ExpertMatmul(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad):
+        # 2026-11-27: training runs under bf16 autocast, so the forward's bmm
+        # (and ``grad``/``xs``) are bf16 while the leaves stay fp32; backward
+        # runs outside autocast, and mixing them raised "expected scalar type
+        # Float but found BFloat16" on the first live rc4 leg. Compute in the
+        # grad's dtype (what autocast's own backward does) and return each
+        # gradient in its input's dtype.
         frozen, selected, rows, xs = ctx.saved_tensors
+        cd = grad.dtype
         gs = grad.index_select(0, rows)
         dx = None
         if ctx.needs_input_grad[0]:
-            dx = torch.bmm(grad, frozen.mT)
-            dx.index_copy_(0, rows, torch.bmm(gs, selected.mT))
-        ds = torch.bmm(xs.mT, gs) if ctx.needs_input_grad[2] else None
+            dx = torch.bmm(grad, frozen.mT.to(cd))
+            dx.index_copy_(0, rows, torch.bmm(gs, selected.mT.to(cd)))
+        ds = None
+        if ctx.needs_input_grad[2]:
+            ds = torch.bmm(xs.mT.to(cd), gs).to(selected.dtype)
         return dx, None, ds, None
 
 
