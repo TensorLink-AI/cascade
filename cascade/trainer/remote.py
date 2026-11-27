@@ -125,6 +125,8 @@ class RemoteDispatchError(RuntimeError):
         # fault classifier trusts, never the message text, which carries a
         # stderr tail anything on the pod could have printed.
         self.final_exception = final_exception
+        # the dispatched worker role, set by the dispatcher on a worker exit
+        self.role = ""
 
 
 HOST_STAGES = ("any", "heat", "final", "init")
@@ -2534,6 +2536,9 @@ class RemoteDispatcher:
                 returncode=proc.returncode,
             )
             err.image_refusal = worker_image_refusal(proc.returncode, proc.stdout or "")
+            # the dispatched role (2026-11-27): a CUDA OOM of a miner-sized
+            # leg (faults.MINER_SIZED_ROLES) is the recipe's, never re-rented
+            err.role = str(role or "")
             raise err
         receipt = parse_receipt(proc.stdout or "")
         if self.detached and prior and loose:

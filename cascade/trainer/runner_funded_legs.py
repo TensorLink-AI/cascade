@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from ..funding.queue import OPERATOR_FAULT_CLASS
 from .corpus import DIVERGED_MARKER
 from .faults import (
+    GPU_OOM_CLASS,
     KEY_LOST_REASON,
     STALL_CLASS,
     CheckpointUnverifiable,
@@ -21,6 +22,7 @@ from .faults import (
     _OperatorFault,
     classify_funded_worker_failure,
     classify_leg_exception,
+    gpu_oom_message,
 )
 from .harvest_release import release_after_verified_harvest
 from .progress import progress_binding, report_progress
@@ -301,7 +303,7 @@ class _FundedLegMixin:
                     self, gen, seeds, e, rc=getattr(e, "returncode", None), text=str(e),
                     stalled_before=bool(prior is not None
                                         and prior.last_error_class == STALL_CLASS),
-                    shards_leg=_shards_leg(contract, corpus))
+                    shards_leg=_shards_leg(contract, corpus), role=role)
                 if error_class == "infra":
                     error_class = OPERATOR_FAULT_CLASS
             from .faults import record_no_lanes_verdict
@@ -648,7 +650,11 @@ class _FundedLegMixin:
                 self, gen, seeds, e, rc=rc, text=text,
                 stalled_before=bool(prior is not None
                                     and prior.last_error_class == STALL_CLASS),
-                shards_leg=_shards_leg(contract, corpus))
+                shards_leg=_shards_leg(contract, corpus), role=role)
+            if error_class == GPU_OOM_CLASS:
+                # 2026-11-27: the recipe outgrew the GPU — the entry ends here
+                # (a re-rent of the same type would OOM again on their key)
+                text = f"{gpu_oom_message(str(getattr(pod, 'sku', '') or ''))}: {text}"
             if not miner_fault and error_class == "infra":
                 # Money safety II: a lost MINER pod is asked of the payer's
                 # own account first — a pod they stopped / cancelled or a

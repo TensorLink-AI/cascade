@@ -144,6 +144,28 @@ def lane_b_repo_fetcher(cache_dir: Path, *, store=None, hub=None,
     return fetch
 
 
+def mkt_recipe_fetcher(cache_dir: Path, *, hub=None):
+    """2026-11-27: ``fetch_mkt_recipe(ref) -> dict`` for the intake's
+    MarketCast GPU fit check: only ``marketcast.json`` of the (content-pinned)
+    recipe tree is downloaded, into ``cache_dir/<sha256 of ref>``, and parsed
+    as JSON — never imported or run. Raises on a fetch or parse failure (the
+    intake then skips the check, logged)."""
+    import hashlib
+    import json
+
+    from ..shared.hippius import fetch_from_hub
+    from ..shared.marketcast_recipe import MARKETCAST_RECIPE_FILE
+
+    cache = Path(cache_dir)
+
+    def fetch(ref: str) -> dict:
+        dest = cache / hashlib.sha256(ref.encode("utf-8")).hexdigest()
+        fetch_from_hub(ref, dest, hub, allow_patterns=[MARKETCAST_RECIPE_FILE])
+        return json.loads((dest / MARKETCAST_RECIPE_FILE).read_text(encoding="utf-8"))
+
+    return fetch
+
+
 def withdrawn_clears_approvals(queue_path: Path):
     """``hotkey -> None``: drop the hotkey's PENDING or APPROVED-but-unlaunched
     operator make-good request for this queue (``work_root/operator_approvals
@@ -795,6 +817,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                  lane_a_until, "" if head_block is not None
                  else " — INERT: no chain head under --trust-refs")
 
+    fetch_mkt_recipe = None
+    if cfg is not None:
+        from ..shared.hippius import HubConfig
+
+        fetch_mkt_recipe = mkt_recipe_fetcher(Path(args.queue_path).parent / "_mkt_recipes",
+                                              hub=HubConfig.from_storage(cfg.storage))
     intake = FundingIntake(
         # Entry TTL tracks the key TTL by construction here; the trainer's
         # [round] funded_entry_ttl_hours must be set to the same value.
@@ -814,6 +842,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         gpu_catalog=gpu_catalog,
         lane_b_gpus=lane_b_gpus,
         mkt_gpu_catalog=mkt_gpu_catalog,
+        # 2026-11-27: the MarketCast recipe's GPU memory fit check at fund time
+        fetch_mkt_recipe=fetch_mkt_recipe,
+        mkt_cfg=(cfg.marketcast if cfg is not None else None),
         # WB23: the reference steps of the lane B base contract cap the steps
         # a train_hours fund fixes (the validator's consensus cap). The lane B
         # queue itself is wired by ``lanes.apply`` (EffectiveLanes, #874).

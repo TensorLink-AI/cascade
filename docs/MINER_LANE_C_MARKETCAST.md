@@ -189,6 +189,47 @@ your own Lium key: send a plain Lium key, because MarketCast never rents on
 Shadeform. Nothing is refunded if the type is slow, cannot boot, runs out of
 memory or crashes.
 
+### GPU memory: the fit check and the no-retry rule
+
+The recipe limits allow far more than a 24 GB card holds. At fund time the
+intake reads your recipe's `marketcast.json` and estimates the peak GPU
+memory of one training step of Timestral-28M (fp32, one GPU):
+
+- rows per sample `V = 1 + rows(covariates)` (each past covariate is one
+  row; `calendar` adds 4, `session` 3, `events` 2);
+- samples per forward `m = min(batch, max(1, micro_batch_tokens // context_length))`,
+  so `R = m * V` rows;
+- patches per row `n = ceil(context_length / 32) + hp` (`hp` = the largest
+  horizon in 32-step patches); with covariates each row carries `S = 2n`
+  tokens, without them `S = n`;
+- activations `4 * R * S * (15 * (16*384 + 3r) + 12 * (2*384 + 4*1024 + 2r))`
+  bytes (`r` = your LoRA rank, 0 for other scopes), plus the attention masks
+  (`4 * R * (12 * 3n² + 3 * S * R)` bytes with covariates), times 1.1, plus
+  1.5 GiB fixed.
+
+For example, batch 16, context 4096, LoRA rank 32 and ten covariates
+(`V = 17`) needs about 47 GiB. That recipe ran out of memory on a 1xRTX4090
+(23.5 GiB). It fits a 1xA100 or a 1xH100 (80 GB).
+
+- **A recommended `--gpu` below the estimate is refused** (400
+  `recipe_exceeds_gpu_memory`). The reply gives the estimate and the
+  recommended types that fit.
+- **Without `--gpu`**, the leg could rent any recommended type, so the fund is
+  refused when any of them is below the estimate. Choose one that fits with
+  `--gpu`.
+- **An own-risk type below the estimate is accepted with a warning**, like any
+  own-risk type. An own-risk type whose memory the intake does not know is
+  warned with the estimate.
+- If the intake cannot read the recipe, the check is skipped and logged.
+
+**No retry on out-of-memory.** A leg whose own run fails with CUDA out of
+memory ends the entry with `out of GPU memory on <gpu>: reduce
+batch/context/LoRA rank or choose a larger GPU` (error class `gpu_oom`). The
+trainer never re-rents the same recipe on your key, because a deterministic
+OOM would fail again. This applies to lane C fine-tunes and lane B experts.
+An OOM where another process filled the GPU is an infrastructure fault and
+is retried as before.
+
 ## What gets you refused
 
 - **Recipe limits:** learning rate above `max_lr` (1e-3), more than
