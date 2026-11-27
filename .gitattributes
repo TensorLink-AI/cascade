@@ -1,0 +1,6 @@
+# PATHS files are append-mostly lists. Two PRs adding entries to the same WP's
+# PATHS conflicted on every update-branch during the 2026-11 launch (#964/#966).
+# The union driver keeps both sides' lines. GitHub's web conflict check does not
+# run merge drivers, so update the branch locally (`git merge origin/main`)
+# when the UI reports a PATHS-only conflict.
+tests/accept/*/PATHS merge=union
