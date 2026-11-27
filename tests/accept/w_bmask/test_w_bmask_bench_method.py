@@ -40,9 +40,9 @@ def _report(method: str):
 def test_sidecar_report_carries_its_bench_method_and_legacy_context():
     obs = load_observed()
     assert hasattr(obs, "METHOD"), "observed.py has no bench method"
-    assert (obs.METHOD, obs.LEGACY_METHOD) == ("observed_mask/1", "impute/0")
+    assert (obs.METHOD, obs.LEGACY_METHOD) == ("observed_mask/2", "impute/0")
     new, old = _report(obs.METHOD), _report(obs.LEGACY_METHOD)
-    assert new["bench_method"] == "observed_mask/1"
+    assert new["bench_method"] == "observed_mask/2"
     assert old["bench_method"] == "impute/0"
     assert new["methodology"]["gift-eval"]["context"].startswith("gluonts-observed/1")
     assert old["methodology"]["gift-eval"]["context"].startswith("impute/0")
@@ -69,7 +69,7 @@ def test_legacy_method_returns_the_pinned_wrapper_unchanged(monkeypatch):
     with pytest.raises(ValueError, match="bogus/9"):
         obs.current_method()
     monkeypatch.delenv("CASCADE_BENCH_METHOD")
-    assert obs.current_method() == "observed_mask/1"
+    assert obs.current_method() == "observed_mask/2"
 
 
 # ── cascade bridge: rows stamp, method of published rows, the CLI arg ────────

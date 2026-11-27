@@ -111,9 +111,12 @@ def build_parser() -> argparse.ArgumentParser:
         metavar=("CHECKPOINT_DIR", "OUT_JSON"),
         help="also sweep this checkpoint in the same pass (paired sweep; repeatable)",
     )
-    p.add_argument("--bench-method", default=None, choices=("observed_mask/1", "impute/0"),
-                   help="context convention (observed.py): observed_mask/1 (default) or "
-                        "impute/0, the pre-#972 behaviour, to reproduce an old report")
+    p.add_argument("--bench-method", default=None,
+                   choices=("observed_mask/2", "observed_mask/1", "impute/0"),
+                   help="context convention (observed.py): observed_mask/2 (default: "
+                        "observed mask + leading padding never an attention key), "
+                        "observed_mask/1 (the observed mask only) or impute/0, the "
+                        "pre-#972 behaviour, to reproduce an old report")
     p.add_argument("--timings-json", default=None,
                    help="write per-suite wall times + the worker plan here (never in the report)")
     return p
