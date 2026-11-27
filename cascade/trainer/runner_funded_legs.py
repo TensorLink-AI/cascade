@@ -181,7 +181,8 @@ class _FundedLegMixin:
                         except _FundedOperatorFallback as e:
                             from .leg_reattach import REATTACH_REFUSED, attach_only
 
-                            if attach_only():
+                            if attach_only() and not _reattach_operator_leg(
+                                    self, e, gen, seeds, role=role, bench=bench):
                                 # a re-attach never moves a leg onto operator
                                 # capacity (that is a new rent / dispatch)
                                 self._record_funded_failure(
@@ -791,6 +792,25 @@ class _FundedLegMixin:
         if not self.cfg.round.one_submission_per_hotkey or not challengers:
             return
         _add_seen_hotkeys(self._submissions_path(), [c.hotkey for c in challengers], block)
+
+
+def _reattach_operator_leg(runner, exc, gen, seeds, *, role: str, bench: bool) -> bool:
+    """A re-attach of a leg ALREADY on an operator-rented pod (2026-11-27: a
+    finished, paid lane B 8xH200 run was refused after a restart — "the
+    entry is routed to operator capacity" — and requeued with its checkpoint
+    still on the pod). True = re-attach it: its ledgered operator pod is
+    adopted by name (``_rent_operator_leg_host`` never rents fresh under
+    :func:`~cascade.trainer.leg_reattach.reattach_only`) and the attach-only
+    dispatcher harvests the FINISHED run on it (no run there = refused). A
+    leg with no ledgered operator pod stays refused (a new rent)."""
+    from .faults import _FundedOperatorRent
+    from .money_guard import operator_leg_allocated
+
+    if not isinstance(exc, _FundedOperatorRent):
+        return False
+    if role not in ("expert", "mkt_finetune") or bench:
+        return False
+    return operator_leg_allocated(runner, str(seeds.base_seed), gen.hotkey)
 
 
 def _leg_allocated(runner, round_id: str, hotkey: str) -> bool:

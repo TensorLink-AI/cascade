@@ -684,9 +684,23 @@ class _OperatorPodMixin:
                 _skip(f"operator leg pod {pod_id} is live with a running worker but could not "
                       f"be adopted yet ({last[:160]}) — kept, re-attach retried, nothing rented",
                       "operator_transient")
+            from .leg_reattach import REATTACH_REFUSED, attach_only
+
+            if attach_only():
+                # a re-attach never lemons a pod that may hold a finished run
+                _skip(f"{REATTACH_REFUSED}: operator leg pod {pod_id} is live but could not be "
+                      f"adopted ({last[:160]}) — kept, nothing rented", "operator_transient")
             log.warning("adopted operator leg pod %s unusable (%s); renting fresh", pod_id, last)
             with contextlib.suppress(ProvisionError):
                 _lemon("adopted operator leg pod unusable")
+
+        from .leg_reattach import REATTACH_REFUSED, attach_only
+
+        if attach_only():
+            # 2026-11-27: a re-attach adopts the leg's live ledgered pod or
+            # nothing — never a fresh operator rent
+            _skip(f"{REATTACH_REFUSED}: the leg's ledgered operator pod {pod_id} is not live "
+                  "and adoptable — nothing rented", "no_capacity")
 
         from .cost_guards import measured_wall_refusal, provider_ttl_seconds
         from .runner_common import disk_guard_refusal
