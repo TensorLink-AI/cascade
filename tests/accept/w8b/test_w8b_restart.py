@@ -53,7 +53,7 @@ def test_crash_between_report_and_state_adopts_the_persisted_report(tmp_path, mo
     assert rig.report_file(h.B2).is_file(), "fixture: the report landed before the crash"
     persisted = rig.report_file(h.B2).read_bytes()
     assert w.report_key(h.B2) not in rig.store.objects
-    assert rig.step.court_for(h.B2) == [None]
+    assert rig.step.court_for(h.B2) is None, "an unpublished settlement reached the court"
     swept = len(rig.host.calls)
     rig.restart()
     rig.step(h.B2)

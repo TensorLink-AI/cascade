@@ -17,6 +17,12 @@ Semantics (tests/accept/w19/README.md):
   later step succeeds.
 - The step gets only the boundary: it must open its own chain access, never
   share the poll thread's (non-thread-safe) client.
+- Moving past an unsettled boundary (2026-11-27): when a boundary whose step
+  raised is followed by a submit of a LATER boundary, that boundary is given
+  up (never retried) and, before the later step, ``on_abandon(boundary)``
+  runs on the new step's thread (the lane D step publishes its absent
+  ``infra_deferred`` record there). A raising ``on_abandon`` is logged; the
+  later step still runs.
 
 Generic thread infrastructure, deliberately not named ``lane_d_*`` and
 importing no lane D module: ``loop.py`` imports it, and the audit's import
@@ -37,8 +43,11 @@ class LaneDWorker:
     """One lane D step at a time, on a daemon thread the caller never joins
     implicitly."""
 
-    def __init__(self, step: Callable[[int], object]):
+    def __init__(self, step: Callable[[int], object],
+                 on_abandon: Callable[[int], object] | None = None):
         self.step = step
+        self.on_abandon = on_abandon
+        self._failed: int | None = None
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._busy = False
@@ -58,8 +67,12 @@ class LaneDWorker:
         with self._lock:
             if self._busy or b in self._completed:
                 return False
+            abandoned = None
+            if self._failed is not None and self._failed < b:
+                abandoned, self._failed = self._failed, None
+                self._completed.add(abandoned)
             self._busy = True
-            t = threading.Thread(target=self._run, args=(b,),
+            t = threading.Thread(target=self._run, args=(b, abandoned),
                                  name=f"lane-d-step-{b}", daemon=True)
             self._thread = t
         try:
@@ -68,6 +81,9 @@ class LaneDWorker:
             with self._lock:
                 self._busy = False
                 self._thread = None
+                if abandoned is not None:
+                    self._completed.discard(abandoned)
+                    self._failed = abandoned
             log.warning("lane D: could not start the step thread for boundary %d (%s)", b, e)
             return False
         log.info("lane D: step for settlement %d started off the poll thread", b)
@@ -82,18 +98,31 @@ class LaneDWorker:
             t.join(timeout)
         return not self.running
 
-    def _run(self, boundary: int) -> None:
+    def _run(self, boundary: int, abandoned: int | None = None) -> None:
+        if abandoned is not None:
+            log.warning("lane D: settlement %d was never settled and the head moved on to "
+                        "%d; it is given up", abandoned, boundary)
+            if self.on_abandon is not None:
+                try:
+                    self.on_abandon(abandoned)
+                except BaseException as e:  # noqa: BLE001 — never blocks the next step
+                    log.warning("lane D: recording settlement %d as abandoned failed (%s)",
+                                abandoned, e)
         try:
             self.step(boundary)
         except BaseException as e:  # noqa: BLE001 — a step never escapes its thread
             with self._lock:
                 self.last_error = e
                 self._busy = False
+                if self._failed is None or boundary > self._failed:
+                    self._failed = boundary
             log.warning("lane D: step for settlement %d failed (%s: %s); retried at a "
                         "later tick", boundary, type(e).__name__, e)
             return
         with self._lock:
             self._completed.add(boundary)
+            if self._failed == boundary:
+                self._failed = None
             self.last_error = None
             self._busy = False
         log.info("lane D: step for settlement %d completed", boundary)

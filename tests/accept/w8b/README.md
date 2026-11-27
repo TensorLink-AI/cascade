@@ -124,10 +124,23 @@ Every refusal in 2-6 writes no file, publishes nothing and calls no bench;
 the court stays what it was; the next call with the input readable settles
 normally (W19: a raising step is retried at a later submit).
 
+**`step.abandon(boundary) -> dict | None`** (2026-11-27): the W19 worker
+moved past `boundary` unsettled. The producing node (signer and inputs
+wired) publishes the W14 absent record (`reason = "infra_deferred"`, prior
+= posterior = the loaded state's digest, which must be the last published
+posterior) at `receipt_key(boundary)` and then as the latest pointer; no
+report, no court, nothing written locally. The house comes from the inputs
+source's cheap `house()` (the signed pointer; no eval host). Nothing is
+published (returns `None`) when the boundary is unarmed, at or below the
+latest published receipt, settled or persisted locally. Never raises.
+
 **`step.court_for(boundary) -> list[int | None] | None`**: the court uids
-(`[s["uid"] for s in report["pay"]["court"]]`) of the latest settlement this
-step has **published** (report and receipt, step 8) at a boundary
-`<= boundary`, or `None`. No I/O (memory only), never raises. A settlement
+(`[s["uid"] for s in report["pay"]["court"]]`) of the settlement this
+step has **published** (report and receipt, step 8) or followed at
+**exactly** `boundary`, or `None` (2026-11-27: never the latest one before
+it carried forward — the audit's `lane_d_pay` pays only a record at the
+settlement's own boundary, and a restarted node, a satellite and CI hold no
+older court; `genesis_for` answers from the same record). No I/O (memory only), never raises. A settlement
 that is saved but not published never reaches it.
 
 ### Restart (W7c)

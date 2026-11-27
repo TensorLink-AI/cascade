@@ -49,7 +49,11 @@ def test_inv6_hung_bench_sweep_never_delays_set_weights(tmp_path, cleanup):
         "X was paid before its settlement was published"
     host.release.set()
     assert r._lane_d_worker.join(30), "the B2 settlement never finished after the sweep"
-    spent += h.drive(r, chain, SEG3)
+    # 2026-11-27: lane D pays the settlement at EXACTLY the vector's boundary,
+    # so the later re-asserts pay once B3's own (quick) settlement is in.
+    spent += h.drive(r, chain, SEG3[:1])
+    assert r._lane_d_worker.join(30), "the B3 settlement never finished"
+    spent += h.drive(r, chain, SEG3[1:])
 
     base = h.runner(cfg)
     bchain = h.PollChain(SEG1[0])

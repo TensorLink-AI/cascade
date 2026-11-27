@@ -128,12 +128,15 @@ def test_court_for_is_the_published_courts_and_does_no_io(tmp_path):
     assert rig.step.court_for(h.B1) is None
     rig.step(h.B1)
     assert rig.step.court_for(h.B1) == [None], "the house holds KING_D at B1: its slot burns"
-    assert rig.step.court_for(h.B1 + 450) == [None]
+    assert rig.step.court_for(h.B1 + 450) is None, "not a settlement boundary: no record"
     rig.step(h.B2)
     assert rig.step.court_for(h.B2) == [h.CHALLENGER_UID]
-    assert rig.step.court_for(h.B2 + 899) == [h.CHALLENGER_UID]
-    assert rig.step.court_for(h.B3) == [h.CHALLENGER_UID], \
-        "the standing court is the latest published settlement's until the next one lands"
+    assert rig.step.court_for(h.B2 + 899) is None, "not a settlement boundary: no record"
+    # 2026-11-27: the settlement at EXACTLY the boundary (the audit's
+    # lane_d_pay; what a restarted node, a satellite and CI hold), never the
+    # latest one before it carried forward: none at B3 yet ⇒ lane D burns.
+    assert rig.step.court_for(h.B3) is None, \
+        "a court was carried forward to a boundary with no published settlement"
     assert rig.step.court_for(h.B1) == [None]
     assert rig.step.court_for(h.ARM_BLOCK) is None
     court = [s["uid"] for s in rig.published_report(h.B2)["pay"]["court"]]
@@ -141,7 +144,7 @@ def test_court_for_is_the_published_courts_and_does_no_io(tmp_path):
     gets, puts, reads = len(rig.store.gets), len(rig.store.puts), len(rig.factory.reader.calls)
     rig.store.fail_get = lambda _k: True
     rig.factory.reader.fail = set(range(h.ARM_BLOCK, h.B3 + 1))
-    assert rig.step.court_for(h.B2 + 5) == [h.CHALLENGER_UID]
+    assert rig.step.court_for(h.B2) == [h.CHALLENGER_UID]
     assert (len(rig.store.gets), len(rig.store.puts), len(rig.factory.reader.calls)) == \
         (gets, puts, reads), "court_for read the store or the chain"
 

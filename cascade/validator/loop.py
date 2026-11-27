@@ -1167,7 +1167,8 @@ class ValidatorRunner(
             if worker is None or worker.step is not step:
                 if worker is not None and worker.running:
                     return
-                worker = LaneDWorker(step)
+                abandon = getattr(step, "abandon", None)
+                worker = LaneDWorker(step, on_abandon=abandon if callable(abandon) else None)
                 self._lane_d_worker = worker
             worker.submit(boundary)
         except Exception as e:  # noqa: BLE001 — lane D must never reach the weight loop
