@@ -1134,11 +1134,34 @@ def _reupload_pending(runner, gen, seeds, contract, suffix: str, warm_start_ref)
     if (recorded and recorded != contract_digest(contract)
             or not recorded and getattr(contract, "base_arch", "") == "cascade_pyramid"):
         return None
+    loc = runner.__dict__.get("_leg_local_obj")
+    lane_b = getattr(loc, "lane_b_dispatch", None)
+    if lane_b is not None:
+        # A lane B expert leg: the checkpoint is bound to the rows it TRAINED
+        # (and the contract block they were planned under); the leg is
+        # recorded with those, never this tick's selection. A record without
+        # them cannot be attributed: no reuse (a human adds them, or retrain).
+        from .runner_common import LANE_B_DISPATCH_KEYS
+
+        missing = [k for k in LANE_B_DISPATCH_KEYS if k not in rec]
+        if missing:
+            log.error("lane B leg %s: pending harvest record lacks %s — the trained "
+                      "selection is unknown, not re-uploaded", gen.hotkey[:12],
+                      ",".join(missing))
+            return None
+        if rec.get("contract_block") != lane_b.get("contract_block"):
+            log.warning("lane B leg %s: pending harvest trained at contract block %s, this "
+                        "dispatch is at %s — not re-uploaded", gen.hotkey[:12],
+                        rec.get("contract_block"), lane_b.get("contract_block"))
+            return None
     log.warning("funded leg %s: re-uploading the checkpoint an earlier attempt of this "
                 "leg harvested and verified (its upload failed) — no retrain",
                 gen.hotkey[:12])
     try:
-        return upload_harvested_checkpoint(runner, rec, base_seed=seeds.base_seed)
+        entry = upload_harvested_checkpoint(runner, rec, base_seed=seeds.base_seed)
+        if lane_b is not None:
+            loc.lane_b_reused = {k: rec[k] for k in LANE_B_DISPATCH_KEYS}
+        return entry
     except _OperatorFault as e:
         runner._record_funded_failure(gen.hotkey, f"operator-side fault: {e}",
                                       miner_fault=False, error_class=OPERATOR_FAULT_CLASS,

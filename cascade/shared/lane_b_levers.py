@@ -370,7 +370,17 @@ def leg_length_contract(cfg, base, spec: dict | None):
 
 def apply_spec_levers(lb_cfg, contract, spec: dict | None, block: int):
     """Step 3 (after rev6.20's ``lane_b_leg_contract``): the levers of
-    ``spec`` effective at ``block`` folded into the contract."""
+    ``spec`` effective at ``block`` folded into the contract.
+
+    No spec (``{}`` / None: a leg funded without levers or ``train_hours``,
+    no ``--recipe-json``) folds NOTHING: the worker applies the levers only
+    ``if lane_b_spec:`` (worker.py), so a leg without a spec trains the
+    contract as ``lane_b_leg_contract`` left it (the image's EMAs) and its
+    receipt digest is that contract's. Defaulting the levers here made the
+    trainer expect another digest than every such leg's receipt carries
+    (2026-11-27: ebfed637... expected vs a3ea79b2... received)."""
+    if not spec:
+        return contract
     raw = dict((spec or {}).get("levers") or {})
     levers = levers_from_dict(raw, lb_cfg) if raw else None
     return apply_levers(contract, effective_levers(lb_cfg, levers, int(block)))
