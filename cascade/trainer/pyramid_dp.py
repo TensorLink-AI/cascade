@@ -73,12 +73,24 @@ _STEP, _STOP, _GATHER, _SCATTER = 1, 0, 2, 3
 def gang_size(device) -> int:
     """GPUs this leg trains on: every visible CUDA device for a plain
     ``"cuda"`` device (``CASCADE_TRAIN_GPUS`` may lower it), else 1."""
+    from .gang_ranks import leg_ranks
+
     if str(device) != "cuda" or not torch.cuda.is_available():
         return 1
-    n = torch.cuda.device_count()
-    with contextlib.suppress(ValueError):
-        n = min(n, int(os.environ.get(GANG_ENV, n)))
-    return max(1, n)
+    # the one rank rule (lane A and lane B alike); only GANG_ENV may lower it
+    override = {GANG_ENV: os.environ[GANG_ENV]} if GANG_ENV in os.environ else {}
+    return leg_ranks(device, torch.cuda.device_count(), override)
+
+
+def assert_full_gang(world: int, device) -> None:
+    """Refuse a CUDA leg that trains on fewer ranks than the GPUs it sees
+    (:func:`~.gang_ranks.check_full_gang`): a short gang is a silent Nx
+    slowdown the throughput watchdog only catches 10 minutes in."""
+    from .gang_ranks import check_full_gang
+
+    if not str(device).startswith("cuda") or not torch.cuda.is_available():
+        return
+    check_full_gang(world, torch.cuda.device_count(), os.environ, device=device)
 
 
 def bound_cpu_threads(world: int) -> int:

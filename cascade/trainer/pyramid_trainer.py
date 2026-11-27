@@ -401,11 +401,14 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
         resumed_optimizer = trainer._load_optimizer_state(Path(warm_start_dir), optimizer, model)
     mask_rng = np.random.default_rng(np.random.SeedSequence([9152026, training_seed, 19]))
     cop_gen = torch.Generator(device=trainer.device).manual_seed(training_seed % (2**63))
-    from .pyramid_dp import Gang, gang_size, micro_batch_pass, owned_splits
+    from .pyramid_dp import Gang, assert_full_gang, gang_size, micro_batch_pass, owned_splits
 
     # every leg, lane A or a lane-B expert leg, trains on the whole layout;
     # an expert gang reduces, shards and syncs only the selected leaves
     world = gang_size(trainer.device)
+    # 2026-11-26: a short gang (an expert leg on GPU 0 of an 8-GPU pod) fails
+    # here, named, instead of running ~8x slower until the watchdog kills it
+    assert_full_gang(world, trainer.device)
     gang = Gang(world, cfg, deterministic=trainer.deterministic, seed=training_seed,
                 device=trainer.device, expert_selection=expert_selection,
                 slices=slices) if world > 1 else None

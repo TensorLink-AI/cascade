@@ -72,3 +72,9 @@ cascade/trainer/runner_capacity.py
 # 2026-11-26: lane B make-good approvals bind by the bare generator ref (domain| prefix).
 cascade/funding/operator_approvals.py
 tests/accept/wb27/test_wb27_approval_ref.py
+
+# 2026-11-26: an expert leg trains on every GPU of its pod (whole pod or an
+# explicit device list); a short gang fails fast (gang_ranks guard).
+cascade/trainer/gang_ranks.py
+cascade/trainer/pyramid_dp.py
+tests/accept/wb27/test_wb27_gang_ranks.py
