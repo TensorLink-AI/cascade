@@ -73,6 +73,23 @@ def _check_king_cancel(runner):
         raise RemoteDispatchError('redundant king replica cancelled', returncode=254)
 
 
+def may_hold_unharvested_run(exc, *, trained: bool) -> bool:
+    """Whether a failed leg's pod may still hold a FINISHED run nobody
+    harvested — worth a read-only probe before the teardown: a dispatch /
+    re-attach / transport failure (:class:`RemoteDispatchError`). Not when a
+    harvest already ran (``trained``: the harvest path decides the pod), the
+    worker itself exited non-zero (that run failed), or the verdict is the
+    miner's (tamper / diverged: never kept on anyone's bill)."""
+    from .remote import RemoteDispatchError
+
+    if trained or isinstance(exc, (_FundedTamper, _FundedDiverged)):
+        return False
+    if not isinstance(exc, RemoteDispatchError):
+        return False            # a pre-dispatch refusal / setup fault: no run of ours ran
+    rc = getattr(exc, "returncode", None)
+    return not (isinstance(rc, int) and rc not in (0, 255))
+
+
 def unharvested_finished_run(runner, host) -> str:
     """The run dir of a FINISHED (exit 0) detached run on ``host`` — its
     checkpoint is still on the pod — or "" (none, or the pod cannot be read:
@@ -1074,7 +1091,9 @@ class _OperatorPodMixin:
                                     reason=f"operator {role} leg {gen.hotkey[:12]}: "
                                            f"{type(exc).__name__ if exc else 'aborted'}: "
                                            f"{str(exc)[:500] if exc else ''}")
-                held = ("" if succeeded or isinstance(exc, (_FundedTamper, _FundedDiverged))
+                held = ("" if succeeded or not may_hold_unharvested_run(
+                    exc, trained=bool(getattr(self.__dict__.get("_leg_local_obj"),
+                                              "leg_trained", False)))
                         else unharvested_finished_run(self, host))
                 if held:
                     # 2026-11-27: a re-attach refusal removed a pod holding a

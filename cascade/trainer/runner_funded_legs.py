@@ -716,10 +716,15 @@ class _FundedLegMixin:
 
                     spend_end(self, gen.hotkey, str(getattr(pod, "instance_id", "") or ""),
                               outcome="waste", reason=str(verdict[0])[:120], kind=MINER)
-                from .runner_operator_pods import unharvested_finished_run
+                from .runner_operator_pods import (
+                    may_hold_unharvested_run,
+                    unharvested_finished_run,
+                )
 
                 # (a miner-fault verdict — tamper — is never kept on their bill)
                 held = ("" if succeeded or (verdict is not None and verdict[1])
+                        or not may_hold_unharvested_run(
+                            failing, trained=trained or _harvested_in_dispatch(self))
                         else unharvested_finished_run(self, host))
                 if held:
                     # 2026-11-27: never remove a pod holding a FINISHED run
