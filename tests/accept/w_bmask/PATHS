@@ -1,0 +1,14 @@
+# W-BMASK (owner 2026-11-27: "align with how GIFT-Eval does it"): the public
+# bench sidecar builds a cascade_pyramid checkpoint's context the GIFT-Eval /
+# GluonTS way. Left padding and NaN are unobserved and the scaler reads
+# observed points only. The pinned cascade/trainer/pyramid_wrapper.py is NOT
+# touched: its bytes are checkpoint-pinned and lane A private eval runs it.
+benchmarks/cascade_benchmark/observed.py
+benchmarks/cascade_benchmark/predictor.py
+benchmarks/cascade_benchmark/results.py
+benchmarks/cascade_benchmark/suites/fev_bench.py
+# Follow-up: bench_method stamp (report + rows) and a version-aware audit, so
+# a report swept before #972 is reproduced with the legacy impute/0 method.
+benchmarks/cascade_benchmark/cli.py
+cascade/eval/benchmarks.py
+cascade/audit/bench_reproduce.py

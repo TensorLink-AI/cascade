@@ -30,9 +30,12 @@ from .results import BenchmarkReport
 from .suites import SUITES
 
 
-def report_json(checkpoint, results, data_revisions: dict) -> str:
+def report_json(checkpoint, results, data_revisions: dict, bench_method: str | None = None) -> str:
     """The exact report text the CLI writes for one checkpoint."""
-    report = BenchmarkReport(checkpoint=str(checkpoint), data_revisions=dict(data_revisions))
+    from .observed import current_method
+
+    report = BenchmarkReport(checkpoint=str(checkpoint), data_revisions=dict(data_revisions),
+                             bench_method=bench_method or current_method())
     report.suites.extend(results)
     return json.dumps(report.to_dict(), indent=2)
 
@@ -108,6 +111,9 @@ def build_parser() -> argparse.ArgumentParser:
         metavar=("CHECKPOINT_DIR", "OUT_JSON"),
         help="also sweep this checkpoint in the same pass (paired sweep; repeatable)",
     )
+    p.add_argument("--bench-method", default=None, choices=("observed_mask/1", "impute/0"),
+                   help="context convention (observed.py): observed_mask/1 (default) or "
+                        "impute/0, the pre-#972 behaviour, to reproduce an old report")
     p.add_argument("--timings-json", default=None,
                    help="write per-suite wall times + the worker plan here (never in the report)")
     return p
@@ -179,6 +185,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.gifteval_datasets:
         os.environ["CASCADE_BENCH_GIFTEVAL_DATASETS"] = args.gifteval_datasets
+    if args.bench_method:
+        # env, so spawned sweep workers inherit it (observed.current_method)
+        os.environ["CASCADE_BENCH_METHOD"] = args.bench_method
 
     from .datasets import DATASETS, apply_env, ensure_datasets, recorded_revision
 
