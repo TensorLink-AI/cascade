@@ -239,6 +239,32 @@ def _pending_upload_path(work_root: Path, base_seed, hotkey: str, job_id: str = 
     return harvest_dir(work_root, base_seed, hotkey, job_id=job_id).with_suffix(".pending.json")
 
 
+# A lane B expert leg's dispatch identity: the rows it trained, the contract
+# block it trained under and the rows other legs held when it was planned.
+# A re-upload of its pending harvest records the leg with THESE, never the
+# selection a later tick plans (2026-11-27: {1: 9} recorded for a checkpoint
+# trained on {0:8,...,6:12}).
+LANE_B_DISPATCH_KEYS = ("expert_selection", "contract_block", "expert_exclude")
+
+
+def lane_b_dispatch_fields(selection, contract_block, exclude) -> dict:
+    """The canonical pending-record fields of a lane B dispatch (JSON-safe:
+    layer keys as strings, sorted rows; empty exclude layers dropped)."""
+    def rows(d):
+        return {str(int(k)): sorted(int(x) for x in v)
+                for k, v in sorted((d or {}).items(), key=lambda kv: int(kv[0])) if v}
+
+    return {"expert_selection": rows(selection),
+            "contract_block": None if contract_block is None else int(contract_block),
+            "expert_exclude": rows(exclude)}
+
+
+def lane_b_record_rows(rows) -> dict[int, list[int]]:
+    """A pending record's ``expert_selection`` / ``expert_exclude`` as the
+    driver's ``{layer: [rows]}``."""
+    return {int(k): sorted(int(x) for x in v) for k, v in (rows or {}).items()}
+
+
 def write_pending_upload(work_root: Path, base_seed, hotkey: str, record: dict) -> None:
     """Remember a verified harvest whose upload failed (best-effort)."""
     try:
