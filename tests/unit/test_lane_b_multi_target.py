@@ -446,18 +446,19 @@ def test_era_init_refuses_a_merge_declared_twice(cfg, tmp_path):
         warm_start_ckpt=_ptr("merged"), warm_start_base=_ptr("member"),
         warm_start_merges=(merge, dict(merge)))
     assert "more than once" in r._verify_merged_init(m)
-    fetched = []
+    rebuilt = []
 
-    def _fetch(entry):
-        fetched.append(entry.trained_pointer)
-        raise OSError("stop here")
+    class _Ops:   # the eval host's rebuild (the validator never loads weights)
+        def merge_verify(self, base, merges, target, *, strict):
+            rebuilt.append((base, merges, target))
+            raise OSError("stop here")
 
-    r._fetch_checkpoint_dir = _fetch
+    r.lane_b_merge_ops = _Ops()
     from cascade.shared.hippius import StorageError
 
     with pytest.raises(StorageError):          # listed once: recorded, then rebuilt
         r._verify_merged_init(dataclasses.replace(m, warm_start_merges=(merge,)))
-    assert fetched
+    assert rebuilt == [(_ptr("member"), [merge], _ptr("merged"))]
 
 
 def test_catch_up_fold_of_a_multi_target_settlement_converges(cfg, tmp_path, monkeypatch):
