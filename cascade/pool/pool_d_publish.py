@@ -18,7 +18,12 @@ published here under ``<prefix>/<snapshot>/`` in the private
 The lane D report already carries each judged snapshot's sha256; that digest
 covers ``metadata.json`` and with it the effective per-feed ``embargo_hours``
 (W6b) and ``catalog_sha256``, the provenance hash of the forge catalog the
-builder read. Nothing here re-reads the catalog. :func:`check_build_wall`
+builder read. Nothing here re-reads the catalog. :func:`check_data_advances`
+refuses (``stale_data``) a snapshot whose newest first-seen point is older than
+``MAX_DATA_AGE_SECONDS`` at its ``as_of_ts`` or is not newer than the previous
+snapshot's: both publish (builder) and pin sync (box) apply it (2026-11-27:
+eight 3-hourly snapshots in a row re-cut the same 2026-11-25 data from a frozen
+builder mirror and were pinned, so lane D could judge nothing). :func:`check_build_wall`
 alerts (``pool_d_build_wall_exceeded``) when a build takes 3 h or more or ends
 after the next boundary. Uploads above one part go multipart in parts of
 ``MULTIPART_CHUNK_BYTES`` (W3a: single PUTs are only safe up to 512 MiB).
@@ -57,6 +62,10 @@ log = logging.getLogger("cascade.pool")
 
 CADENCE_SECONDS = 10_800
 MAX_BUILD_WALL_SECONDS = 10_800
+# Healthy steady state: a point recorded at build N's start is committed at
+# build N+1 and usable from build N+2's as_of, so the newest first-seen point
+# is ~6 h old; 4 cadences (12 h) tolerates two failed builds, not a dead feed.
+MAX_DATA_AGE_SECONDS = 4 * CADENCE_SECONDS
 PINS_SCHEMA = "lane-d-pool-pins/1"
 MANIFEST_SCHEMA = "lane-d-pool-manifest/1"
 INDEX_SCHEMA = "lane-d-pool-index/1"
@@ -127,6 +136,49 @@ def due_as_of(now_ts: int) -> int:
     """The ``as_of_ts`` of the snapshot due at ``now_ts`` (3-hourly)."""
     now_ts = int(now_ts)
     return now_ts - now_ts % CADENCE_SECONDS
+
+
+def max_first_seen_ts(meta: Mapping) -> int | None:
+    """The newest W6fs first-seen time of any target point in a ``pool_d/1``
+    ``metadata.json`` (how far the recorded live data reaches), else None.
+    Data time (``end_ts``) is no freshness signal: publish-ahead feeds carry
+    future end_ts while the mirror is frozen."""
+    best = None
+    for s in meta.get("series") or []:
+        for t in s.get("first_seen_ts") or []:
+            if isinstance(t, list):
+                t = max((x for x in t if x is not None), default=None)
+            if t is not None and (best is None or int(t) > best):
+                best = int(t)
+    return best
+
+
+def check_data_advances(meta: Mapping, *, previous: int | None,
+                        max_age_seconds: int = MAX_DATA_AGE_SECONDS) -> dict:
+    """Refuse (``stale_data``) a snapshot that re-cuts old data under a new
+    name: its newest first-seen point must be within ``max_age_seconds`` of
+    its ``as_of_ts`` and strictly newer than ``previous`` (the previous
+    snapshot's :func:`max_first_seen_ts`; None = no comparison)."""
+    return _judge_freshness(meta.get("snapshot"), int(meta["as_of_ts"]),
+                            max_first_seen_ts(meta), previous=previous,
+                            max_age_seconds=max_age_seconds)
+
+
+def _judge_freshness(name, as_of: int, newest: int | None, *, previous: int | None,
+                     max_age_seconds: int = MAX_DATA_AGE_SECONDS) -> dict:
+    if newest is None:
+        raise PublishError("stale_data", f"{name}: no first-seen point at all")
+    age = as_of - newest
+    if age > int(max_age_seconds):
+        raise PublishError("stale_data",
+                           f"{name}: newest first-seen point {newest} is {age / 3600:.1f} h "
+                           f"before as_of {as_of} (limit {int(max_age_seconds) / 3600:.0f} h): "
+                           "is the builder's forge mirror / first-seen record advancing?")
+    if previous is not None and newest <= int(previous):
+        raise PublishError("stale_data",
+                           f"{name}: newest first-seen point {newest} did not advance past "
+                           f"the previous snapshot's {int(previous)}: same data, new name")
+    return {"max_first_seen_ts": newest, "data_age_seconds": age}
 
 
 def check_build_wall(*, as_of_ts: int, started_ts: int, finished_ts: int) -> dict:
@@ -416,9 +468,25 @@ def _add_to_index(store, prefix: str, manifest: dict, manifest_key: str) -> None
     store.put_bytes(_index_key(prefix), _canonical(index))
 
 
+def _previous_first_seen(store, prefix: str, as_of_ts: int) -> int | None:
+    """``max_first_seen_ts`` of the newest indexed snapshot before ``as_of_ts``
+    (None when there is none or its manifest predates the field)."""
+    index = _get_json(store, _index_key(prefix)) or {"snapshots": []}
+    earlier = [e for e in index.get("snapshots") or [] if int(e["as_of_ts"]) < int(as_of_ts)]
+    if not earlier:
+        return None
+    prev = max(earlier, key=lambda e: (int(e["as_of_ts"]), e["snapshot"]))
+    man = _get_json(store, prev["manifest_key"]) or {}
+    v = man.get("max_first_seen_ts")
+    return None if v is None else int(v)
+
+
 def publish_snapshot(pool_dir: Path | str, store, *, prefix: str = DEFAULT_PREFIX,
-                     build_wall_seconds: int | None = None) -> dict:
-    """Upload one snapshot's two tars, its manifest and its index entry."""
+                     build_wall_seconds: int | None = None, allow_stale: bool = False) -> dict:
+    """Upload one snapshot's two tars, its manifest and its index entry.
+
+    A new snapshot must pass :func:`check_data_advances` against the previous
+    indexed one (``allow_stale`` = a deliberate operator override only)."""
     from .pool_d_split import split_pool_d
 
     meta = json.loads((Path(pool_dir) / "metadata.json").read_text(encoding="utf-8"))
@@ -434,6 +502,7 @@ def publish_snapshot(pool_dir: Path | str, store, *, prefix: str = DEFAULT_PREFI
             "first_seen_roots": list(meta.get("first_seen_roots") or []),
             "n_series": len(meta.get("series") or []),
             "build_wall_seconds": None if build_wall_seconds is None else int(build_wall_seconds),
+            "max_first_seen_ts": max_first_seen_ts(meta),
         }
         existing = _get_json(store, man_key)
         if existing is not None:
@@ -445,6 +514,9 @@ def publish_snapshot(pool_dir: Path | str, store, *, prefix: str = DEFAULT_PREFI
                                    f"{existing.get('sha256')}, not {res.snapshot_sha256}")
             _add_to_index(store, prefix, existing, man_key)
             return existing
+        if not allow_stale:
+            check_data_advances(meta, previous=_previous_first_seen(
+                store, prefix, int(meta["as_of_ts"])))
         store.put_file(hist_key, res.hist_tar)
         store.put_file(tgt_key, res.tgt_tar)
     store.put_bytes(man_key, _canonical(manifest))
@@ -479,9 +551,26 @@ def _fetch_checked(store, key: str, dest: Path, want: str) -> Path:
     return dest
 
 
+def _pinned_first_seen(doc: Mapping, pins_path: Path, as_of_ts: int) -> int | None:
+    """``max_first_seen_ts`` of the newest pin before ``as_of_ts`` whose
+    snapshot dir is still on disk (None when there is none)."""
+    earlier = sorted((p for p in doc["pins"] if int(p["as_of_ts"]) < int(as_of_ts)),
+                     key=lambda p: (int(p["as_of_ts"]), p["snapshot"]))
+    for pin in reversed(earlier):
+        meta = pins_path.parent / pin["dir"] / "metadata.json"
+        if meta.is_file():
+            return max_first_seen_ts(json.loads(meta.read_text(encoding="utf-8")))
+    return None
+
+
 def sync_pins(store, *, prefix: str, local_root: Path | str, pins_path: Path | str,
-              from_block: int) -> list[dict]:
-    """Pin every indexed snapshot not yet pinned (box side)."""
+              from_block: int, refused: list | None = None) -> list[dict]:
+    """Pin every indexed snapshot not yet pinned (box side).
+
+    A snapshot failing :func:`check_data_advances` against the newest earlier
+    pin is never pinned (its dir is removed) and is appended to ``refused`` as
+    ``{"snapshot", "detail"}``; when the NEWEST indexed snapshot is refused the
+    sync raises ``stale_data`` so the timer unit fails loudly."""
     from .pool_d_build import snapshot_sha256
     from .pool_d_split import SplitError, join_split
 
@@ -490,10 +579,21 @@ def sync_pins(store, *, prefix: str, local_root: Path | str, pins_path: Path | s
     pinned = {p.get("snapshot") for p in doc["pins"]}
     index = _get_json(store, _index_key(prefix)) or {"snapshots": []}
     added = []
-    for ent in sorted(index["snapshots"], key=lambda e: (int(e["as_of_ts"]), e["snapshot"])):
+    refused = [] if refused is None else refused
+    ordered = sorted(index["snapshots"], key=lambda e: (int(e["as_of_ts"]), e["snapshot"]))
+    for ent in ordered:
         if ent["snapshot"] in pinned:
             continue
         man = json.loads(store.get_bytes(ent["manifest_key"]))
+        previous = _pinned_first_seen(doc, pins_path, int(man["as_of_ts"]))
+        if man.get("max_first_seen_ts") is not None:
+            try:        # the manifest's claim: refuse before downloading the tars
+                _judge_freshness(man["snapshot"], int(man["as_of_ts"]),
+                                 int(man["max_first_seen_ts"]), previous=previous)
+            except PublishError as e:
+                log.error("pool_d_pin_refused %s", e)
+                refused.append({"snapshot": man["snapshot"], "detail": str(e)})
+                continue
         dest = root / man["snapshot"]
         with tempfile.TemporaryDirectory(prefix="pool-d-sync-") as tmp:
             hist = _fetch_checked(store, man["hist_key"], Path(tmp) / "hist.tar",
@@ -506,6 +606,14 @@ def sync_pins(store, *, prefix: str, local_root: Path | str, pins_path: Path | s
         if snapshot_sha256(dest) != man["sha256"]:
             shutil.rmtree(dest, ignore_errors=True)
             raise PublishError("digest_mismatch", f"{dest} does not hash to {man['sha256']}")
+        meta = json.loads((dest / "metadata.json").read_text(encoding="utf-8"))
+        try:
+            check_data_advances(meta, previous=previous)     # the bytes' truth
+        except PublishError as e:
+            shutil.rmtree(dest, ignore_errors=True)
+            log.error("pool_d_pin_refused %s", e)
+            refused.append({"snapshot": man["snapshot"], "detail": str(e)})
+            continue
         pin = {"dir": os.path.relpath(dest, pins_path.parent), "sha256": man["sha256"],
                "from_block": int(from_block), "snapshot": man["snapshot"],
                "as_of_ts": int(man["as_of_ts"]), "hist_sha256": man["hist_sha256"],
@@ -513,6 +621,9 @@ def sync_pins(store, *, prefix: str, local_root: Path | str, pins_path: Path | s
         doc["pins"].append(pin)
         _save_pins(pins_path, doc)
         added.append(pin)
+    if ordered and refused and refused[-1]["snapshot"] == ordered[-1]["snapshot"]:
+        raise PublishError("stale_data", "the newest pool_d snapshot was refused: "
+                                         + refused[-1]["detail"])
     return added
 
 
@@ -654,6 +765,8 @@ def main(argv: list[str] | None = None) -> int:
     pub.add_argument("--pool-d", type=Path, required=True)
     pub.add_argument("--started-ts", type=int, default=None)
     pub.add_argument("--finished-ts", type=int, default=None)
+    pub.add_argument("--allow-stale", action="store_true",
+                     help="operator override: publish although the data did not advance")
     syn = sub.add_parser("sync")
     store_args(syn)
     syn.add_argument("--pins", type=Path, required=True)
@@ -697,7 +810,8 @@ def main(argv: list[str] | None = None) -> int:
                                          started_ts=args.started_ts, finished_ts=args.finished_ts)
                 wall = check["wall_seconds"]
                 print(json.dumps({"build_wall": check}, sort_keys=True))
-            man = publish_snapshot(args.pool_d, store, prefix=prefix, build_wall_seconds=wall)
+            man = publish_snapshot(args.pool_d, store, prefix=prefix, build_wall_seconds=wall,
+                                   allow_stale=args.allow_stale)
             print(json.dumps(man, sort_keys=True))
         elif args.cmd == "sync":
             added = sync_pins(store, prefix=prefix, local_root=args.local_root,
@@ -724,6 +838,7 @@ __all__ = [
     "INDEX_SCHEMA",
     "MANIFEST_SCHEMA",
     "MAX_BUILD_WALL_SECONDS",
+    "MAX_DATA_AGE_SECONDS",
     "MAX_MULTIPART_PARTS",
     "MULTIPART_CHUNK_BYTES",
     "PINS_SCHEMA",
@@ -733,10 +848,12 @@ __all__ = [
     "PublishError",
     "apply_retention",
     "check_build_wall",
+    "check_data_advances",
     "due_as_of",
     "fetch_hist",
     "lane_d_embargo_hours",
     "main",
+    "max_first_seen_ts",
     "multipart_part_size",
     "open_pool_store",
     "publish_snapshot",

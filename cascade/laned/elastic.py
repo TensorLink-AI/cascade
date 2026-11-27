@@ -1008,7 +1008,11 @@ def pin_steps(cfg: ElasticConfig, inst: Mapping, release_dir: str) -> list[tuple
 
 def builder_bootstrap_steps(cfg: ElasticConfig, inst: Mapping) -> list[tuple[str, list[str]]]:
     """Idempotent: the release + ``uv sync --frozen`` (deploy/pod_bootstrap.sh),
-    the deployed chain.toml, the env file (mode 600), the state restore."""
+    the deployed chain.toml, the env file (mode 600). The state restore and the
+    forge mirror pull are :func:`builder_refresh_steps`, run before EVERY build
+    by :func:`builder_run_steps` (2026-11-27: a warm builder bootstrapped once
+    built 3-hourly snapshots from a mirror frozen at 2026-11-25 17:59 with no
+    priors, so every snapshot held the same data and an empty ``frontier``)."""
     b = cfg.builder
     kh = known_hosts_for(cfg, inst)
     env = {"POD_IP": str(inst["ip"]), "POD_PORT": str(inst["port"]), "POD_USER": b.ssh_user,
@@ -1023,6 +1027,16 @@ def builder_bootstrap_steps(cfg: ElasticConfig, inst: Mapping) -> list[tuple[str
                               src=b.env_file, dest=b.remote_env_file)),
         ("env_mode", ssh_argv(inst, key_path=b.ssh_key_path, known_hosts=kh,
                               remote=f"chmod 600 {remote_env}")),
+    ]
+
+
+def builder_refresh_steps(cfg: ElasticConfig, inst: Mapping) -> list[tuple[str, list[str]]]:
+    """The inputs a build reads, refreshed before every build: the first-seen
+    log + every published snapshot's metadata (the ``--prior-dir`` set that
+    fills ``frontier``), then the forge mirror delta (the live feed data)."""
+    b = cfg.builder
+    kh = known_hosts_for(cfg, inst)
+    return [
         ("state_pull", ssh_argv(inst, key_path=b.ssh_key_path, known_hosts=kh,
                                 remote=_remote(b, "state-pull --chain-toml chain.toml "
                                                   f"--forge-dir {shlex.quote(b.forge_dir)} "
@@ -1084,9 +1098,10 @@ def builder_run_steps(cfg: ElasticConfig, inst: Mapping, *, now_ts: int
     kh = known_hosts_for(cfg, inst)
     script = builder_run_script(b, as_of_ts=due_as_of(now_ts), now_ts=now_ts,
                                 started_ts=now_ts)
-    return [("pool_d_build_publish",
-             ssh_argv(inst, key_path=b.ssh_key_path, known_hosts=kh,
-                      remote=f"bash -c {shlex.quote(script)}"))]
+    return builder_refresh_steps(cfg, inst) + [
+        ("pool_d_build_publish",
+         ssh_argv(inst, key_path=b.ssh_key_path, known_hosts=kh,
+                  remote=f"bash -c {shlex.quote(script)}"))]
 
 
 def profile_uv_extras(profile_path: str | Path) -> list[str]:
@@ -1283,13 +1298,24 @@ def state_pull(store, *, prefix: str, log_dir: Path, prior_root: Path) -> dict:
         local = log_dir / name
         key = _state_key(prefix, "first_seen", name)
         named = head is not None and name in head
-        local_sha = local_size = None
+        local_sha = local_size = local_pre = None
+        hsize = hsizes.get(name) if named else None
         if local.is_file():
-            _, local_sha, local_size = _scan(local)
+            local_pre, local_sha, local_size = _scan(local, int(hsize or 0))
         if (named and local_sha == head.get(name)
                 and hsizes.get(name, local_size) == local_size
                 and _object_size_or_none(store, key) == local_size):
             sizes[name] = int(local_size)
+            kept.append(name)
+            continue
+        # A warm builder whose last build failed between `first_seen record`
+        # and state-push holds a log AHEAD of HEAD (HEAD is its byte prefix):
+        # keep it, the next state-push uploads the extension (state-pull now
+        # runs before every build, 2026-11-27).
+        if (hsize is not None and local_size is not None and local_size > int(hsize)
+                and local_pre == head.get(name)
+                and _object_size_or_none(store, key) == int(hsize)):
+            sizes[name] = int(hsize)
             kept.append(name)
             continue
         tmp = log_dir / f".{name}.pull.tmp"
@@ -1329,13 +1355,19 @@ def state_pull(store, *, prefix: str, log_dir: Path, prior_root: Path) -> dict:
     got = []
     for ent in index.get("snapshots") or []:
         snap = str(ent["snapshot"])
+        d = prior_root / snap
+        dest = d / "metadata.json"
+        if dest.is_file():          # a snapshot name never changes bytes (W6d)
+            got.append(snap)
+            continue
         try:
             data = store.get_bytes(_state_key(prefix, "prior", snap, "metadata.json"))
         except ObjectNotFound:
             continue
-        d = prior_root / snap
         d.mkdir(parents=True, exist_ok=True)
-        (d / "metadata.json").write_bytes(data)
+        tmp = d / ".metadata.json.pull.tmp"
+        tmp.write_bytes(data)
+        os.replace(tmp, dest)       # never a torn file that a later pull would keep
         got.append(snap)
     return {"head": head, "prior": got, "restored": restored, "kept": kept}
 
