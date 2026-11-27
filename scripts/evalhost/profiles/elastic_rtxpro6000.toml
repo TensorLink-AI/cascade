@@ -10,3 +10,9 @@ min_vram_mib = 97000
 min_driver = "580"
 disk_path = "/root"
 min_disk_free_bytes = 9200000000
+# Forecast-serving lane D eval host: the same extras as launch_eval.toml
+# (torch in `train`, boto3 in `hippius`, pyarrow in `pool-forge`, `chain`);
+# the elastic bootstrap passes them to the R12 sync (cascade.laned.elastic).
+# On this host scoring runs in the sm120-torch212 env (its own lock, torch
+# 2.12.1, numpy + safetensors only); these extras are the release venv's.
+uv_extras = ["train", "hippius", "chain", "pool-forge"]

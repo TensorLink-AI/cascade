@@ -216,9 +216,14 @@ every tracked non-symlink file under `cascade/` and `benchmarks/`.
 `--extra NAME` (repeatable; only an `[project.optional-dependencies]` group of
 the release's pyproject, else exit 2) plans `uv sync --frozen --extra NAME`.
 A profile's optional `uv_extras` list (`profile-info --get uv_extras`, space
-separated) is what the owner scripts pass: `launch_eval.toml` has
-`uv_extras = ["train"]` (the pinned torch 2.4.1+cu124 lives in that extra;
-#784: a plain sync left the eval host without torch), `bench_gate.toml` none.
+separated) is what the owner scripts pass: `launch_eval.toml`,
+`elastic_h200.toml` and `elastic_rtxpro6000.toml` have
+`uv_extras = ["train", "hippius", "chain", "pool-forge"]` (the pinned torch
+2.4.1+cu124 lives in `train`, #784: a plain sync left the eval host without
+torch; the lane D public half needs pyarrow from `pool-forge` and boto3 from
+`hippius`, 2026-11-26: a train-only host failed it with "mirror read failed
+(ModuleNotFoundError: No module named 'pyarrow')"), `bench_gate.toml` none
+(the bench runs in the `--bench-venv` sidecar).
 
 ## `handshake`
 

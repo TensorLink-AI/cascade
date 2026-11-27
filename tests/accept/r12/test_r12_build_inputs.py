@@ -153,12 +153,26 @@ def test_only_a_declared_extra_is_accepted(kit, bad):
     assert _copies(proc.stdout) == set() and _runs(proc.stdout) == [], proc.stdout
 
 
+EVAL_HOST_EXTRAS = ["train", "hippius", "chain", "pool-forge"]
+
+
 def test_profiles_name_the_role_extra(kit):
+    # 2026-11-26: a train-only eval host had no pyarrow and the lane D public
+    # half failed ("mirror read failed (ModuleNotFoundError: ...pyarrow)").
     launch = tomllib.loads(LAUNCH_PROFILE.read_text())
-    assert launch.get("uv_extras") == ["train"], launch.get("uv_extras")
+    assert launch.get("uv_extras") == EVAL_HOST_EXTRAS, launch.get("uv_extras")
     proc = kit.tool("profile-info", "--profile", LAUNCH_PROFILE, "--get", "uv_extras")
     assert proc.returncode == 0, output(proc)
-    assert proc.stdout.strip() == "train"
+    assert proc.stdout.strip() == " ".join(EVAL_HOST_EXTRAS)
+    for name in ("elastic_h200.toml", "elastic_rtxpro6000.toml"):
+        prof = tomllib.loads((LAUNCH_PROFILE.parent / name).read_text())
+        assert prof.get("uv_extras") == EVAL_HOST_EXTRAS, (name, prof.get("uv_extras"))
+    # every extra exists, and pyarrow / boto3 ride in them
+    groups = tomllib.loads((REPO / "pyproject.toml").read_text())["project"][
+        "optional-dependencies"]
+    assert set(EVAL_HOST_EXTRAS) <= set(groups), sorted(groups)
+    deps = " ".join(d for e in EVAL_HOST_EXTRAS for d in groups[e])
+    assert "pyarrow" in deps and "boto3" in deps, deps
     proc = kit.tool("profile-info", "--profile", GATE_PROFILE, "--get", "uv_extras")
     assert proc.returncode == 0, output(proc)
     assert proc.stdout.strip() == ""
@@ -177,5 +191,6 @@ def test_setup_script_passes_the_launch_extra_to_sync(kit):
     assert proc.returncode == 0, output(proc)
     sync = [line for line in proc.stdout.splitlines() if line.startswith("PLAN venv_sync ")]
     assert sync, proc.stdout
-    assert any(re.search(r" sync .*--extra train\b", s) for s in sync), sync
+    for extra in EVAL_HOST_EXTRAS:
+        assert any(re.search(rf" sync .*--extra '?{extra}'?(\s|$)", s) for s in sync), (extra, sync)
     assert kit.shim_calls() == []

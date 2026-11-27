@@ -11,7 +11,13 @@ min_vram_mib = 24000
 min_driver = "550.54.14"           # CUDA 12.4 (cu124 wheels) minimum driver
 disk_path = "/root"
 min_disk_free_bytes = 9200000000
-# The release's pinned torch 2.4.1+cu124 lives in pyproject's `train` extra:
-# the sync runs `uv sync --frozen --extra train` (#784: a plain sync left the
-# eval host without torch).
-uv_extras = ["train"]
+# The release's pinned torch 2.4.1+cu124 lives in pyproject's `train` extra
+# (#784: a plain sync left the eval host without torch). The lane D public
+# half also needs pyarrow (`pool-forge`: the public mirror's parquet row
+# groups) and boto3 (`hippius`: the Hippius mirror reads), and the live host
+# carries `chain` (2026-11-26: a train-only host failed the public half with
+# "mirror read failed (ModuleNotFoundError: No module named 'pyarrow')").
+# The sync runs `uv sync --frozen --extra train --extra hippius --extra chain
+# --extra pool-forge`; the worker refuses at start when a module is missing
+# (cascade.eval.lane_d_forecasts.check_host_modules).
+uv_extras = ["train", "hippius", "chain", "pool-forge"]

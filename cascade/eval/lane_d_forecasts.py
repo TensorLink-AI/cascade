@@ -41,12 +41,21 @@ box's SSH transport (:class:`cascade.validator.lane_d_inputs.SSHEvalHost`):
 
 Torch-free at import: the scorer and the W4 finite check import torch
 lazily, only when a checkpoint is scored or ingested.
+
+Startup self-check (2026-11-26): ``public`` and ``forecast`` first look up the
+third-party modules they will import later (:data:`HOST_MODULES`, by
+:func:`importlib.util.find_spec`, nothing imported) and exit
+:data:`EXIT_MISSING_MODULES` with one stderr line naming the missing modules
+and the ``uv sync`` that installs them, before stdin is read. A fresh eval
+host synced with ``--extra train`` only had no ``pyarrow`` and failed the
+public half mid-settlement ("mirror read failed (ModuleNotFoundError: ...)").
 """
 
 from __future__ import annotations
 
 import argparse
 import contextlib
+import importlib.util
 import io
 import json
 import logging
@@ -77,6 +86,50 @@ REPLY_SCHEMA = "lane-d-forecast-reply/1"
 META_KEY = "meta"
 HISTORY_KEY = "h{}"
 N_LEVELS = 9
+
+
+# The third-party modules each worker command imports lazily, and the
+# pyproject extra that installs each (scripts/evalhost/profiles/*.toml
+# uv_extras). ``boto3`` only when the public half reads the Hippius mirror.
+HOST_MODULES = {
+    "forecast": ("torch", "safetensors"),
+    "public": ("torch", "safetensors", "pyarrow"),
+}
+MIRROR_MODULES = ("boto3",)
+MODULE_EXTRAS = {"torch": "train", "safetensors": "train", "pyarrow": "pool-forge",
+                 "boto3": "hippius"}
+EVAL_HOST_SYNC = ("uv sync --frozen --extra train --extra hippius --extra chain "
+                  "--extra pool-forge")
+EXIT_MISSING_MODULES = 3
+
+
+def missing_host_modules(cmd: str, *, hippius_mirror: bool = False) -> list[str]:
+    """The modules ``cmd`` needs that this interpreter cannot find (sorted).
+    Looked up with :func:`importlib.util.find_spec`: nothing is imported."""
+    names = list(HOST_MODULES.get(cmd, ()))
+    if cmd == "public" and hippius_mirror:
+        names += MIRROR_MODULES
+    missing = []
+    for name in names:
+        try:
+            spec = importlib.util.find_spec(name)
+        except (ImportError, ValueError):
+            spec = None
+        if spec is None:
+            missing.append(name)
+    return sorted(set(missing))
+
+
+def check_host_modules(cmd: str, *, hippius_mirror: bool = False) -> str | None:
+    """``None`` when every module ``cmd`` needs is installed, else the one-line
+    refusal: the missing modules, the extras that carry them, the sync."""
+    missing = missing_host_modules(cmd, hippius_mirror=hippius_mirror)
+    if not missing:
+        return None
+    extras = sorted({MODULE_EXTRAS.get(m, "?") for m in missing})
+    return (f"lane D eval host is missing module(s) {', '.join(missing)} needed by "
+            f"`{cmd}` (pyproject extra(s): {', '.join(extras)}); run "
+            f"`{EVAL_HOST_SYNC}` in the release dir (the eval-host profile's uv_extras)")
 
 
 class LaneDForecastError(RuntimeError):
@@ -481,6 +534,11 @@ def main(argv: list[str] | None = None) -> int:
         hello = worker_hello(args.root, environment=probe_environment(args.env))
         print(json.dumps(hello, sort_keys=True))
         return 0
+    refusal = check_host_modules(args.cmd, hippius_mirror=(
+        args.cmd == "public" and args.public_root is None))
+    if refusal:
+        print(refusal, file=sys.stderr)
+        return EXIT_MISSING_MODULES
     try:
         if args.cmd == "public":
             mirror = None
@@ -508,10 +566,11 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-__all__ = ["FORECAST_ERROR_CODES", "MINER_FAULT_CODES", "PUBLIC_REPLY_SCHEMA",
-           "PUBLIC_REQUEST_SCHEMA", "REPLY_SCHEMA", "REQUEST_SCHEMA",
-           "LaneDForecastError", "decode_request", "encode_request", "forecast_entry",
-           "main", "public_scores_entry", "serve_forecast", "serve_public"]
+__all__ = ["EXIT_MISSING_MODULES", "FORECAST_ERROR_CODES", "HOST_MODULES",
+           "MINER_FAULT_CODES", "PUBLIC_REPLY_SCHEMA", "PUBLIC_REQUEST_SCHEMA",
+           "REPLY_SCHEMA", "REQUEST_SCHEMA", "LaneDForecastError", "check_host_modules",
+           "decode_request", "encode_request", "forecast_entry", "main",
+           "missing_host_modules", "public_scores_entry", "serve_forecast", "serve_public"]
 
 
 if __name__ == "__main__":
