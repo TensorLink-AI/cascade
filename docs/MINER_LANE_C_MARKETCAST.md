@@ -212,6 +212,34 @@ memory or crashes.
   you reuse its outputs elsewhere. Its outputs may not be used as a lane D
   teacher.
 
+## Past evaluations
+
+MarketCast evidence is published in the public `cascade-manifests` bucket
+(`https://s3.hippius.com/cascade-manifests/<key>`, no keys needed):
+
+| What | Key | Notes |
+|---|---|---|
+| Per-window report | `marketcast/round-<round_id>.json` | Signed by the main validator. One entry per judged fine-tune and phase (`judge` / `confirm`): per-window base and fine-tune losses, guard losses (MASE, QLIKE, tails), coverage counts, the slot `holder` comparison, and `status` (`infra_deferred` = retried later). Float32 quantile sidecars sit under `marketcast/round-<round_id>/` |
+| Verdict summary | `receipts/index.json` | `lane_c_verdicts` (per entry: `hotkey`, `target`, `stage`, `passed`, `reason`, `gain_lcb`, `gain`, `phase`, `outcome`) and `lane_c_pay` (the slot holder) |
+| One round's receipt | `receipts/<validator_hotkey>/round-<round_id>.json` | Signed. `lane_c` holds the verdict rows |
+| Live lane C state | `status/v2.json`, key `lane_c` | Holder, queued and finished legs per target, settlements |
+
+Find a round through `receipts/index.json` (round ids are seeds, not
+counters). The trainer's lane C manifests (`lane_c/round-<id>.json`) are
+written private, so they are not readable anonymously.
+
+**Am I competitive?** `gain_lcb` must be at least `gain_margin` (1%) with a
+positive `gain`, and `passed` true on both stages. To take the slot you also
+need a strictly higher LCB than the current holder (`holder` in the report).
+
+**No MarketCast entry has been judged yet** (checked 2026-11-27): no
+`marketcast/round-*.json` report exists, every `lane_c_verdicts` list is empty
+and `lane_c_pay.wins` is `[]` since lane C opened at block 9,586,800. There
+is no past score to compare against yet. Example of a receipt that carries
+the (empty) lane C pay record, 2026-11-27 04:31 UTC:
+<https://s3.hippius.com/cascade-manifests/receipts/5FcCsoB2R5M55RdrNrvPQv7xmLJRFzs7R7C73UUSxgUCyfsw/round-12135123300179706659.json>.
+Live state: <https://s3.hippius.com/cascade-manifests/status/v2.json>.
+
 ## FAQ
 
 **Is the base the lane A king?** No. Every recipe fine-tunes the pinned
