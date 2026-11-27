@@ -112,6 +112,7 @@ ALLOWED_PRIMITIVES = (
     "cascade.eval.crps",            # bootstrap's own dependency
     "cascade.shared.sr25519",       # verify_hotkey: the signature verifier
     "cascade.shared.config.lane_d", # the parsed [lane_d] config type
+    "cascade.shared.lane_d_horizons",  # owner 2026-11-27: the GIFT-Eval band table
 )
 ALLOWED_PACKAGES = ("cascade", "cascade.eval", "cascade.shared", "cascade.shared.config",
                     "cascade.audit")
@@ -162,6 +163,9 @@ def genesis_digest(house: dict) -> str:
 # (a floor far below any fixture ratio), so their pre-F4 numbers stand. F4's
 # own tests (tests/accept/w5e/test_w5e_combined.py) pin the combined rule.
 LIVE_ONLY = {"public_weight": 0.0, "window_ratio_floor": 1e-9}
+# Owner 2026-11-27: these fixtures pin the fixed [lane_d] horizon rule (their
+# pools hold fixed-length targets); tests/accept/w_hz pins the band rule.
+FIXED_HORIZON = {"horizon_bands": []}
 
 
 def lane_d_cfg(**over):
@@ -175,7 +179,7 @@ def lane_d_cfg(**over):
            "remainder": "burn", "contexts": [4096, 8192, 16384], "horizon": HORIZON,
            "forward_margin_hours": MARGIN_H, "max_mirror_lag_hours": 6.0,
            "min_windows": FLOOR_WINDOWS, "min_clusters": 4, "bootstrap_B": 200}
-    return parse_lane_d({**raw, **LIVE_ONLY, **over}, era_blocks_at=lambda _block: ERA)
+    return parse_lane_d({**raw, **LIVE_ONLY, **FIXED_HORIZON, **over}, era_blocks_at=lambda _block: ERA)
 
 
 # ── pool_d fixtures (trimmed copy of tests/accept/w7c/helpers.py) ───────────

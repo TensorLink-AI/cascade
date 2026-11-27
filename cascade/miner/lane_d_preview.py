@@ -209,14 +209,20 @@ def series_pool(path: Path, *, horizon: int, freq: str, per_series: int) -> dict
             "first_seen_roots": [], "windows": windows}
 
 
-def _pools(dirs, series, *, horizon: int, freq: str, per_series: int, what: str) -> list[dict]:
-    from ..validator.lane_d import load_pool
+def _pools(dirs, series, *, horizon: int, freq: str, per_series: int, what: str,
+           ld=None) -> list[dict]:
+    """Pool directories load under ``ld``'s horizon rule (owner 2026-11-27:
+    each window at its band horizon, as the validator loads them); your own
+    series are cut at the fixed ``horizon``."""
+    from ..validator.lane_d import load_pool, load_pool_for
 
     if bool(dirs) == (series is not None):
         raise PreviewError("windows_missing", f"give exactly one of --{what}pool-dir or "
                                               f"--{what}series", USAGE)
     if series is not None:
         return [series_pool(series, horizon=horizon, freq=freq, per_series=per_series)]
+    if ld is not None:
+        return [load_pool_for(d, ld) for d in dirs]
     return [load_pool(d, horizon) for d in dirs]
 
 
@@ -225,7 +231,7 @@ def _triples(pools: list[dict], ld, h: int, as_of: int | None, patch: int | None
     """``(window, pool, verdict)`` per usable window, earliest snapshot first
     (the validator's one-version rule), plus the §1.3 refusal counts."""
     from ..validator.lane_d import _admitted_versions, _usable
-    from ..validator.lane_d_forward import WindowVerdict
+    from ..validator.lane_d_forward import WindowVerdict, window_horizon
 
     if as_of is not None:
         admitted, refused = _admitted_versions(pools, int(as_of), int(as_of), ld)
@@ -240,7 +246,7 @@ def _triples(pools: list[dict], ld, h: int, as_of: int | None, patch: int | None
     out, short = [], 0
     for wid in sorted(admitted):
         w, pool, v = admitted[wid]
-        if not _usable(w, h):
+        if not _usable(w, window_horizon(w, ld) if "h" in w else h):
             continue
         if patch and np.shape(w["history"])[-1] < patch:
             short += 1
@@ -253,16 +259,25 @@ def _triples(pools: list[dict], ld, h: int, as_of: int | None, patch: int | None
 
 def _forecast(ckpt: Path, ws: list[dict], *, context: int, horizon: int, armed, device: str
               ) -> dict:
-    """``{window_id: (h, 9) | (k, h, 9)}`` — the eval host's forecast shape."""
+    """``{window_id: (h, 9) | (k, h, 9)}`` — the eval host's forecast shape,
+    one forecast call per window horizon (a band window's own ``h``, owner
+    2026-11-27; else ``horizon``), as the eval host is asked."""
     from ..eval import lane_d_scorer as scorer
 
-    hists = [w["history"] for w in ws]
-    q = scorer.forecast_quantiles(ckpt, hists, context=int(context), horizon=int(horizon),
-                                  contexts=armed, device=device)
-    rows = scorer.forecast_rows(hists)
-    off = np.concatenate([[0], np.cumsum(rows)]).astype(np.int64)
-    return {w["window_id"]: (q[off[i]] if rows[i] == 1 else q[off[i]:off[i + 1]])
-            for i, w in enumerate(ws)}
+    groups: dict[int, list[dict]] = {}
+    for w in ws:
+        groups.setdefault(int(w.get("h", horizon)), []).append(w)
+    out = {}
+    for hz in sorted(groups):
+        part = groups[hz]
+        hists = [w["history"] for w in part]
+        q = scorer.forecast_quantiles(ckpt, hists, context=int(context), horizon=hz,
+                                      contexts=armed, device=device)
+        rows = scorer.forecast_rows(hists)
+        off = np.concatenate([[0], np.cumsum(rows)]).astype(np.int64)
+        out.update({w["window_id"]: (q[off[i]] if rows[i] == 1 else q[off[i]:off[i + 1]])
+                    for i, w in enumerate(part)})
+    return out
 
 
 def _scores(fc: dict, ws: list[dict]) -> tuple[np.ndarray, np.ndarray]:
@@ -346,7 +361,7 @@ def run_preview(args, cfg) -> dict:
     patch = _patch_size(cand)
 
     pools = _pools(args.pool_dir, args.series, horizon=h, freq=args.series_freq,
-                   per_series=args.windows_per_series, what="")
+                   per_series=args.windows_per_series, what="", ld=ld)
     picks = _pick_channels(pools, block_hash, None if max_channels is None else int(max_channels))
     triples, refused = _triples(pools, ld, h, args.as_of, patch)
     cap_seed = f"lane-d/1:cap:local:{seed}"

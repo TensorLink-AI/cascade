@@ -97,8 +97,14 @@ blocks, about 24 h) of `submit`, or the entry expires (`ready_expired`).
 ## How it is scored
 
 - **Metric.** The geometric mean of the CRPS and MASE ratios against the
-  king, on 64-step forecasts (`horizon`). Each window's ratio is clamped to
-  [0.5, 2] and log-averaged. A paired cluster bootstrap over sources gives a
+  king. Each window has its own horizon: one of GIFT-Eval's short, medium
+  and long terms for its frequency (1x, 10x and 15x GIFT's base horizon,
+  rounded up to 32-point patches, at most 2048 points; hourly 64 / 480 /
+  736, daily 32 / 320 / 480; the table is in `docs/LANE_D.md`). Your model
+  predicts the whole horizon in one pass after its declared context, so a
+  model that only forecasts well 64 steps ahead loses on the long cells.
+  Every (frequency class, band) cell counts equally. Each window's ratio is
+  clamped to [0.5, 2] and log-averaged. A paired cluster bootstrap over sources gives a
   one-sided lower confidence bound (LCB) at `alpha` = 0.05.
 - **Live windows.** Forward windows from the private live pool. A window is
   *fresh* when all its target data arrived after your entry, or *embargo*
@@ -244,7 +250,9 @@ none.
 (3% against a fresh king, decaying to 1%). `king_before` / `king_after` name
 the king (`house: true` = the lane A house model). Each `verdicts` row is one
 judged entry: `outcome` (`lost`, `cleared`, `crowned`), its `lcb` against
-the king, and the `fresh` and `embargo` sub-scores. `entries` and `skipped`
+the king, the `fresh` and `embargo` sub-scores, and `cells` (your point
+gain per `live|<frequency class>|<band>` and `public|...` cell; each window
+in `windows` names its `band` and `h`). `entries` and `skipped`
 give each entry's status and reason code (the codes are in `reason_enum` of
 `status/lane_d.json`), and `windows` and `cohorts` show what was drawn.
 

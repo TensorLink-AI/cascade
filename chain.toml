@@ -1662,7 +1662,15 @@ share           = 0.0            # of the total, carved from takes_from (D1: 0.2
 takes_from      = "lane_b"       # lane_a | lane_b | lane_c
 remainder       = "burn"         # release-only burn destination (D21)
 contexts        = [4096, 8192, 16384, 32768, 65536, 131072]  # D2 rev6.6: declarable from launch (cap 131072); each arms per settlement on its gates
-horizon         = 64             # points; <= 512 (§1.1)
+horizon         = 64             # points; <= 512 (§1.1); the fixed rule when horizon_bands = []
+# Owner 2026-11-27: each window is scored at its own horizon, drawn per window
+# from the GIFT-Eval terms of its frequency (short 1x / medium 10x / long 15x
+# GIFT's base horizon; 32-point aligned; cascade/shared/lane_d_horizons.py).
+# Release-only (validators follow the signed report with the pre-band checker).
+horizon_bands   = ["short", "medium", "long"]  # [] = the fixed `horizon` rule
+max_horizon     = 2048           # cap on any band horizon (points, a multiple of 32)
+band_slots      = 1              # candidate targets per band per series per snapshot (each snapshot adds its newest; box memory ~3x windows at 1)
+min_cell_windows = 50            # a (freq class, band) cell below this is left out; the rest balance to equal counts
 dtypes          = ["BF16"]       # D14: BF16 only
 forward_margin_hours = 0.0       # D5; rev6.14 (a): the eligibility / fresh boundary b = T + this (6 -> 0)
 eval_delay_hours = 6.0           # rev6.14 (a): judging start j = T + this ("delay eval by 6 hours"); >= forward_margin_hours

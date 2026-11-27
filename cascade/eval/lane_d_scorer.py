@@ -12,8 +12,8 @@
   the highest armed variant. A forecast runs only at a context in
   :data:`SCORER_CONTEXTS` and, when the armed set is given, in it too
   (:func:`declared_context`). Horizons are capped at
-  :data:`MAX_HORIZON` (16 CPM patches × 32: longer spans are outside
-  training). Both are refused before anything is loaded or torch imported.
+  :data:`MAX_HORIZON` (64 patches × 32 = 2048, the band cap; training's CPM
+  spans stop at 16 patches, so the long bands extrapolate). Both are refused before anything is loaded or torch imported.
 * **No padding.** Each history is truncated to the largest patch multiple it
   really has, capped at the declared ``context``; histories of equal length
   are batched together (:func:`batch_plan`, one batch per length). A batch
@@ -59,8 +59,14 @@ SCORING_METHOD = "quantile_head"
 # launch) is the declarable set; each variant arms per settlement on its two
 # gates (:func:`armed_record`), never by overlay.
 SCORER_CONTEXTS: tuple[int, ...] = (4096, 8192, 16384, 32768, 65536, 131072)
-# CPM masks contiguous spans of at most cpm_c_max = 16 patches of 32 points.
-MAX_HORIZON = 16 * 32
+# Owner 2026-11-27: per-window GIFT-Eval horizons up to [lane_d] max_horizon
+# (2048 = 64 patches of 32). The masked horizon is ONE forward block of
+# ceil(h / 32) patches after the history (no autoregression); the pyramid
+# reads no ``max_patches`` (xPos positions are computed for the sequence it
+# is given), so a declared-4096 entry runs 128 + 64 = 192 patches at h = 2048
+# with its full context. Training masked spans of at most cpm_c_max = 16
+# patches: longer horizons are an extrapolation every model faces alike.
+MAX_HORIZON = 64 * 32
 # #785: patch tokens (windows x channels x patches, horizon patches included)
 # one model forward may carry. The pyramid reshapes to (B * P, C, -1) before
 # scaled_dot_product_attention; at ~65,536 rows the CUDA launch fails
@@ -97,7 +103,7 @@ def declared_context(context, contexts) -> int:
 def _checked_horizon(horizon) -> int:
     h = _as_int(horizon, "horizon")
     if not 1 <= h <= MAX_HORIZON:
-        raise ValueError(f"horizon {h} outside [1, {MAX_HORIZON}] (16 CPM patches x 32)")
+        raise ValueError(f"horizon {h} outside [1, {MAX_HORIZON}] (64 patches x 32)")
     return h
 
 

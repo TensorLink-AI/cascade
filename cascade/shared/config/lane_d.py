@@ -31,8 +31,12 @@ LANE_D_REMAINDERS = ("burn",)
 # gates (cascade.eval.lane_d_scorer.armed_record), never configured here.
 LANE_D_CONTEXTS = (4096, 8192, 16384, 32768, 65536, 131072)
 LANE_D_MAX_CONTEXT = 131072
-# §1.1: any lane D horizon is at most 16 CPM patches x 32 points.
+# §1.1: the fixed ``horizon`` (bands off) is at most 16 CPM patches x 32 points.
 LANE_D_MAX_HORIZON = 512
+# Owner 2026-11-27: per-window horizons from GIFT-Eval's short / medium / long
+# terms (cascade.shared.lane_d_horizons); the longest is capped at this.
+LANE_D_MAX_BAND_HORIZON = 2048
+LANE_D_HORIZON_BANDS = ("short", "medium", "long")
 # D14: BF16 only.
 LANE_D_DTYPES = ("BF16",)
 # rev6.18 B11: keys a deployed [lane_d] table may still carry that no code
@@ -88,6 +92,18 @@ class LaneDConfig:
     # What an entry is judged at (§1.1, D2, D14).
     contexts: tuple[int, ...] = LANE_D_CONTEXTS
     horizon: int = 64
+    # Owner 2026-11-27: each window is scored at its own horizon, drawn per
+    # window from these GIFT-Eval bands of its frequency (short = 1x,
+    # medium = 10x, long = 15x the base horizon, patch-aligned, capped at
+    # ``max_horizon``); ``band_slots`` candidate targets per band per series
+    # per snapshot; a (frequency class, band) cell with fewer than
+    # ``min_cell_windows`` judged windows is left out and the rest are
+    # balanced to equal counts (equal weight per cell). ``horizon_bands = []``
+    # is the fixed ``horizon`` rule (byte for byte the pre-band behaviour).
+    horizon_bands: tuple[str, ...] = LANE_D_HORIZON_BANDS
+    max_horizon: int = LANE_D_MAX_BAND_HORIZON
+    band_slots: int = 1
+    min_cell_windows: int = 50
     dtypes: tuple[str, ...] = LANE_D_DTYPES
     # Forward-only judging (§1.3, D5). rev6.14 (a): two clocks per entry, T =
     # wall(max(T_E, T_K)): the eligibility / fresh boundary b = T +
@@ -212,6 +228,18 @@ def _contexts(raw: object) -> tuple[int, ...]:
     return tuple(int(c) for c in raw)
 
 
+def _bands(raw: object) -> tuple[str, ...]:
+    """``horizon_bands``: unique names from :data:`LANE_D_HORIZON_BANDS`, in
+    that order; ``[]`` = the fixed ``horizon`` rule."""
+    if not isinstance(raw, list | tuple) or not all(isinstance(b, str) for b in raw):
+        raise ValueError(f"[lane_d] horizon_bands must be a list of names; got {raw!r}")
+    bad = sorted(set(raw) - set(LANE_D_HORIZON_BANDS))
+    if bad or len(set(raw)) != len(raw):
+        raise ValueError(f"[lane_d] horizon_bands {list(raw)!r}: unique names from "
+                         f"{list(LANE_D_HORIZON_BANDS)}")
+    return tuple(b for b in LANE_D_HORIZON_BANDS if b in set(raw))
+
+
 def _dtypes(raw: object) -> tuple[str, ...]:
     if (not isinstance(raw, (list, tuple)) or not raw
             or not all(isinstance(d, str) and d in LANE_D_DTYPES for d in raw)
@@ -302,6 +330,15 @@ def parse_lane_d(raw: object, *, era_blocks_at: Callable[[int], int] | None = No
     contexts = _contexts(ld.get("contexts", list(LANE_D_CONTEXTS)))
     horizon = _int(ld.get("horizon", 64), "horizon", lo=1, hi=LANE_D_MAX_HORIZON)
     dtypes = _dtypes(ld.get("dtypes", list(LANE_D_DTYPES)))
+    bands = _bands(ld.get("horizon_bands", list(LANE_D_HORIZON_BANDS)))
+    max_h = _int(ld.get("max_horizon", LANE_D_MAX_BAND_HORIZON), "max_horizon", lo=32,
+                 hi=LANE_D_MAX_BAND_HORIZON)
+    if max_h % 32:
+        raise ValueError(f"[lane_d] max_horizon={max_h} must be a multiple of the 32-point patch")
+    if bands and max_h < horizon:
+        raise ValueError(f"[lane_d] max_horizon={max_h} must be >= horizon={horizon}")
+    slots = _int(ld.get("band_slots", 1), "band_slots", lo=1, hi=64)
+    min_cell = _int(ld.get("min_cell_windows", 50), "min_cell_windows", lo=1)
     fwd = _float(ld.get("forward_margin_hours", 0.0), "forward_margin_hours")
     if fwd < 0.0:
         raise ValueError(f"[lane_d] forward_margin_hours must be >= 0; got {fwd!r}")
@@ -360,6 +397,7 @@ def parse_lane_d(raw: object, *, era_blocks_at: Callable[[int], int] | None = No
         test_family=family, pay_curve=curve,
         from_block=fb, until_block=ub, share=share, takes_from=takes, remainder=rem,
         contexts=contexts, horizon=horizon, dtypes=dtypes,
+        horizon_bands=bands, max_horizon=max_h, band_slots=slots, min_cell_windows=min_cell,
         forward_margin_hours=fwd, eval_delay_hours=delay,
         min_windows=min_windows,
         min_clusters=_int(ld.get("min_clusters", 20), "min_clusters", lo=1),

@@ -653,6 +653,39 @@ def _window_ids(pool_dir: Path) -> set[str]:
             for s in meta.get("series") or [] if s.get("target_ts")}
 
 
+def _window_starts(pool_dir: Path) -> set[tuple[str, int]]:
+    """Owner 2026-11-27: every ``(series_id, target start)`` a window of the
+    snapshot can have (any band horizon): each point of the series' stored
+    target region (``clk.npz``; a pre-band snapshot's is its target)."""
+    import numpy as np
+
+    meta = json.loads((pool_dir / "metadata.json").read_text(encoding="utf-8"))
+    rec = meta.get("clocks")
+    out: set[tuple[str, int]] = set()
+    clk = None
+    if isinstance(rec, dict) and (pool_dir / str(rec.get("file"))).is_file():
+        clk = np.load(pool_dir / str(rec["file"]))
+    try:
+        for s in meta.get("series") or []:
+            sid = str(s["series_id"])
+            if clk is not None and sid in clk.files:
+                out |= {(sid, int(t)) for t in clk[sid][0]}
+            else:
+                out |= {(sid, int(t)) for t in s.get("target_ts") or []}
+    finally:
+        if clk is not None:
+            clk.close()
+    return out
+
+
+def _frozen_starts(ids) -> set[tuple[str, int]]:
+    out = set()
+    for w in ids:
+        sid, ts, _h = str(w).rsplit(":", 2)
+        out.add((sid, int(ts)))
+    return out
+
+
 def lane_d_embargo_hours(chain_toml: Path | str | None = None) -> float:
     """``[lane_d] embargo_hours`` of ``chain_toml`` (else the loader's default
     chain.toml): what retention keeps snapshots for (item 7)."""
@@ -687,10 +720,13 @@ def retention_plan(pins_path: Path | str, state: Mapping, *,
         fs = e.get("frozen_set")
         if isinstance(fs, Mapping):
             frozen |= {str(w) for w in fs.get("window_ids") or []}
+    starts = _frozen_starts(frozen)
     for p in pins:
         if p["snapshot"] not in keep and frozen:
             d = pins_path.parent / p["dir"]
-            if not (d / "metadata.json").is_file() or _window_ids(d) & frozen:
+            # a band window (any h) starts at a region point of its snapshot
+            if not (d / "metadata.json").is_file() or _window_ids(d) & frozen \
+                    or _window_starts(d) & starts:
                 keep.add(p["snapshot"])
     return {"keep": [n for n in names if n in keep], "expire": [n for n in names if n not in keep]}
 

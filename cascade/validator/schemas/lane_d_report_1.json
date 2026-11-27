@@ -54,6 +54,7 @@
     },
     "armed_evidence": {"$ref": "#/$defs/armed_evidence"},
     "host": {"$ref": "#/$defs/host"},
+    "horizon_bands": {"$ref": "#/$defs/horizon_bands"},
     "extensions": {
       "type": "object",
       "description": "Open and never consensus: satellites must not read verdict, eligibility or weight inputs from it."
@@ -306,7 +307,39 @@
           "description": "{reason: count} of pool windows refused by the §1.3 eligibility rule.",
           "propertyNames": {"$ref": "#/$defs/window_refusal_reason"},
           "additionalProperties": {"type": "integer", "minimum": 1}
-        }
+        },
+        "cells": {"$ref": "#/$defs/cell_counts",
+                  "description": "Owner 2026-11-27 (optional; band rule only): judged windows per \"<frequency class>|<band>\" cell, equal by construction."},
+        "cells_dropped": {"$ref": "#/$defs/cell_counts",
+                          "description": "Owner 2026-11-27 (optional; band rule only): cells left out below min_cell_windows, with their drawn counts."}
+      }
+    },
+    "cell_counts": {
+      "type": "object",
+      "propertyNames": {"type": "string", "pattern": "^[^|]+[|](short|medium|long)$"},
+      "additionalProperties": {"type": "integer", "minimum": 0}
+    },
+    "band": {"type": "string", "enum": ["short", "medium", "long"]},
+    "horizon_bands": {
+      "type": "object",
+      "description": "Owner 2026-11-27 (optional extra; absent under the fixed horizon rule): the per-window horizon rule. A window's h is table[GIFT base unit of its freq][its band]: ceil(multiplier * base / patch) * patch, capped at max_horizon (GIFT-Eval data.py PRED_LENGTH_MAP / M4_PRED_LENGTH_MAP and Term.multiplier).",
+      "required": ["schema", "source", "bands", "multipliers", "base_horizons", "patch",
+                   "max_horizon", "band_slots", "min_cell_windows", "table"],
+      "additionalProperties": false,
+      "properties": {
+        "schema": {"type": "string", "const": "lane-d-horizons/1"},
+        "source": {"type": "string", "minLength": 1},
+        "bands": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/band"}},
+        "multipliers": {"type": "object", "propertyNames": {"$ref": "#/$defs/band"},
+                        "additionalProperties": {"type": "integer", "minimum": 1}},
+        "base_horizons": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 1}},
+        "patch": {"type": "integer", "minimum": 1},
+        "max_horizon": {"type": "integer", "minimum": 1},
+        "band_slots": {"type": "integer", "minimum": 1},
+        "min_cell_windows": {"type": "integer", "minimum": 1},
+        "table": {"type": "object", "additionalProperties": {
+          "type": "object", "propertyNames": {"$ref": "#/$defs/band"},
+          "additionalProperties": {"type": "integer", "minimum": 1}}}
       }
     },
     "window": {
@@ -338,6 +371,7 @@
         "kind": {"$ref": "#/$defs/window_kind"},
         "freq_class": {"$ref": "#/$defs/freq_class"},
         "h": {"type": "integer", "minimum": 1, "description": "The drawn horizon: the window id's h<h>."},
+        "band": {"$ref": "#/$defs/band", "description": "Owner 2026-11-27 (optional; band rule only): the window's drawn band; h is its band horizon."},
         "origin": {"$ref": "#/$defs/timestamp", "description": "The target start: the window id's middle field."},
         "series_id": {"type": "string", "minLength": 1, "description": "rev6.18 A4 (F2): a multichannel window's pool series id, the channel pick's seed input. Present exactly on a multichannel window (absent on a univariate one)."},
         "n_channels_raw": {"type": "integer", "minimum": 2, "description": "rev6.18 A4 (F2): the stored series' channel count C."},
@@ -449,7 +483,8 @@
         "freq": {"type": "string", "minLength": 1},
         "cut": {"type": "integer", "minimum": 1},
         "h": {"type": "integer", "minimum": 1},
-        "length": {"type": "integer", "minimum": 1}
+        "length": {"type": "integer", "minimum": 1},
+        "band": {"$ref": "#/$defs/band"}
       }
     },
     "public_dropped": {
@@ -458,7 +493,7 @@
       "additionalProperties": false,
       "properties": {
         "window_id": {"type": "string", "minLength": 1},
-        "reason": {"type": "string", "enum": ["public_nonfinite_target", "public_short_history", "public_no_channel", "public_no_scale"]}
+        "reason": {"type": "string", "enum": ["public_nonfinite_target", "public_short_history", "public_no_channel", "public_no_scale", "public_cell_balance"]}
       }
     },
     "draw_cohort": {
@@ -502,6 +537,10 @@
                     "additionalProperties": {"$ref": "#/$defs/point_gain"}},
         "fresh": {"$ref": "#/$defs/subscore"},
         "embargo": {"$ref": "#/$defs/subscore"},
+        "cells": {"type": "object",
+                  "description": "Owner 2026-11-27 (optional; band rule only): point gain per \"<half>|<frequency class>|<band>\" cell.",
+                  "propertyNames": {"type": "string", "pattern": "^(live|public)[|][^|]+[|](short|medium|long)$"},
+                  "additionalProperties": {"$ref": "#/$defs/point_gain"}},
         "house": {"$ref": "#/$defs/house_judgement"}
       }
     },

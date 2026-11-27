@@ -254,6 +254,13 @@ RELEASE_ONLY_KEYS: dict[tuple[str, str], str] = {
     ("eval", "gift_gate_data_dir"): "an operator-local path is never an overlay",
     ("lane_d", "teacher_ref"): "the teacher model pin is release-only",
     ("lane_d", "teacher_api"): "an external endpoint is release-only",
+    # Owner 2026-11-27: the per-window horizon rule. Validators that follow the
+    # signed report run the pre-band checker; the band rule (and the pool
+    # format it builds) changes only with a release.
+    ("lane_d", "horizon_bands"): "the per-window horizon rule is release-only",
+    ("lane_d", "max_horizon"): "the per-window horizon rule is release-only",
+    ("lane_d", "band_slots"): "the per-window horizon rule is release-only",
+    ("lane_d", "min_cell_windows"): "the per-window horizon rule is release-only",
 }
 
 # Eval DATA keys (owner 2026-11-24: what data a lane is judged on is

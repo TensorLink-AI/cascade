@@ -337,10 +337,24 @@ def _cli(world, tmp_path, lane_a, out_name="cli"):
 def test_cli_builds_with_lane_a_replay(world, tmp_path):
     rc, ev = _cli(world, tmp_path, _lane_a_snapshot(world, tmp_path))
     assert rc == 0
-    assert tree_sha(tmp_path / "cli") == tree_sha(world["d2"])
+    # Owner 2026-11-27: the CLI builds under the shipped [lane_d], whose band
+    # rule adds the region clocks (clk.npz + metadata); hist / tgt are the
+    # pre-band bytes, and the rest is the library build under that config.
+    from cascade.shared.config import load_chain_config
+
+    b, _sel, _fs = mods()
+    cfg = b.PoolDBuildConfig.from_lane_d(load_chain_config().lane_d)   # as the CLI loads it
+    b.build_pool_d(forge_dir=world["root"], selection=world["selection"],
+                   first_seen_dir=world["root"] / "first_seen", as_of_ts=AS2,
+                   out_dir=tmp_path / "want", prior_dirs=[world["d1"]], cfg=cfg)
+    got = tree_sha(tmp_path / "cli")
+    assert got == tree_sha(tmp_path / "want")
+    old = tree_sha(world["d2"])
+    assert {k: got[k] for k in ("hist.npz", "tgt.npz")} == {k: old[k] for k in
+                                                           ("hist.npz", "tgt.npz")}
     doc = json.loads(ev.read_text())
     _check_evidence(doc)
-    assert doc["sha256"] == world["s2"].sha256
+    assert doc["sha256"] == b.snapshot_sha256(tmp_path / "want")
     lines = sorted(f"{p.name} {hashlib.sha256(p.read_bytes()).hexdigest()}"
                    for p in sorted((tmp_path / "lane_a").iterdir())
                    if p.name == "metadata.json" or p.suffix == ".npy")

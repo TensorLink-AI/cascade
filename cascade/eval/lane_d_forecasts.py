@@ -414,12 +414,22 @@ def public_scores_entry(cache: PrefetchCache, digest: str, draws: Sequence[Mappi
         windows += ws
         dropped[src] = drops
     windows.sort(key=lambda w: w["window_id"])
-    cut = [{"window_id": w["window_id"],
-            "history": np.asarray(w["history"])[..., -int(context):]} for w in windows]
-    arr = forecast_entry(cache, digest, cut, context=context, horizon=horizon,
-                         contexts=contexts, grant=grant, contract=contract, expect=expect,
-                         device=device, forecast=forecast) if cut else np.zeros((0, horizon, 9))
-    per = score_public_windows(windows, {digest: _split_rows(arr, cut)}).get(digest, {})
+    # owner 2026-11-27: each public window is forecast at its own h (its
+    # target's length); one forecast per horizon group, windows in id order
+    # inside it. Under the fixed rule every window is one group at
+    # ``horizon``: the pre-band single call.
+    by_h: dict[int, list[dict]] = {}
+    for w in windows:
+        by_h.setdefault(int(np.shape(w["target"])[-1]), []).append(w)
+    fc: dict = {}
+    for hz in sorted(by_h):
+        cut = [{"window_id": w["window_id"],
+                "history": np.asarray(w["history"])[..., -int(context):]} for w in by_h[hz]]
+        arr = forecast_entry(cache, digest, cut, context=context, horizon=hz,
+                             contexts=contexts, grant=grant, contract=contract, expect=expect,
+                             device=device, forecast=forecast)
+        fc.update(_split_rows(arr, cut))
+    per = score_public_windows(windows, {digest: fc}).get(digest, {})
     return {"scores": {src: per.get(src, []) for src in sorted(dropped)}, "dropped": dropped}
 
 
