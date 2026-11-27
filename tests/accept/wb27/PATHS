@@ -132,3 +132,14 @@ tests/unit/test_fix_trainer_infra_harvest.py
 # recorded with its dispatch's selection / contract block / exclude.
 cascade/trainer/runner_common.py
 tests/accept/wb27/test_wb27_lane_b_receipt_contract.py
+# 2026-11-27: a FINISHED lane B expert run was "not found" by the restart
+# re-attach (its run tag's identity hash folds the era's contract block; the
+# re-attach used the CURRENT era) and its pod removed. The re-attach finds a
+# leg's run by its stable name and re-derives the dispatch era; a pod holding
+# a finished, unharvested run is never removed on a failure. Lane B / eval
+# pod cache dirs go on the largest data mount (/workspace); disk-short names it.
+cascade/shared/pod_data_root.py
+cascade/validator/eval_offload.py
+deploy/bench_pod_bootstrap.sh
+tests/accept/wb27/test_wb27_reattach_finished_and_cache_disk.py
+tests/accept/wb27/fixtures/reattach_5gmzsp/

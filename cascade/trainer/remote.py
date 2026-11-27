@@ -706,7 +706,8 @@ class LegAborted(RemoteDispatchError):
     miner's fault."""
 
 
-def _detached_find_command(host: RemoteHost, tag: str) -> str:
+def _detached_find_command(host: RemoteHost, tag: str, *, finished_only: bool = False,
+                           require: str = "") -> str:
     """List prior run dirs of ``tag`` on the pod that still matter: the worker
     is alive (pid answers ``kill -0``) or finished CLEANLY (``exit_code`` 0 —
     a result to harvest). A FAILED run (exit != 0) is never re-attached: that
@@ -715,12 +716,45 @@ def _detached_find_command(host: RemoteHost, tag: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9_.-]", "_", tag)[:80]
     return (f"cd {shlex.quote(host.workdir)} && for d in {DETACHED_RUN_ROOT}/{safe}-*; do "
             f"[ -d \"$d\" ] || continue; if [ -f \"$d/exit_code\" ]; then "
-            f"[ \"$(cat \"$d/exit_code\")\" = 0 ] && echo ATTACH:$d; "
-            f"elif [ -f \"$d/pid\" ] && kill -0 $(cat \"$d/pid\") 2>/dev/null; then "
-            f"echo ATTACH:$d; fi; done; true")
+            f"[ \"$(cat \"$d/exit_code\")\" = 0 ] && "
+            + (f"grep -qF -- {shlex.quote(require)} \"$d/stdout\" 2>/dev/null && "
+               if require else "")
+            + "echo ATTACH:$d; "
+            + ("" if finished_only else
+               "elif [ -f \"$d/pid\" ] && kill -0 $(cat \"$d/pid\") 2>/dev/null; then "
+               "echo ATTACH:$d; ")
+            + "fi; done; true")
 
 
-def find_detached_run(host: RemoteHost, tag: str, *, runner=None) -> str | None:
+def leg_run_base_tag(role: str, hotkey: str, base_seed) -> str:
+    """A leg's STABLE run-dir name on its pod (``<role>-<hotkey12>-<seed>``):
+    the detached tag minus the identity hash suffix. The lane B re-attach
+    record carries the same name (``leg_identity`` "tag")."""
+    return f"{role}-{hotkey[:12]}-{base_seed}"
+
+
+def loose_receipt_mismatch(receipt: dict, *, hotkey: str, repo_suffix: str = "") -> str:
+    """Why a run attached by its stable name is NOT this leg ("" = it is):
+    its receipt names another miner, or a checkpoint dir of another leg
+    suffix (a second domain's expert of the same miner)."""
+    if not isinstance(receipt, dict) or not receipt:
+        return ""                          # no receipt: the receipt checks fail it
+    miner = str(receipt.get("miner_hotkey", "") or "")
+    if miner and miner != hotkey:
+        return f"receipt miner {miner[:12]} != {hotkey[:12]}"
+    ck = str(receipt.get("local_checkpoint_dir", "") or "")
+    if repo_suffix and ck and f"{repo_suffix}/" not in ck + "/":
+        return f"checkpoint {ck} is not leg suffix {repo_suffix}"
+    return ""
+
+
+# Lane B / lane C specialist legs: one leg per (role, hotkey, seed epoch) on
+# its own pod — a finished run there under its stable name IS the leg.
+_SPECIALIST_ROLES = ("expert", "mkt_finetune")
+
+
+def find_detached_run(host: RemoteHost, tag: str, *, runner=None,
+                      finished_only: bool = False, require: str = "") -> str | None:
     """The run dir of a prior detached launch of ``tag`` on ``host`` whose
     worker is still running or has finished, or ``None``.
 
@@ -732,7 +766,9 @@ def find_detached_run(host: RemoteHost, tag: str, *, runner=None) -> str | None:
     grace handles the transport). Absolute path under ``host.workdir``."""
     run = runner or run_ssh
     try:
-        p = run(build_ssh_argv(host, _detached_find_command(host, tag)), 60, "")
+        p = run(build_ssh_argv(host, _detached_find_command(
+            host, tag, **({"finished_only": True} if finished_only else {}),
+            **({"require": require} if require else {}))), 60, "")
     except (subprocess.TimeoutExpired, OSError):
         return None
     if p.returncode != 0:
@@ -2386,13 +2422,48 @@ class RemoteDispatcher:
             prior = find_detached_run(host, tag, runner=self._runner)
             from .leg_reattach import REATTACH_REFUSED, attach_only
 
+            loose = False
+            if (prior is None and tag != leg_run_base_tag(role, hotkey, base_seed)
+                    and (attach_only() or (role in _SPECIALIST_ROLES and bool(repo_suffix)))):
+                # 2026-11-27: the exact tag carries a hash of the leg's
+                # identity (continuation key / argv), which a restart can
+                # re-derive differently (the era rolled: another
+                # --contract-block) — a FINISHED 8xH200 expert run was "not
+                # found" and its pod removed. A re-attach launches nothing,
+                # so it accepts this leg's run by its stable name
+                # (<role>-<hotkey12>-<seed>) and checks the receipt below. A
+                # fresh lane B / lane C dispatch on the leg's adopted pod (the
+                # requeue after such a refusal) harvests a FINISHED run of
+                # the leg the same way instead of retraining over it.
+                base_tag = leg_run_base_tag(role, hotkey, base_seed)
+                fresh_dispatch = not attach_only()
+                prior = find_detached_run(
+                    host, base_tag, runner=self._runner, finished_only=fresh_dispatch,
+                    # a fresh dispatch takes only a finished run whose receipt
+                    # names THIS leg's checkpoint dir (another domain's
+                    # expert of the same miner launches fresh, as before)
+                    require=(f"{repo_suffix}/checkpoint" if fresh_dispatch and repo_suffix
+                             else ""))
+                loose = prior is not None
+                if loose:
+                    log.warning("dispatch role=%s → %s: found this leg's run %s "
+                                "under its stable name (identity tag %s differs) — "
+                                "attaching; its receipt is checked before the harvest",
+                                role, host.name, prior, tag)
+                    if mirror is not None:
+                        # another identity's mirror: never polled / restored
+                        # against this run
+                        with contextlib.suppress(Exception):
+                            mirror.close()
+                        mirror = None
             if prior is None and attach_only():
                 if mirror is not None:
                     with contextlib.suppress(Exception):
                         mirror.close()
                 raise ReattachMissing(
                     f"{REATTACH_REFUSED}: no live or finished run of this {role} leg on "
-                    f"{host.name} — nothing relaunched")
+                    f"{host.name} (looked for {tag}-* and "
+                    f"{leg_run_base_tag(role, hotkey, base_seed)}-*) — nothing relaunched")
             if prior:
                 log.warning("dispatch role=%s → %s: a run of this leg is already on the "
                             "pod (%s) — attaching, not relaunching", role, host.name, prior)
@@ -2465,6 +2536,12 @@ class RemoteDispatcher:
             err.image_refusal = worker_image_refusal(proc.returncode, proc.stdout or "")
             raise err
         receipt = parse_receipt(proc.stdout or "")
+        if self.detached and prior and loose:
+            why = loose_receipt_mismatch(receipt, hotkey=hotkey, repo_suffix=repo_suffix)
+            if why:
+                raise ReattachMissing(f"{REATTACH_REFUSED}: the {role} run {prior} on "
+                                      f"{host.name} is not this leg ({why}) — nothing "
+                                      "relaunched, the pod is kept for its own harvest")
         if (local_checkpoint and self.detached and prior
                 and "local_checkpoint_dir" not in receipt and "trained_pointer" in receipt):
             # We attached to a run some EARLIER dispatch launched — one that

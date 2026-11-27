@@ -400,11 +400,19 @@ def bench_pinned(host, remote_ckpt: str, *, settings: dict, workers, timeout_s: 
 
     run = _run_or_ssh(run)
     q = shlex.quote
-    base = f"{host.workdir}/_lane_b_offload/bench-runs/{uuid.uuid4().hex}"
+    from ..shared.pod_data_root import base_dir
+    from ..validator.eval_offload import _placement
+    from .lane_b_offload import LaneBPodRunner
+
+    # 2026-11-27: the same dirs (and data-mount placement) as the lane B
+    # runner and the validator's bench offload
+    base = f"{LaneBPodRunner.root_of(host)}/bench-runs/{uuid.uuid4().hex}"
     report = f"{base}/report.json"
-    cache = f"{host.workdir}/_eval_offload/cache"
+    cache = f"{base_dir(host)}/_eval_offload/cache"
     try:
-        prep = run(build_ssh_argv(host, f"mkdir -p {q(base)} {q(cache)}"), 120)
+        prep = run(build_ssh_argv(host, _placement(host, f"{base_dir(host)}/_eval_offload")
+                                  + _placement(host, LaneBPodRunner.root_of(host))
+                                  + f"mkdir -p {q(base)} {q(cache)}"), 120)
         if prep.returncode != 0:
             log.warning("lane B bench: prep failed on %s: %s", getattr(host, "name", host),
                         (prep.stderr or "")[-200:])

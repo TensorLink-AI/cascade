@@ -30,6 +30,29 @@ log "sidecar env (benchmarks/uv.lock, frozen)"
 benchmarks/.venv/bin/python -c 'import torch; assert torch.cuda.is_available(), "CUDA unavailable"' \
   || { log "sidecar torch cannot see the GPU"; exit 4; }
 
+# 2026-11-27: the eval caches go on the pod's large data mount (a 43 GB root
+# overlay filled while /workspace sat empty). A missing / empty cache dir
+# becomes a symlink into the largest writable mount on another filesystem
+# (CASCADE_DATA_MOUNTS, default /workspace); a non-empty one is left alone.
+# Twin of cascade/shared/pod_data_root.py:place_on_data_mount_command.
+avail() { df -PB1 "$1" 2>/dev/null | awk 'NR==2{print $4}'; }
+for name in _eval_offload _private_eval_offload _lane_b_offload; do
+  L="$WORKDIR/$name"
+  if [ -d "$L" ] && [ ! -L "$L" ]; then rmdir "$L" 2>/dev/null || true; fi
+  [ -e "$L" ] || [ -L "$L" ] && continue
+  best=""; bestf="$(avail "$WORKDIR")"
+  for c in ${CASCADE_DATA_MOUNTS:-/workspace}; do
+    [ -d "$c" ] && [ -w "$c" ] || continue
+    [ "$(stat -c %d "$c")" = "$(stat -c %d "$WORKDIR")" ] && continue
+    f="$(avail "$c")"
+    [ "${f:-0}" -gt "${bestf:-0}" ] && { best="$c"; bestf="$f"; }
+  done
+  if [ -n "$best" ]; then
+    mkdir -p "$best/$name" && ln -sfn "$best/$name" "$L"
+    log "$name -> $best/$name ($((bestf / 1000000000)) GB free)"
+  fi
+done
+
 mkdir -p "$DATA"
 log "benchmark data -> $DATA ($SUITES)"
 benchmarks/.venv/bin/cascade-benchmark-download --data-dir "$DATA" --suites "$SUITES" >&2

@@ -73,6 +73,40 @@ def _check_king_cancel(runner):
         raise RemoteDispatchError('redundant king replica cancelled', returncode=254)
 
 
+def may_hold_unharvested_run(exc, *, trained: bool) -> bool:
+    """Whether a failed leg's pod may still hold a FINISHED run nobody
+    harvested — worth a read-only probe before the teardown: a dispatch /
+    re-attach / transport failure (:class:`RemoteDispatchError`). Not when a
+    harvest already ran (``trained``: the harvest path decides the pod), the
+    worker itself exited non-zero (that run failed), or the verdict is the
+    miner's (tamper / diverged: never kept on anyone's bill)."""
+    from .remote import RemoteDispatchError
+
+    if trained or isinstance(exc, (_FundedTamper, _FundedDiverged)):
+        return False
+    if not isinstance(exc, RemoteDispatchError):
+        return False            # a pre-dispatch refusal / setup fault: no run of ours ran
+    rc = getattr(exc, "returncode", None)
+    return not (isinstance(rc, int) and rc not in (0, 255))
+
+
+def unharvested_finished_run(runner, host) -> str:
+    """The run dir of a FINISHED (exit 0) detached run on ``host`` — its
+    checkpoint is still on the pod — or "" (none, or the pod cannot be read:
+    an unreachable pod is the sweep's call, never kept here). Read-only."""
+    try:
+        from .remote import probe_pod_runs
+
+        probe = probe_pod_runs(host, runner=getattr(runner, "_sweep_ssh_runner", None),
+                               timeout=60)
+    except Exception as e:  # noqa: BLE001 — unknown: the teardown proceeds as before
+        log.warning("finished-run probe of %s failed (%s)", getattr(host, "name", "?"), e)
+        return ""
+    if not probe.reachable or not probe.finished_ok:
+        return ""
+    return ", ".join(d for d, _ in probe.finished_ok)
+
+
 class _OperatorPodMixin:
     """Operator-account pods: the era king's JIT pod and operator-rented legs."""
 
@@ -1044,6 +1078,7 @@ class _OperatorPodMixin:
             raise
         finally:
             disarm_release(self, armed)
+            exc = None
             if not released:
                 if not succeeded:
                     # 2026-11-26: the pod's evidence BEFORE it goes (bounded)
@@ -1056,4 +1091,17 @@ class _OperatorPodMixin:
                                     reason=f"operator {role} leg {gen.hotkey[:12]}: "
                                            f"{type(exc).__name__ if exc else 'aborted'}: "
                                            f"{str(exc)[:500] if exc else ''}")
-                self._teardown_operator_pod(ledger_pod())
+                held = ("" if succeeded or not may_hold_unharvested_run(
+                    exc, trained=bool(getattr(self.__dict__.get("_leg_local_obj"),
+                                              "leg_trained", False)))
+                        else unharvested_finished_run(self, host))
+                if held:
+                    # 2026-11-27: a re-attach refusal removed a pod holding a
+                    # FINISHED 8xH200 expert run. Never without a verified
+                    # harvest: kept on the ledger; the requeued leg adopts it
+                    # by name and harvests, the sweep bounds the keep.
+                    log.error("operator leg pod %s KEPT — it holds a finished, unharvested "
+                              "run (%s); the requeued leg re-attaches and harvests it "
+                              "(the funded sweep releases it past its keep)", pod_id, held)
+                else:
+                    self._teardown_operator_pod(ledger_pod())

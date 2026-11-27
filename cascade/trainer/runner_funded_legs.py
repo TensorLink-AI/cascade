@@ -605,7 +605,8 @@ class _FundedLegMixin:
         except ReattachMissing as e:
             # A re-attach found the pod but no run of the leg on it: nothing
             # was launched; the driver requeues (uncharged). The pod is torn
-            # down below (its worker is gone), after the postmortem.
+            # down below after the postmortem — unless it holds a FINISHED
+            # run (unharvested_finished_run), which keeps it.
             self._record_funded_failure(gen.hotkey, str(e), miner_fault=False,
                                         error_class="no_capacity", burn=False)
             raise
@@ -715,7 +716,25 @@ class _FundedLegMixin:
 
                     spend_end(self, gen.hotkey, str(getattr(pod, "instance_id", "") or ""),
                               outcome="waste", reason=str(verdict[0])[:120], kind=MINER)
-                self._teardown_funded_pod(pod)
+                from .runner_operator_pods import (
+                    may_hold_unharvested_run,
+                    unharvested_finished_run,
+                )
+
+                # (a miner-fault verdict — tamper — is never kept on their bill)
+                held = ("" if succeeded or (verdict is not None and verdict[1])
+                        or not may_hold_unharvested_run(
+                            failing, trained=trained or _harvested_in_dispatch(self))
+                        else unharvested_finished_run(self, host))
+                if held:
+                    # 2026-11-27: never remove a pod holding a FINISHED run
+                    # without a verified harvest (the requeued leg re-attaches
+                    # to it by name; the funded sweep bounds the keep)
+                    log.error("funded pod %s KEPT — it holds a finished, unharvested run "
+                              "(%s); the requeued leg re-attaches and harvests it",
+                              getattr(pod, "instance_id", "?"), held)
+                else:
+                    self._teardown_funded_pod(pod)
 
     def _keep_funded_pod_for_bench(self) -> bool:
         """Whether a funded leg's pod outlives its leg for the completion

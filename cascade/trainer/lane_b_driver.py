@@ -51,15 +51,16 @@ import json
 import logging
 import threading
 import time
+import types
 from collections import OrderedDict
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields, is_dataclass, replace
 from pathlib import Path
 from typing import Protocol
 
 import numpy as np
 
 from ..shared.atomic import read_text_with_backup, write_text_atomic
-from ..shared.era import image_record_at
+from ..shared.era import era_for_block, image_record_at
 from . import expert_lane as _tel
 from . import leg_reattach as _reattach
 from .expert_lane import (
@@ -319,6 +320,30 @@ def _measured_rate_of(gpus, contract):
         return None if rate is None else float(rate.steps_per_s) * scale
 
     return rate_of
+
+def _dispatch_era(cfg, current, block: int, rec: dict | None):
+    """The era a re-attached leg was DISPATCHED in (its ``dispatch_block``),
+    as an era object the dispatch reads ``start_block`` / ``index`` from;
+    ``current`` when that is the same era or cannot be derived. A leg that
+    trains across an era boundary keeps its dispatch era's contract block,
+    contract and GPU table — the identity its detached run is tagged by."""
+    if block <= 0:
+        return current
+    try:
+        spec = era_for_block(cfg.round, int(block))
+        start = int(spec.start_block)
+    except Exception:  # noqa: BLE001 — no era grid: the current era, as before
+        return current
+    if start == int(getattr(current, "start_block", start)):
+        return current
+    try:
+        index = int((rec or {}).get("era_index", spec.index))
+    except (TypeError, ValueError):
+        index = int(spec.index)
+    if is_dataclass(current) and not isinstance(current, type):
+        return replace(current, index=index, start_block=start)
+    return types.SimpleNamespace(**{**vars(current), "index": index, "start_block": start})
+
 
 def _attach_key(leg: OpenLeg) -> str:
     """One open leg's identity in ``LaneBDriverState.attached``: the chain
@@ -2238,6 +2263,13 @@ class RunnerLaneBOps:
                     raise LegFailure(f"{_reattach.REATTACH_REFUSED}: the seed epoch moved "
                                      f"({reattach.get('base_seed')} -> {seeds.base_seed})",
                                      miner_fault=False, error_class="no_capacity", burn=False)
+                if reattach is not None:
+                    # 2026-11-27: a re-attach re-derives the leg in its DISPATCH
+                    # era, never the current one — the era rolled (2665 -> 2666)
+                    # under a finished 8xH200 run, its --contract-block moved
+                    # 9594000 -> 9597600, the run tag's identity hash with it,
+                    # and the finished run was "not found" and requeued
+                    era = _dispatch_era(self.r.cfg, era, int(block), reattach)
                 base = self.r.cfg.throne_contracts_at(int(era.start_block))[0]
                 f = leg.funding
                 length = _funded_leg_length(f, base)
