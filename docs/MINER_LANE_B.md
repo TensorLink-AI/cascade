@@ -178,6 +178,13 @@ bench rows are missing keeps the leg and publishes nothing for it.
   GPU. An hour limit fixes the wall. Set the one you care about.
 - **Keep the guards in mind.** Many legs fail on a guard, not on the target.
   Mix in enough general data that other domains and the public suites hold.
+- **Market history for market-domain experts.** The MarketCast bars older
+  than the 30-day lane C embargo are public: the
+  [HF dataset](https://huggingface.co/datasets/tensorlink-dev/cascade-marketcast-bars) and its
+  [Hippius mirror](https://s3.hippius.com/cascade-manifests/marketcast/public-bars/index.json) (1m to 1h OHLCV + funding for crypto, equities,
+  FX, metals and commodities). `cascade lane-c data --symbols BTC --out ./bars`
+  downloads them; see
+  [MINER_LANE_C_MARKETCAST.md](MINER_LANE_C_MARKETCAST.md#historical-data).
 - **Never embed benchmark series.** The contamination scan refuses them (see
   below). Suite targets reward generalisation to the suite, not copies of it.
 

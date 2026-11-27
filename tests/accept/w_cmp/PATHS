@@ -61,3 +61,15 @@ docs/OPERATOR.md
 tests/unit/test_mkt_offload.py
 tests/unit/test_mkt_offload_provision.py
 tests/unit/test_lane_c_plugin.py
+
+# 2026-11-27 public post-embargo MarketCast bars (owner "set up a new HF
+# dataset" + "put it on Hippius"): the cut/layout/index module, the daily
+# publisher + workflow (HF tensorlink-dev/cascade-marketcast-bars and the
+# public manifest bucket), `cascade lane-c data`, and the miner docs.
+cascade/shared/marketcast_public.py
+scripts/publish_marketcast_public.py
+.github/workflows/publish-mkt-public.yml
+cascade/miner/marketcast_data.py
+docs/MINER_LANE_C_MARKETCAST.md
+docs/MINER_LANE_B.md
+llms.txt

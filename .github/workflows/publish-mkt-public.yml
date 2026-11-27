@@ -1,0 +1,100 @@
+# Publish the PUBLIC post-embargo MarketCast bar history (owner 2026-11-27).
+#
+# Reads the recorder's bars from the private relay the training pods read
+# ([marketcast] bar_relay, mirrored by publish-mkt-pool.yml), keeps ONLY days
+# strictly older than today - [marketcast] embargo_days (read from chain.toml
+# by the script, never hardcoded), converts each (symbol, timeframe, month)
+# to zstd Parquet and uploads the new/changed files to
+#   - HF dataset tensorlink-dev/cascade-marketcast-bars (public; created if missing)
+#   - s3://<[storage] manifest_bucket>/marketcast/public-bars/ (anonymously readable)
+# each with index.json (sha256 per file) and the generated dataset card.
+# scripts/publish_marketcast_public.py re-reads every staged file and refuses
+# the whole run on any row inside the embargo, before anything is uploaded.
+#
+# REQUIRED repo secrets:
+#   POOL_S3_ACCESS_KEY / POOL_S3_SECRET_KEY     READ the eval-pool relay
+#                                               (fallback: CASCADE_S3_* like publish-mkt-pool.yml)
+#   HF_TOKEN                                    HF WRITE token for the tensorlink-dev org
+#   MANIFEST_S3_ACCESS_KEY / _SECRET_KEY        WRITE on the manifest bucket (the key the
+#                                               trainer/validator run with as HIPPIUS_S3_*);
+#                                               falls back to CASCADE_S3_* when unset
+# Unset HF_TOKEN skips the HF upload; no manifest write key skips the Hippius mirror.
+name: Publish MarketCast public bars
+
+on:
+  schedule:
+    - cron: "45 2 * * *"         # daily; a new day leaves the embargo at 00:00 UTC
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build + verify the Parquet only; upload nothing"
+        type: boolean
+        default: false
+
+concurrency:
+  group: publish-mkt-public    # index.json has one writer per destination
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      S3_ENDPOINT: ${{ vars.HIPPIUS_S3_ENDPOINT || 'https://s3.hippius.com' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.13.4"
+
+      - name: Install cascade (hippius + pool-forge extras; no torch)
+        run: |
+          python scripts/check_tls_trust.py --system-only
+          uv pip install --system --python "$(which python)" "pip==26.2.2" -e ".[hippius,pool-forge]"
+          python scripts/check_tls_trust.py
+
+      - name: Sync the bar relay down  (POOL READ key only)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.POOL_S3_ACCESS_KEY || secrets.CASCADE_S3_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.POOL_S3_SECRET_KEY || secrets.CASCADE_S3_SECRET_KEY }}
+          AWS_MAX_ATTEMPTS: "10"
+          AWS_RETRY_MODE: adaptive
+        run: |
+          test -n "$AWS_ACCESS_KEY_ID" || { echo "::error::no POOL_S3 / CASCADE_S3 read key"; exit 1; }
+          RELAY=$(python -c "from cascade.shared.config import load_chain_config as l; print(l('chain.toml').marketcast.bar_relay)")
+          test -n "$RELAY" || { echo "::error::[marketcast] bar_relay unset"; exit 1; }
+          aws configure set default.s3.max_concurrent_requests 64
+          aws configure set default.s3.max_queue_size 20000
+          ok=""
+          for pass in 1 2 3; do
+            if aws s3 sync "s3://${RELAY%/}" ./mkt/bars --endpoint-url "$S3_ENDPOINT" --exact-timestamps; then
+              ok=1; break
+            fi
+            echo "::warning::relay sync pass $pass failed; retrying the remainder"
+            sleep 30
+          done
+          test -n "$ok" || { echo "::error::relay sync failed after 3 passes"; exit 1; }
+          echo "synced $(find ./mkt/bars -type f | wc -l) files"; du -sh ./mkt/bars
+
+      - name: Build, verify the embargo, upload  (HF + MANIFEST write keys)
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HIPPIUS_S3_ACCESS_KEY: ${{ secrets.MANIFEST_S3_ACCESS_KEY || secrets.CASCADE_S3_ACCESS_KEY }}
+          HIPPIUS_S3_SECRET_KEY: ${{ secrets.MANIFEST_S3_SECRET_KEY || secrets.CASCADE_S3_SECRET_KEY }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+        run: |
+          flags=()
+          [ "$DRY_RUN" = "true" ] && flags+=(--dry-run)
+          [ -z "$HF_TOKEN" ] && { echo "::warning::HF_TOKEN unset: skipping the HF upload"; flags+=(--no-hf); }
+          [ -z "$HIPPIUS_S3_ACCESS_KEY" ] && { echo "::warning::no manifest write key: skipping the Hippius mirror"; flags+=(--no-hippius); }
+          python scripts/publish_marketcast_public.py --bar-store ./mkt/bars --stage ./stage \
+            --chain-toml chain.toml "${flags[@]}"
+          echo "staged: $(find ./stage -name '*.parquet' | wc -l) files"; du -sh ./stage
