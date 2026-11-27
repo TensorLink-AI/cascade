@@ -159,6 +159,62 @@ _SHARD_FETCH_EXC_RE = re.compile(
     r"|ShardError: shard [A-Za-z0-9_.-]+ could not be downloaded: )")
 
 
+# A CUDA out-of-memory exit of a leg whose memory footprint the MINER sized
+# (2026-11-27: a lane C MarketCast recipe — batch 16, context 4096, LoRA rank
+# 32, ten covariates — OOMed on a 1xRTX4090 and the trainer re-rented the same
+# type for the same deterministic OOM, at the miner's expense). The roles whose
+# recipe / levers set batch, context or rank: lane C fine-tunes (``finetune``,
+# ``mkt_finetune``) and lane B experts (``expert``). Lane A's challenger and
+# king legs run the operator's fixed contract: an OOM there stays ``infra``.
+#
+# Read from the dispatcher-parsed final traceback line only (never the message
+# text), and only when the leg's OWN process held the memory: PyTorch's
+# "Of the allocated memory X is allocated by PyTorch" at >= half the device's
+# "total capacity" — a GPU another tenant filled is an infra fault (retried).
+# A forged line could only end the forger's own entry.
+GPU_OOM_CLASS = "gpu_oom"
+MINER_SIZED_ROLES = frozenset({"finetune", "mkt_finetune", "expert"})
+_CUDA_OOM_RE = re.compile(
+    r"^(?:torch\.(?:cuda\.)?OutOfMemoryError|RuntimeError): CUDA out of memory\.")
+_SIZE = r"([0-9]+(?:\.[0-9]+)?) (bytes|KiB|MiB|GiB|TiB)"
+_OOM_TOTAL_RE = re.compile(r"total capacity of " + _SIZE)
+_OOM_TORCH_RE = re.compile(r"Of the allocated memory " + _SIZE + r" is allocated by PyTorch")
+_UNITS = {"bytes": 1, "KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30, "TiB": 1 << 40}
+
+
+def own_run_cuda_oom(final_exception: str) -> bool:
+    """Whether a worker's final traceback line is a CUDA OOM of its OWN run
+    (its PyTorch allocations held >= half the device)."""
+    line = (final_exception or "").strip()
+    if not _CUDA_OOM_RE.match(line):
+        return False
+    tot, own = _OOM_TOTAL_RE.search(line), _OOM_TORCH_RE.search(line)
+    if tot is None or own is None:
+        return False
+    total = float(tot.group(1)) * _UNITS[tot.group(2)]
+    held = float(own.group(1)) * _UNITS[own.group(2)]
+    return total > 0 and held >= 0.5 * total
+
+
+def gpu_oom_message(gpu: str) -> str:
+    """The miner-facing verdict of a recipe that ran out of GPU memory."""
+    return (f"out of GPU memory on {gpu or 'the rented GPU'}: reduce batch/context/LoRA "
+            "rank or choose a larger GPU (a deterministic recipe fault: the entry ends, "
+            "it is not re-rented)")
+
+
+def role_of(exc: BaseException | None) -> str:
+    """The dispatched worker role carried by ``exc`` or its cause chain."""
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        role = getattr(exc, "role", None)
+        if isinstance(role, str) and role:
+            return role
+        exc = exc.__cause__ or exc.__context__
+    return ""
+
+
 def final_exception_of(exc: BaseException | None) -> str:
     """The dispatcher-parsed final traceback exception line carried by
     ``exc`` or an exception in its cause chain (``""`` when none does)."""
@@ -186,7 +242,8 @@ def classify_funded_worker_failure(rc: int | None, text: str, *,
                                    stalled_before: bool,
                                    shards_leg: bool = False,
                                    final_exception: str = "",
-                                   shard_faults_before: int = 0) -> tuple[bool, str, bool]:
+                                   shard_faults_before: int = 0,
+                                   role: str = "") -> tuple[bool, str, bool]:
     """``(miner_fault, error_class, burn_attempt)`` for a funded worker exit.
 
     ``rc == 3`` is the worker's "miner submission rejected" exit (CorpusError).
@@ -198,13 +255,18 @@ def classify_funded_worker_failure(rc: int | None, text: str, *,
     dispatcher-parsed ``final_exception`` is a remote shard fetch failure
     (:func:`shard_fetch_failure` — our storage) is :data:`OPERATOR_FAULT_CLASS`,
     unburned, while ``shard_faults_before`` (this corpus's earlier ones) is
-    under :data:`SHARD_FAULT_REQUEUE_CAP`; any other exit is ``"infra"`` and
-    burns one of the entry's retry attempts, as before.
+    under :data:`SHARD_FAULT_REQUEUE_CAP`. A ``role`` in
+    :data:`MINER_SIZED_ROLES` whose ``final_exception`` is a CUDA OOM of its
+    own run (:func:`own_run_cuda_oom`) is the miner's recipe:
+    :data:`GPU_OOM_CLASS`, terminal (never re-rented). Any other exit is
+    ``"infra"`` and burns one of the entry's retry attempts, as before.
     """
     if rc == 3:
         if _STALL_MARKER in (text or "") and not stalled_before:
             return False, STALL_CLASS, False
         return True, "generator", False
+    if role in MINER_SIZED_ROLES and own_run_cuda_oom(final_exception):
+        return True, GPU_OOM_CLASS, False
     if (shards_leg and shard_fetch_failure(final_exception)
             and shard_faults_before < SHARD_FAULT_REQUEUE_CAP):
         return False, OPERATOR_FAULT_CLASS, False
@@ -213,10 +275,11 @@ def classify_funded_worker_failure(rc: int | None, text: str, *,
 
 def classify_leg_exception(runner, gen, seeds, exc: BaseException, *, rc: int | None,
                            text: str, stalled_before: bool,
-                           shards_leg: bool) -> tuple[bool, str, bool]:
+                           shards_leg: bool, role: str = "") -> tuple[bool, str, bool]:
     """:func:`classify_funded_worker_failure` for a failed funded leg, with
     the per-corpus shard-fault count kept on ``runner`` (in memory; a trainer
-    restart resets it — still bounded per process)."""
+    restart resets it — still bounded per process). ``role`` defaults to the
+    role the dispatcher stamped on ``exc`` (:func:`role_of`)."""
     import threading
 
     from .harvest_guard import local_disk_error
@@ -235,7 +298,8 @@ def classify_leg_exception(runner, gen, seeds, exc: BaseException, *, rc: int | 
         before = int(counts.get(key, 0))
         verdict = classify_funded_worker_failure(
             rc, text, stalled_before=stalled_before, shards_leg=shards_leg,
-            final_exception=final, shard_faults_before=before)
+            final_exception=final, shard_faults_before=before,
+            role=role or role_of(exc))
         if shards_leg and rc != 3 and shard_fetch_failure(final):
             counts[key] = before + 1
             if verdict[1] != OPERATOR_FAULT_CLASS:

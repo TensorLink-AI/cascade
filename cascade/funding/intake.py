@@ -496,6 +496,8 @@ class FundingIntake:
         gpu_catalog: GpuCatalog | None = None,
         lane_b_gpus: object | None = None,        # WB22 LaneBGpus; None = lane A's catalog
         mkt_gpu_catalog: GpuCatalog | None = None,  # MarketCast GPUs; None = lane A's catalog
+        fetch_mkt_recipe: Callable[[str], object] | None = None,  # ref -> marketcast.json obj
+        mkt_cfg: object | None = None,            # [marketcast] (MarketCastConfig) for the fit
         lane_b_landing: Callable[[int], dict | None] | None = None,  # WB23 landing estimate
         lane_b_contract: object | None = None,    # WB23 base contract (steps cap); None = no cap
         lane_b_queue: object | None = None,       # funding LaneBQueue; None = lane B off
@@ -597,6 +599,15 @@ class FundingIntake:
         # any other Lium type at the miner's own risk). None = lane A's catalog
         # (unit construction; the production intake wires it, main.gpu_catalogs).
         self.mkt_gpu_catalog = mkt_gpu_catalog
+        # 2026-11-27 fit check: ``fetch_mkt_recipe(ref)`` -> the recipe tree's
+        # ``marketcast.json`` object (None / raise = unreadable: the check is
+        # skipped, logged) and the ``[marketcast]`` table (micro_batch_tokens,
+        # horizons). A MarketCast fund whose recipe's estimated GPU memory
+        # (``mkt_fit``) exceeds a recommended chosen type — or, with no
+        # choice, any recommended type the default rent may pick — is refused;
+        # an own-risk type is warned. None = no check (unit construction).
+        self.fetch_mkt_recipe = fetch_mkt_recipe
+        self.mkt_cfg = mkt_cfg
         # WB23: ``lane_b_landing(guard_seconds) -> {target_boundary, era_index,
         # cross_era} | None`` (the miner sees where a leg of that wall lands;
         # it never fails a fund) and the contract a lane B leg derives from
@@ -1381,6 +1392,11 @@ class FundingIntake:
                                     "(metro-v1:ft:<target>:hippius:<ref>) for this hotkey "
                                     "matches the target and X-Commit-Ref — commit with "
                                     "`cascade lane-c commit`, wait for the reveal, then fund"}
+        fit_err, fit_warn = self._mkt_fit_check(target, ref, choice, own_risk_warn)
+        if fit_err is not None:
+            return 400, fit_err
+        if fit_warn:
+            own_risk_warn = f"{own_risk_warn} {fit_warn}".strip()
         outcome = self.lane_c_queue.add_lane_c(  # type: ignore[union-attr]
             hotkey, target, ref, int(reveal_block), label=label, gpu_choice=choice)
         self.vault.insert(hotkey, api_key)
@@ -1396,6 +1412,57 @@ class FundingIntake:
         body = self._pay_warning("c", body, target=target)
         return 202, ({**body, "warning": own_risk_warn, "gpu_own_risk": True}
                      if own_risk_warn else body)
+
+    def _mkt_fit_check(self, target: str, ref: str, choice: GpuChoice,
+                       own_risk_warn: str) -> tuple[dict | None, str]:
+        """``(refusal, warning)`` of the 2026-11-27 GPU memory fit check of a
+        MarketCast fund (:mod:`cascade.funding.mkt_fit`): a recommended (or,
+        with no choice, any default-rentable recommended) type below the
+        recipe's estimate is refused with the estimate and the types that
+        fit; an own-risk type below it is accepted with a warning (the
+        own-risk policy). Runs after the signature and reveal gates, so only
+        a revealed commitment's tree is ever fetched (parsed, never run)."""
+        fetch, cat = self.fetch_mkt_recipe, self.mkt_gpu_catalog
+        if fetch is None or cat is None or not ref:
+            return None, ""
+        try:
+            from ..shared.config.lane_c import is_mkt_family
+
+            if not is_mkt_family(target):
+                return None, ""
+        except ImportError:   # pragma: no cover — shared lane-C config not shipped
+            return None, ""
+        from .mkt_fit import DEFAULT_MICRO_BATCH_TOKENS, fit_verdict
+
+        try:
+            obj = fetch(ref)
+        except Exception as e:  # noqa: BLE001 — the trainer re-reads the recipe anyway
+            log.warning("lane-C fund: MarketCast recipe %s unreadable for the GPU fit "
+                        "check (%s) — not checked", ref, e)
+            return None, ""
+        mc = self.mkt_cfg
+        horizons: list[str] = []
+        try:
+            for hs in dict(getattr(mc, "horizons_map", {}) or {}).values():
+                horizons.extend(str(h) for h in hs)
+        except Exception:  # noqa: BLE001 — the recipe's own horizon_mix still counts
+            horizons = []
+        mbt = int(getattr(mc, "micro_batch_tokens", 0) or DEFAULT_MICRO_BATCH_TOKENS)
+        v = fit_verdict(obj, choice.gpu if choice.chosen else "", tuple(cat.skus or ()),
+                        horizons=horizons, micro_batch_tokens=mbt)
+        if v is None or v.fits is not False:
+            if v is not None and v.fits is None and own_risk_warn:
+                return None, (f"Its memory is unknown here: your recipe needs an estimated "
+                              f"{v.estimate_gib:g} GiB on one GPU, and an out-of-memory leg "
+                              "ends the entry with no retry.")
+            return None, ""
+        log.warning("lane-C fund: MarketCast recipe %s needs ~%.1f GiB; %s too small",
+                    ref, v.estimate_gib, v.gpu or ",".join(v.too_small))
+        if own_risk_warn:
+            return None, v.message()
+        return {"code": "recipe_exceeds_gpu_memory", "message": v.message(),
+                "estimate_gib": v.estimate_gib, "gpu": v.gpu, "gpu_gib": v.gpu_gib,
+                "fitting_gpus": list(v.fitting)}, ""
 
     def _lane_c_gpu_choice(self, headers) -> tuple[GpuChoice, str, dict | None, str]:
         """``(choice, signed_segment, error, own_risk_warning)`` of a lane-C

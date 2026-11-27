@@ -73,3 +73,12 @@ cascade/miner/marketcast_data.py
 docs/MINER_LANE_C_MARKETCAST.md
 docs/MINER_LANE_B.md
 llms.txt
+
+# 2026-11-27 MarketCast GPU OOM (5Cu2sxndK8Dw re-rented a 1xRTX4090 for a
+# deterministic OOM): a miner-sized leg's own CUDA OOM ends the entry (no
+# re-rent; the dispatcher stamps the role), and the intake's fund-time GPU
+# memory fit check (stdlib estimate of Timestral-28M's peak memory).
+cascade/trainer/faults.py
+cascade/trainer/remote.py
+cascade/trainer/runner_funded_legs.py
+cascade/funding/mkt_fit.py

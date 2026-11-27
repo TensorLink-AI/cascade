@@ -1,0 +1,68 @@
+Traceback (most recent call last):
+  File "/root/cascade/cascade/trainer/worker.py", line 475, in run_mkt_worker
+    res = _run(None)
+          ^^^^^^^^^^
+  File "/root/cascade/cascade/trainer/worker.py", line 452, in _run
+    return run_mkt_leg(recipe=recipe, mc=mc, base_dir=base_dir,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/cascade/cascade/trainer/marketcast_leg.py", line 800, in run_mkt_leg
+    res = finetune(base_fc_inner.model, _fwd, sampler, recipe, levels=tuple(mc.quantile_knots),
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/cascade/cascade/trainer/marketcast_leg.py", line 584, in finetune
+    pred = forward(b.contexts[i:j], b.steps,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/cascade/cascade/trainer/marketcast_leg.py", line 797, in _fwd
+    return forward_block(base_fc_inner, ctx, steps, past_covariates=past,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/cascade/cascade/eval/timestral_adapter.py", line 502, in forward_block
+    q = fc.model.predict_block(rows.reshape(bb * v, tt), m.reshape(bb * v, tt), group_ids, hp,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/cascade/.venv/lib/python3.11/site-packages/timestral/model.py", line 202, in predict_block
+    return self._predict_window(full_inputs, full_observed, group_ids, horizon_patches, role_ids)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/cascade/.venv/lib/python3.11/site-packages/timestral/model.py", line 269, in _predict_window
+    preds = self._run_two_stream(x_enc, x_dec, time_mask, variate_mask, positions).unflatten(1, (n, ps))
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/cascade/.venv/lib/python3.11/site-packages/timestral/model.py", line 161, in _run_two_stream
+    h = self.transformer(x, mask, variate_mask, positions)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/cascade/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/cascade/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/cascade/.venv/lib/python3.11/site-packages/timestral/layers.py", line 268, in forward
+    x = layer(x, time_mask, variate_mask, cos, sin)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/cascade/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/cascade/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/cascade/.venv/lib/python3.11/site-packages/timestral/layers.py", line 222, in forward
+    x = x + attn(norm(x), time_mask if attn.is_time else variate_mask, cos, sin)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/cascade/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/cascade/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/cascade/.venv/lib/python3.11/site-packages/timestral/layers.py", line 171, in forward
+    q, k, v = self._qkv(inputs)
+              ^^^^^^^^^^^^^^^^^
+  File "/root/cascade/.venv/lib/python3.11/site-packages/timestral/layers.py", line 164, in _qkv
+    qkv = self.wQKV(x.contiguous()).reshape(batch, seq, 3, self.head_dim, self.num_heads)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/cascade/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/cascade/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/cascade/cascade/eval/timestral_adapter.py", line 389, in forward
+    return self.base(x) + (x @ self.lora_A.t() @ self.lora_B.t()) * self.scale
+                          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 312.00 MiB. GPU 0 has a total capacity of 23.52 GiB of which 167.62 MiB is free. Process 437361 has 23.30 GiB memory in use. Of the allocated memory 22.15 GiB is allocated by PyTorch, and 715.38 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
