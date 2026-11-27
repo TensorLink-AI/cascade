@@ -94,6 +94,8 @@ N_LEVELS = 9
 HOST_MODULES = {
     "forecast": ("torch", "safetensors"),
     "public": ("torch", "safetensors", "pyarrow"),
+    # the warm sweep moves bytes only (no decode, no model)
+    "warm-public": ("boto3",),
 }
 MIRROR_MODULES = ("boto3",)
 MODULE_EXTRAS = {"torch": "train", "safetensors": "train", "pyarrow": "pool-forge",
@@ -393,9 +395,12 @@ def public_scores_entry(cache: PrefetchCache, digest: str, draws: Sequence[Mappi
         try:
             if mirror is not None:
                 index_dir, reader = mirror.reader(dict(d))
+                # the mirror's bounded read pool (PublicMirror.workers)
+                par = ({"workers": int(mirror.workers)}
+                       if getattr(mirror, "workers", None) else {})
                 ws, drops = read_public_windows(dict(d), index_dir=index_dir, reader=reader,
                                                 block_hash=block_hash,
-                                                max_channels=int(max_channels))
+                                                max_channels=int(max_channels), **par)
             else:
                 root = Path(public_root)
                 ws, drops = read_public_windows(dict(d), index_dir=root / src / PUBLIC_INDEX_DIR,
@@ -418,14 +423,58 @@ def public_scores_entry(cache: PrefetchCache, digest: str, draws: Sequence[Mappi
     return {"scores": {src: per.get(src, []) for src in sorted(dropped)}, "dropped": dropped}
 
 
-def public_mirror(*, mirror_config=None, cache_dir=None, budget_bytes: int | None = None):
+def public_mirror(*, mirror_config=None, cache_dir=None, budget_bytes: int | None = None,
+                  workers: int | None = None):
     """The Hippius mirror of ``deploy/laned/public_mirror.toml`` (or
     ``mirror_config``): its stores in order (Hippius, then R2) behind the
-    volume cache at ``cache_dir`` (default: the config's, the Lium volume)."""
+    volume cache at ``cache_dir`` (default: the config's, the Lium volume),
+    reading ``workers`` series at once (default: the config's
+    ``read_workers``)."""
     from .lane_d_public_mirror import load_mirror_config, mirror_from_config
 
     return mirror_from_config(load_mirror_config(mirror_config), cache_dir=cache_dir,
-                              budget_bytes=budget_bytes)
+                              budget_bytes=budget_bytes, workers=workers)
+
+
+def warm_public(mirror, sources: Mapping[str, str], *, workers: int,
+                budget_bytes: int | None = None, dry_run: bool = False,
+                out=None) -> int:
+    """``warm-public``: fill ``mirror``'s volume cache with each source's
+    whole mirror (``{source: index_sha256}``,
+    :meth:`~cascade.eval.lane_d_public_mirror.PublicMirror.warm`). Prints
+    ``WARM`` progress lines and one ``WARMED`` (or ``PLAN`` with
+    ``dry_run``) line per source to ``out`` (stdout); exit 0, or 1 when a
+    span failed (rerun the same command: it resumes)."""
+    out = out or sys.stdout
+    gib = 2**30
+
+    def line(tag: str, st: Mapping) -> None:
+        rate = st.get("fetched_bytes", 0) / max(st.get("seconds", 0.0), 1e-9) / 2**20
+        left = max(0, st.get("planned_bytes", 0) - st.get("fetched_bytes", 0))
+        eta = left / max(rate * 2**20, 1e-9) if st.get("fetched_bytes") else float("nan")
+        print(f"{tag} source={st['source']} blobs={st['blobs']} cached={st['cached']} "
+              f"cached_gib={st['cached_bytes'] / gib:.2f} "
+              f"missing_gib={st['missing_bytes'] / gib:.2f} "
+              f"planned_gib={st['planned_bytes'] / gib:.2f} fits={st['fits']}"
+              + ("" if tag == "PLAN" else
+                 f" spans={st['done_spans']}/{st['spans']} "
+                 f"fetched_gib={st['fetched_bytes'] / gib:.2f} rate_mib_s={rate:.1f} "
+                 f"eta_s={eta:.0f} failed={st['failed_spans']} seconds={st['seconds']:.0f}"),
+              file=out, flush=True)
+
+    rc = 0
+    for src in sorted(sources):
+        if dry_run:
+            plan = mirror.warm_plan(src, sources[src], budget_bytes=budget_bytes)
+            plan["spans"] = len(plan["spans"])
+            line("PLAN", plan)
+            continue
+        st = mirror.warm(src, sources[src], workers=int(workers), budget_bytes=budget_bytes,
+                         progress=lambda x: line("WARM", x))
+        line("WARMED", st)
+        if st["failed_spans"]:
+            rc = 1
+    return rc
 
 
 def serve_public(raw: bytes, *, cache_dir, budget_bytes: int, device: str, public_root=None,
@@ -520,7 +569,40 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="the public blob cache byte budget (default: the config's)")
     q.add_argument("--chain-toml", type=Path, default=None,
                    help="this host's chain.toml (the contract a cache miss ingests against)")
+    q.add_argument("--public-workers", type=int, default=None,
+                   help="series read at once (default: the mirror config's read_workers)")
+    w = sub.add_parser("warm-public", help="fill the public blob cache with whole source "
+                       "mirrors ahead of a settlement (resumable)")
+    w.add_argument("--index", action="append", required=True, metavar="SOURCE=INDEX_SHA256",
+                   help="a source and the index_sha256 its draws are made from (repeat per "
+                        "source; the box's public_indexes manifests carry it)")
+    w.add_argument("--mirror-config", type=Path, default=None,
+                   help="the Hippius mirror config (default: the release's "
+                        "deploy/laned/public_mirror.toml)")
+    w.add_argument("--public-cache-dir", type=Path, default=None,
+                   help="the public blob cache (default: the config's cache_dir)")
+    w.add_argument("--public-cache-budget-bytes", type=int, default=None,
+                   help="the cache's byte budget (default: the config's)")
+    w.add_argument("--fill-bytes", type=int, default=None,
+                   help="stop filling at this many cached bytes (default: the budget)")
+    w.add_argument("--workers", type=int, default=8, help="ranged GETs at once")
+    w.add_argument("--dry-run", action="store_true",
+                   help="print the PLAN (cached / missing / fits) and fetch nothing")
     return p
+
+
+def _parse_indexes(items: Sequence[str]) -> dict[str, str]:
+    from .lane_d_public_index import PUBLIC_SOURCES
+
+    out = {}
+    for it in items:
+        src, _, sha = str(it).partition("=")
+        if src not in PUBLIC_SOURCES or len(sha) != 64 \
+                or any(c not in "0123456789abcdef" for c in sha):
+            raise ValueError(f"--index {it!r}: want SOURCE=<64 hex>, SOURCE one of "
+                             f"{sorted(PUBLIC_SOURCES)}")
+        out[src] = sha
+    return out
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -528,6 +610,21 @@ def main(argv: list[str] | None = None) -> int:
     # stdout carries exactly one JSON line; every log line goes to stderr.
     logging.basicConfig(level=logging.INFO, stream=sys.stderr,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    if args.cmd == "warm-public":
+        refusal = check_host_modules(args.cmd)
+        if refusal:
+            print(refusal, file=sys.stderr)
+            return EXIT_MISSING_MODULES
+        try:
+            sources = _parse_indexes(args.index)
+            mirror = public_mirror(mirror_config=args.mirror_config,
+                                   cache_dir=args.public_cache_dir,
+                                   budget_bytes=args.public_cache_budget_bytes)
+        except (OSError, ValueError, KeyError) as e:
+            print(f"lane D warm-public refused: {e}", file=sys.stderr)
+            return 2
+        return warm_public(mirror, sources, workers=int(args.workers),
+                           budget_bytes=args.fill_bytes, dry_run=bool(args.dry_run))
     if args.cmd == "hello":
         from .lane_d_handshake import probe_environment, worker_hello
 
@@ -546,7 +643,8 @@ def main(argv: list[str] | None = None) -> int:
                 try:
                     mirror = public_mirror(mirror_config=args.mirror_config,
                                            cache_dir=args.public_cache_dir,
-                                           budget_bytes=args.public_cache_budget_bytes)
+                                           budget_bytes=args.public_cache_budget_bytes,
+                                           workers=args.public_workers)
                 except (OSError, ValueError, KeyError) as e:
                     print(f"lane D public mirror config refused: {e}", file=sys.stderr)
                     return 2
@@ -570,7 +668,8 @@ __all__ = ["EXIT_MISSING_MODULES", "FORECAST_ERROR_CODES", "HOST_MODULES",
            "MINER_FAULT_CODES", "PUBLIC_REPLY_SCHEMA", "PUBLIC_REQUEST_SCHEMA",
            "REPLY_SCHEMA", "REQUEST_SCHEMA", "LaneDForecastError", "check_host_modules",
            "decode_request", "encode_request", "forecast_entry", "main",
-           "missing_host_modules", "public_scores_entry", "serve_forecast", "serve_public"]
+           "missing_host_modules", "public_scores_entry", "serve_forecast", "serve_public",
+           "warm_public"]
 
 
 if __name__ == "__main__":

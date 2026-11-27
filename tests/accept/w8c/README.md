@@ -360,3 +360,12 @@ mirror path is unchanged. `test_w8c_public_mirror.py`.
 ## rev6.14 (a): judging start vs eligibility boundary (owner 2026-11-23)
 
 Option A (orchestrator 2026-11-23): the source reads the boundary block's on-chain timestamp with its chain reader and returns it as `LaneDInputs.boundary_ts` (W8b passes it to `settle_lane_d`); unreadable is `boundary_ts_unreadable`, never a guessed time. The fake reader answers a boundary block with W8b's fixture clock. `test_w8c_rev614.py`.
+
+## Public half: parallel reads (owner 2026-11-27)
+
+`read_public_windows(..., workers=N)` reads the drawn series on a bounded
+pool (at most N in flight) and returns exactly the serial result (windows,
+drops, order); a reader error fails the read. `public_scores_entry` passes the
+mirror's `workers` (`read_workers`, `public --public-workers`). The draw is
+untouched. `test_w8c_public_parallel.py`. Runbook: docs/OPERATOR.md "Lane D
+public half: warm the mirror before raising public_weight".

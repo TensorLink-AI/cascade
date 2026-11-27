@@ -11,3 +11,5 @@ cascade/eval/lane_d_cache.py
 # settlement source that uses it (one host per cohort; host change re-scores).
 cascade/validator/lane_d_score_cache.py
 cascade/validator/lane_d_inputs.py
+# 2026-11-27: the public half's replies in the score cache (get_public /
+# put_public / retain_public, public_key) and the source's use of them.

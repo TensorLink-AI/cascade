@@ -61,6 +61,21 @@ host (never the validator box); ``size`` reads Hugging Face metadata only.
         Downloads the index + shard map of ``index_sha256`` from the mirror
         (Hippius, then R2) into ``--index-dir`` and verifies every hash: the
         box's ``public_indexes`` dir.
+
+    fix-acl --source S [--mirror-config FILE] [--stores hippius] [--dry-run]
+        One-shot sweep: sets ``public-read`` on every object under
+        ``<prefix>/<source>/`` (shards and index sets uploaded before the
+        uploads carried the ACL, 2026-11-27), so anonymous GETs stop
+        returning 403 and external validators can reproduce the public half.
+        ``PutObjectAcl`` per object; where a store refuses it, an in-place
+        copy with the ACL. Idempotent (rerun freely). Write keys by env NAME
+        (``HIPPIUS_S3_*``). R2 has no canned object ACLs (its bucket is the
+        private backup), so the default store is ``hippius`` only. Prints
+        ``ACL`` progress lines and one ``ACL_DONE`` line; exit 1 when any
+        object failed.
+
+Every upload (``mirror``, ``build``) is ``public-read``; a store that
+refuses canned ACLs (R2) gets the bytes without one.
 """
 
 from __future__ import annotations
@@ -158,8 +173,11 @@ def _store(endpoint: str, bucket: str, key_env_prefix: str):
 
 
 def upload_tree(client, bucket: str, root: Path, prefix: str) -> tuple[int, int]:
-    """Upload every file under ``root`` to ``prefix/<rel>``; skip an object of
-    the same size already there. ``(uploaded, skipped)``."""
+    """Upload every file under ``root`` to ``prefix/<rel>``, ``public-read``
+    (R2: without the ACL it refuses); skip an object of the same size already
+    there (``fix-acl`` sets the ACL on those). ``(uploaded, skipped)``."""
+    from cascade.eval.lane_d_public_build import put_public_read
+
     up = skip = 0
     for p in sorted(x for x in root.rglob("*") if x.is_file() and ".cache" not in x.parts):
         key = f"{prefix}/{p.relative_to(root).as_posix()}"
@@ -170,9 +188,58 @@ def upload_tree(client, bucket: str, root: Path, prefix: str) -> tuple[int, int]
                 continue
         except Exception:                                        # noqa: BLE001 (absent)
             pass
-        client.upload_file(str(p), bucket, key)
+        put_public_read(client, bucket, key, p)
         up += 1
     return up, skip
+
+
+def iter_keys(client, bucket: str, prefix: str):
+    """Every object key under ``prefix`` (``list_objects_v2``, paginated)."""
+    token = None
+    while True:
+        kw = {"Bucket": bucket, "Prefix": prefix}
+        if token:
+            kw["ContinuationToken"] = token
+        page = client.list_objects_v2(**kw)
+        for o in page.get("Contents", []) or []:
+            yield o["Key"]
+        if not page.get("IsTruncated"):
+            return
+        token = page.get("NextContinuationToken")
+
+
+def set_public_read(client, bucket: str, key: str) -> str:
+    """``public-read`` on one object: ``"acl"`` (PutObjectAcl) or ``"copy"``
+    (an in-place copy with the ACL, for a store without PutObjectAcl)."""
+    try:
+        client.put_object_acl(Bucket=bucket, Key=key, ACL="public-read")
+        return "acl"
+    except Exception:                                            # noqa: BLE001 (fallback)
+        head = client.head_object(Bucket=bucket, Key=key)
+        client.copy_object(Bucket=bucket, Key=key, CopySource={"Bucket": bucket, "Key": key},
+                           ACL="public-read", MetadataDirective="REPLACE",
+                           ContentType=head.get("ContentType") or "application/octet-stream",
+                           Metadata=head.get("Metadata") or {})
+        return "copy"
+
+
+def fix_acl(client, bucket: str, prefix: str, *, dry_run: bool = False,
+            every: int = 500, out=None) -> dict:
+    """The ``fix-acl`` sweep over ``prefix`` on one store: ``{objects, acl,
+    copy, failed}``."""
+    out = out or sys.stdout
+    st = {"objects": 0, "acl": 0, "copy": 0, "failed": 0}
+    for key in iter_keys(client, bucket, prefix):
+        st["objects"] += 1
+        if not dry_run:
+            try:
+                st[set_public_read(client, bucket, key)] += 1
+            except Exception as e:                               # noqa: BLE001 (counted)
+                st["failed"] += 1
+                print(f"ACL_FAILED {key} {type(e).__name__}", file=out, flush=True)
+        if st["objects"] % every == 0:
+            print("ACL " + " ".join(f"{k}={v}" for k, v in st.items()), file=out, flush=True)
+    return st
 
 
 def cmd_mirror(args) -> int:
@@ -328,12 +395,28 @@ def cmd_fetch_index(args) -> int:
     return 0
 
 
+def cmd_fix_acl(args) -> int:
+    from cascade.eval import lane_d_public_build as pb
+
+    cfg, stores = _write_stores(args)
+    prefix = f"{cfg['prefix'].strip('/')}/{args.source}/"
+    rc = 0
+    for st in stores:
+        assert isinstance(st, pb.S3PutStore)
+        got = fix_acl(st.client(), st.spec.bucket, prefix, dry_run=bool(args.dry_run))
+        print(f"ACL_DONE store={st.name} bucket={st.spec.bucket} prefix={prefix} "
+              + " ".join(f"{k}={v}" for k, v in got.items())
+              + (" dry_run=1" if args.dry_run else ""), flush=True)
+        rc = rc or (1 if got["failed"] else 0)
+    return rc
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     for name, fn in (("size", cmd_size), ("mirror", cmd_mirror), ("index", cmd_index),
                      ("build", cmd_build), ("estimate", cmd_estimate),
-                     ("fetch-index", cmd_fetch_index)):
+                     ("fetch-index", cmd_fetch_index), ("fix-acl", cmd_fix_acl)):
         p = sub.add_parser(name)
         p.add_argument("--source", required=True, choices=sorted(idx.PUBLIC_SOURCES))
         p.add_argument("--allowed", default=None, help="RMISC allowed list (default: repo's)")
@@ -347,12 +430,17 @@ def main(argv=None) -> int:
             p.add_argument("--datasets", default="", help="comma-separated folder subset")
         if name in ("build", "fetch-index"):
             p.add_argument("--index-dir", required=True)
+        if name in ("build", "fetch-index", "fix-acl"):
             p.add_argument("--mirror-config", default=None,
                            help="default: deploy/laned/public_mirror.toml")
         if name == "build":
             p.add_argument("--stores", default="", help="store names (default: all, in order)")
             p.add_argument("--no-finalize", action="store_true",
                            help="build folders only (finalize on a later run)")
+        if name == "fix-acl":
+            p.add_argument("--stores", default="hippius",
+                           help="store names (default: hippius; R2 has no object ACLs)")
+            p.add_argument("--dry-run", action="store_true", help="count the objects only")
         if name == "estimate":
             p.add_argument("--sample", type=int, default=6, help="folders to convert")
         if name == "fetch-index":

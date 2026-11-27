@@ -235,15 +235,50 @@ def build_window(series: np.ndarray, w: Mapping, *, block_hash: str | None, max_
             "target": tgt[0].copy() if uni else tgt.copy(), "channels": rec}, None
 
 
+def _ordered_map(fn, items: list, workers: int):
+    """``fn`` over ``items`` on at most ``workers`` threads, yielded in
+    ``items`` order with at most ``2 * workers`` results in flight (bounded
+    memory). The first exception cancels what has not started and is
+    raised."""
+    if workers <= 1 or len(items) <= 1:
+        for x in items:
+            yield fn(x)
+        return
+    from collections import deque
+    from concurrent.futures import ThreadPoolExecutor
+
+    ex = ThreadPoolExecutor(max_workers=int(workers))
+    pending: deque = deque()
+    it = iter(items)
+    try:
+        for x in it:
+            pending.append(ex.submit(fn, x))
+            if len(pending) >= 2 * int(workers):
+                break
+        while pending:
+            got = pending.popleft().result()
+            for x in it:
+                pending.append(ex.submit(fn, x))
+                break
+            yield got
+    finally:
+        for f in pending:
+            f.cancel()
+        ex.shutdown(wait=True, cancel_futures=True)
+
+
 def read_public_windows(draw: dict, *, index_dir, data_root=None, block_hash: str | None,
-                        max_channels: int, reader=None) -> tuple[list[dict], list[dict]]:
+                        max_channels: int, reader=None,
+                        workers: int = 1) -> tuple[list[dict], list[dict]]:
     """Read ONLY the drawn series of ``draw`` and build its windows:
     ``(windows, dropped)``, both in ``window_id`` order. The series come
     from ``reader(row) -> (C, L)`` when given (the Hippius mirror,
     :meth:`cascade.eval.lane_d_public_mirror.PublicMirror.reader`), else
     from the local mirror at ``data_root``. Needs ``pyarrow`` (the eval host
     / builder, never the box). ``index_dir`` is the source's index (the one
-    ``draw`` was drawn from)."""
+    ``draw`` was drawn from). ``workers > 1`` reads that many series at once
+    (a bounded thread pool; the result is identical to the serial read: the
+    windows, the drops and their order depend on the data only)."""
     if reader is None and data_root is None:
         raise ValueError("read_public_windows: a data_root or a reader is required")
     source = draw["source"]
@@ -258,10 +293,14 @@ def read_public_windows(draw: dict, *, index_dir, data_root=None, block_hash: st
         if int(row["ordinal"]) in want:
             rows[row["series_id"]] = row
     windows, dropped = [], []
-    for sid in sorted(by_series):
+    sids = sorted(by_series)
+
+    def load(sid):
         row = rows[sid]
-        series = (reader(row) if reader is not None
-                  else read_series(data_root, row, source=source))
+        return (reader(row) if reader is not None
+                else read_series(data_root, row, source=source))
+
+    for sid, series in zip(sids, _ordered_map(load, sids, int(workers)), strict=True):
         for w in by_series[sid]:
             win, why = build_window(series, w, block_hash=block_hash, max_channels=max_channels,
                                     min_history=int(draw["min_history"]))
