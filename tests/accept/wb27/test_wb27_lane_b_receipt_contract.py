@@ -26,6 +26,30 @@ from . import helpers as h
 GEN = "alice/metro-gen@sha256:" + "a" * 64
 PTR = "metro-v1:trained:hippius:org/ckpt@sha256:" + "b" * 64
 LIVE_CFG = Path("/root/cascade/chain.validator.toml")
+
+
+def _live_cfg_readable() -> bool:
+    try:
+        return LIVE_CFG.is_file()
+    except OSError:            # CI: /root is not readable
+        return False
+
+
+def _fields():
+    """``runner_common.lane_b_dispatch_fields`` (the pending-record fields)."""
+    from cascade.trainer import runner_common
+
+    f = getattr(runner_common, "lane_b_dispatch_fields", None)
+    assert f is not None, "the pending record carries no lane B dispatch fields"
+    return f
+
+
+def _rows():
+    from cascade.trainer import runner_common
+
+    f = getattr(runner_common, "lane_b_record_rows", None)
+    assert f is not None, "no lane B record rows reader"
+    return f
 LIVE_CONTRACT_BLOCK = 9594000
 LIVE_DISPATCH_BLOCK = 9596663
 LIVE_RECEIPT = "a3ea79b2b236eea6c01b7c41bbcf4323f026f65166db6e4cf85d5bb6fc770533"
@@ -53,14 +77,11 @@ def _worker_leg_contract(cfg, contract_block: int, spec: dict | None):
     return contract
 
 
-def test_worker_still_folds_levers_only_with_a_spec():
-    """The rule this fix mirrors lives in the worker image: pin it."""
+def test_no_spec_leg_contract_is_the_workers():
+    # the rule this fix mirrors lives in the worker image: pin it
     src = (h.REPO / "cascade" / "trainer" / "worker.py").read_text(encoding="utf-8")
     i = src.index("apply_spec_levers(cfg.lane_b, contract, lane_b_spec")
     assert "if lane_b_spec:" in src[src.rindex("lane_b_leg_contract(contract)", 0, i):i]
-
-
-def test_no_spec_leg_contract_is_the_workers():
     with h.torch_blocked():
         from cascade.shared.lane_b_levers import lane_b_leg_contract
         from cascade.shared.manifest import contract_digest
@@ -79,7 +100,7 @@ def test_no_spec_leg_contract_is_the_workers():
         assert contract_digest(t2) == contract_digest(_worker_leg_contract(cfg, b, spec))
 
 
-@pytest.mark.skipif(not LIVE_CFG.is_file(), reason="the live validator config is box-only")
+@pytest.mark.skipif(not _live_cfg_readable(), reason="the live validator config is box-only")
 def test_live_no_spec_leg_digest_is_the_receipt():
     """The 2026-11-27 leg: the trainer now expects the digest its receipt carries."""
     with h.torch_blocked():
@@ -171,7 +192,7 @@ def test_dispatch_trains_the_workers_contract_for_a_no_spec_leg(tmp_path, monkey
 
 
 def test_reuploaded_harvest_is_recorded_with_its_trained_selection(tmp_path, monkeypatch):
-    from cascade.trainer.runner_common import lane_b_dispatch_fields
+    lane_b_dispatch_fields = _fields()
 
     seen = {}
 
@@ -190,12 +211,11 @@ def test_reuploaded_harvest_is_recorded_with_its_trained_selection(tmp_path, mon
     assert kw["selection"] == TRAINED and kw["exclude"] == {}
     assert kw["_left_dispatch"] is None                  # never leaks past the leg
 
-
-def test_fresh_leg_is_recorded_with_its_own_selection(tmp_path, monkeypatch):
-    def run(self, disp, gen, seeds, block, contract, suffix, **kw):
+    # a fresh leg (no re-upload) is recorded with its own selection
+    def fresh(self, disp, gen, seeds, block, contract, suffix, **kw):
         return _entry(block)
 
-    r = _runner(tmp_path, monkeypatch, run)
+    monkeypatch.setattr(type(r), "_run_funded_leg", fresh)
     ptr, failure, kw = _dispatch(r, _leg(selection=TRAINED))
     assert failure is None and ptr == PTR and "selection" not in kw
 
@@ -204,6 +224,8 @@ def test_leg_done_records_the_trained_selection():
     from cascade.trainer.expert_lane import LaneBQueue
     from cascade.trainer.lane_b_driver import LaneBDriver, LaneBDriverState
 
+    assert "selection" in inspect.signature(LaneBDriver._leg_done).parameters, (
+        "_leg_done cannot record a re-uploaded leg's trained selection")
     drv = LaneBDriver.__new__(LaneBDriver)
     leg = _leg(selection=TICK, exclude={2: [5]})
     drv._lock, drv._running, drv.st = threading.RLock(), {}, LaneBDriverState()
@@ -232,7 +254,9 @@ def _record(tmp_path, **extra):
 
 def test_failed_upload_records_the_dispatch_fields(tmp_path, monkeypatch):
     from cascade.trainer import loop
-    from cascade.trainer.runner_common import lane_b_dispatch_fields, read_pending_upload
+    from cascade.trainer.runner_common import read_pending_upload
+
+    lane_b_dispatch_fields = _fields()
 
     monkeypatch.setattr(loop, "upload_dir_to_hub_or_hf",
                         lambda *a, **k: (_ for _ in ()).throw(OSError("hub down")))
@@ -277,7 +301,7 @@ def _reupload(tmp_path, monkeypatch, rec, dispatch):
 
 
 def test_reupload_binds_the_recorded_selection(tmp_path, monkeypatch):
-    from cascade.trainer.runner_common import lane_b_dispatch_fields
+    lane_b_dispatch_fields = _fields()
 
     fields = lane_b_dispatch_fields(TRAINED, 9594000, {})
     got, uploaded, loc = _reupload(tmp_path, monkeypatch, _record(tmp_path, **fields),
@@ -287,7 +311,7 @@ def test_reupload_binds_the_recorded_selection(tmp_path, monkeypatch):
 
 
 def test_reupload_refuses_an_unattributable_record(tmp_path, monkeypatch):
-    from cascade.trainer.runner_common import lane_b_dispatch_fields
+    lane_b_dispatch_fields = _fields()
 
     tick = lane_b_dispatch_fields(TICK, 9597600, {})
     got, uploaded, _ = _reupload(tmp_path, monkeypatch, _record(tmp_path), tick)
@@ -297,7 +321,7 @@ def test_reupload_refuses_an_unattributable_record(tmp_path, monkeypatch):
 def test_reupload_across_an_era_keeps_the_trained_contract_block(tmp_path, monkeypatch):
     """The 2026-11-27 leg: trained at 9594000, re-dispatched in the next era
     (9597600) — the digest binds the contract; the record's fields win."""
-    from cascade.trainer.runner_common import lane_b_dispatch_fields
+    lane_b_dispatch_fields = _fields()
 
     fields = lane_b_dispatch_fields(TRAINED, 9594000, {})
     got, uploaded, loc = _reupload(tmp_path, monkeypatch, _record(tmp_path, **fields),
@@ -306,11 +330,10 @@ def test_reupload_across_an_era_keeps_the_trained_contract_block(tmp_path, monke
 
 
 def test_pending_fields_are_json_canonical():
-    from cascade.trainer.runner_common import lane_b_dispatch_fields, lane_b_record_rows
+    lane_b_dispatch_fields, lane_b_record_rows = _fields(), _rows()
 
     f = lane_b_dispatch_fields({6: [84, 61], 0: [31, 23]}, None, {1: [], 2: [7]})
     assert json.dumps(f, sort_keys=True) == (
         '{"contract_block": null, "expert_exclude": {"2": [7]}, '
         '"expert_selection": {"0": [23, 31], "6": [61, 84]}}')
     assert lane_b_record_rows(f["expert_selection"]) == {0: [23, 31], 6: [61, 84]}
-    assert inspect.signature(lane_b_dispatch_fields)
