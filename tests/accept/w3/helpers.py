@@ -161,7 +161,7 @@ def lane_d_cfg(**over):
     from cascade.shared.config.lane_d import LaneDConfig
 
     base = LaneDConfig()
-    return replace(base, **{"from_block": 1, "ready_ttl_blocks": TTL,
+    return replace(base, **{"from_block": 1, "ready_ttl_blocks": TTL, "horizon_bands": (),
                             "max_open_per_coldkey": 2, **over})
 
 

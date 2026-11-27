@@ -142,12 +142,15 @@ def raw_verify(ss58: str, message: bytes, signature_hex: str) -> bool:
 # (a floor far below any fixture ratio), so their pre-F4 numbers stand. F4's
 # own tests (tests/accept/w5e/test_w5e_combined.py) pin the combined rule.
 LIVE_ONLY = {"public_weight": 0.0, "window_ratio_floor": 1e-9}
+# Owner 2026-11-27: these fixtures pin the fixed [lane_d] horizon rule (their
+# pools hold fixed-length targets); tests/accept/w_hz pins the band rule.
+FIXED_HORIZON = {"horizon_bands": []}
 
 
 def lane_d_cfg(**over):
     from cascade.shared.config.lane_d import parse_lane_d
 
-    return parse_lane_d({**ARMED, **LIVE_ONLY, **over}, era_blocks_at=lambda _block: ERA)
+    return parse_lane_d({**ARMED, **LIVE_ONLY, **FIXED_HORIZON, **over}, era_blocks_at=lambda _block: ERA)
 
 
 def _quantiles_around(median: np.ndarray, spread: float) -> np.ndarray:

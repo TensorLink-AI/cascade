@@ -66,6 +66,13 @@ HISTORY_LENGTH = 16_384
 DEFAULT_EMBARGO_HOURS = float(LaneDConfig.embargo_hours)
 EVIDENCE_SCHEMA = "laned-evidence/w6b/1"
 SNAPSHOT_FILES = ("metadata.json", "hist.npz", "tgt.npz")
+# Owner 2026-11-27 (per-window horizons): the data / first-seen clocks of each
+# series' stored target REGION (its newest ``target_points`` points: the tail
+# of hist.npz followed by tgt.npz), ``(2, target_points)`` int64 per series.
+# Bound by its sha256 in metadata.json (``clocks``), so the snapshot digest
+# (over SNAPSHOT_FILES) is unchanged and a pre-band reader loads the snapshot
+# exactly as before (its 64-point windows are the region's last 64 points).
+CLOCKS_FILE = "clk.npz"
 REPLAY_MISMATCH_EXIT = 3
 _ZIP_EPOCH = (1980, 1, 1, 0, 0, 0)
 
@@ -112,6 +119,10 @@ class PoolDBuildConfig:
     max_missing_frac: float = 0.2
     min_std: float = 1e-8
     embargo_hours: float = DEFAULT_EMBARGO_HOURS
+    # Per-window horizons (owner 2026-11-27): the GIFT-Eval bands whose
+    # targets the region must hold (() = the fixed ``horizon`` target only).
+    horizon_bands: tuple[str, ...] = ()
+    max_horizon: int = 2048
     # The systemic-read-failure guard (W6fs unreadable_limit defaults).
     max_unreadable_files: int = 50
     max_unreadable_frac: float = 0.001
@@ -119,7 +130,23 @@ class PoolDBuildConfig:
     @classmethod
     def from_lane_d(cls, lane_d_cfg) -> PoolDBuildConfig:
         return cls(horizon=int(getattr(lane_d_cfg, "horizon", 64)),
-                   embargo_hours=lane_d_embargo_hours(lane_d_cfg))
+                   embargo_hours=lane_d_embargo_hours(lane_d_cfg),
+                   horizon_bands=tuple(getattr(lane_d_cfg, "horizon_bands", ()) or ()),
+                   max_horizon=int(getattr(lane_d_cfg, "max_horizon", 2048)))
+
+
+def region_points(freq, raw: np.ndarray, n_used: int, cfg: PoolDBuildConfig) -> int:
+    """The stored target region of a series (owner 2026-11-27): the longest
+    band horizon of ``freq`` (at least ``horizon``), within the raw segment's
+    all-finite suffix (a target point is never interpolated) and leaving
+    ``min_context`` history points before it."""
+    from ..shared.lane_d_horizons import bands_for
+
+    h = int(cfg.horizon)
+    want = max([h, *bands_for(freq, cfg.horizon_bands, max_horizon=cfg.max_horizon).values()])
+    bad = np.flatnonzero(~np.isfinite(np.asarray(raw, dtype=np.float64)))
+    finite_tail = raw.size - (int(bad[-1]) + 1) if bad.size else raw.size
+    return int(max(h, min(want, finite_tail, int(n_used) - int(cfg.min_context))))
 
 
 @dataclass
@@ -315,6 +342,7 @@ def build_pool_d(*, forge_dir: Path | str, selection, first_seen_dir: Path | str
     series_out: list[dict] = []
     hist: dict[str, np.ndarray] = {}
     tgt: dict[str, np.ndarray] = {}
+    clocks: dict[str, np.ndarray] = {}
     feeds_out: dict[str, dict] = {}
     roots_used: set[str] = set()
 
@@ -430,6 +458,17 @@ def build_pool_d(*, forge_dir: Path | str, selection, first_seen_dir: Path | str
                     roots_used.add(index.root_for(feed, pj, int(t)))
                 sid = sel.pool_d_series_id
                 hist[sid], tgt[sid] = h_vals, t_vals
+                region = None
+                if cfg.horizon_bands:
+                    r = region_points(freq, col_vals[lo:hi][-n_used:], n_used, cfg)
+                    reg_ts = [int(t) for t in seg_ts[-r:]]
+                    reg_seen = [int(x) for x in seg_seen[-r:]]
+                    if r > int(cfg.horizon) and _series_invariant_refusal(
+                            reg_ts, reg_seen, as_of_ts) is not None:
+                        r = int(cfg.horizon)
+                        reg_ts, reg_seen = target_ts, first_seen_ts
+                    clocks[sid] = np.asarray([reg_ts, reg_seen], dtype=np.int64)
+                    region = r
                 series_out.append({
                     "series_id": sid, "pool_series_id": sel.pool_series_id,
                     "source": sel.cluster, "feed": feed, "panel": panel,
@@ -440,6 +479,7 @@ def build_pool_d(*, forge_dir: Path | str, selection, first_seen_dir: Path | str
                     "first_seen_ts": first_seen_ts,
                     "first_target_ts": target_ts[0], "end_ts": target_ts[-1],
                     "frontier": frontiers.get(sid, []),
+                    **({} if region is None else {"target_points": int(region)}),
                 })
                 feeds_out[feed] = {
                     "mirror_lag_hours": lag["mirror_lag_hours"],
@@ -486,15 +526,22 @@ def build_pool_d(*, forge_dir: Path | str, selection, first_seen_dir: Path | str
         raise ValueError("refusing to write an empty pool_d snapshot")
     dest = Path(out_dir)
     dest.mkdir(parents=True, exist_ok=True)
-    if any((dest / n).exists() for n in SNAPSHOT_FILES) and not overwrite:
+    if any((dest / n).exists() for n in (*SNAPSHOT_FILES, CLOCKS_FILE)) and not overwrite:
         raise FileExistsError(f"{dest} already holds a pool_d snapshot; pass overwrite=True")
     write_npz(dest / "hist.npz", hist)
     write_npz(dest / "tgt.npz", tgt)
+    if cfg.horizon_bands:
+        kept = {s["series_id"] for s in series_out}
+        write_npz(dest / CLOCKS_FILE, {k: v for k, v in clocks.items() if k in kept})
+        meta["clocks"] = {"file": CLOCKS_FILE, "sha256": hashlib.sha256(
+            (dest / CLOCKS_FILE).read_bytes()).hexdigest()}
+        meta["horizon_bands"] = list(cfg.horizon_bands)
+        meta["max_horizon"] = int(cfg.max_horizon)
     (dest / "metadata.json").write_text(json.dumps(meta, indent=1, sort_keys=True) + "\n",
                                         encoding="utf-8")
     problems = validate_pool_d(dest)
     if problems:
-        for n in SNAPSHOT_FILES:
+        for n in (*SNAPSHOT_FILES, CLOCKS_FILE):
             (dest / n).unlink(missing_ok=True)
         raise ValueError("invalid pool_d snapshot: " + "; ".join(problems[:10]))
     return PoolDSummary(snapshot=meta["snapshot"], sha256=snapshot_sha256(dest),
@@ -563,6 +610,31 @@ def _series_problems(s, feeds, horizon: int, as_of, hist, tgt) -> list[str]:
     return out
 
 
+def _region_problems(s, horizon: int, as_of, hist, clk) -> list[str]:
+    """Owner 2026-11-27: a band snapshot's per-series target region."""
+    sid = s.get("series_id")
+    r = s.get("target_points")
+    if type(r) is not int or r < horizon:
+        return [f"series {sid!r}: target_points {r!r} is not an int >= {horizon}"]
+    if sid not in clk.files:
+        return [f"series {sid!r}: no clocks"]
+    c = clk[sid]
+    if c.shape != (2, r):
+        return [f"series {sid!r}: clocks shape {c.shape} != (2, {r})"]
+    out = []
+    if hist[sid].shape[-1] + horizon < r:
+        out.append(f"series {sid!r}: region of {r} points longer than history + target")
+    ts, seen = c[0].tolist(), c[1].tolist()
+    if ts[-horizon:] != list(s.get("target_ts") or []) \
+            or seen[-horizon:] != list(s.get("first_seen_ts") or []):
+        out.append(f"series {sid!r}: region clocks do not end in target_ts / first_seen_ts")
+    if any(b <= a for a, b in zip(ts, ts[1:], strict=False)):
+        out.append(f"series {sid!r}: region target_ts not strictly increasing")
+    if as_of is not None and any(int(x) >= as_of for x in seen):
+        out.append(f"series {sid!r}: a region first_seen_ts is not before as_of_ts")
+    return out
+
+
 def validate_pool_d(pool_dir: Path | str) -> list[str]:
     """Every problem that makes a ``pool_d/1`` snapshot invalid (``[]`` = ok)."""
     d = Path(pool_dir)
@@ -595,12 +667,28 @@ def validate_pool_d(pool_dir: Path | str) -> list[str]:
         hist_npz, tgt_npz = np.load(d / "hist.npz"), np.load(d / "tgt.npz")
     except (OSError, ValueError) as e:
         return problems + [f"arrays unreadable: {e}"]
+    clk_rec = meta.get("clocks")
+    clk_npz = None
+    if clk_rec is not None:
+        if not isinstance(clk_rec, Mapping) or clk_rec.get("file") != CLOCKS_FILE:
+            return problems + [f"clocks is not {{file: {CLOCKS_FILE!r}, sha256}}"]
+        try:
+            raw = (d / CLOCKS_FILE).read_bytes()
+        except OSError as e:
+            return problems + [f"{CLOCKS_FILE} unreadable: {e}"]
+        if hashlib.sha256(raw).hexdigest() != clk_rec.get("sha256"):
+            return problems + [f"{CLOCKS_FILE} does not hash to metadata clocks.sha256"]
+        clk_npz = np.load(d / CLOCKS_FILE)
     with hist_npz as hist, tgt_npz as tgt:
         for s in series:
             if not isinstance(s, Mapping):
                 problems.append("a series record is not an object")
                 continue
             problems.extend(_series_problems(s, feeds, horizon, as_of, hist, tgt))
+            if clk_npz is not None and not problems:
+                problems.extend(_region_problems(s, horizon, as_of, hist, clk_npz))
+    if clk_npz is not None:
+        clk_npz.close()
     return problems
 
 

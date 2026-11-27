@@ -34,7 +34,8 @@ Everything W1.5 pins stays (`SCORING_LEVELS`, `MEDIAN_INDEX`,
 - `SCORER_CONTEXTS`: ascending tuple of ints, a superset of
   `cascade.shared.config.lane_d.LANE_D_CONTEXTS`; each a multiple of 32 in
   `[4096, 131072]`.
-- `MAX_HORIZON == 512`.
+- `MAX_HORIZON == 2048` (owner 2026-11-27: the per-window band cap, 64 patches;
+  was 512).
 - `declared_context(context, contexts) -> int`: returns `int(context)` when
   it is in `contexts` **and** in `SCORER_CONTEXTS`; otherwise `ValueError`.
 - `batch_plan(history_lengths, *, context, patch_size) -> dict[int, list[int]]`:

@@ -279,5 +279,7 @@ def test_public_windows_score_through_the_f2_per_window_api(tmp_path):
 def test_one_draw_serves_the_king_the_house_and_every_challenger():
     pub = _pub()
     params = set(inspect.signature(pub.draw_public).parameters)
+    # owner 2026-11-27: the band rule (``bands``, ``max_horizon``) is config,
+    # never a per-entry input: still one draw for every model.
     assert params == {"index_dir", "source", "boundary_block_hash", "horizon", "n_windows",
-                      "min_history"}
+                      "min_history", "bands", "max_horizon"}

@@ -187,12 +187,13 @@ def test_forecast_refuses_undeclared_context_before_loading(no_torch, tmp_path):
 
 
 def test_forecast_refuses_horizon_over_512_before_loading(no_torch, tmp_path):
+    """Named for the pre-band cap; the cap is now 2048 (owner 2026-11-27)."""
     s = _scorer()
     assert getattr(s, "MAX_HORIZON", None) == MAX_HORIZON, (
-        "W5d: lane_d_scorer.MAX_HORIZON = 512 (16 CPM patches x 32, §1.1)")
+        "lane_d_scorer.MAX_HORIZON = 2048 (64 patches x 32, the band cap; owner 2026-11-27)")
     fq = _w5d_forecast()
     absent = tmp_path / "no-checkpoint-here"
-    for h in (MAX_HORIZON + 1, 720, 0):
+    for h in (MAX_HORIZON + 1, 4096, 0):
         with pytest.raises(ValueError):
             fq(absent, [series(256, 0)], context=TRAINED_CONTEXT, horizon=h)
 

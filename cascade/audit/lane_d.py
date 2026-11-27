@@ -102,6 +102,7 @@ from pathlib import Path
 import numpy as np
 
 from ..eval.bootstrap import clamped_log_ratios, log_gain, parts_maxt_lcbs
+from ..shared.lane_d_horizons import band_slots, bands_for, bands_on, cell_class
 from .checks import CheckResult, _fail, _ok, _warn
 
 NAME = "lane_d"
@@ -202,7 +203,7 @@ def _groups(x: np.ndarray, labels: list[str]) -> dict:
 
 
 def _judge(report: dict, cfg, scores: dict, bar: str, members: list[str],
-           clusters: list, pub: dict | None) -> list[dict]:
+           clusters: list, pub: dict | None, cells: list | None = None) -> list[dict]:
     """rev6.18 A3 (F4): per member the re-derived ``{lcb, gain, cleared,
     halves, sources, domains}`` of the cohort against ``bar`` on the signed
     live rows (``scores``), the settlement's signed public rows (``pub``:
@@ -233,9 +234,15 @@ def _judge(report: dict, cfg, scores: dict, bar: str, members: list[str],
             domains.update(_groups(xp[j], list(pub["clusters"])))
             big_l += w * p_
         ok = all(g > 0.0 for _, g in halves.values())
-        out.append({"lcb": float(lcb), "gain": log_gain(big_l),
-                    "cleared": bool(float(lcb) >= _report_bar(report, cfg) and ok),
-                    "halves": halves, "sources": sources, "domains": domains})
+        res = {"lcb": float(lcb), "gain": log_gain(big_l),
+               "cleared": bool(float(lcb) >= _report_bar(report, cfg) and ok),
+               "halves": halves, "sources": sources, "domains": domains}
+        if cells is not None:
+            per = _groups(xl[j], [f"live|{c}" for c in cells])
+            if xp is not None and pub.get("cells") is not None:
+                per.update(_groups(xp[j], [f"public|{c}" for c in pub["cells"]]))
+            res["cells"] = per
+        out.append(res)
     return out
 
 
@@ -415,7 +422,12 @@ def _cohort_problems(report: dict, cfg, cohort: dict, rows_by: dict, windows: di
         lost = [dg for dg in [*bars, *members] if dg not in pub["scores"]]
         if lost:
             return [f"cohort {idx}: no public rows for {[d[:12] for d in lost]}"]
-    judged = {b: _judge(report, cfg, scores, b, members, clusters, pub) for b in bars}
+    # owner 2026-11-27: a band report's per-cell point gains (an optional
+    # verdict extra) are re-derived from the rows too.
+    cells = None
+    if any("cells" in v for v in report.get("verdicts", []) if int(v["cohort"]) == idx):
+        cells = [f"{cell_class(windows[w].get('freq'))}|{windows[w].get('band')}" for w in wids]
+    judged = {b: _judge(report, cfg, scores, b, members, clusters, pub, cells) for b in bars}
     verdicts = {v["digest"]: v for v in report.get("verdicts", []) if int(v["cohort"]) == idx}
     if set(verdicts) != set(members):
         return [f"cohort {idx}: verdicts {sorted(verdicts)} do not cover members {members}"]
@@ -430,6 +442,8 @@ def _cohort_problems(report: dict, cfg, cohort: dict, rows_by: dict, windows: di
         for name in ("halves", "sources", "domains"):
             if _gains_problem(v.get(name), jd[name]):
                 out.append(f"cohort {idx}: {m[:12]} {name} are not the re-derived ones")
+        if "cells" in v and _gains_problem(v["cells"], jd.get("cells") or {}):
+            out.append(f"cohort {idx}: {m[:12]} cells are not the re-derived ones")
         if len(bars) == 1:
             if "house" in v:
                 out.append(f"cohort {idx}: {m[:12]} carries a house judgement where the "
@@ -967,9 +981,15 @@ def _embargo_problems(report: dict, cfg, windows: dict, rows_by: dict) -> list[s
         if not isinstance(w.get("min_release_ts"), int) or isinstance(w.get("min_release_ts"), bool):
             out.append(f"window {wid}: min_release_ts {w.get('min_release_ts')!r} is not a timestamp")
         freq = w.get("freq")
+        # owner 2026-11-27: a band window's h is its band horizon under the
+        # config's rule; a window without a band is at the fixed horizon.
+        hw = h
+        if "band" in w:
+            hw = (bands_for(freq, cfg.horizon_bands, max_horizon=int(cfg.max_horizon)).get(
+                w["band"]) if bands_on(cfg) else None)
         if w.get("timeframe") != freq or w.get("freq_class") != _FREQ_CLASS.get(freq, "subdaily") \
-                or w.get("kind") != "forward" or w.get("bin") != "forward" or w.get("h") != h \
-                or wid.rsplit(":", 2)[1:] != [str(w.get("origin")), f"h{h}"]:
+                or w.get("kind") != "forward" or w.get("bin") != "forward" or w.get("h") != hw \
+                or wid.rsplit(":", 2)[1:] != [str(w.get("origin")), f"h{hw}"]:
             out.append(f"window {wid}: the draw cell (timeframe/freq_class/kind/bin/h/origin) "
                        f"does not match the window")
     share = float(cfg.min_fresh_window_share)
@@ -1052,6 +1072,20 @@ def _draw_problems(report: dict, cfg, windows: dict) -> list[str]:
             if quota.get(k, 0) != count.get(k, 0) or quota.get(k, 0) > capacity.get(k, 0):
                 out.append(f"draw cohort {c['index']}: quota {k} {quota.get(k)!r} is not its "
                            f"{count.get(k, 0)} judged windows (capacity {capacity.get(k)!r})")
+        if "cells" in c:
+            # owner 2026-11-27: equal weight per (frequency class, band) cell
+            # = equal judged counts, each at least min_cell_windows.
+            got: dict[str, int] = {}
+            for x in c["window_ids"]:
+                w = windows.get(x)
+                if w is not None:
+                    k = f"{cell_class(w.get('freq'))}|{w.get('band')}"
+                    got[k] = got.get(k, 0) + 1
+            n = set(got.values())
+            if got != c["cells"] or len(n) > 1 or (bands_on(cfg) and n and min(n) < int(
+                    cfg.min_cell_windows)):
+                out.append(f"cohort {c['index']}: cells {c['cells']!r} are not equal judged "
+                           f"counts >= min_cell_windows (re-derived {got!r})")
     return out
 
 
@@ -1172,8 +1206,9 @@ def window_refusal(series: dict, feeds: dict, bound: float, cfg) -> str | None:
     record at ``bound`` (``t_max + 3600 * forward_margin_hours``), or
     ``None`` when the window is eligible. Missing metadata fails closed: an
     unlisted feed (or no ``feeds`` block) is ``unlisted_feed``; an absent,
-    ``null``, empty or malformed ``frontier`` is ``absent_from_s0``."""
-    h = int(cfg.horizon)
+    ``null``, empty or malformed ``frontier`` is ``absent_from_s0``. A band
+    candidate's record carries its ``h`` (owner 2026-11-27)."""
+    h = int(series.get("h") or cfg.horizon)
     ts, seen, end = series.get("target_ts"), series.get("first_seen_ts"), series.get("end_ts")
     if not (isinstance(ts, list) and isinstance(seen, list) and h > 0
             and len(ts) == h and len(seen) == h
@@ -1322,6 +1357,40 @@ def _snapshot_digest(d: Path) -> str:
     return hashlib.sha256(parts.encode()).hexdigest()
 
 
+def _band_records(d: Path, meta: dict, cfg) -> dict:
+    """Owner 2026-11-27: ``{window_id: series record}`` of a snapshot's band
+    candidates, each record the series' with its slice of the region clocks
+    (``clk.npz``, its sha256 bound in metadata; a pre-band snapshot's region
+    is its stored target) and its ``h``."""
+    rec = meta.get("clocks")
+    clk = None
+    if isinstance(rec, dict) and (d / str(rec.get("file"))).is_file():
+        if hashlib.sha256((d / str(rec["file"])).read_bytes()).hexdigest() != rec.get("sha256"):
+            return {}
+        clk = np.load(d / str(rec["file"]))
+    out = {}
+    try:
+        for s in meta.get("series") or []:
+            sid = s.get("series_id")
+            if not isinstance(sid, str):
+                continue
+            if clk is not None and sid in clk.files:
+                c = clk[sid]
+                ts, seen = [int(t) for t in c[0]], [int(t) for t in c[1]]
+            else:
+                ts, seen = list(s.get("target_ts") or []), list(s.get("first_seen_ts") or [])
+            for _band, h, start in band_slots(ts, s.get("freq"), cfg.horizon_bands,
+                                              slots=int(cfg.band_slots),
+                                              max_horizon=int(cfg.max_horizon)):
+                t, f = ts[start:start + h], seen[start:start + h]
+                out[f"{sid}:{int(t[0])}:h{h}"] = {**s, "target_ts": t, "first_seen_ts": f,
+                                                  "end_ts": t[-1], "h": h}
+    finally:
+        if clk is not None:
+            clk.close()
+    return out
+
+
 def _snapshot_problem(report: dict, cfg, pool_dirs, windows: dict) -> str | None:
     """README rules 12-14 against the provided snapshot directories."""
     metas: dict[str, object] = {}
@@ -1366,6 +1435,8 @@ def _snapshot_problem(report: dict, cfg, pool_dirs, windows: dict) -> str | None
             ts = s.get("target_ts")
             if isinstance(sid, str) and isinstance(ts, list) and ts and _finite(ts[0]):
                 by_id[f"{sid}:{int(ts[0])}:h{h}"] = s
+        if bands_on(cfg):
+            by_id.update(_band_records(dirs[sha], meta, cfg))
         why = _snapshot_windows_channels(dirs[sha], judged[sha], by_id)
         if why is not None:
             return why
@@ -1497,22 +1568,38 @@ def _pub_rows(index_dir) -> tuple[dict, list[dict]]:
 
 def public_redraw(rows: list[dict], *, source: str, block_hash: str, horizon: int,
                   n_windows: int = PUBLIC_N_WINDOWS, min_history: int = PUBLIC_MIN_HISTORY,
-                  multi_window: bool | None = None) -> dict:
+                  multi_window: bool | None = None, bands=None,
+                  max_horizon: int = 2048) -> dict:
     """The public draw re-derived from index rows: ``{capacity, quota,
     windows}`` (windows ``{window_id, ordinal, family, freq, cut, h,
-    length}`` sorted by id)."""
+    length}`` sorted by id). ``bands`` (owner 2026-11-27): each series first
+    draws its band, uniform over its frequency's GIFT-Eval bands that fit
+    its length, by ``H(band, ordinal, 0)``; its slots and cuts use that h."""
     multi = PUBLIC_PINS[source][2] if multi_window is None else bool(multi_window)
-    h, m = int(horizon), int(min_history)
+    h0, m = int(horizon), int(min_history)
     seed = f"{block_hash}:{PUBLIC_SEED_TAG}:{source}"
+    band_of: dict[int, tuple[str, int]] = {}
+    if bands:
+        for r in rows:
+            fits = [(b, hb) for b, hb in bands_for(r["freq"], bands,
+                                                   max_horizon=max_horizon).items()
+                    if max(0, (int(r["length"]) - m) // hb) >= 1]
+            if fits:
+                band_of[r["ordinal"]] = fits[_pub_hint(seed, "band", r["ordinal"], 0) % len(fits)]
 
-    def slots(n: int) -> int:
-        return max(0, (int(n) - m) // h)
+    def h_of(r) -> int:
+        return band_of[r["ordinal"]][1] if bands else h0
+
+    def slots_r(r) -> int:
+        if bands and r["ordinal"] not in band_of:
+            return 0
+        return max(0, (int(r["length"]) - m) // h_of(r))
 
     cells: dict[str, list[dict]] = {}
     for r in rows:
-        if slots(r["length"]) >= 1:
+        if slots_r(r) >= 1:
             cells.setdefault(f"{r['family']}|{r['freq']}", []).append(r)
-    caps = {k: (sum(slots(r["length"]) for r in v) if multi else len(v)) for k, v in cells.items()}
+    caps = {k: (sum(slots_r(r) for r in v) if multi else len(v)) for k, v in cells.items()}
     quota = _pub_quota(caps, n_windows)
     taken: dict[int, list[int]] = {}
     for k in sorted(cells):
@@ -1520,22 +1607,23 @@ def public_redraw(rows: list[dict], *, source: str, block_hash: str, horizon: in
         members = sorted(cells[k], key=lambda r: r["ordinal"])
         while left > 0:
             pool = [r for r in members if len(taken.get(r["ordinal"], ())) == rnd - 1
-                    and slots(r["length"]) >= rnd]
+                    and slots_r(r) >= rnd]
             if not pool:
                 break
             pool.sort(key=lambda r: (_pub_hint(seed, "pick", r["ordinal"], rnd), r["ordinal"]))
             for r in pool[:left]:
                 o = r["ordinal"]
-                c = _pub_cut(seed, o, rnd, int(r["length"]), h, m, multi, taken.get(o, []))
+                c = _pub_cut(seed, o, rnd, int(r["length"]), h_of(r), m, multi, taken.get(o, []))
                 taken.setdefault(o, []).append(c)
                 left -= 1
             if not multi:
                 break
             rnd += 1
     by_o = {r["ordinal"]: r for r in rows}
-    windows = sorted(({"window_id": f"{source}:{by_o[o]['series_id']}:{c}:h{h}", "ordinal": o,
-                       "family": by_o[o]["family"], "freq": by_o[o]["freq"], "cut": c, "h": h,
-                       "length": int(by_o[o]["length"])}
+    windows = sorted(({"window_id": f"{source}:{by_o[o]['series_id']}:{c}:h{h_of(by_o[o])}",
+                       "ordinal": o, "family": by_o[o]["family"], "freq": by_o[o]["freq"],
+                       "cut": c, "h": h_of(by_o[o]), "length": int(by_o[o]["length"]),
+                       **({"band": band_of[o][0]} if bands else {})}
                       for o, cuts in taken.items() for c in cuts),
                      key=lambda w: w["window_id"])
     return {"capacity": dict(sorted(caps.items())), "quota": dict(sorted(quota.items())),
@@ -1617,7 +1705,9 @@ def _public_draw_problems(report: dict, cfg, public_indexes) -> list[str]:
             continue          # ld_public_index names it
         if m.get("index_sha256") != s["index_sha256"]:
             continue          # ld_public_index names it
-        got = public_redraw(rows, source=src, block_hash=bh, horizon=int(cfg.horizon))
+        got = public_redraw(rows, source=src, block_hash=bh, horizon=int(cfg.horizon),
+                            bands=tuple(cfg.horizon_bands) if bands_on(cfg) else None,
+                            max_horizon=int(getattr(cfg, "max_horizon", 2048)))
         for k in ("capacity", "quota"):
             if got[k] != s[k]:
                 out.append(f"public {src}: {k} is not the re-derived draw's")
@@ -1654,11 +1744,14 @@ def _public_half(report: dict, cfg) -> tuple[dict | None, tuple[str, str] | None
     if hashlib.sha256(_canon(prows)).hexdigest() != pubrec.get("rows_sha256"):
         return None, ("ld_rows_sha256", "public.rows_sha256 does not match public.rows")
     kept: dict[str, tuple[str, str]] = {}
+    cell_of: dict[str, str] = {}
     for s in pubrec["sources"]:
         gone = {d["window_id"] for d in s["dropped"]}
         for x in s["windows"]:
             if x["window_id"] not in gone:
                 kept[str(x["window_id"])] = (str(s["source"]), str(x["family"]))
+                if "band" in x:
+                    cell_of[str(x["window_id"])] = f"{cell_class(x['freq'])}|{x['band']}"
     order = sorted(kept)
     pos = {wid: i for i, wid in enumerate(order)}
     got: dict[str, dict[int, tuple[float, float]]] = {}
@@ -1683,7 +1776,8 @@ def _public_half(report: dict, cfg) -> tuple[dict | None, tuple[str, str] | None
         return None, ("ld_cohort", "public_weight > 0 but no public window is kept")
     return {"scores": scores, "clusters": [f"{kept[x][0]}|{kept[x][1]}" for x in order],
             "sources": [kept[x][0] for x in order], "n_windows": len(order),
-            "n_rows": len(prows)}, None
+            "n_rows": len(prows),
+            "cells": [cell_of[x] for x in order] if len(cell_of) == len(order) else None}, None
 
 
 _UNSET = object()

@@ -166,9 +166,10 @@ from ..eval.lane_d_scorer import (
     effective_context,
     score_window,
 )
+from ..shared.lane_d_horizons import bands_on, cell_class
 from .lane_d_bench import paired_gate, sweep_record_text
-from .lane_d_draw import draw_windows, freq_class
-from .lane_d_forward import eligible_windows
+from .lane_d_draw import draw_band_windows, draw_windows, freq_class
+from .lane_d_forward import eligible_windows, window_horizon
 from .lane_d_frozen import advance_frozen_set
 from .lane_d_gate import gate_record
 from .lane_d_house import check_house
@@ -204,6 +205,7 @@ from .lane_d_state import (
 )
 
 POOL_SCHEMA = "pool_d/1"
+CLOCKS_FILE = "clk.npz"
 # W-IMG (plan rev6.24 (e)): the eval host code identity a settlement ran on
 EVAL_IMAGE_EXTENSION = "eval_image"
 OPEN_STATUSES = ("pending", "hold")
@@ -295,12 +297,77 @@ def _parse_roots(raw, where: Path) -> list[str]:
     return sorted(set(raw))
 
 
-def load_pool(pool_dir, horizon: int) -> dict:
+def _band_clocks(d: Path, meta: dict):
+    """The ``clk.npz`` of a band snapshot (owner 2026-11-27), checked against
+    its metadata sha256; ``None`` for a pre-band snapshot (its region is the
+    stored 64-point target)."""
+    rec = meta.get("clocks")
+    if rec is None:
+        return None
+    if not isinstance(rec, dict) or rec.get("file") != CLOCKS_FILE:
+        raise ValueError(f"{d}: pool clocks record {rec!r} is not {{file: {CLOCKS_FILE!r}}}")
+    if _file_sha(d / CLOCKS_FILE) != rec.get("sha256"):
+        raise ValueError(f"{d}: {CLOCKS_FILE} does not hash to the metadata clocks.sha256")
+    return np.load(d / CLOCKS_FILE)
+
+
+def _base_window(s: dict, sid: str, d: Path) -> dict:
+    source = str(s.get("source") or sid)
+    return {"series_id": sid, "source": source, "feed": str(s.get("feed") or source),
+            "freq": str(s.get("freq") or ""),
+            "frontier": _parse_frontier(s.get("frontier"), sid, d),
+            "seasonal_period": int(s.get("seasonal_period") or 1)}
+
+
+def _band_windows(s: dict, sid: str, d: Path, hist, tgt, clk, bands, *, max_horizon: int,
+                  slots: int, history_length: int) -> list[dict]:
+    """Owner 2026-11-27: one series' forward candidates at their band
+    horizons. The region is the series' newest ``target_points`` points (the
+    tail of its history, then its target); each candidate's target is a
+    region slice (:func:`~cascade.shared.lane_d_horizons.band_slots`) and its
+    history every point before the cut (embargo-held points included: only
+    the target must be unseen). Arrays are views of one per-series array."""
+    from ..shared.lane_d_horizons import band_slots
+
+    hist_a = np.asarray(hist[sid], dtype=np.float64)
+    tgt_a = np.asarray(tgt[sid], dtype=np.float64)
+    if clk is not None and sid in clk.files:
+        c = np.asarray(clk[sid], dtype=np.int64)
+        ts, seen = c[0], c[1]
+    else:
+        ts = np.asarray([int(t) for t in s.get("target_ts") or []], dtype=np.int64)
+        seen = np.asarray([int(t) for t in s.get("first_seen_ts") or []], dtype=np.int64)
+    if not ts.size or ts.size != seen.size or hist_a.shape[:-1] != tgt_a.shape[:-1]:
+        return []
+    full = np.concatenate([hist_a, tgt_a], axis=-1)
+    if ts.size > full.shape[-1]:
+        return []
+    g = full.shape[-1] - ts.size
+    base = _base_window(s, sid, d)
+    out = []
+    for band, h, start in band_slots(ts, base["freq"], bands, slots=slots,
+                                     max_horizon=max_horizon):
+        cut = g + start
+        t_ts, t_seen = ts[start:start + h], seen[start:start + h]
+        out.append({**base, "window_id": window_id(sid, t_ts, h), "h": int(h), "band": band,
+                    "target_ts": t_ts, "first_seen_ts": t_seen, "end_ts": int(t_ts[-1]),
+                    "history": full[..., max(0, cut - int(history_length)):cut],
+                    "target": full[..., cut:cut + h]})
+    return out
+
+
+def load_pool(pool_dir, horizon: int, bands=None, *, max_horizon: int = 2048,
+              slots: int = 1) -> dict:
     """One ``pool_d/1`` snapshot: ``{"snapshot", "sha256", "feeds",
     "first_seen_roots", "windows": [...]}`` with each window's history,
     target, both clocks, cluster, feed, frequency and frontier (``None`` when
     the series' ``frontier`` is absent or ``null``; eligibility then fails
-    closed as ``absent_from_s0``)."""
+    closed as ``absent_from_s0``).
+
+    ``bands`` (owner 2026-11-27; ``None`` = the fixed ``horizon`` rule, byte
+    for byte): each series yields its per-band candidates
+    (:func:`_band_windows`), every window carrying its ``h`` and ``band``.
+    A pre-band snapshot loads too: its region is its stored target."""
     d = Path(pool_dir)
     meta = json.loads((d / "metadata.json").read_text(encoding="utf-8"))
     if meta.get("schema") != POOL_SCHEMA:
@@ -310,30 +377,47 @@ def load_pool(pool_dir, horizon: int) -> dict:
     sha = hashlib.sha256("".join(_file_sha(d / n) for n in
                                  ("metadata.json", "hist.npz", "tgt.npz")).encode()).hexdigest()
     windows = []
-    with np.load(d / "hist.npz") as hist, np.load(d / "tgt.npz") as tgt:
-        for s in meta.get("series", []):
-            sid = str(s["series_id"])
-            ts = [int(t) for t in s.get("target_ts") or []]
-            seen = [int(t) for t in s.get("first_seen_ts") or []]
-            if sid not in hist.files or sid not in tgt.files:
-                continue
-            target = np.asarray(tgt[sid], dtype=np.float64)
-            source = str(s.get("source") or sid)
-            windows.append({
-                "window_id": window_id(sid, ts, horizon) if ts else "",
-                "series_id": sid, "source": source,
-                "feed": str(s.get("feed") or source),
-                "freq": str(s.get("freq") or ""),
-                "frontier": _parse_frontier(s.get("frontier"), sid, d),
-                "seasonal_period": int(s.get("seasonal_period") or 1),
-                "target_ts": ts, "first_seen_ts": seen,
-                "end_ts": s.get("end_ts"),
-                "history": np.asarray(hist[sid], dtype=np.float64), "target": target,
-            })
+    clk = _band_clocks(d, meta) if bands else None
+    try:
+        with np.load(d / "hist.npz") as hist, np.load(d / "tgt.npz") as tgt:
+            for s in meta.get("series", []):
+                sid = str(s["series_id"])
+                if sid not in hist.files or sid not in tgt.files:
+                    continue
+                if bands:
+                    windows += _band_windows(
+                        s, sid, d, hist, tgt, clk, tuple(bands), max_horizon=int(max_horizon),
+                        slots=int(slots),
+                        history_length=int(meta.get("history_length") or 16384))
+                    continue
+                ts = [int(t) for t in s.get("target_ts") or []]
+                seen = [int(t) for t in s.get("first_seen_ts") or []]
+                target = np.asarray(tgt[sid], dtype=np.float64)
+                windows.append({
+                    "window_id": window_id(sid, ts, horizon) if ts else "",
+                    **_base_window(s, sid, d),
+                    "target_ts": ts, "first_seen_ts": seen,
+                    "end_ts": s.get("end_ts"),
+                    "history": np.asarray(hist[sid], dtype=np.float64), "target": target,
+                })
+    finally:
+        if clk is not None:
+            clk.close()
     return {"snapshot": str(meta.get("snapshot", "")), "sha256": sha,
             "feeds": _parse_feeds(meta.get("feeds"), d),
             "first_seen_roots": _parse_roots(meta.get("first_seen_roots"), d),
             "windows": windows}
+
+
+def load_pool_for(pool_dir, cfg) -> dict:
+    """:func:`load_pool` under ``[lane_d]`` ``cfg``: the band rule when
+    ``horizon_bands`` is non-empty, else the fixed ``horizon``."""
+    from ..shared.lane_d_horizons import bands_on
+
+    if not bands_on(cfg):
+        return load_pool(pool_dir, int(cfg.horizon))
+    return load_pool(pool_dir, int(cfg.horizon), tuple(cfg.horizon_bands),
+                     max_horizon=int(cfg.max_horizon), slots=int(cfg.band_slots))
 
 
 # ── statistic ───────────────────────────────────────────────────────────────
@@ -354,7 +438,8 @@ def _breakdown(x: np.ndarray, labels: list[str]) -> dict:
 
 
 def judge_cohort(king: tuple, members: list[tuple], *, clusters: list, cfg, seed: str,
-                 public: dict | None = None, bar: float | None = None) -> list[dict]:
+                 public: dict | None = None, bar: float | None = None,
+                 cells: list | None = None) -> list[dict]:
     """rev6.18 A3 (F4): ``[{"lcb", "gain", "cleared", "halves", "sources",
     "domains"}]`` per member against the bar ``king`` (module docstring,
     item 5).
@@ -372,7 +457,14 @@ def judge_cohort(king: tuple, members: list[tuple], *, clusters: list, cfg, seed
     ``bar`` is the settlement's crown bar (rev6.23,
     :meth:`LaneDConfig.crown_bar`), ``None`` = ``cfg.d_margin`` (the bar's
     floor); a member clears iff ``lcb >= bar`` and every half's point gain
-    is positive."""
+    is positive.
+
+    ``cells`` (owner 2026-11-27, per-window horizons): each live window's
+    ``"<frequency class>|<band>"`` label; ``public["cells"]`` the public
+    windows'. Given, each result also carries ``cells``, the point gain per
+    ``"<half>|<class>|<band>"`` (an optional report extra). The statistic
+    itself is unchanged: the draws balance the cells to equal counts, so the
+    unweighted mean already weights every cell equally."""
     bar = float(cfg.d_margin) if bar is None else float(bar)
     floor = float(cfg.window_ratio_floor)
     w = float(cfg.public_weight)
@@ -401,10 +493,16 @@ def judge_cohort(king: tuple, members: list[tuple], *, clusters: list, cfg, seed
             domains.update(_breakdown(xp[j], list(public["clusters"])))
             big_l += w * l_pub
             ok = ok and halves["public"]["gain"] > 0.0
-        out.append({"lcb": float(lcb), "gain": log_gain(big_l),
-                    "cleared": bool(float(lcb) >= bar and ok),
-                    "halves": halves, "sources": dict(sorted(sources.items())),
-                    "domains": domains})
+        res = {"lcb": float(lcb), "gain": log_gain(big_l),
+               "cleared": bool(float(lcb) >= bar and ok),
+               "halves": halves, "sources": dict(sorted(sources.items())),
+               "domains": domains}
+        if cells is not None:
+            per = _breakdown(xl[j], [f"{LIVE_SOURCE}|{c}" for c in cells])
+            if xp is not None and public.get("cells") is not None:
+                per.update(_breakdown(xp[j], [f"public|{c}" for c in public["cells"]]))
+            res["cells"] = dict(sorted(per.items()))
+        out.append(res)
     return out
 
 
@@ -631,7 +729,7 @@ def _adopted_gate(cands: list[dict], persisted: dict, where) -> tuple[dict | Non
     return json.loads(json.dumps(gate)), outcomes
 
 
-def _load_pools(pool_dir, prior_pool_dirs, horizon: int) -> list[dict]:
+def _load_pools(pool_dir, prior_pool_dirs, cfg) -> list[dict]:
     """The retained snapshots, oldest first and the newest (``pool_dir``)
     last; a directory listed twice (or equal to ``pool_dir``) loads once."""
     newest = Path(pool_dir).resolve()
@@ -641,7 +739,7 @@ def _load_pools(pool_dir, prior_pool_dirs, horizon: int) -> list[dict]:
         if p not in seen:
             seen.add(p)
             dirs.append(p)
-    return [load_pool(d, horizon) for d in dirs] + [load_pool(newest, horizon)]
+    return [load_pool_for(d, cfg) for d in dirs] + [load_pool_for(newest, cfg)]
 
 
 def _pick_channels(pools: list[dict], block_hash: str | None, max_channels: int | None
@@ -774,7 +872,6 @@ def _cohort_set(pools: list[dict], members: list[str], bars: list[str], king_ts:
     left out of this cohort (fail closed) rather than scored on a second
     version."""
     t_entry = max(int(recs[m]["reveal_ts"]) for m in members)
-    h = int(cfg.horizon)
     admitted, refused = _admitted_versions(pools, t_entry, int(king_ts), cfg)
     common = set.intersection(*(set(recs[m]["frozen_set"]["window_ids"])
                                 for m in members))
@@ -786,6 +883,7 @@ def _cohort_set(pools: list[dict], members: list[str], bars: list[str], king_ts:
         if wid in pinned and pinned[wid] != pool["sha256"]:
             continue
         picks = picks or {}
+        h = window_horizon(w, cfg)
         if not _usable(w, h) or any(
                 _fc_ok(forecasts.get(b), wid, h, picks) is not True for b in bars):
             continue
@@ -839,11 +937,24 @@ def _drawn(picked: list[tuple[dict, dict, object]], cfg, block_hash: str | None,
     if block_hash is None:
         ws = picked[:max(0, int(budget))]
         return ws, None, _meets_floors([w for w, _, _ in ws], cfg)
+    if bands_on(cfg):
+        d = draw_band_windows([_band_cand(w, v) for w, _, v in picked],
+                              boundary_block_hash=str(block_hash), cfg=cfg, budget=int(budget))
+        by_id = {w["window_id"]: (w, pool, v) for w, pool, v in picked}
+        return [by_id[x["window_id"]] for x in d["windows"]], d, bool(d["meets_floors"])
     d = draw_windows(_draw_cells(picked, cfg), boundary_block_hash=str(block_hash), cfg=cfg,
                      budget=int(budget))
     by_id = {w["window_id"]: (w, pool, v) for w, pool, v in picked}
     ws = [by_id[x["window_id"]] for x in d["windows"]]
     return ws, d, bool(d["meets_floors"])
+
+
+def _band_cand(w: dict, v) -> dict:
+    """A band draw candidate (:func:`~cascade.validator.lane_d_draw.draw_band_windows`)."""
+    return {"window_id": w["window_id"], "series_id": str(w["series_id"]),
+            "source": str(w["source"]), "freq": str(w.get("freq") or ""),
+            "band": str(w["band"]), "h": int(w["h"]), "t0": int(w["target_ts"][0]),
+            "t1": int(w["target_ts"][-1]), "embargo_window": bool(v.embargo_window)}
 
 
 def _window_embargo_fields(w: dict, v, h: int) -> dict:
@@ -855,7 +966,10 @@ def _window_embargo_fields(w: dict, v, h: int) -> dict:
     start)."""
     freq = str(w.get("freq") or "")
     e = float(v.embargo_hours)
-    return {"freq": freq, "embargo_hours": e,
+    # owner 2026-11-27: a band window names its band (an optional extra; its
+    # ``h`` is the band horizon of its frequency)
+    band = {"band": str(w["band"])} if w.get("band") is not None else {}
+    return {**band, "freq": freq, "embargo_hours": e,
             "min_release_ts": int(min(w["first_seen_ts"])) + int(round(3600.0 * e)),
             "rule": "embargo" if e > 0.0 else "embargo0",
             "embargo_window": bool(v.embargo_window),
@@ -1026,13 +1140,12 @@ def _public_half(cfg, public_indexes, public_scores, block_hash, horizon: int,
         raise LaneDPublicError("public_missing", "public_weight > 0 needs the public indexes, "
                                "the eval host's public scores and the boundary block hash")
     from ..eval.lane_d_public_index import PUBLIC_SOURCES
-    from .lane_d_public import DROP_REASONS, draw_public, public_record
+    from .lane_d_public import DROP_REASONS, balance_public, public_record
 
     if sorted(public_indexes) != sorted(PUBLIC_SOURCES):
         raise LaneDPublicError("public_sources", f"indexes for {sorted(public_indexes)}, not "
                                f"{sorted(PUBLIC_SOURCES)}")
-    draws = [draw_public(public_indexes[src], source=src, boundary_block_hash=str(block_hash),
-                         horizon=int(horizon)) for src in sorted(public_indexes)]
+    draws = public_draws(cfg, public_indexes, str(block_hash))
     dropped_in = public_scores.get("dropped") or {}
     scores_in = public_scores.get("scores")
     if not isinstance(dropped_in, dict) or not isinstance(scores_in, dict):
@@ -1053,15 +1166,46 @@ def _public_half(cfg, public_indexes, public_scores, block_hash, horizon: int,
         kept = [drawn[k] for k in sorted(drawn) if k not in gone]
         if not kept:
             raise LaneDPublicError("public_empty", f"{src}: no public window is kept")
-        windows += [{"window_id": w["window_id"], "source": src, "family": str(w["family"])}
+        windows += [{"window_id": w["window_id"], "source": src, "family": str(w["family"]),
+                     "freq": str(w["freq"]), **({"band": w["band"]} if "band" in w else {})}
                     for w in kept]
     windows.sort(key=lambda w: w["window_id"])
+    balanced: set[str] = set()
+    cells = None
+    if bands_on(cfg):
+        # owner 2026-11-27: equal counts per (frequency class, band) cell; the
+        # windows left out are recorded as drops (the deployed checker's kept
+        # set = drawn minus dropped, so it scores exactly these windows)
+        windows, gone = balance_public(windows, boundary_block_hash=str(block_hash),
+                                       min_cell=int(cfg.min_cell_windows))
+        if not windows:
+            raise LaneDPublicError("public_empty", "no public (frequency class, band) cell "
+                                   f"holds min_cell_windows={cfg.min_cell_windows}")
+        balanced = {x["window_id"] for x in gone}
+        src_of = {x["window_id"]: x["window_id"].split(":", 1)[0] for x in gone}
+        for x in gone:
+            dropped[src_of[x["window_id"]]].append(dict(x))
+        for src in dropped:
+            dropped[src].sort(key=lambda x: x["window_id"])
+        cells = [f"{cell_class(w['freq'])}|{w['band']}" for w in windows]
     missing = sorted(dg for dg in digests if dg not in scores_in)
     if missing:
         raise LaneDPublicError("public_mismatch", f"no public scores for {missing[:3]}")
     return {"draws": draws, "dropped": dropped, "windows": windows, "scores": scores_in,
-            "record": public_record,
+            "record": public_record, "balanced": balanced, "cells": cells,
             "_pos": {w["window_id"]: i for i, w in enumerate(windows)}}
+
+
+def public_draws(cfg, public_indexes, block_hash: str) -> list[dict]:
+    """Every public source's draw at ``block_hash`` under ``cfg`` (the
+    inputs source and the settlement call this one function): the band rule
+    when ``horizon_bands`` is set, else every window at ``horizon``."""
+    from .lane_d_public import draw_public
+
+    extra = ({"bands": tuple(cfg.horizon_bands), "max_horizon": int(cfg.max_horizon)}
+             if bands_on(cfg) else {})
+    return [draw_public(public_indexes[src], source=src, boundary_block_hash=str(block_hash),
+                        horizon=int(cfg.horizon), **extra) for src in sorted(public_indexes)]
 
 
 def _pub_ready(x) -> bool:
@@ -1080,10 +1224,13 @@ def _public_arrays(pub: dict, dg: str) -> tuple[np.ndarray, np.ndarray] | None |
     if not isinstance(per, dict):
         raise LaneDPublicError("public_mismatch", f"{dg[:16]}: public scores are not per source")
     got = {}
+    skip = pub.get("balanced") or set()
     for src, rows in per.items():
         for r in rows or []:
             if not isinstance(r, dict) or "window_id" not in r:
                 raise LaneDPublicError("public_mismatch", f"{dg[:16]}: a malformed public row")
+            if str(r["window_id"]) in skip:
+                continue
             got[str(r["window_id"])] = (str(src), r)
     want = pub["windows"]
     if sorted(got) != [w["window_id"] for w in want]:
@@ -1323,12 +1470,15 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     # a state written before rev6.23: 0.
     tenure = int(state.get(KING_TENURE_KEY, 0))
     crown_bar = cfg.crown_bar(tenure)
-    pools = _load_pools(pool_dir, prior_pool_dirs, int(cfg.horizon))
+    pools = _load_pools(pool_dir, prior_pool_dirs, cfg)
     # rev6.18 A4 (F2): multichannel windows reduced to their scored channels
     # (a no-op on a univariate pool).
     picks = _pick_channels(pools, boundary_block_hash, max_channels)
     pool = pools[-1]
     pool_ids = _pool_window_ids(pools)
+    # owner 2026-11-27: each pool window's own horizon (the fixed one off bands)
+    pool_h = {w["window_id"]: window_horizon(w, cfg) for p in pools for w in p["windows"]
+              if w["window_id"]}
     seed = f"lane-d/1:{boundary}:{pool['sha256']}"
     # T18e: the max_source_share drop is seeded by the settlement alone.
     cap_seed = f"lane-d/1:cap:{boundary}"
@@ -1382,7 +1532,7 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     # (the house's own: its entry closes, fail closed).
     for dg in list(chosen):
         fc = forecasts.get(dg)
-        if (fc is not None and any(_fc_ok(fc, wid, h, picks) is False
+        if (fc is not None and any(_fc_ok(fc, wid, pool_h[wid], picks) is False
                                    for wid in sorted(pool_ids))) or pub_of(dg) is False:
             state["entries"][dg]["status"] = "closed"
             skip(dg, "checkpoint_fault")
@@ -1415,7 +1565,7 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
             house_open = False
     if house_open and not house_held:
         fc = forecasts.get(hd)
-        if (fc is not None and any(_fc_ok(fc, wid, h, picks) is False
+        if (fc is not None and any(_fc_ok(fc, wid, pool_h[wid], picks) is False
                                    for wid in sorted(pool_ids))) or pub_of(hd) is False:
             house_rec["status"] = "closed"
             skip(hd, "checkpoint_fault", house_rec)
@@ -1512,7 +1662,7 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
                 # rev6.10 (a) / rev6.12 (W7a): the effective embargo, the
                 # release time and the rule it was admitted under, the
                 # fresh / embargo class, and the W5j draw cell.
-                **_window_embargo_fields(w, v, h)}
+                **_window_embargo_fields(w, v, window_horizon(w, cfg))}
             if w["window_id"] in picks:
                 # rev6.18 A4 (F2, W7a): a multichannel window's channel
                 # pick (absent on a univariate window).
@@ -1522,19 +1672,23 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
                              "crps": float(scores[dg][0][i]), "mase": float(scores[dg][1][i])})
         clusters = [w["source"] for w in ws]
         pub_m = None if pub is None else [pub_of(m) for m in members]
+        # owner 2026-11-27: the (frequency class, band) cell of each window
+        live_cells = ([f"{cell_class(w.get('freq'))}|{w['band']}" for w in ws]
+                      if bands_on(cfg) else None)
 
         def pub_in(bar: str, pub_m=pub_m) -> dict | None:
             if pub is None:
                 return None
             return {"anchor": pub_of(bar), "members": pub_m,
                     "clusters": [f"{w['source']}|{w['family']}" for w in pub["windows"]],
-                    "sources": [w["source"] for w in pub["windows"]]}
+                    "sources": [w["source"] for w in pub["windows"]],
+                    "cells": pub.get("cells")}
 
         if pub is not None:
             pub_scored.update(scored)
         res = judge_cohort(scores[kd], [scores[m] for m in members],
                            clusters=clusters, cfg=cfg, seed=seed, public=pub_in(kd),
-                           bar=crown_bar)
+                           bar=crown_bar, cells=live_cells)
         if len(bars) > 1:
             # The same max-T judgment with the house as the bar: a member
             # clears only if it clears both. ``judge_cohort`` needs a
@@ -1544,7 +1698,7 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
             # as ``house``, so a satellite re-derives both from the rows.
             vs_house = judge_cohort(scores[hd], [scores[m] for m in members],
                                     clusters=clusters, cfg=cfg, seed=seed, public=pub_in(hd),
-                                    bar=crown_bar)
+                                    bar=crown_bar, cells=live_cells)
             res = [{**r, "cleared": bool(r["cleared"] and rh["cleared"]),
                     "house": {"digest": hd, "lcb": rh["lcb"], "gain": rh["gain"],
                               "cleared": bool(rh["cleared"])}}
@@ -1562,17 +1716,33 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
             # Present only with a house bar (absent, not null, when the
             # house holds KING_D: one bar, today's shape).
             cohort["house_digest"] = hd
+        if drawn is not None and "cells" in drawn:
+            # owner 2026-11-27 (optional extras): the judged windows per
+            # (frequency class, band) cell, equal by construction, and the
+            # cells left out below min_cell_windows.
+            cohort["cells"] = dict(drawn["cells"])
+            cohort["cells_dropped"] = dict(drawn["cells_dropped"])
         cohorts.append(cohort)
         if drawn is not None:
             # quota: the windows the draw kept per "<timeframe>|<bin>" cell
             # (after the source cap and the fresh share), so a satellite
             # binds each cell's count to the judged set.
-            kept: dict[str, int] = {k: 0 for k in drawn["capacity"]}
+            capacity = dict(drawn["capacity"])
+            if "cells" in drawn:
+                # band draw: the signed per-"<timeframe>|<bin>" record stays the
+                # pre-band shape (every band of a freq is its "forward" bin), so
+                # the deployed checker binds it unchanged; the per-cell counts
+                # are the cohort's ``cells``.
+                capacity = {}
+                for w, _, _ in eligible:
+                    k = f"{str(w.get('freq') or '')}|forward"
+                    capacity[k] = capacity.get(k, 0) + 1
+            kept: dict[str, int] = {k: 0 for k in capacity}
             for w, _, _ in picked:
                 k = f"{str(w.get('freq') or '')}|forward"
                 kept[k] = kept.get(k, 0) + 1
             draws.append({"index": cohort["index"], "quota": kept,
-                          "capacity": dict(drawn["capacity"]),
+                          "capacity": capacity,
                           # the candidate set the draw ran over
                           "candidates_sha256": hashlib.sha256("\n".join(sorted(
                               w["window_id"] for w, _, _ in eligible)).encode()).hexdigest()})
@@ -1736,6 +1906,12 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
                                                   sorted(dict(eval_identity).items())}}
                           if eval_identity else {})},
     }
+    if bands_on(cfg):
+        # owner 2026-11-27: the per-window horizon rule, signed (an optional
+        # extra: params, and so the deployed checker's config echo, unchanged)
+        from ..shared.lane_d_horizons import horizons_record
+
+        report["horizon_bands"] = horizons_record(cfg)
     if draws:
         # W5j: the settlement's draw record, present iff a cohort was drawn
         # (absent, never null, otherwise; the legacy call has no block hash).

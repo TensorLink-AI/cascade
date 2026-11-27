@@ -1,0 +1,32 @@
+# W-HZ per-window horizons (owner 2026-11-27): GIFT-Eval short / medium / long
+# bands per window on both halves; README.md has the contract.
+# The band table, frequency normalisation and report record (new).
+cascade/shared/lane_d_horizons.py
+# [lane_d] horizon_bands / max_horizon / band_slots / min_cell_windows (parse,
+# release-only) and the shipped values.
+cascade/shared/config/lane_d.py
+cascade/shared/netconfig_bounds.py
+chain.toml
+chain.testnet.toml
+# The band pool: the region and its clocks, split / join, retention.
+cascade/pool/pool_d_build.py
+cascade/pool/pool_d_split.py
+cascade/pool/pool_d_publish.py
+# Loading at each window's own h, eligibility on every target point, the
+# band draw and cell balance, the settlement and its report.
+cascade/validator/lane_d.py
+cascade/validator/lane_d_forward.py
+cascade/validator/lane_d_draw.py
+cascade/validator/lane_d_inputs.py
+cascade/validator/lane_d_public.py
+cascade/validator/lane_d_report.py
+cascade/validator/schemas/lane_d_report_1.json
+# The eval host: the 2048 horizon cap, public forecasts per h.
+cascade/eval/lane_d_scorer.py
+cascade/eval/lane_d_forecasts.py
+# Our audit and its chain replay read band reports (the deployed checker is
+# unchanged and stays compatible).
+cascade/audit/lane_d.py
+cascade/audit/lane_d_chain.py
+docs/LANE_D.md
+docs/MINER_LANE_D.md

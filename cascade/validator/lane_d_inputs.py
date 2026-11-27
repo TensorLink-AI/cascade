@@ -91,6 +91,8 @@ from ..eval.lane_d_forecasts import (
     LaneDForecastError,
     encode_request,
 )
+from ..shared.lane_d_horizons import bands_on
+from .lane_d_forward import window_reason
 from .lane_d_wiring import LaneDInputs
 
 log = logging.getLogger("cascade.validator.lane_d_inputs")
@@ -327,7 +329,7 @@ class LaneDInputsSource:
             raise LaneDInputsError("state_unreadable", f"{self.state_path}: {e}") from e
 
     def _pools(self, boundary: int) -> list[tuple[Path, dict]]:
-        from .lane_d import load_pool
+        from .lane_d import load_pool_for
 
         try:
             pins = list(self._pool(boundary))
@@ -342,7 +344,7 @@ class LaneDInputsSource:
                 raise LaneDInputsError("pool_unavailable", f"malformed pool_d pin {pin!r}")
             d = Path(pin["dir"])
             try:
-                pool = load_pool(d, int(self.cfg.lane_d.horizon))
+                pool = load_pool_for(d, self.cfg.lane_d)
             except Exception as e:  # noqa: BLE001 — absent, unreadable or not pool_d/1
                 raise LaneDInputsError("pool_unavailable",
                                        f"{d}: snapshot does not load ({e})") from e
@@ -459,8 +461,8 @@ class LaneDInputsSource:
                                        "(no declared context)")
         return ctx, frozenset(bars)
 
-    def _windows(self, pools: list[tuple[Path, dict]], boundary: int | None = None
-                 ) -> list[dict]:
+    def _windows(self, pools: list[tuple[Path, dict]], boundary: int | None = None,
+                 bound_lo: float | None = None) -> list[dict]:
         """Every pinned window with an id, unique by id (the oldest pin's),
         sorted by id, as exactly ``{"window_id", "history"}``.
 
@@ -475,10 +477,20 @@ class LaneDInputsSource:
 
         self.channel_block_hash = None
         first: dict[str, Any] = {}
+        ld = getattr(self.cfg, "lane_d", None)
+        bands = ld is not None and bands_on(ld)
         for _, pool in pools:
+            feeds = pool.get("feeds") or {}
             for w in pool["windows"]:
                 wid = w["window_id"]
                 if wid and wid not in first:
+                    # owner 2026-11-27: a band candidate no cohort can judge
+                    # (ineligible at the lowest bound any cohort has, and
+                    # eligibility only tightens as the bound grows) is not
+                    # forecast; the fixed rule forecasts every window.
+                    if bands and bound_lo is not None and window_reason(
+                            w, feeds, float(bound_lo), ld, embargo=True) is not None:
+                        continue
                     first[wid] = w
         cap = int(getattr(getattr(self.cfg, "generator", None), "max_channels", 1) or 1)
         multi = [w for w in first.values() if np.ndim(w["history"]) == 2
@@ -500,8 +512,25 @@ class LaneDInputsSource:
         for wid in sorted(first):
             w = apply_pick(first[wid], picks.get(wid))
             if w is not None:
-                out.append({"window_id": wid, "history": w["history"]})
+                out.append({"window_id": wid, "history": w["history"],
+                            **({"h": int(w["h"])} if bands else {})})
         return out
+
+    def _bound_lo(self, entries: list[dict], state: dict) -> float:
+        """The lowest forward bound any cohort of this settlement can have:
+        ``max(T_K, min T)`` over the revealed and open entries and the house
+        entry (each cohort's bound is ``max(T_E, T_K)`` + margin)."""
+        from .lane_d import HOUSE_ENTRY_KEY, OPEN_STATUSES
+
+        t_k = int(state["king"]["reveal_ts"])
+        ts = [int(e["reveal_ts"]) for e in entries]
+        ts += [int(r["reveal_ts"]) for r in state["entries"].values()
+               if r.get("status") in OPEN_STATUSES]
+        he = state.get(HOUSE_ENTRY_KEY)
+        if isinstance(he, Mapping) and he.get("status") in OPEN_STATUSES:
+            ts.append(int(he["reveal_ts"]))
+        lo = max(t_k, min(ts)) if ts else t_k
+        return float(lo) + 3600.0 * float(self.cfg.lane_d.forward_margin_hours)
 
     def _hello(self, boundary: int):
         """The verified eval host: ``(code identity, host record | None)``."""
@@ -547,7 +576,27 @@ class LaneDInputsSource:
         arm = getattr(self._eval_host, "set_armed", None)
         if callable(arm):
             arm([int(c) for c in armed])
-        horizon = int(self.cfg.lane_d.horizon)
+        fixed = int(self.cfg.lane_d.horizon)
+        # owner 2026-11-27: one eval host call per (digest, horizon) group;
+        # the fixed rule is one group at ``horizon`` (the pre-band call).
+        groups: dict[int, list[dict]] = {}
+        for w in windows:
+            groups.setdefault(int(w.get("h", fixed)), []).append(w)
+        out: dict[str, dict] = {}
+        used = []
+        for horizon in sorted(groups) or [fixed]:
+            got_h = self._forecast_group(need, bars, groups.get(horizon, []), horizon, ns,
+                                         cache, used)
+            for dg, per_w in got_h.items():
+                out.setdefault(dg, {}).update(per_w)
+        if ns is not None:
+            cache.retain(ns, used)
+        return out, host
+
+    def _forecast_group(self, need: dict[str, int], bars: frozenset[str], windows: list[dict],
+                        horizon: int, ns, cache, used: list) -> dict[str, dict]:
+        """One horizon group's forecasts per digest (a faulted entry's are
+        non-finite, so the settlement closes it ``checkpoint_fault``)."""
         ids = [w["window_id"] for w in windows]
         # rev6.18 A4 (F2): one forecast row per univariate window, k per
         # k-channel window (window-major).
@@ -558,7 +607,6 @@ class LaneDInputsSource:
         # another key), one key per forecast row.
         row_keys = [] if ns is None else _row_keys(windows, per)
         out: dict[str, dict] = {}
-        used = []
         for dg in sorted(need):
             bar = dg in bars
             if ns is not None:
@@ -570,7 +618,9 @@ class LaneDInputsSource:
                     continue
             try:
                 got = self._eval_host.forecast(dg, context=need[dg], horizon=horizon,
-                                               windows=[dict(w) for w in windows])
+                                               windows=[{"window_id": w["window_id"],
+                                                         "history": w["history"]}
+                                                        for w in windows])
             except LaneDForecastError as e:
                 if bar or e.code not in MINER_FAULT_CODES:
                     raise LaneDInputsError("forecasts_unavailable",
@@ -599,9 +649,7 @@ class LaneDInputsSource:
                 cache.put(ns, dg, context=need[dg], horizon=horizon, window_ids=row_keys,
                           quantiles=arr)
             out[dg] = _per_window(arr, ids, per)
-        if ns is not None:
-            cache.retain(ns, used)
-        return out, host
+        return out
 
     def _public(self, reader: Any, boundary: int, need: dict[str, int],
                 bars: frozenset[str], armed: Sequence[int]) -> tuple[dict | None, dict | None]:
@@ -617,7 +665,7 @@ class LaneDInputsSource:
             raise LaneDInputsError("public_unavailable",
                                    "the eval host cannot score the public half")
         from ..eval.lane_d_public_index import PUBLIC_SOURCES
-        from .lane_d_public import draw_public
+        from .lane_d import public_draws
 
         try:
             block_hash = str(reader.block_hash(int(boundary)))
@@ -630,8 +678,7 @@ class LaneDInputsSource:
                                    f"not {sorted(PUBLIC_SOURCES)}")
         horizon = int(self.cfg.lane_d.horizon)
         try:
-            draws = [draw_public(idx[src], source=src, boundary_block_hash=block_hash,
-                                 horizon=horizon) for src in sorted(idx)]
+            draws = public_draws(self.cfg.lane_d, idx, block_hash)
         except Exception as e:  # noqa: BLE001 — an unreadable index is infrastructure
             raise LaneDInputsError("public_unavailable", f"public draw failed ({e})") from e
         cap = int(getattr(getattr(self.cfg, "generator", None), "max_channels", 1) or 1)
@@ -726,7 +773,8 @@ class LaneDInputsSource:
         pools = self._pools(b)
         armed = self._armed()
         ctxs = tuple(armed["armed_contexts"])
-        windows = self._windows(pools, b)
+        windows = self._windows(pools, b, bound_lo=(self._bound_lo(entries, state)
+                                                    if bands_on(self.cfg.lane_d) else None))
         need, bars = self._needed(entries, state, house, ctxs)
         forecasts, host = self._forecasts(need, bars, windows, state, house, ctxs, b)
         public_indexes, public_scores = self._public(reader, b, need, bars, ctxs)

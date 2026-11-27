@@ -35,6 +35,10 @@ import numpy as np
 HIST_META_SCHEMA = "pool_d_hist/1"
 HIST_MEMBERS = ("hist.npz", "hist_metadata.json")
 TGT_MEMBERS = ("metadata.json", "tgt.npz")
+# Owner 2026-11-27: a band snapshot's region clocks ride with the targets
+# (box side); their sha256 is bound in metadata.json.
+CLOCKS_FILE = "clk.npz"
+TGT_MEMBERS_BANDS = (*TGT_MEMBERS, CLOCKS_FILE)
 HIST_SERIES_FIELDS = ("first_target_ts", "freq", "history_len", "seasonal_period", "series_id")
 SNAPSHOT_FILES = ("metadata.json", "hist.npz", "tgt.npz")
 
@@ -116,13 +120,16 @@ def split_pool_d(pool_dir: Path | str, out_dir: Path | str) -> SplitResult:
     snap = str(meta["snapshot"])
     hist_tar, tgt_tar = dest / f"{snap}.hist.tar", dest / f"{snap}.tgt.tar"
     h_raw = _write_tar(hist_tar, {"hist.npz": files["hist.npz"], "hist_metadata.json": hm_bytes})
-    t_raw = _write_tar(tgt_tar, {"metadata.json": files["metadata.json"],
-                                 "tgt.npz": files["tgt.npz"]})
+    tgt_members = {"metadata.json": files["metadata.json"], "tgt.npz": files["tgt.npz"]}
+    if meta.get("clocks") is not None:
+        tgt_members[CLOCKS_FILE] = (src / CLOCKS_FILE).read_bytes()
+    t_raw = _write_tar(tgt_tar, tgt_members)
     return SplitResult(snapshot=snap, snapshot_sha256=snap_sha, hist_tar=hist_tar,
                        tgt_tar=tgt_tar, hist_sha256=_sha(h_raw), tgt_sha256=_sha(t_raw))
 
 
-def _read_members(tar_path: Path | str, expected: tuple[str, ...]) -> dict[str, bytes]:
+def _read_members(tar_path: Path | str, expected: tuple[str, ...],
+                  alt: tuple[str, ...] | None = None) -> dict[str, bytes]:
     try:
         tf = tarfile.open(tar_path, mode="r:")  # noqa: SIM115 — closed by the with below
     except (tarfile.TarError, OSError) as e:
@@ -134,7 +141,7 @@ def _read_members(tar_path: Path | str, expected: tuple[str, ...]) -> dict[str, 
                     or m.name in ("", ".", "..")):
                 raise SplitError("unsafe_member", f"{tar_path}: member {m.name!r}")
         names = sorted(m.name for m in members)
-        if names != sorted(expected):
+        if names != sorted(expected) and (alt is None or names != sorted(alt)):
             raise SplitError("bad_members", f"{tar_path}: members {names} != {sorted(expected)}")
         return {m.name: tf.extractfile(m).read() for m in members}
 
@@ -153,7 +160,7 @@ def read_hist(hist_tar: Path | str) -> tuple[dict, dict[str, np.ndarray]]:
 def join_split(hist_tar: Path | str, tgt_tar: Path | str, out_dir: Path | str) -> Path:
     """Box side: re-join the two tars into a ``load_pool``-able directory."""
     hist = _read_members(hist_tar, HIST_MEMBERS)
-    tgt = _read_members(tgt_tar, TGT_MEMBERS)
+    tgt = _read_members(tgt_tar, TGT_MEMBERS, TGT_MEMBERS_BANDS)
     hm = json.loads(hist["hist_metadata.json"])
     meta = json.loads(tgt["metadata.json"])
     if hm.get("snapshot") != meta.get("snapshot"):
@@ -166,6 +173,15 @@ def join_split(hist_tar: Path | str, tgt_tar: Path | str, out_dir: Path | str) -
         raise SplitError("digest_mismatch",
                          f"joined files hash to {got}, hist metadata pins "
                          f"{hm.get('snapshot_sha256')}")
+    clocks = meta.get("clocks")
+    if (clocks is None) != (CLOCKS_FILE not in tgt):
+        raise SplitError("bad_members", f"{tgt_tar}: {CLOCKS_FILE} present iff metadata "
+                         "names clocks")
+    if clocks is not None:
+        if _sha(tgt[CLOCKS_FILE]) != clocks.get("sha256"):
+            raise SplitError("digest_mismatch", f"{CLOCKS_FILE} does not hash to the metadata "
+                             "clocks.sha256")
+        files[CLOCKS_FILE] = tgt[CLOCKS_FILE]
     dest = Path(out_dir)
     dest.mkdir(parents=True, exist_ok=True)
     for name, data in files.items():
