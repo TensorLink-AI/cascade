@@ -78,3 +78,9 @@ cascade/trainer/money_guard.py
 cascade/trainer/operator_legs_cli.py
 cascade/trainer/marketcast_runner.py
 tests/accept/wb27/test_wb27_approval_skus.py
+
+# 2026-11-26: an expert leg trains on every GPU of its pod (whole pod or an
+# explicit device list); a short gang fails fast (gang_ranks guard).
+cascade/trainer/gang_ranks.py
+cascade/trainer/pyramid_dp.py
+tests/accept/wb27/test_wb27_gang_ranks.py

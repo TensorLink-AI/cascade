@@ -163,6 +163,19 @@ def test_eval_bootstrap_uses_the_r12_kit(tmp_path):
     assert (REPO / inst["profile"]).is_file()
 
 
+@pytest.mark.parametrize("profile", ["elastic_h200.toml", "elastic_rtxpro6000.toml"])
+def test_eval_bootstrap_sync_installs_the_profile_extras(tmp_path, profile):
+    """2026-11-26: a sync without the profile's uv_extras left the eval host
+    without torch / pyarrow; the lane D public half then failed mid-settlement."""
+    m = mod()
+    cfg = config(tmp_path)
+    inst = {"id": "p0", "ip": "198.51.100.1", "port": 40001, "user": "root",
+            "profile": f"scripts/evalhost/profiles/{profile}"}
+    sync = dict(m.eval_bootstrap_steps(cfg, inst, release_dir=str(REPO)))["venv_sync"]
+    extras = [sync[i + 1] for i, a in enumerate(sync[:-1]) if a == "--extra"]
+    assert extras == ["train", "hippius", "chain", "pool-forge"], sync
+
+
 # ── multi-host sharding (owner 2026-11-24) ─────────────────────────────────
 
 
