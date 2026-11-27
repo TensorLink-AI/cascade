@@ -286,15 +286,23 @@ def test_reupload_binds_the_recorded_selection(tmp_path, monkeypatch):
     assert loc.lane_b_reused == fields
 
 
-def test_reupload_refuses_an_unattributable_or_other_contract_record(tmp_path, monkeypatch):
+def test_reupload_refuses_an_unattributable_record(tmp_path, monkeypatch):
     from cascade.trainer.runner_common import lane_b_dispatch_fields
 
-    tick = lane_b_dispatch_fields(TICK, 9594000, {})
+    tick = lane_b_dispatch_fields(TICK, 9597600, {})
     got, uploaded, _ = _reupload(tmp_path, monkeypatch, _record(tmp_path), tick)
     assert got is None and uploaded == []                 # legacy: selection unknown
-    other = lane_b_dispatch_fields(TRAINED, 9590000, {})
-    got, uploaded, _ = _reupload(tmp_path, monkeypatch, _record(tmp_path, **other), tick)
-    assert got is None and uploaded == []                 # another contract block
+
+
+def test_reupload_across_an_era_keeps_the_trained_contract_block(tmp_path, monkeypatch):
+    """The 2026-11-27 leg: trained at 9594000, re-dispatched in the next era
+    (9597600) — the digest binds the contract; the record's fields win."""
+    from cascade.trainer.runner_common import lane_b_dispatch_fields
+
+    fields = lane_b_dispatch_fields(TRAINED, 9594000, {})
+    got, uploaded, loc = _reupload(tmp_path, monkeypatch, _record(tmp_path, **fields),
+                                   lane_b_dispatch_fields(TICK, 9597600, {}))
+    assert got == "entry" and loc.lane_b_reused == fields
 
 
 def test_pending_fields_are_json_canonical():

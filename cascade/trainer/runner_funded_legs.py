@@ -1150,10 +1150,11 @@ def _reupload_pending(runner, gen, seeds, contract, suffix: str, warm_start_ref)
                       ",".join(missing))
             return None
         if rec.get("contract_block") != lane_b.get("contract_block"):
-            log.warning("lane B leg %s: pending harvest trained at contract block %s, this "
-                        "dispatch is at %s — not re-uploaded", gen.hotkey[:12],
-                        rec.get("contract_block"), lane_b.get("contract_block"))
-            return None
+            # the contract digest above binds what it trained; the leg keeps
+            # the block (and rows) it was planned at, not this dispatch's
+            log.info("lane B leg %s: pending harvest trained at contract block %s (this "
+                     "dispatch: %s) — recorded with its own", gen.hotkey[:12],
+                     rec.get("contract_block"), lane_b.get("contract_block"))
     log.warning("funded leg %s: re-uploading the checkpoint an earlier attempt of this "
                 "leg harvested and verified (its upload failed) — no retrain",
                 gen.hotkey[:12])
