@@ -3,8 +3,10 @@
 # (no --public-root) and written by `scripts/laned_public_mirror.py build`.
 # Names and locations only: credentials are env-only, by NAME
 # (<key_env>_ACCESS_KEY / <key_env>_SECRET_KEY). Without them on the eval host
-# the client is anonymous, which this bucket refuses (403): the eval host env
-# must carry HIPPIUS_PUBLIC_READ_ACCESS_KEY / _SECRET_KEY. Never consensus: the signed
+# the client is anonymous: objects are uploaded public-read (2026-11-27; older
+# objects need the one-shot `scripts/laned_public_mirror.py fix-acl` sweep,
+# until then anonymous GETs are 403 and the eval host env must carry
+# HIPPIUS_PUBLIC_READ_ACCESS_KEY / _SECRET_KEY). Never consensus: the signed
 # report binds the W6p index (index_sha256, files_sha256), and every byte read
 # from here is checked against the sha256s of the index files it names.
 #
@@ -20,6 +22,9 @@ prefix = "lane_d_public"
 # build's `estimate`); the budget below holds it on a 750 GB volume.
 cache_dir = "/workspace/lane_d_public_cache"
 cache_budget_bytes = 700000000000
+# Series fetched + decoded at once by the public read path (bounded pool;
+# serial reads measured 31-45 blobs/min, 2026-11-27). Never consensus.
+read_workers = 16
 
 # Tried in order on a cache miss: Hippius (canonical), then R2 (backup copy).
 [[store]]

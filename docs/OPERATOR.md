@@ -3858,6 +3858,80 @@ trainer (no legs in flight).
 webhook only when `/etc/cascade-ops.env` is filled; otherwise they reach only
 `alerts.jsonl`.
 
+### Lane D public half: warm the mirror before raising `public_weight`
+
+The public half draws 5000 windows from each public source per settlement
+(10,000 in total; the draw is consensus and does not change). The eval host
+reads each drawn series' row group from the Hippius mirror (`deploy/laned/public_mirror.toml`,
+about 588 GiB of shards) and caches it on the Lium volume
+(`/workspace/lane_d_public_cache`). Read serially from a cold cache, the
+4090 measured 31-45 blobs/min (2026-11-27), so one digest's public pass takes
+about 3.7-5.4 h against a 3600 s eval timeout. Every needed digest gets its
+own pass. Do not raise `public_weight` above 0 until the cache is warm.
+
+What helps:
+
+- **Warm sweep.** `python -m cascade.eval.lane_d_forecasts warm-public` walks
+  each source's shard map. It coalesces adjacent row groups into ranged GETs
+  of up to 64 MiB, verifies every blob's sha256 and caches it. It never
+  evicts. It stops at `--fill-bytes` or at the cache budget and reports
+  `fits=False` if it cannot fit everything. It is resumable: rerun the same
+  command and it fetches only what is still missing.
+- **Parallel reads.** The settlement's read path runs on a bounded pool
+  (`read_workers = 16` in the mirror config, or `public --public-workers N`).
+  A warm cache serves from disk, and a cold cache degrades to roughly
+  `read_workers` × the serial rate instead of failing outright.
+- **Score cache.** Public scores are cached in the validator's
+  `score_cache_dir`, keyed by host identity, code, digest, context, horizon
+  and the draw. A retry of the same settlement does not repeat the pass.
+- **Anonymous reads.** Uploads are `public-read`. External validators can
+  reproduce the half without a key once the objects uploaded earlier have had
+  the one-shot ACL sweep (below).
+
+**Runbook.**
+
+1. Deploy the release that carries `warm-public` to the eval host. Before
+   that, the host's release does not have the command.
+2. Dry run on the eval host. It needs the read key; the wrapper loads it.
+
+       /root/cascade/lane_d_py.sh -P -m cascade.eval.lane_d_forecasts warm-public \
+         --index gift_eval_pretrain=c96f91727c145a94abef6a6f7cc12ba00cebf884202a0358f74ccae0b80f1f6d \
+         --index rmisc=d218b21a072a5bcedd99c1d8391f3cd6ed213e0ba8419e70cf89467de523528e \
+         --public-cache-dir /workspace/lane_d_public_cache \
+         --public-cache-budget-bytes 900000000000 --dry-run
+
+   The `PLAN` lines give `blobs`, `cached`, `missing_gib` and `fits` for
+   each source. The index sha256s are the box's `public_indexes` manifests
+   (`/root/cascade-state/lane-d/public_indexes/<source>/manifest.json`). If
+   `fits=False`, the volume is too small: grow it first. A partial fill only
+   helps the windows that land in the warmed shards.
+3. Fill. Drop `--dry-run`, add `--workers 16`, and run it under
+   `nohup … > warm.log 2>&1 &` (stdout is line-buffered). Each `WARM` line
+   reports `rate_mib_s` and `eta_s`. Expected time is about 588 GiB ÷ the
+   measured rate; for example, 1.7 h at 100 MiB/s or 5.6 h at 30 MiB/s.
+   Record the measured rate in OPSLOG. The target cache fill is `cached` =
+   `blobs` with `missing_gib=0.00` for both sources (a second `--dry-run`
+   confirms it). Do not run the fill inside a settlement's scoring window:
+   it competes for the host's network and disk.
+4. Measure one public pass on the warm cache. Run one testnet settlement, or
+   one `public` request by hand, and take the time from the request to the
+   `lane_d_public_ok` log line. Record that time and the cohort size in
+   OPSLOG. Raise `public_weight` (Approve-tier, signed overlay, testnet first)
+   only if the cohort's passes together fit inside the 3600 s eval timeout
+   with headroom. Keep the cache warm: the sweep is idempotent, so rerun it
+   after any volume loss and after any new `index_sha256`.
+5. ACL sweep (Approve-tier, writes ACLs on Hippius; the owner runs it once).
+   Run it on the builder, never the box, with `HIPPIUS_S3_*` write keys in
+   the environment:
+
+       python -P scripts/laned_public_mirror.py fix-acl --source gift_eval_pretrain --dry-run
+       python -P scripts/laned_public_mirror.py fix-acl --source gift_eval_pretrain
+       python -P scripts/laned_public_mirror.py fix-acl --source rmisc
+
+   It prints `ACL_DONE … failed=0`. Then check that an anonymous GET of a
+   shard returns 200 instead of 403. R2 does not support canned object ACLs,
+   so the sweep targets `hippius` only.
+
 ### Elastic lane D hosts (`cascade-laned elastic`)
 
 Owner decision 2026-11-24 (plan R13, W6d): both lane D hosts are rented only

@@ -48,6 +48,16 @@ then R2. A missing or wiped cache simply refills. Credentials are env-only
 (``<key_env>_ACCESS_KEY`` / ``_SECRET_KEY``); without them the client is
 anonymous (a public-read bucket).
 
+**Throughput** (2026-11-27: serial reads measured 31-45 blobs/min, and one
+settlement draws 10,000 windows): the read path fetches + decodes the drawn
+series on a bounded worker pool (``read_workers``, :data:`DEFAULT_READ_WORKERS`;
+:func:`~cascade.validator.lane_d_public.read_public_windows` ``workers=``),
+and :meth:`PublicMirror.warm` (``python -m cascade.eval.lane_d_forecasts
+warm-public``) fills the volume cache with a source's whole mirror ahead of
+time: the shard map walked shard by shard, adjacent row groups coalesced into
+ranged GETs of :data:`WARM_SPAN_BYTES`, every blob verified, a byte budget
+respected without eviction, resumable. Which windows are drawn never changes.
+
 Stdlib + numpy at import; ``pyarrow`` and ``boto3`` load inside the functions
 that need them (the box never imports them through this module).
 """
@@ -61,6 +71,8 @@ import io
 import json
 import logging
 import os
+import threading
+import time
 import tomllib
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -97,6 +109,19 @@ ZSTD_LEVEL = 6
 MIRROR_CONFIG_PATH = (Path(__file__).resolve().parents[2] / "deploy" / "laned"
                       / "public_mirror.toml")
 MIRROR_CONFIG_SCHEMA = "laned_public_mirror/1"
+# The public read path's bounded worker pool (series fetched + decoded at
+# once). Serial reads measured 31-45 blobs/min on the 4090 host (2026-11-27):
+# 10,000 windows per settlement could never meet the 3600 s eval timeout.
+DEFAULT_READ_WORKERS = 16
+# The warm sweep (:meth:`PublicMirror.warm`): one ranged GET covers adjacent
+# row groups of one shard up to this many bytes (sliced and verified per
+# blob), so memory stays at ``workers * WARM_SPAN_BYTES``.
+WARM_SPAN_BYTES = 64 * 2**20
+WARM_SPAN_GAP = 64 * 1024
+DEFAULT_WARM_WORKERS = 8
+# Re-read the cache's on-disk total every this many puts (another process,
+# e.g. a warm sweep, may write the same volume).
+_RESYNC_PUTS = 4096
 
 
 class MirrorError(RuntimeError):
@@ -255,7 +280,13 @@ class BlobCache:
     one fits; ``total_bytes() <= budget_bytes`` holds). The same shape as the
     W15 checkpoint cache's budget (``eval_cache_budget_bytes``), for blobs.
     A failed write (full or missing volume) never fails the caller: the bytes
-    are served uncached."""
+    are served uncached.
+
+    Thread-safe (the public read path and the warm sweep use worker pools).
+    The byte total is kept in memory (one directory scan on first use, then
+    every :data:`_RESYNC_PUTS` puts), so a put scans the blob tree only when
+    it would leave the budget: a fully warm cache holds ~10^6 blobs and a
+    per-put scan alone made every cold read O(cache size)."""
 
     def __init__(self, root, *, budget_bytes: int):
         if isinstance(budget_bytes, bool) or not isinstance(budget_bytes, int) \
@@ -263,6 +294,9 @@ class BlobCache:
             raise ValueError(f"budget_bytes must be a positive int; got {budget_bytes!r}")
         self.root = Path(root)
         self.budget_bytes = budget_bytes
+        self._lock = threading.Lock()
+        self._total: int | None = None
+        self._puts = 0
 
     def _path(self, sha: str) -> Path:
         return self.root / "blobs" / sha[:2] / sha
@@ -274,7 +308,15 @@ class BlobCache:
         return [p for p in d.glob("*/*") if p.is_file() and len(p.name) == 64]
 
     def total_bytes(self) -> int:
-        return sum(p.stat().st_size for p in self._blobs())
+        total = 0
+        for p in self._blobs():
+            with contextlib.suppress(OSError):
+                total += p.stat().st_size
+        return total
+
+    def has(self, sha: str) -> bool:
+        """The blob is on the volume (not re-hashed: :meth:`get` does that)."""
+        return self._path(sha).is_file()
 
     def get(self, sha: str) -> bytes | None:
         p = self._path(sha)
@@ -286,28 +328,46 @@ class BlobCache:
             log.warning("lane_d_public_cache_corrupt %s: dropped, refetching", sha[:16])
             with contextlib.suppress(OSError):
                 p.unlink()
+                with self._lock:
+                    if self._total is not None:
+                        self._total = max(0, self._total - len(data))
             return None
         with contextlib.suppress(OSError):
             os.utime(p)
         return data
 
-    def put(self, sha: str, data: bytes) -> bool:
+    def put(self, sha: str, data: bytes, *, evict: bool = True) -> bool:
+        """Cache ``data`` (which must hash to ``sha``). ``evict=False`` (the
+        warm sweep, which plans its fill against the budget up front) never
+        evicts: a blob that would leave the budget is not written."""
         if sha256_hex(data) != sha:
             raise MirrorError(f"refusing to cache bytes that do not hash to {sha[:16]}")
         if len(data) > self.budget_bytes:
             return False
-        try:
-            self._evict(len(data), keep=sha)
-            p = self._path(sha)
-            p.parent.mkdir(parents=True, exist_ok=True)
-            tmp = p.with_name(f".{p.name}.{os.getpid()}.tmp")
-            tmp.write_bytes(data)
-            os.replace(tmp, p)
-            return True
-        except OSError as e:
-            log.warning("lane_d_public_cache_write_failed %s (%s): served uncached",
-                        sha[:16], e)
-            return False
+        p = self._path(sha)
+        with self._lock:
+            try:
+                self._puts += 1
+                if self._total is None or self._puts % _RESYNC_PUTS == 0:
+                    self._total = self.total_bytes()
+                try:
+                    prior = p.stat().st_size
+                except OSError:
+                    prior = 0
+                if self._total - prior + len(data) > self.budget_bytes:
+                    if not evict:
+                        return False
+                    self._evict(len(data), keep=sha)
+                p.parent.mkdir(parents=True, exist_ok=True)
+                tmp = p.with_name(f".{p.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+                tmp.write_bytes(data)
+                os.replace(tmp, p)
+                self._total = max(0, self._total - prior) + len(data)
+                return True
+            except OSError as e:
+                log.warning("lane_d_public_cache_write_failed %s (%s): served uncached",
+                            sha[:16], e)
+                return False
 
     def _evict(self, incoming: int, *, keep: str) -> None:
         blobs = []
@@ -325,6 +385,7 @@ class BlobCache:
                 p.unlink()
                 total -= size
                 log.info("lane_d_public_cache_evict %s bytes=%d", name[:16], size)
+        self._total = total
 
 
 # ---------------------------------------------------------------------------
@@ -399,8 +460,12 @@ def load_mirror_config(path=None) -> dict:
     budget = raw.get("cache_budget_bytes")
     if not isinstance(budget, int) or isinstance(budget, bool) or budget <= 0:
         raise ValueError(f"{p}: cache_budget_bytes must be a positive int")
+    workers = raw.get("read_workers", DEFAULT_READ_WORKERS)
+    if not isinstance(workers, int) or isinstance(workers, bool) or not 1 <= workers <= 256:
+        raise ValueError(f"{p}: read_workers must be an int in [1, 256]")
     return {"prefix": str(raw.get("prefix", DEFAULT_PREFIX)), "stores": stores,
-            "cache_dir": str(raw["cache_dir"]), "cache_budget_bytes": budget}
+            "cache_dir": str(raw["cache_dir"]), "cache_budget_bytes": budget,
+            "read_workers": workers}
 
 
 # ---------------------------------------------------------------------------
@@ -484,13 +549,20 @@ class PublicMirror:
     on a cache miss. :meth:`reader` returns the ``row -> (C, L)`` callable
     :func:`~cascade.validator.lane_d_public.read_public_windows` takes."""
 
-    def __init__(self, *, cache: BlobCache, stores: Sequence, prefix: str = DEFAULT_PREFIX):
+    def __init__(self, *, cache: BlobCache, stores: Sequence, prefix: str = DEFAULT_PREFIX,
+                 workers: int = DEFAULT_READ_WORKERS):
         if not stores:
             raise ValueError("lane D public mirror: no store configured")
+        if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
+            raise ValueError(f"workers must be a positive int; got {workers!r}")
         self.cache = cache
         self.stores = list(stores)
         self.prefix = prefix
+        # The bounded pool read_public_windows reads the drawn series with.
+        self.workers = workers
         self.fetched: list[tuple[str, str, int | None, int | None]] = []
+        self._flight_lock = threading.Lock()
+        self._flights: dict[str, threading.Lock] = {}
 
     # -- raw fetch with verification and fallback ---------------------------
     def _fetch(self, key: str, *, sha: str | None, offset: int | None = None,
@@ -519,15 +591,31 @@ class PublicMirror:
         got = self.cache.get(sha)
         if got is not None:
             return got
-        data = self._fetch(key, sha=sha, offset=offset, length=length)
-        self.cache.put(sha, data)
+        # Single flight per blob: concurrent readers of one shard share its
+        # tail, so only the first fetches it and the rest read the cache.
+        with self._flight_lock:
+            lock = self._flights.setdefault(sha, threading.Lock())
+        with lock:
+            got = self.cache.get(sha)
+            if got is not None:
+                return got
+            data = self._fetch(key, sha=sha, offset=offset, length=length)
+            self.cache.put(sha, data)
+        with self._flight_lock:
+            self._flights.pop(sha, None)
         return data
 
     # -- index files --------------------------------------------------------
     def index_dir(self, draw: Mapping) -> Path:
         """The verified index + shard map the draw was made from (fetched once
         into ``<cache_root>/index/<source>/<index_sha256>/``)."""
-        source, sha = str(draw["source"]), str(draw["index_sha256"])
+        return self.index_dir_for(str(draw["source"]), str(draw["index_sha256"]),
+                                  str(draw["files_sha256"]))
+
+    def index_dir_for(self, source: str, sha: str, files_sha: str | None = None) -> Path:
+        """:meth:`index_dir` by ``(source, index_sha256)`` (the warm sweep has
+        no draw; ``files_sha`` then comes from the verified manifest)."""
+        draw = {"source": source, "index_sha256": sha, "files_sha256": files_sha}
         d = self.cache.root / "index" / source / sha
         try:
             # Reuse: the cheap checks here; the index and shard-map bytes are
@@ -551,10 +639,11 @@ class PublicMirror:
     @staticmethod
     def _verify_index_dir(d: Path, draw: Mapping, *, full: bool) -> Path:
         m = load_manifest(d)
+        files = draw.get("files_sha256")
         if m["source"] != draw["source"] or m["index_sha256"] != draw["index_sha256"] \
-                or m["files_sha256"] != draw["files_sha256"]:
+                or (files is not None and m["files_sha256"] != files):
             raise ValueError(f"{d}: not the index the draw was made from")
-        doc = load_shards(d, index_sha256=draw["index_sha256"], files_sha256=draw["files_sha256"])
+        doc = load_shards(d, index_sha256=draw["index_sha256"], files_sha256=files)
         if full:
             for _ in iter_index(d):        # the index bytes hash to index_sha256
                 pass
@@ -600,20 +689,138 @@ class PublicMirror:
 
         return d, read
 
+    # -- the warm sweep -------------------------------------------------------
+    def warm_plan(self, source: str, index_sha256: str, *, budget_bytes: int | None = None,
+                  span_bytes: int = WARM_SPAN_BYTES) -> dict:
+        """What :meth:`warm` would fetch: every shard's tail + row groups not
+        yet cached, coalesced into ranged GETs of at most ``span_bytes``, in
+        shard-key order, cut where the fill would pass ``budget_bytes``
+        (default and cap: the cache's budget). Nothing is evicted, so a warm
+        cache never churns. Returns ``{source, index_sha256, blobs, cached,
+        cached_bytes, missing_bytes, planned_bytes, fits, spans}``."""
+        d = self.index_dir_for(source, index_sha256)
+        doc = load_shards(d, index_sha256=index_sha256)
+        shards = {s["key"]: s for s in doc["shards"]}
+        per: dict[str, dict[str, tuple[int, int]]] = {}
+        for r in iter_shardmap(d, doc):
+            per.setdefault(r["shard"], {})[r["sha256"]] = (int(r["offset"]), int(r["length"]))
+        for k, s in shards.items():
+            per.setdefault(k, {})[s["tail_sha256"]] = (int(s["tail_offset"]),
+                                                       int(s["tail_length"]))
+        budget = min(int(budget_bytes or self.cache.budget_bytes), self.cache.budget_bytes)
+        used = self.cache.total_bytes()
+        base = base_key(self.prefix, source)
+        spans: list[dict] = []
+        n = cached = cached_bytes = missing = planned = 0
+        fits = True
+        for k in sorted(per):
+            want = []
+            for sha, (off, ln) in per[k].items():
+                n += 1
+                if self.cache.has(sha):
+                    cached += 1
+                    cached_bytes += ln
+                else:
+                    want.append((off, ln, sha))
+            need = sum(ln for _, ln, _ in want)
+            missing += need
+            if not want:
+                continue
+            if not fits or used + planned + need > budget:
+                fits = False
+                continue
+            planned += need
+            cur = None
+            for off, ln, sha in sorted(want):
+                end = off + ln
+                if cur is not None and off - cur["end"] <= WARM_SPAN_GAP \
+                        and max(end, cur["end"]) - cur["offset"] <= span_bytes:
+                    cur["end"] = max(cur["end"], end)
+                    cur["blobs"].append((off, ln, sha))
+                    continue
+                cur = {"key": f"{base}/{k}", "offset": off, "end": end, "blobs": [(off, ln, sha)]}
+                spans.append(cur)
+        return {"source": source, "index_sha256": index_sha256, "blobs": n, "cached": cached,
+                "cached_bytes": cached_bytes, "missing_bytes": missing,
+                "planned_bytes": planned, "fits": fits, "spans": spans}
+
+    def _warm_span(self, span: Mapping) -> tuple[int, int]:
+        """Fetch one span, cache each blob it covers: ``(blobs, bytes)``. A blob
+        whose slice does not verify is fetched alone (the tiered
+        :meth:`blob`), so one bad span never poisons the cache."""
+        off, ln = int(span["offset"]), int(span["end"]) - int(span["offset"])
+        try:
+            data = self._fetch(span["key"], sha=None, offset=off, length=ln)
+        except MirrorError as e:
+            log.warning("lane_d_public_warm_span_failed %s [%d+%d]: %s; per blob",
+                        span["key"], off, ln, e)
+            data = None
+        got = nbytes = 0
+        for b_off, b_len, sha in span["blobs"]:
+            piece = None if data is None else data[b_off - off:b_off - off + b_len]
+            if piece is None or sha256_hex(piece) != sha:
+                piece = self._fetch(span["key"], sha=sha, offset=b_off, length=b_len)
+            if self.cache.put(sha, piece, evict=False):
+                got += 1
+                nbytes += len(piece)
+        return got, nbytes
+
+    def warm(self, source: str, index_sha256: str, *, workers: int = DEFAULT_WARM_WORKERS,
+             budget_bytes: int | None = None, span_bytes: int = WARM_SPAN_BYTES,
+             progress: Callable[[dict], None] | None = None,
+             progress_every_s: float = 30.0) -> dict:
+        """Fill the blob cache with ``source``'s whole mirror at
+        ``index_sha256`` (:meth:`warm_plan`), ``workers`` ranged GETs at once.
+        Resumable: a rerun plans only what is still missing (an interrupted
+        span is simply re-fetched). Every blob is verified against its sha256
+        before it is cached. ``progress(stats)`` is called about every
+        ``progress_every_s`` and at the end. Returns the plan's counts plus
+        ``{fetched_blobs, fetched_bytes, failed_spans, seconds}``."""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        plan = self.warm_plan(source, index_sha256, budget_bytes=budget_bytes,
+                              span_bytes=span_bytes)
+        spans = plan.pop("spans")
+        stats = {**plan, "spans": len(spans), "done_spans": 0, "fetched_blobs": 0,
+                 "fetched_bytes": 0, "failed_spans": 0, "seconds": 0.0}
+        t0 = last = time.monotonic()
+        with ThreadPoolExecutor(max_workers=max(1, int(workers))) as ex:
+            futs = [ex.submit(self._warm_span, s) for s in spans]
+            for f in as_completed(futs):
+                try:
+                    blobs, nbytes = f.result()
+                    stats["fetched_blobs"] += blobs
+                    stats["fetched_bytes"] += nbytes
+                except Exception as e:  # noqa: BLE001 — reported; a rerun resumes
+                    stats["failed_spans"] += 1
+                    log.warning("lane_d_public_warm_failed %s: %s", type(e).__name__, e)
+                stats["done_spans"] += 1
+                now = time.monotonic()
+                stats["seconds"] = now - t0
+                if progress is not None and now - last >= progress_every_s:
+                    last = now
+                    progress(dict(stats))
+        stats["seconds"] = time.monotonic() - t0
+        if progress is not None:
+            progress(dict(stats))
+        return stats
+
 
 def mirror_from_config(cfg: Mapping, *, cache_dir=None, budget_bytes: int | None = None,
-                       store_factory: Callable | None = None) -> PublicMirror:
+                       store_factory: Callable | None = None,
+                       workers: int | None = None) -> PublicMirror:
     make = store_factory or S3RangeStore
     cache = BlobCache(cache_dir or cfg["cache_dir"],
                       budget_bytes=int(budget_bytes or cfg["cache_budget_bytes"]))
     return PublicMirror(cache=cache, stores=[make(s) for s in cfg["stores"]],
-                        prefix=cfg["prefix"])
+                        prefix=cfg["prefix"],
+                        workers=int(workers or cfg.get("read_workers", DEFAULT_READ_WORKERS)))
 
 
-__all__ = ["DEFAULT_PREFIX", "INDEX_FILES", "MIRROR_CONFIG_PATH", "ROW_GROUP_TARGET_BYTES",
+__all__ = ["DEFAULT_PREFIX", "DEFAULT_READ_WORKERS", "DEFAULT_WARM_WORKERS", "INDEX_FILES", "MIRROR_CONFIG_PATH", "ROW_GROUP_TARGET_BYTES",
            "SHARDMAP_FIELDS", "SHARDMAP_FILE", "SHARDS_FILE", "SHARDS_SCHEMA",
            "SHARD_FIELDS", "SHARD_TARGET_BYTES", "BlobCache", "MirrorError", "PublicMirror",
            "S3RangeStore", "StoreSpec", "base_key", "canonical_series", "decode_row",
            "index_key", "iter_shardmap", "load_mirror_config", "load_shards", "lookup",
            "mirror_from_config", "read_row_group_series", "shard_key", "shardmap_lines",
-           "values_sha256", "write_shard_index"]
+           "values_sha256", "WARM_SPAN_BYTES", "write_shard_index"]

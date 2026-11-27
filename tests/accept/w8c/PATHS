@@ -22,3 +22,7 @@ cascade/validator/lane_d_wiring.py
 cascade/validator/lane_d.py
 # rev6.18 A3 (F4): the public draw the inputs source runs.
 cascade/validator/lane_d_public.py
+# 2026-11-27 (public half throughput): read_public_windows(workers=) and the
+# eval host's warm-public / --public-workers; docs/OPERATOR.md ONLY the
+# "Lane D public half: warm the mirror before raising public_weight" section.
+docs/OPERATOR.md

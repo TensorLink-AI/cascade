@@ -534,6 +534,8 @@ class LaneDInputsSource:
             from .lane_d_score_cache import namespace
 
             ns = namespace(host["identity"], ident.package_hash)
+        # the public half's replies are cached in the same namespace
+        self._score_ns = ns
         pin = getattr(self._eval_host, "set_pinned", None)
         if callable(pin):
             pin(king_d=str(state["king"]["digest"]), house=str(house["digest"]))
@@ -628,13 +630,26 @@ class LaneDInputsSource:
         except Exception as e:  # noqa: BLE001 — an unreadable index is infrastructure
             raise LaneDInputsError("public_unavailable", f"public draw failed ({e})") from e
         cap = int(getattr(getattr(self.cfg, "generator", None), "max_channels", 1) or 1)
+        # Public replies are cached like the live forecasts (same host + code
+        # namespace, B6), keyed by the draw: a retry never redoes the pass.
+        cache, ns = self._score_cache, getattr(self, "_score_ns", None)
+        pkey, used = None, []
+        if cache is not None and ns is not None and hasattr(cache, "get_public"):
+            from .lane_d_score_cache import public_key
+
+            pkey = public_key(draws, block_hash=block_hash, max_channels=cap)
         scores: dict[str, dict] = {}
         dropped = None
         faulted = []
         for dg in sorted(need):
+            hit = None
+            if pkey is not None:
+                used.append((dg, int(need[dg]), horizon, pkey))
+                hit = cache.get_public(ns, dg, context=need[dg], horizon=horizon, key=pkey)
             try:
-                got = ask(dg, context=need[dg], horizon=horizon, draws=draws,
-                          block_hash=block_hash, max_channels=cap)
+                got = hit if hit is not None else ask(
+                    dg, context=need[dg], horizon=horizon, draws=draws,
+                    block_hash=block_hash, max_channels=cap)
             except LaneDForecastError as e:
                 if dg in bars or e.code not in MINER_FAULT_CODES:
                     raise LaneDInputsError("public_unavailable", f"{dg[:16]}: {e}") from e
@@ -653,7 +668,12 @@ class LaneDInputsSource:
             elif got["dropped"] != dropped:
                 raise LaneDInputsError("public_unavailable", f"{dg[:16]}: the public drops "
                                        f"differ between digests (the data, not the model)")
+            if pkey is not None and hit is None:
+                cache.put_public(ns, dg, context=need[dg], horizon=horizon, key=pkey,
+                                 reply=got)
             scores[dg] = got["scores"]
+        if pkey is not None:
+            cache.retain_public(ns, used)
         dropped = dropped or {}
         for dg in faulted:
             # NaN on every kept window: settle_lane_d closes the entry.
