@@ -122,11 +122,15 @@ def score_task_multi(task, wrappers: list, *, batch_size: int = 64) -> list:
             if len(hist) != len(truth):
                 raise RuntimeError(f"window has {len(hist)} histories but {len(truth)} targets")
             for i in range(0, len(hist), batch_size):
-                chunk = [impute_history(h) for h in hist[i:i + batch_size]]
+                raw = hist[i:i + batch_size]
+                chunk = [impute_history(h) for h in raw]
                 qs: dict[int, object] = {}
                 for k in live():
                     try:
-                        qs[k] = forecast_on_grid(wrappers[k], chunk, horizon, QUANTILE_LEVELS)
+                        # handles_missing (observed.py) takes the raw gaps; the
+                        # seasonal-naive baseline and MASE scale keep ``chunk``.
+                        inputs = raw if getattr(wrappers[k], "handles_missing", False) else chunk
+                        qs[k] = forecast_on_grid(wrappers[k], inputs, horizon, QUANTILE_LEVELS)
                     except Exception as e:  # noqa: BLE001 — this checkpoint only
                         failed[k] = e
                 for j, h in enumerate(chunk):

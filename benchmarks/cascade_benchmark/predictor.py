@@ -29,13 +29,13 @@ jena_weather hourly long) carry NaN in the history — the ``_with_missing``
 sets by design, the others as late-start padding. The cascade wrapper is the
 validator's trusted inference path and the private pool has no gaps, so it
 propagates NaN → a NaN forecast → gluonts raises ``Forecast contains NaN
-values`` → the whole config is dropped. Every
-leaderboard model handles gaps its own way (Toto 2 takes a ``target_mask``
-and masks missing points out of its scaler and attention — no imputation);
-ours is ``impute_history``: forward-fill, then
-back-fill, an all-missing series → zeros. Imputation is a sidecar concern
-only — never the wrapper's, which stays byte-identical to what the validator
-scores with.
+values`` → the whole config is dropped. A
+``cascade_pyramid`` checkpoint follows GIFT-Eval's own convention
+(``observed.py``: the GluonTS observed mask. Left padding and NaN are
+unobserved, and the scaler reads observed points only). The pinned wrapper
+file stays byte-identical to what the validator scores with. Any other
+architecture still gets ``impute_history``: forward-fill, then back-fill,
+and an all-missing series becomes zeros.
 """
 
 from __future__ import annotations
@@ -51,6 +51,7 @@ from gluonts.dataset.field_names import FieldName
 from gluonts.model.forecast import Forecast, QuantileForecast, SampleForecast
 from gluonts.model.predictor import Predictor
 
+from .observed import adapt
 from .quantiles import forecast_on_grid, quantile_indices
 
 # The grid the gluonts metrics are configured with (suites/_common.py's
@@ -96,7 +97,9 @@ def _load_wrapper(checkpoint_dir: Path, device: str):
     Wrapper = getattr(module, "Wrapper", None)
     if Wrapper is None:
         raise AttributeError("forecast_wrapper.py defines no `Wrapper` class")
-    return Wrapper(str(checkpoint_dir), device=device)
+    # cascade_pyramid: GIFT-Eval / GluonTS observed mask (observed.py); any
+    # other architecture is returned as loaded.
+    return adapt(Wrapper(str(checkpoint_dir), device=device))
 
 
 # One loaded wrapper per (checkpoint, device) per process. The GIFT-Eval / BOOM

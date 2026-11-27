@@ -11,15 +11,23 @@ from dataclasses import asdict, dataclass, field
 
 # Reporting metadata only: these describe the EXISTING scoring contracts.
 # Parallel execution must not replace them with a faster approximation.
+# How a cascade_pyramid checkpoint's context is built (observed.py).
+CONTEXT = ("gluonts-observed/1: left padding and NaN are unobserved (fill 0.0) and the "
+           "scaler reads observed points only; other architectures: ffill/bfill imputation")
+
 METHODOLOGY = {
     "gift-eval": {"metrics": "reference GIFT-Eval metrics",
-                  "aggregate": "official Seasonal-Naive-normalized shifted geometric mean"},
+                  "aggregate": "official Seasonal-Naive-normalized shifted geometric mean",
+                  "context": CONTEXT},
     "boom": {"metrics": "reference GIFT-Eval metrics over BOOM tasks",
-             "aggregate": "official BOOM baseline and low-variance exclusions"},
+             "aggregate": "official BOOM baseline and low-variance exclusions",
+             "context": CONTEXT},
     "time": {"metrics": "upstream timebench metric engine",
-             "aggregate": "Cascade Seasonal-Naive-normalized shifted geometric mean"},
+             "aggregate": "Cascade Seasonal-Naive-normalized shifted geometric mean",
+             "context": CONTEXT},
     "fev": {"metrics": "cascade-fev/1: pooled nine-quantile WQL and seasonal MASE",
             "aggregate": "Seasonal-Naive-normalized geometric mean",
+            "context": CONTEXT,
             "scope": "univariate targets; covariates unused; multivariate targets reported as scope skips",
             "official_fev_leaderboard_equivalent": False},
 }
