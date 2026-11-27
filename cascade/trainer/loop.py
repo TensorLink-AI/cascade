@@ -1262,6 +1262,11 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
             self.cfg.wandb,
             round_id=str(seeds.base_seed), role=log_role,
             hotkey=gen.hotkey, uid=gen.uid, size=contract.arch_preset,
+            # the generator ref joins the run id: one seed epoch spans several
+            # eras, so the same hotkey can train a NEW submission under the
+            # same base_seed/role — without the ref it resumed the earlier
+            # leg's (finished) run instead of opening its own
+            gen_ref=str(gen.ref or ""),
             config={"corpus_mode": contract.corpus_mode, "token_budget": token_budget,
                     "contract_digest": contract_digest(contract)},
             lane=str(li.get("lane") or "A"), target=str(li.get("target") or ""),
@@ -1274,6 +1279,12 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
 
         progress_sink = progress_file_sink()
         emitters = [s for s in (sink, wandb_sink, progress_sink) if s is not None]
+        # [telemetry] routing_every_steps → the MoE trainer's routing-telemetry
+        # cadence (logging only). Best-effort: a trainer that refuses the
+        # attribute keeps its default.
+        with contextlib.suppress(Exception):
+            self.base_trainer.routing_every_steps = int(
+                getattr(self.cfg.telemetry, "routing_every_steps", 50))
         logger = (lambda record: [s.emit(record) for s in emitters]) if emitters else None
 
         # Host telemetry, taken HERE — after the generator is fetched but before

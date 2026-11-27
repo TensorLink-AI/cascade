@@ -75,8 +75,15 @@ def lane_run_fields(lane: str = "A", target: str = "", recipe: object = None) ->
     return out
 
 
+def generator_ref_tag(gen_ref: str) -> str:
+    """12-hex tag of a generator ref — the same tag
+    ``_GenerationMixin._leg_round_id`` puts on the leg's corpus round, so the
+    training run and the CPU-generation run of one submission share it."""
+    return hashlib.sha256(str(gen_ref).encode()).hexdigest()[:12]
+
+
 def wandb_run_id(round_id: str, role: str, hotkey: str, *, lane: str = "A",
-                 target: str = "") -> str:
+                 target: str = "", gen_ref: str = "") -> str:
     """Deterministic, stable wandb run id for one ``(round, competitor, size/stage)``.
 
     wandb keys a run by its ``id``, **not** its display ``name``. Without a stable
@@ -97,11 +104,21 @@ def wandb_run_id(round_id: str, role: str, hotkey: str, *, lane: str = "A",
     is unchanged from the pre-lane id (an in-flight run still resumes).
     A short digest of the raw key is appended so two runs can never collide even
     if sanitising or truncation would otherwise collapse their slugs.
+
+    ``gen_ref`` (the leg's generator ref) joins the key when given. A v2 seed
+    epoch spans several eras under ONE ``base_seed`` (DEC-CA-0055), so the
+    same hotkey can train a NEW submission in a later era with the same
+    round id, role and lane — without the ref that leg resumed the earlier
+    leg's finished run (round 824229856147703689, uid 203: the 8xH100 leg's
+    steps went into the 8xH200 leg's run, so no run of its own appeared). A
+    retry of the SAME submission keeps the same ref, so it still resumes.
     """
     raw = f"{round_id}-{role}-{hotkey}"
     lane = str(lane or "A").upper()
     if lane != "A":
         raw += f"-lane{lane}-{target or ''}"
+    if gen_ref:
+        raw += f"-g{generator_ref_tag(gen_ref)}"
     slug = _WANDB_ID_UNSAFE.sub("-", raw)[:96]
     tag = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]
     return f"{slug}-{tag}"
@@ -168,6 +185,7 @@ def open_wandb_run(
     lane: str = "A",
     target: str = "",
     recipe: object = None,
+    gen_ref: str = "",
 ) -> WandbSink | None:
     """Start a wandb run for one training, or return ``None`` if unavailable.
 
@@ -180,6 +198,10 @@ def open_wandb_run(
     (:func:`lane_run_fields`): every run carries a ``lane:A|B|C`` tag, a
     ``target:<t>`` tag for a lane-B / lane-C leg (a DEC-CA-0059 multi-target
     leg's targets comma-joined), and the lane-C recipe in its config.
+
+    ``gen_ref`` (the generator ref) makes the run per-SUBMISSION, not just per
+    ``(round, role, hotkey)`` — see :func:`wandb_run_id`; the run then also
+    carries a ``gen:<tag>`` tag, the ref in its config and the tag in its name.
     """
     if not getattr(wcfg, "enabled", False):
         return None
@@ -195,15 +217,23 @@ def open_wandb_run(
         "round_id": round_id, "role": role, "size": size,
         "miner_hotkey": hotkey, "miner_uid": uid, **lane_fields, **(config or {}),
     }
+    gtag = generator_ref_tag(gen_ref) if gen_ref else ""
+    if gen_ref:
+        run_config["generator_ref"] = gen_ref
+        run_config["generator_tag"] = gtag
     tags = [f"round:{round_id}", f"hotkey:{hotkey}", f"uid:{uid}",
             f"size:{size}", f"role:{role}", f"lane:{lane}"]
     if target:
         tags.append(f"target:{target}")
     if lane == "C" and str(target).startswith("mkt:"):
         tags.append("lane:C/mkt")          # DEC-CA-0064 MarketCast legs
+    if gtag:
+        tags.append(f"gen:{gtag}")
     name = f"round-{round_id}-{role}"
     if lane != "A":
         name += f"-lane{lane}" + (f"-{target}" if target else "")
+    if gtag:
+        name += f"-g{gtag[:8]}"
     try:
         run = wandb.init(
             project=(getattr(wcfg, "project", "cascade") or "cascade"),
@@ -211,7 +241,8 @@ def open_wandb_run(
             # Stable id so a retried/re-run training RESUMES its one run instead
             # of minting a duplicate on every service-loop retry (see
             # wandb_run_id). ``resume="allow"`` = resume if it exists, else create.
-            id=wandb_run_id(round_id, role, hotkey, lane=lane, target=target),
+            id=wandb_run_id(round_id, role, hotkey, lane=lane, target=target,
+                            gen_ref=gen_ref),
             resume="allow",
             name=name,
             group=str(round_id),
@@ -238,6 +269,8 @@ def open_wandb_run(
         for k in ("lr", "throughput_tokens_per_s", "steps_per_s", "tokens",
                   "tokens_frac", "data_wait_frac"):
             run.define_metric(k, step_metric="step")
+        # MoE routing telemetry (cascade.trainer.routing_telemetry)
+        run.define_metric("routing/*", step_metric="step")
     except Exception as e:  # noqa: BLE001 — axis setup must never abort a round
         log.debug("wandb define_metric failed (continuing): %s", e)
     return WandbSink(run)
