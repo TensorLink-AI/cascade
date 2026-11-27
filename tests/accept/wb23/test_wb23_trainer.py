@@ -101,7 +101,10 @@ def test_dispatch_contract_unchanged_when_unarmed(tmp_path, monkeypatch):
     want = base_contract(cfg).for_hours(cfg.lane_b.leg_hours,
                                         guard_factor=cfg.round.heat_guard_factor,
                                         guard_floor_seconds=cfg.round.heat_guard_floor_seconds)
-    assert seen["contract"] == _lane_b_ema(want)
+    # no spec (no train_hours, no levers): the worker folds no levers, so the
+    # trainer expects the EMA leg contract with the image's EMAs (WB27
+    # 2026-11-27 owner fix: the receipt digest the worker reports)
+    assert seen["contract"] == dataclasses.replace(want, lr_schedule="warmup_constant_ema")
 
 
 def test_dispatch_contract_armed_nonempty_lane_d_effect(tmp_path, monkeypatch):

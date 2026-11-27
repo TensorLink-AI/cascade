@@ -1335,7 +1335,8 @@ class LaneBDriver:
 
     def _leg_done(self, leg: OpenLeg, leg_pointer: str | None, corpus_digest: str = "",
                   train_block: int = 0, gpu_name: str = "", failure=None,
-                  gpu_n: int = 0, train_image_digest: str = "") -> None:
+                  gpu_n: int = 0, train_image_digest: str = "",
+                  selection: dict | None = None, exclude: dict | None = None) -> None:
         """A leg returned. ``failure`` (a funded leg's
         :class:`~cascade.trainer.lane_c_driver.LegFailure`) decides its queue
         entry: a miner fault ends it; anything else requeues it — a capacity
@@ -1352,6 +1353,13 @@ class LaneBDriver:
                             leg.sub.hotkey[:8], leg.sub.domain)
                 return
             if leg_pointer:
+                if selection is not None:
+                    # a re-uploaded harvest: the leg is recorded with the rows
+                    # (and exclusions) its checkpoint was trained on
+                    leg.selection = {int(k): sorted(int(x) for x in v)
+                                     for k, v in selection.items()}
+                    leg.exclude = {int(k): sorted(int(x) for x in v)
+                                   for k, v in (exclude or {}).items()}
                 self.queue.finish(leg, ok=True)
                 self.st.finished.append(asdict(FinishedExpertLeg(
                     leg=asdict(leg), leg_pointer=leg_pointer, corpus_digest=corpus_digest,
@@ -2306,12 +2314,21 @@ class RunnerLaneBOps:
                 wall_bounded = (wall_bounded_leg(self.r, _measured_rate_of(gpus, contract))
                                 if length is None or limits or pinned
                                 else contextlib.nullcontext())
+                # the dispatch's rows / contract block / exclude: a failed
+                # upload's pending record carries them, and a re-upload of it
+                # records the leg with THOSE (never this tick's selection)
+                from .runner_common import lane_b_dispatch_fields, lane_b_record_rows
+
+                contract_block = self.r._era_contract_block(era)
+                loc.lane_b_dispatch = lane_b_dispatch_fields(leg.selection, contract_block,
+                                                             leg.exclude)
+                loc.lane_b_reused = None
                 try:
                     with rent_scope(self.r, gpus, only=only), wall_bounded:
                         entry = self.r._run_funded_leg(
                             self.r._dispatcher(), gen, seeds, int(block), contract,
                             f"-x{label}-u{leg.sub.uid}", warm_start_ref=leg.base_king_ref,
-                            contract_block=self.r._era_contract_block(era),
+                            contract_block=contract_block,
                             era_index=era.index, role="expert", bench=False, domain=label,
                             expert_selection=leg.selection,
                             funded_queue=self.funded_queue(), gpu_choice=choice,
@@ -2350,6 +2367,21 @@ class RunnerLaneBOps:
                     msg, miner_fault, error_class, burn = verdict
                     raise LegFailure(msg or str(e), miner_fault=miner_fault,
                                      error_class=error_class, burn=burn) from e
+                finally:
+                    loc.lane_b_dispatch = None
+                reused = getattr(loc, "lane_b_reused", None)
+                loc.lane_b_reused = None
+                trained = {}
+                if reused:
+                    # a re-uploaded earlier harvest: the rows it was TRAINED on
+                    trained = {"selection": lane_b_record_rows(reused["expert_selection"]),
+                               "exclude": lane_b_record_rows(reused["expert_exclude"])}
+                    if trained["selection"] != {int(k): sorted(v)
+                                                for k, v in leg.selection.items()}:
+                        log.warning("lane B: %s re-uploaded harvest recorded with its trained "
+                                    "selection %s (this tick planned %s)", gen.hotkey[:12],
+                                    {k: len(v) for k, v in trained["selection"].items()},
+                                    {k: len(v) for k, v in leg.selection.items()})
                 # WB22 / WB25: the leg's GPU count is the rented layout's (every
                 # GPU of it trains); 0 = not known (no rent recorded)
                 sku = str(getattr(loc, "funded_pod_sku", "") or "")
@@ -2360,7 +2392,8 @@ class RunnerLaneBOps:
                      # W-IMG: the image the leg ran (its contract's pin, which
                      # the worker's FINAL image check enforced on the pod)
                      train_image_digest=image_digest(str(
-                         getattr(contract, "train_image_digest", "") or "")))
+                         getattr(contract, "train_image_digest", "") or "")),
+                     **trained)
             except LegFailure as f:
                 done(leg, None, failure=f)
             except Exception as e:  # noqa: BLE001 — an unclassified failure is ours
