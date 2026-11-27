@@ -57,6 +57,10 @@ MONEY_KNOBS: dict[str, tuple[object, str]] = {
     # owner 2026-11-04: an our-side lemon loss below this reruns on the
     # miner's own key instead of an approval-gated operator make-good (0 = off)
     "make_good_rerun_below_usd": (20.0, "usd"),
+    # owner 2026-11-27: a submission's lemons / post-rent rejects on the
+    # miner's own key stop at this many USD; then operator-billed +
+    # approval-gated (0 = off)
+    "miner_make_good_cap_usd": (25.0, "usd"),
     # 2026-11-04: an ssh-unreachable funded pod the provider still lists alive
     # is kept (and polled) this long past dispatch_reattach_grace_seconds
     # before the leg is declared lost (0 = off: the old 900 s give-up).

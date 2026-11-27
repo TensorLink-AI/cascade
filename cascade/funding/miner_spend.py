@@ -170,6 +170,7 @@ class MinerSpend:
         any of the hotkey's submissions; ``hotkey`` None/"" = any hotkey) now,
         or at its last-seen-alive time (``at_last_seen``: a pod found lost).
         No-op when none is open."""
+        owed = []
         with self._locked() as recs:
             changed = False
             for _k, r in self._of(recs, hotkey):
@@ -178,8 +179,31 @@ class MinerSpend:
                         end = (p.get("seen") or p.get("start")) if at_last_seen else self.clock()
                         p.update(end=end, outcome=outcome, reason=reason[:200], kind=kind)
                         changed = True
+                        if outcome == MAKE_GOOD:
+                            owed.append((r, dict(p)))
             if changed:
                 self._save(recs)
+        for r, p in owed:
+            self._record_make_good(r, p)
+
+    def _record_make_good(self, r: dict, p: dict) -> None:
+        """A ``make_good`` pod: the operator's debt goes into the persistent
+        owed→paid ledger beside this file (2026-11-27; it outlives restarts,
+        re-funds and the 6 h alert). Best-effort: a ledger fault never
+        blocks a teardown (the spend record above still holds the row)."""
+        try:
+            from .make_good_ledger import MAKE_GOOD_LEDGER_FILE, MakeGoodLedger
+
+            MakeGoodLedger(self.path.with_name(MAKE_GOOD_LEDGER_FILE), clock=self.clock
+                           ).record_owed(
+                str(r.get("hotkey") or ""), rent_id=str(p.get("rent_id") or p["pod_id"]),
+                usd=_cost(p, self.clock()), pod_id=str(p["pod_id"]), ref=str(r.get("ref") or ""),
+                funded_at=r.get("funded_at"), reason=str(p.get("reason") or ""))
+        except Exception:  # noqa: BLE001 — bookkeeping never blocks a teardown
+            import logging
+
+            logging.getLogger("cascade.funding.miner_spend").warning(
+                "make-good ledger: pod %s not recorded", p.get("pod_id"), exc_info=True)
 
     def touch(self, hotkey: str, pod_id: str) -> None:
         """The pod was seen alive now (the cap for a later vanish)."""

@@ -337,31 +337,85 @@ def best_offer_rate(runner, skus) -> float | None:
     return None
 
 
-def projected_operator_leg_cost(runner, *, live_price: bool = False
+def offer_rates_by_sku(runner, skus) -> dict[str, float]:
+    """``{sku: cheapest current operator-account $/h}`` for each of ``skus``
+    that has an offer right now (one listing; the same price caps a rent
+    uses). A type with no offer is absent. Seams: ``runner._operator_offer_rates``
+    (skus -> mapping), else ``runner._operator_offer_rate`` (skus -> one rate,
+    applied to every type)."""
+    skus = tuple(s for s in skus if s)
+    seam = getattr(runner, "_operator_offer_rates", None)
+    if callable(seam):
+        return {str(k): float(v) for k, v in dict(seam(skus) or {}).items() if v}
+    one = getattr(runner, "_operator_offer_rate", None)
+    if callable(one):
+        # the older single-rate seam (the cheapest of ``skus``): every type at it
+        rate = one(skus)
+        return {s: float(rate) for s in skus} if rate else {}
+    out: dict[str, float] = {}
+    try:
+        from ..provision.core import executor_price_per_hour
+        from ..provision.operator_pool import operator_price_caps
+        from .lane_pool import _lium_provider
+
+        prov = _lium_provider(runner.cfg.round, price_caps=operator_price_caps(runner))
+        for sku, ex in prov.list_offers(skus):
+            price = executor_price_per_hour(ex)
+            if price and (sku not in out or float(price) < out[sku]):
+                out[str(sku)] = float(price)
+    except Exception as e:  # noqa: BLE001 — unknown: the ceiling applies
+        log.debug("operator offer prices unknown (%s)", e)
+    return out
+
+
+def leg_hours_on(runner, sku: str | None) -> float:
+    """Hours an operator leg holds a pod of ``sku``: THAT type's expected wall
+    (``runner._leg_wall_seconds(sku)``) + the ready timeout; an unknown wall
+    is a full day (caps stay strict)."""
+    rnd = runner.cfg.round
+    try:
+        wall = float(runner._leg_wall_seconds(sku or None))
+    except Exception:  # noqa: BLE001 — unknown wall: project a full day
+        wall = 24 * 3600.0
+    return (wall + float(getattr(rnd, "funded_ready_timeout_seconds", 0.0) or 0.0)) / 3600.0
+
+
+def projected_operator_leg_cost(runner, *, live_price: bool = False, hotkey: str = ""
                                 ) -> tuple[str, float, float, float]:
     """``(sku, $/h, hours, $)`` an operator-account leg is projected to cost:
-    the cheapest current offer's $/h when ``live_price`` and known, else the
-    operator $/h ceiling, × the leg's expected wall (+ the ready timeout).
-    The spend actually BOOKED is the landed price (:func:`note_operator_launch`;
-    review R4)."""
+    the MOST expensive of the leg's allowed GPU types (2026-11-27 owner fix),
+    each projected on its OWN price (the cheapest current offer of that type
+    when ``live_price`` and known, else the operator $/h ceiling) × its OWN
+    expected wall (+ the ready timeout). Labelling with the first type,
+    pricing at the cheapest offer of ANY type and timing at the fastest
+    type's wall under-projected a leg that landed on a slower or dearer type.
+
+    ``hotkey``: an operator-billed leg whose approval pins GPU types
+    (#961, ``approve-operator-leg --sku``) is projected on the pinned types
+    among its allowed ones. The spend actually BOOKED is the landed price ×
+    the landed type's wall (:func:`note_operator_launch`; review R4)."""
     from ..provision.operator_pool import operator_max_price_per_hour
 
     rnd = runner.cfg.round
     skus = tuple(runner._funded_skus_for_rent() or ()) or ((rnd.funded_pod_sku,)
                                                           if rnd.funded_pod_sku else ())
-    sku = skus[0] if skus else ""
+    pinned = operator_pinned_skus(runner, hotkey) if hotkey else ()
+    if pinned:
+        allowed = {s.lower() for s in skus}
+        skus = tuple(s for s in pinned if s.lower() in allowed) or skus
     ceiling = float(operator_max_price_per_hour(rnd) or 0.0)
-    rate = ceiling
-    if live_price and skus:
-        best = best_offer_rate(runner, skus)
-        if best:
-            rate = min(best, ceiling) if ceiling else best
-    try:
-        wall = float(runner._leg_wall_seconds())
-    except Exception:  # noqa: BLE001 — unknown wall: project a full day (caps stay strict)
-        wall = 24 * 3600.0
-    hours = (wall + float(getattr(rnd, "funded_ready_timeout_seconds", 0.0) or 0.0)) / 3600.0
-    return sku, rate, hours, rate * hours
+    rates = offer_rates_by_sku(runner, skus) if live_price and skus else {}
+    best: tuple[str, float, float, float] | None = None
+    for sku in skus or ("",):
+        rate = ceiling
+        offer = rates.get(sku)
+        if offer:
+            rate = min(offer, ceiling) if ceiling else offer
+        hours = leg_hours_on(runner, sku)
+        cost = rate * hours
+        if best is None or cost > best[3]:
+            best = (sku, rate, hours, cost)
+    return best
 
 
 KING_KIND, KING_BACKUP_KIND = "king", "king_backup"
@@ -760,13 +814,68 @@ def _parse_iso(text: str) -> float | None:
         return None
 
 
+# 2026-11-27 (owner): the runway counted only the funded ledger + the
+# hand-kept ``operator_standing_pods_usd_per_hour`` table (stale: $2.09/h
+# listed while the account burned ~$15/h — owner and eval pods on no ledger).
+# The OPERATOR account's own ``lium ps`` (refreshed by the money watch) is
+# now the source for every pod not on the ledger, at its LISTED $/h; the
+# table is only the fallback while no fresh listing is known.
+OPERATOR_LISTING_KEY = "_operator_pod_listing"
+OPERATOR_LISTING_MAX_AGE_SECONDS = 1800.0
+_GONE_POD_STATUSES = frozenset({"TERMINATED", "DELETED", "REMOVED", "DESTROYED"})
+
+
+def note_operator_listing(runner, rows, *, now: float | None = None) -> int:
+    """Keep the OPERATOR account's pod listing (``lium ps`` rows) for the
+    runway: each pod's ids, name, status and listed whole-pod $/h. Returns
+    how many pods were noted. Never raises."""
+    try:
+        from ..provision.core import executor_price_per_hour
+
+        pods = []
+        for row in rows or ():
+            if not isinstance(row, dict):
+                continue
+            ids = sorted({str(row.get(k) or "") for k in ("name", "huid", "id")} - {""})
+            price = None
+            for cand in (row, row.get("executor") or {}, row.get("machine") or {}):
+                if isinstance(cand, dict):
+                    price = executor_price_per_hour(cand)
+                    if price:
+                        break
+            pods.append({"ids": ids, "name": str(row.get("name") or (ids[0] if ids else "?")),
+                         "status": str(row.get("status") or "").upper(),
+                         "usd_per_hour": float(price) if price else None})
+        runner.__dict__[OPERATOR_LISTING_KEY] = {
+            "at": time.time() if now is None else float(now), "pods": pods}
+        return len(pods)
+    except Exception as e:  # noqa: BLE001 — the table fallback applies
+        log.warning("runway: operator pod listing not noted (%s)", e)
+        return 0
+
+
+def operator_listing(runner, *, now: float | None = None) -> list[dict] | None:
+    """The last noted operator pod listing when fresh (younger than
+    :data:`OPERATOR_LISTING_MAX_AGE_SECONDS`), else None (unknown)."""
+    snap = runner.__dict__.get(OPERATOR_LISTING_KEY)
+    if not isinstance(snap, dict):
+        return None
+    t = time.time() if now is None else float(now)
+    if t - float(snap.get("at") or 0.0) > OPERATOR_LISTING_MAX_AGE_SECONDS:
+        return None
+    return list(snap.get("pods") or ())
+
+
 def committed_spend(runner, *, now: float | None = None, launching: str = "") -> dict:
-    """``{committed_usd, burn_usd_per_hour, pods: [...]}`` — every live
-    operator pod (funded-ledger rows with no payer: king pods, backups,
-    operator legs) at its booked rate (else the ceiling) x its remaining
-    expected wall, plus each standing pod (``[round]
-    operator_standing_pods_usd_per_hour``: eval pods, hand-rented lanes) at
-    its rate x the alert horizon (they run at least that long).
+    """``{committed_usd, burn_usd_per_hour, burn_source, pods: [...]}`` —
+    every live operator pod (funded-ledger rows with no payer: king pods,
+    backups, operator legs) at its booked rate (else the ceiling) x its
+    remaining expected wall, plus every OTHER pod the operator account lists
+    (``lium ps``: eval pods, owner pods, hand-rented lanes — anything not on
+    the ledger) at its listed $/h (else the ceiling) x the alert horizon
+    (they run at least that long). Only while no fresh listing is known, the
+    ``[round] operator_standing_pods_usd_per_hour`` table stands in for them
+    (``burn_source`` = ``"table"``, else ``"listing"``).
 
     ``launching`` (a launch's name prefix) leaves out the write-ahead row of
     the pod ABOUT to be created: the launch check adds that pod's projection
@@ -799,12 +908,31 @@ def committed_spend(runner, *, now: float | None = None, launching: str = "") ->
         burn += rate
         pods.append({"pod": pid, "rate": rate, "hours_left": round(left, 2), "kind": kind})
     horizon = float(getattr(rnd, "operator_runway_alert_hours", 0.0) or 0.0)
-    for name, rate in tuple(getattr(rnd, "operator_standing_pods_usd_per_hour", ()) or ()):
-        committed += float(rate) * horizon
-        burn += float(rate)
-        pods.append({"pod": name, "rate": float(rate), "hours_left": horizon, "kind": "standing"})
+    listed = operator_listing(runner, now=t)
+    if listed is not None:
+        on_ledger = {str(getattr(p, "instance_id", "") or "") for p in ledger} - {""}
+        for lp in listed:
+            ids = set(lp.get("ids") or ())
+            if ids & on_ledger or lp.get("status") in _GONE_POD_STATUSES:
+                continue                                # counted above / no longer billing
+            if own and any(i.startswith(own) for i in ids):
+                continue                                # this launch's own pod
+            listed_rate = lp.get("usd_per_hour")
+            rate = float(listed_rate or ceiling)
+            committed += rate * horizon
+            burn += rate
+            pods.append({"pod": lp.get("name") or "?", "rate": rate, "hours_left": horizon,
+                         "kind": "unledgered", "priced": bool(listed_rate)})
+        source = "listing"
+    else:
+        for name, rate in tuple(getattr(rnd, "operator_standing_pods_usd_per_hour", ()) or ()):
+            committed += float(rate) * horizon
+            burn += float(rate)
+            pods.append({"pod": name, "rate": float(rate), "hours_left": horizon,
+                         "kind": "standing"})
+        source = "table"
     return {"committed_usd": round(committed, 2), "burn_usd_per_hour": round(burn, 4),
-            "pods": pods}
+            "burn_source": source, "pods": pods}
 
 
 def _read_balance(runner) -> float | None:
@@ -824,7 +952,7 @@ def operator_runway(runner, *, balance: float | None, now: float | None = None,
     c = committed_spend(runner, now=now, launching=launching)
     reserve = float(getattr(runner.cfg.round, "operator_balance_reserve_usd", 0.0) or 0.0)
     out = {**c, "balance_usd": balance, "reserve_usd": reserve, "held": False,
-           "runway_hours": None}
+           "runway_hours": None, "hours_to_reserve": None}
     if balance is None:
         return out
     free = float(balance) - c["committed_usd"] - reserve
@@ -832,6 +960,11 @@ def operator_runway(runner, *, balance: float | None, now: float | None = None,
     burn = c["burn_usd_per_hour"]
     out["runway_hours"] = (round(free / burn, 2) if burn > 0
                            else (float("inf") if free >= 0 else 0.0))
+    # the plain clock: hours until the balance reaches the reserve at the
+    # whole account's burn (every listed pod), commitments aside
+    above = float(balance) - reserve
+    out["hours_to_reserve"] = (round(max(0.0, above) / burn, 2) if burn > 0
+                               else (float("inf") if above >= 0 else 0.0))
     return out
 
 
@@ -936,7 +1069,9 @@ def _save_runway(runner, rw: dict) -> None:
     with contextlib.suppress(Exception):
         doc = {**{k: v for k, v in rw.items() if k != "pods"}, "at": time.time(),
                "runway_hours": (None if rw.get("runway_hours") in (None, float("inf"))
-                                else rw["runway_hours"])}
+                                else rw["runway_hours"]),
+               "hours_to_reserve": (None if rw.get("hours_to_reserve") in (None, float("inf"))
+                                    else rw["hours_to_reserve"])}
         write_text_atomic(Path(runner.work_root) / RUNWAY_FILE, json.dumps(doc, sort_keys=True))
 
 
@@ -948,12 +1083,17 @@ def runway_tick(runner, balance: float | None) -> dict:
     rw = operator_runway(runner, balance=balance)
     alert_h = float(getattr(runner.cfg.round, "operator_runway_alert_hours", 0.0) or 0.0)
     hrs = rw.get("runway_hours")
+    to_reserve = rw.get("hours_to_reserve")
     if balance is not None and alert_h and hrs is not None and hrs < alert_h:
+        src = ("every pod the operator account lists" if rw.get("burn_source") == "listing"
+               else "ledger + the standing-pods table (no fresh account listing)")
         alert(runner, "operator_runway_low", "operator",
-              f"operator runway {hrs:.1f} h < {alert_h:.0f} h: balance ${balance:.2f}, committed "
+              f"operator runway {hrs:.1f} h < {alert_h:.0f} h ({to_reserve:.1f} h until the "
+              f"reserve at the current burn): balance ${balance:.2f}, committed "
               f"${rw['committed_usd']:.2f} by {len(rw['pods'])} pod(s), burn "
-              f"${rw['burn_usd_per_hour']:.2f}/h, reserve ${rw['reserve_usd']:.2f}",
-              severity="critical")
+              f"${rw['burn_usd_per_hour']:.2f}/h ({src}), reserve ${rw['reserve_usd']:.2f}",
+              severity="critical", burn_usd_per_hour=rw["burn_usd_per_hour"],
+              hours_to_reserve=to_reserve)
     else:
         clear_alert(runner, "operator_runway_low", "operator")
     if rw["held"]:
@@ -1179,6 +1319,37 @@ def grandfathered(runner, hotkey: str, *, allocated: bool) -> bool:
     return is_admitted(runner, hotkey)
 
 
+_KIND_REASONS = {
+    "expired_key": "payer key expired",
+    "operator_lane": "no marketplace capacity: an operator lane",
+    "paid_fallback": "ops_paid_fallback: marketplace sold out",
+    "retrain_after_loss": "retrain after a finished run was lost on our side",
+    "spend_cap_make_good": "make-good after the miner waste cap",
+}
+
+
+def operator_kind_reason(kind: str, *, lost: bool = False) -> str:
+    """Why a leg of approval ``kind`` is billed to the operator (one phrase)."""
+    if kind == "make_good":
+        return ("operator make-good: retrain after a finished run was lost on our side"
+                if lost else "operator make-good after an operator-side loss")
+    return _KIND_REASONS.get(kind, kind or "operator-billed")
+
+
+def operator_billing_reason(runner, *, king_backup: bool = False) -> str:
+    """The REAL reason the leg on this thread runs on the operator's account
+    (2026-11-27: every operator leg was logged "payer key expired"): a king
+    backup, else the kind of the owner approval this leg is launching under
+    (:func:`operator_leg_gate` stores it), else unknown."""
+    if king_backup:
+        return "king backup pod"
+    a = getattr(_leg_local(runner), "operator_approval", None) or {}
+    kind = str(a.get("kind") or "")
+    if not kind:
+        return "operator-billed leg (no approval kind on this thread)"
+    return operator_kind_reason(kind, lost=bool(a.get("lost")))
+
+
 def operator_leg_gate(runner, gen, *, kind: str, rent: bool, lost_usd: float = 0.0) -> None:
     """Gate EVERY miner leg about to be billed to the operator (``kind``:
     ``expired_key`` / ``make_good`` / ``operator_lane`` / ``paid_fallback``).
@@ -1211,7 +1382,7 @@ def operator_leg_gate(runner, gen, *, kind: str, rent: bool, lost_usd: float = 0
               "operator's account", cls="withdrawn")
     attempt_id = str(getattr(entry, "attempt_id", "") or "")
     funded_at = getattr(entry, "funded_at", None)
-    sku, rate, hours, cost = projected_operator_leg_cost(runner, live_price=bool(rent))
+    sku, rate, hours, cost = projected_operator_leg_cost(runner, live_price=bool(rent), hotkey=hk)
     lost = float(lost_usd or 0.0)
     if not rent:
         cost = 0.0          # an operator lane is already paid for; no new spend
@@ -1232,7 +1403,7 @@ def operator_leg_gate(runner, gen, *, kind: str, rent: bool, lost_usd: float = 0
         _leg_local(runner).operator_approval = {
             "queue": qname, "hotkey": hk, "ref": gen.ref, "attempt_id": attempt_id,
             "cost": cost, "hours": hours, "kind": kind, "book": bool(rent),
-            "reservation": rid or ""}
+            "reservation": rid or "", "lost": lost}
         if not rent:
             note_operator_launch(runner, hk)           # a lane dispatch IS the launch
         log.warning("operator-billed leg %s (%s, uid %s): owner approval applies — %s, "
@@ -1253,14 +1424,7 @@ def operator_leg_gate(runner, gen, *, kind: str, rent: bool, lost_usd: float = 0
                   cls="auth", miner_fault=True)
         _skip(runner, hk, "the operator declined to pay for this leg; it retries on the "
               "miner's own key (no attempt charged)", cls=DENIED_CLASS)
-    reason = {"expired_key": "payer key expired",
-              "make_good": ("operator make-good: retrain after a finished run was lost on "
-                            "our side" if lost else
-                            "operator make-good after an operator-side loss"),
-              "operator_lane": "no marketplace capacity: an operator lane",
-              "paid_fallback": "ops_paid_fallback: marketplace sold out",
-              "retrain_after_loss": "retrain after a finished run was lost on our side"
-              }.get(kind, kind)
+    reason = operator_kind_reason(kind, lost=bool(lost))
     store.request(qname, hk, ref=gen.ref, attempt_id=attempt_id, queue_path=str(queue.path),
                   uid=getattr(gen, "uid", None), sku=sku, rate_per_hour=rate,
                   expected_hours=hours, projected_cost_usd=cost, kind=kind, reason=reason,
@@ -1312,10 +1476,16 @@ def take_deferred_gate(runner) -> str | None:
 
 
 def note_operator_launch(runner, hotkey: str | None = None, *,
-                         landed_rate: float | None = None, pod_id: str = "") -> bool:
+                         landed_rate: float | None = None, pod_id: str = "",
+                         landed_sku: str = "") -> bool:
     """The approved leg's pod was rented (or its lane dispatched): mark the
     approval launched for THIS attempt and book the operator spend — only
-    now, never for a rent that did not happen (review F3)."""
+    now, never for a rent that did not happen (review F3).
+
+    ``landed_sku``: the GPU type the pod landed on. The landed cost (booked,
+    and checked against the approval's ceiling) is the landed $/h × THAT
+    type's expected wall — never the projection's hours (2026-11-27: those
+    were the fastest type's, so a slower landed type slipped the ceiling)."""
     loc = _leg_local(runner)
     a = getattr(loc, "operator_approval", None)
     if not a:
@@ -1330,8 +1500,8 @@ def note_operator_launch(runner, hotkey: str | None = None, *,
 
     # Book the LANDED $/h × the expected wall when the rent price is known
     # (the projection was an upper bound; review R4).
-    booked = (float(landed_rate) * float(a.get("hours") or 0.0) if landed_rate
-              else float(a["cost"]))
+    hours = leg_hours_on(runner, landed_sku) if landed_sku else float(a.get("hours") or 0.0)
+    booked = float(landed_rate) * hours if landed_rate else float(a["cost"])
     store = OperatorApprovals.for_work_root(runner.work_root)
     rec = store.get(a["queue"], a["hotkey"]) or {}
     ceiling = rec.get("max_cost_usd")

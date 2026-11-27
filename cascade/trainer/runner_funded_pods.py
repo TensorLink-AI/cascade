@@ -1048,6 +1048,10 @@ class _FundedPodMixin:
 
             if capped(self, gen):
                 return False
+            from .miner_spend_guard import make_good_over_cap
+
+            if make_good_over_cap(self, gen.hotkey)[0]:
+                return False              # past the per-submission make-good cap
             if int(getattr(entry, "operator_faults", 0) or 0) >= int(
                     getattr(self, "OPERATOR_FAULT_RETRIES", 0) or 0):
                 return False
@@ -1097,7 +1101,19 @@ class _FundedPodMixin:
         configured the wrapper's accounting is unchanged.
         """
         queue = self._funded_queue()
-        if queue is None or self._operator_recovery_available(hotkey):
+        if queue is None:
+            return more
+        from .miner_spend_guard import make_good_over_cap, note_make_good_cap
+
+        over, owed, cap = make_good_over_cap(self, hotkey)
+        if over:
+            # Owner 2026-11-27: the submission's lemons on the miner's key hit
+            # the per-submission cap — no replacement on their key, with or
+            # without operator capacity; operator-billed (approval-gated) now.
+            queue.set_operator_billed(hotkey, True)
+            note_make_good_cap(self, hotkey, owed, cap)
+            return False
+        if self._operator_recovery_available(hotkey):
             return more
         if not queue.set_operator_billed(hotkey, True):
             return more
@@ -1200,8 +1216,16 @@ class _FundedPodMixin:
             # that keeps recurring (a broken image, our credential setup) must
             # not keep billing the miner: after the cap the entry pauses.
             faults = int(getattr(flagged, "operator_faults", 0) or 0)
-            from .miner_spend_guard import capped
+            from .miner_spend_guard import capped, make_good_over_cap
 
+            if make_good_over_cap(self, gen.hotkey)[0]:
+                # the per-submission make-good cap: NEVER again on the
+                # miner's key — it waits for operator capacity (unburned)
+                self._record_funded_failure(
+                    gen.hotkey, "your bad-pod losses on our side reached the cap; the rest of "
+                    "this leg needs operator capacity — your key is not charged again",
+                    miner_fault=False, error_class="operator_blocked", burn=False)
+                raise _FundedLegSkip(gen.hotkey)
             if capped(self, gen):
                 # A make-good approved after the miner waste cap: NEVER again
                 # on the miner's key — it waits for operator capacity.
@@ -1595,10 +1619,11 @@ class _FundedPodMixin:
             if not adopt_live and not is_king:
                 # The miner waste cap, before EVERY rent on the miner's key
                 # (a lemon re-rent and a retrain included).
-                from .miner_spend_guard import budget_check, waste_cap_check
+                from .miner_spend_guard import budget_check, make_good_cap_check, waste_cap_check
 
                 try:
                     waste_cap_check(self, gen)
+                    make_good_cap_check(self, gen)           # lemons on their key (per submission)
                     budget_check(self, gen, gpu_choice)      # the miner's own total budget
                 except _FundedLegSkip:
                     self._ledger_remove(expected_id)

@@ -11,6 +11,9 @@ each best-effort (a failure logs and never sinks the sampler):
   king host in use, with no live worker and no unharvested finished run on
   ``king_idle_reap_checks`` consecutive checks, is terminated (verified)
   after a final on-pod check, with one alert;
+* :func:`listing_tick` — the OPERATOR account's ``lium ps`` every few
+  minutes, kept for the runway guard (every pod not on the ledger burns at
+  its listed $/h; 2026-11-27);
 * :func:`inventory_tick` — every ``operator_inventory_interval_seconds`` the
   OPERATOR account's ``lium ps`` is diffed against an allowlist; one alert
   per unknown pod with its name and $/h. It NEVER deletes anything;
@@ -44,6 +47,7 @@ def money_periodic(runner, balance: float | None, *, now: float | None = None,
     # slow: one background pass at a time, never holding the sampler.
     def slow():
         _run("king reaper", lambda: king_reaper_tick(runner, now=t))
+        _run("operator listing", lambda: listing_tick(runner, now=t))
         _run("inventory", lambda: inventory_tick(runner, now=t))
         _run("receipt watch", lambda: rejected_receipt_tick(runner, now=t))
 
@@ -230,6 +234,37 @@ def unknown_operator_pods(runner, rows: list[dict]) -> list[dict]:
     return out
 
 
+# The runway's account listing refresh: at most this often (and never more
+# often than the inventory itself; off with the inventory).
+OPERATOR_LISTING_REFRESH_SECONDS = 300.0
+
+
+def _operator_lister(runner):
+    seam = getattr(runner, "_operator_pod_lister", None)
+    if callable(seam):
+        return seam
+    from ..provision.core import LiumProvider
+
+    return LiumProvider()._list_pods
+
+
+def listing_tick(runner, *, now: float | None = None, lister=None) -> int | None:
+    """Refresh the OPERATOR account's pod listing the runway guard counts
+    (:func:`money_guard.note_operator_listing`) every
+    ``min(OPERATOR_LISTING_REFRESH_SECONDS, operator_inventory_interval_seconds)``
+    (0 = off: the standing-pods table is the runway's only source). A failed
+    listing keeps the last one until it goes stale. Returns the pod count,
+    None when not due."""
+    from .money_guard import note_operator_listing
+
+    t = time.time() if now is None else float(now)
+    every = float(getattr(runner.cfg.round, "operator_inventory_interval_seconds", 0) or 0)
+    if every <= 0 or not _due(runner, "_listing_at", min(every, OPERATOR_LISTING_REFRESH_SECONDS), t):
+        return None
+    rows = list((lister or _operator_lister(runner))())
+    return note_operator_listing(runner, rows, now=t)
+
+
 def inventory_tick(runner, *, now: float | None = None, lister=None) -> list[dict]:
     """One inventory pass (every ``operator_inventory_interval_seconds``):
     one alert per unknown pod on the operator account. Never deletes."""
@@ -240,10 +275,12 @@ def inventory_tick(runner, *, now: float | None = None, lister=None) -> list[dic
     if not _due(runner, "_inventory_at", every, t):
         return []
     if lister is None:
-        from ..provision.core import LiumProvider
+        lister = _operator_lister(runner)
+    rows = list(lister())
+    from .money_guard import note_operator_listing
 
-        lister = LiumProvider()._list_pods
-    unknown = unknown_operator_pods(runner, list(lister()))
+    note_operator_listing(runner, rows, now=t)        # the runway counts every listed pod
+    unknown = unknown_operator_pods(runner, rows)
     known_alerts = runner.__dict__.setdefault("_inventory_alerted", set())
     names = set()
     for u in unknown:

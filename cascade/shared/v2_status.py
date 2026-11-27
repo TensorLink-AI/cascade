@@ -1068,6 +1068,26 @@ def _receipt_domain_tags(receipt: dict | None) -> list:
         return []
 
 
+def make_good_view(work_root) -> dict | None:
+    """The operator's make-good debt to miners (owner 2026-11-27): owed,
+    paid and outstanding USD in total and per miner hotkey, from the
+    trainer's persistent ``make_good_ledger.json`` (cascade-ops reads it
+    here). None without a work root; ``{"error": ...}`` when unreadable.
+    Hotkeys and dollars only."""
+    if work_root is None:
+        return None
+    try:
+        from ..funding.make_good_ledger import MakeGoodLedger
+
+        v = MakeGoodLedger.for_work_root(work_root).view()
+        v["miners"] = [{k: m[k] for k in ("hotkey", "owed_usd", "paid_usd", "outstanding_usd",
+                                          "pods")} for m in v["miners"]]
+        return v
+    except Exception as e:  # noqa: BLE001 — presentational, never stalls the trainer
+        log.warning("v2 status: make-good ledger unavailable: %s", e)
+        return {"error": str(e)[:200]}
+
+
 def publish_trainer_v2_status(sched, block: int, *, min_interval_s: float = MIN_INTERVAL_S,
                               allow_probe: bool = True, clock=time.monotonic) -> bool:
     """The trainer hook: build + publish ``status/v2.json`` from a
@@ -1224,6 +1244,7 @@ def publish_trainer_v2_status(sched, block: int, *, min_interval_s: float = MIN_
         from ..funding.providers import ROLLING_PROVIDERS, spending_controls
 
         doc["operations"] = sched.r.__dict__.get("_operations_status")
+        doc["make_good"] = make_good_view(getattr(sched.r, "work_root", None))
         doc["launch_preflight"] = sched.r.__dict__.get("_v2_launch_preflight_status")
         doc["compute"] = {"rolling_providers": list(ROLLING_PROVIDERS),
                           "spending_controls": spending_controls(),
@@ -1256,6 +1277,7 @@ def publish_trainer_v2_status(sched, block: int, *, min_interval_s: float = MIN_
 
 __all__ = [
     "V2_STATUS_KEY", "build_v2_status", "driver_king_load", "emission_split", "golive",
+    "make_good_view",
     "king_check_fields", "king_routing_health", "ladder_fields", "lane_a_receipt_body",
     "lane_a_view", "lane_b_view",
     "lane_c_state_from_receipt", "lane_c_view", "latest_receipt_body", "moe_model_card",

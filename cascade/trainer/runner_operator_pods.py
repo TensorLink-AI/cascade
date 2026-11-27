@@ -803,9 +803,12 @@ class _OperatorPodMixin:
                                                       f"operator leg pod {pod_id}"))
                 if why:
                     _lemon(f"operator leg pod rejected: {why}")
+                from .money_guard import operator_billing_reason
+
                 log.warning("operator leg pod %s ready at %s:%d for %s (sku=%s) — "
-                            "operator-billed (payer key expired)", pod_id, addr.ip,
-                            addr.ssh_port, gen.hotkey[:12], sku)
+                            "operator-billed (%s)", pod_id, addr.ip, addr.ssh_port,
+                            gen.hotkey[:12], sku,
+                            operator_billing_reason(self, king_backup=name_prefix is not None))
                 _check_king_cancel(self)
                 if name_prefix is None:
                     # A usable pod is up: only now is the owner's approval used
@@ -819,7 +822,7 @@ class _OperatorPodMixin:
                     except Exception:  # noqa: BLE001 — unknown: the projection is booked
                         landed = None
                     if not note_operator_launch(self, gen.hotkey, landed_rate=landed,
-                                                pod_id=pod_id):
+                                                pod_id=pod_id, landed_sku=sku):
                         # the landed cost broke the approval's ceiling (money
                         # safety II): release the pod (not a lemon — the host
                         # is fine) and park for the owner's re-approval

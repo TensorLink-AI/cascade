@@ -157,6 +157,12 @@ class RoundConfig:
     # simply reruns on the miner's own key and the small loss stays a
     # make-good owed. 0 disables (every operator-side loss routes to approval).
     make_good_rerun_below_usd: float = 20.0
+    # Owner 2026-11-27: the most a submission's lemons / post-rent rejects may
+    # cost on the MINER's own key (``MinerSpend`` make_good USD). At it, no
+    # further pod is rented on their key for that submission: the leg goes
+    # operator-billed and approval-gated (``make_good``), or — with no
+    # operator capacity — waits unburned. 0 disables.
+    miner_make_good_cap_usd: float = 25.0
     # See money.py: keep an unreachable pod the provider still lists alive.
     unreachable_alive_extend_seconds: int = 7200
     # Harbor expiry (days) on the per-pod Hub robot a funded leg gets
