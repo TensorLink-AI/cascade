@@ -14,6 +14,7 @@ from dataclasses import asdict, dataclass, field
 # How a cascade_pyramid checkpoint's context is built (observed.py).
 CONTEXT = ("gluonts-observed/1: left padding and NaN are unobserved (fill 0.0) and the "
            "scaler reads observed points only; other architectures: ffill/bfill imputation")
+LEGACY_CONTEXT = "impute/0: ffill/bfill imputation, then the pinned wrapper's first-value pad"
 
 METHODOLOGY = {
     "gift-eval": {"metrics": "reference GIFT-Eval metrics",
@@ -114,15 +115,21 @@ class BenchmarkReport:
     # suite → pinned HF dataset revision the numbers were computed against
     # (see ``datasets.DATASETS``) — keeps historical reports traceable.
     data_revisions: dict = field(default_factory=dict)
+    # observed.METHODS: how contexts were built (an auditor re-sweeps with it)
+    bench_method: str = ""
 
     def to_dict(self) -> dict:
+        legacy = self.bench_method == "impute/0"
+        head = {"bench_method": self.bench_method} if self.bench_method else {}
         return {
+            **head,
             "checkpoint": self.checkpoint,
             "suites": [{**asdict(s), "partial": s.partial,
                         "rows": [floor_row_metrics(r) for r in s.rows]}
                        for s in self.suites],
             "row_metric_floor": ROW_METRIC_FLOOR,
             "data_revisions": dict(self.data_revisions),
-            "methodology": {s.suite: METHODOLOGY[s.suite] for s in self.suites
-                            if s.suite in METHODOLOGY},
+            "methodology": {s.suite: ({**METHODOLOGY[s.suite], "context": LEGACY_CONTEXT}
+                                      if legacy else METHODOLOGY[s.suite])
+                            for s in self.suites if s.suite in METHODOLOGY},
         }

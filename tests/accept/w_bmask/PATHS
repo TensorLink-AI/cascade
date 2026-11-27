@@ -7,3 +7,8 @@ benchmarks/cascade_benchmark/observed.py
 benchmarks/cascade_benchmark/predictor.py
 benchmarks/cascade_benchmark/results.py
 benchmarks/cascade_benchmark/suites/fev_bench.py
+# Follow-up: bench_method stamp (report + rows) and a version-aware audit, so
+# a report swept before #972 is reproduced with the legacy impute/0 method.
+benchmarks/cascade_benchmark/cli.py
+cascade/eval/benchmarks.py
+cascade/audit/bench_reproduce.py

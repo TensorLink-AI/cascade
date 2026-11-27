@@ -62,6 +62,16 @@ log = logging.getLogger("cascade_benchmark.observed")
 
 # Recorded in every report's ``methodology`` (results.METHODOLOGY).
 CONVENTION = "gluonts-observed/1"
+# ``bench_method``: stamped on every report (results.BenchmarkReport) and,
+# cascade-side, on every published rows suite, so an auditor reproduces a
+# report with the method it was swept with. LEGACY_METHOD is the pre-#972
+# behaviour (the pinned wrapper as loaded + ``impute_history``); a report
+# without a stamp was swept with it.
+METHOD = "observed_mask/1"
+LEGACY_METHOD = "impute/0"
+METHODS = (METHOD, LEGACY_METHOD)
+# The CLI's ``--bench-method`` lands here, so spawned sweep workers inherit it.
+METHOD_ENV = "CASCADE_BENCH_METHOD"
 # gluonts DummyValueImputation(0.0) and InstanceSplitter(dummy_value=0.0).
 FILL_VALUE = 0.0
 # ``causal_standardize``'s ``min_obs``: fewer observed points than this and
@@ -231,7 +241,25 @@ class ObservedMaskWrapper:
         return self.forecast_joint(np.asarray(history).reshape(1, -1), horizon, num_samples)
 
 
-def adapt(wrapper):
-    """The wrapper every suite forecasts with: a ``cascade_pyramid`` wrapper
-    gets the observed mask, and any other wrapper is returned unchanged."""
+def current_method() -> str:
+    """This process's bench method (``$CASCADE_BENCH_METHOD``, default
+    :data:`METHOD`). An unknown value raises: never a silent fallback."""
+    import os
+
+    method = os.environ.get(METHOD_ENV, "") or METHOD
+    if method not in METHODS:
+        raise ValueError(f"{METHOD_ENV}={method!r}: expected one of {METHODS}")
+    return method
+
+
+def adapt(wrapper, method: str | None = None):
+    """The wrapper every suite forecasts with. Under :data:`METHOD` a
+    ``cascade_pyramid`` wrapper gets the observed mask. Under
+    :data:`LEGACY_METHOD`, and for any other architecture, the wrapper is
+    returned unchanged."""
+    method = current_method() if method is None else method
+    if method not in METHODS:
+        raise ValueError(f"bench method {method!r}: expected one of {METHODS}")
+    if method == LEGACY_METHOD:
+        return wrapper
     return ObservedMaskWrapper(wrapper) if is_pyramid_wrapper(wrapper) else wrapper

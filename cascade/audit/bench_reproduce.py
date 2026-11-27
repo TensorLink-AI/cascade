@@ -16,6 +16,13 @@ Per entry, three outcomes:
 * WARN — not reproducible here: torch / the sidecar unavailable, or the
   re-sweep produced nothing (the sidecar's own failure, not evidence).
 
+Bench method (#972): each published rows suite carries the sidecar's
+``bench_method`` (rows without one were swept with the legacy ``impute/0``
+convention). The re-sweep uses the PUBLISHED method, so a report swept
+before #972 is reproduced with the old behaviour and never reads as a
+mismatch. A method this release cannot run (unknown, or suites that
+disagree) is a WARN that names it, not a FAIL.
+
 Tolerance: GPU sweeps are not bit-reproducible (kernel scheduling, TF32, a
 different GPU SKU), and the forecasts are SAMPLED (``num_samples`` paths), so
 a per-item CRPS carries Monte-Carlo noise of order ``1/sqrt(num_samples)``.
@@ -29,6 +36,7 @@ compared, so the sample bounds the report size, not the GPU time.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import math
 import random
 from collections.abc import Callable
@@ -90,12 +98,27 @@ def compare_rows(published: dict, swept: dict, *, sample: dict[str, list[str]],
     return problems
 
 
+def _accepts_method(sweep_fn: Callable) -> bool:
+    try:
+        params = inspect.signature(sweep_fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return "bench_method" in params or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
 def reproduce_report(report, store, *, sweep_fn: Callable, per_suite: int = DEFAULT_SAMPLE,
                      tolerance: float = DEFAULT_TOLERANCE) -> list[CheckResult]:
     """Re-sweep every entry of a verified validator bench ``report``.
-    ``sweep_fn(entry) -> (item rows, data revisions) | None`` (``None`` =
-    could not sweep here ⇒ WARN). ``store.get_text`` reads the rows."""
+    ``sweep_fn(entry, bench_method=...) -> (item rows, data revisions) |
+    None`` (``None`` = could not sweep here ⇒ WARN); ``bench_method`` is the
+    published rows' own method (:func:`cascade.eval.benchmarks.rows_bench_method`).
+    A ``sweep_fn`` without that keyword can only reproduce the current
+    method; any other is a WARN. ``store.get_text`` reads the rows."""
+    from ..eval.benchmarks import BENCH_METHOD, BENCH_METHODS, rows_bench_method
     from ..shared.bench_report import load_bench_rows
+
+    takes_method = _accepts_method(sweep_fn)
 
     out: list[CheckResult] = []
     for e in report.entries:
@@ -107,8 +130,19 @@ def reproduce_report(report, store, *, sweep_fn: Callable, per_suite: int = DEFA
             out.append(CheckResult(name, FAIL, f"published rows unreadable / fail their "
                                                f"sha256: {exc}"))
             continue
+        method = rows_bench_method(published)
+        if method not in BENCH_METHODS:
+            out.append(CheckResult(name, WARN, "not reproduced here: published bench method "
+                                               f"{method!r} is not one this release runs "
+                                               f"{BENCH_METHODS}"))
+            continue
+        if not takes_method and method != BENCH_METHOD:
+            out.append(CheckResult(name, WARN, f"not reproduced here: swept with bench method "
+                                               f"{method!r} and this sweep runs only "
+                                               f"{BENCH_METHOD!r}"))
+            continue
         try:
-            got = sweep_fn(e)
+            got = sweep_fn(e, bench_method=method) if takes_method else sweep_fn(e)
         except Exception as exc:  # noqa: BLE001 — the sweep's failure is not evidence
             got = None
             why = f"{type(exc).__name__}: {exc}"
@@ -134,7 +168,8 @@ def reproduce_report(report, store, *, sweep_fn: Callable, per_suite: int = DEFA
                                                f"not reproduce: " + "; ".join(problems[:5])))
         else:
             out.append(CheckResult(name, PASS, f"{n} sampled item(s) over {len(sample)} "
-                                               f"suite(s) reproduce within {tolerance:.0%}"))
+                                               f"suite(s) reproduce within {tolerance:.0%} "
+                                               f"(bench method {method})"))
     for f in report.infra_failed:
         out.append(CheckResult(f"bench-reproduce:infra:{str(f.get('trained_pointer'))[-16:]}",
                                PASS, f"recorded infra-failed ({f.get('reason')}): nothing to "
@@ -159,7 +194,7 @@ def default_sweep_fn(cfg, *, device: str, workdir):  # pragma: no cover — GPU 
     ec = cfg.eval
     hub = HubConfig.from_storage(cfg.storage)
 
-    def sweep(entry):
+    def sweep(entry, bench_method=None):
         ref = parse_trained_pointer(entry.trained_pointer)
         if ref is None:
             raise ValueError(f"malformed trained_pointer {entry.trained_pointer!r}")
@@ -175,7 +210,9 @@ def default_sweep_fn(cfg, *, device: str, workdir):  # pragma: no cover — GPU 
             timeout_s=int(ec.bench_hold_max_hours * 3600),
             # the sidecar's report is identical for any worker count: this
             # box's concurrency never changes what is compared
-            workers=getattr(ec, "bench_workers", None))
+            workers=getattr(ec, "bench_workers", None),
+            # #972: the published report's own method (old reports: impute/0)
+            bench_method=bench_method)
         rows = item_rows_from_report(rep)
         if rows is None:
             return None
