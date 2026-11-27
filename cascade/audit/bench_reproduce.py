@@ -113,9 +113,9 @@ def reproduce_report(report, store, *, sweep_fn: Callable, per_suite: int = DEFA
     ``sweep_fn(entry, bench_method=...) -> (item rows, data revisions) |
     None`` (``None`` = could not sweep here ⇒ WARN); ``bench_method`` is the
     published rows' own method (:func:`cascade.eval.benchmarks.rows_bench_method`).
-    A ``sweep_fn`` without that keyword can only reproduce the current
-    method; any other is a WARN. ``store.get_text`` reads the rows."""
-    from ..eval.benchmarks import BENCH_METHOD, BENCH_METHODS, rows_bench_method
+    A ``sweep_fn`` without that keyword is called as before (an injected
+    sweep owns its method). ``store.get_text`` reads the rows."""
+    from ..eval.benchmarks import BENCH_METHODS, rows_bench_method
     from ..shared.bench_report import load_bench_rows
 
     takes_method = _accepts_method(sweep_fn)
@@ -135,11 +135,6 @@ def reproduce_report(report, store, *, sweep_fn: Callable, per_suite: int = DEFA
             out.append(CheckResult(name, WARN, "not reproduced here: published bench method "
                                                f"{method!r} is not one this release runs "
                                                f"{BENCH_METHODS}"))
-            continue
-        if not takes_method and method != BENCH_METHOD:
-            out.append(CheckResult(name, WARN, f"not reproduced here: swept with bench method "
-                                               f"{method!r} and this sweep runs only "
-                                               f"{BENCH_METHOD!r}"))
             continue
         try:
             got = sweep_fn(e, bench_method=method) if takes_method else sweep_fn(e)

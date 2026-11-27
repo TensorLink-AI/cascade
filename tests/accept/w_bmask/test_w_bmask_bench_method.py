@@ -39,6 +39,7 @@ def _report(method: str):
 
 def test_sidecar_report_carries_its_bench_method_and_legacy_context():
     obs = load_observed()
+    assert hasattr(obs, "METHOD"), "observed.py has no bench method"
     assert (obs.METHOD, obs.LEGACY_METHOD) == ("observed_mask/1", "impute/0")
     new, old = _report(obs.METHOD), _report(obs.LEGACY_METHOD)
     assert new["bench_method"] == "observed_mask/1"
@@ -52,6 +53,7 @@ def test_sidecar_report_carries_its_bench_method_and_legacy_context():
 
 def test_legacy_method_returns_the_pinned_wrapper_unchanged(monkeypatch):
     obs = load_observed()
+    assert hasattr(obs, "current_method"), "observed.py has no bench method"
 
     from types import SimpleNamespace
 
@@ -76,6 +78,8 @@ def test_legacy_method_returns_the_pinned_wrapper_unchanged(monkeypatch):
 def test_item_rows_carry_the_method_and_unstamped_rows_are_legacy():
     from cascade.eval import benchmarks as B
 
+    assert hasattr(B, "rows_bench_method"), "no bench-method helpers in cascade.eval.benchmarks"
+
     rows = B.item_rows_from_report(_report("observed_mask/1"))
     assert rows["gift"]["bench_method"] == "observed_mask/1"
     assert B.rows_bench_method(rows) == "observed_mask/1"
@@ -92,7 +96,11 @@ def test_item_rows_carry_the_method_and_unstamped_rows_are_legacy():
 
 
 def test_run_bench_report_passes_the_method_to_the_sidecar(monkeypatch):
+    import inspect
+
     from cascade.eval import benchmarks as B
+
+    assert "bench_method" in inspect.signature(B.run_bench_report).parameters
 
     seen = []
     monkeypatch.setattr(B, "_invoke_sidecar",
@@ -158,18 +166,22 @@ def test_audit_reproduces_each_report_with_its_own_method(published):
 
 
 def test_audit_warns_instead_of_failing_when_it_cannot_run_the_method():
-    from cascade.audit.bench_reproduce import reproduce_report
+    from cascade.audit import bench_reproduce
+    from cascade.eval import benchmarks as B
 
+    assert hasattr(B, "rows_bench_method"), "no bench-method helpers in cascade.eval.benchmarks"
     store = _Store()
-
-    def method_blind(entry):
-        return _rows("observed_mask/1", 0.9), {"gift-eval": "rev1"}
-
-    (old,) = reproduce_report(_audit_report(store, _rows(None)), store, sweep_fn=method_blind)
-    assert old.status == "WARN" and "impute/0" in old.detail
-    (unknown,) = reproduce_report(_audit_report(store, _rows("future/7")), store,
-                                  sweep_fn=lambda e, bench_method=None: None)
-    assert unknown.status == "WARN" and "future/7" in unknown.detail
+    for published in ("future/7", None):
+        rows = _rows("future/7") if published else {
+            "gift": {**_rows("observed_mask/1")["gift"]},
+            "boom": {**_rows("impute/0")["gift"]}}
+        calls = []
+        (res,) = bench_reproduce.reproduce_report(
+            _audit_report(store, rows), store,
+            sweep_fn=lambda e, bench_method=None, c=calls: c.append(bench_method))
+        assert res.status == "WARN", res.detail
+        assert ("future/7" if published else "None") in res.detail
+        assert calls == []                      # never swept with a guessed method
 
 
 def test_default_sweep_fn_forwards_the_method():
