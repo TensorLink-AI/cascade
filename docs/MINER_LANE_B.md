@@ -224,6 +224,36 @@ measured. A failed or rejected leg is not refunded.
 - **Funding:** no `--yes` (exit 5), a spent commitment (`spent`), or a key
   that expired before the leg rented (`funding_expired`).
 
+## Past evaluations
+
+Lane B results are published in the public `cascade-manifests` bucket
+(`https://s3.hippius.com/cascade-manifests/<key>`, no keys needed), inside
+the same per-settlement receipts as lane A:
+
+| What | Key | Notes |
+|---|---|---|
+| Round index | `receipts/index.json` | Last 400 settlements. Lane B columns: `lane_b_verdicts` (one row per judged leg: `hotkey`, `domain`, `targets`, `stage`, `passed`, `reason`, `target_lcb`, `failed_guard`, `worst_guard_lcb`), `lane_b_domains` (the slots each leg improved and the margin per slot), `lane_b_pay` (paid wins) and `emission_split` |
+| One round's receipt | `receipts/<validator_hotkey>/round-<round_id>.json` | Signed. `lane_b` holds the full verdict rows, including every guard LCB (`guard_lcbs`, `public_lcbs`) |
+| Live lane B state | `status/v2.json`, key `lane_b` | Gate state, open, finished and dropped legs per domain (with the drop reason), merges |
+
+Find a round through `receipts/index.json` (round ids are seeds, not
+counters). The expert manifests (`lane_b/round-<id>.json`) are written
+private, so they are not readable anonymously.
+
+**Am I competitive?** For your leg's row, `passed` and `target_lcb` against
+the bar (`gain_margin` 1% on a declared slot, `undeclared_gain_margin` 2% on
+any other). A failed guard names itself in `failed_guard`, and
+`worst_guard_lcb` must stay above −1% (`tau_domain` / `tau_public`). A pass
+pays only once its merge is accepted (`lane_b_pay.wins`).
+
+**No lane B leg has been judged yet** (checked 2026-11-27): every
+`lane_b_verdicts` list is empty and `lane_b_pay.wins` is `[]` since lane B
+opened at block 9,586,800. Until a leg is judged there is no score to compare
+against. Example of a receipt that carries the (empty) lane B pay record,
+2026-11-27 04:31 UTC:
+<https://s3.hippius.com/cascade-manifests/receipts/5FcCsoB2R5M55RdrNrvPQv7xmLJRFzs7R7C73UUSxgUCyfsw/round-12135123300179706659.json>.
+Live state: <https://s3.hippius.com/cascade-manifests/status/v2.json>.
+
 ## FAQ
 
 **Do I pick expert IDs or targets?** Targets. Declared rows are optional and
