@@ -9,7 +9,7 @@ the scaler. `benchmarks/cascade_benchmark/observed.py` applies this to the relea
 
 | File | Pins |
 |---|---|
-| `test_w_bmask_observed_mask.py` | a short history's left padding is unobserved and filled with 0.0; NaN/inf is unobserved, not raised (the pinned wrapper still raises); the scaler's loc/scale equal those of the unpadded observed-only series; a full-length finite history forecasts exactly what the pinned wrapper forecasts; an all-missing history is counted and forecast, not raised; the sidecar loader and FEV hand the raw history to the adapter |
+| `test_w_bmask_observed_mask.py` | a short history's left padding is unobserved and filled with 0.0; NaN/inf is unobserved, not raised (the pinned wrapper still raises); a patch more than half NaN is masked whole, while scattered NaN and short-series padding stay per point; the scaler's loc/scale equal those of the unpadded observed-only series; a full-length finite history forecasts exactly what the pinned wrapper forecasts; an all-missing history is counted and forecast, not raised; the sidecar loader and FEV hand the raw history to the adapter |
 
 The torch tests build a random-init 2m pyramid checkpoint with the real trainer
 code and run only in CI (`uv sync --all-extras`). On the production box, run only

@@ -34,7 +34,7 @@ def test_short_history_padding_is_unobserved_and_filled_like_gluonts():
     assert (values[0, :CONTEXT - 100] == 0.0).all()
     assert observed[0, CONTEXT - 100:].all()
     np.testing.assert_array_equal(values[0, CONTEXT - 100:], h)
-    assert counts == {"histories": 1, "padded": 1, "with_missing": 0,
+    assert counts == {"histories": 1, "padded": 1, "with_missing": 0, "patches_masked": 0,
                       "below_min_obs": 0, "all_missing": 0}
 
 
@@ -51,11 +51,33 @@ def test_nan_and_inf_are_unobserved_not_raised():
     assert counts["padded"] == 0 and counts["with_missing"] == 1
 
 
+def test_mostly_missing_patch_is_masked_whole_scattered_nan_per_point():
+    obs = load_observed()
+    h = series(CONTEXT, seed=7)
+    h[100] = np.nan                        # isolated: patch 3 keeps 31 points
+    h[32 * 10:32 * 10 + 17] = np.nan       # 17 of 32 NaN: patch 10 masked whole
+    h[32 * 20:32 * 20 + 16] = np.nan       # exactly half: per point
+    values, observed, counts = obs.observed_context([h], CONTEXT, 32)
+    patches = observed[0].reshape(-1, 32).sum(1)
+    assert patches[3] == 31 and patches[10] == 0 and patches[20] == 16
+    assert (values[0, 320:352] == 0.0).all()
+    assert counts["patches_masked"] == 1
+    # left padding never triggers it: 13 points (M4-yearly-like) all observed
+    _, short_obs, short_counts = obs.observed_context([series(13, seed=8)], CONTEXT, 32)
+    assert short_obs[0].sum() == 13 and short_counts["patches_masked"] == 0
+    # a short history's boundary patch counts only its real points
+    s = series(40, seed=9)
+    s[[0, 1, 2, 3, 4]] = np.nan             # 5 of the boundary patch's 8 real points
+    _, b_obs, b_counts = obs.observed_context([s], CONTEXT, 32)
+    assert b_obs[0].sum() == 32 and b_counts["patches_masked"] == 1
+
+
 def test_all_missing_and_empty_histories_are_counted():
     obs = load_observed()
     _, observed, counts = obs.observed_context(
-        [np.full(50, np.nan), np.zeros(0), np.r_[np.full(10, np.nan), 1.0, 2.0]], CONTEXT)
-    assert not observed[:2].any() and observed[2].sum() == 2
+        [np.full(50, np.nan), np.zeros(0), np.r_[np.full(3, np.nan), 1.0, 2.0, 3.0, 4.0, 5.0]],
+        CONTEXT)
+    assert not observed[:2].any() and observed[2].sum() == 5
     assert counts["all_missing"] == 2 and counts["below_min_obs"] == 3
     assert counts["padded"] == 3 and counts["histories"] == 3
 
@@ -65,7 +87,7 @@ def test_sidecar_loader_and_fev_hand_raw_history_to_the_adapter():
     assert "from .observed import adapt" in pred
     assert "return adapt(Wrapper(str(checkpoint_dir), device=device))" in pred
     fev = (SIDECAR / "suites" / "fev_bench.py").read_text()
-    assert 'raw if getattr(inner[k], "handles_missing", False) else chunk' in fev
+    assert 'raw if getattr(wrappers[k], "handles_missing", False) else chunk' in fev
     res = (SIDECAR / "results.py").read_text()
     assert "gluonts-observed/1" in res
 

@@ -31,6 +31,14 @@ loaded wrapper and replaces its private ``_prep`` / ``_parameters`` step:
   is inert: ``causal_standardize`` weights every moment by the observed
   mask, and the stem reads ``values * (1 - mask)``;
 * the scaler (``causal_standardize``) counts observed points only;
+* a patch (the wrapper's grid, aligned to the context's right edge) whose
+  real points are MORE than half non-finite is unobserved as a whole.
+  Training only ever masks whole patches (CPM spans,
+  ``pyramid_trainer.prediction``), so this is the closest match to it.
+  Scattered NaN (most of GIFT-Eval's gaps are isolated points) stays per
+  point, as in GluonTS / Moirai, because masking its patch would drop up to
+  31 observed points per NaN. Left padding never triggers the rule: a very
+  short series (M4 yearly) keeps all its points;
 * NaN / inf never raises. A history with fewer than :data:`MIN_OBS`
   observed points (all-missing included) is still forecast, as GIFT-Eval
   requires one forecast per series. The scaler's own fallback handles it
@@ -59,10 +67,14 @@ FILL_VALUE = 0.0
 # ``causal_standardize``'s ``min_obs``: fewer observed points than this and
 # the scaler falls back. Counted, never silent.
 MIN_OBS = 8
+# A patch whose real (non-padding) points are more than this fraction
+# non-finite is masked as a whole patch.
+MOSTLY_MISSING = 0.5
 # The module name pyramid_wrapper loads the checkpoint's model.py under.
 PYRAMID_MODULE = "cascade_pyramid_checkpoint"
 
-COUNT_KEYS = ("histories", "padded", "with_missing", "below_min_obs", "all_missing")
+COUNT_KEYS = ("histories", "padded", "with_missing", "patches_masked", "below_min_obs",
+              "all_missing")
 
 
 def is_pyramid_wrapper(wrapper) -> bool:
@@ -75,13 +87,17 @@ def is_pyramid_wrapper(wrapper) -> bool:
             and hasattr(wrapper, "model") and hasattr(wrapper, "cfg"))
 
 
-def observed_context(histories, context_length: int):
+def observed_context(histories, context_length: int, patch_size: int = 32):
     """``(values (B, L) float64, observed (B, L) bool, counts)`` for raw 1-D
     histories at context ``L``. The last ``L`` points are kept. A shorter
     history is left-padded with :data:`FILL_VALUE`, and its padded steps are
     unobserved. A non-finite value becomes :data:`FILL_VALUE` and is
-    unobserved."""
+    unobserved. So is every point of a patch whose real points are more than
+    :data:`MOSTLY_MISSING` non-finite."""
     size = int(context_length)
+    ps = int(patch_size)
+    if size % ps:
+        raise ValueError("context_length must be a whole number of patches")
     values = np.full((len(histories), size), FILL_VALUE, dtype=np.float64)
     observed = np.zeros((len(histories), size), dtype=bool)
     counts = dict.fromkeys(COUNT_KEYS, 0)
@@ -92,7 +108,17 @@ def observed_context(histories, context_length: int):
         if n:
             values[i, size - n:] = np.where(finite, row, FILL_VALUE)
             observed[i, size - n:] = finite
-        n_obs = int(finite.sum())
+        if n and not finite.all():
+            real = np.zeros(size, dtype=bool)
+            real[size - n:] = True
+            n_real = real.reshape(-1, ps).sum(1)
+            n_bad = (real & ~observed[i]).reshape(-1, ps).sum(1)
+            mostly = (n_bad > MOSTLY_MISSING * n_real) & (n_bad < n_real)
+            if mostly.any():
+                observed[i].reshape(-1, ps)[mostly] = False
+                values[i].reshape(-1, ps)[mostly] = FILL_VALUE
+                counts["patches_masked"] += int(mostly.sum())
+        n_obs = int(observed[i].sum())
         counts["histories"] += 1
         counts["padded"] += int(n < size)
         counts["with_missing"] += int(n_obs < n)
@@ -127,7 +153,8 @@ class ObservedMaskWrapper:
     def _prep(self, histories):
         import torch
 
-        values, observed, counts = observed_context(histories, self.cfg.context_length)
+        values, observed, counts = observed_context(histories, self.cfg.context_length,
+                                                    self.cfg.patch_size)
         for k, v in counts.items():
             self.counts[k] += v
         if counts["below_min_obs"]:
