@@ -32,7 +32,10 @@ def test_backward_under_bf16_autocast_returns_fp32_leaf_grads():
     with torch.autocast("cpu", dtype=torch.bfloat16):
         out = _fn().apply(x, frozen, selected, rows)
         loss = out.float().square().mean()
-    loss.backward()           # raised RuntimeError (Float vs BFloat16) on base
+    try:
+        loss.backward()       # raised RuntimeError (Float vs BFloat16) on base
+    except RuntimeError as e:
+        raise AssertionError(f"expert matmul backward fails under bf16 autocast: {e}") from e
     assert selected.grad is not None and selected.grad.dtype == torch.float32
     assert torch.isfinite(selected.grad).all()
     assert x.grad is not None and x.grad.dtype == x.dtype and torch.isfinite(x.grad).all()
@@ -44,7 +47,10 @@ def test_backward_with_bf16_activations_and_fp32_leaves():
     x2 = x.detach().requires_grad_(True)
     with torch.autocast("cpu", dtype=torch.bfloat16):
         out = _fn().apply(x2, frozen, selected, rows)
-    out.float().sum().backward()
+    try:
+        out.float().sum().backward()
+    except RuntimeError as e:
+        raise AssertionError(f"expert matmul backward fails under bf16 autocast: {e}") from e
     assert selected.grad.dtype == torch.float32 and torch.isfinite(selected.grad).all()
 
 
