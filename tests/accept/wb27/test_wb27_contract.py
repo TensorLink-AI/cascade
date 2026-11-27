@@ -22,12 +22,15 @@ def test_empty_spec_is_todays_leg_contract():
                           guard_floor_seconds=cfg.round.heat_guard_floor_seconds)
     from dataclasses import replace
 
-    # every lane B leg: rev6.20's EMA / no cooldown, ONE EMA (0.10 by default)
-    want = replace(want, lr_schedule="warmup_constant_ema", power_ema_sigma_rels=(0.10,),
-                   power_ema_eval=0)
+    # every lane B leg: rev6.20's EMA / no cooldown. No spec (no --recipe-json)
+    # folds no levers — the worker applies them only `if lane_b_spec:`, so a
+    # no-spec leg keeps the image's EMAs and the trainer expects THAT digest
+    # (2026-11-27 owner fix: ebfed637 expected vs a3ea79b2 received)
+    want = replace(want, lr_schedule="warmup_constant_ema")
     assert lv.lane_b_leg_contract(cfg, base, block=b, spec={}) == want
-    # default levers in a spec change nothing
-    assert lv.lane_b_leg_contract(cfg, base, block=b, spec={"levers": {"lr_scale": 1.0}}) == want
+    # a spec (even with default levers) folds the ONE default EMA (0.10)
+    one = replace(want, power_ema_sigma_rels=(0.10,), power_ema_eval=0)
+    assert lv.lane_b_leg_contract(cfg, base, block=b, spec={"levers": {"lr_scale": 1.0}}) == one
 
 
 def test_armed_levers_fold_into_the_leg_contract():
@@ -45,8 +48,8 @@ def test_armed_levers_fold_into_the_leg_contract():
     assert contract_digest(c) != contract_digest(plain)
     p = contract_payload(c)
     assert p["lane_b_lr_scale"] == 1.5 and p["power_ema_eval"] == 0
-    # the default width is the one EMA of a plain EMA leg too (only it computed)
-    assert (plain.power_ema_sigma_rels, plain.power_ema_eval) == ((0.10,), 0)
+    # a no-spec leg keeps the image's EMAs (the worker folds no levers)
+    assert (plain.power_ema_sigma_rels, plain.power_ema_eval) == ((), -1)
     # no activation block: any dispatch block gives the same contract
     assert lv.lane_b_leg_contract(cfg, base, block=0, spec={"levers": LEVERS}) == c
     assert lv.lane_b_scored_weights_for(cfg.lane_b, 0, lv.LegLevers(ema=0.15)) == "ema015"
