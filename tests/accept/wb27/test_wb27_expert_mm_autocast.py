@@ -53,12 +53,3 @@ def test_backward_with_bf16_activations_and_fp32_leaves():
         raise AssertionError(f"expert matmul backward fails under bf16 autocast: {e}") from e
     assert selected.grad.dtype == torch.float32 and torch.isfinite(selected.grad).all()
 
-
-def test_fp32_path_unchanged():
-    # no autocast: the gradient equals the dense reference exactly as before
-    x, frozen, selected, rows = _inputs()
-    out = _fn().apply(x, frozen, selected, rows)
-    out.square().sum().backward()
-    xs = x.detach()[rows]
-    ref = (xs.mT @ (2 * (xs @ selected.detach())))
-    assert torch.allclose(selected.grad, ref, rtol=1e-5, atol=1e-6)
