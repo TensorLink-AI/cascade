@@ -958,15 +958,22 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
             def r2_fallback():
                 return _mark_harvested(self, host, harvest_checkpoint_r2(
                     self, host, receipt, contract, seeds, suffix, release=release))
+        # 2026-11-27: with R2 able to take over, a too-slow ssh stream is
+        # abandoned after ``harvest_ssh_probe_seconds`` (never trickled to the
+        # 1 h wall) and the checkpoint goes pod → R2; the pod is kept meanwhile
+        probe = (float(getattr(self.cfg.round, "harvest_ssh_probe_seconds", 0) or 0)
+                 if r2_fallback is not None else 0.0)
         return guarded_harvest(
             self, dest, lambda: TrainerRunner._harvest_funded_checkpoint_ssh(
-                self, host, receipt, contract, seeds, suffix, release=release),
+                self, host, receipt, contract, seeds, suffix, release=release,
+                slow_probe_seconds=probe),
             label=f"{receipt.miner_hotkey[:12]}/{job_id[:8]}", hotkey=receipt.miner_hotkey,
             pod_id=str(getattr(host, "allocation_id", "") or getattr(host, "name", "")),
             r2_fallback=r2_fallback)
 
     def _harvest_funded_checkpoint_ssh(self, host, receipt, contract, seeds,
-                                       suffix: str, *, release=None):
+                                       suffix: str, *, release=None,
+                                       slow_probe_seconds: float = 0.0):
         """One ssh harvest attempt (see :meth:`_harvest_funded_checkpoint`)."""
         from ..eval.checkpoint_guard import (
             CheckpointDiverged,
@@ -989,7 +996,9 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
         _check_harvest_dir(receipt.checkpoint_dir)
         bound = harvest_max_bytes(self.cfg.round, contract.arch_preset)
         try:
-            harvest_remote_dir(host, receipt.checkpoint_dir, dest, max_bytes=bound)
+            harvest_remote_dir(host, receipt.checkpoint_dir, dest, max_bytes=bound,
+                               **({"slow_probe_seconds": slow_probe_seconds}
+                                  if slow_probe_seconds else {}))
         except Exception as e:  # noqa: BLE001 — only the size breach is re-classed
             if "exceeds its storage limit" not in str(e):
                 raise

@@ -20,6 +20,10 @@ was gone. The class-level fixes here:
   raised — an operator fault that tells the leg paths to KEEP the pod (its
   ledger row stays; the requeued leg re-attaches and harvests it, the sweep
   keeps a finished-unharvested run for ``SWEEP_UNHARVESTED_KEEP_SECONDS``).
+* a SLOW or stalled ssh stream of the finished run (the watchdog's
+  ``HarvestStreamSlow``, 2026-11-27: 14 GB off an Australian 8xH200 at
+  ~0.5 MB/s) switches to the pod → R2 transport at once; if that fails too
+  the leg fails as :class:`HarvestSlowKeepPod` — unburned, the pod KEPT.
 * the pod is torn down only after a verified harvest (``harvest_release``)
   or when the run is proven failed — never because OUR side failed.
 """
@@ -56,6 +60,24 @@ class HarvestDiskFault(HarvestKeepPod):
 
 class HarvestIncomplete(HarvestKeepPod):
     """The box copy still differs from the pod's own listing (size/sha256)."""
+
+
+class HarvestSlowKeepPod(HarvestKeepPod):
+    """The ssh stream of a finished run was too slow / stalled and the pod →
+    R2 transport failed too (or is not configured): the pod still holds the
+    checkpoint — kept, unburned, re-attached and harvested."""
+
+
+def slow_stream(exc: BaseException | None) -> bool:
+    """Whether ``exc`` (or its cause chain) is a harvest watchdog breach of a
+    pod that still answers (``remote.HarvestStreamSlow`` with ``keep_pod``)."""
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if getattr(exc, "harvest_slow", False) and getattr(exc, "keep_pod", False):
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
 
 
 def local_disk_error(exc: BaseException | None) -> OSError | None:
@@ -186,6 +208,7 @@ def guarded_harvest(runner, dest: Path | str, attempt: Callable[[], object], *,
     payer = bool(getattr(loc, "harvest_pod_payer", False))
     halted = False
     mismatches = 0
+    slow = False
     last: BaseException | None = None
     try:
         for i in range(retries + 1):
@@ -210,6 +233,14 @@ def guarded_harvest(runner, dest: Path | str, attempt: Callable[[], object], *,
                     if payer and mismatches >= 2:
                         raise _unverifiable(runner, dest, label, e, hotkey) from e
                 except Exception as e:
+                    if slow_stream(e):
+                        # the link, not our disk: never re-pulled over it —
+                        # straight to the pod → R2 transport, pod kept
+                        last, slow = e, True
+                        log.error("harvest of %s: ssh stream too slow / stalled (%s) — "
+                                  "switching to the pod → R2 transport; the pod is KEPT",
+                                  label, str(e)[:240])
+                        break
                     err = local_disk_error(e)
                     if err is None:
                         raise
@@ -246,8 +277,9 @@ def guarded_harvest(runner, dest: Path | str, attempt: Callable[[], object], *,
                   "pod is the only copy of the finished run", severity="critical")
         if r2_fallback is not None:
             try:
-                log.warning("harvest of %s: box-side harvest exhausted its budget — pushing "
-                            "pod → R2 directly (the pod-side safety net)", label)
+                log.warning("harvest of %s: box-side harvest %s — pushing pod → R2 directly "
+                            "(the pod-side safety net)", label,
+                            "too slow" if slow else "exhausted its budget")
                 result = r2_fallback()
                 clear_alert(runner, "harvest_disk", label[:16])
                 if hotkey:                      # harvested: no stale lost-run record (N5)
@@ -260,6 +292,11 @@ def guarded_harvest(runner, dest: Path | str, attempt: Callable[[], object], *,
                     raise                          # a verdict on the run, not our disk
                 log.error("harvest of %s: pod → R2 fallback failed too (%s)", label,
                           str(e)[:200])
+        if slow:
+            raise HarvestSlowKeepPod(
+                f"harvest of {label}: ssh stream too slow and the pod → R2 transport "
+                f"{'failed' if r2_fallback is not None else 'is not configured'} ({last}); "
+                "the pod is KEPT for the re-attach — nothing burned") from last
         raise HarvestDiskFault(
             f"harvest of {label} failed on the operator's side after {retries + 1} tries "
             f"({last}); the pod is KEPT for the re-attach — nothing burned") from last

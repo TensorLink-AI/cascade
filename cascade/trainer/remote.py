@@ -1837,7 +1837,8 @@ class _RateWindow:
 def harvest_remote_dir(host: RemoteHost, remote_dir: str, dest: Path | str,
                        *, timeout: int = HARVEST_TIMEOUT_SECONDS,
                        stall_timeout: float = HARVEST_STALL_SECONDS,
-                       runner=None, max_bytes: int | None = None) -> Path:
+                       runner=None, max_bytes: int | None = None,
+                       slow_probe_seconds: float = 0.0) -> Path:
     """Copy ``host:remote_dir`` into local ``dest`` (tar over ssh, ``dest``
     wiped first), under exactly the dispatch transport policy — a pinned host
     key stays pinned for the harvest. The credential-free pods' return
@@ -1853,7 +1854,13 @@ def harvest_remote_dir(host: RemoteHost, remote_dir: str, dest: Path | str,
     ``timeout`` seconds for the whole stream unless it is still averaging at
     least :data:`HARVEST_MIN_RATE_BYTES_PER_S`; and
     :data:`HARVEST_HARD_CAP_SECONDS` absolutely. A watchdog thread kills
-    ssh on either breach, and the harvest raises :class:`RemoteDispatchError`."""
+    ssh on either breach, and the harvest raises :class:`HarvestStreamSlow`
+    (a :class:`RemoteDispatchError`; ``keep_pod`` when the pod still answers).
+
+    ``slow_probe_seconds`` > 0 (``[round] harvest_ssh_probe_seconds``, passed
+    only when the pod → R2 transport can take over): a stream averaging below
+    :data:`HARVEST_MIN_RATE_BYTES_PER_S` that far in is abandoned early as
+    :class:`HarvestStreamSlow` instead of trickling to the hour-long wall."""
     import shutil
     import threading
 
@@ -1889,13 +1896,22 @@ def harvest_remote_dir(host: RemoteHost, remote_dir: str, dest: Path | str,
         work.mkdir(parents=True)
         try:
             _harvest_stream_into(host, remote_dir, argv, work, timeout=timeout,
-                                 stall_timeout=stall_timeout, max_bytes=max_bytes)
+                                 stall_timeout=stall_timeout, max_bytes=max_bytes,
+                                 slow_probe_seconds=slow_probe_seconds)
             _fsync_tree(work)
             os.replace(work, dest)
             _fsync_dir(dest.parent)
             return dest
         except RemoteDispatchError as e:
             shutil.rmtree(work, ignore_errors=True)
+            if isinstance(e, HarvestStreamSlow):
+                # a watchdog breach of a finished run: never retried over the
+                # same slow link — the caller switches transport (pod → R2)
+                # and keeps a pod that still holds the checkpoint
+                reachable = remote_dir_reachable(host, remote_dir)
+                raise HarvestStreamSlow(
+                    f"{e} [pod {'still reachable — kept' if reachable else 'unreachable'}]",
+                    pod_reachable=reachable) from e
             if not _is_broken_stream(e):
                 raise                   # a watchdog breach / refusal: not retried
             reachable = remote_dir_reachable(host, remote_dir)
@@ -1937,6 +1953,24 @@ class _HarvestStreamFailure(RemoteDispatchError, HarvestStreamError):
         self.keep_pod = bool(pod_reachable)
 
 
+class HarvestStreamSlow(RemoteDispatchError):
+    """The harvest watchdog stopped a stalled / trickling / too-slow ssh stream
+    of a FINISHED run (2026-11-27: a 14 GB lane B checkpoint off an 8xH200 in
+    Australia at ~0.5 MB/s was killed at 3600 s and the pod torn down).
+
+    A slow link is the operator's transport, never the run: ``harvest_slow``
+    tells :func:`cascade.trainer.harvest_guard.guarded_harvest` to switch to
+    the pod → R2 transport at once, and ``keep_pod`` (the pod still answers
+    and holds the checkpoint) keeps the pod if that fails too."""
+
+    harvest_slow = True
+
+    def __init__(self, msg: str, *, pod_reachable: bool | None = None) -> None:
+        super().__init__(msg)
+        self.pod_reachable = pod_reachable
+        self.keep_pod = bool(pod_reachable)
+
+
 def remote_dir_reachable(host: RemoteHost, remote_dir: str, *, runner=None,
                          timeout: int = HARVEST_REACH_PROBE_SECONDS) -> bool:
     """Does ``host`` still answer ssh AND hold ``remote_dir``? Read-only."""
@@ -1975,7 +2009,8 @@ def _fsync_tree(root: Path) -> None:
 
 
 def _harvest_stream_into(host, remote_dir: str, argv: list[str], dest: Path, *,
-                         timeout: int, stall_timeout: float, max_bytes: int | None) -> None:
+                         timeout: int, stall_timeout: float, max_bytes: int | None,
+                         slow_probe_seconds: float = 0.0) -> None:
     """The tar-over-ssh stream of :func:`harvest_remote_dir`, extracted into
     ``dest`` under the ``"data"`` filter and both deadlines."""
     import tarfile
@@ -1988,14 +2023,25 @@ def _harvest_stream_into(host, remote_dir: str, argv: list[str], dest: Path, *,
     breach: list[str] = []
 
     rate_window = _RateWindow()
+    probe = float(slow_probe_seconds or 0.0)
 
     def _watchdog() -> None:
         poll = max(0.05, min(5.0, float(stall_timeout) / 4))
+        if probe > 0:
+            poll = min(poll, max(0.05, probe / 4))
+        probed = probe <= 0
         while not stop.wait(poll):
             now = time.monotonic()
             recent = rate_window.add(now, stream.nbytes)
             why = harvest_total_breach(now - started, stream.nbytes, timeout,
                                        recent_rate=recent)
+            if not why and not probed and now - started >= probe:
+                probed = True
+                avg = stream.nbytes / max(now - started, 1e-9)
+                if avg < HARVEST_MIN_RATE_BYTES_PER_S:
+                    why = (f"slow stream: {avg / 1e6:.2f} MB/s average over the first "
+                           f"{probe:.0f}s < {HARVEST_MIN_RATE_BYTES_PER_S / 1e6:.2f} MB/s "
+                           f"floor ({stream.nbytes} bytes received) — switching transport")
             if why:
                 breach.append(why)
             elif now - stream.last_progress > stall_timeout:
@@ -2012,7 +2058,7 @@ def _harvest_stream_into(host, remote_dir: str, argv: list[str], dest: Path, *,
     def _timed_out() -> RemoteDispatchError | None:
         if not breach:
             return None
-        return RemoteDispatchError(
+        return HarvestStreamSlow(
             f"checkpoint harvest from {host.name}:{remote_dir} timed out: {breach[0]}")
 
     try:

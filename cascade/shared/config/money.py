@@ -29,6 +29,10 @@ MONEY_KNOBS: dict[str, tuple[object, str]] = {
     # priced keep (harvest_keep_cost_fraction) usually ends it sooner.
     "harvest_keep_max_seconds": (10800, "seconds"),
     "harvest_keep_cost_fraction": (0.5, "fraction"),
+    # 2026-11-27: an ssh checkpoint harvest still averaging below 1 MB/s this
+    # far in is abandoned for the pod → R2 transport (only when R2 is
+    # configured; the pod is kept meanwhile). 0 = off: ssh to the 1 h wall.
+    "harvest_ssh_probe_seconds": (600, "seconds"),
     "miner_waste_cap_usd": (30.0, "usd"),
     "operator_pause_resume_seconds": (21600, "seconds"),
     "box_fault_window_seconds": (7200, "seconds"),
