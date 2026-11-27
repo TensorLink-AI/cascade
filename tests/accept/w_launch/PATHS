@@ -141,3 +141,14 @@ tests/unit/test_incident_rules.py
 tests/unit/test_box_side_torch_free.py
 tests/unit/test_runner_cfg_consumers_follow_overlay.py
 tests/unit/test_stage_pods_gate_on_their_own_pins.py
+
+# 2026-11-27 RCA (owner ~20:50, "root cause analysis ... add any lessons to
+# lint"): the dated lessons section + OPEN list; IR009 (JSON parsed from an ssh
+# reply's raw stdout, #983) with its reviewed validator_bench exception; the
+# torch-free scans: bf16-autocast backward test per autograd Function (#974),
+# trainer == worker lane B leg contract on the worker's own code (#980), eval-
+# pod cache dirs on the data mount (#982); the pre-paid-leg checklist.
+cascade/validator/validator_bench.py
+tests/unit/test_autograd_functions_have_bf16_tests.py
+tests/unit/test_lane_b_trainer_worker_contract_parity.py
+tests/unit/test_eval_pod_cache_dirs_on_data_mount.py

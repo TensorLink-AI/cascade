@@ -463,6 +463,7 @@ class ValidatorBenchMixin:
             command = (f"cd {shlex.quote(host.workdir)} && "
                        + " ".join(shlex.quote(a) for a in args))
             proc = run_ssh(build_ssh_argv(host, command), 30)
+            # incident-ok: IR009 bench_identity is stdlib-only (no hub/download imports) and prints only its one JSON line
             identity = json.loads(proc.stdout) if proc.returncode == 0 else None
             return identity if isinstance(identity, dict) else None
         except Exception:

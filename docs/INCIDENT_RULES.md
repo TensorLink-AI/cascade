@@ -217,3 +217,30 @@ run beside an orphan.
 
 **Limits.** The check is per function: a command built in one helper and sent
 in another is checked where the `-m` string is built.
+
+## IR009 — an ssh reply's raw stdout parsed as JSON
+
+**Incident.** 2026-11-27, PR #983. The lane B settlement rebase ran
+`<worker> && cat result.json` in one ssh command and parsed the whole stdout
+with `json.loads`. While the step pulled an uncached 16 GB checkpoint,
+`hippius_hub/file_download.py` printed `Downloading <file> (parallel)...` to
+stdout ahead of the JSON. The parse failed ("pod reply is not JSON"), and the
+19:27 settlement published without lane B. #983 parses the last JSON line
+(`lane_b_offload.pod_reply_json`).
+
+**Rule.** In `cascade/` and `scripts/`, a function that makes an ssh call (a
+call whose name contains `ssh`) must not pass `X.stdout` or
+`X.stdout.strip()` straight to `json.loads`. Three shapes pass:
+
+- `X` comes from its own ssh call whose command is a literal `cat <file>`
+  and nothing else (no `&&`, `;` or `|`);
+- the parse picks a line (`.splitlines()[-1]`);
+- the reply goes through a tolerant parser (`pod_reply_json`).
+
+**Fix.** Read the result file with a separate `cat`-only ssh call, or parse
+the last line. Remote modules log to stderr. Library chatter is outside our
+control, so the reader must tolerate it.
+
+**Limits.** The check is per function and follows only plain `X = <call>`
+assignments. A reviewed exception (`validator_bench`'s stdlib-only
+`bench_identity` probe) carries an `incident-ok: IR009` comment.

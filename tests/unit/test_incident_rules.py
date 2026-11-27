@@ -323,6 +323,60 @@ def test_ir008_allowlist_and_reviewed_table(tmp_path):
         assert len(reason) > 10
 
 
+
+# ── IR009 an ssh reply's raw stdout parsed as JSON ─────────────────────────────
+
+# The pre-#983 LaneBOffload step (cascade/trainer/lane_b_offload.py at ea860300):
+# the worker and the `cat result.json` share one ssh stdout.
+IR009_PRE_983 = '''\
+class LaneBOffload:
+    def _step(self, host, op, run_dir, stdin):
+        cmd = (f"cd {q(host.workdir)} && {py} -m cascade.trainer.lane_b_offload {op} && "
+               f"cat {q(run_dir + '/result.json')}")
+        proc = ok(self._ssh(host, cmd, left(), stdin), "worker")
+        doc = json.loads(proc.stdout)
+'''
+
+
+def test_ir009_flags_the_pre_983_pod_reply(tmp_path):
+    files = {"cascade/trainer/lane_b_offload.py": IR009_PRE_983}
+    assert hits(tmp_path, files, "IR009") == [("IR009", "cascade/trainer/lane_b_offload.py", 6)]
+    stripped = IR009_PRE_983.replace("json.loads(proc.stdout)", "json.loads(proc.stdout.strip())")
+    assert hits(tmp_path, {"cascade/y.py": stripped}, "IR009") == [("IR009", "cascade/y.py", 6)]
+
+
+@pytest.mark.parametrize("text", [
+    # #983: the tolerant parser
+    IR009_PRE_983.replace("json.loads(proc.stdout)", "pod_reply_json(proc.stdout)"),
+    # a separate cat-only ssh call (bench_hook / lane_b_bench / eval_offload)
+    "def report(host, path):\n"
+    "    cat = run_ssh(build_ssh_argv(host, f\"cat {shlex.quote(path)}\"), 120)\n"
+    "    return json.loads(cat.stdout)\n",
+    # a last-line parse (eval_offload.check_private_worker)
+    "def probe(host):\n    proc = run_ssh(build_ssh_argv(host, cmd), 30)\n"
+    "    return json.loads(proc.stdout.strip().splitlines()[-1])\n",
+    # a local subprocess: no ssh in the function
+    "def local():\n    run = subprocess.run(argv, capture_output=True)\n"
+    "    return json.loads(run.stdout)\n",
+])
+def test_ir009_passes_tolerant_cat_only_and_local(tmp_path, text):
+    assert hits(tmp_path, {"cascade/x.py": text}, "IR009") == []
+
+
+def test_ir009_cat_chained_after_a_worker_is_still_a_hit(tmp_path):
+    text = ("def step(host):\n"
+            "    proc = run_ssh(build_ssh_argv(host, f\"cat a.json && {py} -m w\"), 9)\n"
+            "    return json.loads(proc.stdout)\n")
+    assert hits(tmp_path, {"cascade/x.py": text}, "IR009") == [("IR009", "cascade/x.py", 3)]
+
+
+def test_ir009_allowlist(tmp_path):
+    text = IR009_PRE_983.replace(
+        "        doc = json.loads(proc.stdout)\n",
+        "        # incident-ok: IR009 stdlib-only module, prints only its JSON\n"
+        "        doc = json.loads(proc.stdout)\n")
+    assert hits(tmp_path, {"cascade/x.py": text}, "IR009") == []
+
 # ── allowlist hygiene (IR000) and the repository itself ────────────────────────
 
 def test_allowlist_needs_a_known_rule_and_a_reason(tmp_path):
