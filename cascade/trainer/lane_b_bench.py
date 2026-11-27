@@ -41,6 +41,19 @@ named by ``--lane-b-bench-hosts`` (an eval-hosts TOML, re-read per bench):
   pointer → key map is persisted next to the rows. Without a pod runner a
   pointer bench needs a box-side fetch and is refused unless
   ``CASCADE_LANE_B_LOCAL_EVAL=1`` (the lane-B offload guard).
+* **Bench method in the key** (#973, 2026-11-27). A row file is keyed by
+  :func:`rows_key` = the content key AND the ``bench_method`` its rows
+  carry (:func:`cascade.eval.benchmarks.rows_bench_method`; unstamped rows
+  are ``impute/0``, whose key is the bare content key, so the rows cached
+  before the stamp stay valid). Lookups use the method of the newest sweep
+  (persisted in ``bench-method.json``): when the pod's sidecar switches
+  method, the next sweep moves the cache onto the new method and every row
+  swept with the old one misses — it is re-benched, never paired across
+  methods (:func:`~cascade.eval.public_guards.pair_public_rows` refuses a
+  mixed pair too). Rows whose suites disagree on the method are not cached.
+* **Prepared candidates** (:meth:`LaneBBench.bench_pin`): the prepare-ahead
+  worker (:mod:`cascade.trainer.lane_b_prepare`) stages a rebased candidate
+  on the pod and queues its pinned dir here, on the same single worker.
 * **Fail closed.** No hosts file, no host in it, a lock that never frees, a
   failed or incomplete sweep: nothing is cached, an ERROR is logged, and the
   bench is re-queued by the next settlement. Nothing ever runs locally.
@@ -66,6 +79,19 @@ log = logging.getLogger("cascade.trainer.lane_b_bench")
 # Lane B's sidecar allowance per checkpoint (a full four-suite sweep is ~1 h).
 LANE_B_BENCH_TIMEOUT_S = 2 * 3600 + 1800
 ROWS_SCHEMA = "lane-b-bench-rows/1"
+METHOD_FILE = "bench-method.json"
+
+
+def rows_key(key: str, method: str | None) -> str:
+    """The row-cache key of content key ``key`` swept with ``method``: the
+    bare content key for the legacy ``impute/0`` (every row file cached before
+    the #973 stamp), else a digest over both — a method switch can never
+    serve rows swept the other way."""
+    from ..eval.benchmarks import LEGACY_BENCH_METHOD
+
+    if not method or method == LEGACY_BENCH_METHOD:
+        return str(key)
+    return hashlib.sha256(f"{key}\0bench_method={method}".encode()).hexdigest()
 
 
 def content_key(ckpt_dir: Path, settings: dict) -> str:
@@ -134,6 +160,48 @@ class LaneBBench:
         self._q: queue.Queue = queue.Queue()
         self._worker: threading.Thread | None = None
         self._start_worker = start_worker
+        # tag -> why its last bench produced no rows (cleared when re-queued);
+        # the prepare-ahead worker polls it to retry within minutes
+        self._failed: dict[str, str] = {}
+        self._method: str | None = None
+
+    # ── bench method (#973) ──────────────────────────────────────────────────
+
+    @property
+    def method(self) -> str:
+        """The bench method of the newest sweep (persisted; ``impute/0``
+        before any stamped sweep — every row cached before the stamp)."""
+        from ..eval.benchmarks import BENCH_METHODS, LEGACY_BENCH_METHOD
+
+        with self._lock:
+            if self._method is not None:
+                return self._method
+        try:
+            got = json.loads((self.cache_dir / METHOD_FILE).read_text(encoding="utf-8"))
+            got = got.get("bench_method") if isinstance(got, dict) else None
+        except (OSError, ValueError):
+            got = None
+        m = got if got in BENCH_METHODS else LEGACY_BENCH_METHOD
+        with self._lock:
+            self._method = m
+        return m
+
+    def _note_method(self, method: str) -> None:
+        old = self.method
+        if method == old:
+            return
+        log.warning("lane B bench: the eval pod's sidecar now sweeps with bench method %s "
+                    "(was %s) — rows swept with %s are no longer served; they re-bench",
+                    method, old, old)
+        with self._lock:
+            self._method = method
+        try:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            tmp = (self.cache_dir / METHOD_FILE).with_suffix(".tmp")
+            tmp.write_text(json.dumps({"bench_method": method}), encoding="utf-8")
+            tmp.replace(self.cache_dir / METHOD_FILE)
+        except OSError as e:
+            log.warning("lane B bench: bench method not persisted: %s", e)
 
     # ── cache ────────────────────────────────────────────────────────────────
 
@@ -141,20 +209,26 @@ class LaneBBench:
         return self.cache_dir / f"{key}.json"
 
     def cached(self, key: str) -> dict | None:
+        """The rows of content key ``key`` swept with the current
+        :attr:`method` (None = not benched that way)."""
+        from ..eval.benchmarks import rows_bench_method
+
+        method = self.method
+        rk = rows_key(key, method)
         with self._lock:
-            if key in self._mem:
-                return self._mem[key]
-        p = self._path(key)
+            if rk in self._mem:
+                return self._mem[rk]
+        p = self._path(rk)
         try:
             doc = json.loads(p.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return None
         rows = doc.get("rows") if isinstance(doc, dict) and doc.get("schema") == ROWS_SCHEMA \
             else None
-        if not rows_complete(rows, self.suites):
+        if not rows_complete(rows, self.suites) or rows_bench_method(rows) != method:
             return None
         with self._lock:
-            self._mem[key] = rows
+            self._mem[rk] = rows
         return rows
 
     def _keys_path(self) -> Path:
@@ -198,15 +272,29 @@ class LaneBBench:
         except OSError as e:
             log.warning("lane B bench: pointer key map not persisted: %s", e)
 
-    def _store(self, key: str, rows: dict, label: str) -> None:
+    def _store(self, key: str, rows: dict, label: str) -> bool:
+        """Cache ``rows`` under :func:`rows_key` of ``key`` and the method
+        they carry; rows whose suites disagree on it are refused (False)."""
+        from ..eval.benchmarks import rows_bench_method
+
+        method = rows_bench_method(rows)
+        if method is None:
+            log.error("lane B bench: %s rows mix bench methods across suites (%s) — not "
+                      "cached", label[-32:], {k: (v or {}).get("bench_method")
+                                              for k, v in rows.items()})
+            return False
+        self._note_method(method)
+        rk = rows_key(key, method)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        tmp = self._path(key).with_suffix(".tmp")
+        tmp = self._path(rk).with_suffix(".tmp")
         tmp.write_text(json.dumps({"schema": ROWS_SCHEMA, "key": key, "label": label,
-                                   "settings": self.settings, "rows": rows}),
+                                   "settings": self.settings, "bench_method": method,
+                                   "rows": rows}),
                        encoding="utf-8")
-        tmp.replace(self._path(key))
+        tmp.replace(self._path(rk))
         with self._lock:
-            self._mem[key] = rows
+            self._mem[rk] = rows
+        return True
 
     # ── public ───────────────────────────────────────────────────────────────
 
@@ -263,13 +351,52 @@ class LaneBBench:
         with self._lock:
             return len(self._pending)
 
+    # ── prepare-ahead (lane_b_prepare) ───────────────────────────────────────
+
+    @staticmethod
+    def ptr_tag(pointer: str) -> str:
+        return f"ptr:{pointer}"
+
+    @staticmethod
+    def key_tag(key: str) -> str:
+        return f"key:{key}"
+
+    def queued(self, tag: str) -> bool:
+        with self._lock:
+            return tag in self._pending
+
+    def failure(self, tag: str) -> str | None:
+        """Why ``tag``'s last bench produced no rows (None = no failure since
+        it was last queued)."""
+        with self._lock:
+            return self._failed.get(tag)
+
+    def pointer_rows(self, pointer: str) -> dict | None:
+        """The cached rows of ``pointer`` (never queues, never fetches)."""
+        key = self._ptr_key(str(pointer))
+        return self.cached(key) if key else None
+
+    def bench_pin(self, host, key: str, pin: str, label: str) -> bool:
+        """Queue the sweep of a checkpoint ALREADY staged on ``host`` at
+        ``pin`` (content key ``key``; the prepare-ahead rebase); the worker
+        removes the pin. False (pin removed now) when already cached or
+        queued."""
+        tag = self.key_tag(key)
+        if self.cached(key) is not None or self.queued(tag) or self.hosts_path is None:
+            if self._pod is not None:
+                self._pod.unpin(host, pin)
+            return False
+        self._enqueue(tag, ("pin", (host, str(key), str(pin), str(label))))
+        return True
+
     # ── worker ───────────────────────────────────────────────────────────────
 
-    def _enqueue(self, tag: str, item: tuple[str, str]) -> None:
+    def _enqueue(self, tag: str, item: tuple) -> None:
         with self._lock:
             if tag in self._pending:
                 return
             self._pending.add(tag)
+            self._failed.pop(tag, None)
             if self._start_worker and (self._worker is None or not self._worker.is_alive()):
                 self._worker = threading.Thread(target=self._loop, name="laneb-bench",
                                                 daemon=True)
@@ -279,27 +406,43 @@ class LaneBBench:
     def _loop(self) -> None:
         while True:
             tag, item = self._q.get()
-            try:
-                self.run_one(item)
-            except Exception as e:  # noqa: BLE001 — a failed bench is retried by the next ask
-                log.error("lane B bench: %s failed: %s", item[1][-40:], e)
-            finally:
-                with self._lock:
-                    self._pending.discard(tag)
+            self.run_tagged(tag, item)
+
+    def run_tagged(self, tag: str, item: tuple) -> dict | None:
+        """:meth:`run_one` for a queued ``tag``, recording a failure (no
+        rows, or an error) for :meth:`failure` (the worker's body)."""
+        rows, why = None, None
+        try:
+            rows = self.run_one(item)
+            if rows is None:
+                why = "the bench produced no complete four-suite rows (see the ERROR log)"
+        except Exception as e:  # noqa: BLE001 — a failed bench is retried by the next ask
+            log.error("lane B bench: %s failed: %s", _item_label(item), e)
+            why = f"{type(e).__name__}: {e}"
+        finally:
+            with self._lock:
+                self._pending.discard(tag)
+                if why is not None:
+                    self._failed[tag] = why[:300]
+        return rows
 
     def _run_pinned(self, pointer: str) -> dict | None:
         """A pointer bench on the eval pod: stage (fetch + content key + pin)
         there, sweep the pinned dir in place, cache the rows by content."""
+        host, key, pin = self._pod.bench_stage(pointer, self.settings)
+        self.note_key(pointer, key)
+        return self._sweep_pin(host, key, pin, str(pointer).rsplit("@", 1)[-1].replace(":", "-"))
+
+    def _sweep_pin(self, host, key: str, pin: str, label: str) -> dict | None:
+        """Sweep the pinned dir ``pin`` on ``host`` in place and cache its rows
+        under ``key``; always removes the pin."""
         from ..eval.benchmarks import item_rows_from_report
 
-        host, key, pin = self._pod.bench_stage(pointer, self.settings)
         try:
-            self.note_key(pointer, key)
             got = self.cached(key)
             if got is not None:
                 return got
             s = self.settings
-            label = str(pointer).rsplit("@", 1)[-1].replace(":", "-")
             log.info("lane B bench: sweeping %s on %s in place (suites=%s, max_series=%d)",
                      label[-32:], getattr(host, "name", host), ",".join(self.suites),
                      s["max_series"])
@@ -314,7 +457,8 @@ class LaneBBench:
                           {k: (v or {}).get("status") for k, v in (rows or {}).items()}
                           or "none")
                 return None
-            self._store(key, rows, label)
+            if not self._store(key, rows, label):
+                return None
             log.info("lane B bench: %s benched on %s — rows cached", label[-32:],
                      getattr(host, "name", host))
             return rows
@@ -324,6 +468,9 @@ class LaneBBench:
     def run_one(self, item: tuple[str, str]) -> dict | None:
         """Bench one queued item now (the worker's body; tests call it)."""
         kind, ref = item
+        if kind == "pin":
+            host, key, pin, label = ref
+            return self._sweep_pin(host, key, pin, label)
         if kind == "ptr" and self._pod is not None:
             return self._run_pinned(ref)
         if kind == "ptr":
@@ -367,13 +514,21 @@ class LaneBBench:
                       getattr(host, "name", host),
                       {k: (v or {}).get("status") for k, v in (rows or {}).items()} or "none")
             return None
-        self._store(key, rows, ckpt.name)
+        if not self._store(key, rows, ckpt.name):
+            return None
         log.info("lane B bench: %s benched on %s — rows cached", ckpt.name[-32:],
                  getattr(host, "name", host))
         return rows
 
 
 KEYS_KEEP = 512
+
+
+def _item_label(item: tuple) -> str:
+    kind, ref = item
+    if kind == "pin":
+        return f"prepared {str(ref[3])[-32:]}"
+    return str(ref)[-40:]
 
 
 def _run_or_ssh(run):
