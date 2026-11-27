@@ -98,21 +98,17 @@ def test_no_spec_leg_contract_is_the_workers():
         t2 = lane_b_leg_contract(cfg, base, block=b, spec=spec)
         assert (t2.power_ema_sigma_rels, t2.power_ema_eval) == ((0.10,), 0)
         assert contract_digest(t2) == contract_digest(_worker_leg_contract(cfg, b, spec))
+        if _live_cfg_readable():
+            # on the box: the 2026-11-27 leg — the trainer now expects the
+            # digest its receipt carries, at the leg's contract block
+            from cascade.shared.config import load_chain_config
 
-
-@pytest.mark.skipif(not _live_cfg_readable(), reason="the live validator config is box-only")
-def test_live_no_spec_leg_digest_is_the_receipt():
-    """The 2026-11-27 leg: the trainer now expects the digest its receipt carries."""
-    with h.torch_blocked():
-        from cascade.shared.config import load_chain_config
-        from cascade.shared.lane_b_levers import lane_b_leg_contract
-        from cascade.shared.manifest import contract_digest
-
-        cfg = load_chain_config(str(LIVE_CFG))
-        base = cfg.throne_contracts_at(LIVE_CONTRACT_BLOCK)[0]
-        trainer = lane_b_leg_contract(cfg, base, block=LIVE_DISPATCH_BLOCK, spec={})
-        assert contract_digest(trainer) == LIVE_RECEIPT
-        assert contract_digest(_worker_leg_contract(cfg, LIVE_CONTRACT_BLOCK, None)) == LIVE_RECEIPT
+            live = load_chain_config(str(LIVE_CFG))
+            lbase = live.throne_contracts_at(LIVE_CONTRACT_BLOCK)[0]
+            got = lane_b_leg_contract(live, lbase, block=LIVE_DISPATCH_BLOCK, spec={})
+            assert contract_digest(got) == LIVE_RECEIPT
+            assert contract_digest(_worker_leg_contract(
+                live, LIVE_CONTRACT_BLOCK, None)) == LIVE_RECEIPT
 
 
 # ── the dispatch (RunnerLaneBOps → _run_funded_leg stand-in) ─────────────────
