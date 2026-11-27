@@ -45,6 +45,9 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          # full history: the image-freshness step diffs from each pin's build commit
+          fetch-depth: 0
 
       - name: Prepare isolated TLS trust for the CI job
         run: python3 scripts/prepare_ci_tls.py "$RUNNER_TEMP/cascade-ca" >> "$GITHUB_ENV"
@@ -76,6 +79,12 @@ jobs:
       # Stdlib only, no cascade imports, well under a second.
       - name: Incident rules
         run: uv run python scripts/check_incident_rules.py
+
+      # Warn-only release check (docs/launch-lessons-2026-11.md, the rc15 / #960
+      # class): worker-side files changed since each pinned image's build commit.
+      # The repo chain.toml is a template; the deployed file decides.
+      - name: Worker image freshness (warn-only)
+        run: python3 scripts/check_image_freshness.py
 
       - name: Unit shard plan is a partition of tests/unit
         run: python3 scripts/ci_shard.py --verify --of 4

@@ -273,6 +273,56 @@ def test_ir007_allowlist(tmp_path):
     assert hits(tmp_path, files, "IR007") == []
 
 
+# ── IR008 remote python over ssh with no on-host bound ─────────────────────────
+
+# The pre-#969 SSHEvalHost._ssh (cascade/validator/lane_d_inputs.py at 0b617360):
+# a local subprocess timeout only; the remote lane_d_forecasts outlived it.
+IR008_PRE_969 = '''\
+class SSHEvalHost:
+    def _ssh(self, host, args, payload):
+        cmd = (f"cd {shlex.quote(host.workdir)} && "
+               + " ".join(shlex.quote(a) for a in
+                          [host.remote_python, "-m", "cascade.eval.lane_d_forecasts", *args]))
+        proc = self._run(build_ssh_argv(host, cmd), input=payload, timeout=self.timeout_s)
+'''
+# The #969 fix: the request is bounded on the host.
+IR008_FIXED = '''\
+class SSHEvalHost:
+    def remote_command(self, host, args):
+        argv = ["timeout", "-k", "30", str(self.timeout_s - 30)]
+        argv += [host.remote_python, "-m", "cascade.eval.lane_d_forecasts", *args]
+        return f"cd {shlex.quote(host.workdir)} && " + " ".join(shlex.quote(a) for a in argv)
+'''
+
+
+def test_ir008_flags_the_pre_969_eval_host_call(tmp_path):
+    files = {"cascade/validator/lane_d_inputs.py": IR008_PRE_969}
+    assert hits(tmp_path, files, "IR008") == [("IR008", "cascade/validator/lane_d_inputs.py", 2)]
+
+
+@pytest.mark.parametrize("text", [
+    IR008_FIXED,
+    # detached launch with its own deadline
+    "def launch(host):\n    return f'nohup {host.remote_python} -m cascade.trainer.worker &'\n",
+    # a local python -m (no remote_python): not a remote command
+    "def local():\n    return [sys.executable, '-m', 'cascade.eval.x']\n",
+    # remote python -c probe, no -m
+    "def probe(host):\n    return f'{host.remote_python} -c \"import cascade\"'\n",
+])
+def test_ir008_passes_bounded_detached_and_local(tmp_path, text):
+    assert hits(tmp_path, {"cascade/x.py": text}, "IR008") == []
+
+
+def test_ir008_allowlist_and_reviewed_table(tmp_path):
+    text = "# incident-ok: IR008 exits in seconds\n" + IR008_PRE_969.split("\n", 1)[1].lstrip()
+    assert hits(tmp_path, {"cascade/x.py": text}, "IR008") == []
+    for key, reason in cir.IR008_REVIEWED.items():
+        rel, fn = key.split("::")
+        src = (ROOT / rel).read_text()
+        assert f"def {fn}(" in src, f"IR008_REVIEWED names a function that is gone: {key}"
+        assert len(reason) > 10
+
+
 # ── allowlist hygiene (IR000) and the repository itself ────────────────────────
 
 def test_allowlist_needs_a_known_rule_and_a_reason(tmp_path):

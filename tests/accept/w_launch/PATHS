@@ -125,3 +125,19 @@ cascade/pool/pool_d_publish.py
 cascade/laned/elastic.py
 tests/unit/test_pool_d_state_streaming.py
 docs/OPERATOR.md
+
+# Launch lessons (owner 2026-11-27, "feed that into CI/CD, linting"): the
+# failure classes of the lane B/C/D launch, each with its fix PR and guard;
+# IR008 (remote python over ssh without an on-host timeout, #969); the
+# warn-only worker image freshness release check (rc15/#960); PATHS union
+# merges; torch-free box imports, overlay re-point and stage-pin guards.
+docs/launch-lessons-2026-11.md
+docs/INCIDENT_RULES.md
+scripts/check_incident_rules.py
+scripts/check_image_freshness.py
+.gitattributes
+.github/workflows/ci.yml
+tests/unit/test_incident_rules.py
+tests/unit/test_box_side_torch_free.py
+tests/unit/test_runner_cfg_consumers_follow_overlay.py
+tests/unit/test_stage_pods_gate_on_their_own_pins.py
