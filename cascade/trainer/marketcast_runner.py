@@ -463,12 +463,18 @@ def train_mkt_leg(ops, leg: dict, recipe: MktLegRecipe, *, mc=None,
         gpu=str(leg.get("gpu", "") or ""),
         allow_fallback=bool(leg.get("gpu_allow_fallback", False)),
         max_price_per_hour=float(leg.get("gpu_max_price_per_hour", 0.0) or 0.0))
+    # owner 2026-11-26: an OPERATOR-billed leg whose approval pins GPU types
+    # rents exactly those (the lane B rule); else today's list
+    from .money_guard import operator_pinned_skus
+
+    rent_skus = (operator_pinned_skus(r, gen.hotkey, queue=ops.queue())
+                 or mkt_rent_skus(r.cfg, choice))
     try:
         # owner 2026-11-24: the leg rents the miner's chosen type (any Lium
         # GPU: the worker is one process on cuda:0), else the cheapest fitting
         # recommended type ([marketcast] funded_pod_skus); Lium only
         with mkt_leg_scope(r), _leg_mc_scope(r, leg_cfg), \
-                mkt_rent_scope(r, mkt_rent_skus(r.cfg, choice)):
+                mkt_rent_scope(r, rent_skus):
             entry = r._run_funded_leg(
                 r._dispatcher(), gen, seeds, int(leg["started_block"]), contract,
                 leg_suffix(leg["target"], int(leg["uid"])),

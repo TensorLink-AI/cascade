@@ -1,7 +1,7 @@
 """Owner commands for operator-billed legs (2026-11-02).
 
     cascade-trainer list-operator-legs   [--work-root _train_work] [--json]
-    cascade-trainer approve-operator-leg <hotkey> [--attempt-id ID] [--max-cost USD] [--queue NAME]
+    cascade-trainer approve-operator-leg <hotkey> [--attempt-id ID] [--max-cost USD] [--sku T1,T2] [--queue NAME]
     cascade-trainer deny-operator-leg    <hotkey> [--attempt-id ID] [--queue NAME]
     cascade-trainer resume-operator-leg  <hotkey> [--queue NAME]
     cascade-trainer rent-status          [--json]
@@ -145,6 +145,11 @@ def _parser() -> argparse.ArgumentParser:
         if cmd == "approve-operator-leg":
             s.add_argument("--max-cost", type=float, default=None,
                            help="refuse the dispatch if its projected cost exceeds this (USD)")
+            s.add_argument("--sku", default="",
+                           help="pin the GPU types this operator-billed leg may rent, e.g. "
+                                "8xH100,8xH200 (cheapest available first among them; "
+                                "measured or not). Without --max-cost the ceiling is bound "
+                                "to the pinned types' projection at dispatch")
             s.add_argument("--kind", default="", choices=KINDS,
                            help="a pre-approval (no pending request) for this kind only")
         if cmd in ("list-operator-legs", "rent-status"):
@@ -250,6 +255,7 @@ def main(argv: list[str]) -> int:
     try:
         rec = store.decide(hk, approve=approve, attempt_id=args.attempt_id,
                            max_cost_usd=getattr(args, "max_cost", None), queue_name=args.queue,
+                           skus=getattr(args, "sku", "") or None,
                            preapprove=_live_entry(wr, hk, args.queue,
                                                   kind=getattr(args, "kind", "")))
     except (LookupError, ValueError) as e:
@@ -273,6 +279,10 @@ def main(argv: list[str]) -> int:
     cost = rec.get("projected_cost_usd")
     print(f"{verb}: {hk} uid={rec.get('uid')} {rec.get('kind')} ~${float(cost or 0):.2f}"
           + (f" ceiling ${rec['max_cost_usd']:.2f}" if rec.get("max_cost_usd") else "")
+          + (f"; GPU types pinned: {','.join(rec['skus'])}"
+             + (" (ceiling bound to their projection at dispatch)"
+                if rec.get("ceiling_basis") == "pinned_skus" else "")
+             if approve and rec.get("skus") else "")
           + ("; entry returned to the queue" if moved else
              "; entry was not parked (it is picked up at its next dispatch)"))
     return 0
