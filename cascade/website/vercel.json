@@ -121,6 +121,20 @@
     {
       "source": "/training/:path*",
       "destination": "https://s3.hippius.com/cascade-manifests/training/:path*"
+    },
+    {
+      "source": "/lane-d/:path*",
+      "has": [
+        {
+          "type": "host",
+          "value": "testnet\\..*"
+        }
+      ],
+      "destination": "https://s3.hippius.com/cascade-testnet-manifests/lane-d/:path*"
+    },
+    {
+      "source": "/lane-d/:path*",
+      "destination": "https://s3.hippius.com/cascade-manifests/lane-d/:path*"
     }
   ],
   "headers": [
@@ -189,6 +203,15 @@
     },
     {
       "source": "/training/(.*)",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=0, s-maxage=60, stale-while-revalidate=300"
+        }
+      ]
+    },
+    {
+      "source": "/lane-d/(.*)",
       "headers": [
         {
           "key": "Cache-Control",

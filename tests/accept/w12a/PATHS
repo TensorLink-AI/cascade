@@ -32,3 +32,5 @@ docs/archive/README.md
 docs/archive/MINER_V2_INCENTIVE_INTRO.md
 docs/archive/V2_FAQ.md
 docs/archive/TESTNET_E2E_CHECKLIST.md
+cascade/website/vercel.json
+tests/unit/test_website_vercel.py
