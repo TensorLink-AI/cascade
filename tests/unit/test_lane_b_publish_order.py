@@ -66,6 +66,14 @@ def _run(cfg, tmp_path, driver_kw):
     sched.tick(client, b0)
     _join(sched)
     _advance(clock, ops, sched, client, from_block=b0, to_block=era_start + EB + 3)
+    # 2026-11-28: a failed lane B retries in-window (the lane-A settlement
+    # waits, bounded by LANE_B_SETTLE_MAX_SECONDS): tick past that bound
+    block = era_start + EB + 3
+    while not ops.manifests and block < era_start + EB + 600:
+        block += 5
+        clock.t += 60.0
+        sched.tick(client, block)
+        _join(sched)
     return events, ops.manifests
 
 
@@ -82,6 +90,9 @@ def test_expert_manifest_settles_before_and_is_bound_into_the_lane_a_manifest(cf
 def test_a_failed_lane_b_settlement_binds_nothing_and_lane_a_proceeds(cfg, tmp_path):
     events, manifests = _run(cfg, tmp_path, {"fail": True})
     (m,) = manifests
+    # every in-window retry is still ordered before the one lane-A publish
+    assert events[-1] == ("lane_a_publish", m.round_id)
+    assert {e for e in events[:-1]} == {("lane_b_settle", m.round_id)}
     assert m.expert_manifest_sha256 == ""
     assert b"expert_manifest_sha256" not in m.canonical_body()
 

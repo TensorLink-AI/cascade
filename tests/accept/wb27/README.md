@@ -63,3 +63,4 @@ New stage `levers` (in `checks.LANE_B_STAGES`); every other guard unchanged.
 | `test_wb27_contract.py` | the three-step leg contract on both sides, argv, lane A digests |
 | `test_wb27_record.py` | entry bytes, limits-leg record check, judge stages, settlement read |
 | `test_wb27_pod.py` | pyramid pure defs (source view), curriculum shard stream (pyarrow, CI), CLI |
+| `test_wb27_in_window_settlement_retry.py` | 2026-11-28: a failed lane B / lane C settlement retries the SAME settlement (2 -> 5 -> 10 min) inside the lane-A hold bound and before the next boundary; byte-identical publish, once; the driver retry settles the first attempt's legs; the MarketCast report run retries in-window |

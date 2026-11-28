@@ -87,7 +87,8 @@ class QuantileForecaster(Protocol):
 
     def forecast_quantiles(self, context: np.ndarray, horizon: int, *,
                            past_covariates: np.ndarray | None = None,
-                           future_covariates: np.ndarray | None = None) -> np.ndarray: ...
+                           future_covariates: np.ndarray | None = None) -> np.ndarray:
+        """``(horizon, K)`` quantiles on :attr:`quantile_levels` (the protocol)."""
 
 
 def load_timestral():

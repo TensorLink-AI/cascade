@@ -399,6 +399,12 @@ class LaneBDriver:
         # rounds the scheduler abandoned (settlement over its bound): settle
         # commits nothing for them any more (see :meth:`abandon`)
         self._abandoned: set[str] = set()
+        # In-window settlement retries (owner 2026-11-28): the inputs the FIRST
+        # attempt of a round read — {rid: {"legs": [leg_pointer...],
+        # "lineage_tokens": n}} — so a retry of that round settles exactly the
+        # legs (and lineage clock) an on-time success would have: a leg that
+        # finishes during the retry wait settles with the next round
+        self._settle_pins: dict[str, dict] = {}
         self._acceptance_jobs: dict = {}
         # Scientific expiry is not physical termination: a stale worker can
         # still own the hotkey's pod and harvest directory until its callback.
@@ -985,6 +991,7 @@ class LaneBDriver:
             rid = str(round_id)
             if rid not in self.st.settled:
                 self._abandoned.add(rid)
+            self._settle_pins.pop(rid, None)
             return str(self.st.settled.get(rid, {}).get("digest", "") or "")
 
     # ── lineage clock ────────────────────────────────────────────────────────
@@ -1552,7 +1559,17 @@ class LaneBDriver:
         with self._lock:
             if rid in self.st.settled or rid in self._abandoned:
                 return []
-            todo = [dict(f) for f in self.st.finished]
+            pin = self._settle_pins.get(rid)
+            if pin is None:
+                todo = [dict(f) for f in self.st.finished]
+                # one round settles at a time: only the latest round's pin
+                self._settle_pins = {rid: {"legs": [f["leg_pointer"] for f in todo],
+                                           "lineage_tokens": int(self.st.lineage_tokens)}}
+            else:
+                # an in-window retry of this round: the first attempt's legs
+                keep = set(pin["legs"])
+                todo = [dict(f) for f in self.st.finished if f["leg_pointer"] in keep]
+            lineage_tokens = int(self._settle_pins[rid]["lineage_tokens"])
         entries, used, dropped = [], [], []
         # W-S2 (D35): the settlement era's §16 sentinel is no public guard nor
         # requirement of lane B; None (unarmed) leaves every call as before
@@ -1688,7 +1705,7 @@ class LaneBDriver:
         if entries:
             manifest = ExpertManifest(round_id=rid, created_block=int(block),
                                       king_pointer=king_pointer,
-                                      lineage_tokens=self.st.lineage_tokens,
+                                      lineage_tokens=lineage_tokens,
                                       entries=tuple(entries))
             self.ops.publish_expert_manifest(manifest)
             judge_kw = {} if sentinel is None else {"sentinel": sentinel}
@@ -1746,6 +1763,7 @@ class LaneBDriver:
             del self.st.submission_results[:-OUTCOMES_KEEP]
             del self.st.outcomes[:-OUTCOMES_KEEP]
             self.st.settled[rid] = {"digest": digest}
+            self._settle_pins.pop(rid, None)
             for old in list(self.st.settled)[:-SETTLED_KEEP]:
                 del self.st.settled[old]
             self.save()
