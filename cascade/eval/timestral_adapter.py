@@ -243,12 +243,31 @@ def resolve_pinned_base(base_ref: str, base_sha256: str, *,
     if not rev:
         raise ValueError(f"[marketcast] base_ref {base_ref!r} is not pinned to a commit")
     check_base_sha256(base_sha256, base_sha256)          # refuses an unset pin
-    load_timestral()
-    from timestral.loading import resolve_checkpoint  # type: ignore[import-not-found]
-
-    d = Path(resolve_checkpoint(repo, revision=rev, cache_dir=cache_dir))
+    d = _hub_snapshot(repo, revision=rev, cache_dir=cache_dir)
     verify_checkpoint(d / WEIGHTS_FILE, base_sha256)
     return d
+
+
+def _hub_snapshot(repo: str, *, revision: str, cache_dir=None) -> Path:
+    """``timestral.loading.resolve_checkpoint`` without the ``timestral``
+    import: an existing directory as is, else the Hub snapshot of the two
+    files (``config.json`` + ``model.safetensors``) at ``revision``.
+
+    The main validator runs this ON THE BOX (the offload uploads the base to
+    the pod), where the ``timestral`` extra is not installed — and must not
+    be: ``timestral.loading`` imports torch at module import. Importing it
+    here made every MarketCast judge ``infra_deferred`` with
+    ``TimestralUnavailable`` (2026-11-28, settlement 12822311400061518391)."""
+    path = Path(repo).expanduser()
+    if path.is_dir():
+        return path
+    if path.exists():
+        raise NotADirectoryError(f"{repo!r} is a file; pass the export directory holding "
+                                 f"{CONFIG_FILE} and {WEIGHTS_FILE}")
+    from huggingface_hub import snapshot_download
+
+    return Path(snapshot_download(str(repo), revision=revision, cache_dir=cache_dir,
+                                  allow_patterns=[CONFIG_FILE, WEIGHTS_FILE]))
 
 
 def batched_forecasts(forecaster, contexts: list[np.ndarray], horizon: int, *,
