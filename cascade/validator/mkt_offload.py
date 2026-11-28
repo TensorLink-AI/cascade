@@ -16,6 +16,15 @@ forecasts on a cheap elastic pod instead of its own ``--device``.
   (``quantile_levels`` + ``forecast_batch``), so the rows code is unchanged.
   Contexts and covariates cross; window targets, losses, the verdict, the
   report and the wallet stay on the validator.
+* **Code (2026-11-28 14:01).** The worker runs THIS release's ``cascade``
+  package, never the image's checkout: :meth:`MktSession.start` ships the
+  validator's package by content hash (``<workdir>/_mkt_code/<hash>``, as
+  lane B's :func:`~cascade.trainer.lane_b_offload.code_bundle`; uploaded only
+  when the pod lacks it) and starts the worker from it (``PYTHONPATH``,
+  ``python -P``; the pod's pinned venv supplies the dependencies). The
+  worker's ``hello`` names the code it imported; any other is refused. A
+  ``worker-v2.1.0-mkt-rc3`` pod served no judge ops (its image predates
+  them), so the 14:01 round was refused in-process and never judged.
 * **Judge (W-MKTOFF, 2026-11-28).** The window cut, the covariate rows, the
   scoring and the reference tests of every entry run ON THE POD
   (:class:`PodJudge` → the worker's ``judge_*`` ops): the 10:54 OOM was the
@@ -80,6 +89,11 @@ UPLOAD_HEADROOM_BYTES = 1 << 30
 SNAP_PREFIX = "snap-"
 SNAP_KEEP = 2
 SNAP_MARKER = ".cascade_snapshot"
+# the validator's release package on the pod, one dir per content hash (kept
+# apart from the cache: never pruned as a checkpoint, never placed on the
+# data mount — a few MB)
+CODE_DIR = "_mkt_code"
+CODE_KEEP = 3
 
 
 class MktOffloadError(ConnectionError):
@@ -237,10 +251,16 @@ class MktSession:
     """One live :mod:`~cascade.validator.mkt_worker` on ``host`` over ssh."""
 
     def __init__(self, host, *, run=None, popen=subprocess.Popen,
-                 call_timeout_s: float = CALL_TIMEOUT_S, device: str = "cuda"):
+                 call_timeout_s: float = CALL_TIMEOUT_S, device: str = "cuda",
+                 code=None, ship_code: bool = True):
         from ..trainer.remote import run_ssh
 
         self.host, self.run, self.popen = host, run or run_ssh, popen
+        # ``code() -> (hash, tar.gz bytes)`` of the package the worker runs
+        # (default: this release's); ``ship_code`` False = the pod's own
+        # checkout (in-thread test workers only)
+        self.code, self.ship_code = code, bool(ship_code)
+        self.code_sha = ""
         self.call_timeout_s, self.device = float(call_timeout_s), str(device)
         self.proc = None
         self._err = None
@@ -257,7 +277,15 @@ class MktSession:
         env = ("OMP_NUM_THREADS=2 "
                + (f"CUDA_VISIBLE_DEVICES={shlex.quote(h.cuda_device)} "
                   if getattr(h, "cuda_device", None) else ""))
-        cmd = (f"cd {shlex.quote(h.workdir)} && {env}exec {shlex.quote(h.remote_python)} -m "
+        # 14:01: the image's worker lacked the judge ops — the worker runs the
+        # validator's own release package, shipped by content hash
+        if self.ship_code:
+            code_dir = self.upload_code()
+            env = f"PYTHONPATH={shlex.quote(code_dir)} {env}"
+            py = f"{shlex.quote(h.remote_python)} -P"
+        else:
+            py = shlex.quote(h.remote_python)
+        cmd = (f"cd {shlex.quote(h.workdir)} && {env}exec {py} -m "
                f"cascade.validator.mkt_worker --serve --device {shlex.quote(self.device)} "
                f"--root .")
         self._err = tempfile.TemporaryFile()  # noqa: SIM115 — lives as long as the session
@@ -270,9 +298,61 @@ class MktSession:
         self.hello = dict(hello)
         if hello.get("schema") != SCHEMA:
             raise MktOffloadError(f"{h.name}: worker schema {hello.get('schema')!r} != {SCHEMA!r}")
-        log.info("marketcast offload: worker up on %s (%s %s)", h.name,
-                 hello.get("device", "?"), hello.get("gpu", ""))
+        if self.ship_code and hello.get("code") != self.code_sha:
+            raise MktOffloadError(f"{h.name}: the worker runs code {hello.get('code')!r}, not "
+                                  f"this release's shipped package {self.code_sha!r}")
+        log.info("marketcast offload: worker up on %s (%s %s; code %s; ops %s)", h.name,
+                 hello.get("device", "?"), hello.get("gpu", ""),
+                 str(hello.get("code", "?"))[:12], ",".join(hello.get("ops") or ()) or "-")
         return hello
+
+    def upload_code(self) -> str:
+        """The pod dir (``<workdir>/_mkt_code/<hash>``) holding this release's
+        ``cascade`` package, uploaded and unpacked only when no complete copy
+        (``.ok``) is there; older copies beyond :data:`CODE_KEEP` pruned."""
+        from ..trainer.lane_b_offload import code_bundle
+        from ..trainer.remote import build_ssh_argv
+        from .eval_offload import build_scp_argv
+
+        q = shlex.quote
+        sha, blob = (self.code or code_bundle)()
+        codes = f"{str(self.host.workdir).rstrip('/')}/{CODE_DIR}"
+        code = f"{codes}/{sha}"
+
+        def step(argv, what, timeout):
+            proc = self.run(argv, timeout)
+            if proc.returncode:
+                raise MktOffloadError(f"{self.host.name}: {what} failed (exit "
+                                      f"{proc.returncode}): {(proc.stderr or '')[-300:]}")
+            return proc
+
+        have = step(build_ssh_argv(self.host, (
+            f"umask 077 && mkdir -p {q(codes)} && "
+            f"{{ test -f {q(code + '/.ok')} && touch {q(code)} && echo HAVE_CODE || true; }}")),
+            "code check", 120)
+        if "HAVE_CODE" not in (have.stdout or ""):
+            part = f"{code}.part-{uuid.uuid4().hex[:12]}"
+            started = time.monotonic()
+            with tempfile.TemporaryDirectory(prefix="cascade-mkt-code-") as td:
+                tgz = Path(td) / "code.tgz"
+                tgz.write_bytes(blob)
+                step(build_ssh_argv(self.host, f"umask 077 && mkdir -p {q(part)}"),
+                     "code part", 120)
+                step(build_scp_argv(self.host, [str(tgz)], part), "code upload",
+                     UPLOAD_TIMEOUT_S)
+            prune = (f"cd {q(codes)} && "
+                     "find . -maxdepth 1 -name '*.part-*' -mmin +360 -exec rm -rf {} + ; "
+                     f"ls -1t | grep -v -e '[.]part-' -e {q('^' + sha + '$')} "
+                     f"| tail -n +{CODE_KEEP} | xargs -r rm -rf --")
+            step(build_ssh_argv(self.host, (
+                f"cd {q(part)} && tar -xzf code.tgz && rm -f code.tgz && touch .ok && "
+                f"{{ mv -T {q(part)} {q(code)} 2>/dev/null || rm -rf {q(part)}; }} && "
+                f"test -f {q(code + '/.ok')} && {{ ( {prune} ) || true; }}")),
+                "code unpack", 300)
+            log.info("marketcast offload: shipped release code %s (%.1f MB) to %s in %.0fs",
+                     sha[:12], len(blob) / 1e6, self.host.name, time.monotonic() - started)
+        self.code_sha = str(sha)
+        return code
 
     def _stderr_tail(self) -> str:
         if self._err is None:
