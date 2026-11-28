@@ -363,7 +363,7 @@ class LaneBPodRunner:
                        f"cat {q(run_dir + '/result.json')}")
                 proc = ok(self._ssh(host, cmd, left(), stdin), "worker")
                 try:
-                    doc = json.loads(proc.stdout)
+                    doc = pod_reply_json(proc.stdout)
                 except ValueError as e:
                     raise LaneBOffloadUnavailable(f"lane B {op}: pod reply is not JSON") from e
                 if isinstance(doc, dict) and "offload_unavailable" in doc:
@@ -1020,3 +1020,24 @@ def _pod_op(op: str, req: dict, run_dir: Path, root: Path) -> dict:
 
 if __name__ == "__main__":
     raise SystemExit(pod_main())
+
+
+def pod_reply_json(stdout: str):
+    """The worker's ``result.json``, which the pod command ``cat``s LAST.
+
+    2026-11-27: the 19:27 lane B settlement rebase failed "pod reply is not
+    JSON" because ``hippius_hub.file_download`` prints ``Downloading <file>
+    (parallel)...`` to stdout while the step pulls an uncached checkpoint,
+    ahead of the JSON. Parse the whole reply, else its last non-empty line
+    (``json.dumps`` writes ``result.json`` on one line); raise ValueError when
+    neither is JSON."""
+    text = stdout or ""
+    try:
+        return json.loads(text)
+    except ValueError:
+        pass
+    for line in reversed(text.splitlines()):
+        line = line.strip()
+        if line:
+            return json.loads(line)
+    raise ValueError("empty pod reply")
