@@ -163,11 +163,14 @@ def test_worker_image_installs_from_the_lock_and_fails_the_build_on_drift():
     for extra in ("train", "hippius", "marketcast", "generation"):
         assert f"--extra {extra}" in sync.group(0), extra
     assert re.search(r"python -P -m cascade\.shared\.lockdrift --lock uv\.lock", df)
+    assert "cascade.shared.lockdrift" in df, "the image build never checks the venv against uv.lock"
     assert df.index("uv sync") < df.index("cascade.shared.lockdrift")
 
 
 def test_pod_bootstrap_checks_the_lock_after_its_sync():
     sh = _commands((REPO / "deploy" / "pod_bootstrap.sh").read_text())
+    assert "uv sync --frozen --all-extras" in sh
+    assert "-m cascade.shared.lockdrift" in sh, "pod_bootstrap.sh never checks the venv against uv.lock"
     assert sh.index("uv sync --frozen --all-extras") < sh.index("-m cascade.shared.lockdrift")
 
 
