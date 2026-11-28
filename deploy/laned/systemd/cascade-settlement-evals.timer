@@ -1,0 +1,13 @@
+# Hourly at :45, after the spent-pool publish (:35) and off the pin-sync
+# minutes (:20/:50): settlements land every ~3 h (900 blocks), so a settlement's
+# eval set is published within an hour of the moment it retires.
+[Unit]
+Description=cascade settlement eval-set publish, hourly
+
+[Timer]
+OnCalendar=*-*-* *:45:00 UTC
+Persistent=false
+Unit=cascade-settlement-evals.service
+
+[Install]
+WantedBy=timers.target

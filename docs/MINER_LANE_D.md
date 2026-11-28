@@ -239,6 +239,15 @@ entries included). A snapshot is typically public 2 to 3 days after it was
 built. Windows whose target lies in the future (publish-ahead feeds) are left
 out.
 
+**A settlement's judged windows** are published the same way, as soon as they
+can never be judged again (`lane-d/evals/`). A judged window is NOT retired at
+its settlement: the draw re-runs every settlement, and the same window stays
+eligible for any entry still open and, as an embargo window, for entries
+revealed up to `embargo_hours` (48 h) after its target was first seen. It is
+retired once every target point was first seen (and lies) at least 48 h + 6 h
+before the earliest reveal of any entry still to be judged: at most about
+54 h after the settlement, later only while an older entry is still open.
+
 Lane D publishes one signed report per settlement boundary in the public
 `cascade-manifests` bucket (`https://s3.hippius.com/cascade-manifests/<key>`,
 no keys needed):
@@ -250,6 +259,8 @@ no keys needed):
 | One boundary's report | `lane-d/reports/lane_d_report_<boundary>.json` | Signed by the validator (`signer`, `signature`) |
 | Spent pools index | [`lane-d/spent/index.json`](https://s3.hippius.com/cascade-manifests/lane-d/spent/index.json) | Every published spent `pool_d` snapshot (`pools[]`: `as_of_ts`, `windows`, `windows_sha256`, `manifest_url`, `windows_url`, `readme_url`). Updated hourly; append-only |
 | One spent pool | `lane-d/spent/pool-preview-<as_of_ts>/` | `windows.npz` (history, target, both clocks, the house's 9 quantiles, CRPS and MASE per window), `manifest.json` (sha256s, counts, the spent rule's `cut_ts`), `README.md` (load snippet). Every window of the snapshot, not a settlement's draw; consecutive pools overlap, dedupe by `window_id` |
+| Settlement eval sets index | [`lane-d/evals/index.json`](https://s3.hippius.com/cascade-manifests/lane-d/evals/index.json) | Every published settlement eval set (`items[]`: `boundary`, `windows`, `windows_sha256`, `cut_ts`, `report_url`, `manifest_url`, `windows_url`, `readme_url`) and the settlements still `waiting` to retire. Updated hourly |
+| One settlement's eval set | `lane-d/evals/<boundary>/` | `windows.npz`: exactly the windows that settlement judged, each with its history (up to 16384 points) and target as the settlement cut them (any band `h`), both clocks, `band`, `embargo_window`; `manifest.json` (sha256s, the report it came from, the retirement `cut_ts`), `README.md` (load snippet). Per-window scores per model are the report's `rows` |
 | Live lane D board | `status/lane_d.json` | King, prior kings, queue, latest board and verdicts |
 
 A boundary is a block number that is a multiple of 900 (`epoch_blocks`,

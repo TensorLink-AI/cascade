@@ -1521,6 +1521,12 @@ th, td, .stat .v, .tile .v, .gate-cell .v { font-variant-numeric:tabular-nums; }
       <div class="panel" id="lc-settle"><div class="empty">Loading&hellip;</div></div>
     </div>
 
+    <!-- W-EVALPUB (owner 2026-11-28): each MarketCast round's judged windows, public once retired -->
+    <div>
+      <div class="section-label"><span>Past evaluations</span></div>
+      <div class="panel"><p class="muted">Each MarketCast round's judged windows, published once no later draw can reuse their bars (about 33 days: backtests come from the 28 days before each dispatch): <a href="https://s3.hippius.com/cascade-manifests/marketcast/evals/index.json">marketcast/evals/index.json</a>. Bars: <a href="https://s3.hippius.com/cascade-manifests/marketcast/public-bars/index.json">marketcast/public-bars/index.json</a>.</p></div>
+    </div>
+
   </div><!-- /page-lanec -->
 
   <!-- LANE_D_PLAN W17: status/lane_d.json (validator) + the signed lane-d/reports -->
@@ -1539,6 +1545,12 @@ th, td, .stat .v, .tile .v, .gate-cell .v { font-variant-numeric:tabular-nums; }
     <div>
       <div class="section-label"><span>Settlements</span><span id="ld-settle-when" class="muted"></span></div>
       <div class="panel" id="ld-settle"><div class="empty">Loading&hellip;</div></div>
+    </div>
+
+    <!-- W-EVALPUB (owner 2026-11-28): each settlement's judged windows, public once retired -->
+    <div>
+      <div class="section-label"><span>Past evaluations</span></div>
+      <div class="panel"><p class="muted">Each settlement's judged windows (histories, targets, both clocks), published once they can never be judged again (about 54 h after the settlement): <a href="https://s3.hippius.com/cascade-manifests/lane-d/evals/index.json">lane-d/evals/index.json</a>. Spent snapshots: <a href="https://s3.hippius.com/cascade-manifests/lane-d/spent/index.json">lane-d/spent/index.json</a>.</p></div>
     </div>
 
   </div><!-- /page-laned -->

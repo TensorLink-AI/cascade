@@ -1131,7 +1131,9 @@ class RunnerLaneCOps:
         return sign_lane_c_manifest(manifest, self.r.wallet)
 
     def publish(self, key: str, text: str) -> None:
-        self.r.manifest_store().put_text(key, text, content_type="application/json")
+        # W-EVALPUB (owner 2026-11-28): signed, read by every validator: public-read
+        self.r.manifest_store().put_text(key, text, content_type="application/json",
+                                         acl="public-read")
 
     def read_mkt_report(self, round_id: str) -> str | None:
         """The main validator's MarketCast report text of ``round_id`` (None
