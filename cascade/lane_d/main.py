@@ -112,6 +112,8 @@ class LaneDView:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    from ..shared import box_guard
+    box_guard.install("cascade-laned-intake")
     args = build_arg_parser().parse_args(argv)
     logging.basicConfig(level=args.log_level, stream=sys.stderr,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")

@@ -1939,9 +1939,15 @@ class LaneBDriver:
                 self._acceptance_jobs[key] = job
 
                 def run():
+                    from ..shared.rss_budget import step_rss
+
                     try:
-                        job["result"] = self.init_for(
-                            era_index, init_pointer, work_dir, era_start=era_start, _stage_only=True)
+                        with step_rss(f"lane B acceptance era={era_index}", logger=log,
+                                      hint="merge / judge model work belongs on the lane B "
+                                      "model host, never in the trainer (#952-#955)"):
+                            job["result"] = self.init_for(
+                                era_index, init_pointer, work_dir, era_start=era_start,
+                                _stage_only=True)
                     except Exception as e:
                         job["error"] = e
                     finally:

@@ -1077,6 +1077,54 @@ class RollingScheduler:
             return False
         return float(retry_at) - float(started) < self.LANE_B_SETTLE_MAX_SECONDS
 
+    # Retro 2026-11-28 #6: a permanent fault (cascade.shared.permanent_fault —
+    # a missing library, a GPU arch the pinned torch lacks, a contract/image
+    # mismatch) is never retried in-window: it cannot heal, and each retry
+    # holds the lane-A settlement. It pages the owner (PERMANENT FAULT log
+    # line → cascade-ops CRIT) and takes the existing "no retry fits the
+    # window" path (legs wait). Separately, the SAME error failing this many
+    # SETTLEMENTS in a row (the window spent each time) pages too — the
+    # next-settlement retry costs nothing, so it is not stopped.
+    SETTLE_REPEAT_THRESHOLD = 3
+
+    def _settle_fault_permanent(self, site: str, err: BaseException | None) -> bool:
+        """Classify a failed settlement attempt; page and return True for a
+        permanent fault (in-window retries stop). Never raises."""
+        try:
+            from ..shared.permanent_fault import classify, page
+
+            pf = classify(err)
+            if pf is None:
+                return False
+            page(site, pf, action="in-window retries stopped (legs wait for the next "
+                               "settlement)")
+            return True
+        except Exception as e:  # noqa: BLE001 — classification never breaks a settlement
+            log.warning("rolling: permanent-fault check failed (ignored): %s", e)
+            return False
+
+    def _settle_fault_final(self, site: str, err: BaseException | None) -> None:
+        """A settlement whose window is spent on ``err``: page once the same
+        error has spent :attr:`SETTLE_REPEAT_THRESHOLD` settlements in a row."""
+        try:
+            from ..shared.permanent_fault import RepeatTracker, page
+
+            tracker = self.__dict__.get("_settle_repeat")
+            if tracker is None:
+                tracker = self.__dict__["_settle_repeat"] = RepeatTracker(
+                    self.SETTLE_REPEAT_THRESHOLD)
+            pf = tracker.failed(site, f"{type(err).__name__}: {err}")
+            if pf is not None:
+                page(site, pf, action="settlements keep failing the same way; "
+                                      "next-settlement retries continue")
+        except Exception as e:  # noqa: BLE001
+            log.warning("rolling: repeat-fault check failed (ignored): %s", e)
+
+    def _settle_fault_cleared(self, site: str) -> None:
+        tracker = self.__dict__.get("_settle_repeat")
+        if tracker is not None:
+            tracker.ok(site)
+
     def _settle_retry_now(self) -> bool:
         """Consume the operator's re-arm file (True = retry at once)."""
         try:
@@ -1173,7 +1221,9 @@ class RollingScheduler:
             return digest
         if slot["error"] is not None:
             retry_at = self.clock() + self._settle_retry_delay(slot["attempt"])
-            if self._settle_retry_ok(slot["boundary"], now_block, slot["started"], retry_at):
+            permanent = self._settle_fault_permanent("lane B settlement", slot["error"])
+            if not permanent and self._settle_retry_ok(slot["boundary"], now_block,
+                                                       slot["started"], retry_at):
                 slot["retry_at"] = retry_at
                 log.warning("rolling: lane B settlement failed at %s (attempt %d): %s — "
                             "retried in %.0fs for the SAME settlement; the lane-A "
@@ -1191,7 +1241,9 @@ class RollingScheduler:
             self._lane_b_abandon(drv, rid)
             log.warning("rolling: lane B settlement failed at %s after %d attempt(s), no "
                         "retry fits the window: %s", rid, slot["attempt"], slot["error"])
+            self._settle_fault_final("lane B settlement", slot["error"])
             return ""
+        self._settle_fault_cleared("lane B settlement")
         return str(slot["digest"] or "")
 
     def _lane_b_pinned(self) -> bool:
@@ -1277,7 +1329,8 @@ class RollingScheduler:
             attempt = 1 + (int(rc["attempt"]) if rc is not None else 0)
             retry_at = self.clock() + self._settle_retry_delay(attempt)
             started = self.clock() if hold_started is None else float(hold_started)
-            if self._settle_retry_ok(block, now_block, started, retry_at):
+            permanent = self._settle_fault_permanent("lane C settlement", e)
+            if not permanent and self._settle_retry_ok(block, now_block, started, retry_at):
                 self._lane_c_retry = {"rid": rid, "attempt": attempt, "retry_at": retry_at}
                 log.warning("rolling: lane C settlement failed at %s (attempt %d): %s — "
                             "retried in %.0fs for the SAME settlement; the lane-A "
@@ -1286,8 +1339,10 @@ class RollingScheduler:
             self._lane_c_retry = None
             log.warning("rolling: lane C settlement failed at %s (its legs wait; nothing "
                         "bound): %s", round_id, e)
+            self._settle_fault_final("lane C settlement", e)
             return "", None
         self._lane_c_retry = None
+        self._settle_fault_cleared("lane C settlement")
         return str(digest or ""), (drv.published(rid) if digest else None)
 
     def _lane_c_live(self) -> set[str]:

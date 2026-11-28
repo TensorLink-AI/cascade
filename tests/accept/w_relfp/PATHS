@@ -1,0 +1,19 @@
+# W-RELFP (owner 2026-11-28, retro P4 / C3: 36 release checkouts, 63 restart
+# scripts, every remote host reset by hand on each release): one release
+# fingerprint, checked and re-synced at the start of every run; README.md has
+# the contract.
+# The fingerprint, the host probe, check-and-sync.
+cascade/shared/release_fp.py
+# Box services log (and optionally write) their fingerprint at start.
+cascade/shared/codepath.py
+# Hosts TOML: per-host release_sync = off | check | sync.
+cascade/trainer/remote.py
+# Wired at the start of every run: lane D eval host (before the W4
+# handshake), MarketCast pod (before the worker), private eval host (before
+# the compatibility probe), pool builder (#994 R13, on the shared token).
+cascade/validator/lane_d_inputs.py
+cascade/validator/mkt_offload.py
+cascade/validator/eval_offload.py
+cascade/laned/elastic.py
+# Report-only cleanup: stale release dirs and restart scripts.
+scripts/release_sprawl.py
