@@ -246,7 +246,7 @@ At fund time the intake reads the public bar index (`cascade lane-c data`,
 first and last recorded bar per asset and timeframe). It estimates the chance
 that your leg hits a batch it cannot cut, using the sampler's own weights,
 your `batch` and your `steps`. At 1 % or more the fund is refused (400
-`recipe_data_range_uncuttable`). The reply names the horizon, the bar, where
+`recipe_data_range_uncuttable`). The reply names the horizon, its bank `timeframe`, where
 that bar's history starts, and `fits_from_start`, the earliest `data.start`
 that brings the chance under 1 %. Move `data.start` there, or drop that bar
 from `data.frequencies` / `horizon_mix`. Bars with no recorded history in

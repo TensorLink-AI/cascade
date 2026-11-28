@@ -68,7 +68,7 @@ def test_intake_refuses_the_recipe_whose_15m_samples_cannot_be_cut(tmp_path):
     intake = _intake(tmp_path)
     status, body = _fund(intake)
     assert status == 400 and body.get("code") == "recipe_data_range_uncuttable", (status, body)
-    assert body["horizon"] == "15mx96" and body["bar"] == "15m"
+    assert body["horizon"] == "15mx96" and body["timeframe"] == "15m"
     assert body["history_start"] == "2026-09-25" and body["risk"] >= 0.99
     assert body["fits_from_start"] and "2026-01-01" < body["fits_from_start"] <= "2026-09-26"
     msg = body["message"]

@@ -1509,7 +1509,7 @@ class FundingIntake:
                     "%s history (risk %.2f, data.start %s, fits from %s)", ref, v.suite,
                     v.horizon, v.bar, v.risk, v.start, v.fix_start or "-")
         return {"code": "recipe_data_range_uncuttable", "message": v.message(),
-                "risk": v.risk, "suite": v.suite, "horizon": v.horizon, "bar": v.bar,
+                "risk": v.risk, "suite": v.suite, "horizon": v.horizon, "timeframe": v.bar,
                 "history_start": v.bar_first, "fits_from_start": v.fix_start}
 
     def _lane_c_gpu_choice(self, headers) -> tuple[GpuChoice, str, dict | None, str]:
