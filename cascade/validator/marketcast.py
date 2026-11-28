@@ -195,6 +195,11 @@ MKT_BASE_CACHE_MAX = 200_000
 MKT_COMPUTE_ATTEMPTS = 2
 # the exact-identity registry keeps this many checkpoint digests
 MKT_SEEN_KEEP = 4096
+# W-MKTOFF (2026-11-28 10:54 OOM): the most one round may grow the validator's
+# RSS (ERROR above it), and the most an IN-PROCESS judge may need by the
+# estimate below before it is refused (the pod judges: mkt_offload.PodJudge)
+MKT_ROUND_RSS_BUDGET_BYTES = 512 * 1024 * 1024
+MKT_BOX_JUDGE_CAP_BYTES = 512 * 1024 * 1024
 
 
 class MktFault(Exception):
@@ -517,6 +522,45 @@ def judge_marketcast_entry(entry: LaneCEntry, rows: MktEntryRows | None, *, mc, 
               clusters=int(v.n_clusters), inconclusive=inc, full_pay=fp)
 
 
+# ── the box's judge budget (W-MKTOFF) ────────────────────────────────────────
+
+# float64 rows a window holds while judged in-process: the context and, at
+# most, every past covariate row (context steps) and the known rows
+# (calendar 4 + session 3 + events 2, context + horizon steps)
+_JUDGE_ROWS_PER_WINDOW = 1 + 9 + 9
+
+
+def box_judge_bytes(snap, mc, targets) -> int:
+    """An upper bound of what judging ``targets`` IN-PROCESS holds at once:
+    the snapshot's bar files (cached as they are read) plus the largest
+    entry's windows x :data:`_JUDGE_ROWS_PER_WINDOW` float64 rows of
+    ``eval_context_length`` steps (:func:`_covariate_rows` builds every
+    window's rows before the first forecast). The 2026-11-28 ``mkt:market``
+    entry: 58 assets x 9 horizons x 48 windows (+ forward windows) x 19 rows
+    x 4096 x 8 B ≈ 16 GB."""
+    from ..pool.marketcast import MktSnapshot
+
+    ctx = int(mc.eval_context_length)
+    n_max = 0
+    for t in set(targets):
+        n = 0
+        for s_ in mc.suites_of(suite_of(t)):
+            labels = len(mc.series_labels(s_))
+            assets = sum(1 for cls, a in mc.suite_assets(s_) if a in snap.assets(cls))
+            for h in mc.horizons_map.get(s_, ()):
+                per = max(int(mc.backtest_windows_per_cell), int(mc.windows_per_cell))
+                if h in tuple(mc.forward_horizons):
+                    per += int(mc.windows_per_cell)
+                n += assets * labels * per
+        n_max = max(n_max, n)
+    disk = 0
+    if isinstance(snap, MktSnapshot):
+        for rel in dict(snap.meta.get("files") or {}):
+            with contextlib.suppress(OSError):
+                disk += (Path(snap.root) / rel).stat().st_size
+    return int(n_max) * _JUDGE_ROWS_PER_WINDOW * ctx * 8 + disk
+
+
 # ── rows (the main validator's GPU path; forecasters injected) ──────────────
 
 
@@ -532,6 +576,7 @@ def _covariate_rows(windows, snap, mc, covs) -> tuple[list, list]:
         raise ValueError(why)
     past, known = [], []
     for w in windows:
+        # incident-ok: IR010 the judge: on the MarketCast pod (mkt_worker), in-process only under MKT_BOX_JUDGE_CAP_BYTES
         p, kn = window_covariates(snap, w, tuple(covs),
                                   context_length=int(mc.eval_context_length),
                                   event_times=tuple(getattr(mc, "event_times", ())))
@@ -590,6 +635,7 @@ def compute_entry_rows(entry: LaneCEntry, *, phase: str, after: float, snap, mc,
     from ..shared.config.marketcast import base_suite
 
     knots = tuple(mc.quantile_knots)
+    # incident-ok: IR010 the judge: on the MarketCast pod (mkt_worker), in-process only under MKT_BOX_JUDGE_CAP_BYTES
     windows = target_windows(snap, mc, suite_of(entry.target), after=after, draw=draw or None)
     base_rows = MktEntryRows(entry.miner_hotkey, entry.trained_pointer, entry.target, phase,
                              float(after), draw=dict(draw or {}))
@@ -600,6 +646,7 @@ def compute_entry_rows(entry: LaneCEntry, *, phase: str, after: float, snap, mc,
     try:
         # the checkpoint's own covariate list (marketcast_meta.json): checked
         # again HERE, inside the fault path — a bad name is the miner's fault
+        # incident-ok: IR010 the judge: on the MarketCast pod (mkt_worker), in-process only under MKT_BOX_JUDGE_CAP_BYTES
         past, known = _covariate_rows(windows, snap, mc, covs)
     except (ValueError, KeyError, TypeError) as e:
         return replace(base_rows, fault=f"fine-tune covariates unusable: {e}"[:300]), None
@@ -679,6 +726,7 @@ def reference_quantiles(pointer: str, windows, *, snap, mc, load_ft: Callable,
     todo = [i for i, w in enumerate(windows) if (pointer, snap.digest, w.wid) not in ft_cache]
     if todo:
         fc, covs = load_ft(pointer)
+        # incident-ok: IR010 the judge: on the MarketCast pod (mkt_worker), in-process only under MKT_BOX_JUDGE_CAP_BYTES
         past, known = _covariate_rows(windows, snap, mc, covs)
         by_steps: dict[int, list[int]] = {}
         for i in todo:
@@ -709,6 +757,7 @@ def near_dup_record(rows: MktEntryRows, data: bytes, refs, *, snap, mc, load_ft:
 
     if not refs or not rows.windows:
         return {}, None
+    # incident-ok: IR010 the judge: on the MarketCast pod (mkt_worker), in-process only under MKT_BOX_JUDGE_CAP_BYTES
     windows = target_windows(snap, mc, suite_of(rows.target), after=float(rows.after),
                              draw=rows.draw or None)
     qs = decode_quantiles(data, [w.steps for w in windows], len(mc.quantile_knots))
@@ -756,6 +805,7 @@ def holder_record(rows: MktEntryRows, data: bytes, holder, *, snap, mc, load_ft:
 
     if holder is None or not rows.windows or holder[1] == rows.trained_pointer:
         return rows, None
+    # incident-ok: IR010 the judge: on the MarketCast pod (mkt_worker), in-process only under MKT_BOX_JUDGE_CAP_BYTES
     windows = target_windows(snap, mc, suite_of(rows.target), after=float(rows.after),
                              draw=rows.draw or None)
     qb = [q[0] for q in decode_quantiles(data, [w.steps for w in windows],
@@ -882,6 +932,13 @@ class MarketCastMixin:
     mkt_host_wait_s: float = 5400.0       # = provision.policy.MKT_BOOT_WORST_S
     mkt_lease_fn: Callable | None = None
     mkt_session_fn: Callable | None = None
+    # W-MKTOFF: judge on the pod's worker when it serves the judge (False =
+    # the in-process judge, the identity tests' reference path); the box's
+    # in-process cap, the round's RSS budget and probe (tests)
+    mkt_judge_on_pod: bool = True
+    mkt_box_judge_cap_bytes: int = MKT_BOX_JUDGE_CAP_BYTES
+    mkt_round_rss_budget_bytes: int = MKT_ROUND_RSS_BUDGET_BYTES
+    mkt_rss_probe: Callable | None = None
 
     def _mkt_cfg(self):
         """The MarketCast-shaped table of the instance being judged."""
@@ -1489,9 +1546,11 @@ class MarketCastMixin:
         return js, offered, pend
 
     def _mkt_near_dups(self, entries: list, datas: dict, holders: dict, *, snap, ft_cache: dict,
-                       round_id: str, sidecars: dict) -> list:
+                       round_id: str, sidecars: dict, judge=None) -> list:
         """Attach each computed entry's ``near_dup`` record (red-team F4)
-        and stage the reference sidecars in ``sidecars``."""
+        and stage the reference sidecars in ``sidecars``. ``judge``
+        (:class:`~cascade.validator.mkt_offload.PodJudge`): both reference
+        tests run on the pod, same results, same exceptions."""
         from .mkt_offload import MktOffloadError
 
         mc = self._mkt_cfg()
@@ -1508,9 +1567,12 @@ class MarketCastMixin:
                 continue
             refs = _near_dup_refs(r, got[1], same_target.get(r.target, {}), holders)
             try:
-                nd, blob = near_dup_record(r, got[0], refs, snap=snap, mc=mc,
-                                           load_ft=self._mkt_load_ft, ft_cache=ft_cache,
-                                           round_id=round_id)
+                if judge is not None:
+                    nd, blob = judge.near_dup_record(r, refs)
+                else:
+                    nd, blob = near_dup_record(r, got[0], refs, snap=snap, mc=mc,
+                                               load_ft=self._mkt_load_ft, ft_cache=ft_cache,
+                                               round_id=round_id)
             except MktOffloadError:
                 raise                       # the pod, not the entry: the round waits
             except Exception as e:  # noqa: BLE001 — never blocks the report
@@ -1521,9 +1583,12 @@ class MarketCastMixin:
                 sidecars[nd["quantiles_key"]] = blob
                 r = replace(r, near_dup=nd)
             try:
-                r, hblob = holder_record(r, got[0], holders.get(r.target), snap=snap, mc=mc,
-                                         load_ft=self._mkt_load_ft, ft_cache=ft_cache,
-                                         round_id=round_id)
+                if judge is not None:
+                    r, hblob = judge.holder_record(r, holders.get(r.target))
+                else:
+                    r, hblob = holder_record(r, got[0], holders.get(r.target), snap=snap,
+                                             mc=mc, load_ft=self._mkt_load_ft,
+                                             ft_cache=ft_cache, round_id=round_id)
             except MktOffloadError:
                 raise
             except Exception as e:  # noqa: BLE001 — never blocks the report
@@ -1613,6 +1678,43 @@ class MarketCastMixin:
             lease.release()
         return published
 
+    def _mkt_pod_judge(self, base_fc, sess):
+        """The round's :class:`~cascade.validator.mkt_offload.PodJudge` when
+        the base forecasts on the live session's pod and its worker serves
+        the judge (``mkt_judge_on_pod`` False = the in-process judge: tests'
+        reference path); else None."""
+        if sess is None or not getattr(self, "mkt_judge_on_pod", True):
+            return None
+        from .mkt_offload import PodJudge, RemoteForecaster
+
+        if isinstance(base_fc, RemoteForecaster) and base_fc.session is sess:
+            if getattr(sess, "has_judge", False):
+                return PodJudge(sess, base_fc, self._mkt_load_ft)
+            log.error("marketcast: the pod's worker serves no judge (an older release on the "
+                      "pod?): the judge runs in-process only under the box cap")
+        return None
+
+    def _mkt_box_judge_ok(self, snap, mc, item: dict, rid: str) -> bool:
+        """Whether round ``item`` may be judged IN the validator process: its
+        :func:`box_judge_bytes` estimate within ``mkt_box_judge_cap_bytes``
+        (:data:`MKT_BOX_JUDGE_CAP_BYTES`). Refused ⇒ an ERROR and the round
+        waits (retried; the trainer records it absent in the end) — never an
+        OOM of the box. An estimate that cannot be made lets it run."""
+        cap = int(getattr(self, "mkt_box_judge_cap_bytes", MKT_BOX_JUDGE_CAP_BYTES))
+        try:
+            targets = [str(c["entry"]["target"]) for c in item.get("candidates", ())]
+            need = box_judge_bytes(snap, mc, targets)
+        except Exception as e:  # noqa: BLE001 — no estimate: as before
+            log.warning("marketcast round=%s: box judge estimate unavailable (%s)", rid, e)
+            return True
+        if need > cap:
+            log.error("marketcast round=%s: judging in-process needs ~%d MB, over the %d MB box "
+                      "cap: refused (judge on the MarketCast pod: --mkt-eval-hosts with a "
+                      "worker that serves the judge); retried at the next settlement", rid,
+                      need // (1024 * 1024), cap // (1024 * 1024))
+            return False
+        return True
+
     def _mkt_round_ready(self, item: dict) -> bool:
         """Whether round ``item`` can be computed at all — its snapshot is
         published and its block hash readable — checked WITHOUT a pod (the
@@ -1638,6 +1740,34 @@ class MarketCastMixin:
         return True
 
     def _mkt_publish_round(self, item: dict, *, holders: dict | None = None) -> bool:
+        """:meth:`_mkt_publish_round_inner` under the box memory guard
+        (W-MKTOFF): the process RSS is sampled for the whole round, logged
+        (``rss start / peak``) and an ERROR names a growth over
+        :data:`MKT_ROUND_RSS_BUDGET_BYTES` (``mkt_round_rss_budget_bytes``)."""
+        from .offthread_worker import RSS_SAMPLE_SECONDS, _RssWatch, process_rss_bytes
+
+        rid = str(item.get("round_id", ""))
+        probe = getattr(self, "mkt_rss_probe", None) or process_rss_bytes
+        watch = _RssWatch(probe, float(getattr(self, "mkt_rss_interval", RSS_SAMPLE_SECONDS)))
+        watch.start()
+        try:
+            return self._mkt_publish_round_inner(item, holders=holders)
+        finally:
+            rss = watch.stop()
+            mb = 1024 * 1024
+            budget = int(getattr(self, "mkt_round_rss_budget_bytes", MKT_ROUND_RSS_BUDGET_BYTES))
+            if rss is None:
+                log.warning("marketcast round=%s: process RSS unreadable", rid)
+            else:
+                log.info("marketcast round=%s: rss start %d MB, peak %d MB (+%d MB)", rid,
+                         rss["start"] // mb, rss["peak"] // mb, rss["growth"] // mb)
+                if rss["growth"] > budget:
+                    log.error("marketcast round=%s grew the validator RSS by %d MB, over the "
+                              "%d MB box budget (peak %d MB): the judge belongs on the "
+                              "MarketCast pod (W-MKTOFF)", rid, rss["growth"] // mb,
+                              budget // mb, rss["peak"] // mb)
+
+    def _mkt_publish_round_inner(self, item: dict, *, holders: dict | None = None) -> bool:
         """Main validator: compute + sign + publish round ``item``'s report
         unless one is already there (never overwritten — a trainer may have
         recorded its sha256). Per entry a compute failure is retried
@@ -1692,7 +1822,7 @@ class MarketCastMixin:
         cache = getattr(self, "_mkt_base_cache", None)
         if cache is None or len(cache) > MKT_BASE_CACHE_MAX:
             cache = self._mkt_base_cache = {}
-        from .mkt_offload import MktOffloadError
+        from .mkt_offload import MktOffloadError, MktRemoteError
 
         base_fc, base_err = None, ""
         for _ in range(MKT_COMPUTE_ATTEMPTS):
@@ -1705,6 +1835,18 @@ class MarketCastMixin:
                 return False
             except Exception as e:  # noqa: BLE001 — the base must load: infra
                 base_err = f"{type(e).__name__}: {e}"
+        judge = None
+        if base_fc is not None:
+            judge = self._mkt_pod_judge(base_fc, sess)
+            try:
+                if judge is not None:
+                    judge.begin_round(snap, mc, rid)
+                elif not self._mkt_box_judge_ok(snap, mc, item, rid):
+                    return False
+            except MktOffloadError as e:
+                log.error("marketcast round=%s: offload pod failed preparing the judge (%s); "
+                          "retried at the next settlement", rid, e)
+                return False
         entries, sidecars = [], {}
         ft_cache: dict = {}
         datas: dict = {}
@@ -1729,10 +1871,14 @@ class MarketCastMixin:
             fwd: list[str] = []
             for _ in range(MKT_COMPUTE_ATTEMPTS):
                 try:
-                    rows, data = compute_entry_rows(
-                        e, phase=phase, after=after, snap=snap, mc=mc, base_fc=base_fc,
-                        load_ft=self._mkt_load_ft, base_cache=cache, round_id=rid,
-                        ft_cache=ft_cache, draw=draw)
+                    if judge is not None:
+                        rows, data = judge.compute_entry_rows(e, phase=phase, after=after,
+                                                              draw=draw, round_id=rid)
+                    else:
+                        rows, data = compute_entry_rows(
+                            e, phase=phase, after=after, snap=snap, mc=mc, base_fc=base_fc,
+                            load_ft=self._mkt_load_ft, base_cache=cache, round_id=rid,
+                            ft_cache=ft_cache, draw=draw)
                     break
                 except MktOffloadError as x:
                     # the POD failed, not this entry: nothing is deferred or
@@ -1741,7 +1887,8 @@ class MarketCastMixin:
                               "the next settlement", rid, x)
                     return False
                 except Exception as x:  # noqa: BLE001 — OOM / fetch / library: retried
-                    err = f"{type(x).__name__}: {x}"
+                    # a pod judge's exception carries the type name it had there
+                    err = x.text if isinstance(x, MktRemoteError) else f"{type(x).__name__}: {x}"
                     fwd.append(str(x) if isinstance(x, MktForwardError) else "")
                     rows = data = None
             if rows is None and len(fwd) == MKT_COMPUTE_ATTEMPTS and fwd[0] and len(set(fwd)) == 1:
@@ -1761,7 +1908,8 @@ class MarketCastMixin:
                 datas[(rows.hotkey, rows.trained_pointer, rows.phase)] = (data, _seniority(c))
         try:
             entries = self._mkt_near_dups(entries, datas, holders or {}, snap=snap,
-                                          ft_cache=ft_cache, round_id=rid, sidecars=sidecars)
+                                          ft_cache=ft_cache, round_id=rid, sidecars=sidecars,
+                                          judge=judge)
         except MktOffloadError as x:
             log.error("marketcast round=%s: offload pod failed in the reference tests (%s); "
                       "retried at the next settlement", rid, x)
