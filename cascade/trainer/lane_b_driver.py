@@ -399,6 +399,12 @@ class LaneBDriver:
         # rounds the scheduler abandoned (settlement over its bound): settle
         # commits nothing for them any more (see :meth:`abandon`)
         self._abandoned: set[str] = set()
+        # In-window settlement retries (owner 2026-11-28): the inputs the FIRST
+        # attempt of a round read — {rid: {"legs": [leg_pointer...],
+        # "lineage_tokens": n}} — so a retry of that round settles exactly the
+        # legs (and lineage clock) an on-time success would have: a leg that
+        # finishes during the retry wait settles with the next round
+        self._settle_pins: dict[str, dict] = {}
         self._acceptance_jobs: dict = {}
         # Scientific expiry is not physical termination: a stale worker can
         # still own the hotkey's pod and harvest directory until its callback.
@@ -985,6 +991,7 @@ class LaneBDriver:
             rid = str(round_id)
             if rid not in self.st.settled:
                 self._abandoned.add(rid)
+            self._settle_pins.pop(rid, None)
             return str(self.st.settled.get(rid, {}).get("digest", "") or "")
 
     # ── lineage clock ────────────────────────────────────────────────────────
@@ -1552,7 +1559,17 @@ class LaneBDriver:
         with self._lock:
             if rid in self.st.settled or rid in self._abandoned:
                 return []
-            todo = [dict(f) for f in self.st.finished]
+            pin = self._settle_pins.get(rid)
+            if pin is None:
+                todo = [dict(f) for f in self.st.finished]
+                # one round settles at a time: only the latest round's pin
+                self._settle_pins = {rid: {"legs": [f["leg_pointer"] for f in todo],
+                                           "lineage_tokens": int(self.st.lineage_tokens)}}
+            else:
+                # an in-window retry of this round: the first attempt's legs
+                keep = set(pin["legs"])
+                todo = [dict(f) for f in self.st.finished if f["leg_pointer"] in keep]
+            lineage_tokens = int(self._settle_pins[rid]["lineage_tokens"])
         entries, used, dropped = [], [], []
         # W-S2 (D35): the settlement era's §16 sentinel is no public guard nor
         # requirement of lane B; None (unarmed) leaves every call as before
@@ -1688,7 +1705,7 @@ class LaneBDriver:
         if entries:
             manifest = ExpertManifest(round_id=rid, created_block=int(block),
                                       king_pointer=king_pointer,
-                                      lineage_tokens=self.st.lineage_tokens,
+                                      lineage_tokens=lineage_tokens,
                                       entries=tuple(entries))
             self.ops.publish_expert_manifest(manifest)
             judge_kw = {} if sentinel is None else {"sentinel": sentinel}
@@ -1717,8 +1734,21 @@ class LaneBDriver:
                             "nothing committed; its legs wait for the next settlement", rid)
                 return []
             progress_outcomes = []
+            # owner 2026-11-28: the judge's per-target LCB / bar / gain per
+            # judged leg, kept in the driver state for the public queue
+            # verdict (display telemetry: never signed, never re-read by any
+            # scoring path; the signed manifest/receipts are unchanged)
+            from ..funding.public_reason import judgement_margins
+
+            margins = {}
+            for j in judgements:
+                try:
+                    margins[j.entry.rebased_pointer] = judgement_margins(j)
+                except Exception as e:  # noqa: BLE001 — telemetry never blocks a settlement
+                    log.debug("lane B: verdict margins unavailable: %s", e)
             for ptr, _f, sel in used:
                 sub = _f["leg"]["sub"]
+                m = margins.get(ptr) or {}
                 progress_outcomes.append({"round_id": rid, "hotkey": sub["hotkey"],
                                 "gen_ref": sub["gen_ref"], "domain": sub["domain"],
                                 "targets": list(sub.get("targets") or [sub["domain"]]),
@@ -1728,7 +1758,9 @@ class LaneBDriver:
                                 "leg_pointer": ptr,
                                 "outcome": ("qualified" if ptr in passed else
                                             "qualification_not_selected" if ptr in checks_passed else
-                                            "qualification_rejected")})
+                                            "qualification_rejected"),
+                                **({"judge_stage": m["stage"]} if m.get("stage") else {}),
+                                **({"margins": m["targets"]} if m.get("targets") else {})})
                 rec = {"rebased_pointer": ptr, "king_pointer": king_pointer,
                        "selection": {str(k): v for k, v in sel.items()}}
                 if ptr in qualified:
@@ -1740,18 +1772,20 @@ class LaneBDriver:
                     # validator that missed it can judge it on demand
                     self.st.pending_merges.append({**rec, "round_id": rid})
             self.st.finished = [f for f in self.st.finished if f not in todo]
-            self._settle_funding(todo, dropped)
+            self._settle_funding(todo, dropped, progress_outcomes)
             self.st.outcomes.extend(dropped)
             self.st.submission_results.extend(progress_outcomes)
             del self.st.submission_results[:-OUTCOMES_KEEP]
             del self.st.outcomes[:-OUTCOMES_KEEP]
             self.st.settled[rid] = {"digest": digest}
+            self._settle_pins.pop(rid, None)
             for old in list(self.st.settled)[:-SETTLED_KEEP]:
                 del self.st.settled[old]
             self.save()
         return judgements
 
-    def _settle_funding(self, todo: list[dict], dropped: list[dict]) -> None:
+    def _settle_funding(self, todo: list[dict], dropped: list[dict],
+                        judged: list[dict] | None = None) -> None:
         """The funded queue entries of the legs this settlement consumed
         (caller holds the lock): a leg that reached the manifest (judged) or
         was refused at the merge byte-check is spent (``mark_done``); a leg
@@ -1763,6 +1797,12 @@ class LaneBDriver:
             return
         fq = self._funded_queue()
         why = {d["leg_pointer"]: d["outcome"] for d in dropped}
+        # owner 2026-11-28: the public verdict each spent entry carries
+        verdicts = {r["leg_pointer"]: {**r, "lane": "b"} for r in (judged or [])
+                    if r.get("leg_pointer")}
+        verdicts.update({d["leg_pointer"]: {"lane": "b", "outcome": d["outcome"],
+                                            "round_id": d.get("round_id"),
+                                            "gen_ref": d.get("gen_ref")} for d in dropped})
         for f in funded:
             hk = f["leg"]["sub"]["hotkey"]
             if why.get(f["leg_pointer"]) in ("stale", "routing_stale"):
@@ -1773,8 +1813,10 @@ class LaneBDriver:
                                error_class="no_capacity", burn_attempt=False, operator_billed=True)
             elif fq is not None:
                 funding = f["leg"]["funding"]
+                verdict = verdicts.get(f["leg_pointer"])
                 fq.mark_done(hk, expect_ref=funding["entry_ref"],
-                             expect_started_block=funding.get("started_block"))
+                             expect_started_block=funding.get("started_block"),
+                             **({"verdict": verdict} if verdict else {}))
 
     def _routing_stale(self, leg: dict, sel: dict[int, list[int]], king_pointer: str,
                        block: int) -> tuple[bool, dict]:
@@ -2286,6 +2328,22 @@ class RunnerLaneBOps:
                 "pod_name": funded_pod_name(seed, hk, self.r.cfg.subnet.netuid) + "-0",
                 "tag": f"expert-{hk[:12]}-{seed}"}
 
+    def leg_pod_ledgered(self, leg: OpenLeg) -> bool:
+        """A ledgered pod (payer or operator-rented) of ``leg`` in the current
+        seed epoch: a re-attach then runs attach-only. False only when the
+        ledger was read and holds neither name; anything unknown (no seeds
+        yet, an unreadable ledger) is True — never risk a fresh rent of a pod
+        name that might be live."""
+        from .runner_funded_legs import _leg_allocated
+
+        try:
+            seeds = self._seeds()
+        except Exception:  # noqa: BLE001 — unknown: attach-only decides
+            return True
+        if seeds is None:
+            return True
+        return bool(_leg_allocated(self.r, str(seeds.base_seed), leg.sub.hotkey))
+
     def reattach_leg(self, leg: OpenLeg, era_index: int, block: int, done, rec: dict) -> None:
         """Re-attach a persisted open funded leg after a trainer restart: the
         leg's own funded path at its ORIGINAL dispatch block, attach-only
@@ -2326,6 +2384,19 @@ class RunnerLaneBOps:
 
         def _run():
             if reattach is None:
+                return _body()
+            if not self.leg_pod_ledgered(leg):
+                # 2026-11-28 (5H63pHtyHgkf): no ledgered pod (payer or
+                # operator) of this leg exists, so there is nothing to attach
+                # to — the old process died before it rented. Attach-only
+                # would generate the whole CPU corpus (~1 h) and only then
+                # refuse the rent. Run it as a NORMAL dispatch instead: same
+                # leg, same in-flight attempt (no new charge), every pre-rent
+                # gate applies. The ledger is write-ahead, so no row means no
+                # pod that a fresh rent could double.
+                log.warning("lane B: re-attach of %s: no ledgered pod for this leg — "
+                            "dispatching it normally (generation + fresh rent)",
+                            leg.sub.hotkey[:12])
                 return _body()
             with _reattach.reattach_only():
                 return _body()

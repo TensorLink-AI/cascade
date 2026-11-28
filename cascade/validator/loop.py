@@ -1138,8 +1138,20 @@ class ValidatorRunner(
             except Exception as e:  # noqa: BLE001
                 log.warning("weight re-assert check failed: %s", e)
             self._lane_d_tick(client)
+            self._mkt_retry_poll(client)
             self._vbench_lease_tick()
             time.sleep(poll)
+
+    def _mkt_retry_poll(self, client: object) -> None:
+        """In-window retry of the MarketCast offloaded report publish (owner
+        2026-11-28; :meth:`MarketCastMixin._mkt_retry_tick`). Nothing is read
+        unless a run left rounds without a report. Never raises."""
+        if not self.__dict__.get("_mkt_pub_retry"):
+            return
+        try:
+            self._mkt_retry_tick(int(client.current_block()))  # type: ignore[attr-defined]
+        except Exception as e:  # noqa: BLE001
+            log.warning("marketcast retry poll failed: %s", e)
 
     def _lane_d_tick(self, client: object) -> None:
         """W19 (invariant 6): submit the armed lane D settlement to the

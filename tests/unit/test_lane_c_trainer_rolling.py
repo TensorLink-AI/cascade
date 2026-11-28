@@ -79,6 +79,14 @@ def _run(cfg, tmp_path, *, fail=False, publish_fails=0, live=()):
     if publish_fails:
         _advance(clock, ops, sched, client, from_block=era_start + EB + 3,
                  to_block=era_start + EB + 5)
+    # 2026-11-28: a failed lane C retries in-window (the lane-A settlement
+    # waits, bounded by LANE_B_SETTLE_MAX_SECONDS): tick past that bound
+    block = era_start + EB + 5
+    while fail and not ops.manifests and block < era_start + EB + 600:
+        block += 5
+        clock.t += 60.0
+        sched.tick(client, block)
+        _join(sched)
     return sched, events, ops
 
 
@@ -94,9 +102,12 @@ def test_lane_c_settles_first_and_is_bound_into_the_lane_a_manifest(cfg, tmp_pat
 
 
 def test_failed_lane_c_settlement_binds_nothing_and_lane_a_proceeds(cfg, tmp_path):
-    _, _, ops = _run(cfg, tmp_path, fail=True)
+    _, events, ops = _run(cfg, tmp_path, fail=True)
     (m,) = ops.manifests
     assert m.lane_c_digest == ""
+    # the in-window retries all ran before the one lane-A publish
+    assert events[-1] == ("lane_a_publish", m.round_id)
+    assert len([e for e in events if e[0] == "lane_c_settle"]) > 1
     assert b"lane_c_digest" not in m.canonical_body()
 
 

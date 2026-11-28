@@ -446,6 +446,14 @@ class LaneCDriver:
         """One leg; ``reattach`` (a persisted open leg after a restart) runs
         the same path attach-only (:mod:`cascade.trainer.leg_reattach`)."""
         if reattach:
+            if not self._leg_pod_ledgered(leg):
+                # 2026-11-28: nothing to attach to (no ledgered pod of this
+                # leg) — a normal run of the same leg and attempt, never an
+                # attach-only run that does all the pre-rent work and then
+                # refuses the rent (lane B 5H63pHtyHgkf: ~1 h of CPU wasted)
+                log.warning("lane C: re-attach of %s/%s: no ledgered pod for this leg — "
+                            "running it normally", leg["hotkey"][:8], leg["target"])
+                return self._run_leg(leg)
             with _reattach.reattach_only():
                 return self._run_leg(leg)
         try:
@@ -494,6 +502,17 @@ class LaneCDriver:
                 miner_fault=False, error_class=OPERATOR_FAULT_CLASS, burn=False))
             return
         self._leg_done(leg, result=out, recipe=recipe)
+
+    def _leg_pod_ledgered(self, leg: dict) -> bool:
+        """The ops' ledger verdict for a re-attach; True (attach-only) when the
+        ops cannot tell or the probe fails."""
+        probe = getattr(self.ops, "leg_pod_ledgered", None)
+        if not callable(probe):
+            return True
+        try:
+            return bool(probe(leg))
+        except Exception:  # noqa: BLE001 — unknown: attach-only decides
+            return True
 
     def _leg_done(self, leg: dict, *, result: dict | None = None,
                   recipe: LegRecipe | None = None,
@@ -643,8 +662,12 @@ class LaneCDriver:
             done = [f for f in self.st.finished if f["trained_pointer"] in pointers]
             for f in done:
                 if queue is not None:
+                    # owner 2026-11-28: the public verdict (display only):
+                    # published for forward judging in this settlement
                     queue.mark_done(f["leg"]["hotkey"], expect_ref=f["leg"]["entry_ref"],
-                                    expect_started_block=f["leg"]["started_block"])
+                                    expect_started_block=f["leg"]["started_block"],
+                                    verdict={"lane": "c", "outcome": "published",
+                                             "round_id": rid, "ref": f["leg"].get("ref")})
                 leg = f["leg"]
                 k = spent_key(leg["hotkey"], leg["target"], leg["ref"],
                               int(leg.get("commit_block", 0) or 0))
@@ -1075,6 +1098,17 @@ class RunnerLaneCOps:
         sched = self.r.__dict__.get("_rolling_sched")
         era = sched.state.current if sched is not None else None
         return (self.r._rolling_seeds(era) if era is not None else None), era
+
+    def leg_pod_ledgered(self, leg: dict) -> bool:
+        """A ledgered pod (payer or operator-rented) of ``leg`` in the current
+        seed epoch (the name its funded path rents by). False only when the
+        ledger was read and holds neither name; unknown is True."""
+        from .runner_funded_legs import _leg_allocated
+
+        seeds, _era = self._seeds()
+        if seeds is None:
+            return True
+        return bool(_leg_allocated(self.r, str(seeds.base_seed), str(leg["hotkey"])))
 
     def train_leg(self, leg: dict, recipe: LegRecipe) -> dict:
         """One fine-tune leg on the MINER's key, by its competition

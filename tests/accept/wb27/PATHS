@@ -64,6 +64,9 @@ cascade/trainer/runner_operator_pods.py
 cascade/trainer/runner_rolling.py
 cascade/provision/funded.py
 tests/unit/test_lane_b_reattach.py
+# 2026-11-28: a re-attach with no ledgered pod is a normal dispatch (lane B /
+# lane C); the funded path refuses attach-only before the corpus (5H63pHtyHgkf).
+tests/unit/test_reattach_no_pod_normal_dispatch.py
 tests/unit/test_pod_postmortem.py
 # 2026-11-26 lane B/C assumption audit: lane A walls, dispatch timeout, the
 # MarketCast watchdog, limits / fixed-steps legs, the operator leg's layout.
@@ -166,3 +169,32 @@ champions/README.md
 docs/MINER_LANE_B.md
 tests/unit/test_direct_submissions.py
 tests/accept/wb27/test_wb27_lane_b_champions.py
+# 2026-11-28 owner ("a failed lane settlement retries quickly within the same
+# window, so a mistake costs minutes instead of 3 hours ... must NOT require a
+# satellite validator update"): a failed lane B / lane C settlement step
+# retries for THE SAME settlement (2 -> 5 -> 10 min) inside the lane-A hold
+# bound (LANE_B_SETTLE_MAX_SECONDS) and before the next boundary; the lane B
+# driver pins the first attempt's legs; the main validator's MarketCast
+# report run retries in-window. Lane D already retries every poll (W19).
+cascade/trainer/rolling.py
+cascade/validator/marketcast.py
+tests/unit/test_lane_b_publish_order.py
+tests/accept/wb27/test_wb27_in_window_settlement_retry.py
+tests/unit/test_lane_c_trainer_rolling.py
+# a Protocol method body stub_scan flagged (#991 put the file in W-CMP PATHS)
+cascade/eval/timestral_adapter.py
+# 2026-11-28 owner ("can miners see that in the CLI and the leaderboard on
+# the dashboard? yes please do that"): a sanitized one-line public reason per
+# queue entry (whitelisted templates, never raw error text) and the settled
+# entry's verdict (outcome, round, per-target LCB / bar / point gain) on the
+# public lane queues, the trainer's status docs, the miner CLI and the
+# website. Display only: no signed manifest, receipt or scoring path reads it.
+cascade/funding/public_reason.py
+cascade/miner/submission_status.py
+cascade/website/index.html
+scripts/publish_website.py
+tests/accept/wb27/test_wb27_miner_visible_reasons.py
+# 2026-11-28: a chunked-v2 Hub object (hippius_hub >= 0.6 push) is reassembled and
+# verified on fetch; a marker over a chunk index is incomplete; every push is
+# forced to the single-blob layout (HIPPIUS_CHUNKED_WRITE=0). hippius.py and
+# lane_b_offload.py (pod cache completeness) are listed above.

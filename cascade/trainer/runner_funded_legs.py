@@ -386,6 +386,21 @@ class _FundedLegMixin:
         reused = _reupload_pending(self, gen, seeds, contract, suffix, warm_start_ref)
         if reused is not None:
             return reused
+        from .faults import _FundedLegSkip
+        from .leg_reattach import REATTACH_REFUSED, attach_only
+
+        if attach_only() and not _leg_allocated(self, str(seeds.base_seed), gen.hotkey):
+            # 2026-11-28 (5H63pHtyHgkf): an attach-only leg with no ledgered
+            # pod can only end in the rent refusal — refuse it BEFORE the
+            # corpus (a ~1 h CPU-tier generation ran in full, then the rent
+            # was refused). The lane drivers run such a leg as a normal
+            # dispatch; this is the backstop for any other attach-only caller.
+            why = f"{REATTACH_REFUSED}: the leg's pod is not on the funded ledger"
+            log.warning("funded leg %s: %s — nothing generated, nothing rented",
+                        gen.hotkey[:12], why)
+            self._record_funded_failure(gen.hotkey, why, miner_fault=False,
+                                        error_class="no_capacity", burn=False)
+            raise _FundedLegSkip(gen.hotkey)
         # Money safety II: the money gates as a side-effect-free "would it
         # rent?" verdict BEFORE the corpus (a CPU VM is operator money): a
         # leg that cannot rent never generates. King legs are exempt (a held

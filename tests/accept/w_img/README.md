@@ -71,5 +71,15 @@ reproducibility-contract decision, signed off by the owner.**
     seed epoch trains its king under the new contract;
   - the normal rollover is unchanged, and a king nobody holds yet (the
     epoch's first era, nothing published) still retrains as before.
+- `test_w_img_lock_frozen.py` (owner 2026-11-28): the image's venv equals
+  `uv.lock`:
+  - the comparer (`cascade.shared.lockdrift`) finds version drift, packages
+    the lock does not know and a wrong git commit, numerics-relevant first;
+  - `deploy/Dockerfile` installs with `uv sync --frozen` and fails the build on
+    drift, and `deploy/pod_bootstrap.sh` checks after its sync;
+  - no install path re-resolves the main project (`pip install -e`), and the
+    benchmarks sidecar stays frozen on its own lock;
+  - the health gate's `lock_match` refuses a marked pod that drifted and
+    reports a legacy image (no marker) without refusing it.
 
 No torch: never run torch-backed files or `make laned-e2e` on the ops box.

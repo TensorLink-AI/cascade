@@ -912,6 +912,12 @@ class RollingScheduler:
         # "started", "digest", "error"} — off the tick thread, still ordered
         # before its lane-A manifest (see _lane_b_settle).
         self._lane_b_slot: dict | None = None
+        # In-window settlement retries (owner 2026-11-28): the boundary whose
+        # lane-A settlement is held for its lanes {"boundary", "started",
+        # "lane_b" (the expert digest once lane B returned)} and the lane-C
+        # retry record {"rid", "attempt", "retry_at"} (see _settle_retry_ok).
+        self._settle_hold: dict | None = None
+        self._lane_c_retry: dict | None = None
         # DEC-CA-0050 lane-B driver (None = lane B not wired in this process)
         self.lane_b = getattr(runner, "lane_b_driver", None)
         # DEC-CA-0056 lane-C driver (None = lane C not wired in this process)
@@ -1036,14 +1042,62 @@ class RollingScheduler:
     # the driver had already committed — never a digest it could still change.
     LANE_B_SETTLE_WAIT_SECONDS = 30.0
     LANE_B_SETTLE_MAX_SECONDS = 3600.0
+    # In-window retries (owner 2026-11-28: "a mistake costs minutes instead of
+    # 3 hours"). A FAILED lane-B or lane-C settlement step is retried for THE
+    # SAME settlement (same round id = boundary block hash, same boundary,
+    # same king, the lane-B leg set of the first attempt) after 2, 5, then
+    # every 10 min — instead of lane A publishing without it and its legs
+    # waiting for the next boundary. Bound: the lane-A hold this boundary
+    # already allows a slow lane B (LANE_B_SETTLE_MAX_SECONDS from the first
+    # attempt) and never past the next boundary, so the lane-A manifest is
+    # never later than today's worst case (its created_block stays inside its
+    # own grid slot — the only clock any validator/satellite applies to it).
+    # ``<work_root>/settle-retry-now`` (touch it after a fix) retries at the
+    # next tick instead of waiting out the backoff.
+    SETTLE_RETRY_BACKOFF_SECONDS = (120.0, 300.0, 600.0)
+    SETTLE_RETRY_NOW_FILE = "settle-retry-now"
 
-    def _lane_b_settle(self, round_id: str, block: int, cur: EraState, king) -> str | None:
+    def _settle_retry_delay(self, attempt: int) -> float:
+        """The wait before retry ``attempt`` (1 = the first retry)."""
+        steps = self.SETTLE_RETRY_BACKOFF_SECONDS
+        return float(steps[min(max(int(attempt), 1), len(steps)) - 1])
+
+    def _settle_retry_ok(self, boundary: int, now_block: int | None, started: float,
+                         retry_at: float) -> bool:
+        """Whether a retry at ``retry_at`` still fits this settlement's window:
+        the head is before the next boundary (a late settlement — the trainer
+        was away — never retries: today's behaviour) and the retry starts
+        inside the lane-A hold bound counted from the first attempt."""
+        if now_block is None:
+            return False
+        from ..shared.config import effective_epoch_blocks
+
+        b = int(boundary)
+        if int(now_block) >= b + int(effective_epoch_blocks(self.cfg.round, b)):
+            return False
+        return float(retry_at) - float(started) < self.LANE_B_SETTLE_MAX_SECONDS
+
+    def _settle_retry_now(self) -> bool:
+        """Consume the operator's re-arm file (True = retry at once)."""
+        try:
+            f = Path(self.r.work_root) / self.SETTLE_RETRY_NOW_FILE
+            if f.exists():
+                f.unlink()
+                log.warning("rolling: %s found — the held settlement retries now", f)
+                return True
+        except OSError as e:
+            log.warning("rolling: settle-retry re-arm file unreadable: %s", e)
+        return False
+
+    def _lane_b_settle(self, round_id: str, block: int, cur: EraState, king,
+                       now_block: int | None = None) -> str | None:
         """Settle lane B for this boundary BEFORE the lane-A manifest is built
         and published; returns the expert manifest digest the lane-A manifest
-        binds ("" = no lane-B legs this round — and on any failure, which
-        keeps the finished legs for the next settlement and binds nothing),
-        or None while the background settlement is still running (the
-        lane-A boundary waits for the next tick)."""
+        binds ("" = no lane-B legs this round — and on a failure no retry can
+        fix inside the window, which keeps the finished legs for the next
+        settlement and binds nothing), or None while the background
+        settlement is still running or a failed attempt waits for its
+        in-window retry (the lane-A boundary waits for the next tick)."""
         drv = self.lane_b
         if drv is None or king is None or not self.cfg.lane_b.active(block):
             return ""
@@ -1062,7 +1116,8 @@ class RollingScheduler:
             slot = None
         if slot is None:
             slot = {"rid": rid, "started": self.clock(), "digest": "", "error": None,
-                    "king": king.trained_pointer, "boundary": int(block)}
+                    "king": king.trained_pointer, "boundary": int(block), "attempt": 1,
+                    "retry_at": None}
 
             # WB26: suite-target legs carry the era anchor king's bench rows —
             # the anchor the validator derives from this era's manifest
@@ -1074,6 +1129,8 @@ class RollingScheduler:
                 if anchor:
                     anchor_kw = {"anchor_pointer": anchor}
 
+            # every attempt (the first and each in-window retry) calls the
+            # driver with the SAME arguments: round id, boundary, era, king
             def _run(slot=slot) -> None:
                 try:
                     drv.settle(round_id=rid, block=int(block), era_index=cur.index,
@@ -1083,9 +1140,23 @@ class RollingScheduler:
                 except Exception as e:  # noqa: BLE001 — lane B never stalls lane A
                     slot["error"] = e
 
+            slot["run"] = _run
             slot["thread"] = threading.Thread(target=_run, name=f"laneb-settle-{rid}",
                                               daemon=True)
             self._lane_b_slot = slot
+            slot["thread"].start()
+        elif slot.get("retry_at") is not None and not slot["thread"].is_alive():
+            # a failed attempt waits for its in-window retry
+            if self.clock() < float(slot["retry_at"]) and not self._settle_retry_now():
+                return None
+            slot["attempt"] = int(slot["attempt"]) + 1
+            slot["retry_at"], slot["error"], slot["digest"] = None, None, ""
+            log.warning("rolling: lane B settlement of %s — in-window retry %d (same "
+                        "settlement, boundary %d, king %s)", rid, slot["attempt"] - 1,
+                        int(slot["boundary"]), slot["king"])
+            slot["thread"] = threading.Thread(target=slot["run"],
+                                              name=f"laneb-settle-{rid}-r{slot['attempt']}",
+                                              daemon=True)
             slot["thread"].start()
         slot["thread"].join(self.LANE_B_SETTLE_WAIT_SECONDS)
         if slot["thread"].is_alive():
@@ -1100,13 +1171,26 @@ class RollingScheduler:
                         "binds %s", rid, self.LANE_B_SETTLE_MAX_SECONDS,
                         digest or "nothing (its legs wait for the next settlement)")
             return digest
+        if slot["error"] is not None:
+            retry_at = self.clock() + self._settle_retry_delay(slot["attempt"])
+            if self._settle_retry_ok(slot["boundary"], now_block, slot["started"], retry_at):
+                slot["retry_at"] = retry_at
+                log.warning("rolling: lane B settlement failed at %s (attempt %d): %s — "
+                            "retried in %.0fs for the SAME settlement; the lane-A "
+                            "settlement waits (bound %.0fs from the first attempt)", rid,
+                            slot["attempt"], slot["error"], retry_at - self.clock(),
+                            self.LANE_B_SETTLE_MAX_SECONDS)
+                return None
         self._lane_b_slot = None
         if slot["king"] != king.trained_pointer:
             # cannot happen while the king is frozen (tick); never silent
             log.error("rolling: lane B settled %s against king %s but the lane-A manifest "
                       "carries %s", rid, slot["king"], king.trained_pointer)
         if slot["error"] is not None:
-            log.warning("rolling: lane B settlement failed at %s: %s", rid, slot["error"])
+            # the window is spent: stop the driver committing anything late
+            self._lane_b_abandon(drv, rid)
+            log.warning("rolling: lane B settlement failed at %s after %d attempt(s), no "
+                        "retry fits the window: %s", rid, slot["attempt"], slot["error"])
             return ""
         return str(slot["digest"] or "")
 
@@ -1157,27 +1241,54 @@ class RollingScheduler:
             log.warning("rolling: lane C tick failed: %s", e)
 
     def _lane_c_settle(self, round_id: str, block: int, created_block: int, cur: EraState,
-                       king) -> tuple[str, dict | None]:
+                       king, now_block: int | None = None,
+                       hold_started: float | None = None) -> tuple[str, dict | None] | None:
         """Settle lane C for this boundary BEFORE the lane-A manifest is built:
         ``(digest, published)`` — the sha256 of the lane-C manifest text the
         lane-A manifest binds (``lane_c_digest``; "" = nothing settled, and on
         ANY failure: its legs wait for the next settlement and nothing is
         bound) and ``{key, text}`` of it for the lane-A write-ahead (a replay
         republishes the identical bytes first). Synchronous: no evaluation
-        runs here, only a sign and one put."""
+        runs here, only a sign and one put.
+
+        In-window retry (owner 2026-11-28): a failed attempt returns None (the
+        lane-A settlement waits) and is retried after the backoff for the SAME
+        round — the driver's write-ahead republishes the identical bytes when
+        the first attempt got that far — while it fits the lane-A hold bound
+        (``hold_started``) and the head is before the next boundary."""
         drv = self.lane_c
         if drv is None or king is None or not self.cfg.lane_c.active(block):
             return "", None
+        rid = str(round_id)
+        rc = self._lane_c_retry
+        if rc is not None and rc["rid"] != rid:
+            rc = self._lane_c_retry = None
+        if rc is not None:
+            if self.clock() < float(rc["retry_at"]) and not self._settle_retry_now():
+                return None
+            log.warning("rolling: lane C settlement of %s — in-window retry %d (same "
+                        "settlement)", rid, int(rc["attempt"]))
         try:
-            digest = drv.settle(round_id=str(round_id), block=int(block),
+            digest = drv.settle(round_id=rid, block=int(block),
                                 era_index=cur.index, base_pointer=king.trained_pointer,
                                 created_block=int(created_block),
-                                base_round_id=str(round_id), pool_block=int(block))
+                                base_round_id=rid, pool_block=int(block))
         except Exception as e:  # noqa: BLE001 — lane C never stalls lane A
+            attempt = 1 + (int(rc["attempt"]) if rc is not None else 0)
+            retry_at = self.clock() + self._settle_retry_delay(attempt)
+            started = self.clock() if hold_started is None else float(hold_started)
+            if self._settle_retry_ok(block, now_block, started, retry_at):
+                self._lane_c_retry = {"rid": rid, "attempt": attempt, "retry_at": retry_at}
+                log.warning("rolling: lane C settlement failed at %s (attempt %d): %s — "
+                            "retried in %.0fs for the SAME settlement; the lane-A "
+                            "settlement waits", rid, attempt, e, retry_at - self.clock())
+                return None
+            self._lane_c_retry = None
             log.warning("rolling: lane C settlement failed at %s (its legs wait; nothing "
                         "bound): %s", round_id, e)
             return "", None
-        return str(digest or ""), (drv.published(str(round_id)) if digest else None)
+        self._lane_c_retry = None
+        return str(digest or ""), (drv.published(rid) if digest else None)
 
     def _lane_c_live(self) -> set[str]:
         drv = self.lane_c
@@ -3378,13 +3489,27 @@ class RollingScheduler:
         # digest signed into the lane-A manifest, so a validator polling
         # between the two publishes can never handle this settlement without
         # its lane-B legs (the merge the next era init declares).
-        expert_sha = self._lane_b_settle(round_id, epoch_start, cur, king)
+        hold = self._settle_hold
+        if hold is None or int(hold["boundary"]) != int(epoch_start):
+            # the first attempt at this boundary: the lane-A hold bound of its
+            # in-window lane B / lane C retries counts from here
+            hold = self._settle_hold = {"boundary": int(epoch_start),
+                                        "started": self.clock(), "lane_b": None}
+        expert_sha = hold["lane_b"]
         if expert_sha is None:
-            return False                     # lane B still settling: this boundary waits
+            expert_sha = self._lane_b_settle(round_id, epoch_start, cur, king,
+                                             now_block=now_block)
+            if expert_sha is None:
+                return False        # lane B settling or retrying: this boundary waits
+            hold["lane_b"] = expert_sha  # lane B ran once for this boundary
         # Lane C next (DEC-CA-0056), the same binding: its manifest is out and
         # its sha256 signed into the lane-A manifest before that publishes.
-        lane_c_sha, lane_c_pub = self._lane_c_settle(round_id, epoch_start, created_block,
-                                                     cur, king)
+        lane_c_res = self._lane_c_settle(round_id, epoch_start, created_block, cur, king,
+                                         now_block=now_block,
+                                         hold_started=float(hold["started"]))
+        if lane_c_res is None:
+            return False            # lane C retrying in its window: this boundary waits
+        lane_c_sha, lane_c_pub = lane_c_res
         from ..shared.manifest import dump_manifest
 
         # DEC-CA-0063: record the main validator's bench reports of earlier

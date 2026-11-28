@@ -67,6 +67,7 @@ import contextlib
 import logging
 import math
 import re
+import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
@@ -193,6 +194,13 @@ class mkt_context:  # noqa: N801 — a context manager used like a function
 MKT_BASE_CACHE_MAX = 200_000
 # a compute failure on the main validator is retried this often within a round
 MKT_COMPUTE_ATTEMPTS = 2
+# In-window retry of an offloaded publish run that left rounds without a
+# report (owner 2026-11-28): after 2, 5, then every 10 min, until the head
+# reaches the next settlement boundary — instead of waiting for the next
+# settlement (3 h). No validator reads a report before a trainer-signed
+# lane-C manifest records its sha256, so a report that lands sooner changes
+# nothing but the settlement that records it.
+MKT_RETRY_BACKOFF_SECONDS = (120.0, 300.0, 600.0)
 # the exact-identity registry keeps this many checkpoint digests
 MKT_SEEN_KEEP = 4096
 
@@ -1218,7 +1226,12 @@ class MarketCastMixin:
             if self.mkt_eval_hosts is not None:
                 # offloaded: off the settlement thread (the pod may take
                 # minutes to come up; the trainer's arbiter waits for it)
-                self._mkt_publish_async(copy.deepcopy(todo), dict(holders), ctx=ctx)
+                from ..shared.config import effective_epoch_blocks
+
+                b = int(block)
+                eb = int(effective_epoch_blocks(self.cfg.round, b))
+                self._mkt_publish_async(copy.deepcopy(todo), dict(holders), ctx=ctx,
+                                        window_end_block=b // eb * eb + eb)
             else:
                 for item in todo:
                     self._mkt_publish_round(item, holders=holders)
@@ -1537,29 +1550,111 @@ class MarketCastMixin:
 
     # ── the main validator's rows ──
 
-    def _mkt_publish_async(self, todo: list, holders: dict, *, ctx: MktCtx | None = None) -> bool:
+    def _mkt_publish_async(self, todo: list, holders: dict, *, ctx: MktCtx | None = None,
+                           window_end_block: int | None = None, _attempt: int = 0) -> bool:
         """Offloaded publishing: one background run over ``todo`` (False =
-        a run is still going; the next settlement retries what it leaves)."""
+        a run is still going). With ``window_end_block`` (the next settlement
+        boundary) the rounds a run leaves without a report — and a ``todo``
+        that found a run still going — are retried in-window by
+        :meth:`_mkt_retry_tick` (2 → 5 → 10 min backoff); past the window the
+        next settlement retries them, as before."""
+        ctx = ctx if ctx is not None else current_ctx(getattr(self, "cfg", None))
+        retry = self.__dict__.setdefault("_mkt_pub_retry", {})
         t = self.__dict__.get("_mkt_pub_thread")
         if t is not None and t.is_alive():
-            log.info("marketcast: an offloaded publish run is still going; %d round(s) "
-                     "retried at the next settlement", len(todo))
+            if window_end_block is not None and todo:
+                retry[ctx.kind] = {"todo": todo, "holders": holders, "ctx": ctx,
+                                   "attempt": int(_attempt), "retry_at": 0.0,
+                                   "until": int(window_end_block)}
+                log.info("marketcast: an offloaded publish run is still going; %d round(s) "
+                         "start when it ends (in-window, until block %d)", len(todo),
+                         int(window_end_block))
+            else:
+                log.info("marketcast: an offloaded publish run is still going; %d round(s) "
+                         "retried at the next settlement", len(todo))
             return False
+        retry.pop(ctx.kind, None)
         if not todo:
             return False
         import threading
-
-        ctx = ctx if ctx is not None else current_ctx(getattr(self, "cfg", None))
 
         def _run():
             # the instance travels with the run (W-CMP2)
             with mkt_context(ctx):
                 self._mkt_publish_remote(todo, holders)
+                if window_end_block is None:
+                    return
+                left = self._mkt_unpublished(todo)
+                if not left:
+                    return
+                attempt = int(_attempt) + 1
+                steps = MKT_RETRY_BACKOFF_SECONDS
+                delay = float(steps[min(attempt, len(steps)) - 1])
+                if ctx.kind not in retry:        # a newer todo queued meanwhile wins
+                    retry[ctx.kind] = {"todo": left, "holders": holders, "ctx": ctx,
+                                       "attempt": attempt, "retry_at": time.time() + delay,
+                                       "until": int(window_end_block)}
+                log.warning("marketcast: %d round(s) still without a report — in-window "
+                            "retry %d in %.0fs (until block %d)", len(left), attempt, delay,
+                            int(window_end_block))
 
         t = threading.Thread(target=_run, name=f"mkt-publish-{ctx.kind}", daemon=True)
         self.__dict__["_mkt_pub_thread"] = t
         t.start()
         return True
+
+    def _mkt_unpublished(self, todo: list) -> list:
+        """The rounds of ``todo`` whose report is not (readably) published.
+        Never raises: an unreadable store counts every round as missing."""
+        from ..shared.hippius import ObjectNotFound
+
+        try:
+            store = self._mkt_store()
+            ctx = current_ctx(getattr(self, "cfg", None))
+        except Exception:  # noqa: BLE001
+            return list(todo)
+        left = []
+        for item in todo:
+            try:
+                store.get_text(ctx.report_key(str(item["round_id"])))
+            except ObjectNotFound:
+                left.append(item)
+            except Exception:  # noqa: BLE001 — unknown: retried
+                left.append(item)
+        return left
+
+    def _mkt_retry_tick(self, head_block: int) -> bool:
+        """Every validator poll (main validator only has records): start the
+        due in-window retry of a publish run (one run at a time); drop a
+        record once the head reaches its window end (the next settlement
+        retries it, as before). True when a retry run started. Never raises."""
+        retry = self.__dict__.get("_mkt_pub_retry")
+        if not retry:
+            return False
+        try:
+            t = self.__dict__.get("_mkt_pub_thread")
+            if t is not None and t.is_alive():
+                return False
+            now = time.time()
+            for kind, rec in list(retry.items()):
+                if int(head_block) >= int(rec["until"]):
+                    retry.pop(kind, None)
+                    log.info("marketcast: in-window retry window of %d round(s) ended at "
+                             "block %d — retried at the next settlement", len(rec["todo"]),
+                             int(rec["until"]))
+                    continue
+                if now < float(rec["retry_at"]):
+                    continue
+                retry.pop(kind, None)
+                log.warning("marketcast: in-window retry %d of %d round(s) (%s)",
+                            int(rec["attempt"]), len(rec["todo"]), kind)
+                return bool(self._mkt_publish_async(rec["todo"], rec["holders"],
+                                                    ctx=rec["ctx"],
+                                                    window_end_block=int(rec["until"]),
+                                                    _attempt=int(rec["attempt"])))
+        except Exception as e:  # noqa: BLE001 — never reaches the weight loop
+            log.warning("marketcast: in-window retry tick failed: %s", e)
+        return False
 
     def _mkt_publish_remote(self, todo: list, holders: dict) -> int:
         """Lease the MarketCast pod, publish every round of ``todo`` still

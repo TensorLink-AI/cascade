@@ -480,6 +480,26 @@ def _retry_hub_op(op, what: str, *, attempts: int = HUB_MAX_ATTEMPTS,
     raise StorageError(f"{what} failed after {attempt} attempt(s): {last_exc}") from last_exc
 
 
+# hippius_hub >= 0.6.0 writes every file >= 256 MiB as a "chunked-v2" object:
+# a small JSON pointer layer (application/vnd.hippius.pointer.v2) plus untitled
+# pack layers. The release pins hippius_hub 0.5.1 (uv.lock), which has no
+# chunk support: its snapshot_download saves the POINTER as the file, so a
+# chunked checkpoint is unverifiable on every validator that runs the
+# release (2026-11-28: the lane B rebased candidate c2787703…, pushed from an
+# eval pod whose venv resolved a newer hippius_hub — deploy/Dockerfile and pod
+# venvs use `uv pip install -e`, not the lock). HIPPIUS_CHUNKED_WRITE=0 is
+# hippius_hub's own switch back to the single-blob layout (0.5.1 ignores it:
+# it only ever writes single blobs), so every cascade push stays readable by
+# the pinned release. Set process-wide, not scoped: a scoped set/restore races
+# between concurrent uploads, and cascade never wants a chunked write.
+CHUNKED_WRITE_ENV = "HIPPIUS_CHUNKED_WRITE"
+
+
+def force_single_blob_layout() -> None:
+    """Make any hippius_hub push in this process use the single-blob layout."""
+    os.environ[CHUNKED_WRITE_ENV] = "0"
+
+
 def upload_dir_to_hub(local_dir: Path | str, repo: str, hub: HubConfig | None = None) -> HubUpload:
     """Upload a folder to a Hippius Hub ``repo`` and return its immutable ref.
 
@@ -498,6 +518,7 @@ def upload_dir_to_hub(local_dir: Path | str, repo: str, hub: HubConfig | None = 
             "hippius-hub not installed; install the [hippius] extra to use the registry"
         ) from e
     token = _resolve_hub_token(f"Uploading {d} to {repo}")
+    force_single_blob_layout()
     result = _retry_hub_op(
         lambda: upload_folder(
             repo_id=str(repo), folder_path=str(d), allow_patterns=ALLOW_PATTERNS,
@@ -610,6 +631,313 @@ def upload_dir_to_hub_or_hf(
 FETCH_COMPLETE_MARKER = ".fetch_complete"
 
 
+# ───────────── chunked-v2 objects: reassembled in cascade's code ─────────────
+# Layout (hippius_hub >= 0.6.0, read from the 2026-11-28 object c2787703…):
+#   manifest  annotations {"com.hippius.layout": "chunked-v2"},
+#             artifactType application/vnd.hippius.chunked.v2
+#   pointer   titled layer, mediaType application/vnd.hippius.pointer.v2,
+#             annotations com.hippius.file.size / .file.digest / .chunk.count;
+#             its blob is JSON {"chunks": [{"digest", "offset", "pack", "size"}…],
+#             "file": {"digest", "size"}, "version": "chunked-v2"}
+#   packs     untitled layers, mediaType application/vnd.hippius.pack.v1
+# Chunks are listed in FILE order (file offset = sum of preceding sizes);
+# "pack"/"offset" locate each chunk's bytes inside a pack blob; "digest" is
+# sha256 of the chunk's bytes; file.digest is sha256 of the whole file.
+# The pinned hippius_hub 0.5.1 skips the untitled packs and writes the pointer
+# blob under the file's title, so fetch_from_hub detects such a file and
+# rebuilds it here, verified end to end against the pinned manifest digest:
+#   ref digest → manifest bytes → pointer layer digest → chunk + pack digests
+#   → whole-file size + sha256.
+CHUNKED_V2_VERSION = "chunked-v2"
+CHUNKED_POINTER_MEDIA_TYPE = "application/vnd.hippius.pointer.v2"
+CHUNKED_PACK_MEDIA_TYPE = "application/vnd.hippius.pack.v1"
+_ANN_FILE_SIZE = "com.hippius.file.size"
+_ANN_FILE_DIGEST = "com.hippius.file.digest"
+_ANN_CHUNK_COUNT = "com.hippius.chunk.count"
+_ANN_TITLE = "org.opencontainers.image.title"
+# The c2787703… index is 196 KB for 4.9 GB (989 chunks, ~200 B each); 64 MiB
+# covers >1 TB files. Anything larger is never read as a candidate index.
+CHUNKED_INDEX_MAX_BYTES = 64 * 1024 * 1024
+_SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_IO_BLOCK = 4 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class ChunkRef:
+    digest: str        # sha256 of this chunk's bytes
+    size: int
+    pack: str          # digest of the pack blob holding it
+    pack_offset: int   # where in that pack
+
+
+@dataclass(frozen=True)
+class ChunkedIndex:
+    file_digest: str
+    file_size: int
+    chunks: tuple[ChunkRef, ...]
+
+
+def _layer_file_size(layer: dict) -> int:
+    """Bytes a titled layer becomes on disk (a chunked pointer: its file)."""
+    if layer.get("mediaType") == CHUNKED_POINTER_MEDIA_TYPE:
+        with contextlib.suppress(KeyError, TypeError, ValueError):
+            return int(layer["annotations"][_ANN_FILE_SIZE])
+    return int(layer.get("size", 0))
+
+
+def _is_int(v: object) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def parse_chunked_v2_index(data: bytes) -> ChunkedIndex | None:
+    """``data`` as a chunked-v2 pointer blob, or None when it is not one.
+
+    Exact schema: a JSON object with exactly ``chunks``/``file``/``version``,
+    ``version == "chunked-v2"``. Anything else (a real file, a config.json)
+    is None. A document that IS shaped as an index but violates the schema
+    (bad digests, non-integer sizes, sizes not summing to ``file.size``)
+    raises :class:`StorageError` — reassembling from it would be wrong."""
+    head = data[:64].lstrip()
+    if not head.startswith(b"{"):
+        return None
+    try:
+        doc = json.loads(data)
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not (isinstance(doc, dict) and set(doc) == {"chunks", "file", "version"}
+            and doc.get("version") == CHUNKED_V2_VERSION):
+        return None
+    f, chunks = doc["file"], doc["chunks"]
+    bad = "chunked_v2_index_malformed"
+    if not (isinstance(f, dict) and set(f) == {"digest", "size"}
+            and isinstance(f["digest"], str) and _SHA256_RE.match(f["digest"])
+            and _is_int(f["size"]) and f["size"] >= 0):
+        raise StorageError(f"{bad}: bad file entry {f!r}")
+    if not isinstance(chunks, list) or not chunks:
+        raise StorageError(f"{bad}: no chunks")
+    refs = []
+    for i, c in enumerate(chunks):
+        if not (isinstance(c, dict) and set(c) == {"digest", "offset", "pack", "size"}
+                and all(isinstance(c[k], str) and _SHA256_RE.match(c[k])
+                        for k in ("digest", "pack"))
+                and _is_int(c["size"]) and c["size"] > 0
+                and _is_int(c["offset"]) and c["offset"] >= 0):
+            raise StorageError(f"{bad}: chunk {i} {c!r}")
+        refs.append(ChunkRef(c["digest"], c["size"], c["pack"], c["offset"]))
+    if sum(r.size for r in refs) != f["size"]:
+        raise StorageError(f"{bad}: chunk sizes sum to {sum(r.size for r in refs)} "
+                           f"!= file.size {f['size']}")
+    return ChunkedIndex(f["digest"], f["size"], tuple(refs))
+
+
+def _read_candidate_index(path: Path) -> tuple[bytes, ChunkedIndex] | None:
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None
+        if path.stat().st_size > CHUNKED_INDEX_MAX_BYTES:
+            return None
+        with path.open("rb") as fh:
+            if not fh.read(64).lstrip().startswith(b"{"):
+                return None
+        data = path.read_bytes()
+    except OSError:
+        return None
+    idx = parse_chunked_v2_index(data)
+    return (data, idx) if idx is not None else None
+
+
+def chunked_index_files(snap_dir: Path | str) -> list[str]:
+    """Relative paths in ``snap_dir`` that hold a chunked-v2 index instead of
+    the file (what hippius_hub 0.5.1 leaves for a chunked object)."""
+    root = Path(snap_dir)
+    if not root.is_dir():
+        return []
+    out = []
+    for p in sorted(root.rglob("*")):
+        if p.name == FETCH_COMPLETE_MARKER:
+            continue
+        try:
+            if _read_candidate_index(p) is not None:
+                out.append(p.relative_to(root).as_posix())
+        except StorageError:
+            out.append(p.relative_to(root).as_posix())  # malformed index: not a file
+    return out
+
+
+def snapshot_complete(snap_dir: Path | str) -> bool:
+    """True when ``snap_dir`` holds a complete snapshot: the marker AND no
+    file is a chunked-v2 index. A marker over an index (written by a fetch
+    before this check existed) is INCOMPLETE, so the next fetch heals it."""
+    d = Path(snap_dir)
+    return (d / FETCH_COMPLETE_MARKER).is_file() and not chunked_index_files(d)
+
+
+class _HubBlobReader:
+    """Raw reads from the Hippius OCI registry for one repo (same registry,
+    same auth as hippius_hub's snapshot_download: its own bearer token)."""
+
+    def __init__(self, repo: str, action: str) -> None:
+        from hippius_hub.auth import get_oci_bearer_token
+        from hippius_hub.constants import OCI_MANIFEST_ACCEPT, resolve_registry
+        from hippius_hub.file_download import _oci_repo_path
+
+        self._registry = resolve_registry(None)
+        self._oci_repo = _oci_repo_path(repo, None)
+        self._accept = OCI_MANIFEST_ACCEPT
+        self._token = get_oci_bearer_token(self._oci_repo, _resolve_hub_token_for_pull(action))
+
+    def _headers(self, **extra) -> dict:
+        return {"Authorization": f"Bearer {self._token}", **extra}
+
+    def manifest_bytes(self, digest: str) -> bytes:
+        import httpx
+
+        resp = httpx.get(f"{self._registry}/v2/{self._oci_repo}/manifests/{digest}",
+                         headers=self._headers(Accept=self._accept), timeout=60.0,
+                         follow_redirects=True)
+        resp.raise_for_status()
+        return resp.content
+
+    def blob_to(self, digest: str, fh) -> None:
+        """Stream blob ``digest`` into the open binary file ``fh``."""
+        import httpx
+
+        with httpx.stream("GET", f"{self._registry}/v2/{self._oci_repo}/blobs/{digest}",
+                          headers=self._headers(), follow_redirects=True,
+                          timeout=httpx.Timeout(60.0, read=120.0)) as resp:
+            resp.raise_for_status()
+            for block in resp.iter_bytes(_IO_BLOCK):
+                fh.write(block)
+
+
+def _chunked_registry_reader(ref: HubRef) -> _HubBlobReader:
+    """Seam for tests (a fake registry)."""
+    return _HubBlobReader(ref.repo, f"Reassembling {ref.immutable_ref}")
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        while block := fh.read(_IO_BLOCK):
+            h.update(block)
+    return "sha256:" + h.hexdigest()
+
+
+def _pointer_layers(manifest: dict) -> tuple[dict, dict]:
+    pointers, packs = {}, {}
+    for layer in manifest.get("layers", []) or []:
+        mt = layer.get("mediaType")
+        if mt == CHUNKED_POINTER_MEDIA_TYPE:
+            title = (layer.get("annotations") or {}).get(_ANN_TITLE)
+            if title:
+                pointers[title] = layer
+        elif mt == CHUNKED_PACK_MEDIA_TYPE:
+            packs[str(layer.get("digest"))] = int(layer.get("size", -1))
+    return pointers, packs
+
+
+def _assemble_chunked_file(reader, target: Path, idx: ChunkedIndex, packs: dict,
+                           what: str) -> None:
+    """Rebuild ``target`` from its packs; verified, then atomically replaced."""
+    out = target.parent / f".{target.name}.chunked-{uuid.uuid4().hex[:8]}"
+    pack_tmp = target.parent / f".{target.name}.pack-{uuid.uuid4().hex[:8]}"
+    by_pack: dict[str, list[tuple[ChunkRef, int]]] = {}
+    pos = 0
+    for c in idx.chunks:
+        if c.pack not in packs:
+            raise StorageError(f"chunked_v2_pack_not_in_manifest: {what}: {c.pack}")
+        by_pack.setdefault(c.pack, []).append((c, pos))
+        pos += c.size
+    try:
+        with out.open("wb") as dst:
+            dst.truncate(idx.file_size)
+            for pack, targets in by_pack.items():
+                def _pull(pack=pack):
+                    with pack_tmp.open("wb") as fh:
+                        reader.blob_to(pack, fh)
+                _retry_hub_op(_pull, f"pack {pack[:19]}… of {what}")
+                if pack_tmp.stat().st_size != packs[pack] or _sha256_file(pack_tmp) != pack:
+                    raise StorageError(f"chunked_v2_pack_digest_mismatch: {what}: {pack}")
+                with pack_tmp.open("rb") as src:
+                    for c, file_off in targets:
+                        src.seek(c.pack_offset)
+                        data = src.read(c.size)
+                        if len(data) != c.size or \
+                                "sha256:" + hashlib.sha256(data).hexdigest() != c.digest:
+                            raise StorageError(
+                                f"chunked_v2_chunk_digest_mismatch: {what}: {c.digest}")
+                        dst.seek(file_off)
+                        dst.write(data)
+                pack_tmp.unlink()
+            dst.flush()
+            os.fsync(dst.fileno())
+        if out.stat().st_size != idx.file_size:
+            raise StorageError(f"chunked_v2_file_size_mismatch: {what}")
+        if _sha256_file(out) != idx.file_digest:
+            raise StorageError(f"chunked_v2_file_digest_mismatch: {what}: "
+                               f"expected {idx.file_digest}")
+        os.replace(out, target)
+    finally:
+        for p in (out, pack_tmp):
+            with contextlib.suppress(OSError):
+                p.unlink()
+
+
+def reassemble_chunked_v2(ref: HubRef | str, snap_dir: Path | str) -> list[str]:
+    """Replace every chunked-v2 index in ``snap_dir`` (a snapshot of ``ref``)
+    with the file it describes. Returns the rebuilt relative paths ([] when
+    there is nothing to do — no registry call is made then).
+
+    Every step is bound to the pinned digest: the manifest's sha256 must be
+    ``ref.digest``; each index must be the blob of the manifest's pointer layer
+    with that title (digest + size/digest annotations); every pack and chunk
+    digest and the whole file's size + sha256 must verify. Any mismatch raises
+    :class:`StorageError` and leaves the index in place (never a marker)."""
+    ref = ref if isinstance(ref, HubRef) else HubRef.parse(ref)
+    root = Path(snap_dir)
+    found: list[tuple[str, bytes, ChunkedIndex]] = []
+    for rel in chunked_index_files(root):
+        got = _read_candidate_index(root / rel)  # raises on a malformed index
+        if got is not None:
+            found.append((rel, *got))
+    if not found:
+        return []
+    if not _SHA256_RE.match(ref.digest):
+        raise StorageError(f"chunked_v2_unsupported_ref: {ref.immutable_ref}")
+    reader = _chunked_registry_reader(ref)
+    raw = _retry_hub_op(lambda: reader.manifest_bytes(ref.digest),
+                        f"manifest of {ref.immutable_ref}")
+    if "sha256:" + hashlib.sha256(raw).hexdigest() != ref.digest:
+        raise StorageError(f"chunked_v2_manifest_digest_mismatch: {ref.immutable_ref}")
+    pointers, packs = _pointer_layers(json.loads(raw))
+    import logging
+
+    log = logging.getLogger("cascade.storage")
+    done = []
+    for rel, data, idx in found:
+        what = f"{ref.immutable_ref}/{rel}"
+        layer = pointers.get(rel)
+        if layer is None:
+            raise StorageError(f"chunked_v2_no_pointer_layer: {what}")
+        ann = layer.get("annotations") or {}
+        if ("sha256:" + hashlib.sha256(data).hexdigest() != layer.get("digest")
+                or int(layer.get("size", -1)) != len(data)):
+            raise StorageError(f"chunked_v2_pointer_digest_mismatch: {what}")
+        try:
+            ann_ok = (int(ann[_ANN_FILE_SIZE]) == idx.file_size
+                      and ann[_ANN_FILE_DIGEST] == idx.file_digest
+                      and int(ann.get(_ANN_CHUNK_COUNT, len(idx.chunks))) == len(idx.chunks))
+        except (KeyError, TypeError, ValueError):
+            ann_ok = False
+        if not ann_ok:
+            raise StorageError(f"chunked_v2_pointer_annotation_mismatch: {what}")
+        log.warning("%s is a chunked-v2 object (%d chunks, %d bytes): reassembling",
+                    what, len(idx.chunks), idx.file_size)
+        _assemble_chunked_file(reader, root / rel, idx, packs, what)
+        done.append(rel)
+    return done
+
+
 def _fetch_patterns(allow_patterns, ignore_patterns) -> tuple[list[str], list[str]]:
     """The (allow, ignore) a fetch passes: :data:`ALLOW_PATTERNS` unless
     narrowed; :data:`UNPUBLISHED_PATTERNS` are ALWAYS ignored."""
@@ -640,7 +968,9 @@ def hub_snapshot_bytes(ref: HubRef | str, *, allow_patterns: list[str] | None = 
         token = get_oci_bearer_token(
             oci_repo, _resolve_hub_token_for_pull(f"Sizing {ref.immutable_ref}"))
         manifest = fetch_manifest(resolve_registry(None), oci_repo, ref.digest, token).manifest
-        sizes = dict((t, int(layer.get("size", 0))) for t, layer in iter_titled_layers(manifest))
+        # A chunked-v2 pointer layer is ~200 KB; the file it reassembles to
+        # is its com.hippius.file.size annotation (what lands on disk).
+        sizes = dict((t, _layer_file_size(layer)) for t, layer in iter_titled_layers(manifest))
         keep = filter_repo_objects(items=list(sizes), allow_patterns=allow,
                                    ignore_patterns=ignore)
         return sum(sizes[t] for t in keep)
@@ -672,8 +1002,15 @@ def fetch_from_hub(ref: HubRef | str, dest_dir: Path | str, hub: HubConfig | Non
     ref = ref if isinstance(ref, HubRef) else HubRef.parse(ref)
     allow, ignore = _fetch_patterns(allow_patterns, ignore_patterns)
     dest = Path(dest_dir)
-    if (dest / FETCH_COMPLETE_MARKER).exists():
+    if snapshot_complete(dest):
         return dest
+    if (dest / FETCH_COMPLETE_MARKER).exists():
+        import logging
+
+        # A marker over a chunked-v2 index (a pre-fix fetch): incomplete.
+        logging.getLogger("cascade.storage").warning(
+            "%s: cached snapshot holds a chunked-v2 index %s; refetching",
+            ref.immutable_ref, chunked_index_files(dest))
     if ref.repo == "vault/direct":
         # Direct-to-gateway submission (DEC-CA-0036): the reserved vault
         # namespace never touches a registry — it resolves from the private
@@ -725,14 +1062,18 @@ def fetch_from_hub(ref: HubRef | str, dest_dir: Path | str, hub: HubConfig | Non
                         f"{HUB_PASSWORD_ENV_NAMES[0]})."
                     ) from e
                 raise
+            # hippius_hub 0.5.1 saves a chunked-v2 file's pointer as the file:
+            # rebuild it (verified) BEFORE the marker, or the marker lies.
+            reassemble_chunked_v2(ref, tmp)
         (tmp / FETCH_COMPLETE_MARKER).touch()
         try:
             os.rename(tmp, dest)
         except OSError:
-            if (dest / FETCH_COMPLETE_MARKER).exists():
+            if snapshot_complete(dest):
                 pass  # a sibling completed first — its snapshot is identical
             else:
-                # dest holds a legacy or partial dir (no marker): replace it.
+                # dest holds a legacy or partial dir (no marker, or a marker
+                # over a chunked-v2 index): replace it.
                 shutil.rmtree(dest, ignore_errors=True)
                 os.rename(tmp, dest)
         return dest
