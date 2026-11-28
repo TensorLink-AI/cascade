@@ -1,0 +1,22 @@
+# W-EVALPUB (owner 2026-11-28: "publish the eval dataset for lane D after it
+# occurs, and lane C: not 30 days"): each settlement's judged eval set, public
+# once it can never be judged again, and the signed lane B / lane C manifests
+# and lane D reports public-read; README.md has the contract and the proof.
+# The box pass (lane D plan + host orchestration + upload + index, MarketCast
+# round sets + index, the ACL backfill, the CLI).
+cascade/pool/settlement_evals.py
+# The eval-host builder of a settlement's windows.npz (the retirement rule).
+cascade/eval/settlement_eval_build.py
+# ONLY RunnerLaneBOps.publish_expert_manifest / RunnerLaneCOps.publish: the
+# trainer's signed manifests written public-read.
+cascade/trainer/lane_b_driver.py
+cascade/trainer/lane_c_driver.py
+# The hourly box job (template, --dry-run).
+deploy/laned/systemd/cascade-settlement-evals.service
+deploy/laned/systemd/cascade-settlement-evals.timer
+# Miner docs (the past-evaluation rows and the delays), the operator job row
+# and the dashboard's "Past evaluations" links.
+docs/MINER_LANE_D.md
+docs/MINER_LANE_C_MARKETCAST.md
+docs/OPERATOR.md
+cascade/website/index.html

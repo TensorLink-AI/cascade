@@ -2700,8 +2700,10 @@ class RunnerLaneBOps:
             manifest = sign_expert_manifest(manifest, self.r.wallet)
         else:
             log.warning("lane B: publishing an UNSIGNED expert manifest (no wallet)")
+        # W-EVALPUB (owner 2026-11-28): signed, read by every validator: public-read
         self.r.manifest_store().put_text(expert_manifest_key(manifest.round_id),
-                                         manifest.to_json(), content_type="application/json")
+                                         manifest.to_json(), content_type="application/json",
+                                         acl="public-read")
 
     def judge(self, manifest, round_id: str, block: int, sentinel: str | None = None,
               anchor_pointer: str | None = None) -> list:

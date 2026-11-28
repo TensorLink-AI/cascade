@@ -289,11 +289,21 @@ MarketCast evidence is published in the public `cascade-manifests` bucket
 | Per-window report | `marketcast/round-<round_id>.json` | Signed by the main validator. One entry per judged fine-tune and phase (`judge` / `confirm`): per-window base and fine-tune losses, guard losses (MASE, QLIKE, tails), coverage counts, the slot `holder` comparison, and `status` (`infra_deferred` = retried later). Float32 quantile sidecars sit under `marketcast/round-<round_id>/` |
 | Verdict summary | `receipts/index.json` | `lane_c_verdicts` (per entry: `hotkey`, `target`, `stage`, `passed`, `reason`, `gain_lcb`, `gain`, `phase`, `outcome`) and `lane_c_pay` (the slot holder) |
 | One round's receipt | `receipts/<validator_hotkey>/round-<round_id>.json` | Signed. `lane_c` holds the verdict rows |
+| Judged windows index | [`marketcast/evals/index.json`](https://s3.hippius.com/cascade-manifests/marketcast/evals/index.json) | Every published round eval set (`items[]`: `round_id`, `windows`, `snapshot_end`, `cut_ts`, `manifest_url`, `windows_url`) |
+| One round's judged windows | `marketcast/evals/<round_id>/` | `windows.json`: per entry and phase every window id, its kind (`backtest` / `forward`), start and signed per-window losses; `manifest.json` (draw records, the snapshot's key and sha256, the retirement `cut_ts`). The bars are in the public post-embargo bars above |
+| Trainer lane C manifest | `lane_c/round-<id>.json` | Signed by the trainer; public-read |
 | Live lane C state | `status/v2.json`, key `lane_c` | Holder, queued and finished legs per target, settlements |
 
 Find a round through `receipts/index.json` (round ids are seeds, not
-counters). The trainer's lane C manifests (`lane_c/round-<id>.json`) are
-written private, so they are not readable anonymously.
+counters).
+
+**When are a round's judged windows public?** About 33 days after the round.
+Every leg's backtests are drawn from the `embargo_eval_days` (28) before ITS
+dispatch, so a bar judged in one round (backtest or forward) can be drawn
+again for every leg dispatched in the following ~28 days. A round is
+published once its snapshot ends `embargo_days` (30) days plus 72 h before the
+earliest dispatch of any entry still to be judged; by then its bars are in
+the public post-embargo bars too.
 
 **Am I competitive?** `gain_lcb` must be at least `gain_margin` (1%) with a
 positive `gain`, and `passed` true on both stages. To take the slot you also
