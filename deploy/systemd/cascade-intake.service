@@ -1,0 +1,35 @@
+# cascade funded-round intake (miner funding + private submissions).
+# Supersedes the box's stale, inactive /etc/systemd/system/cascade-intake.service
+# (PYTHONPATH /root/cascade-release, .venv) and restart_intake_*.sh (nohup).
+# NOT installed by any tool: deploy/systemd/README.md is the owner-run runbook.
+[Unit]
+Description=cascade funded-round intake
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/cascade
+EnvironmentFile=/etc/cascade/cascade.env
+EnvironmentFile=/etc/cascade/intake.args
+Environment=PYTHONPATH=/root/cascade-releases/intake.current
+Environment=PYTHONUNBUFFERED=1
+Environment=CASCADE_BOX_GUARD=enforce
+ExecStart=/root/cascade-v2/.venv/bin/python -P -m cascade.funding.main $CASCADE_INTAKE_ARGS
+StandardOutput=append:/root/cascade/intake.log
+StandardError=append:/root/cascade/intake.log
+Restart=on-failure
+RestartSec=10
+KillMode=mixed
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+# steady ~90 MB
+MemoryHigh=384M
+MemoryMax=512M
+MemorySwapMax=256M
+OOMScoreAdjust=200
+
+[Install]
+WantedBy=multi-user.target

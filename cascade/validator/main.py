@@ -367,6 +367,11 @@ def main(argv: list[str] | None = None) -> int:
     from ..shared.codepath import verify_release_code_path
     from ..shared.env import load_env_files
     verify_release_code_path("cascade-validator")
+    # Box guard (retro P2): OFF by default here — external validators run this
+    # entry point on their own GPU hosts and may evaluate locally with torch.
+    # The operator box turns it on with CASCADE_BOX_GUARD=enforce (unit file).
+    from ..shared import box_guard
+    box_guard.install("cascade-validator", default_mode="off")
     # DEC-CA-0067: this process votes on / acts on the v2b vote — a config
     # whose pinned feature is missing or wrong refuses to load
     from ..shared.config.loader import require_vote_pin

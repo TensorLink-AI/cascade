@@ -1,0 +1,34 @@
+# cascade MarketCast offload provisioner (Lium RTX3090 on validator request).
+# Replaces the live unit's start_mkt_provisioner.sh indirection (hard-coded
+# PYTHONPATH) with the release symlink; keeps its MemoryMax=1G / Nice=10.
+# NOT installed by any tool: deploy/systemd/README.md is the owner-run runbook.
+[Unit]
+Description=cascade MarketCast offload provisioner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/cascade
+EnvironmentFile=/etc/cascade/cascade.env
+Environment=PYTHONPATH=/root/cascade-releases/mkt-provisioner.current
+Environment=PATH=/root/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+Environment=CASCADE_BOX_GUARD=enforce
+ExecStart=/root/cascade-v2/.venv/bin/python -P -m cascade.provision.main --config /root/cascade/provision.mkt.toml --chain-toml /root/cascade/chain.validator.toml --work-root /root/cascade/_mkt_prov_work
+StandardOutput=append:/root/cascade/mkt-provisioner.log
+StandardError=append:/root/cascade/mkt-provisioner.log
+Restart=on-failure
+RestartSec=60
+Nice=10
+KillMode=mixed
+TimeoutStopSec=30
+# steady ~20 MB
+MemoryHigh=512M
+MemoryMax=1G
+MemorySwapMax=256M
+OOMScoreAdjust=200
+
+[Install]
+WantedBy=multi-user.target

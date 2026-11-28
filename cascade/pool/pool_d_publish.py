@@ -786,6 +786,8 @@ def _evidence(store, prefix: str, last: int) -> dict:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from ..shared import box_guard
+    box_guard.install("pool-d-pin-sync")
     ap = argparse.ArgumentParser(prog="python -P -m cascade.pool.pool_d_publish",
                                  description="pool_d pinning, retention and cadence (W6d)")
     sub = ap.add_subparsers(dest="cmd", required=True)
