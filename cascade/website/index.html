@@ -1419,6 +1419,20 @@ th, td, .stat .v, .tile .v, .gate-cell .v { font-variant-numeric:tabular-nums; }
     </div>
   </details>
 
+  <!-- owner 2026-11-28: the live lane B/C/D queues with a plain-English
+       reason per entry, and the recent verdicts with their margins
+       (status/lane_b.json, status/lane_c.json, status/lane_d.json; unsigned,
+       display only — verdicts and pay stay on the signed receipts) -->
+  <div>
+    <div class="section-label"><span>Queue (lanes B, C, D)</span><span id="mq-queue-when" class="muted"></span></div>
+    <div class="panel" id="mq-queue"><div class="empty">Loading&hellip;</div></div>
+  </div>
+
+  <div>
+    <div class="section-label"><span>Recent verdicts</span><span class="muted">LCB vs bar per target</span></div>
+    <div class="panel" id="mq-verdicts"><div class="empty">Loading&hellip;</div></div>
+  </div>
+
   <div>
     <div class="section-label"><span>Rounds</span></div>
     <div class="panel"><div class="scroll-box scroll-hist">
@@ -3115,6 +3129,9 @@ function renderLcQueue(){
   var html='<div class="row" style="font-family:var(--font-mono);font-size:12px">'+(qk.length?qk.map(function(k){ return esc(k)+' <b>'+esc(q[k])+'</b>'; }).join(" &middot; "):'<span class="muted">queue empty</span>')+'</div>';
   if(open.length) html+='<div class="scroll-box" style="margin-top:10px"><table><thead><tr><th>Miner</th><th>Target</th><th class="num">Base era</th><th class="num">Started</th><th>GPU</th></tr></thead><tbody>'+open.map(function(l){
     return '<tr><td title="'+esc(l.hotkey)+'">uid '+esc(l.uid)+' · '+esc(shortHk(l.hotkey))+'</td><td>'+esc(l.target)+'</td><td class="num">'+esc(l.base_era)+'</td><td class="num">'+esc(l.started_block)+'</td><td>'+esc(l.gpu||"--")+'</td></tr>'; }).join("")+'</tbody></table></div>';
+  var fents=(d&&d.funded_queue&&typeof d.funded_queue==="object")?laneRows(d.funded_queue.entries):[];
+  if(fents.length) html+='<div class="sec-k" style="margin-top:14px">Funded queue</div>'+laneTable(["Miner","Target","Status","Reason","GPU"],
+    fents.map(function(e){ return '<tr>'+minerCell(e.hotkey,null)+'<td>'+targetTags(e.target)+'</td><td>'+esc(String(e.phase||e.status||"--").replace(/_/g," "))+'</td><td>'+esc(e.reason||"--")+'</td><td>'+esc(e.gpu||"--")+'</td></tr>'; }), "");
   if(outs.length) html+='<div class="lb-note" style="margin-top:10px">Recent outcomes: '+outs.slice(-6).map(function(o){ return esc((o.target||"")+" "+(o.outcome||o.kind||"")+(o.hotkey?" · "+shortHk(o.hotkey):"")); }).join(" &middot; ")+'</div>';
   el.innerHTML=html;
 }
@@ -3169,9 +3186,9 @@ function renderLbQueue(){
       var leg=Number(l.steps)>0?fmtSteps(l.steps):(Number(l.train_hours)>0?fmt(l.train_hours,1)+" h":"--");
       return '<tr>'+minerCell(l.hotkey,l.uid)+'<td>'+targetTags(l.targets)+'</td><td class="num">'+esc(fmtCount(l.base_era))+'</td><td class="num">'+esc(fmtCount(l.experts))+'</td><td>'+esc(l.gpu||"--")+'</td><td class="num">'+esc(leg)+'</td></tr>';
     }), "no legs in flight");
-  html+='<div class="sec-k" style="margin-top:14px">Funded queue</div>'+laneTable(["Miner","Targets","Status","GPU","Funded","#Spend"],
+  html+='<div class="sec-k" style="margin-top:14px">Funded queue</div>'+laneTable(["Miner","Targets","Status","Reason","GPU","Funded","#Spend"],
     ents.map(function(e){
-      return '<tr>'+minerCell(e.hotkey,e.uid)+'<td>'+targetTags(e.targets)+'</td><td>'+esc(String(e.phase||e.status||"--").replace(/_/g," "))+'</td><td>'+esc(e.gpu||"--")+'</td><td>'+esc(fmtUtc(e.funded_at))+'</td><td class="num">'+esc(fmtUsd(e.spend_usd))+'</td></tr>';
+      return '<tr>'+minerCell(e.hotkey,e.uid)+'<td>'+targetTags(e.targets)+'</td><td>'+esc(String(e.phase||e.status||"--").replace(/_/g," "))+'</td><td>'+esc(e.reason||"--")+'</td><td>'+esc(e.gpu||"--")+'</td><td>'+esc(fmtUtc(e.funded_at))+'</td><td class="num">'+esc(fmtUsd(e.spend_usd))+'</td></tr>';
     }), "no entries yet");
   html+='<div class="sec-k" style="margin-top:14px">Recent outcomes</div>'+laneTable(["Miner","Target","Outcome","Class"],
     outs.map(function(o){
@@ -3181,6 +3198,48 @@ function renderLbQueue(){
   el.innerHTML=html;
 }
 
+
+// ── miner queue (owner 2026-11-28): lanes B, C, D in one table ──────────────
+// Every row's ``reason`` is the intake/trainer's sanitized one-liner
+// (cascade.funding.public_reason: whitelisted templates, never raw error
+// text); ``verdict`` is a settled entry's outcome + round + per-target LCB /
+// bar / point gain. Lane D rows come from the validator's status/lane_d.json.
+function mqRows(){
+  var rows=[];
+  var b=(_lb&&_lb.queue&&typeof _lb.queue==="object")?laneRows(_lb.queue.entries):[];
+  b.forEach(function(e){ rows.push({lane:"B", hotkey:e.hotkey, targets:e.targets, stage:e.phase||e.status, reason:e.reason, verdict:e.verdict}); });
+  var c=(_lc&&_lc.funded_queue&&typeof _lc.funded_queue==="object")?laneRows(_lc.funded_queue.entries):[];
+  c.forEach(function(e){ rows.push({lane:"C", hotkey:e.hotkey, targets:e.target, stage:e.phase||e.status, reason:e.reason, verdict:e.verdict}); });
+  var d=_ld?laneRows(_ld.queue):[];
+  d.forEach(function(e){ rows.push({lane:"D", hotkey:e.hotkey, targets:null, stage:e.status, reason:e.reason, verdict:null}); });
+  return rows;
+}
+function mqSigned(x){ if(x==null||x===""||!isFinite(x)) return "--"; x=Number(x); return (x<0?"&minus;":"+")+Math.abs(x).toFixed(4); }
+function renderMinerQueue(){
+  var el=document.getElementById("mq-queue"), when=document.getElementById("mq-queue-when"); if(!el) return;
+  var rows=mqRows(), src=[];
+  if(_lb&&_lb.block!=null) src.push("B @ "+_lb.block);
+  if(_lc&&_lc.block!=null) src.push("C @ "+_lc.block);
+  if(_ld&&_ld.block!=null) src.push("D @ "+_ld.block);
+  when.textContent=src.length?"status at block "+src.join(" · "):"";
+  el.innerHTML=laneTable(["Lane","Miner","Target(s)","Status","Reason"], rows.map(function(r){
+    return '<tr><td>'+esc(r.lane)+'</td>'+minerCell(r.hotkey,null)+'<td>'+(r.targets?targetTags(r.targets):'<span class="muted">--</span>')+'</td><td>'+esc(String(r.stage||"--").replace(/_/g," "))+'</td><td>'+esc(r.reason||"--")+'</td></tr>';
+  }), (_lb||_lc||_ld)?"no queued entries in lanes B, C or D":"no lane queue published yet");
+  var vel=document.getElementById("mq-verdicts"); if(!vel) return;
+  var vs=[];
+  rows.forEach(function(r){
+    var v=r.verdict; if(!v||typeof v!=="object"||!v.outcome) return;
+    var ms=laneRows(v.margins);
+    if(!ms.length) ms=[null];
+    ms.forEach(function(m){ vs.push({r:r, v:v, m:m}); });
+  });
+  vel.innerHTML=laneTable(["Lane","Miner","Outcome","Round","Target","#LCB","#Bar","#Margin","#Point gain"], vs.map(function(x){
+    var m=x.m||{};
+    return '<tr><td>'+esc(x.r.lane)+'</td>'+minerCell(x.r.hotkey,null)+'<td title="'+esc(x.v.summary||"")+'">'+esc(String(x.v.outcome).replace(/_/g," "))+'</td><td>'+esc(x.v.round_id||x.v.receipt_round_id||"--")+'</td>'+
+      '<td>'+(x.m?targetTags(m.target)+(m.declared===false?' <span class="muted">undeclared</span>':''):'<span class="muted">margins not recorded</span>')+'</td>'+
+      '<td class="num">'+mqSigned(m.lcb)+'</td><td class="num">'+mqSigned(m.gain_bar)+'</td><td class="num'+(m.passed===true?' good':'')+'">'+mqSigned(m.margin)+'</td><td class="num">'+mqSigned(m.gain)+'</td></tr>';
+  }), "no settled verdicts in the live queues");
+}
 // ── lane C: settlements (status/lane_c.json, else status/v2.json lane_c.trainer)
 function renderLcSettle(){
   var el=document.getElementById("lc-settle"), when=document.getElementById("lc-settle-when"); if(!el) return;
@@ -3222,7 +3281,7 @@ function loadLdReports(){
   });
 }
 function loadLaneD(){
-  fetchJSON("status/lane_d.json").then(function(d){ _ld=(d&&typeof d==="object")?d:null; loadLdReports(); if(_page==="laned") renderLaneD(); }).catch(function(){});
+  fetchJSON("status/lane_d.json").then(function(d){ _ld=(d&&typeof d==="object")?d:null; loadLdReports(); renderMinerQueue(); if(_page==="laned") renderLaneD(); }).catch(function(){});
   fetchJSON("lane-d/receipts/latest.json").then(function(d){ _ldReceipt=(d&&typeof d==="object")?d:null; if(_page==="laned") renderLaneD(); }).catch(function(){});
 }
 function ldReport(b){ return (b!=null&&_ldReports[String(b)])||null; }
@@ -4022,9 +4081,9 @@ function poll(){
   // v2 status (trainer, unsigned): go-live, lane-B driver state, MoE health
   fetchJSON("status/v2.json").then(function(d){ _v2=d; if(_rawIndex&&v2FromBlock()!==(_index&&_index.v2_from_block)){ _index=v2Scope(_rawIndex); renderAll(); } renderV2(); renderTrain(); renderWarm(); renderWarmHistory(); }).catch(function(){});
   // lane-C queue (trainer, unsigned; absent while lane C is off)
-  fetchJSON("status/lane_c.json").then(function(d){ _lc=d; if(_page==="lanec") renderLaneC(); }).catch(function(){});
+  fetchJSON("status/lane_c.json").then(function(d){ _lc=d; renderMinerQueue(); if(_page==="lanec") renderLaneC(); }).catch(function(){});
   // lane-B funded queue + legs (trainer, unsigned; absent while lane B is off)
-  fetchJSON("status/lane_b.json").then(function(d){ _lb=d; if(_page==="laneb") renderLaneB(); }).catch(function(){});
+  fetchJSON("status/lane_b.json").then(function(d){ _lb=d; renderMinerQueue(); if(_page==="laneb") renderLaneB(); }).catch(function(){});
   // lane D (validator): status/lane_d.json, its signed reports, the latest receipt
   loadLaneD();
 }

@@ -1734,8 +1734,21 @@ class LaneBDriver:
                             "nothing committed; its legs wait for the next settlement", rid)
                 return []
             progress_outcomes = []
+            # owner 2026-11-28: the judge's per-target LCB / bar / gain per
+            # judged leg, kept in the driver state for the public queue
+            # verdict (display telemetry: never signed, never re-read by any
+            # scoring path; the signed manifest/receipts are unchanged)
+            from ..funding.public_reason import judgement_margins
+
+            margins = {}
+            for j in judgements:
+                try:
+                    margins[j.entry.rebased_pointer] = judgement_margins(j)
+                except Exception as e:  # noqa: BLE001 — telemetry never blocks a settlement
+                    log.debug("lane B: verdict margins unavailable: %s", e)
             for ptr, _f, sel in used:
                 sub = _f["leg"]["sub"]
+                m = margins.get(ptr) or {}
                 progress_outcomes.append({"round_id": rid, "hotkey": sub["hotkey"],
                                 "gen_ref": sub["gen_ref"], "domain": sub["domain"],
                                 "targets": list(sub.get("targets") or [sub["domain"]]),
@@ -1745,7 +1758,9 @@ class LaneBDriver:
                                 "leg_pointer": ptr,
                                 "outcome": ("qualified" if ptr in passed else
                                             "qualification_not_selected" if ptr in checks_passed else
-                                            "qualification_rejected")})
+                                            "qualification_rejected"),
+                                **({"judge_stage": m["stage"]} if m.get("stage") else {}),
+                                **({"margins": m["targets"]} if m.get("targets") else {})})
                 rec = {"rebased_pointer": ptr, "king_pointer": king_pointer,
                        "selection": {str(k): v for k, v in sel.items()}}
                 if ptr in qualified:
@@ -1757,7 +1772,7 @@ class LaneBDriver:
                     # validator that missed it can judge it on demand
                     self.st.pending_merges.append({**rec, "round_id": rid})
             self.st.finished = [f for f in self.st.finished if f not in todo]
-            self._settle_funding(todo, dropped)
+            self._settle_funding(todo, dropped, progress_outcomes)
             self.st.outcomes.extend(dropped)
             self.st.submission_results.extend(progress_outcomes)
             del self.st.submission_results[:-OUTCOMES_KEEP]
@@ -1769,7 +1784,8 @@ class LaneBDriver:
             self.save()
         return judgements
 
-    def _settle_funding(self, todo: list[dict], dropped: list[dict]) -> None:
+    def _settle_funding(self, todo: list[dict], dropped: list[dict],
+                        judged: list[dict] | None = None) -> None:
         """The funded queue entries of the legs this settlement consumed
         (caller holds the lock): a leg that reached the manifest (judged) or
         was refused at the merge byte-check is spent (``mark_done``); a leg
@@ -1781,6 +1797,12 @@ class LaneBDriver:
             return
         fq = self._funded_queue()
         why = {d["leg_pointer"]: d["outcome"] for d in dropped}
+        # owner 2026-11-28: the public verdict each spent entry carries
+        verdicts = {r["leg_pointer"]: {**r, "lane": "b"} for r in (judged or [])
+                    if r.get("leg_pointer")}
+        verdicts.update({d["leg_pointer"]: {"lane": "b", "outcome": d["outcome"],
+                                            "round_id": d.get("round_id"),
+                                            "gen_ref": d.get("gen_ref")} for d in dropped})
         for f in funded:
             hk = f["leg"]["sub"]["hotkey"]
             if why.get(f["leg_pointer"]) in ("stale", "routing_stale"):
@@ -1791,8 +1813,10 @@ class LaneBDriver:
                                error_class="no_capacity", burn_attempt=False, operator_billed=True)
             elif fq is not None:
                 funding = f["leg"]["funding"]
+                verdict = verdicts.get(f["leg_pointer"])
                 fq.mark_done(hk, expect_ref=funding["entry_ref"],
-                             expect_started_block=funding.get("started_block"))
+                             expect_started_block=funding.get("started_block"),
+                             **({"verdict": verdict} if verdict else {}))
 
     def _routing_stale(self, leg: dict, sel: dict[int, list[int]], king_pointer: str,
                        block: int) -> tuple[bool, dict]:

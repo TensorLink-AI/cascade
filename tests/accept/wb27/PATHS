@@ -183,3 +183,14 @@ tests/accept/wb27/test_wb27_in_window_settlement_retry.py
 tests/unit/test_lane_c_trainer_rolling.py
 # a Protocol method body stub_scan flagged (#991 put the file in W-CMP PATHS)
 cascade/eval/timestral_adapter.py
+# 2026-11-28 owner ("can miners see that in the CLI and the leaderboard on
+# the dashboard? yes please do that"): a sanitized one-line public reason per
+# queue entry (whitelisted templates, never raw error text) and the settled
+# entry's verdict (outcome, round, per-target LCB / bar / point gain) on the
+# public lane queues, the trainer's status docs, the miner CLI and the
+# website. Display only: no signed manifest, receipt or scoring path reads it.
+cascade/funding/public_reason.py
+cascade/miner/submission_status.py
+cascade/website/index.html
+scripts/publish_website.py
+tests/accept/wb27/test_wb27_miner_visible_reasons.py
