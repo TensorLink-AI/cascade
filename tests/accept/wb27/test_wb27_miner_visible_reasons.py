@@ -174,9 +174,9 @@ def test_mark_done_stores_a_sanitized_verdict_with_margins(tmp_path):
             "lane": "b", "outcome": "qualification_rejected", "round_id": RID, "gen_ref": GEN2,
             "pod": "funded-5cu2sxndk8dw", "error": "10.42.7.19 refused",
             "margins": [{"target": "energy", "declared": True, "passed": False,
-                         "lcb": -0.0123, "bar": 0.02, "gain": 0.004, "why": "no_gain",
+                         "lcb": -0.0123, "gain_bar": 0.02, "gain": 0.004, "why": "no_gain",
                          "note": "$104.42"},
-                        {"target": "<script>", "lcb": 1.0, "bar": 0.0}]})
+                        {"target": "<script>", "lcb": 1.0, "gain_bar": 0.0}]})
         raw = json.loads((tmp_path / "lane_b_queue.json").read_text())
         row = _row(LaneBQueue(tmp_path / "lane_b_queue.json").public_view(), HK2)
     v = row.get("verdict")
@@ -184,7 +184,7 @@ def test_mark_done_stores_a_sanitized_verdict_with_margins(tmp_path):
     assert v["outcome"] == "qualification_rejected" and v["round_id"] == RID, v
     (m,) = v["margins"]                               # the unsafe target slug dropped
     assert m["target"] == "energy" and m["passed"] is False and m["why"] == "no_gain"
-    assert abs(m["margin"] - (-0.0323)) < 1e-9 and m["lcb"] == -0.0123 and m["bar"] == 0.02
+    assert abs(m["margin"] - (-0.0323)) < 1e-9 and m["lcb"] == -0.0123 and m["gain_bar"] == 0.02
     blob = json.dumps(raw) + json.dumps(row)
     for s in SECRETS:
         assert s not in blob, s
@@ -227,7 +227,7 @@ def test_settle_funding_passes_the_judged_verdict_to_the_queue(tmp_path):
         judged = [{"round_id": RID, "hotkey": HK2, "gen_ref": GEN2, "leg_pointer": ptr,
                    "outcome": "qualification_rejected",
                    "margins": [{"target": "energy", "declared": True, "passed": False,
-                                "lcb": 0.011, "bar": 0.02, "gain": 0.03, "why": "no_gain"}]}]
+                                "lcb": 0.011, "gain_bar": 0.02, "gain": 0.03, "why": "no_gain"}]}]
         import inspect
 
         assert "judged" in inspect.signature(LaneBDriver._settle_funding).parameters
@@ -258,7 +258,7 @@ def test_judgement_margins_records_lcb_bar_gain_per_declared_target():
     by = {r["target"]: r for r in out["targets"]}
     assert set(by) == {"energy", "web", "transport"}, by
     assert by["energy"] == {"target": "energy", "declared": True, "passed": False,
-                            "why": "no_gain", "lcb": -0.01, "bar": 0.02, "gain": 0.004}
+                            "why": "no_gain", "lcb": -0.01, "gain_bar": 0.02, "gain": 0.004}
     assert by["web"]["why"] == "cleared" and by["web"]["metric"] == "crps"
     assert by["transport"]["why"] == "inconclusive_windows" and "lcb" not in by["transport"]
 
@@ -311,7 +311,7 @@ def test_cli_prints_reason_verdict_and_marks_your_row(tmp_path):
         q.mark_done(HK2, expect_ref=lane_b_entry_ref(("energy",), GEN2), verdict={
             "outcome": "qualification_rejected", "round_id": RID, "margins": [
                 {"target": "energy", "declared": True, "passed": False, "lcb": -0.0123,
-                 "bar": 0.02, "gain": 0.004, "why": "no_gain"}]})
+                 "gain_bar": 0.02, "gain": 0.004, "why": "no_gain"}]})
         doc = q.public_view()
         lines = [queue_row_line(r, me=HK) for r in doc["entries"]]
         out = _Out()

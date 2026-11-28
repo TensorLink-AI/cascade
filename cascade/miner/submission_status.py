@@ -345,7 +345,7 @@ def verdict_lines(verdict) -> list[str]:
         res = "PASS" if m.get("passed") else "fail"
         why = f", {safe_text(m['why']).replace('_', ' ')}" if m.get("why") and not m.get("passed") else ""
         lines.append(f"  {safe_text(m.get('target'))} ({tag}): LCB {_signed(m.get('lcb'))} vs bar "
-                     f"{_signed(m.get('bar'))} (margin {_signed(m.get('margin'))}), point gain "
+                     f"{_signed(m.get('gain_bar'))} (margin {_signed(m.get('margin'))}), point gain "
                      f"{_signed(m.get('gain'))} — {res}{why}")
     if not margins and verdict.get("lane") == "b":
         lines.append("  per-target margins were not recorded for this settlement")

@@ -3237,7 +3237,7 @@ function renderMinerQueue(){
     var m=x.m||{};
     return '<tr><td>'+esc(x.r.lane)+'</td>'+minerCell(x.r.hotkey,null)+'<td title="'+esc(x.v.summary||"")+'">'+esc(String(x.v.outcome).replace(/_/g," "))+'</td><td>'+esc(x.v.round_id||x.v.receipt_round_id||"--")+'</td>'+
       '<td>'+(x.m?targetTags(m.target)+(m.declared===false?' <span class="muted">undeclared</span>':''):'<span class="muted">margins not recorded</span>')+'</td>'+
-      '<td class="num">'+mqSigned(m.lcb)+'</td><td class="num">'+mqSigned(m.bar)+'</td><td class="num'+(m.passed===true?' good':'')+'">'+mqSigned(m.margin)+'</td><td class="num">'+mqSigned(m.gain)+'</td></tr>';
+      '<td class="num">'+mqSigned(m.lcb)+'</td><td class="num">'+mqSigned(m.gain_bar)+'</td><td class="num'+(m.passed===true?' good':'')+'">'+mqSigned(m.margin)+'</td><td class="num">'+mqSigned(m.gain)+'</td></tr>';
   }), "no settled verdicts in the live queues");
 }
 // ── lane C: settlements (status/lane_c.json, else status/v2.json lane_c.trainer)

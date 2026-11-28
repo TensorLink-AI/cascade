@@ -219,7 +219,7 @@ def _error_reason(cls: str, err: str, entry) -> tuple[str, str]:
         if "embargo" in low:
             return ("recipe_embargo", "your recipe tree embeds embargoed market bars: remove "
                                       "the embargoed history and fund a new ref")
-        if "could not cut" in low or ("sample" in low and "geometry" in low):
+        if "could not cut" in low or "sample geometry" in low:
             m = _DATE_RE.search(err or "") if "data.start to" in low else None
             fix = (f"earliest data.start that fits: {m.group(1)}" if m else
                    "move data.start later (`cascade lane-c data` shows the recorded history)")
@@ -309,9 +309,13 @@ def judgement_margins(judgement, *, cap: int = 16) -> dict:
         inc = str(getattr(v, "inconclusive", "") or "")
         why = ("cleared" if passed else f"inconclusive_{inc}" if inc else
                "no_gain" if reason.startswith("no gain") else "guard" if reason else "")
-        lcb, bar = _num(getattr(v, "target_lcb", None)), _num(getattr(v, "bar", None))
+        try:
+            bar = _num(v.bar)                # the applied gain bar (published as gain_bar)
+        except AttributeError:
+            bar = None
+        lcb = _num(getattr(v, "target_lcb", None))
         row = {"target": str(t), "declared": declared, "passed": passed, "why": why,
-               "lcb": lcb, "bar": bar, "gain": _num(getattr(v, "target_gain", None)),
+               "lcb": lcb, "gain_bar": bar, "gain": _num(getattr(v, "target_gain", None)),
                "metric": str(getattr(v, "gain_metric", "") or "")}
         row = {k: val for k, val in row.items() if val not in (None, "")}
         rows.append(row)
@@ -330,12 +334,12 @@ def _target_row(raw) -> dict | None:
     for k in ("declared", "passed"):
         if isinstance(raw.get(k), bool):
             row[k] = raw[k]
-    for k in ("lcb", "bar", "gain"):
+    for k in ("lcb", "gain_bar", "gain"):
         v = _num(raw.get(k))
         if v is not None:
             row[k] = v
-    if "lcb" in row and "bar" in row:
-        row["margin"] = round(row["lcb"] - row["bar"], 6)
+    if "lcb" in row and "gain_bar" in row:
+        row["margin"] = round(row["lcb"] - row["gain_bar"], 6)
     for k in ("why", "metric"):
         v = str(raw.get(k) or "")
         if v and _OUTCOME_RE.match(v):
