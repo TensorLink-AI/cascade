@@ -12,3 +12,6 @@ tests/e2e_testnet/LANES_RUNBOOK.md
 # its verdict (keyed by the rebased pointer).
 cascade/trainer/expert_lane.py
 cascade/trainer/lane_b_driver.py
+# retro 2026-11-28 #7 (#1009): the harnesses mirror the worker-exit attribution
+# (fund-time fit evidence decides whether an OOM is the miner's)
+cascade/trainer/fault_class.py
