@@ -712,8 +712,13 @@ The trainer rents miner-funded pods on Lium, Shadeform, Vast.ai or Runpod
   a `make_good` request priced on the miner's GPU type × the leg wall and
   parks `awaiting_operator_approval` (unburned, uncharged; the miner sees
   "our fault: waiting for an operator re-run, no cost to you"). Approve it
-  with `cascade-trainer approve-operator-leg <hotkey> --lane c [--max-cost USD]`
-  (default ceiling: projection × 1.25). The re-run then rents on the
+  (default ceiling: projection × 1.25):
+
+  ```bash
+  cascade-trainer approve-operator-leg <hotkey> --lane c [--max-cost 120]
+  ```
+
+  The re-run then rents on the
   OPERATOR's Lium account, on the miner's chosen GPU type, under the usual
   daily cap, reserve and ceiling checks; the payer key is never used.
 
