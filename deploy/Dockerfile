@@ -35,30 +35,31 @@ COPY --from=ghcr.io/astral-sh/uv:0.13.4@sha256:9f130421e930bfbdc563c00740466603f
 WORKDIR /root/cascade
 COPY . /root/cascade
 
-# Pinned Python + the worker's extras. Torch is pinned to a specific CUDA build
-# so the numeric stack is identical on every pod. Bump deliberately — a torch
-# change can shift numerics and break byte-exact re-derivation of older rounds.
+# Pinned Python + the worker's extras, installed FROM THE LOCK. `uv sync
+# --frozen` installs exactly uv.lock (torch 2.4.1+cu124 from the cu124 index
+# pinned in pyproject [tool.uv.sources]) and never re-resolves. Images up to
+# worker-v2.1.0-rc5 / mkt-rc3 used `uv pip install -e '.[...]'`, which
+# re-resolved every unpinned package at build time: ~45 packages drifted off
+# the lock, including hippius_hub 0.7.2 against a locked 0.5.1, whose chunked-v2
+# pushes no 0.5.1 validator could read (2026-11-28, #998). Bump deliberately: a
+# lock change can shift numerics and break byte-exact re-derivation.
+#   train/hippius/marketcast  the worker; wandb  per-step log mirror (no-op
+#   unless enabled); generation  the generator-runtime allowlist (chain.toml
+#   [dependencies]: numpy/scipy/pandas/numba/statsmodels/scikit-learn/gpytorch/
+#   networkx/pyarrow, pinned in pyproject); pool-forge  pyyaml/pyarrow/pandas.
 RUN uv venv --python 3.11 /root/cascade/.venv \
     && .venv/bin/python scripts/check_tls_trust.py --system-only \
-    && uv pip install --python /root/cascade/.venv/bin/python \
-        torch==2.4.1 --index-url https://download.pytorch.org/whl/cu124 \
-    && uv pip install --python /root/cascade/.venv/bin/python -e '.[train,hippius,wandb,marketcast]'
-    # [wandb] extra (2026-07-18): lets pod workers mirror per-step training
-    # logs to wandb when [wandb] enabled=true AND WANDB_API_KEY is forwarded
-    # (provision.toml forward_env). Absent either, the sink no-ops. NOTE: this
-    # layer change lands in the NEXT image rotation (digest re-pin + contract
-    # recompute) — it is not worth a rotation on its own.
+    && UV_LINK_MODE=copy uv sync --frozen --no-dev \
+        --extra train --extra hippius --extra wandb --extra marketcast \
+        --extra generation --extra pool-forge
 
-# Generator-runtime allowlist (chain.toml [dependencies]) — baked and PINNED so
-# every miner generator finds the identical numeric stack on every pod.
-# worker-v0.3.0 shipped without these: every generator importing pandas failed
-# heats with generator_import_failed (2026-07-15; pods were hand-patched).
-# Pins match uv.lock where present, else a frozen `uv pip compile` resolution
-# against it (2026-07-16). torch stays the cu124 build installed above.
-RUN uv pip install --python /root/cascade/.venv/bin/python \
-        numpy==2.4.6 pandas==3.0.3 pyarrow==25.0.0 pyyaml==6.0.3 \
-        scipy==1.17.1 statsmodels==0.14.6 numba==0.66.0 \
-        scikit-learn==1.9.0 gpytorch==1.15.2 networkx==3.6.1
+# Build-time guard: the venv must EQUAL uv.lock (every installed distribution
+# at its locked version, nothing the lock does not know, timestral at its locked
+# commit). Any drift fails the build. On success it writes the venv's lock
+# marker, which the provisioner's health gate (cascade/provision/health.py
+# lock_match) requires before it enforces the same check on a booted pod.
+RUN .venv/bin/python -P -m cascade.shared.lockdrift --lock uv.lock \
+        --write-marker /root/cascade/.venv/.cascade-lock-verified
 
 RUN .venv/bin/python scripts/check_tls_trust.py
 
