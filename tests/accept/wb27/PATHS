@@ -194,3 +194,7 @@ cascade/miner/submission_status.py
 cascade/website/index.html
 scripts/publish_website.py
 tests/accept/wb27/test_wb27_miner_visible_reasons.py
+# 2026-11-28: a chunked-v2 Hub object (hippius_hub >= 0.6 push) is reassembled and
+# verified on fetch; a marker over a chunk index is incomplete; every push is
+# forced to the single-blob layout (HIPPIUS_CHUNKED_WRITE=0). hippius.py and
+# lane_b_offload.py (pod cache completeness) are listed above.
