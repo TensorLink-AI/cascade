@@ -139,7 +139,9 @@ bar nobody recorded is an absent row. Aggregate 1h bars for 4h and 1d.
 `index.json` lists every file's sha256. The data is Hyperliquid perpetuals
 (core dex for crypto, the `xyz` dex for equities, FX, metals and
 commodities), redistributed under Hyperliquid's terms; the dataset card has
-the details. It updates daily.
+the details. It updates daily (about 03:30 UTC): `index.json`'s
+`public_before` is the first day still private and advances by one day, and
+only new or grown month files are re-uploaded.
 
 ```bash
 cascade lane-c data --symbols BTC,ETH,SP500 --timeframes 1m,1h,funding \
