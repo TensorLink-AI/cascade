@@ -20,6 +20,15 @@ payloads and -0.0 count too):
 Prints a PASS/FAIL table; exits 1 on any mismatch, 2 on a run error, 0 when
 every check passes (an OOM on BOTH sides is reported as SKIP-OOM).
 
+``--solo`` (W-IMG retro item 8, the pipeline's qualification job) runs the
+candidate ONLY — fresh N, straight 2k and crash@k+resume per world — inside
+the image under test, and records the GPU model and harness terms in
+``summary.json``. ``scripts/write_image_qualification.py --golden`` then
+compares its tensors bit for bit with the previous qualified image's GOLDEN
+file (the same runs, recorded when that image was qualified), so one pod
+booting the new image qualifies it — no second checkout inside a foreign
+venv.
+
 Usage (on a rented GPU pod, rc15 worker image layout: /root/cascade repo +
 /root/cascade/.venv; only core-venv deps are used)::
 
@@ -211,7 +220,8 @@ def worker(args) -> int:
     result = {"repo": str(repo), "cascade_file": cascade.__file__, "world": args.world,
               "mode": args.mode, "batch_shape": [rows, c, length],
               "contract_digest": contract_digest(contract), "torch": torch.__version__,
-              "cuda_devices": torch.cuda.device_count() if torch.cuda.is_available() else 0}
+              "cuda_devices": torch.cuda.device_count() if torch.cuda.is_available() else 0,
+              "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"}
     if torch.cuda.is_available() and torch.cuda.device_count() < int(args.world):
         result["error"] = f"need {args.world} GPUs, have {torch.cuda.device_count()}"
         (run / "result.json").write_text(json.dumps(result, default=str))
@@ -323,8 +333,17 @@ def _status(rows, world, check, a, b, compare):
                  f"{len(mism)} mismatches: " + "; ".join(f"{m.key} ({m.reason})" for m in mism[:4])))
 
 
+def harness_terms(args) -> dict:
+    """The terms two golden runs must share to be compared bit for bit."""
+    return {"steps": int(args.steps), "resume_at": int(args.resume_at or args.steps),
+            "seed": int(args.seed), "channels": int(args.channels),
+            "contract_steps": int(args.contract_steps or 0), "groups": not args.no_groups}
+
+
 def orchestrate(args) -> int:
-    ref, cand = Path(args.ref).resolve(), Path(args.cand).resolve()
+    solo = bool(args.solo)
+    cand = Path(args.cand).resolve()
+    ref = cand if solo else Path(args.ref).resolve()
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
     if args.chain_toml is None:
@@ -332,19 +351,29 @@ def orchestrate(args) -> int:
         args.chain_toml = deployed if deployed.is_file() else cand / "chain.toml"
     worlds = [int(w) for w in str(args.worlds).split(",") if w.strip()]
     k = int(args.resume_at or args.steps)
-    print(f"A (ref)  = {ref} @ {_git_head(ref)}\nB (cand) = {cand} @ {_git_head(cand)}\n"
+    print(("A (ref)  = none (--solo: compared against a golden file)\n" if solo else
+           f"A (ref)  = {ref} @ {_git_head(ref)}\n") + f"B (cand) = {cand} @ {_git_head(cand)}\n"
           f"contract = {args.chain_toml}  worlds={worlds} steps={args.steps} resume {k}->{2 * k} "
           f"timing={args.timing_steps}", flush=True)
     rows: list[tuple] = []
     timing: list[tuple] = []
+    gpu_names: set[str] = set()
     for w in worlds:
         base = out / f"w{w}"
-        ra = launch(args, ref, base / "A-fresh", world=w, mode="fresh", total_steps=args.steps)
         rb = launch(args, cand, base / "B-fresh", world=w, mode="fresh", total_steps=args.steps)
-        _status(rows, w, f"A vs B, {args.steps} steps", ra, rb,
-                lambda base=base: compare_run_dirs(base / "A-fresh", base / "B-fresh"))
+        if rb.get("gpu_name"):
+            gpu_names.add(str(rb["gpu_name"]))
+        if solo:
+            rows.append((w, f"B fresh, {args.steps} steps", "ERROR" if rb.get("error") else "RAN",
+                         (rb.get("error") or "compared against the golden file")[:160]))
+        else:
+            ra = launch(args, ref, base / "A-fresh", world=w, mode="fresh",
+                        total_steps=args.steps)
+            _status(rows, w, f"A vs B, {args.steps} steps", ra, rb,
+                    lambda base=base: compare_run_dirs(base / "A-fresh", base / "B-fresh"))
         if k > 0:
-            for tag, repo in (("B", cand), ("A", ref)) if args.resume_both else (("B", cand),):
+            for tag, repo in (("B", cand), ("A", ref)) if args.resume_both and not solo \
+                    else (("B", cand),):
                 snap = base / f"{tag}-snapshots"
                 full = launch(args, repo, base / f"{tag}-full{2 * k}", world=w, mode="fresh",
                               total_steps=2 * k)
@@ -361,7 +390,8 @@ def orchestrate(args) -> int:
                                                          step_logs=False))
         if args.timing_steps:
             n = int(args.timing_steps) + int(args.warmup_steps) + 1
-            ta = launch(args, ref, base / "A-timing", world=w, mode="fresh", total_steps=n)
+            ta = {} if solo else launch(args, ref, base / "A-timing", world=w, mode="fresh",
+                                        total_steps=n)
             tb = launch(args, cand, base / "B-timing", world=w, mode="fresh", total_steps=n)
             timing.append((w, ta.get("steps_per_s"), tb.get("steps_per_s")))
     print("\n| world | check | status | detail |\n|---|---|---|---|")
@@ -373,7 +403,10 @@ def orchestrate(args) -> int:
             ratio = f"{b / a:.3f}" if a and b else "-"
             fa, fb = (f"{v:.3f}" if v else "-" for v in (a, b))
             print(f"| {w} | {fa} | {fb} | {ratio} |")
-    (out / "summary.json").write_text(json.dumps({"rows": rows, "timing": timing}, default=str))
+    (out / "summary.json").write_text(json.dumps(
+        {"rows": rows, "timing": timing, "solo": solo, "harness": harness_terms(args),
+         "gpu_name": sorted(gpu_names)[0] if len(gpu_names) == 1 else sorted(gpu_names)},
+        default=str))
     if any(r[2] == "FAIL" for r in rows):
         print("\nRESULT: FAIL (training results differ)")
         return 1
@@ -392,6 +425,8 @@ def main(argv=None) -> int:
     ap.add_argument("--steps", type=int, default=3)
     ap.add_argument("--resume-at", type=int, default=None, help="crash step k (default --steps; 0 = skip)")
     ap.add_argument("--resume-both", action="store_true", help="also crash/resume-check A")
+    ap.add_argument("--solo", action="store_true",
+                    help="candidate only (compare against a golden file; no --ref)")
     ap.add_argument("--timing-steps", type=int, default=20)
     ap.add_argument("--warmup-steps", type=int, default=3)
     ap.add_argument("--contract-steps", type=int, default=None)
@@ -414,8 +449,8 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     if args.worker:
         return worker(args)
-    if not args.ref or not args.cand:
-        ap.error("--ref and --cand are required")
+    if not args.cand or not (args.ref or args.solo):
+        ap.error("--cand and --ref (or --solo) are required")
     return orchestrate(args)
 
 

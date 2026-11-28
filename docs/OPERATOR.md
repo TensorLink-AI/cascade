@@ -25,17 +25,18 @@ remains unspecified and blocked.
 ## Contents
 
 1. [Before activation](#before-go-live--before-a-testnet-cycle): pins, calibration and launch order
-2. [Pods and the worker image](#pods-and-the-worker-image): worker image,
+2. [Releasing a worker image](#releasing-a-worker-image): build → qualify → walls → PR → repin
+3. [Pods and the worker image](#pods-and-the-worker-image): worker image,
    GPU type, rented pods, operator lanes, sandbox, `cascade-provisioner`
-3. [Funded intake](#funded-intake): bring-up, fronting the intake, payer-pod
+4. [Funded intake](#funded-intake): bring-up, fronting the intake, payer-pod
    credentials, bench, direct submissions, cost model
-4. [Backlogs and recovery](#backlogs-and-recovery-across-lanes), including shared limits and operator-billed retries
-5. [Security and credentials](#security-and-credentials)
-6. [Dashboards and status](#stakeholder-scoreboard): publishing, benchmark sources and missing-data checks
-7. [C competition changes](#lane-c-competitions-add-re-weight-end-dec-ca-0056)
-8. [Network config overlays](#network-config-overlays-dec-ca-0057): change
+5. [Backlogs and recovery](#backlogs-and-recovery-across-lanes), including shared limits and operator-billed retries
+6. [Security and credentials](#security-and-credentials)
+7. [Dashboards and status](#stakeholder-scoreboard): publishing, benchmark sources and missing-data checks
+8. [C competition changes](#lane-c-competitions-add-re-weight-end-dec-ca-0056)
+9. [Network config overlays](#network-config-overlays-dec-ca-0057): change
    verdict / payout constants without a fleet release
-9. [Lane D operations](#lane-d-operations-open-weights): intake, vault,
+10. [Lane D operations](#lane-d-operations-open-weights): intake, vault,
    launch eval host, S8, first-seen recorder, retention, runbook
 
 ## Before go-live / before a testnet cycle
@@ -203,12 +204,150 @@ edited `chain.toml` before shipping it.
     (`cascade/shared/config/marketcast.py` `arming_problems`,
     `check_marketcast_arming`). See [MarketCast](#marketcast-dec-ca-0064-snapshot-feeds-validator-gpu).
 
+## Releasing a worker image
+
+W-IMG retro item 8 (owner 2026-11-28). A worker image is built, qualified and
+smoke-tested by the pipeline before any pin points at it. The trainer enforces
+this for `[v2] *_after` and `[marketcast] pod_image`: with no valid
+`qualifications/` record, every rent and dispatch on that image is refused.
+Legs wait as unburned operator faults, the log shows an ERROR every tick, and
+the `image_after_unqualified` / `mkt_image_unqualified` alert fires. The
+causes: rc15 vs the new image was not bitwise, the rc4 bf16 crash surfaced on
+a paid leg, mkt-rc3 was hand-built, and `uv pip install -e` drifted 46
+packages off the lock.
+
+Steps, in this order. Each step is one change, and the spend steps are
+Approve-tier:
+
+1. **Build.** Dispatch `publish-worker` (`gh workflow run publish-worker.yml
+   -f tag=<tag>` on the commit you release, or push a `worker-v*` tag). The
+   image installs with `uv sync --frozen`. The lock-drift guard fails the
+   build on any drift. The run uploads `image-manifest.json` (artifact
+   `image-manifest`) with these fields:
+   - the image digest;
+   - the source commit;
+   - the `uv.lock` sha256;
+   - the in-image `worker_code_fingerprint` (the job refuses it unless it
+     equals the checkout's);
+   - the torch build and its CUDA arch list.
+
+   Download the manifest: `gh run download <run> -n image-manifest`. Never
+   pin a hand-built image: it has no manifest, so it can never qualify.
+2. **Plan** (box, torch-free).
+
+   ```bash
+   python3 -P scripts/qualify_worker_image.py plan --manifest image-manifest.json \
+       --chain-toml /root/cascade/chain.validator.toml
+   ```
+
+   The plan prints the FROM image, the world sizes, the roles, the SKUs whose
+   walls to measure and the FROM golden file. Before renting:
+   - fill `[smoke.lane_b]` (the era king pointer + a selection) and
+     `[smoke.mkt] recipe` in `deploy/qualify/worker_image_job.toml`;
+   - if `qualifications/golden/<from12>.json` is missing (the current image
+     predates this pipeline), create it first. Run the `pod` step below on a
+     pod booting the current image, then the record script (step 5) with
+     `--golden-only`.
+3. **Qualify** on ONE cheap Lium pod. Use `[pod] qual_sku`, default
+   8xRTX4090. Keep it the same model as the golden file: bitwise only
+   compares like with like. Check the Lium balance first, then rent the pod
+   on the new image (owner OK).
+
+   ```bash
+   /root/cascade/.venv/bin/python -P scripts/qualify_worker_image.py pod \
+       --manifest image-manifest.json --chain-toml chain.deployed.toml \
+       --contract-block <era start> --out /root/qualify-out
+   ```
+
+   The step first checks that the pod really runs the manifest's image
+   (fingerprint, lock, lock-drift marker). Then it runs:
+   - `qualify_pyramid_bitwise.py --solo` at every world size: the fresh run,
+     the straight 2k run, and crash@k + resume;
+   - the 30-step smoke per role: `lane_a_leg`, `lane_b_expert_bf16` (the bf16
+     autocast backward must run), `lane_b_rebase_judge` and
+     `lane_d_forecast`.
+
+   For a `[marketcast] pod_image`, add `--mkt`. That runs `mkt_finetune` and
+   `mkt_flat_context` (finite LoRA gradients on an exactly flat context, plus
+   the forward sha256).
+
+   Copy `/root/qualify-out` back to the box, then delete the pod (check that
+   the on-pod worker has stopped first).
+4. **Walls.** Rent one short pod per rentable SKU and run:
+
+   ```bash
+   qualify_worker_image.py pod --walls-only --sku 8xH200 ...
+   ```
+
+   Each run is a 60-step lane A leg. It writes `walls-<sku>.json`: the
+   measured steps/s, the startup time and `wall_seconds` = (startup +
+   training_steps / rate) × 1.05. With `[round]
+   unmeasured_image_wall_cap_seconds` = 0, every rentable SKU needs a wall.
+   Otherwise one is enough, and the rest rent under the cap. Never reuse a
+   wall measured on another image or another GPU count.
+5. **Record** (box):
+
+   ```bash
+   python3 -P scripts/write_image_qualification.py \
+       --from-image <cur> --from-fingerprint <cur fp> \
+       --to-image <new> --to-fingerprint <new fp> --run-id <id> \
+       --qual-out qualify-out/qual-out \
+       --golden qualifications/golden/<from12>.json \
+       --build-manifest image-manifest.json --smoke qualify-out/smoke.json \
+       --walls walls-8xH200.json [--walls ...] \
+       --chain-toml /root/cascade/chain.validator.toml
+   ```
+
+   For the MarketCast record, pass `--mkt --from-forward-sha256 <previous mkt
+   image's flat-context forward>`. The script writes the record only if it
+   validates. A fleet record is `<from12>-to-<to12>.json` plus both golden
+   files; a MarketCast record is `mkt-<to12>.json`.
+6. **PR.** Commit the record and the golden files in one PR. Paste in the
+   config patch:
+
+   ```bash
+   python3 -P scripts/qualify_worker_image.py patch --record <record> \
+       --manifest image-manifest.json --chain-toml /root/cascade/chain.validator.toml
+   ```
+
+   The patch covers every pin of the release through the `*_after` path:
+   - `train_image_digest_after`, `funded_pod_image_after`,
+     `worker_code_fingerprint_after` and
+     `funded_sku_wall_measured_image_after`;
+   - `[round] ops_continuation_image_digest`;
+   - the `prior_train_image_digests` append;
+   - the merged `funded_sku_wall_seconds`;
+   - the override turned off.
+7. **Repin** (owner Approve). Deploy the release that carries the record,
+   then apply the patch to the deployed config. Do it only at an observed
+   seed-epoch start, or let the trainer bind it through `[v2]
+   image_epoch_from_block` (release-then-activate; see
+   [Changing the worker image per seed epoch](#changing-the-worker-image-per-seed-epoch-w-img-plan-rev624-e)).
+   Never repin mid-seed-epoch. Restart the trainer and the funding intake with
+   no leg in flight and outside a scoring window. Spot-check one pod per
+   stage.
+
+**Overrides expire.** If an unqualified image must run, the override is dated:
+- `[v2] image_after_unqualified_override = true` needs
+  `image_after_unqualified_override_until = "2026-11-30T00:00Z"`;
+- for MarketCast, use `[marketcast] pod_image_unqualified_override_until`.
+
+The loader refuses an override with no date, or with a date more than 14 days
+ahead. From that instant the override is no longer honoured: the image is
+refused again and the alert fires. Before deploying the release that carries
+this rule, give every live override a date. A dateless `= true` stops the
+trainer at load.
+
 ## Pods and the worker image
 
 The transport is plain SSH (`cascade/trainer/remote.py`), so any
 SSH-reachable GPU host looks the same to the trainer.
 
 ### Build and pin the worker image
+
+Release images through [Releasing a worker image](#releasing-a-worker-image):
+a hand build like the one below has no build manifest and never qualifies for
+a pin the trainer checks (`[v2] *_after`, `[marketcast] pod_image`).
 
 ```bash
 docker build -f deploy/Dockerfile -t <registry>/cascade-worker:<tag> .
@@ -478,8 +617,10 @@ python3 scripts/write_image_qualification.py \
 
 Commit the record it writes and deploy it with the trainer code. It writes
 nothing when any world, the resume check or any tensor is missing or differs.
-Emergency only: `[v2] image_after_unqualified_override = true` uses the after
-pins unqualified (ERROR every tick, `image_after_override` alert).
+Emergency only: `[v2] image_after_unqualified_override = true` with a dated
+`image_after_unqualified_override_until` uses the after pins unqualified (ERROR
+every tick, `image_after_override` alert) until that date. A record is now
+schema /2: see [Releasing a worker image](#releasing-a-worker-image).
 
 What changes, and when:
 - Nothing changes until the vote resolves the switch (or a typed

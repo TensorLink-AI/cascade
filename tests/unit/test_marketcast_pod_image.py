@@ -25,6 +25,14 @@ BASE = {"assets": {"crypto": ["BTC"]}, "suites": ["returns"],
         "frequencies": {"returns": ["5m"]}, "horizons": {"returns": ["5m"]}}
 
 
+@pytest.fixture(autouse=True)
+def _qualified(monkeypatch):
+    """These tests exercise the pod_image pins with a QUALIFIED MarketCast
+    image (the qualification rule itself is tested in
+    test_image_qualification.py and tests/accept/w_img)."""
+    monkeypatch.setattr("cascade.trainer.leg_pins.mkt_image_refusal", lambda cfg: "")
+
+
 def test_parse_both_or_neither_and_digest_pinned():
     mc = parse_marketcast({**BASE, "pod_image": MKT_REF, "worker_code_fingerprint": MKT_FP.upper()})
     assert (mc.pod_image, mc.worker_code_fingerprint) == (MKT_REF, MKT_FP)

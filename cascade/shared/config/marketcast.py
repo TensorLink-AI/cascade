@@ -413,6 +413,12 @@ class MarketCastConfig:
     # keeps [round] funded_pod_image / worker_code_fingerprint; "" = the fleet's.
     pod_image: str = ""
     worker_code_fingerprint: str = ""
+    # W-IMG retro item 8 (trainer-only): a pod_image with no
+    # qualifications/mkt-<img12>.json record (cascade.shared.image_qualification)
+    # is refused for every MarketCast rent unless this dated override is set
+    # and in the future (ISO-8601 UTC time or date, at most MAX_OVERRIDE_DAYS
+    # ahead). "" = no override.
+    pod_image_unqualified_override_until: str = ""
     # the leg splits each recipe batch into micro-batches of at most this many
     # context steps (batch x context_length) and accumulates their gradients
     # (release-only): any recipe the bounds admit fits a 16 GB card (measured
@@ -1025,6 +1031,16 @@ def parse_marketcast(raw: object, *, open_classes: bool = False) -> MarketCastCo
                          f"('<repo>:<tag>@sha256:<64 hex>'); got {pod_image!r}")
     if wcf and not re.fullmatch(r"[0-9a-f]{64}", wcf):
         raise ValueError(f"[marketcast] worker_code_fingerprint must be 64 hex; got {wcf!r}")
+    pod_until = mc.get("pod_image_unqualified_override_until", "")
+    if not isinstance(pod_until, str):
+        raise ValueError("[marketcast] pod_image_unqualified_override_until must be an "
+                         f"ISO-8601 string; got {pod_until!r}")
+    if pod_until.strip() and not pod_image:
+        raise ValueError("[marketcast] pod_image_unqualified_override_until needs a pod_image")
+    from ..image_qualification import check_override_until
+
+    pod_until = check_override_until("[marketcast] pod_image_unqualified_override_until",
+                                     pod_until)
     if bar_relay and ("/" not in bar_relay.strip("/") or not bar_relay.endswith("/")):
         raise ValueError(f"[marketcast] bar_relay must be '<bucket>/<prefix>/'; got {bar_relay!r}")
     if crps_scale not in CRPS_SCALES:
@@ -1172,6 +1188,7 @@ def parse_marketcast(raw: object, *, open_classes: bool = False) -> MarketCastCo
         cluster_block_hours=cbh, min_time_blocks=mtb,
         min_bar_coverage=mbc, min_dollar_volume_24h=mdv, coverage_tolerance_over=tov, crps_scale=crps_scale, bar_relay=bar_relay,
         pod_image=pod_image, worker_code_fingerprint=wcf,
+        pod_image_unqualified_override_until=pod_until,
         micro_batch_tokens=mbt,
         coverage_gate_levels=cgl, zero_scale_frac=zsf, cell_ratio_cap=cap, tail_levels=tls,
         tail_tolerance=ttol, calibration_z=cz, near_dup_tol=ndt,

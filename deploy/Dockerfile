@@ -16,7 +16,7 @@
 #   docker push <registry>/cascade-worker:<tag>
 
 # cuDNN runtime base — cuDNN version is pinned here for deterministic kernels.
-FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04 AS worker
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -61,6 +61,13 @@ RUN uv venv --python 3.11 /root/cascade/.venv \
 RUN .venv/bin/python -P -m cascade.shared.lockdrift --lock uv.lock \
         --write-marker /root/cascade/.venv/.cascade-lock-verified
 
+# W-IMG retro item 8: the build-time probe (torch build, CUDA arch list, the
+# in-image worker code fingerprint, the uv.lock hash, the lock-drift marker).
+# publish-worker.yml exports it through the `image-probe` stage below and
+# folds it into the image's build manifest (scripts/worker_image_manifest.py).
+RUN .venv/bin/python -P scripts/worker_image_manifest.py probe --root /root/cascade \
+        --out /root/cascade/.image-probe.json
+
 RUN .venv/bin/python scripts/check_tls_trust.py
 
 # The baked chain.toml is a BUILD-TIME SNAPSHOT, kept only so a pod can boot
@@ -103,3 +110,11 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 
 EXPOSE 22
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+
+# W-IMG retro item 8: the probe file on its own (`--target image-probe` with a
+# local output, cached from the build above), so CI never pulls the image.
+FROM scratch AS image-probe
+COPY --from=worker /root/cascade/.image-probe.json /image-probe.json
+
+# The default target: the worker image itself.
+FROM worker

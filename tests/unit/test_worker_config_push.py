@@ -266,9 +266,11 @@ def test_trainer_push_sends_the_fleet_release_its_worker_config(tmp_path):
     assert src.read_text(encoding="utf-8") == worker_toml_for_image(_text(), RC15)[0]
 
 
-def test_trainer_push_sends_a_marketcast_leg_the_mkt_release_config(tmp_path):
+def test_trainer_push_sends_a_marketcast_leg_the_mkt_release_config(tmp_path, monkeypatch):
     from cascade.trainer.leg_pins import mkt_leg_scope
 
+    # a QUALIFIED MarketCast image (the rule: test_image_qualification.py)
+    monkeypatch.setattr("cascade.trainer.leg_pins.mkt_image_refusal", lambda cfg: "")
     fake = _fake_runner(tmp_path)
     with mkt_leg_scope(fake):
         fake._push_deployed_chain_toml(_host())

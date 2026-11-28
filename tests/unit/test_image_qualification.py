@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import logging
 import re
 import struct
 from dataclasses import replace
@@ -58,21 +57,64 @@ def _pair(cfg):
             cfg.round.worker_code_fingerprint, cfg.v2.worker_code_fingerprint_after)
 
 
+def build_manifest(image: str, fp: str) -> dict:
+    return {"schema": Q.BUILD_SCHEMA, "builder": Q.BUILDER, "run_id": "45999",
+            "image": "ghcr.io/tensorlink-ai/cascade-worker@sha256:" + Q.image_hex(image),
+            "source_commit": "1" * 39 + "2", "lock_sha256": "3" * 63 + "4", "lock_frozen": True,
+            "worker_code_fingerprint": fp, "torch": "2.4.1+cu124", "cuda": "12.4",
+            "cuda_arch_list": ["sm_80", "sm_86", "sm_89", "sm_90"], "python": "3.11.10"}
+
+
+def smoke_doc(image: str, roles=Q.FLEET_SMOKE_ROLES) -> dict:
+    out = {}
+    for r in roles:
+        out[r] = {"role": r, "passed": True, "run_id": "qual-1", "gpus": 8, "detail": "pass"}
+        if r in Q.TRAINING_SMOKE_ROLES:
+            out[r].update(steps=30, final_loss=6.3)
+        if r == "lane_b_expert_bf16":
+            out[r]["bf16_autocast"] = True
+        if r == "mkt_flat_context":
+            out[r].update(grads_finite=True, forward_sha256="5" * 63 + "6")
+    return {"image": "sha256:" + Q.image_hex(image), "roles": out}
+
+
+def walls_doc(image: str, skus=LADDER_SKUS) -> dict:
+    return {"image": "sha256:" + Q.image_hex(image),
+            "skus": {s: {"gpus": Q.sku_gpus(s), "steps_per_s": 1.9, "measured_steps": 28,
+                         "wall_seconds": 13300, "run_id": "walls-1"} for s in skus}}
+
+
+def golden_doc(image: str) -> dict:
+    return {"schema": Q.GOLDEN_SCHEMA, "image": "sha256:" + Q.image_hex(image),
+            "gpu_name": "NVIDIA GeForce RTX 4090", "harness": {"steps": 3},
+            "worlds": {"8": {"fresh": {}}}}
+
+
+def _gold_text(image: str) -> str:
+    return json.dumps(golden_doc(image), sort_keys=True)
+
+
 def _good(cfg) -> dict:
     frm, to, ffp, tfp = _pair(cfg)
     comp = {"manifest_sha256": "a" * 64, "tensors": 3, "equal": True,
             "resume_manifest_sha256": "b" * 64, "resume_equal": True}
+    sha = lambda t: hashlib.sha256(t.encode()).hexdigest()  # noqa: E731
     return {"schema": Q.SCHEMA, "from_image": "sha256:" + Q.image_hex(frm),
             "to_image": "sha256:" + Q.image_hex(to),
             "from_worker_code_fingerprint": ffp, "to_worker_code_fingerprint": tfp,
             "date_utc": "2026-11-01T08:22:00Z", "run_ids": ["qual-1"], "world_sizes": [4, 8],
-            "resume_tested": True, "comparisons": {"4": dict(comp), "8": dict(comp)}}
+            "resume_tested": True, "comparisons": {"4": dict(comp), "8": dict(comp)},
+            "golden": {"from": sha(_gold_text(frm)), "to": sha(_gold_text(to))},
+            "build": build_manifest(to, tfp), "smoke": smoke_doc(to),
+            "measured_walls": walls_doc(to, cfg.round.funded_pod_skus)}
 
 
 def _write(cfg, obj, name=None):
     frm, to, _, _ = _pair(cfg)
     d = Q.QUALIFICATIONS_DIR
-    d.mkdir(parents=True, exist_ok=True)
+    (d / Q.GOLDEN_DIRNAME).mkdir(parents=True, exist_ok=True)
+    for img in (frm, to):
+        (d / Q.GOLDEN_DIRNAME / Q.golden_filename(img)).write_text(_gold_text(img))
     (d / (name or Q.record_filename(frm, to))).write_text(json.dumps(obj))
 
 
@@ -220,21 +262,25 @@ def test_a_record_for_another_pair_does_not_count(armed):
     assert not st.usable and "no qualification record" in st.reason
 
 
-def test_override_allows_and_is_loud(armed, caplog):
+def test_override_allows_and_is_loud(armed, monkeypatch):
     from cascade.trainer.leg_pins import after_image_refusal, log_image_qualification
 
     cond = log_image_qualification(armed)
     assert cond["code"] == "image_after_unqualified"
-    over = replace(armed, v2=replace(armed.v2, image_after_unqualified_override=True))
+    over = replace(armed, v2=replace(armed.v2, image_after_unqualified_override=True,
+                                     image_after_unqualified_override_until="2099-01-01"))
     st = Q.qualification_status(over)
     assert st.usable and st.override and not st.qualified
     assert after_image_refusal(over) == ""
-    caplog.clear()
-    with caplog.at_level(logging.ERROR):
-        cond = log_image_qualification(over)
+    # capture the module logger's ERROR calls directly: an earlier test's
+    # logging config (disabled loggers, a raised level) must not hide them
+    import cascade.trainer.leg_pins as lp
+
+    seen: list[str] = []
+    monkeypatch.setattr(lp.log, "error", lambda msg, *a, **k: seen.append(msg % a))
+    cond = log_image_qualification(over)
     assert cond["code"] == "image_after_override"
-    assert any("image_after_unqualified_override" in r.getMessage()
-               for r in caplog.records if r.levelno == logging.ERROR)
+    assert any("image_after_unqualified_override" in m for m in seen)
 
 
 def test_unarmed_config_is_unaffected():
@@ -242,7 +288,9 @@ def test_unarmed_config_is_unaffected():
 
     cfg = load_chain_config(REPO / "chain.toml")
     assert Q.qualification_status(cfg).usable
-    assert after_image_refusal(cfg) == "" and image_qualification_condition(cfg) is None
+    no_mkt = replace(cfg, marketcast=replace(cfg.marketcast, pod_image="",
+                                             worker_code_fingerprint=""))
+    assert after_image_refusal(cfg) == "" and image_qualification_condition(no_mkt) is None
 
 
 def test_operator_alert_carries_the_condition(armed):
@@ -299,15 +347,18 @@ def test_funded_leg_refused_before_corpus_or_rent_unburned(armed):
 # ── the knob ─────────────────────────────────────────────────────────────────
 
 
-def test_override_knob_round_trips_and_ships_false(tmp_path):
+def test_override_knob_round_trips_and_ships_false(tmp_path, monkeypatch):
     for path in ("chain.toml", "chain.testnet.toml"):
         assert load_chain_config(REPO / path).v2.image_after_unqualified_override is False
     text = (REPO / "chain.toml").read_text()
     on, n = re.subn(r"(?m)^image_after_unqualified_override\s*=.*$",
-                    "image_after_unqualified_override = true", text)
+                    "image_after_unqualified_override = true\n"
+                    'image_after_unqualified_override_until = "2026-11-29T00:00Z"', text)
     assert n == 1
     p = tmp_path / "chain.toml"
     p.write_text(on)
+    now = Q.parse_until("2026-11-29T00:00Z") - 3600
+    monkeypatch.setattr(Q.time, "time", lambda: now)
     assert load_chain_config(p).v2.image_after_unqualified_override is True
     p.write_text(on.replace("image_after_unqualified_override = true",
                             'image_after_unqualified_override = "yes"'))
@@ -329,19 +380,24 @@ def _safetensors(path: Path, tensors: dict[str, bytes]) -> None:
     path.write_bytes(struct.pack("<Q", len(h)) + h + blob)
 
 
-def _harness_out(root: Path, *, worlds=(4, 8), drift_world=None, resume=True) -> Path:
+def _harness_out(root: Path, *, worlds=(4, 8), drift_world=None, resume=True,
+                 gpu="NVIDIA GeForce RTX 4090") -> Path:
+    """``qualify_pyramid_bitwise.py --solo`` output: B runs only."""
     rows = []
     for w in worlds:
-        for run in ("A-fresh", "B-fresh") + (("B-full6", "B-resume6") if resume else ()):
+        for run in ("B-fresh", "B-full6") + (("B-resume6",) if resume else ()):
             for f in ("weights.safetensors", "optimizer.safetensors"):
                 raw = struct.pack("<4f", 1.0, 2.0, 3.0, float(w))
                 if drift_world == w and run == "B-fresh":
                     raw = struct.pack("<4f", 1.0, 2.0, 3.0, 9.0)
                 _safetensors(root / f"w{w}" / run / "ckpt" / f, {"layer.w": raw, "layer.b": raw})
-        rows.append([w, "A vs B, 3 steps", "PASS", "bit-identical"])
+        rows.append([w, "B fresh, 3 steps", "RAN", "compared against the golden file"])
         if resume:
             rows.append([w, "B: crash@3+resume vs 6 straight", "PASS", "bit-identical"])
-    (root / "summary.json").write_text(json.dumps({"rows": rows, "timing": []}))
+    (root / "summary.json").write_text(json.dumps(
+        {"rows": rows, "timing": [], "solo": True, "gpu_name": gpu,
+         "harness": {"steps": 3, "resume_at": 3, "seed": 20261031, "channels": 32,
+                     "contract_steps": 0, "groups": True}}))
     return root
 
 
@@ -355,40 +411,77 @@ def _helper():
     return mod
 
 
-def _argv(cfg, out_dir, *outs):
+def _from_golden(cfg, tmp_path, **kw) -> Path:
+    """The FROM image's golden file, from its own --solo runs."""
+    frm, _, ffp, _ = _pair(cfg)
+    out = _harness_out(tmp_path / "from-qual", **kw)
+    gdir = tmp_path / "from-golden"
+    assert _helper().main(["--golden-only", "--to-image", frm, "--to-fingerprint", ffp,
+                           "--qual-out", str(out), "--out-dir", str(gdir)]) == 0
+    return gdir / Q.GOLDEN_DIRNAME / Q.golden_filename(frm)
+
+
+def _evidence(cfg, tmp_path) -> list[str]:
+    _, to, _, tfp = _pair(cfg)
+    files = {"build": build_manifest(to, tfp), "smoke": smoke_doc(to),
+             "walls": walls_doc(to, cfg.round.funded_pod_skus)}
+    argv = []
+    for k, v in files.items():
+        f = tmp_path / f"{k}.json"
+        f.write_text(json.dumps(v))
+        argv += [{"build": "--build-manifest", "smoke": "--smoke", "walls": "--walls"}[k], str(f)]
+    return argv
+
+
+def _argv(cfg, out_dir, *outs, golden=None, evidence=()):
     frm, to, ffp, tfp = _pair(cfg)
     argv = ["--from-image", frm, "--to-image", to, "--from-fingerprint", ffp,
             "--to-fingerprint", tfp, "--run-id", "run-1", "--out-dir", str(out_dir),
             # the fixture's 8x/4x ladder (LADDER_SKUS); the shipped mainnet list
             # is 8x only since S0a, so the helper's chain.toml default is (8,)
-            "--require-worlds", "4,8"]
+            "--require-worlds", "4,8", *evidence]
+    if golden is not None:
+        argv += ["--golden", str(golden)]
     for o in outs:
         argv += ["--qual-out", str(o)]
     return argv
 
 
 def test_helper_writes_a_record_the_trainer_accepts(armed, tmp_path):
+    gold = _from_golden(armed, tmp_path)
     out = _harness_out(tmp_path / "qual")
-    rc = _helper().main(_argv(armed, Q.QUALIFICATIONS_DIR, out))
+    rc = _helper().main(_argv(armed, Q.QUALIFICATIONS_DIR, out, golden=gold,
+                              evidence=_evidence(armed, tmp_path)))
     assert rc == 0
-    rec = json.loads(next(Q.QUALIFICATIONS_DIR.glob("*.json")).read_text())
-    assert rec["world_sizes"] == [4, 8] and rec["resume_tested"] is True
-    rows = _helper().comparison_manifest(out / "w8" / "A-fresh", out / "w8" / "B-fresh")[0]
-    assert rec["comparisons"]["8"]["manifest_sha256"] == hashlib.sha256(
-        json.dumps(rows, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-    for f in {r["file"] for r in rows}:
-        keys = [r["key"] for r in rows if r["file"] == f]
-        assert keys == sorted(keys)                              # sorted per-tensor manifest
+    rec = json.loads(next(Q.QUALIFICATIONS_DIR.glob("*-to-*.json")).read_text())
+    assert rec["schema"] == Q.SCHEMA and rec["world_sizes"] == [4, 8]
+    assert rec["resume_tested"] is True and rec["comparisons"]["8"]["equal"] is True
+    # both golden files are committed beside the record, and the record pins them
+    frm, to, _, _ = _pair(armed)
+    for side, img in (("from", frm), ("to", to)):
+        g = Q.QUALIFICATIONS_DIR / Q.GOLDEN_DIRNAME / Q.golden_filename(img)
+        assert Q.file_sha256(g) == rec["golden"][side]
     assert Q.qualification_status(armed).qualified
 
 
 @pytest.mark.parametrize("kw", [{"drift_world": 8}, {"worlds": (8,)}, {"worlds": (1, 8)},
-                                {"resume": False}])
+                                {"resume": False}, {"gpu": "NVIDIA H200"}])
 def test_helper_refuses_incomplete_evidence(armed, tmp_path, kw):
+    gold = _from_golden(armed, tmp_path)
     out = _harness_out(tmp_path / "qual", **kw)
-    assert _helper().main(_argv(armed, Q.QUALIFICATIONS_DIR, out)) == 1
-    assert not Q.QUALIFICATIONS_DIR.exists() or not list(Q.QUALIFICATIONS_DIR.glob("*.json"))
+    assert _helper().main(_argv(armed, Q.QUALIFICATIONS_DIR, out, golden=gold,
+                                evidence=_evidence(armed, tmp_path))) == 1
+    assert not list(Q.QUALIFICATIONS_DIR.glob("*-to-*.json"))
     assert not Q.qualification_status(armed).usable
+
+
+def test_helper_refuses_without_build_smoke_walls_or_golden(armed, tmp_path):
+    gold = _from_golden(armed, tmp_path)
+    out = _harness_out(tmp_path / "qual")
+    assert _helper().main(_argv(armed, Q.QUALIFICATIONS_DIR, out, golden=gold)) == 1
+    assert _helper().main(_argv(armed, Q.QUALIFICATIONS_DIR, out,
+                                evidence=_evidence(armed, tmp_path))) == 1
+    assert not list(Q.QUALIFICATIONS_DIR.glob("*-to-*.json"))
 
 
 def test_shipped_records_validate():
@@ -396,7 +489,7 @@ def test_shipped_records_validate():
     validates for the shipped SKUs (fingerprints are checked by the trainer
     against the deployed pins). No record committed yet ⇒ skipped, loudly."""
     cfg = load_chain_config(REPO / "chain.toml")
-    records = sorted(Q.QUALIFICATIONS_DIR.glob("*.json"))
+    records = sorted(Q.QUALIFICATIONS_DIR.glob("*-to-*.json"))
     if not records:
         pytest.skip("no qualification record committed yet (qualifications/ is empty): "
                     "every *_after arming is refused until one is")
@@ -405,4 +498,5 @@ def test_shipped_records_validate():
         assert obj.get("schema") == Q.SCHEMA, p.name
         assert p.name == Q.record_filename(obj["from_image"], obj["to_image"])
         assert Q.validate_record(obj, from_image=obj["from_image"], to_image=obj["to_image"],
-                                 required=Q.required_worlds(cfg)) == [], p.name
+                                 required=Q.required_worlds(cfg), skus=Q.rentable_skus(cfg),
+                                 require_all_walls=Q.walls_all_required(cfg)) == [], p.name
