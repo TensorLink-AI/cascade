@@ -61,8 +61,11 @@ jobs:
       - name: Install CLI deps
         run: |
           python scripts/check_tls_trust.py --system-only
-          uv pip install --system --python "$(which python)" "pip==26.2.2" -e ".[chain,hippius]" numpy
-          python scripts/check_tls_trust.py
+          # The lock, exactly (reproducibility contract: `uv sync --frozen`); the
+          # venv's bin/ goes first on PATH for every later step.
+          uv sync --frozen --no-dev --extra chain --extra hippius
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+          .venv/bin/python scripts/check_tls_trust.py
 
       - name: Sync the king
         run: |

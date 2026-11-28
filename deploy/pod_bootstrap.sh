@@ -78,6 +78,11 @@ fi
 # Check OS trust before uv invokes git for direct-reference dependencies.
 .bootstrap/uv run --no-project --python 3.11 python scripts/check_tls_trust.py --system-only
 .bootstrap/uv sync --frozen --all-extras --no-dev
+# The venv must EQUAL uv.lock (a stale .venv from a recycled box, or a later
+# `pip install`, would otherwise survive). Drift fails provisioning; success
+# writes the marker the health gate's lock_match check enforces against.
+.venv/bin/python -P -m cascade.shared.lockdrift --lock uv.lock \
+  --write-marker .venv/.cascade-lock-verified
 .venv/bin/python scripts/check_tls_trust.py
 .venv/bin/python -c 'import sys, torch, cascade.trainer.worker; print("bootstrap ok:", sys.version.split()[0], torch.__version__)'
 if [[ "$3" == "generation" ]]; then

@@ -41,7 +41,7 @@ def _gate(**kw):
 def test_fresh_container_passes_fresh_boot():
     report = _gate().check(_run_ssh())
     assert report.ok, report.summary()
-    assert [c.name for c in report.checks][-1] == "fresh_boot"
+    assert [c.name for c in report.checks][-2:] == ["fresh_boot", "lock_match"]
 
 
 def test_pinned_digest_line_on_disk_means_recycled_container():

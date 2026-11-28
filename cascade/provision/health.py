@@ -36,6 +36,14 @@ when ALL of them pass:
    were exactly this); the digest check alone only catches it when the
    leftover pin happens to differ from today's. Skipped on the adopted-pod
    re-gate (a restart re-gates pods this service pinned itself).
+9. **lock match** — the pod venv EQUALS the pod's own ``uv.lock``
+   (:mod:`cascade.shared.lockdrift`: every ``*.dist-info`` at its locked
+   version, nothing the lock does not know). Enforced on pods whose venv
+   carries the lock marker the image build / ``deploy/pod_bootstrap.sh``
+   writes after the same check passed; images built before the guard (up to
+   worker-v2.1.0-rc5 / mkt-rc3, ``uv pip install -e``) pass with their drift
+   in the detail line until the repin retires them (2026-11-28: rc5 carried
+   hippius_hub 0.7.2 against a locked 0.5.1).
 
 Everything here is a pure predicate over an injected ``run_ssh(argv) →
 CompletedProcess``-style boundary; the replace-once policy on failure lives in
@@ -176,6 +184,7 @@ class HealthGate:
             ("hippius", self._check_hippius),
             ("disk", self._check_disk),
             ("fresh_boot", self._check_fresh_boot),
+            ("lock_match", self._check_lock_match),
         )
         results = []
         for name, fn in checks:
@@ -338,6 +347,57 @@ class HealthGate:
                                f"{len(entries)} entr{'y' if len(entries) == 1 else 'ies'} "
                                f"from a previous rental")
         return True, ""
+
+    def _check_lock_match(self, run_ssh: RunSSH) -> tuple[bool, str]:
+        """The pod venv must equal the pod's ``uv.lock`` (strict).
+
+        Three single-purpose remote commands, parsed locally: the marker test,
+        ``find`` for the venv's ``*.dist-info`` directories (no Python on the
+        pod side, so a broken venv still reports), and ``cat uv.lock``.
+        """
+        from ..shared.lockdrift import LOCK_MARKER
+
+        venv = self.remote_python.rsplit("/bin/", 1)[0]
+        enforced = run_ssh(["test", "-e", f"{venv}/{LOCK_MARKER}"]).returncode == 0
+        try:
+            ok, detail = self._lock_compare(run_ssh, venv, enforced)
+        except Exception as e:  # noqa: BLE001 — a legacy pod's report never blocks
+            if enforced:
+                raise
+            return True, f"legacy image (no {LOCK_MARKER}), not enforced: probe errored: {e}"
+        return ok, detail
+
+    def _lock_compare(self, run_ssh: RunSSH, venv: str, enforced: bool) -> tuple[bool, str]:
+        from ..shared.lockdrift import (
+            LOCK_MARKER,
+            compare,
+            installed_from_dist_info_names,
+            parse_lock,
+        )
+
+        proc = run_ssh(["find", f"{venv}/lib", "-maxdepth", "3", "-type", "d",
+                        "-name", "*.dist-info"])
+        if proc.returncode != 0:
+            return (not enforced), f"find dist-info rc={proc.returncode}"
+        installed = installed_from_dist_info_names((proc.stdout or "").splitlines())
+        lock_proc = run_ssh(["cat", f"{self.workdir.rstrip('/')}/uv.lock"])
+        if lock_proc.returncode != 0:
+            return (not enforced), f"no uv.lock under {self.workdir} (rc={lock_proc.returncode})"
+        try:
+            lock = parse_lock(lock_proc.stdout or "")
+        except ValueError as e:  # tomllib.TOMLDecodeError subclasses ValueError
+            return (not enforced), f"unparseable uv.lock: {e}"
+        if not installed:
+            return (not enforced), f"no *.dist-info under {venv}/lib"
+        drifts = compare(lock, installed)
+        if not drifts:
+            return True, f"{len(installed)} dists == uv.lock"
+        shown = "; ".join(d.line() for d in drifts[:5])
+        more = f" (+{len(drifts) - 5} more)" if len(drifts) > 5 else ""
+        detail = f"{len(drifts)} drift(s) vs uv.lock: {shown}{more}"
+        if not enforced:
+            return True, f"legacy image (no {LOCK_MARKER}), not enforced: {detail}"
+        return False, detail
 
 
 # Sentinel the provisioner's post-gate hook (``digest_env_command``) drops in the
