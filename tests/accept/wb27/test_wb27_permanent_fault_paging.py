@@ -98,7 +98,9 @@ def test_permanent_lane_b_failure_pages_and_is_not_retried_in_window(tmp_path, c
     caplog.set_level(logging.WARNING)
     run = _Run(tmp_path, lane_b=_LaneBMissingLib())
     # lane A did not wait for an in-window retry that cannot succeed
-    (m,) = run.until_published(limit=600.0)
+    ms = run.until_published(limit=600.0)
+    assert len(ms) == 1, "lane A waited for an in-window retry of a permanent fault"
+    (m,) = ms
     assert m.expert_manifest_sha256 == ""
     assert run.clock.t - run.t0 <= 60.0
     for _ in range(10):
@@ -111,6 +113,10 @@ def test_permanent_lane_b_failure_pages_and_is_not_retried_in_window(tmp_path, c
 
 
 def test_transient_lane_b_failure_still_retries_in_window(tmp_path, caplog):
+    from cascade.shared.permanent_fault import classify
+
+    # the fake's failure is classified transient, so the #993 retries stay
+    assert classify(OSError("pod disk short (attempt 1)")) is None
     caplog.set_level(logging.WARNING)
     run = _Run(tmp_path, lane_b=_LaneB(fails=1))
     (m,) = run.until_published()
@@ -123,7 +129,8 @@ def test_permanent_lane_c_failure_pages_and_is_not_retried_in_window(tmp_path, c
     caplog.set_level(logging.WARNING)
     lane_c = _LaneCMissingLib()
     run = _Run(tmp_path, lane_c=lane_c)
-    (m,) = run.until_published(limit=600.0)
+    ms = run.until_published(limit=600.0)
+    assert len(ms) == 1, "lane A waited for an in-window retry of a permanent lane C fault"
     assert run.clock.t - run.t0 <= 60.0
     for _ in range(10):
         run.step()
@@ -135,7 +142,10 @@ def test_same_error_over_settlements_pages(tmp_path, caplog):
     caplog.set_level(logging.WARNING)
     run = _Run(tmp_path / "r")
     sched = run.sched
-    n = int(sched.SETTLE_REPEAT_THRESHOLD)
+    threshold = getattr(sched, "SETTLE_REPEAT_THRESHOLD", None)
+    final = getattr(sched, "_settle_fault_final", None)
+    assert threshold is not None and callable(final), "repeat-fault paging is missing"
+    n = int(threshold)
     for i in range(n - 1):
         sched._settle_fault_final("lane B settlement", ValueError(f"pod reply is not JSON "
                                                                   f"(byte {i})"))
