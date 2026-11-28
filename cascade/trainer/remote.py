@@ -200,6 +200,11 @@ class RemoteHost:
     # checkpoint cache, code bundles, run dirs, bench pins), e.g. a Lium
     # volume at /workspace. "" = ``workdir`` (the old behaviour).
     cache_root: str = ""
+    # Release check at the start of every run (cascade.shared.release_fp,
+    # retro P4): "off" | "check" (log release_skew) | "sync" (re-sync the
+    # host's cascade/ onto this release first, refuse the run if it fails).
+    # "" = $CASCADE_RELEASE_SYNC_DEFAULT, else off.
+    release_sync: str = ""
 
 
 def load_hosts(path: Path | str) -> list[RemoteHost]:
@@ -221,6 +226,8 @@ def load_hosts(path: Path | str) -> list[RemoteHost]:
                             # lane (never a leg); "heat" is accepted, unused
         sku = "L40S"        # optional: the lane's GPU type (per-SKU latest safe start)
         cache_root = "/workspace"  # optional: lane B's _lane_b_offload root (default workdir)
+        release_sync = "sync"      # optional: "off" | "check" | "sync" — the host's
+                                   # cascade/ vs this release at every run (release_fp)
         isolated = true     # optional: the pod receives NOTHING from the orchestrator's
                             # environment (forward_env ignored); its legs train
                             # --local-only and the orchestrator harvests, verifies and
@@ -248,6 +255,11 @@ def load_hosts(path: Path | str) -> list[RemoteHost]:
             raise RemoteDispatchError(
                 f"host {h.get('name', '?')!r}: stage={stage!r} invalid; expected one of {HOST_STAGES}"
             )
+        release_sync = str(h.get("release_sync", "") or "").strip().lower()
+        if release_sync not in ("", "off", "check", "sync"):
+            raise RemoteDispatchError(
+                f"host {h.get('name', '?')!r}: release_sync={release_sync!r} invalid; "
+                "expected off | check | sync")
         hosts.append(
             RemoteHost(
                 name=str(h["name"]),
@@ -268,6 +280,7 @@ def load_hosts(path: Path | str) -> list[RemoteHost]:
                 sku=str(h.get("sku", "") or "").strip(),
                 isolated=bool(h.get("isolated", False)),
                 cache_root=str(h.get("cache_root", "") or "").strip(),
+                release_sync=release_sync,
             )
         )
     return hosts
