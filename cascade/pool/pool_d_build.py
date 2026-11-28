@@ -16,8 +16,16 @@ holds, for every series the W6a join selected from lane A's ``pool``:
   global value when the catalog has none, 0 for a publish-ahead feed; rev6.12:
   no sub-hourly zero is written, the pinned value applies to every series).
 
-Only points the W6fs index knows at ``as_of_ts`` (roots committed by then)
-are used, so every first-seen time is earlier than the snapshot. A feed whose
+Only points the W6fs index knows at ``as_of_ts`` are used, so every
+first-seen time is earlier than the snapshot. ``first_seen_roots`` picks the
+W6fs root rule: ``"committed"`` (the library default, rev6.11 (d)) = roots
+committed by ``as_of_ts``; ``"ended"`` (the CLI default since 2026-11-28) =
+every period that ended by ``as_of_ts``, including the root this build's own
+``first_seen commit`` wrote just before the build, so the newest recorded
+data reaches lane D one build (3 h) earlier. The snapshot bytes keep the same
+schema (``first_seen_roots`` lists root hashes either way), and the usable
+set is final when the build runs (``uncommitted_period`` otherwise), so the
+snapshot is still re-derivable from the log. A feed whose
 catalog ``embargo_hours`` is negative or non-numeric is left out of ``feeds``
 together with its series (fail closed; the snapshot stays valid). The files
 (``metadata.json``, ``hist.npz``, ``tgt.npz``) are written deterministically,
@@ -305,12 +313,16 @@ def _prior_frontiers(prior_dirs: Sequence[Path | str], as_of_ts: int) -> dict[st
 def build_pool_d(*, forge_dir: Path | str, selection, first_seen_dir: Path | str,
                  as_of_ts: int, out_dir: Path | str, cfg: PoolDBuildConfig | None = None,
                  prior_dirs: Sequence[Path | str] = (), overwrite: bool = False,
-                 lane_a_source: Mapping | None = None) -> PoolDSummary:
+                 lane_a_source: Mapping | None = None, first_seen_roots: str = "committed",
+                 first_seen_cache_dir: Path | str | None = None,
+                 full_first_seen_scan: bool = False) -> PoolDSummary:
     """Build one ``pool_d/1`` snapshot for the W6a ``selection`` at ``as_of_ts``.
 
     ``lane_a_source`` (``{"mode", "effective_block", "sha256"}``) is recorded
     in ``metadata.json`` as ``lane_a_selection`` when given (absent = the
-    pre-W-LAUNCH bytes)."""
+    pre-W-LAUNCH bytes). ``first_seen_roots`` is the W6fs root rule (module
+    docstring); ``first_seen_cache_dir`` / ``full_first_seen_scan`` are the
+    W6fs incremental scan cache and its full-scan override."""
     from .first_seen import FirstSeenLog, _epoch_seconds, panel_json
     from .sources.tsbench_forge import TsbenchForgeSource, resolve_frequency
 
@@ -322,11 +334,12 @@ def build_pool_d(*, forge_dir: Path | str, selection, first_seen_dir: Path | str
     entries = {str(e["id"]): e for e in (yaml.safe_load(catalog_bytes) or []) if e.get("id")}
     from .first_seen import unreadable_limit
 
-    fs_log = FirstSeenLog(first_seen_dir)
+    fs_log = FirstSeenLog(first_seen_dir, cache_dir=first_seen_cache_dir,
+                          full=full_first_seen_scan)
     # One feed's first-seen points in memory at a time (2026-11-26: the
     # whole-log index of a 20 GB records.jsonl reached 39.3 GB RSS); feeds
     # are walked in order below and every lookup is for the current feed.
-    index = fs_log.feed_index(until_ts=as_of_ts)
+    index = fs_log.feed_index(until_ts=as_of_ts, roots=first_seen_roots)
     quarantined = fs_log.quarantined(until_ts=as_of_ts)
     quarantine_report = fs_log.quarantine_report(until_ts=as_of_ts)
     unreadable: list[list[str]] = []
@@ -815,6 +828,16 @@ def main(argv: list[str] | None = None) -> int:
                          "forge and require byte-identical files")
     ap.add_argument("--lane-a-ref", type=Path, default=None,
                     help="snapshot mode: the fetch step's ref (default <lane-a-pool>.ref.json)")
+    ap.add_argument("--first-seen-roots", choices=("ended", "committed"), default="ended",
+                    help="W6fs root rule: ended (default, 2026-11-28) = every period ended "
+                         "by --as-of-ts, incl. the root this build's commit just wrote; "
+                         "committed = roots committed by --as-of-ts (one build later)")
+    ap.add_argument("--first-seen-cache-dir", type=Path, default=None,
+                    help="W6fs incremental scan cache (default <first-seen-dir>.cache)")
+    ap.add_argument("--no-first-seen-cache", action="store_true",
+                    help="scan the whole first-seen log, read and write no cache")
+    ap.add_argument("--full-first-seen-scan", action="store_true",
+                    help="ignore the scan cache this run (full scan, cache rebuilt)")
     args = ap.parse_args(argv)
 
     from ..shared.config import load_chain_config
@@ -856,12 +879,19 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: lane_a_replay_mismatch: {len(mismatches)} file(s) differ from "
                   f"{args.lane_a_pool}: {', '.join(mismatches[:10])}", file=sys.stderr)
             return REPLAY_MISMATCH_EXIT
+    from .first_seen import default_cache_dir
+
     fs_dir = args.first_seen_dir or args.forge_dir / "first_seen"
+    cache_dir = None if args.no_first_seen_cache else (
+        args.first_seen_cache_dir or default_cache_dir(fs_dir))
     try:
         summary = build_pool_d(forge_dir=args.forge_dir, selection=selection,
                                first_seen_dir=fs_dir, as_of_ts=args.as_of_ts, out_dir=args.out,
                                cfg=cfg, prior_dirs=args.prior_dir, overwrite=args.overwrite,
-                               lane_a_source=lane_a_source)
+                               lane_a_source=lane_a_source,
+                               first_seen_roots=args.first_seen_roots,
+                               first_seen_cache_dir=cache_dir,
+                               full_first_seen_scan=args.full_first_seen_scan)
     except (ValueError, FileExistsError, OSError) as e:
         print(f"error: pool_d build failed: {e}", file=sys.stderr)
         return 2

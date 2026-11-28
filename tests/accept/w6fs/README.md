@@ -90,6 +90,41 @@ Two forge objects with no parquet footer aborted every `record`. Now
 * `record` returns `{"records", "points"}` plus `quarantined` / `blocked` /
   `unreadable` counts only when non-zero.
 
+### Incremental scans and the `ended` root rule (2026-11-28)
+
+Every pool_d build re-hashed all ~630k forge partitions and re-parsed the
+whole 20 GB `records.jsonl` (record, commit, the build's index), and cut the
+snapshot from the root committed one build earlier (`test_w6fs_incremental.py`):
+
+* `FirstSeenLog(log_dir, *, cache_dir=None, full=False,
+  full_verify_seconds=FULL_VERIFY_SECONDS, clock=time.time)`. With a
+  `cache_dir` (the CLI's default is `default_cache_dir(log_dir)` =
+  `<log_dir>.cache`; `--no-cache` turns it off, `--full` ignores it for one
+  run) it keeps `partitions.json` (`(size, mtime_ns, inode) -> sha256` per
+  partition: only new or changed partitions are hashed) and
+  `records.meta.json` (per log line: span, feed, partition, sha256, `seen_ts`,
+  `period_start`, point count, data-time range, Merkle leaf; plus a
+  fingerprint of the bytes covered): only lines appended since are parsed,
+  and `record` loads a feed's known points only from the records whose
+  data-time range meets the new partition's. Every result (records, roots,
+  quarantine, index, lag) equals the uncached run. A cache that no longer
+  fingerprints its log prefix is dropped (full scan); one older than
+  `full_verify_seconds` (24 h) is replaced by a full scan that warns
+  `DIVERGED` if it differed. The cache is never one of the pushed log files.
+* `.index(*, until_ts, roots="committed")` / `.feed_index(...)`: `roots` is
+  `"committed"` (the rule above) or `"ended"`: every committed period that
+  ENDED by `until_ts` (`period_start + PERIOD_SECONDS <= until_ts`, so all its
+  `seen_ts < until_ts`), whenever its root was committed — the pool_d
+  builder's own `commit`, run just after the boundary, makes the previous
+  build's records usable in this build's snapshot. `"ended"` raises
+  `FirstSeenError("uncommitted_period")` when an ended period has records but
+  no root, so the usable set is final when the snapshot is cut.
+* `.record` raises `FirstSeenError("period_frozen")` when `period_start(now_ts)`
+  ended by the newest `committed_ts` (a backdated `now_ts`): no record can
+  later enter a period an `ended` snapshot relied on, so a re-derivation from
+  the log sees the same points.
+* `verify_snapshot(meta, log_dir, *, roots="committed", cache_dir=None)`.
+
 ## Evidence (`evidence/w6fs.json`)
 
 `python -P -m cascade.pool.first_seen evidence --forge-dir D --log-dir L
@@ -112,4 +147,6 @@ sha256 of `canonical_json` of the document without `digest`.
 | snapshot postdating its committed root refused | `test_verify_snapshot_refuses_uncommitted_and_late_roots`, `test_index_refuses_rewritten_log` |
 | release recomputable from the signed record and pinned `e` alone | `test_release_recomputable_from_record_and_e` |
 | `pool` bytes and lane A windows byte-identical with and without the recorder | `test_pool_bytes_identical_with_and_without_recorder` |
+| incremental scans equal the full recompute; only new input read; stale cache caught | `test_cached_runs_equal_the_full_recompute`, `test_only_new_or_changed_partitions_are_hashed`, `test_only_appended_log_lines_are_parsed`, `test_rewritten_log_is_caught_through_the_cache`, `test_periodic_full_verify_rebuilds_a_diverged_cache` |
+| `ended` root rule: same-build root, final, frozen periods | `test_ended_rule_uses_the_root_this_build_committed`, `test_ended_rule_refuses_an_uncommitted_ended_period`, `test_record_refuses_a_period_frozen_by_a_commit` |
 | evidence from the real run | `test_evidence_*` |

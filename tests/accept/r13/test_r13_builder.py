@@ -233,10 +233,10 @@ def test_every_build_refreshes_the_mirror_and_priors_first(tmp_path):
     cfg = config(tmp_path)
     inst = {"id": "sf-1", "ip": "203.0.113.5", "port": 22, "user": "shadeform"}
     names = [n for n, _ in m.builder_run_steps(cfg, inst, now_ts=T0)]
-    assert names == ["state_pull", "mirror_sync", "pool_d_build_publish"]
+    assert names == ["release_sync", "state_pull", "mirror_sync", "pool_d_build_publish"]
     joined = [" ".join(a) for _, a in m.builder_run_steps(cfg, inst, now_ts=T0)]
-    assert "state-pull" in joined[0] and "--prior-root" in joined[0]
-    assert "mirror-sync" in joined[1]
+    assert "state-pull" in joined[1] and "--prior-root" in joined[1]
+    assert "mirror-sync" in joined[2]
     # bootstrap no longer duplicates them (a cycle pulls once per build)
     assert not {"state_pull", "mirror_sync"} & {n for n, _ in m.builder_bootstrap_steps(cfg, inst)}
     cfg = replace(cfg, builder=replace(cfg.builder, keep_warm=True))
