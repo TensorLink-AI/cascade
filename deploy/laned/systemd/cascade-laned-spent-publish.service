@@ -1,0 +1,36 @@
+# Publish every SPENT lane D pool_d snapshot (owner 2026-11-27 "it's all ok to
+# publish" prior eval data): cascade.pool.pool_d_spent writes
+# lane-d/spent/pool-preview-<as_of>/{windows.npz,README.md,manifest.json}
+# (public-read, manifest last) to [storage] manifest_bucket and rebuilds
+# lane-d/spent/index.json. Spent = retention expired it AND every target point
+# was first seen (every history point recorded) at or before
+# min(now, state mtime, open reveals) - 6 h - [lane_d] embargo_hours (>= 48 h):
+# no published value can enter a window still eligible to be judged.
+# Idempotent (a pool whose manifest.json exists is skipped; the index is only
+# rewritten when its pool list changes). One snapshot at a time, hist.npz
+# streamed: ~170 MB RSS, ~15 s per pool on the box. No torch, no chain, no keys.
+#
+# Credentials: HIPPIUS_S3_ACCESS_KEY / HIPPIUS_S3_SECRET_KEY (write on
+# cascade-manifests) from the EnvironmentFile, by name only; never printed.
+# Ships in --dry-run (prints the plan and every file it would upload, writes
+# nothing). Going live is a drop-in repeating ExecStart without --dry-run.
+# PYTHONPATH / the venv: point both at the live release (as the pin-sync job).
+[Unit]
+Description=cascade lane D spent pool_d publish (public, idempotent; dry-run template)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/
+Environment=PYTHONPATH=/root/cascade
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/cascade-laned-intake.env
+ExecStart=/root/cascade/.venv/bin/python -P -m cascade.pool.pool_d_spent publish --chain-toml /root/cascade/chain.validator.toml --pins /root/cascade-state/lane-d/pool_d_pins.json --state /root/cascade/lane_d_state.json --stage /root/cascade-state/lane-d/spent-stage --score-cache-dir /root/cascade-state/lane-d/score_cache --house-pointer /root/cascade-state/lane-d/house_pointer.json --dry-run
+Nice=19
+IOSchedulingClass=idle
+MemoryMax=1G
+TimeoutStartSec=1h
+NoNewPrivileges=true
+StandardOutput=append:/root/cascade/laned-spent-publish.log
+StandardError=append:/root/cascade/laned-spent-publish.log

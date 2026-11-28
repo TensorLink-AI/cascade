@@ -5,3 +5,14 @@
 # the cadence and build-wall check, the Hippius / filesystem stores and the CLI
 # (the owner's live run writes evidence/w6d.json with it).
 cascade/pool/pool_d_publish.py
+# 2026-11-28 owner ("is lane D public now?"): publish every SPENT pool_d
+# snapshot (retention expired + past the leak cut: no published value can
+# enter a window still eligible to be judged) to lane-d/spent/ with a rolling
+# index; hourly box job (template, --dry-run) and the miner/operator docs.
+cascade/pool/pool_d_spent.py
+tests/accept/w6d/test_w6d_spent_publish.py
+deploy/laned/systemd/cascade-laned-spent-publish.service
+deploy/laned/systemd/cascade-laned-spent-publish.timer
+docs/MINER_LANE_D.md
+docs/MINER_LANE_C_MARKETCAST.md
+docs/OPERATOR.md

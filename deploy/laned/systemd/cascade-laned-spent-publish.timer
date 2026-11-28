@@ -1,0 +1,14 @@
+# Hourly, off the pin-sync minutes (:20/:50): a lane D settlement lands every
+# ~3 h (900 blocks) and moves the state's mtime, so a newly spent snapshot is
+# published within an hour of the settlement that spends it. A run with
+# nothing new reads the pins + state only and writes nothing.
+[Unit]
+Description=cascade lane D spent pool_d publish, hourly
+
+[Timer]
+OnCalendar=*-*-* *:35:00 UTC
+Persistent=false
+Unit=cascade-laned-spent-publish.service
+
+[Install]
+WantedBy=timers.target
