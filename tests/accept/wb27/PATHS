@@ -177,3 +177,6 @@ cascade/trainer/rolling.py
 cascade/validator/marketcast.py
 tests/unit/test_lane_b_publish_order.py
 tests/accept/wb27/test_wb27_in_window_settlement_retry.py
+tests/unit/test_lane_c_trainer_rolling.py
+# a Protocol method body stub_scan flagged (#991 put the file in W-CMP PATHS)
+cascade/eval/timestral_adapter.py

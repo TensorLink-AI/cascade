@@ -347,7 +347,7 @@ def test_marketcast_report_publish_retries_in_window(monkeypatch):
     from cascade.validator.marketcast import MarketCastMixin, current_ctx
 
     now = [1000.0]
-    monkeypatch.setattr(mk.time, "time", lambda: now[0], raising=False)
+    monkeypatch.setattr(mk, "time", SimpleNamespace(time=lambda: now[0]), raising=False)
 
     class V(MarketCastMixin):
         pass
@@ -388,7 +388,7 @@ def test_marketcast_retry_stops_at_the_next_boundary(monkeypatch):
     from cascade.validator.marketcast import MarketCastMixin
 
     now = [1000.0]
-    monkeypatch.setattr(mk.time, "time", lambda: now[0], raising=False)
+    monkeypatch.setattr(mk, "time", SimpleNamespace(time=lambda: now[0]), raising=False)
 
     class V(MarketCastMixin):
         pass
