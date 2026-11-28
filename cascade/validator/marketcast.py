@@ -545,7 +545,11 @@ def box_judge_bytes(snap, mc, targets) -> int:
     ``eval_context_length`` steps (:func:`_covariate_rows` builds every
     window's rows before the first forecast). The 2026-11-28 ``mkt:market``
     entry: 58 assets x 9 horizons x 48 windows (+ forward windows) x 19 rows
-    x 4096 x 8 B ≈ 16 GB."""
+    x 4096 x 8 B ≈ 16 GB. Bytes throughout (logged in MiB): the deployed
+    table (``eval_context_length`` 32768, the composite's 10 window labels x
+    58 assets x 384 windows ≈ 223k windows) bounds the 14:01 round at
+    ~1.06 TiB — loose (contexts shorter than the history, fewer covariates
+    declared), but far over any box cap: such a round is judged on the pod."""
     from ..pool.marketcast import MktSnapshot
 
     ctx = int(mc.eval_context_length)

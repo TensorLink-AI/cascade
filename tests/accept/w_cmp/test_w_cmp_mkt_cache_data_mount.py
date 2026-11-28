@@ -82,7 +82,7 @@ def _start_cmd(host) -> str:
         seen.append(argv[-1])
         raise _Started
 
-    s = MktSession(host, popen=popen, device="cpu")
+    s = MktSession(host, popen=popen, device="cpu", ship_code=False)
     with pytest.raises(_Started):
         s.start()
     s.close()

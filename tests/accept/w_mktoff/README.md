@@ -41,6 +41,20 @@ bytes (deterministic signer) and every sidecar. The round has a covariate
 fine-tune, a plain one, a load fault, a forward that raises (F7), a failed
 load (infra deferral), the near-duplicate test and the holder pairing.
 
+## The pod runs the validator's code (14:01 follow-up)
+
+2026-11-28 14:01:35 the rc3 image's own worker answered `hello` without the
+judge ops; the round fell to the in-process cap (~1 TiB estimate) and was
+refused. `MktSession.start` now ships the validator's release `cascade`
+package by content hash to `<workdir>/_mkt_code/<hash>` (lane B's
+`code_bundle`; uploaded once, older copies pruned) and starts the worker with
+`PYTHONPATH=<that dir> python -P` in the pod's venv; `hello` names the code
+dir it imported and any other is refused. `test_w_mktoff_codeship.py`: the
+pod (`helpers.pod_popen`) serves the image's judge-less worker unless started
+from the shipped package; the judge then runs on the pod with the in-process
+path's report bytes, the package ships once per hash, a shadowed worker is
+refused.
+
 ## Guards
 
 - **Round RSS**: every round logs `rss start / peak (+growth)`; growth over
