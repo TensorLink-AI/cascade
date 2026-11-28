@@ -28,8 +28,8 @@ import math
 import re
 from collections.abc import Mapping
 
-__all__ = ["OUTCOME_TEXT", "judgement_margins", "public_reason", "public_verdict",
-           "verdict_line"]
+__all__ = ["MAKE_GOOD_WAIT_CODE", "MAKE_GOOD_WAIT_TEXT", "OUTCOME_TEXT", "judgement_margins",
+           "public_reason", "public_verdict", "verdict_line"]
 
 _GPU_RE = re.compile(r"^[1-9][0-9]?x[A-Za-z0-9]{2,20}$")
 _DATE_RE = re.compile(r"\b(20[0-9]{2}-[01][0-9]-[0-3][0-9])\b")
@@ -255,6 +255,24 @@ def _error_reason(cls: str, err: str, entry) -> tuple[str, str]:
                             "operator (no detail is published)")
 
 
+# Owner 2026-11-28 ("add make goods", lane C 5Cu2sxndK8Dw): an entry parked for
+# the owner's approval of an operator make-good — a leg lost on OUR side,
+# re-run on the operator's account — says so, never "the operator must
+# approve paying" (which reads like the miner's problem).
+MAKE_GOOD_WAIT_CODE = "operator_rerun_pending"
+MAKE_GOOD_WAIT_TEXT = "our fault: waiting for an operator re-run, no cost to you"
+
+
+def _make_good_wait(entry, err: str) -> bool:
+    """An approval wait that is an operator make-good: the entry is already on
+    the operator's bill (``operator_billed``: lost on our side) or the trainer's
+    own park message names a make-good (a fixed shape, never echoed)."""
+    if bool(_get(entry, "operator_billed", False)):
+        return True
+    low = (err or "").lower()
+    return "awaiting operator approval" in low and "make-good" in low
+
+
 def public_reason(entry) -> tuple[str, str]:
     """``(reason_code, reason)`` for one queue entry (a ``FundedEntry`` or a
     row mapping with its fields). Never raises; never returns error text."""
@@ -268,6 +286,8 @@ def public_reason(entry) -> tuple[str, str]:
             line = verdict_line(v) if isinstance(v, Mapping) else ""
             return ("settled", f"settled: {line}" if line else "settled: queue work completed; "
                     "the verdict is reported separately")
+        if status == "awaiting_operator_approval" and _make_good_wait(entry, err):
+            return (MAKE_GOOD_WAIT_CODE, MAKE_GOOD_WAIT_TEXT)
         if status in _STATUS_TEXT:
             return (status, _STATUS_TEXT[status])
         if status == "failed":

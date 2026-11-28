@@ -702,7 +702,25 @@ The trainer rents miner-funded pods on Lium, Shadeform, Vast.ai or Runpod
 
   Run these from the deployment directory (`--work-root` defaults to
   `./_train_work`). `approve` with no pending request pre-approves the
-  hotkey's next operator-billed leg; `--kind` narrows it.
+  hotkey's next operator-billed leg; `--kind` narrows it. The commands cover
+  every lane's queue; `--lane a|b|c` picks one when a hotkey has entries in
+  several (shorthand for `--queue funded_queue.json|lane_b_queue.json|lane_c_queue.json`).
+
+  **Lane C make-goods (2026-11-28).** A lane C (MarketCast) leg lost on our
+  side is requeued operator-billed. Its next dispatch no longer falls back
+  to the miner's key: with `[round] funded_operator_fallback = true` it files
+  a `make_good` request priced on the miner's GPU type × the leg wall and
+  parks `awaiting_operator_approval` (unburned, uncharged; the miner sees
+  "our fault: waiting for an operator re-run, no cost to you"). Approve it
+  (default ceiling: projection × 1.25):
+
+  ```bash
+  cascade-trainer approve-operator-leg <hotkey> --lane c [--max-cost 120]
+  ```
+
+  The re-run then rents on the
+  OPERATOR's Lium account, on the miner's chosen GPU type, under the usual
+  daily cap, reserve and ceiling checks; the payer key is never used.
 
   An approval lasts for one **leg**. It is bound to the entry's ref and
   funding and to the request's kind, and is used only when that leg's pod is

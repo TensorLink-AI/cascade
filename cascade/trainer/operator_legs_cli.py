@@ -1,9 +1,9 @@
 """Owner commands for operator-billed legs (2026-11-02).
 
     cascade-trainer list-operator-legs   [--work-root _train_work] [--json]
-    cascade-trainer approve-operator-leg <hotkey> [--attempt-id ID] [--max-cost USD] [--sku T1,T2] [--queue NAME]
-    cascade-trainer deny-operator-leg    <hotkey> [--attempt-id ID] [--queue NAME]
-    cascade-trainer resume-operator-leg  <hotkey> [--queue NAME]
+    cascade-trainer approve-operator-leg <hotkey> [--attempt-id ID] [--max-cost USD] [--sku T1,T2] [--lane a|b|c | --queue NAME]
+    cascade-trainer deny-operator-leg    <hotkey> [--attempt-id ID] [--lane a|b|c | --queue NAME]
+    cascade-trainer resume-operator-leg  <hotkey> [--lane a|b|c | --queue NAME]
     cascade-trainer rent-status          [--json]
     cascade-trainer resume-rents         --reason TEXT
     cascade-trainer block-executor       <executor-id | ip> [--days N] [--reason TEXT]
@@ -24,6 +24,14 @@ king check benches): it resets the per-epoch try counter of every era that
 still wants its init. The trainer consumes the request on its next tick and
 logs "operator requested an init pointer rebuild"; nothing is rented for it
 — the build still waits for an operator-billed pod of the epoch.
+
+Every lane's queue is covered (A ``funded_queue.json``, B ``lane_b_queue.json``,
+C ``lane_c_queue.json``); ``--lane c`` is shorthand for ``--queue
+lane_c_queue.json`` when a hotkey has entries in several lanes. A lane C
+(MarketCast) leg lost on our side parks ``awaiting_operator_approval`` with a
+``make_good`` request priced on the miner's GPU type x the leg wall (owner
+2026-11-28); ``approve-operator-leg <hotkey> --lane c [--max-cost USD]`` lets
+its re-run rent on the OPERATOR's Lium account, the miner's key untouched.
 
 ``list`` shows legs awaiting approval (hotkey, uid, SKU, projected cost, why)
 and entries paused after operator-side faults. ``approve`` records a
@@ -69,6 +77,8 @@ _NO_QUEUE = ("rent-status", "resume-rents", "block-executor", "unblock-executor"
 # The request file ``rebuild-init-pointer`` writes under the work root; the
 # scheduler (``RollingScheduler._consume_init_pointer_rebuild``) removes it.
 INIT_POINTER_REBUILD_FILE = "init_pointer_rebuild.json"
+# ``--lane`` → the lane's queue file name (the same files :func:`_queues` reads).
+LANE_QUEUES = {"a": QUEUE_FILE, "b": "lane_b_queue.json", "c": "lane_c_queue.json"}
 KINDS = ("", "expired_key", "make_good", "operator_lane", "paid_fallback", "retrain_after_loss")
 
 
@@ -91,12 +101,24 @@ def _queues(work_root: Path) -> list:
     return out
 
 
-def _queue_for(work_root: Path, rec: dict | None, queue_name: str | None):
-    from ..funding.queue import FundedQueue
+def _queue_class(path: Path):
+    """The queue class of a lane's queue file (by its name; lane A otherwise)."""
+    from ..funding.queue import (
+        LANE_B_QUEUE_FILE,
+        LANE_C_QUEUE_FILE,
+        FundedQueue,
+        LaneBQueue,
+        LaneCQueue,
+    )
 
+    return {LANE_B_QUEUE_FILE: LaneBQueue, LANE_C_QUEUE_FILE: LaneCQueue}.get(
+        Path(path).name, FundedQueue)
+
+
+def _queue_for(work_root: Path, rec: dict | None, queue_name: str | None):
     path = (rec or {}).get("queue_path") or ""
     if path and Path(path).is_file():
-        return FundedQueue(path)
+        return _queue_class(Path(path))(path)
     for q in _queues(work_root):
         if queue_name is None or q.path.name == queue_name:
             return q
@@ -153,6 +175,9 @@ def _parser() -> argparse.ArgumentParser:
             s.add_argument("hotkey")
             s.add_argument("--queue", default=None,
                            help="queue file name when the hotkey has entries in several lanes")
+            s.add_argument("--lane", default=None, choices=sorted(LANE_QUEUES),
+                           help="shorthand for --queue: a = funded_queue.json, "
+                                "b = lane_b_queue.json, c = lane_c_queue.json")
         if cmd in ("approve-operator-leg", "deny-operator-leg"):
             s.add_argument("--attempt-id", default=None,
                            help="bind to this pending request (as listed)")
@@ -187,6 +212,13 @@ def main(argv: list[str]) -> int:
     )
 
     args = _parser().parse_args(argv)
+    lane = getattr(args, "lane", None)
+    if lane:
+        if args.queue and args.queue != LANE_QUEUES[lane]:
+            print(f"error: --lane {lane} is {LANE_QUEUES[lane]}, not --queue {args.queue}",
+                  file=sys.stderr)
+            return 2
+        args.queue = LANE_QUEUES[lane]
     wr, how = resolve_work_root(args.work_root, chain_toml=args.chain_toml)
     queue_path = wr / QUEUE_FILE
     # Every command names what it read (the human must see WHICH queue).

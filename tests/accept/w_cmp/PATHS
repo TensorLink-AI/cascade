@@ -96,3 +96,13 @@ cascade/trainer/worker.py
 # vs a 15m bank recorded from 2026-09-25): the intake's fund-time check of a
 # recipe's cuttable samples over the public bar index's recorded history.
 cascade/funding/mkt_geom.py
+# 2026-11-28 lane C operator make-good (owner 07:30 "add make goods",
+# 5Cu2sxndK8Dw re-dispatched on the miner's key after our fault): the
+# MarketCast leg opts in to the operator make-good (money_guard
+# operator_make_good_scope) so an operator-billed entry files a make_good
+# approval request and waits; the miner-visible "our fault" wait reason; the
+# approve CLI's --lane and lane queue class; the operator runbook.
+cascade/trainer/marketcast_runner.py
+cascade/trainer/money_guard.py
+cascade/funding/public_reason.py
+cascade/trainer/operator_legs_cli.py

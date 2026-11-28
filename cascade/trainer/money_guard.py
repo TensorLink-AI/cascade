@@ -1237,6 +1237,30 @@ def _leg_local(runner):
     return runner.__dict__.setdefault("_leg_local_obj", threading.local())
 
 
+@contextlib.contextmanager
+def operator_make_good_scope(runner):
+    """While the block runs on this thread, the leg OPTS IN to the operator
+    make-good (``operator_rent_ok``, what a rolling lane A leg sets): with
+    ``[round] funded_operator_fallback`` on, an operator-billed entry (a leg
+    lost on our side) with no operator lane PROPOSES an operator-rented re-run
+    — :func:`operator_leg_gate` files the approval request and parks the entry
+    ``awaiting_operator_approval`` (unburned, uncharged) — instead of retrying
+    on the miner's key. Every rent stays approval-gated (daily cap, reserve,
+    the approval's ceiling). Owner 2026-11-28: lane C (MarketCast) legs."""
+    loc = _leg_local(runner)
+    missing = object()
+    saved = getattr(loc, "operator_rent_ok", missing)
+    loc.operator_rent_ok = True
+    try:
+        yield loc
+    finally:
+        if saved is missing:
+            with contextlib.suppress(AttributeError):
+                delattr(loc, "operator_rent_ok")
+        else:
+            loc.operator_rent_ok = saved
+
+
 def preapproved(runner, hotkey: str, *, kind: str = "") -> bool:
     """Whether ``hotkey``'s current leg holds an unlaunched owner approval
     (peek only; an owner pre-approval counts). A miner-funded leg with a
@@ -1534,6 +1558,6 @@ __all__ = ["AWAITING_APPROVAL_STATUS", "OperatorBreaker", "OperatorSpend", "aler
            "would_rent_refusal",
            "clear_alert", "daily_cap_usd", "guard_operator_provider", "health_conditions",
            "is_balance_refusal", "operator_leg_gate", "operator_rent_preflight",
-           "gate_or_adopt", "grandfathered", "operator_pinned_skus", "note_operator_launch", "operator_leg_allocated",
+           "gate_or_adopt", "grandfathered", "operator_make_good_scope", "operator_pinned_skus", "note_operator_launch", "operator_leg_allocated",
            "take_deferred_gate", "payer_balance_note", "payer_balance_refusal", "preapproved",
            "projected_operator_leg_cost"]
