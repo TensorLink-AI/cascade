@@ -64,6 +64,24 @@ class MktLegError(ValueError):
     """The MINER's recipe / generator made the leg impossible (miner fault)."""
 
 
+class MktNonFiniteTraining(RuntimeError):
+    """A non-finite training loss or gradient: OUR side (operator fault).
+
+    The recipe's numbers are bounded when it is parsed (``optimizer.lr`` in
+    ``(0, [marketcast] max_lr]``, ``clip``, ``steps``, ``batch``), the base
+    and the adapter are ours, and the data is real bars + a sandboxed series
+    stream. 2026-11-28: an exactly flat context NaN'd the refine frame's
+    gradient in our adapter and was labelled the miner's. The worker exits
+    1 (never the rc 3 "miner submission rejected"), and the trainer classes
+    :data:`NONFINITE_TRAINING_MARKER` as an operator fault (requeued,
+    unburned, make-good eligible) whatever the exit code."""
+
+
+# The worker's message prefix the trainer's classifier keys on
+# (cascade.trainer.faults.nonfinite_training).
+NONFINITE_TRAINING_MARKER = "non-finite training"
+
+
 class MktDataUnavailable(RuntimeError):
     """An upstream feed failed; retry the leg without charging a miner fault."""
 
@@ -522,8 +540,8 @@ def finetune(model, forward: Callable, sampler: MktSampler, recipe, *, levels: S
              max_seconds: float, clock=time.monotonic, continuation=None) -> FinetuneResult:
     """The recipe's fine-tune of ``model`` (a Timestral-shaped module):
     ``forward(contexts, steps, past, known) -> (B, steps, K)`` torch.
-    Raises :class:`MktLegError` on a non-finite loss (the miner's
-    recipe / data diverged)."""
+    Raises :class:`MktNonFiniteTraining` on a non-finite loss or gradient
+    norm (operator fault: the recipe is bounded at parse time)."""
     import torch
 
     from ..eval.timestral_adapter import select_trainable
@@ -588,11 +606,15 @@ def finetune(model, forward: Callable, sampler: MktSampler, recipe, *, levels: S
                                  recipe.quantile_weights, recipe.coverage_penalty,
                                  freq_minutes=(b.freq_minutes or None) if sn else None)
             if not torch.isfinite(part):
-                raise MktLegError(f"non-finite training loss at step {step}")
+                raise MktNonFiniteTraining(f"{NONFINITE_TRAINING_MARKER} loss at step {step}")
             part = part * ((j - i) / n) if (i, j) != (0, n) else part
             part.backward()
             loss = part.detach() if loss is None else loss + part.detach()
-        torch.nn.utils.clip_grad_norm_(params, float(recipe.clip))
+        gnorm = torch.nn.utils.clip_grad_norm_(params, float(recipe.clip))
+        if not torch.isfinite(gnorm):
+            # a NaN/inf gradient would poison every weight on opt.step();
+            # stop before it (the next loss would be NaN anyway)
+            raise MktNonFiniteTraining(f"{NONFINITE_TRAINING_MARKER} gradient at step {step}")
         opt.step()
         if ema is not None:
             with torch.no_grad():
@@ -813,7 +835,7 @@ def run_mkt_leg(*, recipe, mc: MarketCastConfig, base_dir, base_fc_inner, train_
 
 __all__ = [
     "AUG_DEFAULTS", "Batch", "FinetuneResult", "MktDataUnavailable", "MktLegError",
-    "MktSampler", "augment",
+    "MktNonFiniteTraining", "MktSampler", "NONFINITE_TRAINING_MARKER", "augment",
     "build_training_snapshot", "finetune", "lr_at", "quantile_loss", "recipe_digest",
     "run_mkt_leg", "load_init_weights", "training_intervals", "training_relay_plan", "training_span",
 ]
