@@ -97,12 +97,24 @@ def test_the_fitting_start_or_no_15m_is_accepted(tmp_path):
     assert status == 202, body
 
 
-def test_unreadable_history_skips_the_check(tmp_path):
+def test_unreadable_history_skips_the_check(tmp_path, caplog):
+    import logging
+
+    consulted = []
+
     def down():
+        consulted.append(1)
         raise OSError("no source served index.json")
 
-    status, body = _fund(_intake(tmp_path, history=down))
+    with caplog.at_level(logging.WARNING, logger="cascade.funding.intake"):
+        status, body = _fund(_intake(tmp_path, history=down))
     assert status == 202, body
+    # the check DID run and was skipped for the stated reason (logged)
+    assert consulted, "the intake never consulted the bar history"
+    skipped = [r.getMessage() for r in caplog.records
+               if "sample-geometry check" in r.getMessage()]
+    assert skipped and "no source served index.json" in skipped[0], skipped
+    assert "not checked" in skipped[0]
 
 
 def test_the_estimate_matches_the_sampler_arithmetic():
