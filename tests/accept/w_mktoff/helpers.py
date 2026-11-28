@@ -179,13 +179,82 @@ class ForkProc:
 
 
 def local_run(argv, timeout):
-    """ssh / scp of the session, run on this machine."""
+    """ssh / scp of the session, run on this machine (``scp -r`` semantics:
+    one directory onto a new path = that path; else every source into the
+    existing directory)."""
     if argv[0] == "scp":
-        src, dest = argv[-2], argv[-1].split(":", 1)[1]
-        shutil.copytree(src, dest)
+        rest, srcs, i = argv[1:-1], [], 0
+        while i < len(rest):
+            if rest[i] in ("-P", "-o", "-i"):
+                i += 2
+                continue
+            if not rest[i].startswith("-"):
+                srcs.append(rest[i])
+            i += 1
+        dest = Path(argv[-1].split(":", 1)[1])
+        if len(srcs) == 1 and Path(srcs[0]).is_dir() and not dest.exists():
+            shutil.copytree(srcs[0], dest)
+        else:
+            for src in map(Path, srcs):
+                if src.is_dir():
+                    shutil.copytree(src, dest / src.name)
+                else:
+                    shutil.copy2(src, dest / src.name)
         return subprocess.CompletedProcess(argv, 0, "", "")
     return subprocess.run(["bash", "-c", argv[-1]], capture_output=True, text=True,
                           timeout=timeout)
+
+
+def image_worker(worker):
+    """``worker`` as the ``worker-v2.1.0-mkt-rc3`` image's own checkout
+    serves it (2026-11-28 14:01): a ``hello`` with no judge op and no code
+    id — everything else unchanged."""
+    serve = worker.handle
+
+    def handle(header, arrays):
+        if header.get("op") == "hello":
+            got, arr = serve(header, arrays)
+            got = {k: v for k, v in got.items() if k != "code"}
+            return {**got, "ops": []}, arr
+        return serve(header, arrays)
+
+    worker.handle = handle
+    return worker
+
+
+def pod_popen(make_worker, *, guard=None, started=None):
+    """A ``popen`` standing in for the MarketCast pod: the worker command is
+    inspected as the pod's python would run it. Started from the validator's
+    shipped package (``PYTHONPATH=<dir>``, ``-P``, ``<dir>/.ok`` and
+    ``<dir>/cascade`` byte-identical to this checkout's) the pod serves this
+    release's worker, answering ``hello`` with the dir's name; started any
+    other way it serves the IMAGE's worker (:func:`image_worker`: no judge).
+    ``started`` collects each command."""
+    import re
+    import shlex
+
+    here = Path(__file__).resolve().parents[3] / "cascade"
+
+    def popen(argv, **kw):
+        cmd = argv[-1]
+        if started is not None:
+            started.append(cmd)
+        w = make_worker()
+        m = re.search(r"PYTHONPATH=(\S+) ", cmd)
+        code = Path(shlex.split(m.group(1))[0]) if m else None
+        shipped = (code is not None and " -P -m cascade.validator.mkt_worker " in cmd
+                   and (code / ".ok").is_file()
+                   and all((code / "cascade" / rel).read_bytes() == (here / rel).read_bytes()
+                           for rel in ("validator/mkt_worker.py", "validator/marketcast.py",
+                                       "validator/mkt_offload.py", "pool/marketcast.py")))
+        if shipped:
+            w.code_id = code.name
+        else:
+            image_worker(w)
+        with guard() if guard is not None else contextlib.nullcontext():
+            return ForkProc(w)
+
+    return popen
 
 
 # the round: alice (four covariates) and carol (none) on the target, erin the
@@ -232,7 +301,7 @@ def rig(tmp_path: Path, snap, *, on_pod: bool = True, worker_models=None):
     root.mkdir(parents=True, exist_ok=True)
     w = Worker("cpu", root)
     w.models.update(worker_models if worker_models is not None else models())
-    sess = MktSession(host, run=local_run, popen=lambda *a, **k: ForkProc(w))
+    sess = MktSession(host, run=local_run, popen=pod_popen(lambda: w))
     sess.start()
     levels = tuple(float(x) for x in Fc(1.0).quantile_levels)
 

@@ -4,7 +4,8 @@
 # contract.
 # The worker's judge_* ops, the wire forms and the pod-side forecaster.
 cascade/validator/mkt_worker.py
-# PodJudge, the snapshot upload, the exact error mapping, the cache prune.
+# PodJudge, the snapshot upload, the exact error mapping, the cache prune,
+# the release package shipped to the pod by content hash.
 cascade/validator/mkt_offload.py
 # The publish path's judge selection, the box judge cap, the round RSS log.
 cascade/validator/marketcast.py

@@ -77,7 +77,8 @@ class _PipeProc:
 def _session(models, tmp_path=None):
     w = Worker("cpu", tmp_path or Path("."))
     w.models.update(models)
-    s = MktSession(RemoteHost(name="pod", host="h"), popen=lambda *a, **k: _PipeProc(w))
+    s = MktSession(RemoteHost(name="pod", host="h"), popen=lambda *a, **k: _PipeProc(w),
+                   ship_code=False)
     s.start()
     return s, w
 

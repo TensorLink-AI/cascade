@@ -760,12 +760,10 @@ class LaneCWorld:
                           workdir=str(self.root / f"pod-{name}"))
         cache = Path(cache_root_of(host))
         cache.mkdir(parents=True, exist_ok=True)
-        def popen(*a, **k):
-            # the "pod" is a forked child of the box process: fork it inside
-            # the box guard so the worker (its hello probes torch) never loads
-            # torch on this machine either
-            with box_guard():
-                return H.ForkProc(Worker("cpu", cache))
+        # the "pod" is a forked child of the box process: fork it inside the
+        # box guard so the worker (its hello probes torch) never loads torch
+        # on this machine either; it runs the validator's shipped package
+        popen = H.pod_popen(lambda: Worker("cpu", cache), guard=box_guard)
 
         import scipy.stats  # noqa: F401 — the forecaster's; imported once, before the forks
 

@@ -48,6 +48,16 @@ JUDGE_MSG_MAX = 1 << 20
 SNAPSHOTS_KEEP = 2
 
 
+def code_id() -> str:
+    """The name of the directory this worker's ``cascade`` package was
+    imported from: the validator ships its own release package to the pod by
+    content hash (``<code dir>/<hash>/cascade``, :meth:`cascade.validator.
+    mkt_offload.MktSession.start`), so a worker started from the shipped code
+    answers ``hello`` with that hash; one importing the image's checkout
+    answers its checkout's directory name and is refused."""
+    return Path(__file__).resolve().parents[2].name
+
+
 def encode_frame(header: dict, arrays: dict | None = None) -> bytes:
     """``header`` (JSON) + named numeric arrays as one length-prefixed NPZ."""
     buf = io.BytesIO()
@@ -238,6 +248,7 @@ class Worker:
         self.base_cache: dict = {}
         self.ft_cache: dict = {}
         self.datas: dict = {}
+        self.code_id = code_id()
 
     def _dir(self, rel: str) -> Path:
         d = (self.root / str(rel)).resolve()
@@ -353,7 +364,8 @@ class Worker:
                     gpu = torch.cuda.get_device_name(0)
             except Exception:  # noqa: BLE001 — informational
                 pass
-            return {"schema": SCHEMA, "device": self.device, "gpu": gpu, "ops": list(OPS)}, {}
+            return {"schema": SCHEMA, "device": self.device, "gpu": gpu, "ops": list(OPS),
+                    "code": self.code_id}, {}
         if op == "load":
             from ..eval.timestral_adapter import WEIGHTS_FILE, sha256_file
 
