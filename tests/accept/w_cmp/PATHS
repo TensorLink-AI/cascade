@@ -83,6 +83,14 @@ cascade/trainer/remote.py
 cascade/trainer/runner_funded_legs.py
 cascade/funding/mkt_fit.py
 
+# 2026-11-28 MarketCast flat-context NaN (5Cu2sxndK8Dw, mkt-rc2, step 1050):
+# the training refine frame's gradient-safe sqrt (forward and non-flat
+# gradients bit-identical to timestral a534bdbd; no-grad keeps the library's
+# own method), and a non-finite training loss / gradient is an operator
+# fault (worker rc 1; the trainer classes the mkt-rc2 image's rc 3 line too).
+cascade/eval/timestral_adapter.py
+cascade/trainer/marketcast_leg.py
+cascade/trainer/worker.py
 # 2026-11-28 MarketCast sample geometry (5Cu2sxndK8Dw "could not cut a
 # high/15mx96 training sample" after 32 min of paid prep: data.start 2024-01-01
 # vs a 15m bank recorded from 2026-09-25): the intake's fund-time check of a

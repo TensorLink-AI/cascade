@@ -196,6 +196,26 @@ def own_run_cuda_oom(final_exception: str) -> bool:
     return total > 0 and held >= 0.5 * total
 
 
+# A MarketCast leg's non-finite training loss / gradient (2026-11-28): the
+# recipe is bounded at parse time (optimizer.lr <= [marketcast] max_lr, clip,
+# steps, batch), so a NaN is OUR side — the 2026-11-28 one was our adapter's
+# refine frame backpropagating sqrt(0) on an exactly flat context. Matched on
+# the worker's own message: rc 3 "marketcast leg: non-finite training loss at
+# step N" (worker images up to mkt-rc2) and rc 1 "marketcast leg failed
+# (operator fault): non-finite training ... at step N" (the fixed worker).
+# A spoofed line (stderr a generator controls) only buys requeues bounded by
+# the entry's operator-fault cap ([round] operator_fault_cap), never a pass.
+_NONFINITE_TRAINING_RE = re.compile(
+    r"marketcast leg(?: failed \(operator fault\))?: non-finite training "
+    r"(?:loss|gradient) at step \d+")
+
+
+def nonfinite_training(text: str) -> bool:
+    """Whether a failed leg's text is the MarketCast worker's non-finite
+    training loss / gradient (an operator fault, :data:`OPERATOR_FAULT_CLASS`)."""
+    return bool(_NONFINITE_TRAINING_RE.search(text or ""))
+
+
 def gpu_oom_message(gpu: str) -> str:
     """The miner-facing verdict of a recipe that ran out of GPU memory."""
     return (f"out of GPU memory on {gpu or 'the rented GPU'}: reduce batch/context/LoRA "
@@ -250,7 +270,9 @@ def classify_funded_worker_failure(rc: int | None, text: str, *,
     A rejection whose text is a stream STALL is classed :data:`STALL_CLASS`
     (infra-side, unburned) the first time and ``"generator"`` (the miner's
     shot) only when this hotkey already stalled once before. Every other
-    rejection stays ``"generator"``. On a ``shards_leg`` (the corpus was
+    rejection stays ``"generator"`` — except a MarketCast non-finite training
+    loss / gradient (:func:`nonfinite_training`, any rc), which is
+    :data:`OPERATOR_FAULT_CLASS`, unburned (2026-11-28). On a ``shards_leg`` (the corpus was
     pushed; no miner code ran on the pod) a non-rejection exit whose
     dispatcher-parsed ``final_exception`` is a remote shard fetch failure
     (:func:`shard_fetch_failure` — our storage) is :data:`OPERATOR_FAULT_CLASS`,
@@ -261,6 +283,8 @@ def classify_funded_worker_failure(rc: int | None, text: str, *,
     :data:`GPU_OOM_CLASS`, terminal (never re-rented). Any other exit is
     ``"infra"`` and burns one of the entry's retry attempts, as before.
     """
+    if nonfinite_training(text):
+        return False, OPERATOR_FAULT_CLASS, False
     if rc == 3:
         if _STALL_MARKER in (text or "") and not stalled_before:
             return False, STALL_CLASS, False
