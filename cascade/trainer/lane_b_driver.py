@@ -2304,6 +2304,22 @@ class RunnerLaneBOps:
                 "pod_name": funded_pod_name(seed, hk, self.r.cfg.subnet.netuid) + "-0",
                 "tag": f"expert-{hk[:12]}-{seed}"}
 
+    def leg_pod_ledgered(self, leg: OpenLeg) -> bool:
+        """A ledgered pod (payer or operator-rented) of ``leg`` in the current
+        seed epoch: a re-attach then runs attach-only. False only when the
+        ledger was read and holds neither name; anything unknown (no seeds
+        yet, an unreadable ledger) is True — never risk a fresh rent of a pod
+        name that might be live."""
+        from .runner_funded_legs import _leg_allocated
+
+        try:
+            seeds = self._seeds()
+        except Exception:  # noqa: BLE001 — unknown: attach-only decides
+            return True
+        if seeds is None:
+            return True
+        return bool(_leg_allocated(self.r, str(seeds.base_seed), leg.sub.hotkey))
+
     def reattach_leg(self, leg: OpenLeg, era_index: int, block: int, done, rec: dict) -> None:
         """Re-attach a persisted open funded leg after a trainer restart: the
         leg's own funded path at its ORIGINAL dispatch block, attach-only
@@ -2344,6 +2360,19 @@ class RunnerLaneBOps:
 
         def _run():
             if reattach is None:
+                return _body()
+            if not self.leg_pod_ledgered(leg):
+                # 2026-11-28 (5H63pHtyHgkf): no ledgered pod (payer or
+                # operator) of this leg exists, so there is nothing to attach
+                # to — the old process died before it rented. Attach-only
+                # would generate the whole CPU corpus (~1 h) and only then
+                # refuse the rent. Run it as a NORMAL dispatch instead: same
+                # leg, same in-flight attempt (no new charge), every pre-rent
+                # gate applies. The ledger is write-ahead, so no row means no
+                # pod that a fresh rent could double.
+                log.warning("lane B: re-attach of %s: no ledgered pod for this leg — "
+                            "dispatching it normally (generation + fresh rent)",
+                            leg.sub.hotkey[:12])
                 return _body()
             with _reattach.reattach_only():
                 return _body()

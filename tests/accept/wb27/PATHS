@@ -64,6 +64,9 @@ cascade/trainer/runner_operator_pods.py
 cascade/trainer/runner_rolling.py
 cascade/provision/funded.py
 tests/unit/test_lane_b_reattach.py
+# 2026-11-28: a re-attach with no ledgered pod is a normal dispatch (lane B /
+# lane C); the funded path refuses attach-only before the corpus (5H63pHtyHgkf).
+tests/unit/test_reattach_no_pod_normal_dispatch.py
 tests/unit/test_pod_postmortem.py
 # 2026-11-26 lane B/C assumption audit: lane A walls, dispatch timeout, the
 # MarketCast watchdog, limits / fixed-steps legs, the operator leg's layout.
