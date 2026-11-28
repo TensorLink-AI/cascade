@@ -8,6 +8,18 @@ name: Publish cascade-worker image
 # [training] expected_gpu, so the job prints it to the run summary.
 #
 # Trigger by pushing a tag like `worker-v0.1.0`, or run manually.
+#
+# W-IMG retro item 8 (2026-11-28): the build is the FIRST step of a release,
+# never a hand build. The image installs from `uv sync --frozen` (#999), and
+# this job emits its BUILD MANIFEST (`image-manifest.json`, a run artifact and
+# the run summary): image digest, source commit, uv.lock sha256, the in-image
+# worker_code_fingerprint (checked equal to this checkout's), torch build and
+# CUDA arch list (scripts/worker_image_manifest.py; the probe runs inside the
+# image build, so the runner never pulls the image). Nothing pins an image
+# without that manifest: the qualification record embeds it and the trainer
+# refuses an `*_after` / [marketcast] pod_image without a record
+# (docs/OPERATOR.md "Releasing a worker image": build -> qualify -> walls ->
+# PR -> repin).
 
 on:
   push:
@@ -75,6 +87,39 @@ jobs:
             BUILD_REF=${{ github.ref_name }}
             BUILD_SHA=${{ github.sha }}
 
+      - name: Export the build-time probe (cached; no image pull)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          platforms: linux/amd64
+          target: image-probe
+          push: false
+          outputs: type=local,dest=image-probe
+          build-args: |
+            BUILD_REF=${{ github.ref_name }}
+            BUILD_SHA=${{ github.sha }}
+
+      - name: Emit the build manifest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          owner=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          python3 -P scripts/worker_image_manifest.py emit --repo . \
+            --image "ghcr.io/${owner}/cascade-worker@${DIGEST}" \
+            --probe image-probe/image-probe.json \
+            --source-commit "$GITHUB_SHA" --source-ref "$GITHUB_REF_NAME" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --out image-manifest.json
+
+      - name: Upload the build manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-manifest
+          path: image-manifest.json
+          if-no-files-found: error
+
       - name: Report digest
         run: |
           {
@@ -87,6 +132,11 @@ jobs:
             echo "python deploy/provision.py \\"
             echo "  --image ghcr.io/${{ github.repository_owner }}/cascade-worker@${{ steps.build.outputs.digest }} \\"
             echo "  --ssh-pubkey ~/.ssh/orchestrator.pub --sku L40S --count 2"
+            echo '```'
+            echo ""
+            echo "Build manifest (artifact \`image-manifest\`; next: qualify it, docs/OPERATOR.md \"Releasing a worker image\"):"
+            echo '```json'
+            cat image-manifest.json
             echo '```'
             echo ""
             echo "Tags pushed:"

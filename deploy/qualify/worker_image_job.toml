@@ -1,0 +1,53 @@
+# W-IMG retro item 8 (owner 2026-11-28): the worker image QUALIFICATION JOB.
+#
+# Operator-triggered, never automatic: nothing here rents a pod. The runbook is
+# docs/OPERATOR.md "Releasing a worker image"; the driver is
+# scripts/qualify_worker_image.py (plan on the box, pod on the pod, patch on
+# the box). Every run is Approve-tier spend: the owner OKs the pod first.
+schema = "cascade-image-qualify-job/1"
+
+[pod]
+# ONE cheap Lium pod booting the image under test: bitwise vs the previous
+# image's golden file at every world size, crash+resume at every world size,
+# and the per-role smoke. Bitwise only compares like with like: the previous
+# image's golden must come from the SAME GPU model (the driver refuses
+# otherwise), so keep this SKU fixed across releases.
+qual_sku = "8xRTX4090"
+ttl_minutes = 150
+# GPU = Lium only (owner 2026-11-24); check the Lium balance before renting.
+provider = "lium"
+
+[bitwise]
+# qualify_pyramid_bitwise.py --solo terms (they are recorded in the golden
+# file; a change here makes the previous golden incomparable)
+steps = 3
+resume_at = 3
+seed = 20261031
+channels = 32
+# world sizes beyond the rentable SKUs' GPU counts (equality only)
+extra_worlds = [1]
+
+[smoke]
+steps = 30
+timeout_seconds = 1800
+roles = ["lane_a_leg", "lane_b_expert_bf16", "lane_b_rebase_judge", "lane_d_forecast"]
+mkt_roles = ["mkt_finetune", "mkt_flat_context"]
+
+[smoke.lane_b]
+# The era king's public pointer and an expert selection (copy both from the
+# last settled lane B leg's dispatch record). Empty = the lane B smoke FAILS
+# (and so the qualification): fill them per release.
+king_ref = ""
+selection_json = ""
+domain = "energy"
+
+[smoke.mkt]
+# A recorded MarketCast recipe (marketcast.json of a past accepted lane C leg),
+# copied next to this file per release. Empty = the mkt smoke FAILS.
+recipe = ""
+
+[walls]
+# One short pod per rentable SKU (its own rental, after the qualification
+# pod): the lane A smoke with this many steps measures steps/s and startup on
+# that SKU; wall = (startup + training_steps / rate) x 1.05.
+steps = 60
