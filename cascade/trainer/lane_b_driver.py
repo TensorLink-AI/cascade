@@ -1756,6 +1756,9 @@ class LaneBDriver:
                                 "started_block": (_f["leg"].get("funding") or {}).get("started_block"),
                                 "attempt_id": (_f["leg"].get("funding") or {}).get("attempt_id"),
                                 "leg_pointer": ptr,
+                                # W-E2E: the funded leg's own (trained) pointer —
+                                # what _settle_funding finds this verdict by
+                                "trained_leg_pointer": _f["leg_pointer"],
                                 "outcome": ("qualified" if ptr in passed else
                                             "qualification_not_selected" if ptr in checks_passed else
                                             "qualification_rejected"),
@@ -1798,8 +1801,12 @@ class LaneBDriver:
         fq = self._funded_queue()
         why = {d["leg_pointer"]: d["outcome"] for d in dropped}
         # owner 2026-11-28: the public verdict each spent entry carries
-        verdicts = {r["leg_pointer"]: {**r, "lane": "b"} for r in (judged or [])
-                    if r.get("leg_pointer")}
+        # a judged row's ``leg_pointer`` is the REBASED checkpoint; the funded
+        # leg is found by its trained pointer (W-E2E 2026-11-28: keyed by the
+        # rebased one, no settled entry ever stored its verdict — only the
+        # driver-state fallback of the public view showed it)
+        verdicts = {(r.get("trained_leg_pointer") or r["leg_pointer"]): {**r, "lane": "b"}
+                    for r in (judged or []) if r.get("leg_pointer")}
         verdicts.update({d["leg_pointer"]: {"lane": "b", "outcome": d["outcome"],
                                             "round_id": d.get("round_id"),
                                             "gen_ref": d.get("gen_ref")} for d in dropped})

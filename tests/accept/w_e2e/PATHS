@@ -1,0 +1,14 @@
+# W-E2E (owner 2026-11-28, retrospective item P1): a full-cycle test per lane
+# (B, C, D) before a lane takes money. README.md has the contract.
+# The CI tier: cycle drivers + fakes (pods, registry, chain, S3), box guard.
+tests/e2e_lanes/
+# The staging tier: testnet runner (dry-run default) + runbook.
+tests/e2e_testnet/lanes.py
+tests/e2e_testnet/LANES_RUNBOOK.md
+# The CI job (torch-free install, required via the `test` aggregator).
+.github/workflows/ci.yml
+# Bugs the lane B cycle found on main: torch on the trainer box at every
+# lane B dispatch (ESFT selection), and a settled funded entry never storing
+# its verdict (keyed by the rebased pointer).
+cascade/trainer/expert_lane.py
+cascade/trainer/lane_b_driver.py

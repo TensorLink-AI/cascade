@@ -99,18 +99,39 @@ def select_routed_experts(affinity, *, p: float, min_n: int, max_n: int,
     than ``min_n`` rows (possibly none). Implemented as extra exclusions so
     the digest-pinned model source (``moe_model.py`` feeds
     ``base_arch_digest``) and the direct lane's ``verify_selection`` replay
-    stay byte-identical."""
-    import torch
+    stay byte-identical.
 
-    from .moe_model import select_domain_experts
-
-    aff = torch.as_tensor(affinity)
-    banned: dict[int, set[int]] = {int(k): set(v) for k, v in (exclude or {}).items()}
+    W-E2E (2026-11-28): numpy only. This runs on the TRAINER BOX at every
+    lane B dispatch tick (``RoutingProbe.select``), where the torch import it
+    used to make (plus ``moe_model``) is refused (the 7 GB box rule; the
+    full-cycle harness's box guard caught it). The arithmetic is
+    ``moe_model.select_domain_experts`` step for step on float64 copies of
+    integer counts (exact in any summation order), so the selection is
+    identical; the equivalence is pinned by
+    tests/accept/w_e2e/test_w_e2e_lane_b_cycle.py (torch, CI only)."""
+    aff = np.asarray(affinity, dtype=np.float64)
+    banned: dict[int, set[int]] = {int(k): {int(e) for e in v}
+                                   for k, v in (exclude or {}).items()}
     for li in range(aff.shape[0]):
-        zero = {int(e) for e in torch.nonzero(aff[li] <= 0).reshape(-1).tolist()}
+        zero = {int(e) for e in np.nonzero(aff[li] <= 0)[0].tolist()}
         if zero:
             banned.setdefault(li, set()).update(zero)
-    return select_domain_experts(aff, p=p, min_n=min_n, max_n=max_n, exclude=banned or None)
+    out: dict[int, list[int]] = {}
+    n_experts = aff.shape[1]
+    for li in range(aff.shape[0]):
+        row = aff[li]
+        total = float(row.sum())
+        skip = banned.get(li, set())
+        ranked = sorted((e for e in range(n_experts) if e not in skip),
+                        key=lambda e: (-float(row[e]), e))
+        picked, cum = [], 0.0
+        for e in ranked:
+            if len(picked) >= max_n or (len(picked) >= min_n and cum >= p):
+                break
+            picked.append(e)
+            cum += float(row[e]) / total if total > 0 else 0.0
+        out[li] = sorted(picked)
+    return out
 
 
 def check_finite_rows(state: dict, selection: dict, names, *, what: str = "candidate") -> None:
