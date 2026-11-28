@@ -391,12 +391,14 @@ def run_mkt_worker(args, cfg, log, *, post=None, get=None, synthetic_fn=None,
     base from the miner's MarketCast recipe on this credential-free pod and
     print a ``--local-only`` receipt (the orchestrator harvests). rc 2 =
     bad invocation / not armed, 3 = the miner's recipe or data (miner
-    fault), 1 = anything else. ``post`` / ``get`` / ``synthetic_fn`` /
+    fault), 1 = anything else — including a non-finite training loss or
+    gradient (:class:`MktNonFiniteTraining`, OUR side, 2026-11-28). ``post`` / ``get`` / ``synthetic_fn`` /
     ``base_loader`` are injectable (tests)."""
     from ..shared.marketcast_recipe import parse_marketcast_recipe
     from .marketcast_leg import (
         MktDataUnavailable,
         MktLegError,
+        MktNonFiniteTraining,
         build_training_snapshot,
         run_mkt_leg,
     )
@@ -536,6 +538,10 @@ def run_mkt_worker(args, cfg, log, *, post=None, get=None, synthetic_fn=None,
                     res = _run(it)
         else:
             res = _run(None)
+    except MktNonFiniteTraining as e:
+        # operator fault (our adapter / pipeline), never a miner rejection
+        log.error("marketcast leg failed (operator fault): %s", e)
+        return 1
     except MktLegError as e:
         log.error("miner submission rejected: marketcast leg: %s", e)
         return 3
