@@ -1043,6 +1043,33 @@ OP_PROFILE = {"probe": FETCH_WEIGHTS, "lineage": FETCH_META, "eval": FETCH_WEIGH
               "merge_check": FETCH_WEIGHTS}
 
 
+def _nvidia_compute_cap() -> str:
+    """``nvidia-smi --query-gpu=compute_cap`` on the pod ("" when absent)."""
+    import subprocess
+
+    try:
+        proc = subprocess.run(["nvidia-smi", "--query-gpu=compute_cap",
+                               "--format=csv,noheader"], capture_output=True, text=True,
+                              timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return proc.stdout if proc.returncode == 0 else ""
+
+
+def pod_gpu_arch_refusal(device: str, query: Callable[[], str] | None = None):
+    """Pod side: the feasibility arch check of a ``cuda`` eval device (the
+    observed compute capability vs the pinned torch's arch list, read without
+    importing torch). None for ``cpu`` or an unreadable capability."""
+    if not str(device or "").startswith("cuda"):
+        return None
+    from ..funding.feasibility import gpu_arch_refusal, parse_compute_cap
+
+    cap = parse_compute_cap((query or _nvidia_compute_cap)())
+    if cap is None:
+        return None
+    return gpu_arch_refusal(compute_cap=cap)
+
+
 def _pod_op(op: str, req: dict, run_dir: Path, root: Path) -> dict:
     from types import SimpleNamespace
 
@@ -1058,16 +1085,24 @@ def _pod_op(op: str, req: dict, run_dir: Path, root: Path) -> dict:
             req["base"], list(req["merges"]), req["target"], strict=bool(req["strict"]))
     if op not in OP_PROFILE:
         raise SystemExit(f"unknown op {op!r}")
-    pointers = list(req.get("pointers") or [req["pointer"]])
-    keep: set = set()
-    dirs = [_pod_fetch(p, root, keep=keep, profile=OP_PROFILE[op], disk=req.get("disk"))
-            for p in pointers]
-    ckpt = dirs[0]
     payload = None
     if (run_dir / "payload.pkl").is_file():
         import pickle
 
         payload = pickle.loads((run_dir / "payload.pkl").read_bytes())  # noqa: S301 — from our box
+    if op == "eval" and isinstance(payload, dict):
+        # retro 2026-11-28 #5 (01:44 sm_120 judge): the pod's GPU must run the
+        # pinned torch BEFORE any fetch or model load (refused, never a crash)
+        refusal = pod_gpu_arch_refusal(str(payload.get("device", "") or ""))
+        if refusal is not None:
+            from ..funding.feasibility import failure_message
+
+            return {"offload_unavailable": failure_message(refusal)}
+    pointers = list(req.get("pointers") or [req["pointer"]])
+    keep: set = set()
+    dirs = [_pod_fetch(p, root, keep=keep, profile=OP_PROFILE[op], disk=req.get("disk"))
+            for p in pointers]
+    ckpt = dirs[0]
     if op == "probe":
         from .expert_lane import probe_target_routing
 

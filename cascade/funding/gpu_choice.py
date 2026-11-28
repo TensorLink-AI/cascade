@@ -154,6 +154,14 @@ def parse_gpu_headers(headers, catalog: GpuCatalog | None
         return GpuChoice(), "", {
             "code": "unknown_gpu",
             "message": f"{g!r} is not a funded GPU type; choose one of: {listed}"}
+    # retro 2026-11-28 #5: a GPU the pinned torch has no kernels for (sm_120
+    # Blackwell under 2.4.1+cu124) is refused here, free, before anything is
+    # signed, vaulted or rented (cascade.funding.feasibility)
+    from .feasibility import gpu_arch_refusal
+
+    arch = gpu_arch_refusal(sku)
+    if arch is not None:
+        return GpuChoice(), "", arch.as_body()
     if f.lower() in _TRUE:
         fallback = True
     elif not f or f.lower() in _FALSE:
