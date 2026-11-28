@@ -722,9 +722,11 @@ def _entry_name(digest_name: str, profile: str) -> str:
 
 
 def _complete(d: Path) -> bool:
-    from ..shared.hippius import FETCH_COMPLETE_MARKER
+    # marker AND no chunked-v2 index left as a file (an older fetch's
+    # marker over one is incomplete: refetched, which reassembles it)
+    from ..shared.hippius import snapshot_complete
 
-    return (d / FETCH_COMPLETE_MARKER).is_file()
+    return snapshot_complete(d)
 
 
 def _cached(ckpt: Path, digest_name: str, profile: str) -> Path | None:
