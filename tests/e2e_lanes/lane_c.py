@@ -378,10 +378,15 @@ class FakeLegPod:
             # what runner_funded_legs does with a worker exit
             q = r._funded_queue()
             prior = q.get(gen.hotkey) if q is not None else None
+            # retro 2026-11-28 (P7): the fund-time fit evidence the intake
+            # recorded decides whether an OOM is the miner's (M-OOM-FIT)
+            from cascade.trainer.fault_class import fit_evidence_of
+
             miner_fault, error_class, burn = faults.classify_leg_exception(
                 r, gen, seeds, err, rc=rc, text=str(err),
                 stalled_before=bool(prior is not None and prior.last_error_class == "stall"),
-                shards_leg=False, role="mkt_finetune")
+                shards_leg=False, role="mkt_finetune",
+                fit_evidence=fit_evidence_of(prior, "mkt_finetune"))
             text = str(err)
             if error_class == faults.GPU_OOM_CLASS:
                 text = f"{faults.gpu_oom_message(sku)}: {text}"

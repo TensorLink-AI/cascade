@@ -52,9 +52,14 @@ def _verdict(exc, fit_evidence="fit"):
 
     runner = SimpleNamespace()
     gen = SimpleNamespace(hotkey="5Cu2sxndK8Dw", ref="Alemaj-ft-ai-7/mkt-8a4e0122@hf:ba4d")
+    import inspect
+
+    # BASE's classifier has no fit_evidence parameter: call it the old way there
+    # so the Accept sees the verdict assertion, not a TypeError
+    kw = ({"fit_evidence": fit_evidence}
+          if "fit_evidence" in inspect.signature(classify_leg_exception).parameters else {})
     return classify_leg_exception(runner, gen, SimpleNamespace(base_seed=1), exc, rc=1,
-                                  text=str(exc), stalled_before=False, shards_leg=False,
-                                  fit_evidence=fit_evidence)
+                                  text=str(exc), stalled_before=False, shards_leg=False, **kw)
 
 
 class _Queue:
