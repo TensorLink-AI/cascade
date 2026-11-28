@@ -1930,6 +1930,24 @@ class MarketCastMixin:
                           "retried at the next settlement", rid, e)
                 return False
         entries, sidecars = [], {}
+        # retro 2026-11-28 #6: a permanent fault behind an infra deferral (a
+        # library missing in the judging process, a GPU arch the pinned torch
+        # lacks) pages the owner once per round. Log-only: the deferral rows
+        # and the report bytes are unchanged.
+        from ..shared.permanent_fault import classify_text as _perm_text
+        from ..shared.permanent_fault import page as _perm_page
+
+        paged: set[str] = set()
+
+        def _page_if_permanent(text: str) -> None:
+            pf = _perm_text(text)
+            if pf is not None and pf.kind not in paged:
+                paged.add(pf.kind)
+                _perm_page(f"marketcast round={rid}", pf,
+                           action="entries infra_deferred; deferring cannot fix it")
+
+        if base_fc is None:
+            _page_if_permanent(base_err)
         ft_cache: dict = {}
         datas: dict = {}
         for c in item["candidates"]:
@@ -1980,6 +1998,7 @@ class MarketCastMixin:
                                                    f"{MKT_COMPUTE_ATTEMPTS}x: {fwd[0]}"[:300]))
                 continue
             if rows is None:
+                _page_if_permanent(err)
                 entries.append(replace(stub, status=INFRA_DEFERRED,
                                        infra_reason=f"compute failed {MKT_COMPUTE_ATTEMPTS}x: "
                                                     f"{err}"[:240] + cap))
