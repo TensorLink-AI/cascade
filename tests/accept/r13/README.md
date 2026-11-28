@@ -68,6 +68,7 @@ by `deploy/laned/elastic.toml`. Owner execution WP: the live run writes
 | $/h and monthly caps | `test_price_cap_and_monthly_cap_refuse_before_renting`, `test_ledger_counts_only_this_month`, `test_monthly_cap_limits_host_count`, `test_over_cap_offers_are_never_rented` |
 | delete on failure | `test_failed_boot_deletes_and_verifies`, `test_unverified_delete_alerts`, `test_cycle_deletes_on_failure_even_with_keep_warm`, `test_lemon_is_recorded_and_every_rented_host_deleted` |
 | the W6 build sequence, elastic cycle, keep-warm | `test_run_script_is_the_w6_sequence`, `test_cycle_builds_then_deletes`, `test_keep_warm_keeps_the_vm_after_a_good_build` |
+| every build re-syncs a changed release (`.release_sha` = release_dir HEAD + uncommitted edits + chain.toml sha; bootstrap always syncs and records it; 2026-11-28 release_dir switch never reached the builder) | `test_every_build_resyncs_a_changed_release`, `test_bootstrap_always_syncs_and_records_the_release`, `test_a_failed_sync_records_nothing`, `test_every_build_refreshes_the_mirror_and_priors_first` |
 | credentials placement (names only, mode 600) | `test_env_template_names_only_mode_600` |
 | first-seen append-only on object storage | `test_r13_state.py` |
 | Lium only, retry then alert | `test_eval_role_is_lium_only_no_shadeform_gpu_path`, `test_no_lium_gpu_retries_lium_then_alerts` |

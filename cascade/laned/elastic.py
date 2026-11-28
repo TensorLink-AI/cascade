@@ -1006,6 +1006,52 @@ def pin_steps(cfg: ElasticConfig, inst: Mapping, release_dir: str) -> list[tuple
     ]
 
 
+RELEASE_SHA_FILE = ".release_sha"
+
+
+def release_sync_script(cfg: ElasticConfig, inst: Mapping, *, force: bool) -> str:
+    """The release sync (deploy/pod_bootstrap.sh: rsync of ``release_dir``,
+    the deployed chain.toml, ``uv sync --frozen``), then the builder's
+    ``.release_sha`` := the release fingerprint (``release_dir`` HEAD, a
+    ``+dirty.<diff sha>`` suffix for uncommitted edits, the chain.toml sha).
+
+    ``force`` (bootstrap) always syncs. Otherwise (2026-11-28, before every
+    build) it syncs only when the builder's recorded fingerprint differs: a
+    ``release_dir`` switch on the box (81cefead -> b1d26efa) never reached a
+    warm builder, which built from old code until synced by hand."""
+    b = cfg.builder
+    kh = known_hosts_for(cfg, inst)
+    q = shlex.quote
+    rd = q(b.release_dir)
+    env = {"POD_IP": str(inst["ip"]), "POD_PORT": str(inst["port"]), "POD_USER": b.ssh_user,
+           "POD_KEY": str(Path(b.ssh_key_path).expanduser()), "POD_WORKDIR": b.workdir,
+           "POD_KNOWN_HOSTS": kh, "CASCADE_SRC_ROOT": b.release_dir,
+           "CASCADE_CHAIN_TOML": b.chain_toml, "POD_STAGE": "pool_d"}
+    bootstrap = shlex.join(["env"] + [f"{k}={v}" for k, v in env.items()]
+                           + ["bash", f"{b.release_dir}/deploy/pod_bootstrap.sh"])
+    sha_path = q(f"{b.workdir}/{RELEASE_SHA_FILE}")
+    read_sha = shlex.join(ssh_argv(inst, key_path=b.ssh_key_path, known_hosts=kh,
+                                   remote=f"cat {sha_path} 2>/dev/null || true"))
+    write_sha = shlex.join(ssh_argv(inst, key_path=b.ssh_key_path, known_hosts=kh,
+                                    remote=f"cat > {sha_path}"))
+    lines = [
+        "set -euo pipefail",
+        f"want=\"$(git -C {rd} rev-parse HEAD)\"",
+        f"if [ -n \"$(git -C {rd} status --porcelain --untracked-files=no)\" ]; then "
+        f"want=\"$want+dirty.$(git -C {rd} diff HEAD | sha256sum | cut -c1-16)\"; fi",
+        f"want=\"$want chain.$(sha256sum < {q(b.chain_toml)} | cut -c1-16)\"",
+    ]
+    if not force:
+        lines += [
+            f"have=\"$({read_sha})\"",
+            "if [ \"$have\" = \"$want\" ]; then "
+            "echo \"release_sync: builder already on $want\" >&2; exit 0; fi",
+            "echo \"release_sync: builder ${have:-<none>} -> $want\" >&2",
+        ]
+    lines += [bootstrap, f"printf '%s' \"$want\" | {write_sha}"]
+    return "\n".join(lines)
+
+
 def builder_bootstrap_steps(cfg: ElasticConfig, inst: Mapping) -> list[tuple[str, list[str]]]:
     """Idempotent: the release + ``uv sync --frozen`` (deploy/pod_bootstrap.sh),
     the deployed chain.toml, the env file (mode 600). The state restore and the
@@ -1015,14 +1061,9 @@ def builder_bootstrap_steps(cfg: ElasticConfig, inst: Mapping) -> list[tuple[str
     priors, so every snapshot held the same data and an empty ``frontier``)."""
     b = cfg.builder
     kh = known_hosts_for(cfg, inst)
-    env = {"POD_IP": str(inst["ip"]), "POD_PORT": str(inst["port"]), "POD_USER": b.ssh_user,
-           "POD_KEY": str(Path(b.ssh_key_path).expanduser()), "POD_WORKDIR": b.workdir,
-           "POD_KNOWN_HOSTS": kh, "CASCADE_SRC_ROOT": b.release_dir,
-           "CASCADE_CHAIN_TOML": b.chain_toml, "POD_STAGE": "pool_d"}
-    envargs = ["env"] + [f"{k}={v}" for k, v in env.items()]
     remote_env = shlex.quote(b.remote_env_file)
     return pin_steps(cfg, inst, b.release_dir) + [
-        ("release_sync", envargs + ["bash", f"{b.release_dir}/deploy/pod_bootstrap.sh"]),
+        ("release_sync", ["bash", "-c", release_sync_script(cfg, inst, force=True)]),
         ("env_file", scp_argv(inst, key_path=b.ssh_key_path, known_hosts=kh,
                               src=b.env_file, dest=b.remote_env_file)),
         ("env_mode", ssh_argv(inst, key_path=b.ssh_key_path, known_hosts=kh,
@@ -1066,15 +1107,22 @@ def builder_run_script(b: BuilderConfig, *, as_of_ts: int, now_ts: int, started_
     lanea = f"{b.work_root}/lane_a_pool"
     py = ".venv/bin/python -P -m"
     extra = " ".join(q(x) for x in b.build_args)
+    # `pool_d_step <name> <epoch>` on stderr before each step: the run log
+    # then carries per-step wall times (2026-11-28: only the total was known).
     return "\n".join([
         "set -euo pipefail",
+        "step() { echo \"pool_d_step $1 $(date +%s)\" >&2; }",
         f"cd {q(b.workdir)}",
         f"set -a; . {q(b.remote_env_file)}; set +a",
         f"rm -rf -- {q(lanea)} {q(lanea + '.tar')} {q(lanea + '.ref.json')} {q(out)}",
+        "step lane_a",
         f".venv/bin/cascade-laned elastic lane-a-pool --chain-toml chain.toml --out {q(lanea)}",
+        "step fs_record",
         f"{py} cascade.pool.first_seen record --forge-dir {q(b.forge_dir)} "
         f"--log-dir {q(fs)} --now-ts {int(now_ts)}",
+        "step fs_commit",
         f"{py} cascade.pool.first_seen commit --log-dir {q(fs)} --now-ts {int(now_ts)}",
+        "step build",
         "prior=()",
         f"for d in {q(b.work_root)}/prior/*/; do [ -f \"$d/metadata.json\" ] && "
         "prior+=(--prior-dir \"$d\"); done",
@@ -1083,22 +1131,29 @@ def builder_run_script(b: BuilderConfig, *, as_of_ts: int, now_ts: int, started_
             f"--lane-a-pool {q(lanea)} --out {q(out)} --as-of-ts {int(as_of_ts)}",
             "--chain-toml chain.toml", extra, "\"${prior[@]}\"") if x),
         "finished=\"$(date +%s)\"",
+        "step publish",
         f"{py} cascade.pool.pool_d_publish publish --pool-d {q(out)} --chain-toml chain.toml "
         f"--started-ts {int(started_ts)} --finished-ts \"$finished\"",
+        "step state_push",
         f".venv/bin/cascade-laned elastic state-push --chain-toml chain.toml "
         f"--forge-dir {q(b.forge_dir)} --pool-d {q(out)}",
+        "step done",
     ])
 
 
 def builder_run_steps(cfg: ElasticConfig, inst: Mapping, *, now_ts: int
                       ) -> list[tuple[str, list[str]]]:
+    """Every build: the release sync when the builder's ``.release_sha`` is
+    not the box's release (:func:`release_sync_script`), the state + mirror
+    refresh, then the W6 sequence."""
     from ..pool.pool_d_publish import due_as_of
 
     b = cfg.builder
     kh = known_hosts_for(cfg, inst)
     script = builder_run_script(b, as_of_ts=due_as_of(now_ts), now_ts=now_ts,
                                 started_ts=now_ts)
-    return builder_refresh_steps(cfg, inst) + [
+    return [("release_sync", ["bash", "-c", release_sync_script(cfg, inst, force=False)])] \
+        + builder_refresh_steps(cfg, inst) + [
         ("pool_d_build_publish",
          ssh_argv(inst, key_path=b.ssh_key_path, known_hosts=kh,
                   remote=f"bash -c {shlex.quote(script)}"))]

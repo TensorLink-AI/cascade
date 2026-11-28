@@ -68,6 +68,13 @@ and the target (the last `horizon` points, never interpolated).
 
 Only points the W6fs index knows at `as_of_ts` are used (committed periods
 ending by `as_of_ts`), so every `first_seen_ts` is `< as_of_ts`.
+`build_pool_d(..., first_seen_roots="committed", first_seen_cache_dir=None,
+full_first_seen_scan=False)` passes the W6fs root rule and scan cache through;
+the CLI defaults to `--first-seen-roots ended` (2026-11-28: the root this
+build's own `first_seen commit` wrote after `as_of_ts` is used, so new data
+reaches lane D one build earlier; the bytes equal a build whose root was
+committed exactly at `as_of_ts`) and to the cache in `<first-seen-dir>.cache`
+(`--no-first-seen-cache`, `--full-first-seen-scan`).
 
 Refused selections (typed, in `refused`): `rollup_not_supported` (a `.rollup_*`
 series), `bad_embargo` (the feed's catalog `embargo_hours` fails closed: the
@@ -180,5 +187,6 @@ fields only).
 | W6fs roots + verify | `test_first_seen_roots_and_verify` |
 | typed refusals | `test_rollup_and_target_gap_refused` |
 | event feeds: per-series refusal, dedupe (#841) | `test_w6b_event_feeds.py` |
+| the snapshot uses the root this build committed (same bytes, re-derivable) | `test_snapshot_uses_the_root_this_build_committed` |
 | builder CLI + lane A replay guard | `test_cli_builds_with_lane_a_replay`, `test_cli_refuses_lane_a_mismatch` |
 | evidence from the real run | `test_evidence_*` |

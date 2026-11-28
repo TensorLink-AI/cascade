@@ -5,3 +5,6 @@
 # the pool_d builder uses, the per-feed mirror-lag measurement and the
 # snapshot verifier.
 cascade/pool/first_seen.py
+# The index-memory unit test stubs feed_index (its signature gained the
+# 2026-11-28 `roots` rule).
+tests/unit/test_first_seen_index_memory.py

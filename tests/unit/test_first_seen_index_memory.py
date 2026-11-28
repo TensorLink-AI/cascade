@@ -523,8 +523,8 @@ def test_pool_d_build_output_byte_identical(tmp_path, monkeypatch):
     loads = []
     real_feed_index = fs.FirstSeenLog.feed_index
 
-    def counting_feed_index(self, *, until_ts):
-        idx = real_feed_index(self, until_ts=until_ts)
+    def counting_feed_index(self, *, until_ts, roots="committed"):
+        idx = real_feed_index(self, until_ts=until_ts, roots=roots)
         loads.append(idx)
         return idx
 
@@ -532,8 +532,8 @@ def test_pool_d_build_output_byte_identical(tmp_path, monkeypatch):
         if name == "old":
             monkeypatch.setattr(
                 fs.FirstSeenLog, "feed_index",
-                lambda self, *, until_ts: _OldIndexAdapter(OldLog(self.log_dir).index(
-                    until_ts=until_ts)))
+                lambda self, *, until_ts, roots="committed": _OldIndexAdapter(
+                    OldLog(self.log_dir).index(until_ts=until_ts)))
         else:
             monkeypatch.setattr(fs.FirstSeenLog, "feed_index", counting_feed_index)
         for as_of in as_ofs:

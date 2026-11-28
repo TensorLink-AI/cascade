@@ -36,6 +36,37 @@ therefore never count as fresh in lane D. Points already recorded from other
 partitions before the quarantine keep their genuine first-seen time. More
 than :func:`unreadable_limit` unreadable partitions in one run (a systemic
 read failure) aborts as before (``too_many_unreadable``), writing nothing.
+
+Incremental scans (2026-11-28; every build re-hashed all ~630k forge
+partitions and re-parsed the whole 20 GB ``records.jsonl`` three times):
+with a ``cache_dir`` (the CLIs default to ``<log_dir>.cache``) the log keeps
+
+* ``partitions.json``: per partition ``(size, mtime_ns, inode) -> sha256``,
+  so only new or changed partitions are hashed;
+* ``records.meta.json``: per ``records.jsonl`` line its byte span, feed,
+  partition, sha256, ``seen_ts``, ``period_start``, point count, data-time
+  range and Merkle leaf hash, plus a fingerprint of the bytes it covers; a
+  run parses only the lines appended since (the log is append-only), and
+  ``record`` loads a feed's known points only from the lines whose data-time
+  range meets the new partition's.
+
+Every answer equals the uncached one (same records, roots, index; tests on
+fixtures). A cache that no longer fingerprints its log prefix is dropped (a
+full scan); ``full=True`` (CLI ``--full``) ignores it; and a full scan runs
+anyway once the cache's last full verification is ``full_verify_seconds``
+(24 h) old, warning loudly when the cache had diverged. The cache lives
+outside the three log files: ``state-push`` never uploads it.
+
+Root rule ``roots="ended"`` (2026-11-28, the pool_d builder): a snapshot at
+``as_of`` uses every committed period that ENDED by ``as_of`` (its records
+are all first seen before ``as_of``), including the root this build's own
+``commit`` wrote after ``as_of``; ``"committed"`` (the default) keeps the
+rev6.11 (d) rule (root committed by ``as_of``), one build later. ``ended``
+refuses (``uncommitted_period``) when an ended period has records but no
+root, so the usable set is final when the snapshot is cut and anyone
+re-derives it from the log; ``record`` refuses a ``now_ts`` whose period
+ended before the newest commit (``period_frozen``), so no record can later
+enter a period an earlier snapshot relied on being empty.
 """
 
 from __future__ import annotations
@@ -69,6 +100,12 @@ DEFAULT_LOG_DIRNAME = "first_seen"
 DEFAULT_MAX_UNREADABLE_FILES = 50
 DEFAULT_MAX_UNREADABLE_FRAC = 0.001
 _REASON_MAX = 300
+CACHE_SCHEMA = "pool-d-first-seen-cache/1"
+CACHE_META_FILE = "records.meta.json"
+CACHE_PARTS_FILE = "partitions.json"
+FULL_VERIFY_SECONDS = 86_400
+ROOT_RULES = ("committed", "ended")
+_FP_BYTES = 1 << 16
 
 
 class FirstSeenError(ValueError):
@@ -152,6 +189,53 @@ def _file_sha(path: Path) -> str:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def default_cache_dir(log_dir: Path | str) -> Path:
+    """``<log_dir>.cache``: beside the log, never one of its pushed files."""
+    d = Path(log_dir)
+    return d.with_name(d.name + ".cache")
+
+
+def _fingerprint(path: Path, size: int) -> str:
+    """sha256 over the first and the last ``_FP_BYTES`` of ``path[:size]``
+    (an append-only log keeps both; a rewrite or a truncation changes them)."""
+    h = hashlib.sha256(str(int(size)).encode())
+    if size:
+        with open(path, "rb") as f:
+            h.update(f.read(min(_FP_BYTES, size)))
+            f.seek(max(0, size - _FP_BYTES))
+            h.update(f.read(size - max(0, size - _FP_BYTES)))
+    return h.hexdigest()
+
+
+def _meta_of(off: int, n: int, r: Mapping) -> list:
+    """The cached metadata of one ``records.jsonl`` line: ``[offset, length,
+    feed, partition, partition_sha256, seen_ts, period_start, n_points,
+    min data_ts, max data_ts, leaf hash hex]``."""
+    ts = [int(t) for _pj, t in r["points"]]
+    return [int(off), int(n), r["feed"], r["partition"], r["partition_sha256"],
+            int(r["seen_ts"]), int(r["period_start"]), len(ts),
+            min(ts) if ts else None, max(ts) if ts else None,
+            _leaf_hash(canonical_json(r)).hex()]
+
+
+def _write_json_atomic(path: Path, doc) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp")
+    with open(tmp, "wb") as f:
+        f.write(canonical_json(doc))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def _read_cache(path: Path) -> dict | None:
+    try:
+        doc = json.loads(path.read_bytes())
+    except (OSError, ValueError):
+        return None
+    return doc if isinstance(doc, dict) and doc.get("schema") == CACHE_SCHEMA else None
 
 
 def _epoch_seconds(pd, raw):
@@ -360,8 +444,16 @@ class FirstSeenFeedIndex:
 class FirstSeenLog:
     """The append-only ingest log in ``log_dir``."""
 
-    def __init__(self, log_dir: Path | str):
+    def __init__(self, log_dir: Path | str, *, cache_dir: Path | str | None = None,
+                 full: bool = False, full_verify_seconds: float = FULL_VERIFY_SECONDS,
+                 clock=time.time):
+        """``cache_dir`` None = no cache (every scan reads everything);
+        ``full`` = ignore the cache this run (and rewrite it from a full scan)."""
         self.log_dir = Path(log_dir)
+        self.cache_dir = None if cache_dir is None else Path(cache_dir)
+        self.full = bool(full)
+        self.full_verify_seconds = float(full_verify_seconds)
+        self._clock = clock
 
     @property
     def records_path(self) -> Path:
@@ -382,13 +474,15 @@ class FirstSeenLog:
         return [doc for _off, _len, doc in FirstSeenLog._scan(path)]
 
     @staticmethod
-    def _scan(path: Path):
-        """Yield ``(byte offset, byte length, parsed doc)`` per non-blank line,
-        one line in memory at a time (``log_corrupt`` on a bad line)."""
+    def _scan(path: Path, start: int = 0):
+        """Yield ``(byte offset, byte length, parsed doc)`` per non-blank line
+        from byte ``start`` (a line boundary), one line in memory at a time
+        (``log_corrupt`` on a bad line)."""
         if not path.is_file():
             return
         with open(path, "rb") as f:
-            off = 0
+            f.seek(int(start))
+            off = int(start)
             for n, raw in enumerate(f, 1):
                 start, off = off, off + len(raw)
                 line = raw.decode("utf-8")
@@ -402,6 +496,78 @@ class FirstSeenLog:
 
     def records(self) -> list[dict]:
         return self._lines(self.records_path)
+
+    # ── the incremental scan cache (module docstring) ───────────────────────
+
+    def _full_due(self, cached: Mapping | None) -> bool:
+        if self.full or cached is None:
+            return True
+        last = cached.get("full_verify_ts")
+        return not isinstance(last, int | float) or \
+            self._clock() - float(last) >= self.full_verify_seconds
+
+    def _records_meta(self) -> list[list]:
+        """Per-line metadata (:func:`_meta_of`) of every ``records.jsonl``
+        line, in file order: the cached lines plus the lines appended since,
+        or a full scan (no / stale / mismatching cache, ``full``, or the
+        periodic full verification). Raises what :meth:`_scan` raises."""
+        path = self.records_path
+        size = path.stat().st_size if path.is_file() else 0
+        cpath = self.cache_dir / CACHE_META_FILE
+        cached = _read_cache(cpath)
+        prefix_ok = (cached is not None and isinstance(cached.get("size"), int)
+                     and cached["size"] <= size
+                     and cached.get("fingerprint") == _fingerprint(path, cached["size"]))
+        if cached is not None and not prefix_ok and not self.full:
+            _warn(f"first-seen scan cache {cpath} does not match {path} (rewritten or "
+                  f"restored log?); full scan")
+        if self._full_due(cached) or not prefix_ok:
+            lines = [_meta_of(off, n, r) for off, n, r in self._scan(path)]
+            if prefix_ok and lines[:len(cached["lines"])] != cached["lines"]:
+                _warn(f"first-seen scan cache {cpath} DIVERGED from a full scan of {path}; "
+                      f"the full scan is used and the cache rebuilt")
+            full_ts = self._clock()
+        else:
+            lines = list(cached["lines"])
+            lines.extend(_meta_of(off, n, r) for off, n, r in self._scan(path, cached["size"]))
+            full_ts = cached["full_verify_ts"]
+        end_ok = size == 0
+        if size:
+            with open(path, "rb") as f:
+                f.seek(size - 1)
+                end_ok = f.read(1) == b"\n"
+        if end_ok:                         # cache only a prefix that ends a line
+            _write_json_atomic(cpath, {"schema": CACHE_SCHEMA, "size": size,
+                                       "fingerprint": _fingerprint(path, size),
+                                       "full_verify_ts": full_ts, "lines": lines})
+        return lines
+
+    def _partition_cache(self) -> tuple[dict, float | None]:
+        """``({"feed/name": [size, mtime_ns, inode, sha256]}, last full
+        verification ts)``; the ts is None when this run must hash everything."""
+        cached = _read_cache(self.cache_dir / CACHE_PARTS_FILE)
+        entries = cached.get("entries") if cached is not None else None
+        entries = entries if isinstance(entries, dict) else {}
+        if self._full_due(cached):
+            return entries, None           # every partition re-hashed, compared
+        return entries, float(cached["full_verify_ts"])
+
+    def _partition_sha(self, feed: str, part: Path, cache: dict, out: dict,
+                       full: bool) -> str:
+        """``part``'s sha256: the cached one when its size, mtime_ns and inode
+        are unchanged (never under ``full``), else hashed."""
+        st = part.stat()
+        key, stat = f"{feed}/{part.name}", [int(st.st_size), int(st.st_mtime_ns), int(st.st_ino)]
+        hit = cache.get(key)
+        if not full and isinstance(hit, list) and len(hit) == 4 and hit[:3] == stat:
+            sha = str(hit[3])
+        else:
+            sha = _file_sha(part)
+            if isinstance(hit, list) and len(hit) == 4 and hit[:3] == stat and hit[3] != sha:
+                _warn(f"partition sha cache DIVERGED for data/{key} (same size/mtime/inode, "
+                      f"new bytes); the hash is used and the cache rebuilt")
+        out[key] = [*stat, sha]
+        return sha
 
     def quarantine(self) -> list[dict]:
         """Every quarantine entry (``kind`` ``unreadable`` or ``blocked``)."""
@@ -486,11 +652,21 @@ class FirstSeenLog:
         seen_parts: set = set()
         logged_feeds: set = set()
         rec_spans: dict[str, list[tuple[int, int]]] = {}
-        for off, n, r in self._scan(self.records_path):
-            seen_parts.add((r["feed"], r["partition"], r["partition_sha256"]))
-            logged_feeds.add(r["feed"])
-            if r["points"]:
-                rec_spans.setdefault(r["feed"], []).append((off, n))
+        # cached runs only: per feed [(offset, length, min data_ts, max data_ts)]
+        rec_ranges: dict[str, list[tuple[int, int, int, int]]] = {}
+        if self.cache_dir is not None:
+            for off, n, feed, part, sha, _seen, _p, npts, lo, hi, _leaf in self._records_meta():
+                seen_parts.add((feed, part, sha))
+                logged_feeds.add(feed)
+                if npts:
+                    rec_spans.setdefault(feed, []).append((off, n))
+                    rec_ranges.setdefault(feed, []).append((off, n, lo, hi))
+        else:
+            for off, n, r in self._scan(self.records_path):
+                seen_parts.add((r["feed"], r["partition"], r["partition_sha256"]))
+                logged_feeds.add(r["feed"])
+                if r["points"]:
+                    rec_spans.setdefault(r["feed"], []).append((off, n))
         q_names: set = set()
         q_versions: dict = {}
         blk_spans: dict[str, list[tuple[int, int]]] = {}
@@ -501,9 +677,12 @@ class FirstSeenLog:
             q_versions[key] = e.get("kind")
             if e.get("kind") == "blocked" and e.get("points"):
                 blk_spans.setdefault(key[0], []).append((off, n))
-        return {"seen_parts": seen_parts, "logged_feeds": logged_feeds,
-                "rec_spans": rec_spans, "q_names": q_names, "q_versions": q_versions,
-                "blk_spans": blk_spans}
+        out = {"seen_parts": seen_parts, "logged_feeds": logged_feeds,
+               "rec_spans": rec_spans, "q_names": q_names, "q_versions": q_versions,
+               "blk_spans": blk_spans}
+        if self.cache_dir is not None:
+            out["rec_ranges"] = rec_ranges
+        return out
 
     @staticmethod
     def _read_spans(path: Path, spans) -> list[dict]:
@@ -538,6 +717,27 @@ class FirstSeenLog:
             known.update((intern.setdefault(pj, pj), int(t)) for pj, t in e.get("points") or [])
         return known
 
+    def _feed_known_in(self, feed: str, hist: dict, lo: int, hi: int, have: set,
+                       loaded: set) -> None:
+        """Cached runs: add to ``have`` the points of ``feed``'s records whose
+        data-time range meets ``[lo, hi]`` (not loaded yet). A logged point
+        with data time in ``[lo, hi]`` lies in such a record, so ``points -
+        have`` equals ``points - (every known point)`` for points in range."""
+        spans = [(off, n) for off, n, rlo, rhi in hist["rec_ranges"].get(feed, ())
+                 if (off, n) not in loaded and rlo <= hi and rhi >= lo]
+        intern: dict[str, str] = {}
+        for r in self._iter_spans(self.records_path, spans):
+            have.update((intern.setdefault(pj, pj), int(t)) for pj, t in r["points"])
+        loaded.update(spans)
+
+    def _feed_blocked(self, feed: str, hist: dict) -> set:
+        """``feed``'s ``blocked`` quarantine points (the small half of
+        :meth:`_feed_known`)."""
+        known: set = set()
+        for e in self._read_spans(self.quarantine_path, hist["blk_spans"].get(feed)):
+            known.update((pj, int(t)) for pj, t in e.get("points") or [])
+        return known
+
     def record(self, forge_dir: Path | str, *, now_ts: int,
                max_unreadable_files: int = DEFAULT_MAX_UNREADABLE_FILES,
                max_unreadable_frac: float = DEFAULT_MAX_UNREADABLE_FRAC) -> dict:
@@ -559,10 +759,23 @@ class FirstSeenLog:
         bytes, in the same order, that the whole-forge version wrote."""
         now_ts = int(now_ts)
         p = period_start(now_ts)
-        if p in self.roots():
+        roots = self.roots()
+        if p in roots:
             raise FirstSeenError("period_committed",
                                  f"period {p} already has a committed root; now_ts={now_ts}")
+        last_commit = max((int(e["committed_ts"]) for e in roots.values()), default=None)
+        if last_commit is not None and p + PERIOD_SECONDS <= last_commit:
+            # A commit at last_commit froze every period ended by then (a
+            # roots="ended" snapshot relied on them); never record into one.
+            raise FirstSeenError("period_frozen",
+                                 f"period {p} ended before the last commit at {last_commit}; "
+                                 f"now_ts={now_ts} is in the past")
         hist = self._scan_history()
+        cached = self.cache_dir is not None
+        if cached:
+            part_cache, part_verified = self._partition_cache()
+            part_full = part_verified is None
+            part_out: dict = {}
         seen_parts, logged_feeds = hist["seen_parts"], hist["logged_feeds"]
         q_names, q_versions = hist["q_names"], hist["q_versions"]
         data = Path(forge_dir) / "data"
@@ -580,9 +793,11 @@ class FirstSeenLog:
                 for feed_dir in feed_dirs:
                     feed = feed_dir.name
                     have: set | None = None       # this feed's known points, loaded lazily
+                    loaded: set = set()           # cached runs: record spans already in `have`
                     for part in sorted(feed_dir.glob("*.parquet")):
                         n_parts += 1
-                        sha = _file_sha(part)
+                        sha = (self._partition_sha(feed, part, part_cache, part_out, part_full)
+                               if cached else _file_sha(part))
                         if (feed, part.name, sha) in seen_parts:
                             continue
                         kind = q_versions.get((feed, part.name, sha))
@@ -608,7 +823,13 @@ class FirstSeenLog:
                             q_versions[(feed, part.name, sha)] = "unreadable"
                             q_names.add((feed, part.name))
                             continue
-                        if have is None:
+                        if cached:
+                            if have is None:
+                                have = self._feed_blocked(feed, hist)
+                            if points:
+                                ts = [t for _pj, t in points]
+                                self._feed_known_in(feed, hist, min(ts), max(ts), have, loaded)
+                        elif have is None:
                             have = self._feed_known(feed, hist)
                         fresh = sorted(set(points) - have)
                         del points
@@ -638,7 +859,7 @@ class FirstSeenLog:
                             "points": [[pj, int(t)] for pj, t in fresh],
                         }])
                         del fresh
-                    del have                              # free this feed before the next
+                    del have, loaded                      # free this feed before the next
                     self._feed_state_freed(feed)
                 limit = unreadable_limit(n_parts, max_files=max_unreadable_files,
                                          max_frac=max_unreadable_frac)
@@ -651,6 +872,10 @@ class FirstSeenLog:
                 # Quarantine first: a crash between the two appends errs on the safe side.
                 self._append_staged(self.quarantine_path, stage_q)
                 self._append_staged(self.records_path, stage_r)
+                if cached:
+                    _write_json_atomic(self.cache_dir / CACHE_PARTS_FILE, {
+                        "schema": CACHE_SCHEMA, "entries": part_out,
+                        "full_verify_ts": self._clock() if part_full else part_verified})
         finally:
             for d in made_dirs:                           # deepest first
                 try:
@@ -679,7 +904,13 @@ class FirstSeenLog:
         now_ts = int(now_ts)
         roots = self.roots()
         by_period: dict[int, list[bytes]] = {}
-        for _off, _n, r in self._scan(self.records_path):
+        if self.cache_dir is not None:
+            for m in self._records_meta():
+                pr = m[6]
+                if pr in roots or pr + PERIOD_SECONDS > now_ts:
+                    continue
+                by_period.setdefault(pr, []).append(bytes.fromhex(m[10]))
+        for _off, _n, r in (() if self.cache_dir is not None else self._scan(self.records_path)):
             pr = int(r["period_start"])
             if pr in roots or pr + PERIOD_SECONDS > now_ts:
                 continue
@@ -694,14 +925,20 @@ class FirstSeenLog:
 
     # ── the index ───────────────────────────────────────────────────────────
 
-    def index(self, *, until_ts: int) -> FirstSeenIndex:
-        """Points of the periods whose root was committed by ``until_ts``,
-        after checking every committed root against the log (every feed in
-        memory; :meth:`feed_index` holds one feed at a time)."""
-        return self.feed_index(until_ts=until_ts).to_index()
+    def index(self, *, until_ts: int, roots: str = "committed") -> FirstSeenIndex:
+        """Points of the periods whose root was committed by ``until_ts``
+        (``roots`` as :meth:`feed_index`), after checking every committed root
+        against the log (every feed in memory; :meth:`feed_index` holds one
+        feed at a time)."""
+        return self.feed_index(until_ts=until_ts, roots=roots).to_index()
 
-    def feed_index(self, *, until_ts: int) -> FirstSeenFeedIndex:
+    def feed_index(self, *, until_ts: int, roots: str = "committed") -> FirstSeenFeedIndex:
         """:meth:`index` that holds one feed at a time.
+
+        ``roots`` picks the usable periods (module docstring): ``"committed"``
+        = root committed by ``until_ts``; ``"ended"`` = period ended by
+        ``until_ts`` and committed (any time), refusing ``uncommitted_period``
+        when an ended period has records but no root.
 
         One streaming pass over ``records.jsonl`` checks every committed root
         (32-byte leaf hashes only) and keeps, per feed, the byte spans of the
@@ -712,6 +949,9 @@ class FirstSeenLog:
         then a wrong ``period_start``, then ``root_mismatch``, then the
         quarantine file."""
         until_ts = int(until_ts)
+        if roots not in ROOT_RULES:
+            raise ValueError(f"roots must be one of {ROOT_RULES}; got {roots!r}")
+        rule = roots
         try:
             roots = self.roots()
             roots_err = None
@@ -722,25 +962,38 @@ class FirstSeenLog:
             q_err = None
         except Exception as e:  # noqa: BLE001 — re-raised after the root checks
             quarantined, q_err = {}, e
-        usable = {p: e["root"] for p, e in roots.items() if int(e["committed_ts"]) <= until_ts}
+        if rule == "ended":
+            usable = {p: e["root"] for p, e in roots.items() if p + PERIOD_SECONDS <= until_ts}
+        else:
+            usable = {p: e["root"] for p, e in roots.items()
+                      if int(e["committed_ts"]) <= until_ts}
         hashes: dict[int, list[bytes]] = {}
         spans: dict[str, list[tuple[int, int]]] = {}
+        open_ended: set[int] = set()       # ended by until_ts, records, no root
         period_err: FirstSeenError | None = None
-        for off, n, r in self._scan(self.records_path):
-            p = int(r["period_start"])
-            if period_err is None and p != period_start(int(r["seen_ts"])):
+        if self.cache_dir is not None:
+            lines = ((m[0], m[1], m[2], m[3], m[5], m[6], m[7], bytes.fromhex(m[10]))
+                     for m in self._records_meta())
+        else:
+            lines = ((off, n, r["feed"], r["partition"], int(r["seen_ts"]),
+                      int(r["period_start"]), len(r["points"]), _leaf_hash(canonical_json(r)))
+                     for off, n, r in self._scan(self.records_path))
+        for off, n, feed, part, seen, p, npts, leaf in lines:
+            if period_err is None and p != period_start(seen):
                 period_err = FirstSeenError(
-                    "root_mismatch", f"record of {r.get('feed')} has a wrong period_start")
+                    "root_mismatch", f"record of {feed} has a wrong period_start")
             if p in roots:
-                hashes.setdefault(p, []).append(_leaf_hash(canonical_json(r)))
-            if p not in usable or not r["points"]:
+                hashes.setdefault(p, []).append(leaf)
+            elif p + PERIOD_SECONDS <= until_ts:
+                open_ended.add(p)
+            if p not in usable or not npts:
                 continue
-            q_ts = quarantined.get((str(r["feed"]), str(r["partition"])))
-            if q_ts is not None and int(r["seen_ts"]) >= q_ts:
+            q_ts = quarantined.get((str(feed), str(part)))
+            if q_ts is not None and seen >= q_ts:
                 # A quarantined name recorded at/after its quarantine (e.g. by
                 # a release that did not know quarantine.jsonl): never fresh.
                 continue
-            spans.setdefault(str(r["feed"]), []).append((off, n))
+            spans.setdefault(str(feed), []).append((off, n))
         if roots_err is not None:
             raise roots_err
         if period_err is not None:
@@ -753,18 +1006,26 @@ class FirstSeenLog:
                                      f"period {p}: log no longer matches its committed root")
         if q_err is not None:
             raise q_err
+        if rule == "ended" and open_ended:
+            raise FirstSeenError(
+                "uncommitted_period",
+                f"period(s) {sorted(open_ended)} ended by {until_ts} hold records but no "
+                f"committed root; run `commit` first (roots='ended' needs every ended "
+                f"period final)")
         return FirstSeenFeedIndex(self.records_path, spans, usable, until_ts)
 
 
-def verify_snapshot(meta: Mapping, log_dir: Path | str) -> list[str]:
-    """Problems of a ``pool_d/1`` metadata dict against the log (``[]`` = ok)."""
+def verify_snapshot(meta: Mapping, log_dir: Path | str, *, roots: str = "committed",
+                    cache_dir: Path | str | None = None) -> list[str]:
+    """Problems of a ``pool_d/1`` metadata dict against the log (``[]`` = ok);
+    ``roots="ended"`` for a snapshot the builder cut under that rule."""
     problems: list[str] = []
     try:
         as_of = int(meta["as_of_ts"])
     except (KeyError, TypeError, ValueError):
         return ["metadata has no integer as_of_ts"]
     try:
-        idx = FirstSeenLog(log_dir).feed_index(until_ts=as_of)
+        idx = FirstSeenLog(log_dir, cache_dir=cache_dir).feed_index(until_ts=as_of, roots=roots)
     except FirstSeenError as e:
         return [f"first-seen log: {e}"]
     listed = set(meta.get("first_seen_roots") or [])
@@ -840,6 +1101,13 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--now-ts", type=int, default=None, help="default: the wall clock")
         if name == "evidence":
             p.add_argument("--out", type=Path, required=True)
+        else:
+            p.add_argument("--cache-dir", type=Path, default=None,
+                           help="incremental scan cache (default: <log-dir>.cache)")
+            p.add_argument("--no-cache", action="store_true",
+                           help="scan everything, read and write no cache")
+            p.add_argument("--full", action="store_true",
+                           help="ignore the cache this run: full scan, cache rebuilt")
     args = ap.parse_args(argv)
     now = int(time.time()) if args.now_ts is None else int(args.now_ts)
     log_dir = args.log_dir
@@ -847,7 +1115,10 @@ def main(argv: list[str] | None = None) -> int:
         if getattr(args, "forge_dir", None) is None:
             ap.error("--log-dir is required")
         log_dir = args.forge_dir / DEFAULT_LOG_DIRNAME
-    log = FirstSeenLog(log_dir)
+    cache_dir = None
+    if args.cmd != "evidence" and not args.no_cache:
+        cache_dir = args.cache_dir or default_cache_dir(log_dir)
+    log = FirstSeenLog(log_dir, cache_dir=cache_dir, full=getattr(args, "full", False))
     try:
         if args.cmd == "record":
             print(json.dumps(log.record(args.forge_dir, now_ts=now,
@@ -873,9 +1144,14 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "CACHE_META_FILE",
+    "CACHE_PARTS_FILE",
+    "CACHE_SCHEMA",
     "DEFAULT_MAX_UNREADABLE_FILES",
     "DEFAULT_MAX_UNREADABLE_FRAC",
     "EVIDENCE_SCHEMA",
+    "FULL_VERIFY_SECONDS",
+    "ROOT_RULES",
     "LOG_SCHEMA",
     "PERIOD_SECONDS",
     "QUARANTINE_FILE",
@@ -885,6 +1161,7 @@ __all__ = [
     "FirstSeenIndex",
     "FirstSeenLog",
     "canonical_json",
+    "default_cache_dir",
     "main",
     "merkle_root",
     "panel_json",
