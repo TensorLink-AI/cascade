@@ -20,6 +20,15 @@ forecasts on a cheap elastic pod instead of its own ``--device``.
   (``quantile_levels`` + ``forecast_batch``), so the rows code is unchanged.
   Contexts and covariates cross; window targets, losses, the verdict, the
   report and the wallet stay on the validator.
+* **Judge (W-MKTOFF, 2026-11-28).** The window cut, the covariate rows, the
+  scoring and the reference tests of every entry run ON THE POD
+  (:class:`PodJudge` → the worker's ``judge_*`` ops): the 10:54 OOM was the
+  box building ~16 GB of covariate rows for one ``mkt:market`` entry. The
+  snapshot is uploaded once per digest (``snap-<digest>`` in the cache) and
+  the pod's view of it is bound to the box's by digest + meta sha256; the
+  ``[marketcast]`` table crosses as JSON and is bound by sha256; each entry
+  comes back as its rows + its sidecar bytes (sha256-checked). The report,
+  its signature and the wallet stay on the validator.
 * **Errors.** A transport failure is :class:`MktOffloadError` (a
   ``ConnectionError`` — infra to :func:`~cascade.validator.marketcast.
   infra_like`); the worker's own exceptions come back classified (a
@@ -51,7 +60,20 @@ from ..shared.pod_data_root import (
     base_dir,
     parse_alternatives,
 )
-from .mkt_worker import _LEN, FRAME_MAX, SCHEMA, decode_frame, encode_frame
+from .mkt_worker import (
+    _LEN,
+    FRAME_MAX,
+    SCHEMA,
+    MktRemoteError,
+    decode_frame,
+    encode_frame,
+    mc_from_wire,
+    mc_to_wire,
+    rows_from_wire,
+    rows_to_wire,
+    snapshot_meta_sha256,
+    wire_sha256,
+)
 
 log = logging.getLogger("cascade.validator.mkt_offload")
 
@@ -64,6 +86,11 @@ UPLOAD_TIMEOUT_S = 1800.0
 TOUCH_EVERY_S = 60.0
 # free bytes an upload needs beyond the checkpoint itself
 UPLOAD_HEADROOM_BYTES = 1 << 30
+# snapshots in the pod cache are ``snap-<digest>``: never pruned as checkpoints,
+# the newest SNAP_KEEP kept
+SNAP_PREFIX = "snap-"
+SNAP_KEEP = 2
+SNAP_MARKER = ".cascade_snapshot"
 
 
 class MktOffloadError(ConnectionError):
@@ -222,7 +249,7 @@ def cache_setup_command(cache_root: str, key: str) -> str:
     files = " ".join(q(f) for f in CKPT_FILES)
     prune = (f"cd {q(cache_root)} && "
              "find . -maxdepth 1 -name '*.part-*' -mmin +360 -exec rm -rf {} + ; "
-             f"ls -1t | grep -v -e '[.]part-' -e {q('^' + key + '$')} "
+             f"ls -1t | grep -v -e '[.]part-' -e {q('^' + SNAP_PREFIX)} -e {q('^' + key + '$')} "
              f"| tail -n +{CACHE_KEEP} | xargs -r rm -rf --")
     return (f"umask 077 && mkdir -p {q(cache_root)} && {{ ( {prune} ) || true; }} && "
             f"{{ cd {q(cache_root + '/' + key)} 2>/dev/null && touch . && "
@@ -244,6 +271,7 @@ class MktSession:
         self._err = None
         self._models: dict[str, RemoteForecaster] = {}
         self.calls = 0
+        self.hello: dict = {}
 
     # transport
 
@@ -272,6 +300,7 @@ class MktSession:
         except OSError as e:
             raise MktOffloadError(f"ssh to {h.name} failed to start: {e}") from e
         hello, _ = self.call({"op": "hello"}, timeout_s=180.0)
+        self.hello = dict(hello)
         if hello.get("schema") != SCHEMA:
             raise MktOffloadError(f"{h.name}: worker schema {hello.get('schema')!r} != {SCHEMA!r}")
         log.info("marketcast offload: worker up on %s (%s %s)", h.name,
@@ -308,7 +337,12 @@ class MktSession:
         return bytes(buf)
 
     def call(self, header: dict, arrays: dict | None = None, *,
-             timeout_s: float | None = None) -> tuple[dict, dict]:
+             timeout_s: float | None = None, exact: bool = False) -> tuple[dict, dict]:
+        """One request. ``exact`` (the judge ops): a non-infra error comes
+        back as the type the pod raised — ``MktForwardError`` and
+        ``ValueError`` themselves, anything else :class:`MktRemoteError`
+        carrying the type name — so the rows record what the in-process path
+        would have recorded."""
         if self.proc is None:
             raise MktOffloadError("marketcast offload session not started")
         deadline = time.monotonic() + float(timeout_s or self.call_timeout_s)
@@ -332,6 +366,12 @@ class MktSession:
             raise MktOffloadError(f"{self.host.name}: {err}: {msg}")
         if err == "ValueError":
             raise ValueError(msg)
+        if exact:
+            if err == "MktForwardError":
+                from .marketcast import MktForwardError
+
+                raise MktForwardError(msg)
+            raise MktRemoteError(err, msg)
         raise RuntimeError(f"{err}: {msg}")
 
     def close(self) -> None:
@@ -430,6 +470,187 @@ class MktSession:
         fc = RemoteForecaster(self, model, tuple(reply.get("levels", ())))
         self._models[model] = fc
         return fc
+
+    # the judge
+
+    @property
+    def has_judge(self) -> bool:
+        return "judge" in tuple(self.hello.get("ops") or ())
+
+    def upload_snapshot(self, snap) -> str:
+        """``snap``'s directory in the pod cache as ``snap-<digest>`` (dir
+        relative to the worker's --root), uploaded only when no copy marked
+        with this digest is there; a cache filesystem without room fails
+        before the copy. The pod re-verifies every file's sha256 on load."""
+        from ..trainer.remote import build_ssh_argv
+        from .eval_offload import _FREE_TAG, bench_free_bytes, build_scp_argv
+
+        q = shlex.quote
+        digest = str(snap.digest)
+        key = f"{SNAP_PREFIX}{digest[:48]}"
+        root = cache_root_of(self.host)
+        local = Path(snap.root)
+
+        def step(argv, what, timeout):
+            proc = self.run(argv, timeout)
+            if proc.returncode:
+                raise MktOffloadError(f"{self.host.name}: {what} failed (exit "
+                                      f"{proc.returncode}): {(proc.stderr or '')[-300:]}")
+            return proc
+
+        setup = (f"umask 077 && mkdir -p {q(root)} && {{ ( cd {q(root)} && "
+                 f"ls -1td {q(SNAP_PREFIX)}* 2>/dev/null | grep -v -e '[.]part-' "
+                 f"-e {q('^' + key + '$')} | tail -n +{SNAP_KEEP} | xargs -r rm -rf -- ) "
+                 f"|| true; }} && {{ cat {q(root + '/' + key + '/' + SNAP_MARKER)} "
+                 f"2>/dev/null && touch {q(root + '/' + key)} || true; }}; "
+                 f"echo; echo {_FREE_TAG}$(df -PB1 {q(root)} 2>/dev/null | awk 'NR==2{{print $4}}')")
+        got = step(build_ssh_argv(self.host, setup), "snapshot cache setup", 120)
+        if digest in (got.stdout or "").split():
+            return key
+        size = sum(p.stat().st_size for p in local.rglob("*") if p.is_file())
+        need = size + UPLOAD_HEADROOM_BYTES
+        free = bench_free_bytes(got.stdout)
+        if free is not None and free < need:
+            msg = (f"{self.host.name}: pod disk short for the snapshot upload: "
+                   f"{free / 1e9:.1f} GB free on the MarketCast cache filesystem ({root}) "
+                   f"< {need / 1e9:.1f} GB needed")
+            log.error("marketcast offload: %s", msg)
+            raise MktOffloadError(msg)
+        part = f"{root}/{key}.part-{uuid.uuid4().hex[:12]}"
+        started = time.monotonic()
+        step(build_scp_argv(self.host, str(local), part), "snapshot upload", UPLOAD_TIMEOUT_S)
+        step(build_ssh_argv(self.host, f"echo {q(digest)} > {q(part + '/' + SNAP_MARKER)} && "
+                            f"rm -rf {q(root + '/' + key)} && mv {q(part)} {q(root + '/' + key)}"),
+             "snapshot publish", 120)
+        log.info("marketcast offload: uploaded snapshot %s (%.0f MB) to %s in %.0fs",
+                 digest[:16], size / 1e6, self.host.name, time.monotonic() - started)
+        return key
+
+
+class PodJudge:
+    """The judge of one round on the pod: the same three functions the
+    in-process path calls (:func:`~cascade.validator.marketcast.
+    compute_entry_rows`, ``near_dup_record``, ``holder_record``), with the
+    same results and the same exceptions, computed by the worker. The box
+    fetches, checks and uploads every checkpoint the pod may need
+    (``load_ft``) and keeps nothing heavier than the rows and the sidecars it
+    publishes."""
+
+    def __init__(self, session: MktSession, base: RemoteForecaster, load_ft):
+        self.sess, self.base, self._load = session, base, load_ft
+        self.snapshot = ""
+        self.round_id = ""
+        self._specs: dict = {}
+        self.pod_peak_rss_mb = -1
+
+    def begin_round(self, snap, mc, round_id: str) -> None:
+        """Upload + bind the snapshot and the config; reset the round's
+        caches on the pod (the box's ``ft_cache`` is per round too). Any
+        failure is the pod's (:class:`MktOffloadError`: the round waits)."""
+        try:
+            self._begin_round(snap, mc, round_id)
+        except MktOffloadError:
+            raise
+        except Exception as e:  # noqa: BLE001 — a pod that cannot hold the round
+            raise MktOffloadError(f"{self.sess.host.name}: judge setup failed: "
+                                  f"{type(e).__name__}: {e}") from e
+
+    def _begin_round(self, snap, mc, round_id: str) -> None:
+        text = mc_to_wire(mc)
+        if mc_from_wire(text) != mc:
+            raise MktOffloadError("the [marketcast] table does not survive its wire form; "
+                                  "refusing to judge on the pod")
+        rel = self.sess.upload_snapshot(snap)
+        got, _ = self.sess.call({"op": "judge_snapshot", "dir": rel, "digest": str(snap.digest),
+                                 "schema": str(getattr(mc, "pool_schema", "") or ""),
+                                 "select": [list(x) for x in getattr(mc, "pool_select", ())],
+                                 "channels": [list(x) for x in getattr(mc, "pool_channels", ())]},
+                                timeout_s=UPLOAD_TIMEOUT_S)
+        if got.get("digest") != snap.digest or \
+                got.get("meta_sha256") != snapshot_meta_sha256(snap.meta):
+            raise MktOffloadError(f"{self.sess.host.name}: the pod's snapshot view "
+                                  f"{str(got.get('digest'))[:16]} is not the box's "
+                                  f"{str(snap.digest)[:16]}")
+        got, _ = self.sess.call({"op": "judge_round", "mc": text})
+        if got.get("mc_sha256") != wire_sha256(text):
+            raise MktOffloadError(f"{self.sess.host.name}: the pod parsed another "
+                                  "[marketcast] table")
+        self.snapshot, self.round_id, self._specs = str(snap.digest), str(round_id), {}
+
+    def _spec(self, pointer: str, *, ref: bool = False) -> dict:
+        """What ``load_ft(pointer)`` gave on the box, as the pod replays it
+        at the point the in-process path called it. A loaded model is kept
+        for the round; a fault or an error is re-tried on every call, as the
+        in-process path did. ``ref``: a reference's load is inside the
+        reference test's own ``except`` (an unloadable reference — even a
+        failed upload — is skipped), a fine-tune's offload failure is the
+        pod's (the round waits)."""
+        from .marketcast import MktFault
+
+        hit = self._specs.get(pointer)
+        if hit is not None:
+            return hit
+        try:
+            fc, covs = self._load(pointer)
+            if not isinstance(fc, RemoteForecaster) or fc.session is not self.sess:
+                raise MktOffloadError(f"fine-tune {pointer[:40]} is not loaded on the pod")
+        except MktFault as e:
+            return {"fault": str(e)}
+        except MktOffloadError as e:
+            if not ref:
+                raise
+            return {"error": type(e).__name__, "msg": str(e)}
+        except Exception as e:  # noqa: BLE001 — replayed on the pod where load_ft ran
+            return {"error": type(e).__name__, "msg": str(e)}
+        sp = {"model": fc.model, "covariates": list(covs)}
+        self._specs[pointer] = sp
+        return sp
+
+    def _call(self, header: dict) -> tuple[dict, bytes | None]:
+        import hashlib
+
+        got, arr = self.sess.call({**header, "snapshot": self.snapshot,
+                                   "round_id": self.round_id}, exact=True)
+        blob = None
+        if "blob" in arr:
+            blob = arr["blob"].astype(np.uint8, copy=False).tobytes()
+            if hashlib.sha256(blob).hexdigest() != got.get("blob_sha256"):
+                raise MktOffloadError(f"{self.sess.host.name}: a judge reply's sidecar does "
+                                      "not match its sha256")
+        self.pod_peak_rss_mb = int(got.get("pod_peak_rss_mb", -1))
+        return got, blob
+
+    def compute_entry_rows(self, entry, *, phase: str, after: float, draw: dict | None,
+                           round_id: str):
+        """``(rows, sidecar bytes | None)`` exactly as
+        :func:`~cascade.validator.marketcast.compute_entry_rows`."""
+        sp = self._spec(entry.trained_pointer)
+        got, blob = self._call({
+            "op": "judge_rows", "phase": str(phase), "after": float(after),
+            "draw": dict(draw or {}), "base": self.base.model,
+            "entry": {"miner_hotkey": entry.miner_hotkey,
+                      "trained_pointer": entry.trained_pointer, "target": entry.target},
+            "specs": {entry.trained_pointer: sp}})
+        log.info("marketcast round=%s: %s rows judged on %s (%d windows; pod peak RSS %d MB)",
+                 round_id, entry.miner_hotkey[:12], self.sess.host.name,
+                 int(got.get("windows", 0)), self.pod_peak_rss_mb)
+        return rows_from_wire(got["rows"]), blob
+
+    def near_dup_record(self, rows, refs) -> tuple[dict, bytes | None]:
+        if not refs or not rows.windows:
+            return {}, None
+        specs = {str(p): self._spec(str(p), ref=True) for _h, p, _c in refs}
+        got, blob = self._call({"op": "judge_near_dup", "rows": rows_to_wire(rows),
+                                "refs": [list(r) for r in refs], "specs": specs})
+        return dict(got.get("near_dup") or {}), blob
+
+    def holder_record(self, rows, holder):
+        if holder is None or not rows.windows or holder[1] == rows.trained_pointer:
+            return rows, None
+        got, blob = self._call({"op": "judge_holder", "rows": rows_to_wire(rows),
+                                "holder": list(holder),
+                                "specs": {str(holder[1]): self._spec(str(holder[1]), ref=True)}})
+        return rows_from_wire(got["rows"]), blob
 
 
 # ── qualification ────────────────────────────────────────────────────────────

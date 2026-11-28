@@ -1,0 +1,13 @@
+# W-MKTOFF (owner 2026-11-28, after the 10:54 validator OOM kill): the
+# MarketCast judge (windows, covariate rows, forecasts, scores, the
+# near-duplicate and holder tests) on the MarketCast pod; README.md has the
+# contract.
+# The worker's judge_* ops, the wire forms and the pod-side forecaster.
+cascade/validator/mkt_worker.py
+# PodJudge, the snapshot upload, the exact error mapping, the cache prune.
+cascade/validator/mkt_offload.py
+# The publish path's judge selection, the box judge cap, the round RSS log.
+cascade/validator/marketcast.py
+# IR010 extended to the MarketCast judge's materialisers (rule, book).
+scripts/check_incident_rules.py
+docs/INCIDENT_RULES.md
