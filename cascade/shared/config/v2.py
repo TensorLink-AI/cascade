@@ -158,6 +158,13 @@ class V2Config:
     # tick and raises an operator alert while it is true. Default false: an
     # unqualified after release is refused (no post-switch rent/dispatch).
     image_after_unqualified_override: bool = False
+    # W-IMG retro item 8 (2026-11-28): the override EXPIRES. Required while
+    # the override is true (the loader refuses a dateless override, and one
+    # more than image_qualification.MAX_OVERRIDE_DAYS ahead): an ISO-8601 UTC
+    # time ("2026-11-30T00:00Z") or date. From that instant the override is
+    # NOT honoured — the unqualified after release is refused again (ERROR +
+    # operator alert; legs wait unburned). "" = no override.
+    image_after_unqualified_override_until: str = ""
     # W-IMG (plan rev6.24 (e), owner 2026-11-24; CONSENSUS, release-then-
     # activate): the image-per-seed-epoch rule. From the first v2 SEED EPOCH
     # starting at or after this block (an era start; a block inside a seed
@@ -442,6 +449,21 @@ def parse_v2_economics(v2raw: dict) -> dict:
     if not isinstance(ov, bool):
         raise ValueError(f"[v2] image_after_unqualified_override must be true/false; got {ov!r}")
     out["image_after_unqualified_override"] = ov
+    until = v2raw.get("image_after_unqualified_override_until", "")
+    if not isinstance(until, str):
+        raise ValueError("[v2] image_after_unqualified_override_until must be an ISO-8601 "
+                         f"string; got {until!r}")
+    if ov and not until.strip():
+        raise ValueError("[v2] image_after_unqualified_override = true needs "
+                         "image_after_unqualified_override_until (an override expires: "
+                         'e.g. "2026-11-30T00:00Z")')
+    if until.strip() and not ov:
+        raise ValueError("[v2] image_after_unqualified_override_until is set but the "
+                         "override is false (set both or neither)")
+    from ..image_qualification import check_override_until
+
+    out["image_after_unqualified_override_until"] = check_override_until(
+        "[v2] image_after_unqualified_override_until", until)
     out["bench_source"], out["bench_source_from_block"] = parse_bench_source(v2raw)
     out.update(parse_bench_source_bounds(v2raw))
     ladder = v2raw.get("king_ladder", False)

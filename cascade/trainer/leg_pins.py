@@ -86,16 +86,22 @@ def leg_round(runner):
     mc = getattr(cfg, "marketcast", None)
     if getattr(_local(runner), "mkt_leg", False) and getattr(mc, "pod_image", ""):
         # a MarketCast leg on its own release ([marketcast] pod_image): the SKU
-        # wall table was measured for lane-A training, so its gate stays off
-        from dataclasses import replace
-
-        return replace(cfg.round, funded_pod_image=mc.pod_image,
-                       worker_code_fingerprint=mc.worker_code_fingerprint,
-                       funded_sku_wall_measured_image="")
+        # wall table was measured for lane-A training, so its gate stays off.
+        # W-IMG retro item 8: never rented on an unqualified pod_image.
+        require_mkt_qualified(cfg, "rent")
+        return _mkt_round(cfg, mc)
     if not contract_runs_after(cfg, leg_contract(runner)):
         return cfg.round
     require_after_qualified(cfg, "rent")
     return round_pins_at(cfg, image_after_from(cfg))
+
+
+def _mkt_round(cfg, mc):
+    from dataclasses import replace
+
+    return replace(cfg.round, funded_pod_image=mc.pod_image,
+                   worker_code_fingerprint=mc.worker_code_fingerprint,
+                   funded_sku_wall_measured_image="")
 
 
 def leg_round_view(runner):
@@ -105,7 +111,7 @@ def leg_round_view(runner):
     cfg = runner.cfg
     mc = getattr(cfg, "marketcast", None)
     if getattr(_local(runner), "mkt_leg", False) and getattr(mc, "pod_image", ""):
-        return leg_round(runner)
+        return _mkt_round(cfg, mc)
     if not contract_runs_after(cfg, leg_contract(runner)):
         return cfg.round
     return round_pins_at(cfg, image_after_from(cfg))
@@ -165,11 +171,34 @@ def require_after_qualified(cfg, what: str) -> None:
     fails as an operator fault (unburned) and waits for a record."""
     why = after_image_refusal(cfg)
     if why:
-        log.error("DEC-CA-0067: REFUSING %s on the after image %s — %s. Commit the "
-                  "qualification record (scripts/write_image_qualification.py) or, in an "
-                  "emergency only, set [v2] image_after_unqualified_override = true",
+        log.error("DEC-CA-0067: REFUSING %s on the after image %s — %s. Qualify it "
+                  "(docs/OPERATOR.md \"Releasing a worker image\") or, in an emergency "
+                  "only, set [v2] image_after_unqualified_override = true with "
+                  "image_after_unqualified_override_until",
                   what, str(cfg.v2.train_image_digest_after)[:19], why)
         raise ImageAfterUnqualified(f"after image not qualified ({what}): {why}")
+
+
+def mkt_image_refusal(cfg) -> str:
+    """Why ``[marketcast] pod_image`` must NOT be rented, or "" (qualified,
+    the dated override is on, or no pod_image)."""
+    from ..shared.image_qualification import mkt_qualification_status
+
+    st = mkt_qualification_status(cfg)
+    return "" if st.usable else st.reason
+
+
+def require_mkt_qualified(cfg, what: str) -> None:
+    """Raise :class:`MktImageUnqualified` (loud ERROR) when the MarketCast
+    pod image is not qualified: the leg fails as an operator fault
+    (unburned) and waits for the record — never a fallback image."""
+    why = mkt_image_refusal(cfg)
+    if why:
+        log.error("W-IMG: REFUSING MarketCast %s on [marketcast] pod_image %s — %s. Qualify "
+                  "it (docs/OPERATOR.md \"Releasing a worker image\") or, in an emergency "
+                  "only, set [marketcast] pod_image_unqualified_override_until",
+                  what, image_digest(str(cfg.marketcast.pod_image))[:19], why)
+        raise MktImageUnqualified(f"MarketCast pod image not qualified ({what}): {why}")
 
 
 @contextlib.contextmanager
@@ -226,6 +255,11 @@ class LegImageUnverified(LegImageMismatch):
 class ImageAfterUnqualified(LegImageMismatch):
     """A post-switch leg whose ``[v2] *_after`` release has no valid
     qualification record (the owner's bit-identical rule)."""
+
+
+class MktImageUnqualified(LegImageMismatch):
+    """A MarketCast leg whose ``[marketcast] pod_image`` has no valid
+    ``qualifications/mkt-<img12>.json`` record (W-IMG retro item 8)."""
 
 
 # ── the deployed chain.toml a post-switch leg's worker loads ────────────────
@@ -538,15 +572,23 @@ def image_qualification_condition(cfg) -> dict | None:
     ``image_after_unqualified`` (armed without a valid record — every
     post-switch leg is refused) or ``image_after_override`` (used unqualified
     under the owner's emergency override)."""
-    from ..shared.image_qualification import qualification_status
+    from ..shared.image_qualification import mkt_qualification_status, qualification_status
 
-    if not image_after_armed(cfg):
-        return None
-    st = qualification_status(cfg)
-    if not st.usable:
-        return {"code": "image_after_unqualified", "scope": "image", "reason": st.reason[:300]}
-    if st.override and not st.qualified:
-        return {"code": "image_after_override", "scope": "image", "reason": st.reason[:300]}
+    if image_after_armed(cfg):
+        st = qualification_status(cfg)
+        if not st.usable:
+            return {"code": "image_after_unqualified", "scope": "image",
+                    "reason": st.reason[:300]}
+        if st.override and not st.qualified:
+            return {"code": "image_after_override", "scope": "image",
+                    "reason": st.reason[:300]}
+    if str(getattr(getattr(cfg, "marketcast", None), "pod_image", "") or ""):
+        st = mkt_qualification_status(cfg)
+        if not st.usable:
+            return {"code": "mkt_image_unqualified", "scope": "image",
+                    "reason": st.reason[:300]}
+        if st.override and not st.qualified:
+            return {"code": "mkt_image_override", "scope": "image", "reason": st.reason[:300]}
     return None
 
 
@@ -560,6 +602,14 @@ def log_image_qualification(cfg) -> dict | None:
         log.error("DEC-CA-0067: [v2] *_after release %s is NOT QUALIFIED — every post-switch "
                   "rent/dispatch on it is refused (legs wait as operator faults): %s",
                   str(cfg.v2.train_image_digest_after)[:19], cond["reason"])
+    elif cond["code"] == "mkt_image_unqualified":
+        log.error("W-IMG: [marketcast] pod_image %s is NOT QUALIFIED — every MarketCast rent "
+                  "is refused (legs wait as operator faults): %s",
+                  image_digest(str(cfg.marketcast.pod_image))[:19], cond["reason"])
+    elif cond["code"] == "mkt_image_override":
+        log.error("W-IMG: [marketcast] pod_image %s is used WITHOUT a qualification record "
+                  "(%s). Emergency only: qualify it before the override expires",
+                  image_digest(str(cfg.marketcast.pod_image))[:19], cond["reason"])
     else:
         log.error("DEC-CA-0067: [v2] image_after_unqualified_override = true — the after "
                   "release %s is used WITHOUT a qualification record (%s). Emergency only: "

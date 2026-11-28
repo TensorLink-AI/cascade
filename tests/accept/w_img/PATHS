@@ -67,3 +67,22 @@ deploy/pod_bootstrap.sh
 .github/workflows/publish-mkt-public.yml
 .github/workflows/king-sync.yml
 .github/workflows/laned-king-sync.yml
+# Retro item 8 (owner 2026-11-28): images built, qualified and smoke-tested by
+# the pipeline before any pin points at them. The /2 qualification record
+# (build manifest + per-role smoke + measured walls + golden files), the
+# MarketCast record, the dated overrides and their loader parsing, the
+# MarketCast rent refusal, the build manifest (publish-worker + the
+# Dockerfile probe stage), the one-pod job + driver + per-role smoke, the
+# harness's --solo mode, the record writer's golden mode and the runbook.
+cascade/shared/image_qualification.py
+cascade/shared/config/marketcast.py
+.github/workflows/publish-worker.yml
+scripts/worker_image_manifest.py
+scripts/qualify_worker_image.py
+scripts/image_smoke.py
+scripts/qualify_pyramid_bitwise.py
+scripts/write_image_qualification.py
+deploy/qualify/worker_image_job.toml
+tests/unit/test_image_qualification.py
+tests/unit/test_marketcast_pod_image.py
+tests/unit/test_worker_config_push.py

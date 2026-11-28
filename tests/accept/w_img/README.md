@@ -83,3 +83,29 @@ reproducibility-contract decision, signed off by the owner.**
     reports a legacy image (no marker) without refusing it.
 
 No torch: never run torch-backed files or `make laned-e2e` on the ops box.
+
+## Retro item 8: images built, qualified and smoke-tested by the pipeline (owner 2026-11-28)
+
+`test_w_img_qualify_pipeline.py`:
+
+- a bitwise-only `/1` record no longer qualifies an `*_after` image. A `/2`
+  record must carry:
+  - the publish-worker build manifest;
+  - a passing 30-step smoke for every fleet role (the bf16 autocast backward,
+    the full gang);
+  - measured walls on the SKU's own GPU count;
+  - the golden files;
+- `[marketcast] pod_image` is refused without `qualifications/mkt-<to12>.json`.
+  That record needs the flat-context forward to be bit-identical to the
+  previous MarketCast image's, and a pipeline build;
+- an override needs a date at most 14 days ahead. It stops being honoured at
+  that date;
+- the build manifest is the checkout's lock-frozen build: fingerprint, lock,
+  marker, arch list. CI emits it from a Dockerfile probe stage, without
+  pulling the image;
+- the smoke verdicts catch the three paid-leg classes: the rc15 single-GPU
+  leg, the rc4 bf16 crash and the lane C NaN;
+- the job plans one cheap Lium pod and emits ONE config patch (the 5 pins +
+  the walls);
+- docs/OPERATOR.md orders the release: build, qualify, walls, record, patch,
+  repin at a seed-epoch start.
