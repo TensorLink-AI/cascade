@@ -93,6 +93,8 @@ N_LEVELS = 9
 # uv_extras). ``boto3`` only when the public half reads the Hippius mirror.
 HOST_MODULES = {
     "forecast": ("torch", "safetensors"),
+    # W-OFFBOX: the settlement's pool phase forecasts like `forecast`
+    "settle": ("torch", "safetensors"),
     "public": ("torch", "safetensors", "pyarrow"),
     # the warm sweep moves bytes only (no decode, no model)
     "warm-public": ("boto3",),
@@ -302,6 +304,29 @@ def _lane_d_contract(chain_toml):
     raise ValueError(f"the chain.toml pins no {LANE_D_ARCH} contract")
 
 
+def forecast_on_host(digest: str, windows: Sequence[Mapping], *, cache_dir,
+                     budget_bytes: int, device: str, context: int, horizon: int, contexts,
+                     pinned: Mapping, grant: Mapping | None, chain_toml=None) -> np.ndarray:
+    """One digest's forecasts on this host's prefetch cache (the body of a
+    ``forecast`` request, and of each digest of a W-OFFBOX ``settle``
+    request); every refusal is a :class:`LaneDForecastError`."""
+    cache = PrefetchCache(cache_dir, budget_bytes=int(budget_bytes),
+                          king_d=pinned.get("king_d") or None, house=pinned.get("house") or None)
+    try:
+        contract = None
+        if grant is not None and digest not in cache.entries():
+            try:
+                contract = _lane_d_contract(chain_toml)
+            except Exception as e:  # noqa: BLE001 — this host's config, not the miner's bytes
+                raise LaneDForecastError("checkpoint_unavailable",
+                                         f"no lane D contract to ingest against ({e})") from e
+        return forecast_entry(cache, digest, windows, context=context, horizon=horizon,
+                              contexts=tuple(contexts), grant=grant, contract=contract,
+                              device=device)
+    except CacheError as e:
+        raise LaneDForecastError("checkpoint_refused", str(e)) from e
+
+
 def serve_forecast(raw: bytes, *, cache_dir, budget_bytes: int, device: str,
                    chain_toml=None) -> dict:
     """Answer one request: the :data:`REPLY_SCHEMA` record. ``ValueError`` on
@@ -322,27 +347,14 @@ def serve_forecast(raw: bytes, *, cache_dir, budget_bytes: int, device: str,
         raise ValueError("request grant must be an object or null")
     windows = [{"window_id": wid, "history": h}
                for wid, h in zip(meta["window_ids"], histories, strict=True)]
-    cache = PrefetchCache(cache_dir, budget_bytes=int(budget_bytes),
-                          king_d=pinned.get("king_d") or None, house=pinned.get("house") or None)
     try:
-        contract = None
-        if grant is not None and digest not in cache.entries():
-            try:
-                contract = _lane_d_contract(chain_toml)
-            except Exception as e:  # noqa: BLE001 — this host's config, not the miner's bytes
-                raise LaneDForecastError("checkpoint_unavailable",
-                                         f"no lane D contract to ingest against ({e})") from e
-        q = forecast_entry(cache, digest, windows, context=context, horizon=horizon,
-                           contexts=tuple(contexts), grant=grant, contract=contract,
-                           device=device)
+        q = forecast_on_host(digest, windows, cache_dir=cache_dir, budget_bytes=budget_bytes,
+                             device=device, context=context, horizon=horizon,
+                             contexts=contexts, pinned=pinned, grant=grant,
+                             chain_toml=chain_toml)
     except LaneDForecastError as e:
         log.warning("lane_d_forecast_refused %s digest=%s detail=%s", e.code, digest, e.detail)
         return {"schema": REPLY_SCHEMA, "ok": False, "code": e.code, "detail": e.detail}
-    except CacheError as e:
-        log.warning("lane_d_forecast_refused checkpoint_refused digest=%s detail=%s",
-                    digest, e)
-        return {"schema": REPLY_SCHEMA, "ok": False, "code": "checkpoint_refused",
-                "detail": str(e)}
     log.info("lane_d_forecast_ok digest=%s windows=%d context=%d", digest, len(windows), context)
     return {"schema": REPLY_SCHEMA, "ok": True, "quantiles": q.tolist()}
 
@@ -581,6 +593,17 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="this host's chain.toml (the contract a cache miss ingests against)")
     q.add_argument("--public-workers", type=int, default=None,
                    help="series read at once (default: the mirror config's read_workers)")
+    s = sub.add_parser("settle", help="W-OFFBOX: one settlement's pool phase (pins, windows, "
+                       "forecasts, scores) read as JSON from stdin")
+    s.add_argument("--cache-dir", type=Path, required=True, help="the W15 prefetch cache root")
+    s.add_argument("--budget-bytes", type=int, required=True, help="the cache byte budget")
+    s.add_argument("--device", default="cuda")
+    s.add_argument("--pool-root", type=Path, required=True,
+                   help="this host's copy of the pinned pool_d snapshots (<root>/<snapshot>/)")
+    s.add_argument("--score-cache-dir", type=Path, default=None,
+                   help="this host's B6 score cache (default: none)")
+    s.add_argument("--chain-toml", type=Path, default=None,
+                   help="this host's chain.toml (the contract a cache miss ingests against)")
     w = sub.add_parser("warm-public", help="fill the public blob cache with whole source "
                        "mirrors ahead of a settlement (resumable)")
     w.add_argument("--index", action="append", required=True, metavar="SOURCE=INDEX_SHA256",
@@ -647,7 +670,20 @@ def main(argv: list[str] | None = None) -> int:
         print(refusal, file=sys.stderr)
         return EXIT_MISSING_MODULES
     try:
-        if args.cmd == "public":
+        if args.cmd == "settle":
+            from .lane_d_settle import LocalForecaster, serve_settle
+
+            score_cache = None
+            if args.score_cache_dir is not None:
+                from ..validator.lane_d_score_cache import ScoreCache
+
+                score_cache = ScoreCache(args.score_cache_dir)
+            reply = serve_settle(sys.stdin.buffer.read(), pool_root=args.pool_root,
+                                 forecaster=LocalForecaster(
+                                     cache_dir=args.cache_dir, budget_bytes=args.budget_bytes,
+                                     device=args.device, chain_toml=args.chain_toml),
+                                 score_cache=score_cache)
+        elif args.cmd == "public":
             mirror = None
             if args.public_root is None:
                 try:
@@ -677,7 +713,7 @@ def main(argv: list[str] | None = None) -> int:
 __all__ = ["EXIT_MISSING_MODULES", "FORECAST_ERROR_CODES", "HOST_MODULES",
            "MINER_FAULT_CODES", "PUBLIC_REPLY_SCHEMA", "PUBLIC_REQUEST_SCHEMA",
            "REPLY_SCHEMA", "REQUEST_SCHEMA", "LaneDForecastError", "check_host_modules",
-           "decode_request", "encode_request", "forecast_entry", "main",
+           "decode_request", "encode_request", "forecast_entry", "forecast_on_host", "main",
            "missing_host_modules", "public_scores_entry", "serve_forecast", "serve_public",
            "warm_public"]
 

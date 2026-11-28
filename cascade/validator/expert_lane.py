@@ -177,8 +177,10 @@ def merge_check_dirs(kd: Path, cd: Path, selection: dict, *, strict: bool) -> st
         from ..trainer.expert_lane import _moe_names, check_finite_rows
         from ..trainer.moe_model import merge_expert_slices
 
+        # incident-ok: IR010 baseline 2026-11-28: lane B expert merge, one checkpoint pair at a time
         cand = load_file(str(cd / "weights.safetensors"))
         names = _moe_names(kd)
+        # incident-ok: IR010 baseline 2026-11-28: lane B expert merge, one checkpoint pair at a time
         merge_expert_slices(load_file(str(kd / "weights.safetensors")), cand,
                             selection, names)
         if strict:
@@ -210,10 +212,12 @@ def merged_rebuild_check(load_dir: Callable[[str], Path], base_pointer: str, mer
     from ..trainer.moe_model import MergeError
 
     def load(pointer: str) -> dict:
+        # incident-ok: IR010 baseline 2026-11-28: lane B expert merge, one checkpoint at a time
         return load_file(str(Path(load_dir(pointer)) / "weights.safetensors"))
 
     try:
         base_dir = Path(load_dir(base_pointer))
+        # incident-ok: IR010 baseline 2026-11-28: lane B expert merge, one checkpoint at a time
         want = apply_merges(load_file(str(base_dir / "weights.safetensors")), list(merges),
                             load, _moe_names(base_dir), strict=strict)
         got = load(target_pointer)

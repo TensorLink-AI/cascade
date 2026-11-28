@@ -68,10 +68,12 @@ def _load_series_dir(d: Path) -> tuple[list[np.ndarray], list[str]]:
     series: list[np.ndarray] = []
     ids: list[str] = []
     for p in sorted(d.rglob("*.npy")):
+        # incident-ok: IR010 baseline 2026-11-28: the lane A pool loader (one snapshot)
         arr = np.load(p, allow_pickle=False)
         series.append(np.asarray(arr, dtype=np.float64))
         ids.append(p.stem)
     for p in sorted(d.rglob("*.npz")):
+        # incident-ok: IR010 baseline 2026-11-28: the lane A pool loader (one snapshot)
         with np.load(p, allow_pickle=False) as npz:
             for key in sorted(npz.files):
                 series.append(np.asarray(npz[key], dtype=np.float64))

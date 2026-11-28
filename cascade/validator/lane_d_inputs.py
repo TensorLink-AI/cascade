@@ -122,6 +122,14 @@ INPUTS_ERROR_CODES = (
 )
 
 STATE_FILE = "lane_d_state.json"
+# W-OFFBOX (owner 2026-11-28, after two validator OOM kills: "I said nothing
+# local"): the most pool_d bytes (on disk, summed over the pins) the
+# validator process may load in-process. The reference path refuses above it
+# (``pool_unavailable``) before anything is read: production settles on the
+# lane D eval host (``settle_on_host``), where the pools are loaded and scored.
+BOX_POOL_BUDGET_BYTES = 64 * 1024 * 1024
+SETTLE_REQUEST_SCHEMA = "lane-d-settle-request/1"
+SETTLE_REPLY_SCHEMA = "lane-d-settle-reply/1"
 REVEALED = "revealed"
 ENTRY_FIELDS = ("hotkey", "digest", "context", "coldkey_at_ready", "ready_block",
                 "reveal_block", "reveal_ts")
@@ -188,6 +196,223 @@ def _per_window(arr: np.ndarray, ids: list[str], rows: list[int]) -> dict:
     return out
 
 
+def pinned_windows(pools: Sequence[Mapping], ld: Any, cap: int,
+                   block_hash_of: Callable[[], str] | None, *, bound_lo: float | None = None
+                   ) -> tuple[list[dict], str | None]:
+    """``(windows, channel_block_hash)``: every pinned window with an id,
+    unique by id (the oldest pin's), sorted by id, as exactly ``{"window_id",
+    "history"}`` (plus ``"h"`` under horizon bands). The box (in-process
+    reference path) and the lane D eval host (W-OFFBOX) build the windows
+    with this one function.
+
+    rev6.18 A4 (F2): a multichannel ``(C, L)`` window carries only the
+    channels it is scored on (:func:`~cascade.eval.lane_d_channels.
+    channel_plan` under ``cap`` = ``[generator] max_channels``; the
+    settlement re-derives the same pick); one left is a 1-D history, none
+    drops the window. Only a series wider than the cap calls
+    ``block_hash_of()`` (the boundary's block hash, returned as
+    ``channel_block_hash``), so a univariate pool reads nothing new."""
+    from ..eval.lane_d_channels import apply_pick, channel_plan, empty_channels
+
+    first: dict[str, Any] = {}
+    bands = ld is not None and bands_on(ld)
+    for pool in pools:
+        feeds = pool.get("feeds") or {}
+        for w in pool["windows"]:
+            wid = w["window_id"]
+            if wid and wid not in first:
+                # owner 2026-11-27: a band candidate no cohort can judge
+                # (ineligible at the lowest bound any cohort has, and
+                # eligibility only tightens as the bound grows) is not
+                # forecast; the fixed rule forecasts every window.
+                if bands and bound_lo is not None and window_reason(
+                        w, feeds, float(bound_lo), ld, embargo=True) is not None:
+                    continue
+                first[wid] = w
+    cap = int(cap or 1)
+    multi = [w for w in first.values() if np.ndim(w["history"]) == 2
+             and np.shape(w["history"])[0] > 1]
+    block_hash = None
+    if block_hash_of is not None and any(
+            np.shape(w["history"])[0] - len(empty_channels(w["history"])) > cap
+            for w in multi):
+        block_hash = str(block_hash_of())
+    picks = channel_plan([first[k] for k in sorted(first)], block_hash, cap) if multi else {}
+    out = []
+    for wid in sorted(first):
+        w = apply_pick(first[wid], picks.get(wid))
+        if w is not None:
+            out.append({"window_id": wid, "history": w["history"],
+                        **({"h": int(w["h"])} if bands else {})})
+    return out, block_hash
+
+
+def forecast_windows(eval_host: Any, need: dict[str, int], bars: frozenset[str],
+                     windows: list[dict], fixed_horizon: int, ns, cache) -> dict:
+    """``{digest: {window_id: quantiles}}``: every needed digest's forecasts
+    on ``windows``, one eval host call per (digest, horizon) group (owner
+    2026-11-27; the fixed rule is one group at ``fixed_horizon``), through
+    the B6 score cache ``cache`` under namespace ``ns`` (``None``: no cache).
+    A bar's fault refuses (:class:`LaneDInputsError`); an entry's own fault
+    is recorded non-finite (the settlement closes it ``checkpoint_fault``).
+    The box (in-process reference path) and the lane D eval host (W-OFFBOX)
+    forecast with this one function."""
+    fixed = int(fixed_horizon)
+    groups: dict[int, list[dict]] = {}
+    for w in windows:
+        groups.setdefault(int(w.get("h", fixed)), []).append(w)
+    out: dict[str, dict] = {}
+    used: list = []
+    for horizon in sorted(groups) or [fixed]:
+        got_h = _forecast_group(eval_host, need, bars, groups.get(horizon, []), horizon, ns,
+                                cache, used)
+        for dg, per_w in got_h.items():
+            out.setdefault(dg, {}).update(per_w)
+    if ns is not None:
+        cache.retain(ns, used)
+    return out
+
+
+def _forecast_group(eval_host: Any, need: dict[str, int], bars: frozenset[str],
+                    windows: list[dict], horizon: int, ns, cache, used: list
+                    ) -> dict[str, dict]:
+    """One horizon group's forecasts per digest (a faulted entry's are
+    non-finite, so the settlement closes it ``checkpoint_fault``)."""
+    ids = [w["window_id"] for w in windows]
+    # rev6.18 A4 (F2): one forecast row per univariate window, k per
+    # k-channel window (window-major).
+    per = [_rows_of(w["history"]) for w in windows]
+    n = sum(per)
+    # B6: cache rows are keyed by the window id AND its history bytes (a
+    # recurring id with another history, or another channel pick, is
+    # another key), one key per forecast row.
+    row_keys = [] if ns is None else _row_keys(windows, per)
+    out: dict[str, dict] = {}
+    for dg in sorted(need):
+        bar = dg in bars
+        if ns is not None:
+            used.append((dg, int(need[dg]), horizon))
+            hit = cache.get(ns, dg, context=need[dg], horizon=horizon,
+                            window_ids=row_keys)
+            if hit is not None:
+                out[dg] = _per_window(hit, ids, per)
+                continue
+        try:
+            got = eval_host.forecast(dg, context=need[dg], horizon=horizon,
+                                     windows=[{"window_id": w["window_id"],
+                                               "history": w["history"]}
+                                              for w in windows])
+        except LaneDForecastError as e:
+            if bar or e.code not in MINER_FAULT_CODES:
+                raise LaneDInputsError("forecasts_unavailable",
+                                       f"{dg[:16]}: {e}") from e
+            log.warning("lane D entry %s: checkpoint fault on the eval host (%s); the "
+                        "settlement closes it", dg[:16], e.code)
+            out[dg] = LaneDInputsSource._fault(ids, horizon, per)
+            continue
+        except Exception as e:  # noqa: BLE001 — the host, never the miner
+            raise LaneDInputsError("forecasts_unavailable",
+                                   f"{dg[:16]}: eval host failed ({e})") from e
+        try:
+            arr = np.asarray(got, dtype=np.float64)
+        except (TypeError, ValueError):
+            arr = None
+        if arr is None or not _well_formed(arr, n, horizon):
+            if bar:
+                raise LaneDInputsError("forecast_malformed",
+                                       f"{dg[:16]}: forecasts are not a finite "
+                                       f"({n}, {horizon}, {N_LEVELS}) array")
+            log.warning("lane D entry %s: malformed forecasts; the settlement closes it",
+                        dg[:16])
+            out[dg] = LaneDInputsSource._fault(ids, horizon, per)
+            continue
+        if ns is not None:
+            cache.put(ns, dg, context=need[dg], horizon=horizon, window_ids=row_keys,
+                      quantiles=arr)
+        out[dg] = _per_window(arr, ids, per)
+    return out
+
+
+
+def pool_dir_bytes(d: Path) -> int:
+    """The bytes of one snapshot directory's files (``stat`` only; an absent
+    directory is 0, its load then refuses)."""
+    try:
+        return sum(f.stat().st_size for f in Path(d).iterdir() if f.is_file())
+    except OSError:
+        return 0
+
+
+class RemoteForecasts(dict):
+    """W-OFFBOX: the forecasts of an offloaded settlement, which stay on the
+    eval host: ``{digest: None}`` for every needed digest, so the settlement
+    knows which digests were forecast (the public half binds them) and
+    nothing else."""
+
+    def __init__(self, need: Mapping[str, int]):
+        super().__init__({str(dg): None for dg in sorted(need)})
+
+
+class HostJudge:
+    """W-OFFBOX ``pool_phase``: ``judge(request)`` sends the settlement's
+    judge request (:func:`~cascade.validator.lane_d.judge_request`) with the
+    pins, the needed digests and their contexts to the eval host
+    (``eval_host.settle``) and returns the judged record after binding it to
+    the pins: the host's snapshot digests must be the pins' in order, the seed
+    the newest pin's and every scored snapshot a pinned one. A refusal is the
+    host's typed :class:`LaneDInputsError`."""
+
+    def __init__(self, eval_host: Any, *, boundary: int, pins: list[dict], need: dict,
+                 bars: frozenset, cap: int, bound_lo, block_hash: str, pinned: dict,
+                 armed: list[int], score_ns):
+        self._eval_host = eval_host
+        self.boundary = int(boundary)
+        self.request = {"schema": SETTLE_REQUEST_SCHEMA, "pins": list(pins),
+                        "need": {str(k): int(v) for k, v in sorted(need.items())},
+                        "bars": sorted(str(x) for x in bars), "cap": int(cap),
+                        "bound_lo": None if bound_lo is None else float(bound_lo),
+                        "block_hash": str(block_hash), "pinned": dict(pinned),
+                        "armed": list(armed), "score_ns": score_ns}
+
+    def __call__(self, judge: dict) -> dict:
+        if int(judge.get("boundary", -1)) != self.boundary:
+            raise LaneDInputsError("not_active", f"judge request for {judge.get('boundary')}, "
+                                                 f"inputs for {self.boundary}")
+        try:
+            reply = self._eval_host.settle({**self.request, "judge": judge})
+        except LaneDInputsError:
+            raise
+        except Exception as e:  # noqa: BLE001 — the host, never the miner
+            raise LaneDInputsError("forecasts_unavailable",
+                                   f"eval host settle failed ({e})") from e
+        if not isinstance(reply, dict) or reply.get("schema") != SETTLE_REPLY_SCHEMA:
+            raise LaneDInputsError("forecasts_unavailable",
+                                   f"eval host settle: not a {SETTLE_REPLY_SCHEMA} reply")
+        if not reply.get("ok"):
+            code = str(reply.get("code"))
+            raise LaneDInputsError(code if code in INPUTS_ERROR_CODES else
+                                   "forecasts_unavailable",
+                                   f"eval host settle refused ({reply.get('detail')})")
+        shas = [p["sha256"] for p in self.request["pins"]]
+        judged = reply.get("judged")
+        if reply.get("snapshots") != shas:
+            raise LaneDInputsError("pool_digest_mismatch",
+                                   "the eval host scored other snapshots than the pins")
+        if not isinstance(judged, dict) or judged.get("seed") != (
+                f"lane-d/1:{self.boundary}:{shas[-1]}"):
+            raise LaneDInputsError("pool_digest_mismatch",
+                                   "the judged record's seed is not the newest pin's")
+        snaps = (judged.get("pool_rec") or {}).get("snapshots")
+        if not isinstance(snaps, list) or not all(
+                isinstance(s, dict) and s.get("sha256") in shas for s in snaps):
+            raise LaneDInputsError("pool_digest_mismatch",
+                                   "the judged record names an unpinned snapshot")
+        if reply.get("channel_block_hash") not in (None, self.request["block_hash"]):
+            raise LaneDInputsError("chain_unavailable",
+                                   "the eval host picked channels by another block hash")
+        return judged
+
+
 class LaneDInputsSource:
     """``source(boundary) -> LaneDInputs`` (W8b's ``inputs``) and
     ``source.bench(boundary)`` (W8b's ``bench``); see the module docstring."""
@@ -199,8 +424,13 @@ class LaneDInputsSource:
                  bench_host: Callable | None = None, expected_identity=None,
                  public_indexes: Mapping | None = None,
                  scoring_envs=None, score_cache=None,
-                 cfg_at: Callable[[int], Any] | None = None):
+                 cfg_at: Callable[[int], Any] | None = None,
+                 settle_on_host: bool = False,
+                 box_pool_budget_bytes: int = BOX_POOL_BUDGET_BYTES):
         self.cfg = cfg
+        # W-OFFBOX: the pools, windows, forecasts and scores on the eval host
+        self._settle_on_host = bool(settle_on_host)
+        self._box_pool_budget = int(box_pool_budget_bytes)
         # containment (owner 2026-11-24): the config in force at a boundary
         self._cfg_at = cfg_at
         # rev6.18 A3 (F4): {source: index dir} on the box (W6p indexes).
@@ -328,22 +558,41 @@ class LaneDInputsSource:
         except (LaneDStateError, OSError, KeyError, TypeError, ValueError) as e:
             raise LaneDInputsError("state_unreadable", f"{self.state_path}: {e}") from e
 
-    def _pools(self, boundary: int) -> list[tuple[Path, dict]]:
-        from .lane_d import load_pool_for
-
+    def _pins(self, boundary: int) -> list[Mapping]:
+        """The boundary's pins, checked for shape; nothing is loaded."""
         try:
             pins = list(self._pool(boundary))
         except Exception as e:  # noqa: BLE001 — no pin list: no settlement
             raise LaneDInputsError("pool_unavailable", f"pool_d pins unreadable ({e})") from e
         if not pins:
             raise LaneDInputsError("pool_unavailable", f"no pool_d snapshot pinned at {boundary}")
-        out = []
         for pin in pins:
             if (not isinstance(pin, Mapping) or not isinstance(pin.get("sha256"), str)
                     or not isinstance(pin.get("dir"), (str, os.PathLike))):
                 raise LaneDInputsError("pool_unavailable", f"malformed pool_d pin {pin!r}")
+        return pins
+
+    def _check_box_budget(self, pins: Sequence[Mapping]) -> None:
+        """W-OFFBOX: refuse an in-process load whose pinned bytes exceed the
+        box budget, from the file sizes alone (nothing is read)."""
+        total = sum(pool_dir_bytes(Path(p["dir"])) for p in pins)
+        if total > self._box_pool_budget:
+            raise LaneDInputsError(
+                "pool_unavailable",
+                f"{len(pins)} pinned pool_d snapshots hold {total} bytes, over the box "
+                f"budget {self._box_pool_budget}: refusing to load them in the validator "
+                "process (settle on the lane D eval host: inputs key eval_pool_root)")
+
+    def _pools(self, boundary: int) -> list[tuple[Path, dict]]:
+        from .lane_d import load_pool_for
+
+        pins = self._pins(boundary)
+        self._check_box_budget(pins)
+        out = []
+        for pin in pins:
             d = Path(pin["dir"])
             try:
+                # incident-ok: IR010 the reference path, under the box budget just checked
                 pool = load_pool_for(d, self.cfg.lane_d)
             except Exception as e:  # noqa: BLE001 — absent, unreadable or not pool_d/1
                 raise LaneDInputsError("pool_unavailable",
@@ -463,57 +712,21 @@ class LaneDInputsSource:
 
     def _windows(self, pools: list[tuple[Path, dict]], boundary: int | None = None,
                  bound_lo: float | None = None) -> list[dict]:
-        """Every pinned window with an id, unique by id (the oldest pin's),
-        sorted by id, as exactly ``{"window_id", "history"}``.
-
-        rev6.18 A4 (F2): a multichannel ``(C, L)`` window carries only the
-        channels it is scored on (:func:`~cascade.eval.lane_d_channels.
-        channel_plan` under ``[generator] max_channels``; the settlement
-        re-derives the same pick); one left is a 1-D history, none drops the
-        window. Only a series wider than the cap reads the boundary's block
-        hash (:attr:`channel_block_hash`), so a univariate pool reads
-        nothing new."""
-        from ..eval.lane_d_channels import apply_pick, channel_plan, empty_channels
-
-        self.channel_block_hash = None
-        first: dict[str, Any] = {}
-        ld = getattr(self.cfg, "lane_d", None)
-        bands = ld is not None and bands_on(ld)
-        for _, pool in pools:
-            feeds = pool.get("feeds") or {}
-            for w in pool["windows"]:
-                wid = w["window_id"]
-                if wid and wid not in first:
-                    # owner 2026-11-27: a band candidate no cohort can judge
-                    # (ineligible at the lowest bound any cohort has, and
-                    # eligibility only tightens as the bound grows) is not
-                    # forecast; the fixed rule forecasts every window.
-                    if bands and bound_lo is not None and window_reason(
-                            w, feeds, float(bound_lo), ld, embargo=True) is not None:
-                        continue
-                    first[wid] = w
-        cap = int(getattr(getattr(self.cfg, "generator", None), "max_channels", 1) or 1)
-        multi = [w for w in first.values() if np.ndim(w["history"]) == 2
-                 and np.shape(w["history"])[0] > 1]
-        block_hash = None
-        if boundary is not None and any(
-                np.shape(w["history"])[0] - len(empty_channels(w["history"])) > cap
-                for w in multi):
+        """Every pinned window (:func:`pinned_windows`); the boundary's block
+        hash is read from the chain only when a series is wider than the cap."""
+        def block_hash_of() -> str:
             try:
-                block_hash = str(self._reader().block_hash(int(boundary)))
+                return str(self._reader().block_hash(int(boundary)))
             except LaneDInputsError:
                 raise
             except Exception as e:  # noqa: BLE001 — the boundary hash is the channel pick's input
                 raise LaneDInputsError("chain_unavailable",
                                        f"boundary {boundary} block hash unreadable ({e})") from e
-            self.channel_block_hash = block_hash
-        picks = channel_plan([first[k] for k in sorted(first)], block_hash, cap) if multi else {}
-        out = []
-        for wid in sorted(first):
-            w = apply_pick(first[wid], picks.get(wid))
-            if w is not None:
-                out.append({"window_id": wid, "history": w["history"],
-                            **({"h": int(w["h"])} if bands else {})})
+
+        cap = int(getattr(getattr(self.cfg, "generator", None), "max_channels", 1) or 1)
+        out, self.channel_block_hash = pinned_windows(
+            [pool for _, pool in pools], getattr(self.cfg, "lane_d", None), cap,
+            None if boundary is None else block_hash_of, bound_lo=bound_lo)
         return out
 
     def _bound_lo(self, entries: list[dict], state: dict) -> float:
@@ -556,6 +769,14 @@ class LaneDInputsSource:
                     else "env_unqualified")
             raise LaneDInputsError(code, str(e)) from e
 
+    def _namespace(self, ident, host) -> str | None:
+        """The B6 score-cache namespace of the verified host (``None``: no cache)."""
+        if self._score_cache is None or host is None:
+            return None
+        from .lane_d_score_cache import namespace
+
+        return namespace(host["identity"], ident.package_hash)
+
     def _forecasts(self, need: dict[str, int], bars: frozenset[str], windows: list[dict],
                    state: dict, house: dict, armed: Sequence[int], boundary: int
                    ) -> tuple[dict, dict | None]:
@@ -563,11 +784,7 @@ class LaneDInputsSource:
         # W-IMG: the identity the forecasts ran on (recorded in the report)
         self._eval_identity = {"git_head": str(getattr(ident, "git_head", "") or ""),
                                "package_hash": str(getattr(ident, "package_hash", "") or "")}
-        cache, ns = self._score_cache, None
-        if cache is not None and host is not None:
-            from .lane_d_score_cache import namespace
-
-            ns = namespace(host["identity"], ident.package_hash)
+        cache, ns = self._score_cache, self._namespace(ident, host)
         # the public half's replies are cached in the same namespace
         self._score_ns = ns
         pin = getattr(self._eval_host, "set_pinned", None)
@@ -576,80 +793,8 @@ class LaneDInputsSource:
         arm = getattr(self._eval_host, "set_armed", None)
         if callable(arm):
             arm([int(c) for c in armed])
-        fixed = int(self.cfg.lane_d.horizon)
-        # owner 2026-11-27: one eval host call per (digest, horizon) group;
-        # the fixed rule is one group at ``horizon`` (the pre-band call).
-        groups: dict[int, list[dict]] = {}
-        for w in windows:
-            groups.setdefault(int(w.get("h", fixed)), []).append(w)
-        out: dict[str, dict] = {}
-        used = []
-        for horizon in sorted(groups) or [fixed]:
-            got_h = self._forecast_group(need, bars, groups.get(horizon, []), horizon, ns,
-                                         cache, used)
-            for dg, per_w in got_h.items():
-                out.setdefault(dg, {}).update(per_w)
-        if ns is not None:
-            cache.retain(ns, used)
-        return out, host
-
-    def _forecast_group(self, need: dict[str, int], bars: frozenset[str], windows: list[dict],
-                        horizon: int, ns, cache, used: list) -> dict[str, dict]:
-        """One horizon group's forecasts per digest (a faulted entry's are
-        non-finite, so the settlement closes it ``checkpoint_fault``)."""
-        ids = [w["window_id"] for w in windows]
-        # rev6.18 A4 (F2): one forecast row per univariate window, k per
-        # k-channel window (window-major).
-        per = [_rows_of(w["history"]) for w in windows]
-        n = sum(per)
-        # B6: cache rows are keyed by the window id AND its history bytes (a
-        # recurring id with another history, or another channel pick, is
-        # another key), one key per forecast row.
-        row_keys = [] if ns is None else _row_keys(windows, per)
-        out: dict[str, dict] = {}
-        for dg in sorted(need):
-            bar = dg in bars
-            if ns is not None:
-                used.append((dg, int(need[dg]), horizon))
-                hit = cache.get(ns, dg, context=need[dg], horizon=horizon,
-                                window_ids=row_keys)
-                if hit is not None:
-                    out[dg] = _per_window(hit, ids, per)
-                    continue
-            try:
-                got = self._eval_host.forecast(dg, context=need[dg], horizon=horizon,
-                                               windows=[{"window_id": w["window_id"],
-                                                         "history": w["history"]}
-                                                        for w in windows])
-            except LaneDForecastError as e:
-                if bar or e.code not in MINER_FAULT_CODES:
-                    raise LaneDInputsError("forecasts_unavailable",
-                                           f"{dg[:16]}: {e}") from e
-                log.warning("lane D entry %s: checkpoint fault on the eval host (%s); the "
-                            "settlement closes it", dg[:16], e.code)
-                out[dg] = self._fault(ids, horizon, per)
-                continue
-            except Exception as e:  # noqa: BLE001 — the host, never the miner
-                raise LaneDInputsError("forecasts_unavailable",
-                                       f"{dg[:16]}: eval host failed ({e})") from e
-            try:
-                arr = np.asarray(got, dtype=np.float64)
-            except (TypeError, ValueError):
-                arr = None
-            if arr is None or not _well_formed(arr, n, horizon):
-                if bar:
-                    raise LaneDInputsError("forecast_malformed",
-                                           f"{dg[:16]}: forecasts are not a finite "
-                                           f"({n}, {horizon}, {N_LEVELS}) array")
-                log.warning("lane D entry %s: malformed forecasts; the settlement closes it",
-                            dg[:16])
-                out[dg] = self._fault(ids, horizon, per)
-                continue
-            if ns is not None:
-                cache.put(ns, dg, context=need[dg], horizon=horizon, window_ids=row_keys,
-                          quantiles=arr)
-            out[dg] = _per_window(arr, ids, per)
-        return out
+        return forecast_windows(self._eval_host, need, bars, windows,
+                                int(self.cfg.lane_d.horizon), ns, cache), host
 
     def _public(self, reader: Any, boundary: int, need: dict[str, int],
                 bars: frozenset[str], armed: Sequence[int]) -> tuple[dict | None, dict | None]:
@@ -736,6 +881,58 @@ class LaneDInputsSource:
                 for d in draws}
         return idx, {"scores": scores, "dropped": dropped}
 
+    # ── W-OFFBOX: the settlement's pool phase on the eval host ──────────────
+
+    def _offloaded(self, reader: Any, b: int, entries: list[dict], boundary_ts: int,
+                   uid_of: dict, house: dict, state: dict) -> LaneDInputs:
+        """The inputs with nothing of the pools in this process: the pins are
+        checked for shape, the eval host is verified (W4 handshake), the
+        public half is asked as before, and ``pool_phase`` is the
+        :class:`HostJudge` the settlement calls with its judge request. The
+        eval host then loads the pins from its own copy (re-hashed against
+        each pin), cuts the windows, forecasts and scores them, and returns
+        the judged record."""
+        pins = self._pins(b)
+        armed = self._armed()
+        ctxs = tuple(armed["armed_contexts"])
+        bands = bands_on(self.cfg.lane_d)
+        bound_lo = self._bound_lo(entries, state) if bands else None
+        need, bars = self._needed(entries, state, house, ctxs)
+        ident, host = self._hello(b)
+        self._eval_identity = {"git_head": str(getattr(ident, "git_head", "") or ""),
+                               "package_hash": str(getattr(ident, "package_hash", "") or "")}
+        self._score_ns = self._namespace(ident, host)
+        if not callable(getattr(self._eval_host, "settle", None)):
+            raise LaneDInputsError("forecasts_unavailable",
+                                   "settle_on_host: the eval host cannot settle")
+        public_indexes, public_scores = self._public(reader, b, need, bars, ctxs)
+        set_contexts = getattr(self._bench_host, "set_contexts", None)
+        if callable(set_contexts):
+            set_contexts(dict(need))
+        try:
+            block_hash = str(reader.block_hash(b))
+        except Exception as e:  # noqa: BLE001 — the channel pick's input
+            raise LaneDInputsError("chain_unavailable",
+                                   f"boundary {b} block hash unreadable ({e})") from e
+        host_ns = None
+        if host is not None:
+            from .lane_d_score_cache import namespace
+
+            host_ns = namespace(host["identity"], ident.package_hash)
+        cap = int(getattr(getattr(self.cfg, "generator", None), "max_channels", 1) or 1)
+        judge = HostJudge(self._eval_host, boundary=b, pins=[
+            {"snapshot": Path(p["dir"]).name, "sha256": str(p["sha256"])} for p in pins],
+            need=need, bars=bars, cap=cap, bound_lo=bound_lo, block_hash=block_hash,
+            pinned={"king_d": str(state["king"]["digest"]), "house": str(house["digest"])},
+            armed=[int(c) for c in ctxs], score_ns=host_ns)
+        dirs = [Path(p["dir"]) for p in pins]
+        return LaneDInputs(pool_dir=dirs[-1], entries=entries, forecasts=RemoteForecasts(need),
+                           uid_of=uid_of, house=house, prior_pool_dirs=tuple(dirs[:-1]),
+                           armed=armed, boundary_ts=boundary_ts, channel_block_hash=None,
+                           host=host, eval_identity=self._eval_identity,
+                           public_indexes=public_indexes, public_scores=public_scores,
+                           pool_phase=judge)
+
     @staticmethod
     def _fault(ids: list[str], horizon: int, per: list[int] | None = None) -> dict:
         """A faulted entry's record: malformed (non-finite) on every window, so
@@ -770,6 +967,8 @@ class LaneDInputsSource:
         uid_of = self._uid_of(reader)
         house = self._house()
         state = self._state(house)
+        if self._settle_on_host:
+            return self._offloaded(reader, b, entries, boundary_ts, uid_of, house, state)
         pools = self._pools(b)
         armed = self._armed()
         ctxs = tuple(armed["armed_contexts"])
@@ -799,7 +998,9 @@ def build_lane_d_inputs(cfg: Any, *, state_dir, intake_state_dir,
                         expected_identity=None, scoring_envs=None,
                         score_cache=None, public_indexes: Mapping | None = None,
                         cfg_at: Callable[[int], Any] | None = None,
-                        always: bool = False) -> LaneDInputsSource | None:
+                        always: bool = False, settle_on_host: bool = False,
+                        box_pool_budget_bytes: int = BOX_POOL_BUDGET_BYTES
+                        ) -> LaneDInputsSource | None:
     """The lane D inputs source for ``cfg`` (the full ``ChainConfig``), or
     ``None`` while ``[lane_d] from_block = 0`` (nothing is called, read or
     created). Building an armed source reads nothing. ``readiness`` / ``t7``
@@ -810,7 +1011,10 @@ def build_lane_d_inputs(cfg: Any, *, state_dir, intake_state_dir,
     :class:`~cascade.validator.lane_d_score_cache.ScoreCache` (production
     passes both, :func:`load_inputs_services`). ``always`` / ``cfg_at``
     (containment, owner 2026-11-24): built unarmed too, inert until the
-    config in force at a boundary arms lane D."""
+    config in force at a boundary arms lane D. ``settle_on_host`` (W-OFFBOX,
+    production): the pool phase runs on the eval host (``eval_host.settle``);
+    without it the pools load in this process, refused above
+    ``box_pool_budget_bytes`` on disk."""
     if not always and int(getattr(getattr(cfg, "lane_d", None), "from_block", 0) or 0) <= 0:
         return None
     return LaneDInputsSource(cfg, state_dir=state_dir, intake_state_dir=intake_state_dir,
@@ -819,7 +1023,9 @@ def build_lane_d_inputs(cfg: Any, *, state_dir, intake_state_dir,
                              readiness=readiness, t7=t7, bench_host=bench_host,
                              expected_identity=expected_identity,
                              scoring_envs=scoring_envs, score_cache=score_cache,
-                             public_indexes=public_indexes, cfg_at=cfg_at)
+                             public_indexes=public_indexes, cfg_at=cfg_at,
+                             settle_on_host=settle_on_host,
+                             box_pool_budget_bytes=box_pool_budget_bytes)
 
 
 # ── the production collaborators ─────────────────────────────────────────────
@@ -932,8 +1138,13 @@ class SSHEvalHost:
                  host_name: str = "", device: str = "cuda", timeout_s: float = 3600.0,
                  grants: Callable[[str], dict | None] | None = None,
                  run: Callable | None = None, public_root: str = "",
-                 public_cache_dir: str = "", public_cache_budget_bytes: int = 0):
+                 public_cache_dir: str = "", public_cache_budget_bytes: int = 0,
+                 pool_root: str = "", score_cache_dir: str = ""):
         self.hosts_path = Path(hosts_path)
+        # W-OFFBOX: the host's own pool_d copy (<pool_root>/<snapshot>/, the
+        # box's pins re-hashed there) and its B6 score cache.
+        self.pool_root = str(pool_root or "")
+        self.score_cache_dir = str(score_cache_dir or "")
         # rev6.18 A3 (F4): a LOCAL public mirror root ON the eval host; empty =
         # the Hippius mirror (owner 2026-11-24, #894: the eval host fetches only
         # the drawn series, behind its Lium-volume cache).
@@ -964,7 +1175,7 @@ class SSHEvalHost:
                                f"{self.host_name or '(any/final stage)'}")
         return hosts[0]
 
-    def remote_command(self, host, args: list[str]) -> str:
+    def remote_command(self, host, args: list[str], timeout_s: float | None = None) -> str:
         """The remote shell command of one eval-host request.
 
         A local ``subprocess.run(timeout=)`` kills only the local ``ssh``; the
@@ -979,7 +1190,8 @@ class SSHEvalHost:
         env = ""
         if host.cuda_device is not None:
             env = f"CUDA_VISIBLE_DEVICES={shlex.quote(host.cuda_device)} "
-        bound = max(1, int(self.timeout_s) - REMOTE_KILL_GRACE_S)
+        limit = self.timeout_s if timeout_s is None else float(timeout_s)
+        bound = max(1, int(limit) - REMOTE_KILL_GRACE_S)
         argv = ["timeout", "-k", str(REMOTE_KILL_GRACE_S), str(bound)]
         prep = ""
         if args and args[0] != "hello":
@@ -990,15 +1202,17 @@ class SSHEvalHost:
         return (f"cd {shlex.quote(host.workdir)} && {prep}{env}"
                 + " ".join(shlex.quote(a) for a in argv))
 
-    def _ssh(self, host, args: list[str], payload: bytes) -> str:
+    def _ssh(self, host, args: list[str], payload: bytes,
+             timeout_s: float | None = None) -> str:
         from ..trainer.remote import build_ssh_argv
 
-        cmd = self.remote_command(host, args)
+        limit = self.timeout_s if timeout_s is None else float(timeout_s)
+        cmd = self.remote_command(host, args, timeout_s=limit)
         proc = self._run(build_ssh_argv(host, cmd), input=payload, capture_output=True,
-                         timeout=self.timeout_s, check=False)
+                         timeout=limit, check=False)
         if proc.returncode == 124:
             raise RuntimeError(f"{host.name}: lane D eval host request timed out on the host "
-                               f"(timeout {max(1, int(self.timeout_s) - REMOTE_KILL_GRACE_S)}s)")
+                               f"(timeout {max(1, int(limit) - REMOTE_KILL_GRACE_S)}s)")
         err = (proc.stderr or b"").decode("utf-8", "replace")[-600:]
         if proc.returncode != 0:
             raise RuntimeError(f"{host.name}: lane D eval host exited {proc.returncode}: {err}")
@@ -1060,6 +1274,39 @@ class SSHEvalHost:
         return np.asarray(reply["quantiles"], dtype=np.float64)
 
 
+    def settle(self, request: dict) -> dict:
+        """W-OFFBOX: one settlement's pool phase on the host (``settle``
+        request, JSON both ways): the host loads the pins from ``pool_root``,
+        cuts the windows, forecasts every needed digest (its prefetch cache,
+        each cache miss with its presigned GET grant, added here) and judges
+        them; the reply is the judged record. Bounded on the host like a
+        forecast, at ``eval_timeout_seconds`` per needed digest (the same
+        total as the per-digest calls it replaces)."""
+        host = self._host
+        if host is None:
+            raise RuntimeError("lane D eval host: settle before a matching hello")
+        if not self.pool_root:
+            raise RuntimeError("lane D eval host: settle needs eval_pool_root")
+        grants = {}
+        for dg in sorted(request.get("need") or {}):
+            grant = None
+            if self._grants is not None:
+                try:
+                    grant = self._grants(dg)
+                except Exception as e:  # noqa: BLE001 — a cache hit still scores
+                    log.warning("lane D entry %s: no presigned grant (%s); the eval host "
+                                "scores it only from its cache", dg[:16], e)
+            grants[dg] = grant
+        args = ["settle", "--cache-dir", self.cache_dir, "--budget-bytes",
+                str(self.budget_bytes), "--device", self.device, "--pool-root", self.pool_root]
+        if self.score_cache_dir:
+            args += ["--score-cache-dir", self.score_cache_dir]
+        if host.chain_toml:
+            args += ["--chain-toml", host.chain_toml]
+        payload = json.dumps({**request, "grants": grants}, sort_keys=True).encode("utf-8")
+        limit = self.timeout_s * max(1, len(request.get("need") or {}))
+        return json.loads(self._ssh(host, args, payload, timeout_s=limit))
+
     def public_scores(self, digest: str, *, context: int, horizon: int, draws,
                       block_hash: str, max_channels: int) -> dict:
         """rev6.18 A3 (F4): ``digest``'s per-window scores on the public
@@ -1104,7 +1351,9 @@ INPUTS_FILE_KEYS = ("intake_state_dir", "pool_pins", "house_pointer", "house_sig
                     "eval_device", "eval_timeout_seconds", "grant_expires_seconds",
                     "readiness", "t7", "bench_hosts", "public_indexes", "eval_public_root",
                     "eval_public_cache_dir", "eval_public_cache_budget_bytes",
-                    "scoring_envs", "score_cache_dir")
+                    "scoring_envs", "score_cache_dir",
+                    # W-OFFBOX (2026-11-28)
+                    "eval_pool_root", "eval_score_cache_dir", "box_pool_budget_bytes")
 _REQUIRED_KEYS = ("intake_state_dir", "pool_pins", "house_pointer", "house_signer_ss58",
                   "eval_hosts", "eval_cache_dir", "eval_cache_budget_bytes", "readiness", "t7")
 
@@ -1139,6 +1388,11 @@ def load_inputs_services(cfg: Any, path) -> dict:
         scoring_envs = "/abs/scoring_envs.toml"   # optional (rev6.18 B5): default the
                                                   # release's deploy/laned/scoring_envs.toml
         score_cache_dir = "/abs/lane_d_score_cache"  # optional (B6): no cache without it
+        eval_pool_root = "/root/lane_d_pool_d"    # W-OFFBOX (production): the host's copy of
+                                                  # the pinned snapshots (<root>/<snapshot>/);
+                                                  # set = the pool phase runs ON the host
+        eval_score_cache_dir = "/root/lane_d_score_cache"  # optional: the host's B6 cache
+        box_pool_budget_bytes = 67108864          # optional: the in-process load cap
 
     Returns the keyword arguments. ``bench_host`` is the W3b6a
     :class:`~cascade.validator.lane_d_bench_host.SSHBenchHost` on
@@ -1160,7 +1414,8 @@ def load_inputs_services(cfg: Any, path) -> dict:
     bad = [k for k in strs if not isinstance(raw[k], str) or (k != "eval_host_name"
                                                              and not raw[k])]
     nums = [k for k in ("eval_cache_budget_bytes", "eval_timeout_seconds",
-                        "grant_expires_seconds", "eval_public_cache_budget_bytes") if k in raw]
+                        "grant_expires_seconds", "eval_public_cache_budget_bytes",
+                        "box_pool_budget_bytes") if k in raw]
     bad += [k for k in nums if not _is_int(raw[k]) or raw[k] <= 0]
     pidx = raw.get("public_indexes", {})
     if not isinstance(pidx, dict) or not all(isinstance(v, str) and v for v in pidx.values()):
@@ -1186,7 +1441,9 @@ def load_inputs_services(cfg: Any, path) -> dict:
                        timeout_s=float(raw.get("eval_timeout_seconds", 3600)), grants=grants,
                        public_root=raw.get("eval_public_root", ""),
                        public_cache_dir=raw.get("eval_public_cache_dir", ""),
-                       public_cache_budget_bytes=int(raw.get("eval_public_cache_budget_bytes", 0)))
+                       public_cache_budget_bytes=int(raw.get("eval_public_cache_budget_bytes", 0)),
+                       pool_root=raw.get("eval_pool_root", ""),
+                       score_cache_dir=raw.get("eval_score_cache_dir", ""))
     from ..shared.config.lane_d import ScoringEnvError, load_scoring_envs
 
     try:
@@ -1210,9 +1467,14 @@ def load_inputs_services(cfg: Any, path) -> dict:
             "house_signer_ss58": raw["house_signer_ss58"], "bench_host": bench,
             "readiness": DocumentFile(raw["readiness"]), "t7": DocumentFile(raw["t7"]),
             "public_indexes": {str(k): Path(v) for k, v in pidx.items()},
-            "scoring_envs": envs, "score_cache": score_cache}
+            "scoring_envs": envs, "score_cache": score_cache,
+            "settle_on_host": bool(raw.get("eval_pool_root")),
+            "box_pool_budget_bytes": int(raw.get("box_pool_budget_bytes",
+                                                 BOX_POOL_BUDGET_BYTES))}
 
 
-__all__ = ["INPUTS_ERROR_CODES", "DocumentFile", "LaneDInputsConfigError", "LaneDInputsError",
-           "LaneDInputsSource", "PinFilePool", "SSHEvalHost", "VaultGetGrants",
-           "build_lane_d_inputs", "load_inputs_services"]
+__all__ = ["BOX_POOL_BUDGET_BYTES", "INPUTS_ERROR_CODES", "SETTLE_REPLY_SCHEMA",
+           "SETTLE_REQUEST_SCHEMA", "DocumentFile", "HostJudge", "LaneDInputsConfigError",
+           "LaneDInputsError", "LaneDInputsSource", "PinFilePool", "RemoteForecasts",
+           "SSHEvalHost", "VaultGetGrants", "build_lane_d_inputs", "forecast_windows",
+           "load_inputs_services", "pinned_windows", "pool_dir_bytes"]
