@@ -232,6 +232,20 @@ OOM would fail again. This applies to lane C fine-tunes and lane B experts.
 An OOM where another process filled the GPU is an infrastructure fault and
 is retried as before.
 
+An OOM is your fault only when the fund-time check vouched for the recipe:
+the estimate fit the GPU, or you chose an own-risk GPU and were warned. If
+nothing vouched for it (the recipe could not be read at the fund, or an
+entry funded before the check existed), the OOM is ours: the leg is requeued
+at no cost and is eligible for a make-good.
+
+**Who is billed for a failure.** One table in the trainer
+(`cascade/trainer/fault_class.py`) decides who is billed for a failed leg.
+Each row names the evidence it needs. A failure is yours only when a row
+names positive evidence for it, such as the worker rejecting your
+submission, an uncuttable data range, or an OOM the fit check vouched for.
+The operator's log line cites that row as `[rule <id>]`. A failure that no
+row recognises is ours: requeued, no attempt charged, make-good eligible.
+
 ### Data range: the sample-geometry check
 
 Every training series spans `[data.start, data.end + 1 day)` on its bar

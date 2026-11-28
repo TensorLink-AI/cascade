@@ -107,6 +107,12 @@ class LegFailure(Exception):
     ``fail``); otherwise it requeues, ``burn`` consuming one infra attempt."""
 
     def __init__(self, msg: str, *, miner_fault: bool, error_class: str, burn: bool) -> None:
+        # retro 2026-11-28 (P7): a miner verdict must cite an attribution
+        # rule (cascade.trainer.fault_class); an uncited one is ours
+        from .fault_class import enforce_miner_citation
+
+        msg, miner_fault, error_class, burn = enforce_miner_citation(
+            str(msg), bool(miner_fault), str(error_class), bool(burn))
         super().__init__(msg)
         self.msg, self.miner_fault, self.error_class, self.burn = (
             str(msg), bool(miner_fault), str(error_class), bool(burn))

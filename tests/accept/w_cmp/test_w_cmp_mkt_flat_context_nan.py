@@ -78,10 +78,13 @@ def test_fixed_worker_nonfinite_exit_is_an_operator_fault(what):
 
 
 def test_a_genuine_recipe_rejection_stays_the_miners():
+    from cascade.funding.queue import OPERATOR_FAULT_CLASS
+
     assert _verdict(3, "miner submission rejected: marketcast leg: no training data for "
                        "the target suite 'range'") == (True, "generator", False)
+    # retro 2026-11-28 (P7): an unrecognised exit is OURS (unburned)
     assert _verdict(1, "remote mkt_finetune failed (rc=1) exit_code=1: boom") == (
-        False, "infra", True)
+        False, OPERATOR_FAULT_CLASS, False)
 
 
 def test_nonfinite_training_is_not_a_miner_leg_error():

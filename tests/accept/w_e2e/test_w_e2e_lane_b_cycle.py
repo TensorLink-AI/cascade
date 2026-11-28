@@ -230,18 +230,31 @@ def _failed_leg(cfg, tmp_path, monkeypatch, name, fail):
 def test_regression_recipe_gpu_oom_ends_the_entry_989(cfg, tmp_path, monkeypatch):
     """#989 (2026-11-27): a leg's own CUDA OOM was classed infra and re-rented
     on the miner's key (same GPU, same OOM). Now: the miner's sizing, the
-    entry ends with a miner-visible reason, no re-rent."""
+    entry ends with a miner-visible reason, no re-rent.
+
+    Retro 2026-11-28 (P7, #1009): the OOM is the miner's only when fund-time
+    fit evidence vouched for their sizing (M-OOM-FIT: a miner-set context
+    length checked against the GPU's measured memory, or an own-risk GPU).
+    The default recipe on a measured GPU is OUR sizing: requeued, unburned."""
+    import cascade.trainer.fault_class as fault_class
     import cascade.trainer.faults as faults
 
-    w, row = _failed_leg(cfg, tmp_path, monkeypatch, "fixed", "oom")
+    with monkeypatch.context() as m:                         # the miner's sizing, vouched
+        m.setattr(fault_class, "fit_evidence_of", lambda entry, role: fault_class.FIT_OK)
+        w, row = _failed_leg(cfg, tmp_path, monkeypatch, "fixed", "oom")
     assert (row["status"], row["last_error_class"]) == ("failed", "gpu_oom"), row
     assert row["reason"].startswith("out of GPU memory") and "not re-rented" in row["reason"]
     assert not w.drv.st.finished and len(w.lium.rents) == 1
+    # the default recipe (nothing vouched): our sizing, never the miner's burn
+    _, ours = _failed_leg(cfg, tmp_path, monkeypatch, "unvouched", "oom")
+    assert ours["status"] == "queued" and ours["last_error_class"] == "operator", ours
     with monkeypatch.context() as m:
+        m.setattr(fault_class, "fit_evidence_of", lambda entry, role: fault_class.FIT_OK)
         m.setattr(faults, "own_run_cuda_oom", lambda line: False)   # the pre-#989 class
         _, bad = _failed_leg(cfg, tmp_path, monkeypatch, "reverted", "oom")
     assert (bad["status"], bad["last_error_class"]) != ("failed", "gpu_oom"), bad
-    assert bad["status"] == "queued" and bad["last_error_class"] == "infra", bad
+    # unrecognised ⇒ OPERATOR (U-DEFAULT): requeued, unburned
+    assert bad["status"] == "queued" and bad["last_error_class"] == "operator", bad
 
 
 def test_lane_b_nonfinite_training_is_never_the_miners_fault(cfg, tmp_path, monkeypatch):

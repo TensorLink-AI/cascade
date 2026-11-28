@@ -16,6 +16,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from cascade.funding.queue import OPERATOR_FAULT_CLASS
 from cascade.generation import shards as S
 from cascade.generation import transfer as T
 
@@ -287,7 +288,7 @@ def test_a_shard_fetch_failure_on_a_shards_leg_is_an_unburned_operator_fault():
         assert final_exception_of(outer) == _SHARD_EXC_LINES[0]
 
 
-def test_shard_faults_per_corpus_are_capped_then_burn():
+def test_shard_faults_per_corpus_stay_ours_past_the_cap():
     from types import SimpleNamespace
 
     from cascade.funding.queue import OPERATOR_FAULT_CLASS
@@ -297,7 +298,9 @@ def test_shard_faults_per_corpus_are_capped_then_burn():
     e = _dispatch_failure(_traceback(_SHARD_EXC_LINES[0]))
     got = [_classify(runner, e) for _ in range(SHARD_FAULT_REQUEUE_CAP + 2)]
     assert got[:SHARD_FAULT_REQUEUE_CAP] == [(False, OPERATOR_FAULT_CLASS, False)] * 2
-    assert got[SHARD_FAULT_REQUEUE_CAP:] == [(False, "infra", True)] * 2
+    # retro 2026-11-28 (P7): past the cap it is still OUR storage (unburned;
+    # the entry's operator-fault cap bounds the requeues)
+    assert got[SHARD_FAULT_REQUEUE_CAP:] == [(False, OPERATOR_FAULT_CLASS, False)] * 2
     # The cap is per corpus: another seed (a new corpus) starts fresh.
     other = type("S", (), {"base_seed": 1})
     assert _classify(runner, e, seeds=other) == (False, OPERATOR_FAULT_CLASS, False)
@@ -305,24 +308,30 @@ def test_shard_faults_per_corpus_are_capped_then_burn():
     runner2 = SimpleNamespace()
     crash = _dispatch_failure(_traceback("RuntimeError: CUDA error: device lost"))
     for _ in range(5):
-        assert _classify(runner2, crash) == (False, "infra", True)
+        assert _classify(runner2, crash) == (False, OPERATOR_FAULT_CLASS, False)  # unknown ⇒ ours
     assert _classify(runner2, e) == (False, OPERATOR_FAULT_CLASS, False)
 
 
-def test_forged_shard_text_in_a_streaming_leg_stays_burned():
+def test_forged_shard_text_in_a_streaming_leg_is_never_consulted():
     """A streaming leg runs the miner's generator on the pod, so it can print
     anything — including our exact shard-failure traceback. Off a shards leg
-    it is never consulted: the exit stays infra and burns an attempt."""
+    it is never consulted: the exit is attributed by the default row
+    (retro 2026-11-28 P7: unknown ⇒ operator, unburned), never O-SHARD-FETCH."""
     from types import SimpleNamespace
 
     from cascade.trainer.faults import classify_funded_worker_failure
 
     for exc in _SHARD_EXC_LINES:
         forged = _dispatch_failure(_traceback(exc))
-        assert _classify(SimpleNamespace(), forged, shards_leg=False) == (False, "infra", True)
+        assert _classify(SimpleNamespace(), forged, shards_leg=False) == (False, OPERATOR_FAULT_CLASS, False)
+        from cascade.trainer.faults import attribute_funded_worker_failure
+
+        assert attribute_funded_worker_failure(
+            1, str(forged), stalled_before=False,
+            final_exception=forged.final_exception).rule_id == "U-DEFAULT"
         assert classify_funded_worker_failure(
             1, str(forged), stalled_before=False,
-            final_exception=forged.final_exception) == (False, "infra", True)
+            final_exception=forged.final_exception) == (False, OPERATOR_FAULT_CLASS, False)
 
 
 def test_a_forged_traceback_marker_without_a_real_traceback_is_ignored():
@@ -338,12 +347,14 @@ def test_a_forged_traceback_marker_without_a_real_traceback_is_ignored():
     e = _dispatch_failure(forged_tail)
     assert "--- last traceback ---" in str(e) and _SHARD_EXC_LINES[0] in str(e)
     assert e.final_exception == ""
-    assert _classify(SimpleNamespace(), e) == (False, "infra", True)
+    assert _classify(SimpleNamespace(), e) == (False, OPERATOR_FAULT_CLASS, False)
     # The message text alone (no parsed line) is never enough either.
-    from cascade.trainer.faults import classify_funded_worker_failure
+    from cascade.trainer.faults import (
+        attribute_funded_worker_failure,
+    )
 
-    assert classify_funded_worker_failure(1, str(e), stalled_before=False, shards_leg=True) == (
-        False, "infra", True)
+    assert attribute_funded_worker_failure(
+        1, str(e), stalled_before=False, shards_leg=True).rule_id == "U-DEFAULT"
 
 
 def test_only_the_final_traceback_exception_counts():
@@ -355,7 +366,7 @@ def test_only_the_final_traceback_exception_counts():
     # The phrase as a log line, then a different real death: not a shard fault.
     other = _dispatch_failure(f"{shard}\n" + _traceback("RuntimeError: CUDA error: device lost"))
     assert other.final_exception == "RuntimeError: CUDA error: device lost"
-    assert _classify(SimpleNamespace(), other) == (False, "infra", True)
+    assert _classify(SimpleNamespace(), other) == (False, OPERATOR_FAULT_CLASS, False)
     # Not fully qualified, or a prefetch log line: not matched.
     assert not shard_fetch_failure("ShardError: downloaded shard c4-00030.parquet fails its sha256")
     assert not shard_fetch_failure(

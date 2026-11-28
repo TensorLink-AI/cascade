@@ -1402,7 +1402,8 @@ class FundingIntake:
                                     "(metro-v1:ft:<target>:hippius:<ref>) for this hotkey "
                                     "matches the target and X-Commit-Ref — commit with "
                                     "`cascade lane-c commit`, wait for the reveal, then fund"}
-        fit_err, fit_warn = self._mkt_fit_check(target, ref, choice, own_risk_warn)
+        fit_err, fit_warn, fit_evidence = self._mkt_fit_check(target, ref, choice,
+                                                              own_risk_warn)
         if fit_err is not None:
             return 400, fit_err
         geom_err = self._mkt_geom_check(target, ref)
@@ -1412,6 +1413,12 @@ class FundingIntake:
             own_risk_warn = f"{own_risk_warn} {fit_warn}".strip()
         outcome = self.lane_c_queue.add_lane_c(  # type: ignore[union-attr]
             hotkey, target, ref, int(reveal_block), label=label, gpu_choice=choice)
+        # retro 2026-11-28 (P7): the fit check's outcome is the evidence an OOM
+        # needs to be the miner's (cascade.trainer.fault_class M-OOM-FIT);
+        # every fund records it (the latest request wins; "" = not vouched)
+        set_fit = getattr(self.lane_c_queue, "set_fit_evidence", None)
+        if callable(set_fit):
+            set_fit(hotkey, fit_evidence)
         self.vault.insert(hotkey, api_key)
         log.info("lane-C fund %s: %s target=%s (reveal_block=%d%s)", hotkey, outcome, target,
                  reveal_block, f", gpu={choice.gpu}" if choice.chosen else "")
@@ -1427,24 +1434,27 @@ class FundingIntake:
                      if own_risk_warn else body)
 
     def _mkt_fit_check(self, target: str, ref: str, choice: GpuChoice,
-                       own_risk_warn: str) -> tuple[dict | None, str]:
-        """``(refusal, warning)`` of the 2026-11-27 GPU memory fit check of a
+                       own_risk_warn: str) -> tuple[dict | None, str, str]:
+        """``(refusal, warning, evidence)`` of the 2026-11-27 GPU memory fit check of a
         MarketCast fund (:mod:`cascade.funding.mkt_fit`): a recommended (or,
         with no choice, any default-rentable recommended) type below the
         recipe's estimate is refused with the estimate and the types that
         fit; an own-risk type below it is accepted with a warning (the
         own-risk policy). Runs after the signature and reveal gates, so only
-        a revealed commitment's tree is ever fetched (parsed, never run)."""
+        a revealed commitment's tree is ever fetched (parsed, never run).
+        ``evidence`` (retro 2026-11-28 P7) is ``"fit"`` when the estimate fits,
+        ``"own_risk"`` when the miner was warned an OOM ends the entry, else
+        ``""`` (nothing vouched: an OOM is then the operator's)."""
         fetch, cat = self.fetch_mkt_recipe, self.mkt_gpu_catalog
         if fetch is None or cat is None or not ref:
-            return None, ""
+            return None, "", ""
         try:
             from ..shared.config.lane_c import is_mkt_family
 
             if not is_mkt_family(target):
-                return None, ""
+                return None, "", ""
         except ImportError:   # pragma: no cover — shared lane-C config not shipped
-            return None, ""
+            return None, "", ""
         from .mkt_fit import DEFAULT_MICRO_BATCH_TOKENS, fit_verdict
 
         try:
@@ -1452,7 +1462,7 @@ class FundingIntake:
         except Exception as e:  # noqa: BLE001 — the trainer re-reads the recipe anyway
             log.warning("lane-C fund: MarketCast recipe %s unreadable for the GPU fit "
                         "check (%s) — not checked", ref, e)
-            return None, ""
+            return None, "", ""
         mc = self.mkt_cfg
         horizons: list[str] = []
         try:
@@ -1474,14 +1484,15 @@ class FundingIntake:
             if v is not None and v.fits is None and own_risk_warn:
                 return None, (f"Its memory is unknown here: your recipe needs an estimated "
                               f"{v.estimate_gib:g} GiB on one GPU, and an out-of-memory leg "
-                              "ends the entry with no retry.")
-            return None, ""
+                              "ends the entry with no retry."), "own_risk"
+            # retro P7 fit evidence: "fit" only when the estimate fits the GPU
+            return None, "", ("fit" if v is not None and v.fits is True else "")
         d = refusal.detail
         log.warning("lane-C fund: MarketCast recipe %s needs ~%.1f GiB; %s too small",
                     ref, d["estimate_gib"], d["gpu"] or "a recommended type")
         if own_risk_warn:
-            return None, refusal.message
-        return refusal.as_body(), ""
+            return None, refusal.message, "own_risk"
+        return refusal.as_body(), "", ""
 
     def _mkt_geom_check(self, target: str, ref: str) -> dict | None:
         """The refusal of the 2026-11-28 sample-geometry check of a plain

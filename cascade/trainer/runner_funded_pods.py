@@ -1029,6 +1029,12 @@ class _FundedPodMixin:
 
     def _record_funded_failure(self, hotkey: str, msg: str, *, miner_fault: bool,
                                error_class: str, burn: bool) -> None:
+        # retro 2026-11-28 (P7): a miner verdict must cite an attribution
+        # rule (cascade.trainer.fault_class); an uncited one is ours
+        from .fault_class import enforce_miner_citation
+
+        msg, miner_fault, error_class, burn = enforce_miner_citation(
+            msg, miner_fault, error_class, burn)
         self._funded_leg_failures[hotkey] = (error_tail(msg, 500), miner_fault,
                                              error_class, burn)
 

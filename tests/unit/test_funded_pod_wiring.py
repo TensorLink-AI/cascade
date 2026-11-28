@@ -478,7 +478,9 @@ def test_funded_leg_failure_classifies_and_still_tears_down(tmp_path, monkeypatc
                                contract, "", warm_start_ref=None)
     assert torn == ["cascade-n91-777-funded-hka-0"]
     msg, miner_fault, cls, burn = runner._funded_leg_failures["hkA"]
-    assert (miner_fault, cls, burn) == (False, "infra", True)
+    # retro 2026-11-28 (P7): a transport loss is never the miner's: ours, unburned
+    assert (miner_fault, cls, burn) == (False, "operator", False)
+    assert "[rule " in msg
 
 
 def test_funded_leg_rc3_is_the_miners_fault(tmp_path, monkeypatch):
@@ -1104,7 +1106,8 @@ def test_harvest_transport_failure_is_infra_not_tamper(tmp_path, monkeypatch):
         runner._run_funded_leg(disp, _challenger("hkA"), seeds, 100,
                                contract, "", warm_start_ref=None)
     msg, miner_fault, cls, burn = runner._funded_leg_failures["hkA"]
-    assert (miner_fault, cls) == (False, "infra")   # miner's training was fine
+    # miner's training was fine; retro 2026-11-28 (P7): unknown ⇒ ours
+    assert (miner_fault, cls) == (False, "operator")
 
 
 def test_bad_funded_pod_checkpoint_value_fails_loud(tmp_path):

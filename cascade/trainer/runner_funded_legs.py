@@ -661,16 +661,26 @@ class _FundedLegMixin:
                 raise
             queue = self._funded_queue()
             prior = queue.get(gen.hotkey) if queue is not None else None
+            from .fault_class import UNKNOWN_RULE, fit_evidence_of
+            from .faults import role_of
+
+            # retro 2026-11-28 (P7): the ONE attribution table decides; an
+            # unrecognised exit is OURS (unburned, make-good eligible)
+            self.__dict__.pop("_last_attribution", None)
             miner_fault, error_class, burn = classify_leg_exception(
                 self, gen, seeds, e, rc=rc, text=text,
                 stalled_before=bool(prior is not None
                                     and prior.last_error_class == STALL_CLASS),
-                shards_leg=_shards_leg(contract, corpus), role=role)
+                shards_leg=_shards_leg(contract, corpus), role=role,
+                fit_evidence=fit_evidence_of(prior, role or role_of(e)))
+            att = self.__dict__.pop("_last_attribution", None)
+            rule_id = str(getattr(att, "rule_id", "") or "")
             if error_class == GPU_OOM_CLASS:
                 # 2026-11-27: the recipe outgrew the GPU — the entry ends here
                 # (a re-rent of the same type would OOM again on their key)
                 text = f"{gpu_oom_message(str(getattr(pod, 'sku', '') or ''))}: {text}"
-            if not miner_fault and error_class == "infra":
+            if not miner_fault and (error_class == "infra"
+                                    or rule_id in (UNKNOWN_RULE.rule_id, "O-HOST")):
                 # Money safety II: a lost MINER pod is asked of the payer's
                 # own account first — a pod they stopped / cancelled or a
                 # balance at zero is THEIR doing (unburned, never billed to
@@ -687,12 +697,14 @@ class _FundedLegMixin:
                     error_class, burn = "payer_pod_lost", False
                     text = f"payer pod ended mid-leg: {text} [evidence {ev}]"
                 elif not ev.get("known"):
-                    # no listing answered: nothing is proven either way — the
-                    # verdict stays a plain infra loss (its attempt still
-                    # counts: the attempt cap is what stops a flaky pod from
-                    # retrying on the miner's money forever); the evidence
-                    # rides the text for the owner (2026-11-04 review)
+                    # no listing answered: nothing is proven either way —
+                    # unknown ⇒ OPERATOR (retro 2026-11-28 P7: unburned, the
+                    # entry's operator-fault cap bounds the retries); the
+                    # evidence rides the text for the owner
                     text = f"pod state unknown: {text} [evidence {ev}]"
+            if rule_id and error_class not in (PayerPodInterference.error_class,
+                                               "payer_pod_lost"):
+                text = f"{text} [rule {rule_id}]"
             self._record_funded_failure(gen.hotkey, text, miner_fault=miner_fault,
                                         error_class=error_class, burn=burn)
             from .harvest_guard import handle_our_side_fault, keeps_pod, local_disk_error
@@ -708,9 +720,11 @@ class _FundedLegMixin:
                 raise                  # our side: never an operator make-good
             if not miner_fault and error_class not in (
                     "infra", PayerPodInterference.error_class, "payer_pod_lost"):
-                # an operator make-good ONLY with our-side evidence (an
-                # operator-class verdict, e.g. our storage); a generic infra
-                # loss of a miner's pod is never billed to us on its own
+                # an operator make-good for an operator-class verdict: our
+                # side's evidence (our storage, our NaN) or, retro 2026-11-28
+                # P7, an exit no attribution row recognises (unknown ⇒ ours;
+                # the make-good cap and operator-fault cap bound it). A payer
+                # pod proven / seen ended on the payer's account is not.
                 queue = self._funded_queue()
                 if queue is not None:
                     queue.set_operator_billed(gen.hotkey, True)

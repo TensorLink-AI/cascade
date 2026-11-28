@@ -574,9 +574,15 @@ class Lium:
         line = OOM_LINE if self.fail == "oom" else NAN_LINE
         e = WorkerFailed(f"worker exited 1: {line}", returncode=1, final_exception=line)
         seeds = SimpleNamespace(base_seed=str(round_id))
+        # retro 2026-11-28 (P7): the fund-time fit evidence of the queue entry,
+        # as runner_funded_legs reads it (M-OOM-FIT needs it to be the miner's)
+        from cascade.trainer import fault_class
+
+        q = runner._funded_queue()
+        prior = q.get(gen.hotkey) if q is not None else None
         miner_fault, cls, burn = classify_leg_exception(
             runner, gen, seeds, e, rc=1, text=str(e), stalled_before=False, shards_leg=False,
-            role="expert")
+            role="expert", fit_evidence=fault_class.fit_evidence_of(prior, "expert"))
         text = str(e)
         if cls == GPU_OOM_CLASS:
             text = f"{gpu_oom_message(f'1x{GPU}')}: {text}"

@@ -106,3 +106,18 @@ cascade/trainer/marketcast_runner.py
 cascade/trainer/money_guard.py
 cascade/funding/public_reason.py
 cascade/trainer/operator_legs_cli.py
+# 2026-11-28 retro item #7 (plan P7, owner "work through the retrospective"):
+# fault attribution as data. One table (rule id, party, class, burn, evidence)
+# decides every funded worker exit; unknown => operator (requeued, unburned,
+# make-good eligible); a miner verdict must cite a rule (the recorders gate
+# it); an OOM is the miner's only with fund-time fit evidence, which the
+# lane C intake records on the queue entry.
+cascade/trainer/fault_class.py
+cascade/trainer/runner_funded_pods.py
+cascade/trainer/runner_operator_pods.py
+cascade/funding/queue.py
+# unit pins of the superseded "unclassified exit = infra burn" default
+tests/unit/test_shard_fetch_retry.py
+tests/unit/test_worker_code_fingerprint.py
+tests/unit/test_funded_pod_wiring.py
+tests/unit/test_image_decoupled_merge.py

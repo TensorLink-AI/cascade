@@ -957,6 +957,24 @@ class FundedQueue:
                 self._save(entries)
             return True
 
+    def set_fit_evidence(self, hotkey: str, evidence: str) -> bool:
+        """Record the fund-time GPU fit evidence of an entry (retro 2026-11-28
+        P7, ``cascade.trainer.fault_class``): ``"fit"`` / ``"own_risk"`` / ``""``.
+        Rides :attr:`FundedEntry.extra` (``fit_evidence``), so older readers
+        keep it and no schema bump is needed. False when unknown."""
+        with self._locked() as entries:
+            e = entries.get(hotkey)
+            if e is None:
+                return False
+            extra = dict(e.extra or {})
+            if evidence:
+                extra["fit_evidence"] = str(evidence)
+            else:
+                extra.pop("fit_evidence", None)
+            entries[hotkey] = replace(e, extra=extra)
+            self._save(entries)
+            return True
+
     def set_operator_billed(self, hotkey: str, flag: bool) -> bool:
         """Mark (or unmark) an entry as operator-billed: its leg runs on an
         operator lane, never on the payer's key (owner make-good for a leg
