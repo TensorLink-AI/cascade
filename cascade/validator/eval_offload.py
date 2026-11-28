@@ -80,6 +80,19 @@ WORKER_PROBE = (
 )
 
 
+def _ensure_host_release(host, role: str) -> None:
+    """The host's ``cascade/`` vs this release before the run (retro P4,
+    ``release_sync`` on the host entry): a sync that cannot land holds the
+    round, never runs it on the host's old code."""
+    from ..shared.release_fp import ReleaseSyncFailed, ReleaseUnreachable, ensure_release
+
+    try:
+        ensure_release(host, role=role)
+    except (ReleaseSyncFailed, ReleaseUnreachable) as e:
+        log.error("private eval host %s: %s — the round holds", getattr(host, "name", host), e)
+        raise PrivateEvalUnavailable(f"private evaluation host release sync failed: {e}") from e
+
+
 def check_private_worker(host, contract, *, quantile_levels=None, run=None,
                          timeout_s=WORKER_PROBE_SECONDS, quantile_batch=1) -> None:
     """Refuse before any upload when ``host`` provably cannot serve this request.
@@ -210,6 +223,7 @@ def forecasts_via_host(host, checkpoint, windows, *, contract, num_samples,
             raise PrivateEvalUnavailable("private evaluation transport/worker failed")
         return proc
 
+    _ensure_host_release(host, "private-eval")
     tmpdir = tempfile.TemporaryDirectory(prefix="cascade-private-eval-")
     try:
         check_private_worker(host, contract, quantile_levels=quantile_levels, run=run,
