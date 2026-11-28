@@ -1505,6 +1505,18 @@ The first command joins execution with qualification/acceptance observations;
 the second is the intake queue only. To withdraw while queued, use
 `cascade lane-b fund` with the same identity and `--withdraw`.
 
+Every lane B / lane C queue row carries `reason` (one plain-English line
+with the fix, e.g. `waiting: no 4xA100 available on your GPU provider and
+your fund allows no fallback GPU: re-fund with --allow-fallback or another
+--gpu`) and `reason_code`. They come from fixed templates; the trainer's raw
+error text is never published. A settled row also carries `verdict`: the
+outcome, the round id and, when recorded, the LCB, bar, point gain and
+margin for each target. `cascade lane-b status`, `cascade lane-c status` and
+`cascade queue --intake URL --lane b|c --hotkey HOTKEY` print them and mark
+your row `← you`. The dashboard shows them under "Queue (lanes B, C, D)" and
+"Recent verdicts". These fields are for display only; the signed receipts
+decide pay.
+
 No capacity requeues without using an attempt or renting a pod. Other
 infrastructure retries have bounded attempts. Bad source, tampering or a bad
 key ends the entry under its reported error class; inspect that class before

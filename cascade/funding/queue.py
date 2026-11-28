@@ -329,6 +329,12 @@ class FundedEntry:
     # its receipt as ``queued_contamination``. Written only when set.
     contamination: dict | None = field(default=None, hash=False)
     queued_contamination: dict | None = field(default=None, hash=False)
+    # owner 2026-11-28: the settled entry's public verdict (outcome, round id,
+    # per-target LCB / bar / gain), sanitized by
+    # :func:`cascade.funding.public_reason.public_verdict` and written by the
+    # trainer's settlement (``mark_done(verdict=)``). DISPLAY ONLY: never
+    # signed, never read by any scoring path. Written only when set.
+    verdict: dict | None = field(default=None, hash=False, compare=False)
     # Keys a NEWER writer stored on this entry that this code does not know:
     # carried verbatim through every load/save, never interpreted, never
     # compared (money safety II: an old writer must not drop new fields).
@@ -399,6 +405,8 @@ _CONTAMINATION_FIELD_DEFAULTS = {"contamination": None, "queued_contamination": 
 # train_hours serialises exactly as before).
 _LEG_FIELD_DEFAULTS = {"train_hours": 0.0, "leg_steps": 0, "leg_guard_seconds": 0,
                        "levers": None, "train_tokens": 0, "gpu_measured": True}
+# owner 2026-11-28 public verdict, likewise written only when set.
+_VERDICT_FIELD_DEFAULTS = {"verdict": None}
 
 
 def _receipt_copy(value) -> dict | None:
@@ -588,6 +596,8 @@ class FundedQueue:
                         and item["levers"] else None),
                 train_tokens=int(item.get("train_tokens", 0) or 0),
                 gpu_measured=bool(item.get("gpu_measured", True)),
+                verdict=(dict(item["verdict"]) if isinstance(item.get("verdict"), dict)
+                         and item["verdict"] else None),
                 extra=extra,
             )
             entries[entry.hotkey] = entry
@@ -624,7 +634,7 @@ class FundedQueue:
             extra = row.pop("extra", None) or {}
             for k, default in (*_GPU_FIELD_DEFAULTS.items(), *_ROWS_FIELD_DEFAULTS.items(),
                                *_CONTAMINATION_FIELD_DEFAULTS.items(),
-                               *_LEG_FIELD_DEFAULTS.items()):
+                               *_LEG_FIELD_DEFAULTS.items(), *_VERDICT_FIELD_DEFAULTS.items()):
                 if row.get(k) == default:
                     row.pop(k, None)
             for k, v in extra.items():
@@ -1024,7 +1034,9 @@ class FundedQueue:
             gpu_max_price_per_hour=e.gpu_max_price_per_hour,
             max_total_spend_usd=e.max_total_spend_usd,
             declared_rows=_rows_copy(e.queued_declared_rows),
-            contamination=_receipt_copy(e.queued_contamination))
+            contamination=_receipt_copy(e.queued_contamination),
+            # the settled flight's verdict stays visible (it names its own ref)
+            verdict=e.verdict)
 
     def expire_stale(self, max_age_seconds: float | None = None) -> int:
         """Terminally expire idle queued entries past the payer-key TTL.
@@ -1079,12 +1091,20 @@ class FundedQueue:
             return due
 
     def mark_done(self, hotkey: str, *, expect_ref: str | None = None,
-                  expect_started_block: int | None = None) -> None:
+                  expect_started_block: int | None = None, verdict=None) -> None:
         """Complete only the named flight when called by a settlement replay.
 
         A previous call may already have promoted a parked re-commit. Never
         mark that next entry done when replaying the old settlement.
+
+        ``verdict`` (owner 2026-11-28; display only): the settlement's outcome
+        for this entry, stored sanitized (:func:`public_verdict`) and shown
+        by :meth:`public_view`. None keeps whatever is stored.
         """
+        if verdict is not None:
+            from .public_reason import public_verdict
+
+            verdict = public_verdict(verdict)
         with self._locked() as entries:
             e = entries.get(hotkey)
             if expect_ref is not None and (e is None or e.ref != expect_ref
@@ -1095,7 +1115,8 @@ class FundedQueue:
                 return
             if e is not None:
                 was_flight = e.status == "in_flight"
-                entries[hotkey] = _phase(replace(e, status="done"), "done", self.clock())
+                done = replace(e, status="done", **({"verdict": verdict} if verdict else {}))
+                entries[hotkey] = _phase(done, "done", self.clock())
                 if was_flight:
                     self._after_flight(entries, hotkey)
                 self._save(entries)
@@ -1327,6 +1348,12 @@ class FundedQueue:
         except Exception:  # noqa: BLE001 — telemetry only
             return {}
 
+    def _verdict_fallback(self):
+        """``entry -> raw verdict | None`` for a ``done`` entry settled before
+        verdicts were stored on the entry (lane B / C override it to read the
+        driver state beside the queue file); lane A: none."""
+        return lambda _e: None
+
     def public_view(self) -> dict:
         """The queue as miners may see it — no key material, no sealed field.
 
@@ -1337,8 +1364,23 @@ class FundedQueue:
         the moment their reveal resolves, which is when the chain shows them
         anyway.
         """
+        from .public_reason import public_reason, public_verdict
+
         current = self.entries()
         spend = self._spend_view()
+        fallback = self._verdict_fallback()
+
+        def _why(e: FundedEntry) -> dict:
+            # owner 2026-11-28: a sanitized one-line reason (whitelisted
+            # templates; never the raw last_error) and the settled verdict
+            v = e.verdict
+            if e.status == "done" and (not v or (v.get("ref") and v["ref"] not in e.ref)):
+                # settled before the field, or the stored verdict is the
+                # previous ref's (carried over by a promoted re-commit)
+                v = fallback(e)
+            v = public_verdict(v) if v else None
+            code, text = public_reason(replace(e, verdict=v))
+            return {"reason": text, "reason_code": code, **({"verdict": v} if v else {})}
 
         def _spent(e: FundedEntry) -> dict:
             s = spend.get((e.hotkey, e.ref))
@@ -1378,6 +1420,7 @@ class FundedQueue:
                     **({"operator_requeues": e.operator_requeues}
                        if e.operator_requeues else {}),
                     **_spent(e),
+                    **_why(e),
                     **({"budget_usd": round(e.max_total_spend_usd, 2)}
                        if e.max_total_spend_usd is not None else {}),
                     "label": e.label,
@@ -1393,6 +1436,29 @@ class FundedQueue:
                 for e in current if e.status != "pending_reveal"
             ],
         }
+
+
+# The trainer's lane driver state files live in the work root beside the queue
+# files (``[round] funded_queue_path`` is work_root-relative): a done entry
+# settled before verdicts were stored on it reads its outcome from there.
+LANE_B_DRIVER_FILE = "lane_b_driver.json"
+LANE_C_DRIVER_FILE = "lane_c_driver.json"
+_DRIVER_READ_MAX = 8_000_000
+
+
+def _driver_rows(path: Path, keys: tuple[str, ...]) -> list[dict]:
+    """The ``keys`` lists of a driver state file (``[]`` when unreadable)."""
+    try:
+        if not path.is_file() or path.stat().st_size > _DRIVER_READ_MAX:
+            return []
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    out: list[dict] = []
+    for k in keys:
+        rows = raw.get(k) if isinstance(raw, dict) else None
+        out.extend(r for r in (rows or []) if isinstance(r, dict))
+    return out
 
 
 # ── lane C (DEC-CA-0056): the fine-tune queue ────────────────────────────────
@@ -1451,6 +1517,21 @@ class LaneCQueue(FundedQueue):
         t = self.clock() if now is None else float(now)
         return [e for e in select_field(self.entries(), 0)
                 if not (e.not_before and t < e.not_before)]
+
+    def _verdict_fallback(self):
+        rows = _driver_rows(self.path.with_name(LANE_C_DRIVER_FILE), ("submission_verdicts",))
+
+        def find(e: FundedEntry):
+            try:
+                target, ref = split_lane_c_ref(e.ref)
+            except ValueError:
+                return None
+            hit = next((r for r in reversed(rows) if r.get("hotkey") == e.hotkey
+                        and r.get("ref") == ref and e.attempt_id
+                        and r.get("attempt_id") == e.attempt_id
+                        and (r.get("targets") or [target]) == [target]), None)
+            return None if hit is None else {**hit, "lane": "c", "outcome": hit.get("stage")}
+        return find
 
     def public_view(self) -> dict:
         view = super().public_view()
@@ -1529,6 +1610,25 @@ class LaneBQueue(FundedQueue):
         t = self.clock() if now is None else float(now)
         return [e for e in select_field(self.entries(), 0)
                 if not (e.not_before and t < e.not_before)]
+
+    def _verdict_fallback(self):
+        path = self.path.with_name(LANE_B_DRIVER_FILE)
+        # the judged settlement rows first, then the legs the settlement
+        # consumed unjudged (merge refused / record missing): never a requeue
+        rows = [*reversed(_driver_rows(path, ("submission_results",))),
+                *(r for r in reversed(_driver_rows(path, ("outcomes",)))
+                  if r.get("outcome") in ("merge_refused", "leg_record_missing"))]
+
+        def find(e: FundedEntry):
+            try:
+                _targets, ref = split_lane_b_ref(e.ref)
+            except ValueError:
+                return None
+            return next(({**r, "lane": "b"} for r in rows
+                         if r.get("hotkey") == e.hotkey and r.get("gen_ref") == ref
+                         and (not r.get("attempt_id") or r.get("attempt_id") == e.attempt_id)),
+                        None)
+        return find
 
     def public_view(self) -> dict:
         view = super().public_view()

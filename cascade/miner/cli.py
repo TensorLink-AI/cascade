@@ -596,6 +596,9 @@ def _add_queue(sub: argparse._SubParsersAction) -> None:
                    help="Intake base URL — also fetch the live /v1/queue.")
     p.add_argument("--hotkey", default=None,
                    help="Your hotkey (ss58) — marks your rows '← you'.")
+    p.add_argument("--lane", choices=("a", "b", "c"), default="a",
+                   help="With --intake: which live queue (a = /v1/queue, b = /v1/lane-b/queue, "
+                        "c = /v1/lane-c/queue); b/c rows show the reason and the verdict.")
     p.set_defaults(func=_cmd_queue)
 
 
@@ -649,8 +652,35 @@ def _cmd_queue(args: argparse.Namespace) -> int:
         out.info("  (verify independently: reveal blocks are on-chain; "
                  "`cascade-audit round <id>` cross-checks this roster against "
                  "the signed manifest)")
+    lane = getattr(args, "lane", "a") or "a"
+    if args.intake and lane != "a":
+        from .submission_status import (
+            QUEUE_PATHS,
+            queue_row_line,
+            read_queue,
+            render_submission,
+            submission_view,
+        )
+
+        if not _intake_transport_ok(args.intake):
+            return out.fail("insecure_intake", "refusing plain http to a non-loopback intake", USAGE)
+        try:
+            live = read_queue(args.intake, lane, timeout=10)
+        except (OSError, ValueError) as e:
+            return out.fail("intake_unreachable",
+                            f"intake unreachable or not answering JSON: {e}", NETWORK)
+        out.result(live_queue=live)
+        out.info(f"live lane {lane.upper()} queue (depth {live.get('queued_depth')}):")
+        for e in live.get("entries") or []:
+            out.info("  " + queue_row_line(e, me=me))
+        if me:
+            view = submission_view({}, hotkey=me, lane=lane, queue=live,
+                                   source=args.intake.rstrip("/") + QUEUE_PATHS[lane])
+            out.result(submission=view)
+            render_submission(out, view)
+        return OK
     if args.intake:
-        from .submission_status import read_queue, render_submission, submission_view
+        from .submission_status import read_queue, render_submission, safe_text, submission_view
 
         if not _intake_transport_ok(args.intake):
             return out.fail("insecure_intake", "refusing plain http to a non-loopback intake", USAGE)
@@ -664,9 +694,10 @@ def _cmd_queue(args: argparse.Namespace) -> int:
         out.info(f"live queue (depth {live.get('queued_depth')}):")
         for e in live.get("entries") or []:
             err = f" [{e.get('last_error_class')}]" if e.get("last_error_class") else ""
+            why = f"  — {safe_text(e['reason'])}" if isinstance(e.get("reason"), str) and e["reason"] else ""
             out.info(f"  {e.get('hotkey')}{_label_of(e)}  {e.get('status')}  "
                      f"reveal={e.get('reveal_block')} attempts={e.get('attempts')}"
-                     f"{_gpu_of(e)}{err}{_tag(str(e.get('hotkey')))}")
+                     f"{_gpu_of(e)}{err}{why}{_tag(str(e.get('hotkey')))}")
         if me:
             view = submission_view({}, hotkey=me, lane="a", queue=live,
                                    source=args.intake.rstrip("/") + "/v1/queue")

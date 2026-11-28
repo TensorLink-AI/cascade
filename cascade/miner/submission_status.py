@@ -256,6 +256,13 @@ def submission_view(snapshot, *, hotkey, lane, ref=None, queue=None, source=None
                 "gpu_max_price_per_hour": number(row.get("gpu_max_price_per_hour")),
                 "gpu_allow_fallback": bool(row.get("gpu_allow_fallback")),
                 "phase_history": history}
+    # owner 2026-11-28: the intake's sanitized reason and the settled verdict
+    # (absent on older intakes: nothing is inferred here)
+    if isinstance(row.get("reason"), str) and row["reason"]:
+        result["reason"] = safe_text(row["reason"])
+        result["reason_code"] = safe_text(row.get("reason_code"))
+    if isinstance(row.get("verdict"), dict):
+        result["queue_verdict"] = row["verdict"]
     result.update(ref=ref, observed=observed,
                   worker_liveness="not_measured",
                   status=phase if clock["fresh"] else "stale",
@@ -318,11 +325,58 @@ def submission_view(snapshot, *, hotkey, lane, ref=None, queue=None, source=None
     return result
 
 
+def _signed(x) -> str:
+    v = number(abs(x)) if isinstance(x, (int, float)) and not isinstance(x, bool) else None
+    return "--" if v is None else f"{'-' if x < 0 else '+'}{v:.4f}"
+
+
+def verdict_lines(verdict) -> list[str]:
+    """The settled verdict of a queue row (outcome, round, per-target LCB vs
+    bar and point gain), one line each; [] when the row carries none."""
+    if not isinstance(verdict, dict) or not verdict.get("outcome"):
+        return []
+    rid = verdict.get("round_id") or verdict.get("receipt_round_id")
+    lines = [f"Verdict: {safe_text(verdict['outcome'])}"
+             + (f" in round {safe_text(rid)}" if rid else "")
+             + (f" — {safe_text(verdict['summary'])}" if verdict.get("summary") else "")]
+    margins = [m for m in verdict.get("margins") or [] if isinstance(m, dict)]
+    for m in margins:
+        tag = "declared" if m.get("declared", True) else "undeclared"
+        res = "PASS" if m.get("passed") else "fail"
+        why = f", {safe_text(m['why']).replace('_', ' ')}" if m.get("why") and not m.get("passed") else ""
+        lines.append(f"  {safe_text(m.get('target'))} ({tag}): LCB {_signed(m.get('lcb'))} vs bar "
+                     f"{_signed(m.get('bar'))} (margin {_signed(m.get('margin'))}), point gain "
+                     f"{_signed(m.get('gain'))} — {res}{why}")
+    if not margins and verdict.get("lane") == "b":
+        lines.append("  per-target margins were not recorded for this settlement")
+    return lines
+
+
+def queue_row_line(row, *, me=None) -> str:
+    """One compact queue row: hotkey, targets, stage, reason, verdict."""
+    targets = row.get("targets") or ([row["target"]] if row.get("target") else [])
+    stage = row.get("phase") or row.get("status") or "?"
+    line = (f"{safe_text(row.get('hotkey'))[:12]}…  {','.join(safe_text(t) for t in targets if t) or '-'}"
+            f"  {safe_text(stage)}")
+    if row.get("reason"):
+        line += f"  — {safe_text(row['reason'])}"
+    v = row.get("verdict")
+    if isinstance(v, dict) and v.get("outcome") and row.get("status") != "done":
+        line += f"  [last verdict: {safe_text(v['outcome'])}]"
+    if me and row.get("hotkey") == me:
+        line += "  ← you"
+    return line
+
+
 def render_submission(out, view):
     out.info(f"Lane {view['lane'].upper()} — {safe_text(view['hotkey'])}")
     if view.get("ref"):
         out.info(f"  Reference: {safe_text(view['ref'])}")
     out.info(f"  Status: {safe_text(view['message'])}")
+    if view.get("reason"):
+        out.info(f"  Reason: {view['reason']}")
+    for line in verdict_lines(view.get("queue_verdict")):
+        out.info(f"  {line}")
     out.info(f"  Source as of: {safe_text(view['freshness'].get('as_of')) or 'unknown'}; "
              f"{'fresh' if view['freshness']['fresh'] else 'stale/unavailable'}")
     gen = view.get("generation")
@@ -360,7 +414,7 @@ def render_submission(out, view):
             out.info(f"  Waiting reason: {reason}")
         if view.get("reveal_order_position"):
             out.info(f"  Reveal-order position: {view['reveal_order_position']} (not a GPU ETA)")
-        if obs.get("last_error_class"):
+        if obs.get("last_error_class") and obs.get("status") != "done":
             out.info(f"  Last retry: {safe_text(obs['last_error_class'])} — {view['last_retry_explanation']}")
         if view.get("retry_in_seconds"):
             out.info(f"  Retry allowed in {view['retry_in_seconds']}s; capacity is not reserved.")
@@ -425,6 +479,10 @@ def lane_queue_status(args, lane):
     if args.hotkey and not views:
         views = [submission_view({}, hotkey=args.hotkey, lane=lane, queue=doc)]
     out.result(submissions=views, freshness=clock)
+    out.info(f"Lane {lane.upper()} queue ({len(rows)} entr{'y' if len(rows) == 1 else 'ies'}, "
+             f"as of {safe_text(doc.get('as_of')) or 'unknown'}):")
+    for row in rows:
+        out.info("  " + queue_row_line(row, me=args.hotkey))
     for view in views:
         render_submission(out, view)
     if not clock["fresh"]:

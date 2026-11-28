@@ -58,6 +58,12 @@ from cascade.shared.hippius import (
 # scripts/refresh_leaderboard_reference.py, which writes the packaged copy).
 LEADERBOARD_REFERENCE_KEY = "benchmarks/leaderboard-reference.json"
 FRONTIER_REFERENCE_KEY = "benchmarks/model-frontier.json"
+# The live lane queue docs the dashboard's lanes B/C/D queue and verdict
+# sections read (trainer: lanes B, C; validator: lane D). Published by those
+# services, not by this script; listed so the operator can check them.
+LANE_STATUS_KEYS = ("status/lane_b.json (trainer: lane B queue, reasons, verdicts)",
+                    "status/lane_c.json (trainer: lane C queue, reasons, verdicts)",
+                    "status/lane_d.json (validator: lane D entries and reasons)")
 
 
 def _read_asset(name: str) -> str:
@@ -96,6 +102,8 @@ def main() -> None:
         print(f"[dry-run] would publish {len(frontier)} B {FRONTIER_REFERENCE_KEY} to {base}/")
         if reference is not None:
             print(f"[dry-run] would publish {len(reference)} B {LEADERBOARD_REFERENCE_KEY} to {base}/")
+        for key in LANE_STATUS_KEYS:
+            print(f"[dry-run] the dashboard also reads {base}/{key}")
         return
 
     store = S3Store(s3cfg)
@@ -122,6 +130,10 @@ def main() -> None:
     print(f"  {base}/receipts/latest.json")
     print(f"  {base}/status/chain.json      (validator: live block anchor + submissions)")
     print(f"  {base}/status/v2.json         (trainer: v2 go-live, lane B, MoE routing health)")
+    # owner 2026-11-28: the dashboard's "Queue (lanes B, C, D)" and "Recent
+    # verdicts" sections read these live (per-entry reason + verdict margins)
+    for key in LANE_STATUS_KEYS:
+        print(f"  {base}/{key}")
 
 
 if __name__ == "__main__":

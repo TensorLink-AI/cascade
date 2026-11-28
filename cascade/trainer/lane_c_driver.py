@@ -662,8 +662,12 @@ class LaneCDriver:
             done = [f for f in self.st.finished if f["trained_pointer"] in pointers]
             for f in done:
                 if queue is not None:
+                    # owner 2026-11-28: the public verdict (display only):
+                    # published for forward judging in this settlement
                     queue.mark_done(f["leg"]["hotkey"], expect_ref=f["leg"]["entry_ref"],
-                                    expect_started_block=f["leg"]["started_block"])
+                                    expect_started_block=f["leg"]["started_block"],
+                                    verdict={"lane": "c", "outcome": "published",
+                                             "round_id": rid, "ref": f["leg"].get("ref")})
                 leg = f["leg"]
                 k = spent_key(leg["hotkey"], leg["target"], leg["ref"],
                               int(leg.get("commit_block", 0) or 0))
