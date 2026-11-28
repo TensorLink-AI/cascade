@@ -76,9 +76,10 @@ CONTEXT = w7a.CONTEXT
 STAGES = ("submit", "intake", "pool_build", "pool_pin", "settle", "publish", "verify",
           "miner_status")
 # The box's heap budget for one settlement step (pools never load here). The
-# reference in-process path over the same pins goes several times over it.
-BOX_STEP_BUDGET_BYTES = 2 * 1024 * 1024
-FIXTURE_HISTORY = 4096
+# box path peaks ~0.8 MiB locally, ~2.3 MiB on GitHub runners (first-use
+# allocations); the reference in-process path over the same pins is > 24 MiB.
+BOX_STEP_BUDGET_BYTES = 8 * 1024 * 1024
+FIXTURE_HISTORY = 16384
 # What real eval hosts print on stdout before their one JSON line (hf_hub /
 # pip download progress; #983 was lane B's copy of this).
 CHATTER = (b"Downloading model.safetensors: 100%|##########| 12.0M/12.0M\n"
@@ -395,7 +396,7 @@ def make_world(tmp: Path, monkeypatch, capsys, caplog) -> World:
     from cascade.shared.config.lane_d_ops import lane_d_ops_config
 
     w = World(Path(tmp), monkeypatch, capsys, caplog)
-    # 4096-point histories (W7a's default is 256): an in-process pool load is
+    # 16384-point histories (W7a's default is 256): an in-process pool load is
     # then several MiB, far over BOX_STEP_BUDGET_BYTES; the box path is not.
     monkeypatch.setattr(w7a, "HISTORY", FIXTURE_HISTORY)
     w.fx = w8b.fixture(w.tmp / "fx")
