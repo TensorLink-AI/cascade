@@ -243,6 +243,9 @@ def _error_reason(cls: str, err: str, entry) -> tuple[str, str]:
         return ("funding_expired", "funding expired before the leg started: fund again")
     if cls == "tamper":
         return ("tamper", "a pod identity / integrity check failed: the entry ended")
+    if cls == "checkpoint_unverifiable":
+        return (cls, "your pod's checkpoint could not be verified against the pod's own "
+                     "listing: the entry ended unburned; the operator reviews the evidence")
     if cls in ("spend_cap", "budget"):
         return (cls, _STATUS_TEXT["paused_spend_cap" if cls == "spend_cap" else "paused_budget"])
     if cls == "price_cap_unavailable":

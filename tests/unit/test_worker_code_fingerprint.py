@@ -164,8 +164,11 @@ def test_second_stall_is_the_miners_shot():
 def test_other_rejections_and_infra_exits_are_unchanged():
     assert classify_funded_worker_failure(3, "rejected: static_guard: import os", stalled_before=False) \
         == (True, "generator", False)
-    assert classify_funded_worker_failure(1, "Traceback ...", stalled_before=False) == (False, "infra", True)
-    assert classify_funded_worker_failure(None, "ssh died", stalled_before=False) == (False, "infra", True)
+    # retro 2026-11-28 (P7): an exit no attribution row recognises is OURS
+    assert classify_funded_worker_failure(1, "Traceback ...", stalled_before=False) == (
+        False, "operator", False)
+    assert classify_funded_worker_failure(None, "ssh died", stalled_before=False) == (
+        False, "operator", False)
 
 
 # ── funded rent path: a stale pod never receives a leg ──────────────────────

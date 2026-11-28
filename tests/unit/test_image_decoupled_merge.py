@@ -225,6 +225,6 @@ def test_ssh_failure_is_infra_never_miner_never_an_image_refusal(msg):
     miner_fault, error_class, _ = classify_leg_exception(
         SimpleNamespace(), SimpleNamespace(hotkey="hk", ref="r"), SimpleNamespace(base_seed=1),
         err, rc=255, text=str(err), stalled_before=False, shards_leg=False)
-    # infra: the payer leg's generic handler never flips it operator-billed
-    # (#419 — only an operator-class verdict is a make-good)
-    assert (miner_fault, error_class) == (False, "infra")
+    # retro 2026-11-28 (P7): never the miner's — a transport loss is ours
+    # (unknown ⇒ operator, make-good eligible; supersedes #419's "infra")
+    assert (miner_fault, error_class) == (False, "operator")

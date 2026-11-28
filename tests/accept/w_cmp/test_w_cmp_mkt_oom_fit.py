@@ -44,13 +44,17 @@ def _dispatch_error(stderr: str, role: str):
     return err
 
 
-def _verdict(exc):
+def _verdict(exc, fit_evidence="fit"):
+    """The classifier's verdict; ``fit_evidence`` is the fund-time fit check's
+    outcome (retro 2026-11-28 P7: an OOM is the miner's only when it vouched
+    — the unvouched case is pinned in test_w_cmp_fault_attribution.py)."""
     from cascade.trainer.faults import classify_leg_exception
 
     runner = SimpleNamespace()
     gen = SimpleNamespace(hotkey="5Cu2sxndK8Dw", ref="Alemaj-ft-ai-7/mkt-8a4e0122@hf:ba4d")
     return classify_leg_exception(runner, gen, SimpleNamespace(base_seed=1), exc, rc=1,
-                                  text=str(exc), stalled_before=False, shards_leg=False)
+                                  text=str(exc), stalled_before=False, shards_leg=False,
+                                  fit_evidence=fit_evidence)
 
 
 class _Queue:
@@ -113,11 +117,12 @@ def test_infra_faults_keep_the_retry_while_the_recipe_oom_does_not(tmp_path):
     infra = [_dispatch_error(crash, "mkt_finetune"),          # a crash, not an OOM
              _dispatch_error(other, "mkt_finetune"),          # another process filled the GPU
              _dispatch_error(STDERR, "challenger")]           # lane A: the operator's contract
+    # retro 2026-11-28 (P7): unknown ⇒ OPERATOR — requeued, never burned
     for exc in infra:
-        assert _verdict(exc) == (False, "infra", True), exc.final_exception[:80]
+        assert _verdict(exc) == (False, "operator", False), exc.final_exception[:80]
     q = _leg_done(tmp_path, _verdict(infra[0]))
     assert q.failed == [] and [h for h, _ in q.requeued] == ["5Cu2sxndK8Dw"]
-    assert q.requeued[0][1]["burn_attempt"] is True
+    assert q.requeued[0][1]["burn_attempt"] is False
     # ... and the SAME stderr on a miner-sized role is no longer retried
     assert _verdict(_dispatch_error(STDERR, "mkt_finetune"))[0] is True
 

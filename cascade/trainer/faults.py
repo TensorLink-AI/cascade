@@ -148,9 +148,10 @@ _STALL_MARKER = "generator_stalled"
 # must match in full the fully-qualified class names the interpreter prints.
 #
 # Bounded: the corpus is reused across retries, so a persistently bad stored
-# object would fail every retry the same way. After SHARD_FAULT_REQUEUE_CAP
-# unburned shard faults for one corpus (hotkey, seed, ref) the next one is
-# plain "infra" again (burns, as before this class existed).
+# object would fail every retry the same way. Retro 2026-11-28 (P7): it stays
+# OURS past SHARD_FAULT_REQUEUE_CAP (no miner burn for our storage); the
+# entry's operator-fault cap bounds the requeues, and past this cap the
+# trainer logs a warning to check the stored object.
 SHARD_FAULT_REQUEUE_CAP = 2
 _SHARD_FETCH_EXC_RE = re.compile(
     r"^cascade\.generation\.shards\.(?:"
@@ -258,61 +259,89 @@ def shard_fetch_failure(final_exception: str) -> bool:
     return bool(_SHARD_FETCH_EXC_RE.match((final_exception or "").strip()))
 
 
+def attribute_funded_worker_failure(rc: int | None, text: str, *,
+                                    stalled_before: bool,
+                                    shards_leg: bool = False,
+                                    final_exception: str = "",
+                                    shard_faults_before: int = 0,
+                                    role: str = "",
+                                    fit_evidence: str = ""):
+    """The :class:`~cascade.trainer.fault_class.Attribution` of a funded
+    worker exit — the ONE table (:data:`cascade.trainer.fault_class.RULES`)
+    decides; an exit no row recognises is the OPERATOR's (unburned,
+    make-good eligible). ``shard_faults_before`` is kept for callers; a
+    repeated shard fetch failure of one corpus is still our storage."""
+    from .fault_class import FailureFacts, attribute
+
+    del shard_faults_before
+    return attribute(FailureFacts(
+        rc=rc, text=text or "", final_exception=final_exception or "", role=role or "",
+        stalled_before=bool(stalled_before), shards_leg=bool(shards_leg),
+        fit_evidence=fit_evidence or ""))
+
+
 def classify_funded_worker_failure(rc: int | None, text: str, *,
                                    stalled_before: bool,
                                    shards_leg: bool = False,
                                    final_exception: str = "",
                                    shard_faults_before: int = 0,
-                                   role: str = "") -> tuple[bool, str, bool]:
-    """``(miner_fault, error_class, burn_attempt)`` for a funded worker exit.
+                                   role: str = "",
+                                   fit_evidence: str = "") -> tuple[bool, str, bool]:
+    """``(miner_fault, error_class, burn_attempt)`` for a funded worker exit:
+    :func:`attribute_funded_worker_failure`'s verdict (retro 2026-11-28 P7:
+    the table in :mod:`cascade.trainer.fault_class`, unknown ⇒ operator).
 
-    ``rc == 3`` is the worker's "miner submission rejected" exit (CorpusError).
-    A rejection whose text is a stream STALL is classed :data:`STALL_CLASS`
-    (infra-side, unburned) the first time and ``"generator"`` (the miner's
-    shot) only when this hotkey already stalled once before. Every other
-    rejection stays ``"generator"`` — except a MarketCast non-finite training
-    loss / gradient (:func:`nonfinite_training`, any rc), which is
-    :data:`OPERATOR_FAULT_CLASS`, unburned (2026-11-28). On a ``shards_leg`` (the corpus was
-    pushed; no miner code ran on the pod) a non-rejection exit whose
-    dispatcher-parsed ``final_exception`` is a remote shard fetch failure
-    (:func:`shard_fetch_failure` — our storage) is :data:`OPERATOR_FAULT_CLASS`,
-    unburned, while ``shard_faults_before`` (this corpus's earlier ones) is
-    under :data:`SHARD_FAULT_REQUEUE_CAP`. A ``role`` in
-    :data:`MINER_SIZED_ROLES` whose ``final_exception`` is a CUDA OOM of its
-    own run (:func:`own_run_cuda_oom`) is the miner's recipe:
-    :data:`GPU_OOM_CLASS`, terminal (never re-rented). Any other exit is
-    ``"infra"`` and burns one of the entry's retry attempts, as before.
+    Rows, first match wins: a MarketCast non-finite training loss / gradient
+    is OURS (:func:`nonfinite_training`, any rc); rc 3 with a stream STALL is
+    :data:`STALL_CLASS` the first time, ``"generator"`` when this hotkey
+    stalled before; rc 3 "could not cut a … training sample" is the miner's
+    ``"recipe"``; any other rc 3 (the worker's "miner submission rejected")
+    is ``"generator"``; a CUDA OOM of a :data:`MINER_SIZED_ROLES` leg's own
+    run (:func:`own_run_cuda_oom`) is :data:`GPU_OOM_CLASS` (terminal) ONLY
+    with fund-time ``fit_evidence`` ("fit" / "own_risk"), else ours; a shards
+    leg's shard fetch failure and the trainer's own pod / watchdog /
+    transport texts are ours; ANY other exit is ours by policy —
+    :data:`OPERATOR_FAULT_CLASS`, unburned (no longer an "infra" burn).
     """
-    if nonfinite_training(text):
-        return False, OPERATOR_FAULT_CLASS, False
-    if rc == 3:
-        if _STALL_MARKER in (text or "") and not stalled_before:
-            return False, STALL_CLASS, False
-        return True, "generator", False
-    if role in MINER_SIZED_ROLES and own_run_cuda_oom(final_exception):
-        return True, GPU_OOM_CLASS, False
-    if (shards_leg and shard_fetch_failure(final_exception)
-            and shard_faults_before < SHARD_FAULT_REQUEUE_CAP):
-        return False, OPERATOR_FAULT_CLASS, False
-    return False, "infra", True
+    return attribute_funded_worker_failure(
+        rc, text, stalled_before=stalled_before, shards_leg=shards_leg,
+        final_exception=final_exception, shard_faults_before=shard_faults_before,
+        role=role, fit_evidence=fit_evidence).verdict()
 
 
 def classify_leg_exception(runner, gen, seeds, exc: BaseException, *, rc: int | None,
                            text: str, stalled_before: bool,
-                           shards_leg: bool, role: str = "") -> tuple[bool, str, bool]:
-    """:func:`classify_funded_worker_failure` for a failed funded leg, with
-    the per-corpus shard-fault count kept on ``runner`` (in memory; a trainer
-    restart resets it — still bounded per process). ``role`` defaults to the
-    role the dispatcher stamped on ``exc`` (:func:`role_of`)."""
+                           shards_leg: bool, role: str = "",
+                           fit_evidence: str = "") -> tuple[bool, str, bool]:
+    """:func:`classify_funded_worker_failure` for a failed funded leg.
+    ``role`` defaults to the role the dispatcher stamped on ``exc``
+    (:func:`role_of`). The attribution (with its rule id) is kept on
+    ``runner._last_attribution`` for the caller's failure line."""
+    return attribute_leg_exception(runner, gen, seeds, exc, rc=rc, text=text,
+                                   stalled_before=stalled_before, shards_leg=shards_leg,
+                                   role=role, fit_evidence=fit_evidence).verdict()
+
+
+def attribute_leg_exception(runner, gen, seeds, exc: BaseException, *, rc: int | None,
+                            text: str, stalled_before: bool, shards_leg: bool,
+                            role: str = "", fit_evidence: str = ""):
+    """The :class:`~cascade.trainer.fault_class.Attribution` of a failed
+    funded leg: our disk / a harvest we could not finish first (operator,
+    rule ``O-OUR-DISK``), then the table. The per-corpus shard-fault count
+    stays on ``runner`` for the operator's log line."""
     import threading
 
+    from .fault_class import OPERATOR, Attribution
     from .harvest_guard import local_disk_error
 
     if local_disk_error(exc) is not None or getattr(exc, "keep_pod", False):
         # 2026-11-02: OUR disk (ENOSPC/EIO/... anywhere in the leg) or a
         # harvest our side could not finish — an operator fault, never a
         # miner burn, whatever the message says.
-        return False, OPERATOR_FAULT_CLASS, False
+        att = Attribution(OPERATOR, OPERATOR_FAULT_CLASS, False, "O-OUR-DISK",
+                          "our disk error / a harvest our side could not finish")
+        runner.__dict__["_last_attribution"] = att
+        return att
     final = final_exception_of(exc)
     key = (str(getattr(gen, "hotkey", "")), str(getattr(seeds, "base_seed", "")),
            str(getattr(gen, "ref", "")))
@@ -320,17 +349,18 @@ def classify_leg_exception(runner, gen, seeds, exc: BaseException, *, rc: int | 
     with lock:
         counts = runner.__dict__.setdefault("_shard_fault_counts", {})
         before = int(counts.get(key, 0))
-        verdict = classify_funded_worker_failure(
+        att = attribute_funded_worker_failure(
             rc, text, stalled_before=stalled_before, shards_leg=shards_leg,
             final_exception=final, shard_faults_before=before,
-            role=role or role_of(exc))
+            role=role or role_of(exc), fit_evidence=fit_evidence)
         if shards_leg and rc != 3 and shard_fetch_failure(final):
             counts[key] = before + 1
-            if verdict[1] != OPERATOR_FAULT_CLASS:
+            if before + 1 > SHARD_FAULT_REQUEUE_CAP:
                 log.warning("leg %s: shard fetch failure #%d for one corpus (cap %d) — "
-                            "classed infra; check the stored object (%s)",
+                            "still ours (operator, unburned); check the stored object (%s)",
                             key[0][:12], before + 1, SHARD_FAULT_REQUEUE_CAP, final[:200])
-    return verdict
+    runner.__dict__["_last_attribution"] = att
+    return att
 
 
 # Storage-layer failure fingerprints: a run that died inside the artifact /

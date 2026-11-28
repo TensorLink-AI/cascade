@@ -1065,13 +1065,18 @@ class _OperatorPodMixin:
             # ours and never burns one of their attempts.
             q = self._funded_queue()
             prior = q.get(gen.hotkey) if q is not None else None
+            from .fault_class import UNKNOWN_RULE
+
+            self.__dict__.pop("_last_attribution", None)
             miner_fault, error_class, _burn = classify_leg_exception(
                 self, gen, seeds, e, rc=getattr(e, "returncode", None), text=str(e),
                 stalled_before=bool(prior is not None
                                     and prior.last_error_class == STALL_CLASS),
                 shards_leg=bool(corpus.get("corpus_files")))
-            if error_class == "infra":
-                # infra on OUR pod (it died, transport): transient (review F4)
+            rid = getattr(self.__dict__.pop("_last_attribution", None), "rule_id", "")
+            if error_class == "infra" or rid in (UNKNOWN_RULE.rule_id, "O-HOST"):
+                # unknown / host loss on OUR pod (it died, transport):
+                # transient (review F4) — ours either way, never burned
                 error_class = "operator_transient"
             self._record_funded_failure(gen.hotkey, str(e), miner_fault=miner_fault,
                                         error_class=error_class, burn=False)
