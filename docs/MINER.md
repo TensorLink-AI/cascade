@@ -1136,6 +1136,7 @@ What happens to your entry when a leg does not produce a judged checkpoint:
 | generator | your code raised, a series failed the checks, the loss went non-finite, code packed in a string refused at admission | **spent** |
 | duplicate | an exact, rename-only, embedded or private copy of an earlier commit (§9) | **spent** |
 | tamper | pod replaced under the same name, checkpoint altered | **spent** |
+| infeasible | refused BEFORE anything was rented: the GPU type you chose cannot run the pinned `torch==2.4.1+cu124` (`gpu_arch_unsupported`, e.g. RTX 5090 / RTX PRO 6000 / B200), your recipe does not fit the GPU's memory (`recipe_exceeds_gpu_memory`, `context_length_unfit`) or its data range cannot cut a sample (`recipe_data_range_uncuttable`) | released, **not spent**, no attempt consumed, nothing charged; fix it and fund again. The intake refuses the same cases at fund time with the same code. A refusal on OUR side (no operator GPU type runs the pinned torch, image not qualified, walls unmeasured, target disk short) waits instead, at no cost to you |
 | ref_mismatch / burned / funding_expired | you re-revealed a different ref / hotkey already used this round / entry outlived the 36 h key TTL | terminal; re-fund (a burned hotkey waits for the next round, or use a fresh one) |
 
 `cascade queue` shows the class beside a failed entry. A rate-limit streak

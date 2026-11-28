@@ -433,6 +433,37 @@ def instance_pool_corpus(cfg, wrap: dict, *, mc=None, store=None,
     return {"corpus_files": {POOL_RELAY_FILE: _json.dumps(plan, sort_keys=True)}}
 
 
+def mkt_pre_rent_refusal(recipe: MktLegRecipe, rent_skus, choice, mc, *,
+                         recommended=None):
+    """The rent-time feasibility of a MarketCast leg
+    (:func:`cascade.funding.feasibility.feasibility`): the chosen (or every
+    default) GPU type's architecture vs the pinned torch and the recipe's
+    memory estimate vs it — the fund-time checks, re-run on the types this
+    rent may actually take. The data-range check stays fund-time only (it
+    needs the public bar index). None = rent."""
+    from ..funding.feasibility import LegPlan, feasibility
+
+    try:
+        obj = json.loads(recipe.payload)
+    except (TypeError, ValueError):
+        obj = None
+    horizons: list[str] = []
+    try:
+        for hs in dict(getattr(mc, "horizons_map", {}) or {}).values():
+            horizons.extend(str(h) for h in hs)
+    except (TypeError, ValueError, AttributeError):
+        horizons = []
+    gpu = str(getattr(choice, "gpu", "") or "")
+    # an own-risk type (not recommended) runs a too-big recipe at the miner's
+    # own risk (owner 2026-11-24; the intake only warns): no memory refusal
+    own_risk = bool(gpu) and recommended is not None and gpu not in tuple(recommended)
+    return feasibility(LegPlan(
+        lane="c", gpu=gpu, candidates=tuple(rent_skus or ()),
+        mkt_recipe=obj if isinstance(obj, dict) and not own_risk else None,
+        mkt_horizons=tuple(horizons),
+        micro_batch_tokens=int(getattr(mc, "micro_batch_tokens", 0) or 0) or None))
+
+
 def train_mkt_leg(ops, leg: dict, recipe: MktLegRecipe, *, mc=None,
                   kind: str = "mkt") -> dict:  # pragma: no cover — pods
     """One MarketCast leg on the MINER's key through the lane-C funded path
@@ -469,6 +500,19 @@ def train_mkt_leg(ops, leg: dict, recipe: MktLegRecipe, *, mc=None,
 
     rent_skus = (operator_pinned_skus(r, gen.hotkey, queue=ops.queue())
                  or mkt_rent_skus(r.cfg, choice))
+    from ..funding.mkt_gpus import mkt_skus
+
+    refusal = mkt_pre_rent_refusal(recipe, rent_skus, choice, leg_cfg,
+                                   recommended=mkt_skus(r.cfg))
+    if refusal is not None:
+        # retro 2026-11-28 #5: refused BEFORE any rent (nothing billed)
+        from ..funding.feasibility import INFEASIBLE_CLASS, failure_message
+
+        log.error("lane C leg %s: refused before renting [%s, %s side]: %s",
+                  gen.hotkey[:12], refusal.code, refusal.actor, refusal.message)
+        raise LegFailure(failure_message(refusal), miner_fault=refusal.miner_side,
+                         error_class=(INFEASIBLE_CLASS if refusal.miner_side
+                                      else "operator_blocked"), burn=False)
     try:
         # owner 2026-11-24: the leg rents the miner's chosen type (any Lium
         # GPU: the worker is one process on cuda:0), else the cheapest fitting

@@ -190,6 +190,17 @@ def _error_reason(cls: str, err: str, entry) -> tuple[str, str]:
             return ("operator_nonfinite", "our fault (non-finite training on our side): "
                                           "requeued at no cost")
         return ("operator_fault", "our fault: requeued at no cost")
+    if cls in ("infeasible", "operator_blocked"):
+        # retro 2026-11-28 #5: a pre-rent feasibility refusal (stored as
+        # "feasibility <code>: ..."): its code's template, never the text
+        from .feasibility import public_text
+
+        got = public_text(err, miner_side=cls == "infeasible")
+        if got is not None:
+            return got
+    if cls == "infeasible":
+        return ("infeasible", "refused before renting: this leg cannot run as funded; fix "
+                              "it and fund again (nothing rented, no attempt charged)")
     if cls == "operator_blocked":
         return ("operator_blocked", "waiting: operator-paid capacity is on hold; your leg "
                                     "resumes when it frees (no cost to you)")
