@@ -151,6 +151,9 @@ class LaneDInputs:
     # W-IMG: the eval host's code identity the forecasts came from
     # ({"git_head", "package_hash"}; None = not known)
     eval_identity: Mapping | None = None
+    # W-OFFBOX (2026-11-28): the settlement's pool phase on the eval host
+    # (settle_lane_d(pool_phase=)); None = judged in this process.
+    pool_phase: Any = None
 
 
 def _eval_identity_of(cfg: Any, inp: Any, boundary: int) -> dict | None:
@@ -375,6 +378,8 @@ class LaneDStep:
                               public_indexes=_mapping_of(inp, "public_indexes"),
                               public_scores=_mapping_of(inp, "public_scores"),
                               **({} if _host_of(inp) is None else {"host": _host_of(inp)}),
+                              **({} if getattr(inp, "pool_phase", None) is None
+                                 else {"pool_phase": inp.pool_phase}),
                               **({"eval_identity": ident} if (ident := _eval_identity_of(
                                   self.cfg, inp, int(boundary))) else {}))
         except Exception as e:  # noqa: BLE001 — LaneDStateError, schema, pool or crash

@@ -105,6 +105,7 @@ def run_horizon_calibration(
         def evaluate_fn(d, w, ns, dev):  # noqa: ANN001
             return evaluate_checkpoint(d, w, num_samples=ns, device=dev)
 
+    # incident-ok: IR010 baseline 2026-11-28: lane A calibration reads one round's eval pool snapshot
     series, _ids, metadata = load_pool_series(pool_dir)
     out: dict = {"seed": seed, "n_windows": n_windows,
                  "num_samples": num_samples, "horizons": {}}

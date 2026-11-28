@@ -1,0 +1,35 @@
+# W-OFFBOX (owner 2026-11-28, after the 04:39 / 05:41 validator OOM kills): the
+# lane D settlement's pool phase on the lane D eval host; README.md has the
+# contract.
+# The pool phase as a function (_judge_pools, the old body unchanged), its JSON
+# request / record and settle_lane_d(pool_phase=).
+cascade/validator/lane_d.py
+# The offloaded inputs (settle_on_host, HostJudge, RemoteForecasts), the box
+# pool budget, the shared window / forecast functions, SSHEvalHost.settle and
+# the inputs-file keys.
+cascade/validator/lane_d_inputs.py
+# LaneDInputs.pool_phase, passed to settle_lane_d.
+cascade/validator/lane_d_wiring.py
+# The step's RSS sampling, log and over-budget ERROR.
+cascade/validator/offthread_worker.py
+# The eval host: the settle command and the shared local forecast.
+cascade/eval/lane_d_settle.py
+cascade/eval/lane_d_forecasts.py
+# IR010: in-process pool / checkpoint loads in cascade/validator/ (rule, book,
+# tests) and the reviewed allowlist comments on the existing sites.
+scripts/check_incident_rules.py
+docs/INCIDENT_RULES.md
+tests/unit/test_incident_rules.py
+cascade/validator/calibration.py
+cascade/validator/expert_lane.py
+cascade/validator/lane_d_score_cache.py
+cascade/validator/main.py
+cascade/validator/mkt_worker.py
+cascade/validator/pool.py
+cascade/validator/private_worker.py
+# windows.py also: the WindowSource Protocol method's body is its docstring
+# (stub_scan over PATHS).
+cascade/validator/windows.py
+# docs/OPERATOR.md ONLY the lane D "What runs" table, the runbook line and the
+# "Lane D pool phase on the eval host (W-OFFBOX)" section.
+docs/OPERATOR.md
