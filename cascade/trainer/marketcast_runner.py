@@ -465,7 +465,7 @@ def train_mkt_leg(ops, leg: dict, recipe: MktLegRecipe, *, mc=None,
         max_price_per_hour=float(leg.get("gpu_max_price_per_hour", 0.0) or 0.0))
     # owner 2026-11-26: an OPERATOR-billed leg whose approval pins GPU types
     # rents exactly those (the lane B rule); else today's list
-    from .money_guard import operator_pinned_skus
+    from .money_guard import operator_make_good_scope, operator_pinned_skus
 
     rent_skus = (operator_pinned_skus(r, gen.hotkey, queue=ops.queue())
                  or mkt_rent_skus(r.cfg, choice))
@@ -473,8 +473,13 @@ def train_mkt_leg(ops, leg: dict, recipe: MktLegRecipe, *, mc=None,
         # owner 2026-11-24: the leg rents the miner's chosen type (any Lium
         # GPU: the worker is one process on cuda:0), else the cheapest fitting
         # recommended type ([marketcast] funded_pod_skus); Lium only
+        # owner 2026-11-28 "add make goods": a lane C leg opts in to the
+        # operator make-good like a rolling lane A leg — an operator-billed
+        # entry (our fault) PROPOSES an operator re-run (the approval request,
+        # priced on the miner's GPU type x the leg wall) and waits for the
+        # owner, never falling back to the miner's key
         with mkt_leg_scope(r), _leg_mc_scope(r, leg_cfg), \
-                mkt_rent_scope(r, rent_skus):
+                mkt_rent_scope(r, rent_skus), operator_make_good_scope(r):
             entry = r._run_funded_leg(
                 r._dispatcher(), gen, seeds, int(leg["started_block"]), contract,
                 leg_suffix(leg["target"], int(leg["uid"])),
