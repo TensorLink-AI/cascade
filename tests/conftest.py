@@ -32,6 +32,17 @@ _LIVE_CREDENTIAL_ENV = (
 
 
 @pytest.fixture(autouse=True)
+def _box_guard_is_per_test():
+    """A test that runs a box service's ``main`` installs the runtime box
+    guard (retro P2) process-wide; never leak it into the next test (later
+    tests may legitimately import torch)."""
+    yield
+    guard = sys.modules.get("cascade.shared.box_guard")
+    if guard is not None:
+        guard.uninstall()
+
+
+@pytest.fixture(autouse=True)
 def _vote_pin_mode_is_per_test():
     """DEC-CA-0067: a test that runs a validator/trainer/audit ``main`` turns
     the process-wide vote-pin guard on; never leak it into the next test."""

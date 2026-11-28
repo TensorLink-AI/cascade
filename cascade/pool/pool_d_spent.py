@@ -680,6 +680,8 @@ def cmd_publish(a) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from ..shared import box_guard
+    box_guard.install("pool-d-spent-publish")
     ap = argparse.ArgumentParser(prog="python -P -m cascade.pool.pool_d_spent",
                                  description="publish spent lane D pool_d snapshots")
     sub = ap.add_subparsers(dest="cmd", required=True)

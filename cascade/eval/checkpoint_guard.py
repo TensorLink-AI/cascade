@@ -176,23 +176,56 @@ def verify_checkpoint_code(checkpoint_dir: Path | str) -> str:
     return arch
 
 
+# Non-finite ⇔ every exponent bit set (IEEE 754; BF16 is F32's top half). The
+# check reads the raw bits, so it needs neither torch nor safetensors and is
+# exactly torch.isfinite for these dtypes.
+_FLOAT_EXP_MASK = {"F16": ("<u2", 0x7C00), "BF16": ("<u2", 0x7F80),
+                   "F32": ("<u4", 0x7F800000), "F64": ("<u8", 0x7FF0000000000000)}
+_FINITE_CHUNK_ELEMS = 1 << 22                  # 16 MiB of F32 per read: bounded RSS
+
+
 def verify_weights_finite(checkpoint_dir: Path | str) -> None:
     """Refuse a checkpoint whose floating-point weights are not all finite.
 
-    Loads the tensors, so call it AFTER :func:`verify_checkpoint` has bounded
-    the file by its header (never on an unverified file). Raises
-    :class:`CheckpointDiverged` naming the first offending tensors.
+    Reads the tensor bytes, so call it AFTER :func:`verify_checkpoint` has
+    bounded the file by its header (never on an unverified file). Torch-free
+    (box guard, retro P2): the header is parsed by :func:`safetensors_header`
+    and each floating tensor is memory-mapped in bounded chunks and tested on
+    its exponent bits. Raises :class:`CheckpointDiverged` naming the first
+    offending tensors, ``ValueError`` on a malformed data region.
     """
-    import torch
-    from safetensors import safe_open
+    import numpy as np
 
     p = Path(checkpoint_dir) / WEIGHTS_FILE
+    with open(p, "rb") as f:
+        (n,) = struct.unpack("<Q", f.read(8))
+    header = safetensors_header(p)
+    base = 8 + int(n)
+    size = p.stat().st_size
     bad: list[str] = []
-    with safe_open(str(p), framework="pt", device="cpu") as f:
-        for name in list(f.keys()):
-            t = f.get_tensor(name)
-            if t.is_floating_point() and not bool(torch.isfinite(t).all()):
+    for name in sorted(header, key=lambda k: header[k].get("data_offsets", [0])[0]
+                       if isinstance(header[k], dict) else 0):
+        meta = header[name]
+        dt = str(meta.get("dtype", "")) if isinstance(meta, dict) else ""
+        if dt.startswith("F") and dt not in _FLOAT_EXP_MASK:
+            raise ValueError(f"tensor {name!r}: no finiteness rule for dtype {dt!r}")
+        if dt not in _FLOAT_EXP_MASK:
+            continue                                   # ints / bool: always finite
+        utype, mask = _FLOAT_EXP_MASK[dt]
+        lo, hi = (int(x) for x in meta["data_offsets"])
+        width = np.dtype(utype).itemsize
+        if lo < 0 or hi < lo or (hi - lo) % width or base + hi > size:
+            raise ValueError(f"tensor {name!r}: data_offsets outside the file")
+        count = (hi - lo) // width
+        if count == 0:
+            continue
+        bits = np.memmap(p, dtype=utype, mode="r", offset=base + lo, shape=(count,))
+        m = bits.dtype.type(mask)
+        for i in range(0, count, _FINITE_CHUNK_ELEMS):
+            if bool(((bits[i:i + _FINITE_CHUNK_ELEMS] & m) == m).any()):
                 bad.append(str(name))
+                break
+        del bits
     if bad:
         raise CheckpointDiverged(
             f"{WEIGHTS_FILE}: {len(bad)} tensor(s) hold non-finite values "
@@ -227,7 +260,18 @@ def safetensors_header(path: Path | str) -> dict:
 def _model_for_contract(contract):
     """The pinned model + its config dict for ``contract`` (no weights). The
     MoE model is built on the meta device — its shapes are all the guard
-    needs, and 191M params need not be allocated per ingest."""
+    needs, and 191M params need not be allocated per ingest.
+
+    The one box path that still imports torch (the pinned model code IS
+    torch modules): a named :func:`cascade.shared.box_guard.allow` window,
+    holding no weights (meta device / the 4M CPU model's random init)."""
+    from ..shared import box_guard
+
+    with box_guard.allow("torch", why="checkpoint_guard: pinned model state spec"):
+        return _model_for_contract_inner(contract)
+
+
+def _model_for_contract_inner(contract):
     if str(getattr(contract, "base_arch", "") or "") == "cascade_pyramid":
         import torch
 

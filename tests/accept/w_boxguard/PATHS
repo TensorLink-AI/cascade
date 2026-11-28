@@ -1,0 +1,27 @@
+# W-BOXGUARD (owner 2026-11-28, retro P2 / C2 after three validator OOM kills
+# and the #1003 timestral import on the box): the runtime box guard, the
+# per-service memory limits and the shared per-step RSS sampler; README.md has
+# the contract.
+# The import refuser and the one sampler.
+cascade/shared/box_guard.py
+cascade/shared/rss_budget.py
+# The guard installed at the start of every box service.
+cascade/validator/main.py
+cascade/trainer/main.py
+cascade/funding/main.py
+cascade/provision/main.py
+cascade/lane_d/main.py
+cascade/pool/pool_d_publish.py
+cascade/pool/pool_d_spent.py
+cascade/pool/settlement_evals.py
+# Torch-free finiteness check; the named torch window for the shape spec.
+cascade/eval/checkpoint_guard.py
+# The off-thread steps on the shared sampler (lane D, MarketCast, lane B acceptance).
+cascade/validator/offthread_worker.py
+cascade/validator/marketcast.py
+cascade/trainer/lane_b_driver.py
+# Unit files + owner-run migration runbook (never installed by a tool).
+deploy/systemd/
+# The import-time guard's module list; the per-test guard reset.
+tests/unit/test_box_side_torch_free.py
+tests/conftest.py

@@ -534,6 +534,8 @@ def main(argv: list[str] | None = None) -> int:
     from ..shared.env import load_env_files
 
     verify_release_code_path("cascade-provisioner")
+    from ..shared import box_guard
+    box_guard.install("cascade-provisioner")
     load_env_files()
     args = _build_parser().parse_args(argv)
     logging.basicConfig(level=args.log_level,

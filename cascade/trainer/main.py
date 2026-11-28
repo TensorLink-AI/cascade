@@ -200,6 +200,10 @@ def _preflight_v2_baseline(cfg, args) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # the box guard (retro P2) defaults to WARN here: the live trainer has torch
+    # mapped from a path not yet named; flip to enforce once a warn era is clean
+    from ..shared import box_guard
+    box_guard.install("cascade-trainer", default_mode="warn")
     from .operator_legs_cli import COMMANDS as _OPERATOR_LEG_COMMANDS
 
     raw = list(sys.argv[1:] if argv is None else argv)
