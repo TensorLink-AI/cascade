@@ -221,7 +221,8 @@ Approve-tier:
 
 1. **Build.** Dispatch `publish-worker` (`gh workflow run publish-worker.yml
    -f tag=<tag>` on the commit you release, or push a `worker-v*` tag). The
-   image installs with `uv sync --frozen`. The lock-drift guard fails the
+   image installs from the lock (`deploy/Dockerfile`: a frozen sync with the
+   worker's extras). The lock-drift guard fails the
    build on any drift. The run uploads `image-manifest.json` (artifact
    `image-manifest`) with these fields:
    - the image digest;
