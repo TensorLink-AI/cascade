@@ -111,7 +111,7 @@ snapshot from the root committed one build earlier (`test_w6fs_incremental.py`):
   fingerprints its log prefix is dropped (full scan); one older than
   `full_verify_seconds` (24 h) is replaced by a full scan that warns
   `DIVERGED` if it differed. The cache is never one of the pushed log files.
-* `.index(*, until_ts, roots="committed")` / `.feed_index(...)`: `roots` is
+* `.index(*, until_ts, roots="committed")` / `.feed_index(...)` (plan rev6.26, owner-approved 2026-11-28): `roots` is
   `"committed"` (the rule above) or `"ended"`: every committed period that
   ENDED by `until_ts` (`period_start + PERIOD_SECONDS <= until_ts`, so all its
   `seen_ts < until_ts`), whenever its root was committed — the pool_d
