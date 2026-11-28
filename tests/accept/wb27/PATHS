@@ -198,3 +198,9 @@ tests/accept/wb27/test_wb27_miner_visible_reasons.py
 # verified on fetch; a marker over a chunk index is incomplete; every push is
 # forced to the single-blob layout (HIPPIUS_CHUNKED_WRITE=0). hippius.py and
 # lane_b_offload.py (pod cache completeness) are listed above.
+# 2026-11-28 retro #6: permanent-fault paging. A fault a retry cannot fix (missing
+# library, GPU arch the pinned torch lacks, contract/image mismatch) stops the
+# in-window settlement retries and logs PERMANENT FAULT (cascade-ops pages on it);
+# the same error over N settlements pages; MarketCast deferrals page (log-only).
+cascade/shared/permanent_fault.py
+tests/accept/wb27/test_wb27_permanent_fault_paging.py

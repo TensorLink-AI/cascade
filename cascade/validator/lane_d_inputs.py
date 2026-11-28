@@ -1224,6 +1224,14 @@ class SSHEvalHost:
     def hello(self) -> dict:
         host = self._resolve()
         self._host = None
+        # retro P4: re-sync the eval host onto this release BEFORE the W4
+        # handshake (which still fails closed on any remaining difference)
+        from ..shared.release_fp import ReleaseSyncFailed, ReleaseUnreachable, ensure_release
+
+        try:
+            ensure_release(host, role="lane-d-eval")
+        except (ReleaseSyncFailed, ReleaseUnreachable) as e:
+            raise RuntimeError(f"{host.name}: {e}") from e
         doc = json.loads(self._ssh(host, ["hello"], b""))
         self._host = host
         return doc

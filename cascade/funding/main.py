@@ -688,6 +688,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     from ..shared.codepath import verify_release_code_path
     verify_release_code_path("cascade-intake")
+    from ..shared import box_guard
+    box_guard.install("cascade-intake")
     load_env_files()
 
     cfg = None

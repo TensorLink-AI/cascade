@@ -288,6 +288,13 @@ class MktSession:
         # BEFORE the worker resolves its --root, so the worker's containment
         # check runs on the real location
         root = cache_root_of(h)
+        # retro P4: the pod's cascade/ is this release before the worker starts
+        from ..shared.release_fp import ReleaseSyncFailed, ReleaseUnreachable, ensure_release
+
+        try:
+            ensure_release(h, role="marketcast")
+        except (ReleaseSyncFailed, ReleaseUnreachable) as e:
+            raise MktOffloadError(f"{h.name}: {e}") from e
         cmd = (f"{_placement(h, f'{base_dir(h)}/{OFFLOAD_DIR}')}"
                f"mkdir -p {shlex.quote(root)} && "
                f"cd {shlex.quote(h.workdir)} && {env}exec {shlex.quote(h.remote_python)} -m "

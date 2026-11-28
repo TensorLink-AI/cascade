@@ -1839,28 +1839,15 @@ class MarketCastMixin:
         (W-MKTOFF): the process RSS is sampled for the whole round, logged
         (``rss start / peak``) and an ERROR names a growth over
         :data:`MKT_ROUND_RSS_BUDGET_BYTES` (``mkt_round_rss_budget_bytes``)."""
-        from .offthread_worker import RSS_SAMPLE_SECONDS, _RssWatch, process_rss_bytes
+        from ..shared.rss_budget import RSS_SAMPLE_SECONDS, process_rss_bytes, step_rss
 
         rid = str(item.get("round_id", ""))
-        probe = getattr(self, "mkt_rss_probe", None) or process_rss_bytes
-        watch = _RssWatch(probe, float(getattr(self, "mkt_rss_interval", RSS_SAMPLE_SECONDS)))
-        watch.start()
-        try:
+        with step_rss(f"marketcast round={rid}",
+                      int(getattr(self, "mkt_round_rss_budget_bytes", MKT_ROUND_RSS_BUDGET_BYTES)),
+                      logger=log, hint="the judge belongs on the MarketCast pod (W-MKTOFF)",
+                      probe=getattr(self, "mkt_rss_probe", None) or process_rss_bytes,
+                      interval=float(getattr(self, "mkt_rss_interval", RSS_SAMPLE_SECONDS))):
             return self._mkt_publish_round_inner(item, holders=holders)
-        finally:
-            rss = watch.stop()
-            mb = 1024 * 1024
-            budget = int(getattr(self, "mkt_round_rss_budget_bytes", MKT_ROUND_RSS_BUDGET_BYTES))
-            if rss is None:
-                log.warning("marketcast round=%s: process RSS unreadable", rid)
-            else:
-                log.info("marketcast round=%s: rss start %d MB, peak %d MB (+%d MB)", rid,
-                         rss["start"] // mb, rss["peak"] // mb, rss["growth"] // mb)
-                if rss["growth"] > budget:
-                    log.error("marketcast round=%s grew the validator RSS by %d MB, over the "
-                              "%d MB box budget (peak %d MB): the judge belongs on the "
-                              "MarketCast pod (W-MKTOFF)", rid, rss["growth"] // mb,
-                              budget // mb, rss["peak"] // mb)
 
     def _mkt_publish_round_inner(self, item: dict, *, holders: dict | None = None) -> bool:
         """Main validator: compute + sign + publish round ``item``'s report
@@ -1943,6 +1930,24 @@ class MarketCastMixin:
                           "retried at the next settlement", rid, e)
                 return False
         entries, sidecars = [], {}
+        # retro 2026-11-28 #6: a permanent fault behind an infra deferral (a
+        # library missing in the judging process, a GPU arch the pinned torch
+        # lacks) pages the owner once per round. Log-only: the deferral rows
+        # and the report bytes are unchanged.
+        from ..shared.permanent_fault import classify_text as _perm_text
+        from ..shared.permanent_fault import page as _perm_page
+
+        paged: set[str] = set()
+
+        def _page_if_permanent(text: str) -> None:
+            pf = _perm_text(text)
+            if pf is not None and pf.kind not in paged:
+                paged.add(pf.kind)
+                _perm_page(f"marketcast round={rid}", pf,
+                           action="entries infra_deferred; deferring cannot fix it")
+
+        if base_fc is None:
+            _page_if_permanent(base_err)
         ft_cache: dict = {}
         datas: dict = {}
         for c in item["candidates"]:
@@ -1993,6 +1998,7 @@ class MarketCastMixin:
                                                    f"{MKT_COMPUTE_ATTEMPTS}x: {fwd[0]}"[:300]))
                 continue
             if rows is None:
+                _page_if_permanent(err)
                 entries.append(replace(stub, status=INFRA_DEFERRED,
                                        infra_reason=f"compute failed {MKT_COMPUTE_ATTEMPTS}x: "
                                                     f"{err}"[:240] + cap))

@@ -1,0 +1,40 @@
+# cascade trainer on the operator box: replaces restart_trainer_*.sh (nohup).
+# NOT installed by any tool: deploy/systemd/README.md is the owner-run runbook.
+# NEVER `systemctl restart` it without `cascade-ops restart-check trainer` = GO.
+[Unit]
+Description=cascade trainer (operator box)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/cascade
+EnvironmentFile=/etc/cascade/cascade.env
+EnvironmentFile=/etc/cascade/trainer.args
+Environment=PYTHONPATH=/root/cascade-releases/trainer.current
+Environment=PYTHONUNBUFFERED=1
+# warn = log every heavy import as ERROR (box_guard_refused) but proceed; flip
+# to enforce after one era with no box_guard_refused line in trainer.log
+Environment=CASCADE_BOX_GUARD=warn
+ExecStartPre=/bin/sh -c 'test -f /root/cascade/chain.validator.toml'
+ExecStartPre=/bin/sh -c '! grep -q "POD-ONLY OVERRIDE" /root/cascade/chain.toml'
+ExecStart=/root/cascade-v2/.venv/bin/python -P /root/cascade-v2/.venv/bin/cascade-trainer $CASCADE_TRAINER_ARGS
+StandardOutput=append:/root/cascade/trainer.log
+StandardError=append:/root/cascade/trainer.log
+# A trainer restart has side effects (re-attach, killed generation VMs,
+# attach-only gens: OPSLOG 11-28 01:44, 03:50): never automatic.
+Restart=no
+# Only the main process gets TERM; ssh sessions to pods are left as the
+# nohup scripts left them (KillMode=process), so a stop never cuts a harvest.
+KillMode=process
+TimeoutStopSec=45
+# Steady ~750 MB (torch mapped from a path the box guard's warn mode will
+# name). MemoryMax kills the trainer, not the validator.
+MemoryHigh=1500M
+MemoryMax=2G
+MemorySwapMax=1G
+OOMScoreAdjust=0
+
+[Install]
+WantedBy=multi-user.target
