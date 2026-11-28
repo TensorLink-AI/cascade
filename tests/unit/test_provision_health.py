@@ -81,7 +81,7 @@ def test_healthy_pod_passes_all_checks():
     assert report.ok and report.failures == ()
     assert [c.name for c in report.checks] == [
         "ssh_echo", "gpu_sku", "runtime_pin", "worker_import",
-        "image_digest", "code_fingerprint", "hippius", "disk", "fresh_boot",
+        "image_digest", "code_fingerprint", "hippius", "disk", "fresh_boot", "lock_match",
     ]
 
 

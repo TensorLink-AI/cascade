@@ -50,3 +50,20 @@ cascade/trainer/runner_operator_pods.py
 # The decision record and the operator runbook.
 decisions/DEC-CA-0067-image-decoupled-training-contract.md
 docs/OPERATOR.md
+# The image's venv equals uv.lock (owner 2026-11-28 "yeah fix it"; rc5 and
+# mkt-rc3 had ~45 packages off the lock, hippius_hub 0.7.2 vs 0.5.1): the
+# comparer, the frozen image build + build-time guard, the bootstrap guard,
+# the health gate's lock_match check, and the CI installs moved off
+# `uv pip install -e` onto `uv sync --frozen`.
+cascade/shared/lockdrift.py
+cascade/provision/health.py
+tests/unit/test_provision_health.py
+tests/unit/test_provision_boundary_guards.py
+deploy/Dockerfile
+deploy/pod_bootstrap.sh
+.github/workflows/scrape-kings.yml
+.github/workflows/publish-pool.yml
+.github/workflows/publish-mkt-pool.yml
+.github/workflows/publish-mkt-public.yml
+.github/workflows/king-sync.yml
+.github/workflows/laned-king-sync.yml
