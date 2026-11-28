@@ -498,6 +498,7 @@ class FundingIntake:
         mkt_gpu_catalog: GpuCatalog | None = None,  # MarketCast GPUs; None = lane A's catalog
         fetch_mkt_recipe: Callable[[str], object] | None = None,  # ref -> marketcast.json obj
         mkt_cfg: object | None = None,            # [marketcast] (MarketCastConfig) for the fit
+        fetch_mkt_history: Callable[[], object] | None = None,  # public bar index.json
         lane_b_landing: Callable[[int], dict | None] | None = None,  # WB23 landing estimate
         lane_b_contract: object | None = None,    # WB23 base contract (steps cap); None = no cap
         lane_b_queue: object | None = None,       # funding LaneBQueue; None = lane B off
@@ -608,6 +609,15 @@ class FundingIntake:
         # an own-risk type is warned. None = no check (unit construction).
         self.fetch_mkt_recipe = fetch_mkt_recipe
         self.mkt_cfg = mkt_cfg
+        # 2026-11-28 sample-geometry check: ``fetch_mkt_history()`` -> the
+        # public post-embargo bar index (``marketcast_public`` index.json: the
+        # recorder's first/last bar per class/symbol/timeframe; None / raise =
+        # unavailable: the check is skipped, logged). A plain ``mkt`` fund
+        # whose recipe's leg would hit "could not cut a <suite>/<h> training
+        # sample" (``mkt_geom``: its data range mostly before a trained bank's
+        # recorded history) is refused with the earliest data.start that
+        # fits. None = no check (unit construction).
+        self.fetch_mkt_history = fetch_mkt_history
         # WB23: ``lane_b_landing(guard_seconds) -> {target_boundary, era_index,
         # cross_era} | None`` (the miner sees where a leg of that wall lands;
         # it never fails a fund) and the contract a lane B leg derives from
@@ -1395,6 +1405,9 @@ class FundingIntake:
         fit_err, fit_warn = self._mkt_fit_check(target, ref, choice, own_risk_warn)
         if fit_err is not None:
             return 400, fit_err
+        geom_err = self._mkt_geom_check(target, ref)
+        if geom_err is not None:
+            return 400, geom_err
         if fit_warn:
             own_risk_warn = f"{own_risk_warn} {fit_warn}".strip()
         outcome = self.lane_c_queue.add_lane_c(  # type: ignore[union-attr]
@@ -1463,6 +1476,41 @@ class FundingIntake:
         return {"code": "recipe_exceeds_gpu_memory", "message": v.message(),
                 "estimate_gib": v.estimate_gib, "gpu": v.gpu, "gpu_gib": v.gpu_gib,
                 "fitting_gpus": list(v.fitting)}, ""
+
+    def _mkt_geom_check(self, target: str, ref: str) -> dict | None:
+        """The refusal of the 2026-11-28 sample-geometry check of a plain
+        ``mkt`` fund (:mod:`cascade.funding.mkt_geom`), None = accepted or
+        not checked. A spec instance trains on its own standard pool, not
+        the recorder, and is not checked here. Runs after the reveal gate
+        (only a revealed tree's ``marketcast.json`` is fetched, parsed, never
+        run); an unreadable recipe or history skips the check, logged."""
+        fetch, hist, mc = self.fetch_mkt_recipe, self.fetch_mkt_history, self.mkt_cfg
+        if fetch is None or hist is None or mc is None or not ref:
+            return None
+        try:
+            from ..shared.config.lane_c import MKT_KIND, kind_of
+
+            if kind_of(target) != MKT_KIND:
+                return None
+        except (ImportError, ValueError):   # pragma: no cover — lane-C config not shipped
+            return None
+        from .mkt_geom import geom_verdict
+
+        try:
+            obj, index = fetch(ref), hist()
+            v = geom_verdict(obj, mc, index) if index else None
+        except Exception as e:  # noqa: BLE001 — the trainer re-reads the recipe anyway
+            log.warning("lane-C fund: MarketCast recipe %s / bar history unreadable for the "
+                        "sample-geometry check (%s) — not checked", ref, e)
+            return None
+        if v is None or not v.refused:
+            return None
+        log.warning("lane-C fund: MarketCast recipe %s refused: %s/%s cannot be cut from the "
+                    "%s history (risk %.2f, data.start %s, fits from %s)", ref, v.suite,
+                    v.horizon, v.bar, v.risk, v.start, v.fix_start or "-")
+        return {"code": "recipe_data_range_uncuttable", "message": v.message(),
+                "risk": v.risk, "suite": v.suite, "horizon": v.horizon, "bar": v.bar,
+                "history_start": v.bar_first, "fits_from_start": v.fix_start}
 
     def _lane_c_gpu_choice(self, headers) -> tuple[GpuChoice, str, dict | None, str]:
         """``(choice, signed_segment, error, own_risk_warning)`` of a lane-C

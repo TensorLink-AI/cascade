@@ -1,0 +1,142 @@
+{
+ "augmentations": [],
+ "context_length": 4096,
+ "covariates": [
+  "calendar",
+  "session",
+  "events",
+  "cross_asset",
+  "funding",
+  "volume",
+  "cross_eth",
+  "cross_equity",
+  "cross_gold",
+  "cross_fx"
+ ],
+ "data": {
+  "assets": {
+   "commodities": [
+    "CL",
+    "BRENTOIL",
+    "NATGAS",
+    "COPPER"
+   ],
+   "crypto": [
+    "BTC",
+    "ETH",
+    "SOL",
+    "XRP",
+    "HYPE",
+    "BNB",
+    "DOGE",
+    "ADA",
+    "AVAX",
+    "LINK",
+    "SUI",
+    "TRX",
+    "LTC",
+    "DOT",
+    "BCH",
+    "NEAR",
+    "APT",
+    "ARB",
+    "OP",
+    "TAO",
+    "ENA",
+    "AAVE",
+    "UNI",
+    "INJ",
+    "TIA",
+    "SEI",
+    "WIF",
+    "JUP"
+   ],
+   "equity_etf": [
+    "SP500",
+    "XYZ100",
+    "JP225",
+    "KR200",
+    "SMH",
+    "XLE",
+    "TLT",
+    "XBI",
+    "EWJ",
+    "EWY",
+    "EWZ",
+    "EWT",
+    "AAPL",
+    "MSFT",
+    "NVDA",
+    "AMZN",
+    "GOOGL",
+    "META",
+    "TSLA"
+   ],
+   "fx": [
+    "EUR",
+    "JPY",
+    "GBP"
+   ],
+   "metals": [
+    "GOLD",
+    "SILVER",
+    "PLATINUM",
+    "PALLADIUM"
+   ]
+  },
+  "class_weights": {
+   "commodities": 0.19,
+   "crypto": 0.22,
+   "equity_etf": 0.22,
+   "fx": 0.18,
+   "metals": 0.19
+  },
+  "end": "2026-10-25",
+  "frequencies": [
+   "1m",
+   "5m",
+   "15m",
+   "1h",
+   "4h",
+   "1d"
+  ],
+  "start": "2024-01-01"
+ },
+ "horizon_mix": {
+  "15mx96": 0.18,
+  "1dx7": 0.14,
+  "1hx48": 0.17,
+  "1mx60": 0.18,
+  "4hx42": 0.15,
+  "5mx36": 0.18
+ },
+ "leg_hours": 3.0,
+ "objective": {
+  "coverage_penalty": 0.2,
+  "suite_weights": {
+   "high": 0.075,
+   "liquidity": 0.1,
+   "low": 0.075,
+   "ohlcv": 0.2,
+   "range": 0.12,
+   "returns": 0.25,
+   "vol": 0.18
+  }
+ },
+ "optimizer": {
+  "batch": 6,
+  "clip": 1.0,
+  "ema_decay": 0.994,
+  "lr": 0.0001,
+  "schedule": "cosine",
+  "steps": 3600,
+  "warmup_fraction": 0.08,
+  "weight_decay": 0.01
+ },
+ "synthetic_fraction": 0.0,
+ "target": "mkt:market",
+ "trainable": {
+  "lora_rank": 32,
+  "scope": "lora"
+ }
+}
