@@ -969,7 +969,7 @@ class MarketCastMixin:
             self._mkt_base_dir = _d
         return hit
 
-    def _mkt_base_dir_local(self) -> Path:  # pragma: no cover — the timestral extra
+    def _mkt_base_dir_local(self) -> Path:  # pragma: no cover — box-side, no timestral import
         d = getattr(self, "_mkt_base_dir", None)
         if d is None:
             d = self._mkt_base_dir = resolve_pinned_base_dir(
@@ -1893,7 +1893,7 @@ class MarketCastMixin:
         return True
 
 
-def resolve_pinned_base_dir(mc, *, cache_dir=None) -> Path:  # pragma: no cover — timestral extra
+def resolve_pinned_base_dir(mc, *, cache_dir=None) -> Path:  # box-side: no timestral import (torch)
     """The pinned base's verified local directory (nothing loaded)."""
     from ..eval.timestral_adapter import resolve_pinned_base
 
