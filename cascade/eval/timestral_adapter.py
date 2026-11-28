@@ -467,6 +467,89 @@ def merge_lora(model) -> int:
     return n
 
 
+def _grad_safe_sqrt(var):
+    """``var.sqrt()`` with a FINITE gradient at ``var == 0``.
+
+    ``torch.sqrt``'s backward is ``grad / (2 * sqrt(var))``: at an exactly
+    zero variance it is ``0 / 0 = NaN`` even when the scale floor
+    (``clamp(min=minimum_scale)``) already sends a zero gradient back. The
+    double ``where`` keeps the forward bit-identical (``0 == sqrt(0)`` at
+    zero, ``sqrt(var)`` everywhere else, NaN included) and the backward
+    bit-identical wherever ``var != 0`` (the same ``sqrt`` node, ``where``
+    only selects);
+    at ``var == 0`` the gradient is 0 — the true one under the floor."""
+    import torch
+
+    zero = var == 0            # NaN stays NaN (sqrt), as in the library
+    safe = torch.where(zero, torch.ones_like(var), var)
+    return torch.where(zero, torch.zeros_like(var), safe.sqrt())
+
+
+def _advancing_block_frames(context, observation_mask, sinh_median, minimum_scale: float):
+    """``timestral.scaler.advancing_block_frames`` (pinned
+    :data:`TIMESTRAL_LIB_COMMIT`) op for op, with :func:`_grad_safe_sqrt` for
+    the per-patch scale. 2026-11-28 lane C NaN: an exactly flat context (a
+    generator clipping ``exp(cumsum)``) gives a median equal to the context
+    mean in float32, so the second patch's variance is exactly 0 and the
+    library's ``var.sqrt()`` backprops NaN into every LoRA weight (through
+    ``clip_grad_norm_``). Training path only (see :func:`forward_block`)."""
+    import torch
+    from timestral.scaler import cumulative_welford, welford_combine
+
+    r, n_pred, ps = sinh_median.shape
+    blank = sinh_median.new_zeros(r, n_pred, ps)
+    values = torch.cat([context.unflatten(-1, (-1, ps)).to(torch.float64), blank], dim=1)
+    weights = torch.cat([observation_mask.unflatten(-1, (-1, ps)).to(torch.float64), blank], dim=1)
+    cnt = weights.sum(-1)
+    mean = (values * weights).sum(-1) / cnt.clamp(min=1.0)
+    m2 = (weights * (values - mean.unsqueeze(-1)).square()).sum(-1)
+    is_zero = cnt == 0
+    mean = torch.where(is_zero, torch.zeros_like(mean), mean)
+    m2 = torch.where(is_zero, torch.zeros_like(m2), m2)
+    cnt, mean, m2 = (s[:, -n_pred - 1] for s in cumulative_welford(cnt, mean, m2))
+
+    offset = mean
+    clip = torch.finfo(torch.float32).max ** 0.5 / 1e3
+    locs, scales = [], []
+    for h in range(n_pred):
+        var = (m2 / (cnt - 1.0).clamp(min=1.0)).clamp(min=0.0)
+        scale = _grad_safe_sqrt(var).clamp(min=minimum_scale)
+        locs.append(mean)
+        scales.append(scale)
+        folded = (sinh_median[:, h] * scale[:, None] + mean[:, None] - offset[:, None]).clamp(-clip, clip)
+        folded = folded + offset[:, None]
+        b_mean = folded.mean(-1)
+        b_m2 = (folded - b_mean[:, None]).square().sum(-1)
+        cnt, mean, m2 = welford_combine(cnt, mean, m2, torch.full_like(cnt, ps), b_mean, b_m2)
+    return torch.stack(locs, dim=1), torch.stack(scales, dim=1)
+
+
+def _refine_block(fc, quantiles, context, mask, target_rows):
+    """``TimestralForecaster._refine_block`` (pinned commit) op for op, over
+    :func:`_advancing_block_frames` — the gradient-safe refine frame."""
+    import torch
+    from timestral.scaler import clamp_nonfinite
+
+    ps = fc.patch_size
+    n_pred = quantiles.shape[1] // ps
+    if n_pred <= 1:
+        return quantiles
+    _, loc, scale = fc.model.scale(context, mask)
+    loc0, scale0 = loc[:, -1], scale[:, -1]
+    median = quantiles[..., fc.median_index].unflatten(-1, (n_pred, ps)).to(torch.float64)
+    sinh_median = (median - loc0[:, None, None]) / scale0[:, None, None]
+    loc_j, scale_j = _advancing_block_frames(context, mask, sinh_median, fc.config.minimum_scale)
+    first = torch.zeros(loc_j.shape, dtype=torch.bool, device=loc_j.device)
+    first[:, 0] = True
+    loc_j = torch.where(first, loc0[:, None], loc_j.to(quantiles.dtype)).repeat_interleave(ps, dim=-1)
+    scale_j = torch.where(first, scale0[:, None], scale_j.to(quantiles.dtype)).repeat_interleave(ps, dim=-1)
+    sinh_norm = (quantiles - loc0[:, None, None]) / scale0[:, None, None]
+    refined = clamp_nonfinite(sinh_norm * scale_j[..., None] + loc_j[..., None])
+    if target_rows is not None:
+        refined = torch.where(target_rows[:, None, None], refined, quantiles)
+    return refined
+
+
 def forward_block(forecaster_inner, contexts, horizon: int, *, past_covariates=None,
                   known_covariates=None):
     """One DIFFERENTIABLE decode block through the library: contexts
@@ -503,8 +586,14 @@ def forward_block(forecaster_inner, contexts, horizon: int, *, past_covariates=N
                                role_ids, kf, kfm)
     # Match the inference decoder's advancing frame beyond the first patch.
     # This private method is differentiable; forecast() itself is not.
+    # With autograd on (training) the gradient-safe copy runs: identical
+    # values, finite gradients on an exactly flat context (2026-11-28). Without
+    # it the library's own method runs, untouched. Scoring never comes here
+    # (it decodes through the library's forecast()).
     target_rows = None if role_ids is None else role_ids == ROLE_TARGET
-    q = fc._refine_block(q, rows.reshape(bb * v, tt), m.reshape(bb * v, tt), target_rows)
+    refine = _refine_block if torch.is_grad_enabled() else (
+        lambda f, *a: f._refine_block(*a))
+    q = refine(fc, q, rows.reshape(bb * v, tt), m.reshape(bb * v, tt), target_rows)
     return q.reshape(bb, v, hp * ps, -1)[:, 0, :int(horizon)]
 
 
