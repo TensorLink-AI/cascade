@@ -1,0 +1,43 @@
+# cascade validator on the operator box: replaces restart_validator_*.sh (nohup)
+# and the cascade-validator-watchdog stopgap. NOT installed by any tool:
+# deploy/systemd/README.md is the owner-run migration runbook.
+[Unit]
+Description=cascade validator (operator box)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/cascade
+EnvironmentFile=/etc/cascade/cascade.env
+# release = the symlink a release switch flips (retro P4); args per deployment
+EnvironmentFile=/etc/cascade/validator.args
+Environment=PYTHONPATH=/root/cascade-releases/validator.current
+Environment=PYTHONUNBUFFERED=1
+# runtime box guard (retro P2): the validator entry point defaults it OFF for
+# external validators; the operator box enforces it
+Environment=CASCADE_BOX_GUARD=enforce
+ExecStartPre=/bin/sh -c 'test -f /root/cascade/chain.validator.toml'
+ExecStartPre=/bin/sh -c '! grep -q "POD-ONLY OVERRIDE" /root/cascade/chain.toml'
+ExecStart=/root/cascade-v2/.venv/bin/python -P /root/cascade-v2/.venv/bin/cascade-validator $CASCADE_VALIDATOR_ARGS
+StandardOutput=append:/root/cascade/validator.log
+StandardError=append:/root/cascade/validator.log
+# the validator sets weights: back within a minute of any death (was the watchdog)
+Restart=always
+RestartSec=20
+# TERM the main process only (its ssh children to eval hosts are left alone,
+# as the restart scripts left them), KILL after 45 s (scripts: 30 s + KILL)
+KillMode=process
+TimeoutStopSec=45
+# Memory (box: 4 cores, 7 GB + 6 GB swap). Steady state ~150 MB; the 11-28
+# OOMs were 3.3-5.9 GB of in-process model/pool work, which is now refused.
+# MemoryHigh throttles + reclaims, MemoryMax kills THIS unit, never a neighbour.
+MemoryHigh=2G
+MemoryMax=3G
+MemorySwapMax=1G
+# protected: under global pressure the kernel picks the trainer/intake first
+OOMScoreAdjust=-900
+
+[Install]
+WantedBy=multi-user.target

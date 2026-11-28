@@ -59,6 +59,15 @@ BOX_MODULES = (
     "cascade.trainer.cost_guards",
     "cascade.provision.main",
     "cascade.audit.main",
+    # retro P2 (iv): the module that imported timestral on the box (#1003),
+    # the guard itself and the other box services that install it
+    "cascade.validator.marketcast",
+    "cascade.eval.checkpoint_guard",
+    "cascade.shared.box_guard",
+    "cascade.shared.rss_budget",
+    "cascade.pool.pool_d_publish",
+    "cascade.pool.pool_d_spent",
+    "cascade.pool.settlement_evals",
 )
 
 PROBE = r"""

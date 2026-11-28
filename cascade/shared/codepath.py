@@ -110,4 +110,9 @@ def verify_release_code_path(service: str, *, package=None, environ=None,
     head = git_head(imported)
     log.info("%s: code %s%s%s", service, imported, f" @ {head}" if head else "",
              "" if declared is not None else " (no release declared: PYTHONPATH unset)")
+    # retro P4: the one release fingerprint (git head + package hash), logged
+    # and, with CASCADE_RELEASE_STATUS_DIR set, written for cascade-ops
+    from .release_fp import log_service_fingerprint
+
+    log_service_fingerprint(service, imported, environ=env)
     return imported
