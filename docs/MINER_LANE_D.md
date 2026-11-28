@@ -71,8 +71,10 @@ yet. Before the first lane D crown the bar is the house, a BF16 cast of the
 frozen lane A king (uid 164) that the operator builds and does not publish.
 After a crown, each king's checkpoint is published (HF dataset
 `tensorlink-dev/cascade-lane-d-kings`, indexed in the signed
-`champions/lane_d/index.json`). No `pool_d` snapshot is published for miners;
-preview on your own data with `--series S.npz`.
+`champions/lane_d/index.json`). Spent `pool_d` snapshots are public (see
+[Past evaluations](#past-evaluations)): every window of a snapshot no entry
+can still be judged on, with the house's forecasts and scores. Preview on
+those (`windows.npz`) or on your own data with `--series S.npz`.
 
 **Scoring environments.** Validators score lane D only on an environment
 listed as `qualified` in `deploy/laned/scoring_envs.toml` and past its
@@ -229,6 +231,14 @@ Full lists: [LANE_D.md](LANE_D.md#lane-d-faq).
 
 ## Past evaluations
 
+**What "spent" means.** A snapshot is published only when no value in it can
+reach a window still eligible to be judged: every target point was first
+seen, and every history point recorded, at least `embargo_hours` (48 h) plus
+6 h before the earliest reveal time of any entry still to be judged (open
+entries included). A snapshot is typically public 2 to 3 days after it was
+built. Windows whose target lies in the future (publish-ahead feeds) are left
+out.
+
 Lane D publishes one signed report per settlement boundary in the public
 `cascade-manifests` bucket (`https://s3.hippius.com/cascade-manifests/<key>`,
 no keys needed):
@@ -238,7 +248,8 @@ no keys needed):
 | Latest receipt | `lane-d/receipts/latest.json` | Its `boundary` is the newest settlement. `status: "absent"` with a `reason` (for example `infra_deferred`) means that boundary published no report |
 | One boundary's receipt | `lane-d/receipts/lane_d_receipt_<boundary>.json` | Binds the report by `report_sha256` and chains the state hashes |
 | One boundary's report | `lane-d/reports/lane_d_report_<boundary>.json` | Signed by the validator (`signer`, `signature`) |
-| Spent windows | `lane-d/spent/<boundary>/` (coming) | The windows a boundary used, with per-window scores |
+| Spent pools index | [`lane-d/spent/index.json`](https://s3.hippius.com/cascade-manifests/lane-d/spent/index.json) | Every published spent `pool_d` snapshot (`pools[]`: `as_of_ts`, `windows`, `windows_sha256`, `manifest_url`, `windows_url`, `readme_url`). Updated hourly; append-only |
+| One spent pool | `lane-d/spent/pool-preview-<as_of_ts>/` | `windows.npz` (history, target, both clocks, the house's 9 quantiles, CRPS and MASE per window), `manifest.json` (sha256s, counts, the spent rule's `cut_ts`), `README.md` (load snippet). Every window of the snapshot, not a settlement's draw; consecutive pools overlap, dedupe by `window_id` |
 | Live lane D board | `status/lane_d.json` | King, prior kings, queue, latest board and verdicts |
 
 A boundary is a block number that is a multiple of 900 (`epoch_blocks`,
