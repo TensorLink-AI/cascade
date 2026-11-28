@@ -352,3 +352,55 @@ def test_real_base_forecasts_identically_through_the_worker(tmp_path):
         assert "scp" not in scp
     finally:
         s.close()
+
+
+def _fake_hub(tmp_path, monkeypatch, payload: bytes):
+    """A huggingface_hub.snapshot_download stand-in serving the two base files;
+    the ``timestral`` import is made to fail (the box has no extra)."""
+    import hashlib
+    import types
+
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    (snap / "config.json").write_text("{}")
+    (snap / "model.safetensors").write_bytes(payload)
+    calls = []
+
+    def snapshot_download(repo, **kw):
+        calls.append((repo, kw))
+        return str(snap)
+
+    hub = types.ModuleType("huggingface_hub")
+    hub.snapshot_download = snapshot_download
+    monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
+    for m in ("timestral", "timestral.loading"):
+        monkeypatch.setitem(sys.modules, m, None)      # import raises ImportError
+    return hashlib.sha256(payload).hexdigest(), calls, snap
+
+
+def test_box_resolves_the_pinned_base_without_the_timestral_extra(tmp_path, monkeypatch):
+    # 2026-11-28: the main validator resolves the base ON THE BOX (no timestral,
+    # and timestral.loading imports torch) — every lane C entry went
+    # infra_deferred with TimestralUnavailable. The resolve must not import it.
+    from cascade.eval.timestral_adapter import resolve_pinned_base
+    from cascade.validator.marketcast import resolve_pinned_base_dir
+
+    sha, calls, snap = _fake_hub(tmp_path, monkeypatch, b"weights")
+    rev = "a" * 40
+    d = resolve_pinned_base(f"org/timestral-28m@{rev}", sha, cache_dir=str(tmp_path / "c"))
+    assert d == snap
+    assert calls == [("org/timestral-28m", {"revision": rev, "cache_dir": str(tmp_path / "c"),
+                                            "allow_patterns": ["config.json",
+                                                               "model.safetensors"]})]
+    mc = SimpleNamespace(base_ref=f"org/timestral-28m@{rev}", base_sha256=sha)
+    assert resolve_pinned_base_dir(mc) == snap
+
+
+def test_box_base_resolve_still_refuses_a_wrong_sha(tmp_path, monkeypatch):
+    from cascade.eval.timestral_adapter import resolve_pinned_base
+
+    _sha, _calls, _snap = _fake_hub(tmp_path, monkeypatch, b"weights")
+    with pytest.raises(ValueError, match="base_sha256"):
+        resolve_pinned_base("org/timestral-28m@" + "a" * 40, "0" * 64)
+    with pytest.raises(ValueError, match="not pinned"):
+        resolve_pinned_base("org/timestral-28m", "0" * 64)
