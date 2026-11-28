@@ -1,0 +1,2 @@
+# /etc/cascade/intake.args (mode 600)
+CASCADE_INTAKE_ARGS=--host 127.0.0.1 --port 8790 --queue-path /root/cascade/_train_work/funded_queue.json --vault-dir /root/cascade/_train_work/payer_vault --submission-dir /root/cascade/_train_work/submission_vault --chain-toml /root/cascade/chain.validator.toml --network finney --ttl-hours 36 --trusted-proxy 127.0.0.1 --log-level INFO

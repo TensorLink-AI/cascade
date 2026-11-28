@@ -141,22 +141,57 @@ jobs:
             uv run --frozen pytest "@$list" "${opts[@]}" --durations=40 --durations-min=2
           fi
 
-  # The required status check. It aggregates `lint` and every `unit` shard, and
-  # runs even when a dependency failed or was cancelled, so it can never be
-  # skipped.
+  # W-E2E (retro 2026-11-28 item P1a): one full submit -> verdict -> miner
+  # status cycle per lane (B, C, D) through the real intake, trainer,
+  # validator and miner CLI code on fake pods / registry / chain / S3, plus
+  # the regression fixtures of the lane launch week and the staging runner's
+  # dry run (tests/accept/w_e2e/, tests/e2e_lanes/). Installed WITHOUT the
+  # train / marketcast extras: a torch or timestral import anywhere on a box
+  # path fails here as well as under the harness's box guard. Budget: 10 min.
+  e2e-lanes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare isolated TLS trust for the CI job
+        run: python3 scripts/prepare_ci_tls.py "$RUNNER_TEMP/cascade-ca" >> "$GITHUB_ENV"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.13.4"
+          enable-cache: true
+
+      - name: Sync (frozen; chain + hippius + dev only, no torch / timestral)
+        run: uv sync --frozen --extra chain --extra hippius --extra dev
+
+      - name: Box libraries are absent
+        run: |
+          uv run --frozen python -P -c "import importlib.util as u, sys; bad = [m for m in ('torch', 'timestral', 'safetensors', 'transformers', 'triton') if u.find_spec(m)]; print('box libraries installed:', bad); sys.exit(1 if bad else 0)"
+
+      - name: Lane B / C / D full cycles
+        run: |
+          uv run --frozen pytest tests/accept/w_e2e -q -o tmp_path_retention_policy=failed \
+            -o tmp_path_retention_count=1 --durations=15
+
+  # The required status check. It aggregates `lint`, every `unit` shard and
+  # the lane full cycles, and runs even when a dependency failed or was
+  # cancelled, so it can never be skipped.
   test:
     if: always()
-    needs: [lint, unit]
+    needs: [lint, unit, e2e-lanes]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Every lint and unit-shard job succeeded
+      - name: Every lint, unit-shard and lane-cycle job succeeded
         env:
           LINT: ${{ needs.lint.result }}
           UNIT: ${{ needs.unit.result }}
+          E2E: ${{ needs.e2e-lanes.result }}
         run: |
-          echo "lint=$LINT unit=$UNIT"
-          [ "$LINT" = "success" ] && [ "$UNIT" = "success" ]
+          echo "lint=$LINT unit=$UNIT e2e-lanes=$E2E"
+          [ "$LINT" = "success" ] && [ "$UNIT" = "success" ] && [ "$E2E" = "success" ]
 
   # Fork detector (2026-11-16 deploy review): replay the latest mainnet receipts
   # through THIS PR's satellite/audit code. A FAIL means the change alters what

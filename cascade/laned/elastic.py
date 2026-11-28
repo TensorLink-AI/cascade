@@ -1022,7 +1022,6 @@ def release_sync_script(cfg: ElasticConfig, inst: Mapping, *, force: bool) -> st
     b = cfg.builder
     kh = known_hosts_for(cfg, inst)
     q = shlex.quote
-    rd = q(b.release_dir)
     env = {"POD_IP": str(inst["ip"]), "POD_PORT": str(inst["port"]), "POD_USER": b.ssh_user,
            "POD_KEY": str(Path(b.ssh_key_path).expanduser()), "POD_WORKDIR": b.workdir,
            "POD_KNOWN_HOSTS": kh, "CASCADE_SRC_ROOT": b.release_dir,
@@ -1034,13 +1033,15 @@ def release_sync_script(cfg: ElasticConfig, inst: Mapping, *, force: bool) -> st
                                    remote=f"cat {sha_path} 2>/dev/null || true"))
     write_sha = shlex.join(ssh_argv(inst, key_path=b.ssh_key_path, known_hosts=kh,
                                     remote=f"cat > {sha_path}"))
-    lines = [
-        "set -euo pipefail",
-        f"want=\"$(git -C {rd} rev-parse HEAD)\"",
-        f"if [ -n \"$(git -C {rd} status --porcelain --untracked-files=no)\" ]; then "
-        f"want=\"$want+dirty.$(git -C {rd} diff HEAD | sha256sum | cut -c1-16)\"; fi",
-        f"want=\"$want chain.$(sha256sum < {q(b.chain_toml)} | cut -c1-16)\"",
-    ]
+    # The one release fingerprint implementation (cascade.shared.release_fp,
+    # retro P4); the token format is #994's, so warm builders do not re-sync.
+    from ..shared.release_fp import ReleaseSyncFailed, builder_token
+
+    try:
+        want = f"want={q(builder_token(b.release_dir, b.chain_toml))}"
+    except (ReleaseSyncFailed, OSError) as e:      # fails when RUN, as the shell did
+        want = f"echo {q(f'release_sync: no release fingerprint ({e})')} >&2; exit 1"
+    lines = ["set -euo pipefail", want]
     if not force:
         lines += [
             f"have=\"$({read_sha})\"",

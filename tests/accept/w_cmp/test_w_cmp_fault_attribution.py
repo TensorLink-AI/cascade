@@ -181,6 +181,17 @@ def test_an_uncited_miner_verdict_is_reattributed_to_the_operator():
     assert m2 == msg
 
 
+def test_a_pre_rent_feasibility_refusal_keeps_its_miner_class():
+    """#1007's miner-side pre-rent refusal (class ``infeasible``, nothing
+    rented) cites M-INFEASIBLE, so the citation gate does not move it to the
+    operator."""
+    fc = _fc()
+    msg, miner, cls, burn = fc.enforce_miner_citation(
+        "feasibility gpu_arch_unsupported: RTX5090 is sm_120", True, "infeasible", False)
+    assert (miner, cls, burn) == (True, "infeasible", False)
+    assert msg.endswith("[rule M-INFEASIBLE]")
+
+
 def test_the_recorders_enforce_the_citation():
     from cascade.trainer.lane_c_driver import LegFailure
     from cascade.trainer.runner_funded_pods import _FundedPodMixin

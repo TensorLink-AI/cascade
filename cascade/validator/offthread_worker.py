@@ -41,63 +41,19 @@ invariant 12).
 from __future__ import annotations
 
 import logging
-import os
 import threading
 from collections.abc import Callable
+
+from ..shared.rss_budget import RSS_SAMPLE_SECONDS, RssWatch, process_rss_bytes, report_rss
 
 log = logging.getLogger(__name__)
 
 # The most a lane D step may grow the validator's RSS (the box runs the
 # validator, trainer and intake in 7 GB): the step orchestrates, the lane D
-# eval host loads and scores (W-OFFBOX).
+# eval host loads and scores (W-OFFBOX). The sampler is the shared one
+# (cascade.shared.rss_budget, retro P2).
 STEP_RSS_BUDGET_BYTES = 512 * 1024 * 1024
-RSS_SAMPLE_SECONDS = 0.25
-_MB = 1024 * 1024
-
-
-def process_rss_bytes() -> int | None:
-    """This process's resident set size (``/proc/self/statm``), ``None`` where
-    it cannot be read."""
-    try:
-        with open("/proc/self/statm", encoding="ascii") as f:
-            return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
-    except (OSError, ValueError, IndexError):
-        return None
-
-
-class _RssWatch:
-    """Samples the RSS on a daemon thread from ``start()`` to ``stop()``."""
-
-    def __init__(self, probe: Callable[[], int | None], interval: float):
-        self._probe = probe
-        self._interval = float(interval)
-        self._stop = threading.Event()
-        self.start_rss = probe()
-        self.peak = self.start_rss
-        self._thread = threading.Thread(target=self._loop, name="lane-d-rss", daemon=True)
-
-    def _sample(self) -> None:
-        v = self._probe()
-        if v is not None and (self.peak is None or v > self.peak):
-            self.peak = v
-
-    def _loop(self) -> None:
-        while not self._stop.wait(self._interval):
-            self._sample()
-
-    def start(self) -> _RssWatch:
-        self._thread.start()
-        return self
-
-    def stop(self) -> dict | None:
-        self._stop.set()
-        if self._thread.ident is not None:
-            self._thread.join(5.0)
-        self._sample()
-        if self.start_rss is None or self.peak is None:
-            return None
-        return {"start": int(self.start_rss), "peak": int(self.peak),
-                "growth": int(self.peak - self.start_rss)}
+_RssWatch = RssWatch            # the pre-P2 private name (marketcast, tests)
 
 
 class LaneDWorker:
@@ -209,17 +165,9 @@ class LaneDWorker:
 
     def _rss_report(self, boundary: int, rss: dict | None) -> None:
         self.last_rss = rss
-        if rss is None:
-            log.warning("lane D: step for settlement %d: process RSS unreadable", boundary)
-            return
-        log.info("lane D: step for settlement %d rss start %d MB, peak %d MB (+%d MB)",
-                 boundary, rss["start"] // _MB, rss["peak"] // _MB, rss["growth"] // _MB)
-        if rss["growth"] > self.rss_budget_bytes:
-            log.error("lane D: step for settlement %d grew the validator RSS by %d MB, over "
-                      "the %d MB box budget (peak %d MB): pools, windows and checkpoints must "
-                      "stay on the lane D eval host (W-OFFBOX, docs/INCIDENT_RULES.md IR010)",
-                      boundary, rss["growth"] // _MB, self.rss_budget_bytes // _MB,
-                      rss["peak"] // _MB)
+        report_rss(f"lane D: step for settlement {boundary}", rss, self.rss_budget_bytes,
+                   logger=log, hint="pools, windows and checkpoints must stay on the lane D "
+                   "eval host (W-OFFBOX, docs/INCIDENT_RULES.md IR010)")
 
 
 __all__ = ["RSS_SAMPLE_SECONDS", "STEP_RSS_BUDGET_BYTES", "LaneDWorker", "process_rss_bytes"]

@@ -231,6 +231,31 @@ def payer_projection_rate(rnd, gpu_choice, *, marketcast: bool = False) -> float
     chosen_rate = (own or ceiling) if chosen else 0.0
     return max(knob, chosen_rate)
 
+def pre_rent_refusal(*, gpu: str = "", candidates: tuple[str, ...] = (), **plan):
+    """The rent-time :func:`cascade.funding.feasibility.feasibility` of one
+    leg (``gpu`` = the miner's chosen type, else the default ``candidates``);
+    extra :class:`~cascade.funding.feasibility.LegPlan` fields pass through."""
+    from ..funding.feasibility import LegPlan, feasibility
+
+    return feasibility(LegPlan(gpu=str(gpu or ""), candidates=tuple(candidates), **plan))
+
+
+def record_pre_rent_refusal(runner, hotkey: str, refusal) -> None:
+    """Record a pre-rent refusal as the leg's verdict: a MINER-side one
+    releases the entry (``infeasible``: miner fault, never burned — like
+    ``auth``), an operator-side one requeues it with a backoff
+    (``operator_blocked``). Nothing was rented either way."""
+    from ..funding.feasibility import INFEASIBLE_CLASS, failure_message
+    from ..funding.queue import OPERATOR_BLOCKED_CLASS
+
+    log.error("funded leg %s: refused before renting [%s, %s side]: %s", hotkey[:12],
+              refusal.code, refusal.actor, refusal.message)
+    runner._record_funded_failure(
+        hotkey, failure_message(refusal), miner_fault=refusal.miner_side,
+        error_class=INFEASIBLE_CLASS if refusal.miner_side else OPERATOR_BLOCKED_CLASS,
+        burn=False)
+
+
 class _FundedPodMixin:
     """Per-payer funded pods (DEC-CA-0036, ``[round] funded_pods = "rent"``)."""
 
@@ -1570,6 +1595,14 @@ class _FundedPodMixin:
                                         f"config fault: {e}", miner_fault=False,
                                         error_class="infra", burn=False)
             raise _FundedLegSkip(gen.hotkey) from e
+        if not adopt_live:
+            # retro 2026-11-28 #5: the one pre-rent feasibility check, BEFORE the
+            # write-ahead and any provider call (a live adopted pod is exempt)
+            refusal = pre_rent_refusal(gpu=chosen[0][0] if chosen is not None else "",
+                                       candidates=tuple(skus))
+            if refusal is not None:
+                record_pre_rent_refusal(self, gen.hotkey, refusal)
+                raise _FundedLegSkip(gen.hotkey)
         # TRUE write-ahead: the pod's name is deterministic (launch appends
         # "-0"), so ledger the INTENT before `lium up` — a crash anywhere in
         # launch/wait/IP leaves the entry for the startup sweep, instead of a

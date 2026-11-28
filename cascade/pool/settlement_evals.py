@@ -820,6 +820,8 @@ def cmd_run(a) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from ..shared import box_guard
+    box_guard.install("settlement-evals")
     ap = argparse.ArgumentParser(prog="python -P -m cascade.pool.settlement_evals",
                                  description="publish retired settlement eval sets")
     sub = ap.add_subparsers(dest="cmd", required=True)

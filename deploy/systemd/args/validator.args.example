@@ -1,0 +1,2 @@
+# /etc/cascade/validator.args (mode 600): one line, the live flags
+CASCADE_VALIDATOR_ARGS=--wallet-name main_one --wallet-hotkey sn_validator_hk --network finney --chain-toml chain.validator.toml --device cpu --eval-hosts targon-eval.toml --private-eval-hosts valpriv-eval.toml --mkt-eval-hosts /root/cascade/mkt_hosts.toml --lane-d-inputs /root/cascade-state/lane-d/lane_d_inputs.toml

@@ -1,0 +1,2 @@
+# /etc/cascade/trainer.args (mode 600)
+CASCADE_TRAINER_ARGS=--wallet-name main_one --wallet-hotkey sn_validator_hk --network finney --chain-toml chain.validator.toml --trainer cascade.trainer.toto2_trainer:Toto2Trainer --remote-hosts hosts.toml --lane-b-bench-hosts /root/cascade/targon-eval.toml --lane-b-model-hosts /root/cascade/laneb-judge-hosts.toml

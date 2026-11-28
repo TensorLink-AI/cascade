@@ -198,3 +198,20 @@ tests/accept/wb27/test_wb27_miner_visible_reasons.py
 # verified on fetch; a marker over a chunk index is incomplete; every push is
 # forced to the single-blob layout (HIPPIUS_CHUNKED_WRITE=0). hippius.py and
 # lane_b_offload.py (pod cache completeness) are listed above.
+# Retro 2026-11-28 #5: one pre-rent feasibility check for every paid leg (GPU
+# arch vs the pinned torch's recorded arch list, memory, data geometry, image
+# qualified + walls measured, target disk), at fund time (the GPU header and
+# the lane C / lane B memory and geometry checks call through it) and again
+# right before each rent (runner_funded_pods, marketcast_runner) and on the
+# lane B judge pod before any fetch (lane_b_offload). intake.py,
+# public_reason.py, runner_funded_pods.py, marketcast_runner.py,
+# lane_b_offload.py and docs/MINER.md are listed above.
+cascade/funding/feasibility.py
+cascade/funding/gpu_choice.py
+tests/accept/wb27/test_wb27_feasibility.py
+# 2026-11-28 retro #6: permanent-fault paging. A fault a retry cannot fix (missing
+# library, GPU arch the pinned torch lacks, contract/image mismatch) stops the
+# in-window settlement retries and logs PERMANENT FAULT (cascade-ops pages on it);
+# the same error over N settlements pages; MarketCast deferrals page (log-only).
+cascade/shared/permanent_fault.py
+tests/accept/wb27/test_wb27_permanent_fault_paging.py

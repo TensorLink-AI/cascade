@@ -240,6 +240,11 @@ MINER_CITATIONS: tuple[Rule, ...] = (
     Rule("M-RECIPE", MINER, "recipe", True,
          "the recipe failed its parse / embargo / geometry check (RecipeError)",
          "the miner's recipe"),
+    Rule("M-INFEASIBLE", MINER, "infeasible", False,
+         "the pre-rent feasibility check (cascade.funding.feasibility, #1007) refused a "
+         "miner-side choice — GPU arch vs the pinned torch, recipe memory, data "
+         "geometry — BEFORE anything was rented (entry released, nothing charged)",
+         "the miner's own choice cannot run as funded"),
     Rule("M-TARGET", MINER, "target", True,
          "the target is not open for this lane", "the miner's target choice"),
     Rule("M-ENTRY-CLOSED", MINER, "competition_ended", False,

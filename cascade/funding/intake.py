@@ -1471,21 +1471,28 @@ class FundingIntake:
         except Exception:  # noqa: BLE001 — the recipe's own horizon_mix still counts
             horizons = []
         mbt = int(getattr(mc, "micro_batch_tokens", 0) or DEFAULT_MICRO_BATCH_TOKENS)
-        v = fit_verdict(obj, choice.gpu if choice.chosen else "", tuple(cat.skus or ()),
-                        horizons=horizons, micro_batch_tokens=mbt)
-        if v is None or v.fits is not False:
+        gpu = choice.gpu if choice.chosen else ""
+        # retro 2026-11-28 #5: the one pre-rent feasibility check
+        # (cascade.funding.feasibility); the trainer re-runs it at rent
+        from .feasibility import mkt_vram_refusal
+
+        refusal = mkt_vram_refusal(obj, gpu, tuple(cat.skus or ()), horizons=horizons,
+                                   micro_batch_tokens=mbt)
+        if refusal is None:
+            v = fit_verdict(obj, gpu, tuple(cat.skus or ()), horizons=horizons,
+                            micro_batch_tokens=mbt)
             if v is not None and v.fits is None and own_risk_warn:
                 return None, (f"Its memory is unknown here: your recipe needs an estimated "
                               f"{v.estimate_gib:g} GiB on one GPU, and an out-of-memory leg "
                               "ends the entry with no retry."), "own_risk"
+            # retro P7 fit evidence: "fit" only when the estimate fits the GPU
             return None, "", ("fit" if v is not None and v.fits is True else "")
+        d = refusal.detail
         log.warning("lane-C fund: MarketCast recipe %s needs ~%.1f GiB; %s too small",
-                    ref, v.estimate_gib, v.gpu or ",".join(v.too_small))
+                    ref, d["estimate_gib"], d["gpu"] or "a recommended type")
         if own_risk_warn:
-            return None, v.message(), "own_risk"
-        return {"code": "recipe_exceeds_gpu_memory", "message": v.message(),
-                "estimate_gib": v.estimate_gib, "gpu": v.gpu, "gpu_gib": v.gpu_gib,
-                "fitting_gpus": list(v.fitting)}, "", ""
+            return None, refusal.message, "own_risk"
+        return refusal.as_body(), "", ""
 
     def _mkt_geom_check(self, target: str, ref: str) -> dict | None:
         """The refusal of the 2026-11-28 sample-geometry check of a plain
@@ -1504,23 +1511,23 @@ class FundingIntake:
                 return None
         except (ImportError, ValueError):   # pragma: no cover — lane-C config not shipped
             return None
-        from .mkt_geom import geom_verdict
+        # retro 2026-11-28 #5: through the one feasibility check
+        from .feasibility import geometry_refusal
 
         try:
             obj, index = fetch(ref), hist()
-            v = geom_verdict(obj, mc, index) if index else None
+            refusal = geometry_refusal(obj, mc, index)
         except Exception as e:  # noqa: BLE001 — the trainer re-reads the recipe anyway
             log.warning("lane-C fund: MarketCast recipe %s / bar history unreadable for the "
                         "sample-geometry check (%s) — not checked", ref, e)
             return None
-        if v is None or not v.refused:
+        if refusal is None:
             return None
+        d = refusal.detail
         log.warning("lane-C fund: MarketCast recipe %s refused: %s/%s cannot be cut from the "
-                    "%s history (risk %.2f, data.start %s, fits from %s)", ref, v.suite,
-                    v.horizon, v.bar, v.risk, v.start, v.fix_start or "-")
-        return {"code": "recipe_data_range_uncuttable", "message": v.message(),
-                "risk": v.risk, "suite": v.suite, "horizon": v.horizon, "timeframe": v.bar,
-                "history_start": v.bar_first, "fits_from_start": v.fix_start}
+                    "%s history (risk %.2f, fits from %s)", ref, d["suite"], d["horizon"],
+                    d["timeframe"], d["risk"], d["fits_from_start"] or "-")
+        return refusal.as_body()
 
     def _lane_c_gpu_choice(self, headers) -> tuple[GpuChoice, str, dict | None, str]:
         """``(choice, signed_segment, error, own_risk_warning)`` of a lane-C
@@ -1920,10 +1927,11 @@ class FundingIntake:
             chosen = self.lane_b_gpus is not None and getattr(choice, "chosen", False)
             rate = self.lane_b_gpus.rate(choice.gpu) if chosen else None
             own_risk = chosen and rate is None and bool(self._lane_b_own_risk_gpu(headers))
-            if not own_risk and (rate is None or not lv.context_fits(rate, levers.context_length)):
-                return None, {"code": lv.CONTEXT_UNFIT,
-                              "message": f"context_length {levers.context_length} does not fit "
-                                         "the chosen GPU's measured memory (choose a GPU)"}
+            from .feasibility import lane_b_vram_refusal
+
+            refusal = lane_b_vram_refusal(rate, levers.context_length, own_risk=own_risk)
+            if refusal is not None:
+                return None, {"code": refusal.code, "message": refusal.message}
         return levers, None
 
     def _lane_b_landing_estimate(self, guard_seconds: int) -> dict | None:
