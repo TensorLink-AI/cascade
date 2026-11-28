@@ -188,6 +188,16 @@ def test_public_reason_uses_the_code_template_never_the_text():
 # ── 3. the rent paths refuse before any provider call ───────────────────────
 
 
+def _call(fn):
+    """The exception ``fn`` raised (None if none). The Accept on BASE needs an
+    assertion failure, not a pytest.raises "DID NOT RAISE"."""
+    try:
+        fn()
+    except Exception as e:  # noqa: BLE001
+        return e
+    return None
+
+
 def test_funded_rent_refuses_a_blackwell_choice_before_renting(tmp_path, monkeypatch):
     import cascade.provision.funded as funded_mod
     from cascade.funding.gpu_choice import GpuChoice
@@ -201,11 +211,16 @@ def test_funded_rent_refuses_a_blackwell_choice_before_renting(tmp_path, monkeyp
     r._chosen_gpu_rent = TrainerRunner._chosen_gpu_rent.__get__(r)
     _vault(tmp_path, "hkA")
     calls = []
-    monkeypatch.setattr(funded_mod, "rent_funded_pod",
-                        lambda **kw: calls.append(kw) or pytest.fail("rented"))
-    with pytest.raises(_FundedLegSkip):
-        r._rent_funded_host("777", _challenger("hkA"), gpu_choice=GpuChoice("RTX5090"))
-    assert calls == []
+
+    def _rent(**kw):
+        calls.append(kw)
+        raise AssertionError("rented before the feasibility check refused")
+
+    monkeypatch.setattr(funded_mod, "rent_funded_pod", _rent)
+    raised = _call(lambda: r._rent_funded_host("777", _challenger("hkA"),
+                                               gpu_choice=GpuChoice("RTX5090")))
+    assert calls == [], "the pod was rented before the feasibility refusal"
+    assert isinstance(raised, _FundedLegSkip), f"expected _FundedLegSkip, got {raised!r}"
     msg, miner_fault, cls, burn = r._funded_leg_failures["hkA"]
     assert (miner_fault, cls, burn) == (True, "infeasible", False)
     assert msg.startswith("feasibility gpu_arch_unsupported:")
@@ -220,9 +235,17 @@ def test_funded_rent_default_list_all_blackwell_is_an_operator_block(tmp_path, m
     r = _runner(tmp_path, funded_pod_skus=("8xB200", "4xB300"),
                 funded_sku_wall_seconds={"8xB200": 6866, "4xB300": 10299})
     _vault(tmp_path, "hkA")
-    monkeypatch.setattr(funded_mod, "rent_funded_pod", lambda **kw: pytest.fail("rented"))
-    with pytest.raises(_FundedLegSkip):
-        r._rent_funded_host("777", _challenger("hkA"))
+    calls = []
+
+    def _rent(**kw):
+        calls.append(kw)
+        raise AssertionError("rented before the feasibility check refused")
+
+    monkeypatch.setattr(funded_mod, "rent_funded_pod", _rent)
+    raised = _call(lambda: r._rent_funded_host("777", _challenger("hkA")))
+    assert calls == [], "the pod was rented before the feasibility refusal"
+    assert isinstance(raised, _FundedLegSkip), f"expected _FundedLegSkip, got {raised!r}"
+    assert "hkA" in r._funded_leg_failures, "no verdict recorded for the refused leg"
     _msg, miner_fault, cls, burn = r._funded_leg_failures["hkA"]
     assert (miner_fault, cls, burn) == (False, "operator_blocked", False)
 
@@ -286,7 +309,10 @@ def test_lane_b_judge_pod_refuses_sm120_before_any_fetch(tmp_path, monkeypatch):
     assert r is not None and r.code == "gpu_arch_unsupported"
 
     monkeypatch.setattr(lbo, "_nvidia_compute_cap", lambda: "12.0\n")
-    monkeypatch.setattr(lbo, "_pod_fetch", lambda *a, **k: pytest.fail("fetched"))
+    def _fetch(*a, **k):
+        raise AssertionError("fetched before the arch refusal")
+
+    monkeypatch.setattr(lbo, "_pod_fetch", _fetch)
     run = tmp_path / "run"
     run.mkdir()
     (run / "payload.pkl").write_bytes(pickle.dumps({"device": "cuda", "windows": []}))
