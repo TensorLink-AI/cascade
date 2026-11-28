@@ -308,6 +308,7 @@ def _band_clocks(d: Path, meta: dict):
         raise ValueError(f"{d}: pool clocks record {rec!r} is not {{file: {CLOCKS_FILE!r}}}")
     if _file_sha(d / CLOCKS_FILE) != rec.get("sha256"):
         raise ValueError(f"{d}: {CLOCKS_FILE} does not hash to the metadata clocks.sha256")
+    # incident-ok: IR010 the pool_d loader itself (clocks); its callers are checked
     return np.load(d / CLOCKS_FILE)
 
 
@@ -379,6 +380,7 @@ def load_pool(pool_dir, horizon: int, bands=None, *, max_horizon: int = 2048,
     windows = []
     clk = _band_clocks(d, meta) if bands else None
     try:
+        # incident-ok: IR010 the pool_d loader itself; its callers are checked
         with np.load(d / "hist.npz") as hist, np.load(d / "tgt.npz") as tgt:
             for s in meta.get("series", []):
                 sid = str(s["series_id"])
@@ -415,7 +417,9 @@ def load_pool_for(pool_dir, cfg) -> dict:
     from ..shared.lane_d_horizons import bands_on
 
     if not bands_on(cfg):
+        # incident-ok: IR010 load_pool_for is the loader's config wrapper; its callers are checked
         return load_pool(pool_dir, int(cfg.horizon))
+    # incident-ok: IR010 load_pool_for is the loader's config wrapper; its callers are checked
     return load_pool(pool_dir, int(cfg.horizon), tuple(cfg.horizon_bands),
                      max_horizon=int(cfg.max_horizon), slots=int(cfg.band_slots))
 
@@ -739,6 +743,7 @@ def _load_pools(pool_dir, prior_pool_dirs, cfg) -> list[dict]:
         if p not in seen:
             seen.add(p)
             dirs.append(p)
+    # incident-ok: IR010 the reference path's helper; its caller is checked
     return [load_pool_for(d, cfg) for d in dirs] + [load_pool_for(newest, cfg)]
 
 
@@ -1325,122 +1330,23 @@ def check_armed(armed, cfg) -> dict:
             "armed_evidence": json.loads(json.dumps(ev, allow_nan=False))}
 
 
-def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: dict,
-                  forecasts: dict, uid_of: dict, state_path, signer,
-                  prior_pool_dirs=(), expect_prior_sha256: str | None = None,
-                  boundary_block_hash: str | None = None, sentinel: str | None = None,
-                  bench=None, armed: dict | None = None,
-                  boundary_ts: int | None = None,
-                  max_channels: int | None = None,
-                  public_indexes: dict | None = None,
-                  public_scores: dict | None = None,
-                  host: dict | None = None,
-                  eval_identity: dict | None = None) -> LaneDSettlement:
-    """Settle lane D at ``boundary`` (see the module docstring).
+def _judge_pools(*, cfg, boundary: int, boundary_ts, boundary_block_hash, max_channels,
+                 armed_fields, state: dict, entries: list[dict], uid_of: dict, forecasts,
+                 pools: list[dict], pub, crown_bar: float) -> dict:
+    """The pool phase of :func:`settle_lane_d` (W-OFFBOX, 2026-11-28): every
+    step that reads a ``pool_d`` window (the channel pick, the forecast
+    checks, the frozen sets, the cohort draws, the per-window scores), from
+    the registration through the last cohort's verdicts. Mutates ``state``
+    and returns the judged record (plain JSON types only, :func:`remote_judge`
+    carries it): ``state``, ``skipped``, ``held``, ``house_held``, ``seed``,
+    ``rows``, ``windows_out``, ``cohorts``, ``verdicts``, ``draws``,
+    ``candidates``, ``pub_scored`` and ``pool_rec``.
 
-    ``boundary_ts`` (rev6.14 (a)) is the boundary block's on-chain
-    ``Timestamp.Now`` (seconds), signed in the report. An entry (and the house
-    challenger) is drawn, frozen or judged only when ``boundary_ts`` >= its
-    judging start ``j = max(T_E, T_K) + 3600 * eval_delay_hours``, else it is
-    skipped ``before_eval_delay``. Without it (the legacy call) nothing is
-    frozen or judged: every open entry is skipped ``boundary_ts_missing``
-    (fail closed).
-
-    ``public_indexes`` (rev6.18 A1/A2/A6, F3) is ``{source: index dir}`` of the
-    public sources (W6p indexes) and ``public_scores`` (F4) the eval host's
-    per-window scores of every forecast digest on their drawn windows
-    (:func:`_public_half`). At ``public_weight > 0`` both are required with
-    ``boundary_block_hash`` (else :class:`LaneDPublicError`
-    ``public_missing``, before anything is written): each source is drawn
-    (:func:`~cascade.validator.lane_d_public.draw_public`, 5000 windows, the
-    same for KING_D, the house and every challenger), every judged digest is
-    scored on the kept windows (the public half of :func:`judge_cohort`) and
-    the report carries the ``public`` block (revision, index and file-list
-    hashes, window ids, the read-time drops, the public ``rows`` and their
-    ``rows_sha256``). A member whose public scores are not finite is
-    ``checkpoint_fault``. At ``public_weight = 0`` nothing is drawn or
-    recorded.
-
-    ``max_channels`` (rev6.18 A4, F2) is ``[generator] max_channels``: the
-    channel cap of a multichannel ``(C, L)`` pool window, whose pick
-    (empty channels dropped, a wider series cut to ``max_channels`` by
-    ``boundary_block_hash``) is :mod:`cascade.eval.lane_d_channels`'. Each
-    such window is ONE per-window score per model (channels averaged,
-    :func:`~cascade.eval.lane_d_scorer.score_window`), one resampling unit
-    in its source's cluster, and its report window carries the pick
-    (``series_id``, ``n_channels_raw``, ``empty_channels``, ``n_channels``,
-    ``channels_sha256``). ``None`` (the legacy call) scores no
-    multichannel window. Univariate windows are unaffected.
-
-    ``pool_dir`` is the newest ``pool_d`` snapshot; ``prior_pool_dirs`` are
-    the earlier retained ones. They feed every open entry's union and supply
-    the history and targets of windows frozen from them.
-
-    The §1.3b gate inputs (W5e): ``boundary_block_hash`` is the settlement
-    boundary's block hash (``0x`` + 64 hex, the draw's input), ``sentinel``
-    the era's §16 sentinel suite (``None`` = W-S1 unarmed) and ``bench`` the
-    bench host session (a :class:`~cascade.validator.lane_d_bench.SweepSession`).
-    Only a settlement with a crowning candidate uses them; without ``bench``
-    or ``boundary_block_hash`` every crowning candidate is ``bench_hold``
-    (fail closed: nothing crowns ungated).
-
-    ``expect_prior_sha256`` (the last published receipt's
-    ``posterior_state_sha256``), when given, must equal the digest of the
-    state as loaded (``state_digest_mismatch``). A lost state after a
-    persisted settlement is ``state_missing`` and a rolled-back one is
-    ``state_digest_mismatch`` (:func:`~cascade.validator.lane_d_state.load_prior_state`);
-    every such refusal comes before any pool or forecast is read and writes
-    nothing.
-
-    ``armed`` (rev6.6) is the settlement's W5d
-    :func:`~cascade.eval.lane_d_scorer.armed_record`. Given, it is checked by
-    :func:`check_armed` (a ``LaneDArmedError`` before anything is read or
-    written) and recorded as the report's ``armed_contexts`` /
-    ``armed_evidence``; the forecasts are the eval host's at each entry's
-    ``effective_context``. ``None`` (the legacy call) records neither.
-
-    ``host`` (rev6.18 B7) is the eval host record the W4 handshake verified
-    (:func:`~cascade.eval.lane_d_handshake.check_worker`: environment, GPU
-    model, driver, torch build, fingerprint and the B6 host identity). Every
-    forecast in ``forecasts`` came from that one host (B6). Given, it must be
-    well formed (a ``ValueError`` before anything is read or written) and is
-    signed as the report's ``host``; ``None`` records no host.
-
-    ``eval_identity`` (W-IMG, plan rev6.24 (e)): the eval host's code
-    identity the forecasts ran on, recorded under ``extensions`` as
-    :data:`EVAL_IMAGE_EXTENSION` (logged, never consensus). ``None`` (every
-    settlement before ``[v2] image_epoch_from_block``) records nothing."""
-    if not cfg.active(boundary):
-        return LaneDSettlement(report=None, pay=None, receipt=None)
-    if boundary_ts is not None and (isinstance(boundary_ts, bool) or not isinstance(boundary_ts, int)
-                                    or boundary_ts < 0):
-        raise ValueError(f"boundary_ts must be a non-negative int timestamp; got {boundary_ts!r}")
-    armed_fields = None if armed is None else check_armed(armed, cfg)
-    if host is not None:
-        from ..shared.config.lane_d import host_record_problem
-
-        why = host_record_problem(host)
-        if why:
-            raise ValueError(f"lane D host record refused: {why}")
-        host = {k: str(v) for k, v in host.items()}
-    # W5f: the house is the verified record a signed pointer enters
-    # (lane_d_house). Anything else is refused before any state, report or
-    # pool is read or written (fail closed).
-    house = check_house(house)
-    boundary = int(boundary)
-    state = load_prior_state(state_path, house, boundary,
-                             expect_prior_sha256=expect_prior_sha256)
-    settled = int(state["boundary"])
-    rp = report_path(state_path, boundary)
-    if settled == boundary and "last_report" in state:
-        return _already_settled(state, rp, boundary)
-    if settled >= boundary:
-        raise LaneDStateError("stale_boundary", f"lane D already settled through {settled}; "
-                              f"got {boundary}")
-    # rev6.18 A3 (F4): the public half, drawn and bound to the eval host's
-    # scores before anything else is read or written (fail closed).
-    pub = _public_half(cfg, public_indexes, public_scores, boundary_block_hash,
-                       int(cfg.horizon), sorted(forecasts))
+    The validator box runs it in-process only on budget-sized pools
+    (:data:`~cascade.validator.lane_d_inputs.BOX_POOL_BUDGET_BYTES`); the lane D
+    eval host runs it for the live settlement
+    (:func:`cascade.eval.lane_d_settle.serve_settle`), where the pools and
+    the forecasts already are. The code is the pre-W-OFFBOX body, unchanged."""
     pub_arr: dict[str, object] = {}
 
     def pub_of(dg: str):
@@ -1450,30 +1356,6 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
             pub_arr[dg] = _public_arrays(pub, dg)
         return pub_arr[dg]
 
-    # A report file without its state: a crash between the two writes. RV7
-    # B1: recovery ADOPTS it, never re-sweeps the bench. It is parsed
-    # strictly and checked (the settling validator's signature, the boundary,
-    # the prior state digest bound in its signed body) before anything else
-    # is read; a refusal calls no bench and writes nothing.
-    persisted = load_report_file(rp) if rp.exists() else None
-    prior_sha = state_digest(state)
-    if persisted is not None:
-        check_persisted_report(persisted,
-                               signer_ss58=str(getattr(signer, "hotkey", signer).ss58_address),
-                               boundary=boundary, prior_state_sha256=prior_sha, where=rp)
-    # W7c (rev6.11 (b); orchestrator decision 2026-11-23): a testnet state
-    # written by the old code may hold `confirm_pending` entries. Migrated
-    # after the prior digest is taken, so the receipt binds legacy -> migrated.
-    migrated = migrate_confirm_pending(state)
-    refresh_house(state, house)
-    king_before = _king_record(state["king"])
-    # rev6.23 (owner 2026-11-24): the crown bar decays with KING_D's tenure,
-    # the lane D settlements it has held the crown before this one (a house
-    # KING_D counts; a house refresh in place does not reset it). Absent in
-    # a state written before rev6.23: 0.
-    tenure = int(state.get(KING_TENURE_KEY, 0))
-    crown_bar = cfg.crown_bar(tenure)
-    pools = _load_pools(pool_dir, prior_pool_dirs, cfg)
     # rev6.18 A4 (F2): multichannel windows reduced to their scored channels
     # (a no-op on a univariate pool).
     picks = _pick_channels(pools, boundary_block_hash, max_channels)
@@ -1488,7 +1370,6 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     # Every entry considered and not judged is a typed skip, including the
     # entries voided this settlement (invariant 11).
     skipped = _register(state, entries, cfg, uid_of)
-    h = int(cfg.horizon)
     # W5f: the house entry (§1.4 "It enters at that settlement"), opened by
     # ``refresh_house`` when a new house meets a miner KING_D. It is judged
     # like an entry but lives outside ``entries`` (it has no hotkey and is
@@ -1770,6 +1651,338 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
                              # rev6.12 (b): the fresh and embargo sub-scores.
                              "fresh": _subscore(scores[m], fresh_idx),
                              "embargo": _subscore(scores[m], emb_idx)})
+    return {"state": state, "skipped": skipped, "held": list(held),
+            "house_held": bool(house_held), "seed": seed, "rows": rows,
+            "windows_out": windows_out, "cohorts": cohorts, "verdicts": verdicts,
+            "draws": draws, "candidates": candidates, "pub_scored": sorted(pub_scored),
+            "pool_rec": _pool_record(pools, windows_out)}
+
+
+# ── W-OFFBOX (2026-11-28): the pool phase as a JSON request / record ────────
+#
+# Two validator OOM kills (04:39, 05:41) followed the lane D step loading all
+# 13 pinned pool_d snapshots (~1.7 GB on disk) into the validator process on
+# a 7 GB box. The pool phase now runs on the lane D eval host; these carry its
+# inputs and its judged record between the two, as plain JSON.
+
+JUDGE_REQUEST_SCHEMA = "lane-d-judge-request/1"
+JUDGE_RECORD_KEYS = ("state", "skipped", "held", "house_held", "seed", "rows", "windows_out",
+                     "cohorts", "verdicts", "draws", "candidates", "pub_scored", "pool_rec")
+
+
+def plain_json(obj, where: str = "$"):
+    """``obj`` as plain JSON types (numpy scalars to Python, tuples to lists),
+    refusing what a JSON round trip would change silently: a non-str key, a
+    set, an array or any other type (``TypeError``)."""
+    if obj is None or isinstance(obj, (bool, str)):
+        return obj
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    if isinstance(obj, (int, np.integer)):
+        return int(obj)
+    if isinstance(obj, (float, np.floating)):
+        return float(obj)
+    if isinstance(obj, dict):
+        bad = [k for k in obj if not isinstance(k, str)]
+        if bad:
+            raise TypeError(f"{where}: non-str key {bad[0]!r} would change in JSON")
+        return {k: plain_json(v, f"{where}.{k}") for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [plain_json(v, f"{where}[{i}]") for i, v in enumerate(obj)]
+    raise TypeError(f"{where}: {type(obj).__name__} is not plain JSON")
+
+
+def lane_d_config_record(cfg) -> dict:
+    """The ``[lane_d]`` config as plain JSON (:func:`lane_d_config_from_record`
+    inverts it exactly)."""
+    import dataclasses
+
+    return plain_json(dataclasses.asdict(cfg), "lane_d")
+
+
+def _tuples(v):
+    return tuple(_tuples(x) for x in v) if isinstance(v, list) else v
+
+
+def lane_d_config_from_record(rec: dict):
+    """The :class:`~cascade.shared.config.lane_d.LaneDConfig` of a
+    :func:`lane_d_config_record`; ``ValueError`` unless it round-trips."""
+    import dataclasses
+
+    from ..shared.config.lane_d import LaneDConfig
+
+    names = {f.name: f for f in dataclasses.fields(LaneDConfig)}
+    if not isinstance(rec, dict) or set(rec) != set(names):
+        raise ValueError("lane D judge request: the [lane_d] record names other fields")
+    kw = {k: (_tuples(v) if isinstance(v, list) else v) for k, v in rec.items()}
+    cfg = LaneDConfig(**kw)
+    if lane_d_config_record(cfg) != rec:
+        raise ValueError("lane D judge request: the [lane_d] record does not round-trip")
+    return cfg
+
+
+def _pub_record(pub: dict | None) -> dict | None:
+    if pub is None:
+        return None
+    return plain_json({"draws": pub["draws"], "dropped": pub["dropped"],
+                       "windows": pub["windows"], "scores": pub["scores"],
+                       "balanced": sorted(pub.get("balanced") or ()), "cells": pub.get("cells")},
+                      "pub")
+
+
+def _pub_from_record(rec: dict | None) -> dict | None:
+    if rec is None:
+        return None
+    from .lane_d_public import public_record
+
+    return {**rec, "record": public_record, "balanced": set(rec["balanced"]),
+            "_pos": {w["window_id"]: i for i, w in enumerate(rec["windows"])}}
+
+
+def judge_request(phase: dict) -> dict:
+    """The JSON judge request of :func:`_judge_pools`'s keyword arguments
+    (all but ``pools`` and ``forecasts``, which the eval host holds)."""
+    return {"schema": JUDGE_REQUEST_SCHEMA,
+            "lane_d": lane_d_config_record(phase["cfg"]),
+            "boundary": int(phase["boundary"]),
+            "boundary_ts": None if phase["boundary_ts"] is None else int(phase["boundary_ts"]),
+            "boundary_block_hash": phase["boundary_block_hash"],
+            "max_channels": phase["max_channels"],
+            "armed_fields": plain_json(phase["armed_fields"], "armed_fields"),
+            "state": plain_json(phase["state"], "state"),
+            "entries": plain_json(phase["entries"], "entries"),
+            "uid_of": plain_json(phase["uid_of"], "uid_of"),
+            "pub": _pub_record(phase["pub"]),
+            "crown_bar": float(phase["crown_bar"])}
+
+
+def judge_phase_of(request: dict) -> dict:
+    """:func:`_judge_pools`'s keyword arguments (no ``pools`` / ``forecasts``)
+    of a :func:`judge_request`; ``ValueError`` on anything else."""
+    if not isinstance(request, dict) or request.get("schema") != JUDGE_REQUEST_SCHEMA:
+        raise ValueError(f"not a {JUDGE_REQUEST_SCHEMA} request")
+    return {"cfg": lane_d_config_from_record(request.get("lane_d")),
+            "boundary": int(request["boundary"]), "boundary_ts": request["boundary_ts"],
+            "boundary_block_hash": request["boundary_block_hash"],
+            "max_channels": request["max_channels"], "armed_fields": request["armed_fields"],
+            "state": request["state"], "entries": request["entries"],
+            "uid_of": request["uid_of"], "pub": _pub_from_record(request["pub"]),
+            "crown_bar": float(request["crown_bar"])}
+
+
+def judged_record(judged: dict) -> dict:
+    """:func:`_judge_pools`'s return value as plain JSON (what the eval host
+    sends back)."""
+    return plain_json({k: judged[k] for k in JUDGE_RECORD_KEYS}, "judged")
+
+
+def remote_judge(pool_phase, phase: dict) -> dict:
+    """:func:`_judge_pools` on the lane D eval host: ``pool_phase(request)``
+    returns the judged record (:func:`judged_record`), checked for its keys
+    and types here (its binding to the pinned snapshots is the caller's,
+    :class:`~cascade.validator.lane_d_inputs.LaneDInputsSource`)."""
+    got = pool_phase(judge_request(phase))
+    if not isinstance(got, dict) or set(got) != set(JUDGE_RECORD_KEYS):
+        raise ValueError("lane D judged record: not the judge keys "
+                         f"({sorted(got) if isinstance(got, dict) else type(got).__name__})")
+    want = {"state": dict, "skipped": list, "held": list, "house_held": bool, "seed": str,
+            "rows": list, "windows_out": dict, "cohorts": list, "verdicts": list,
+            "draws": list, "candidates": list, "pub_scored": list, "pool_rec": dict}
+    bad = sorted(k for k, t in want.items() if not isinstance(got[k], t))
+    if bad:
+        raise ValueError(f"lane D judged record: malformed {bad}")
+    return got
+
+
+def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: dict,
+                  forecasts: dict, uid_of: dict, state_path, signer,
+                  prior_pool_dirs=(), expect_prior_sha256: str | None = None,
+                  boundary_block_hash: str | None = None, sentinel: str | None = None,
+                  bench=None, armed: dict | None = None,
+                  boundary_ts: int | None = None,
+                  max_channels: int | None = None,
+                  public_indexes: dict | None = None,
+                  public_scores: dict | None = None,
+                  host: dict | None = None,
+                  eval_identity: dict | None = None,
+                  pool_phase=None) -> LaneDSettlement:
+    """Settle lane D at ``boundary`` (see the module docstring).
+
+    ``pool_phase`` (W-OFFBOX, 2026-11-28): ``None`` judges in this process
+    (:func:`_judge_pools` over ``pool_dir`` / ``prior_pool_dirs`` and
+    ``forecasts``). Given, it is a callable taking the JSON judge request
+    (:data:`JUDGE_REQUEST_SCHEMA`) and returning the judged record computed on
+    the lane D eval host (:func:`remote_judge`): no pool, window or forecast
+    is read in this process and ``forecasts`` is only the digest list the
+    public half binds. Both give the same report bytes for the same inputs.
+
+    ``boundary_ts`` (rev6.14 (a)) is the boundary block's on-chain
+    ``Timestamp.Now`` (seconds), signed in the report. An entry (and the house
+    challenger) is drawn, frozen or judged only when ``boundary_ts`` >= its
+    judging start ``j = max(T_E, T_K) + 3600 * eval_delay_hours``, else it is
+    skipped ``before_eval_delay``. Without it (the legacy call) nothing is
+    frozen or judged: every open entry is skipped ``boundary_ts_missing``
+    (fail closed).
+
+    ``public_indexes`` (rev6.18 A1/A2/A6, F3) is ``{source: index dir}`` of the
+    public sources (W6p indexes) and ``public_scores`` (F4) the eval host's
+    per-window scores of every forecast digest on their drawn windows
+    (:func:`_public_half`). At ``public_weight > 0`` both are required with
+    ``boundary_block_hash`` (else :class:`LaneDPublicError`
+    ``public_missing``, before anything is written): each source is drawn
+    (:func:`~cascade.validator.lane_d_public.draw_public`, 5000 windows, the
+    same for KING_D, the house and every challenger), every judged digest is
+    scored on the kept windows (the public half of :func:`judge_cohort`) and
+    the report carries the ``public`` block (revision, index and file-list
+    hashes, window ids, the read-time drops, the public ``rows`` and their
+    ``rows_sha256``). A member whose public scores are not finite is
+    ``checkpoint_fault``. At ``public_weight = 0`` nothing is drawn or
+    recorded.
+
+    ``max_channels`` (rev6.18 A4, F2) is ``[generator] max_channels``: the
+    channel cap of a multichannel ``(C, L)`` pool window, whose pick
+    (empty channels dropped, a wider series cut to ``max_channels`` by
+    ``boundary_block_hash``) is :mod:`cascade.eval.lane_d_channels`'. Each
+    such window is ONE per-window score per model (channels averaged,
+    :func:`~cascade.eval.lane_d_scorer.score_window`), one resampling unit
+    in its source's cluster, and its report window carries the pick
+    (``series_id``, ``n_channels_raw``, ``empty_channels``, ``n_channels``,
+    ``channels_sha256``). ``None`` (the legacy call) scores no
+    multichannel window. Univariate windows are unaffected.
+
+    ``pool_dir`` is the newest ``pool_d`` snapshot; ``prior_pool_dirs`` are
+    the earlier retained ones. They feed every open entry's union and supply
+    the history and targets of windows frozen from them.
+
+    The §1.3b gate inputs (W5e): ``boundary_block_hash`` is the settlement
+    boundary's block hash (``0x`` + 64 hex, the draw's input), ``sentinel``
+    the era's §16 sentinel suite (``None`` = W-S1 unarmed) and ``bench`` the
+    bench host session (a :class:`~cascade.validator.lane_d_bench.SweepSession`).
+    Only a settlement with a crowning candidate uses them; without ``bench``
+    or ``boundary_block_hash`` every crowning candidate is ``bench_hold``
+    (fail closed: nothing crowns ungated).
+
+    ``expect_prior_sha256`` (the last published receipt's
+    ``posterior_state_sha256``), when given, must equal the digest of the
+    state as loaded (``state_digest_mismatch``). A lost state after a
+    persisted settlement is ``state_missing`` and a rolled-back one is
+    ``state_digest_mismatch`` (:func:`~cascade.validator.lane_d_state.load_prior_state`);
+    every such refusal comes before any pool or forecast is read and writes
+    nothing.
+
+    ``armed`` (rev6.6) is the settlement's W5d
+    :func:`~cascade.eval.lane_d_scorer.armed_record`. Given, it is checked by
+    :func:`check_armed` (a ``LaneDArmedError`` before anything is read or
+    written) and recorded as the report's ``armed_contexts`` /
+    ``armed_evidence``; the forecasts are the eval host's at each entry's
+    ``effective_context``. ``None`` (the legacy call) records neither.
+
+    ``host`` (rev6.18 B7) is the eval host record the W4 handshake verified
+    (:func:`~cascade.eval.lane_d_handshake.check_worker`: environment, GPU
+    model, driver, torch build, fingerprint and the B6 host identity). Every
+    forecast in ``forecasts`` came from that one host (B6). Given, it must be
+    well formed (a ``ValueError`` before anything is read or written) and is
+    signed as the report's ``host``; ``None`` records no host.
+
+    ``eval_identity`` (W-IMG, plan rev6.24 (e)): the eval host's code
+    identity the forecasts ran on, recorded under ``extensions`` as
+    :data:`EVAL_IMAGE_EXTENSION` (logged, never consensus). ``None`` (every
+    settlement before ``[v2] image_epoch_from_block``) records nothing."""
+    if not cfg.active(boundary):
+        return LaneDSettlement(report=None, pay=None, receipt=None)
+    if boundary_ts is not None and (isinstance(boundary_ts, bool) or not isinstance(boundary_ts, int)
+                                    or boundary_ts < 0):
+        raise ValueError(f"boundary_ts must be a non-negative int timestamp; got {boundary_ts!r}")
+    armed_fields = None if armed is None else check_armed(armed, cfg)
+    if host is not None:
+        from ..shared.config.lane_d import host_record_problem
+
+        why = host_record_problem(host)
+        if why:
+            raise ValueError(f"lane D host record refused: {why}")
+        host = {k: str(v) for k, v in host.items()}
+    # W5f: the house is the verified record a signed pointer enters
+    # (lane_d_house). Anything else is refused before any state, report or
+    # pool is read or written (fail closed).
+    house = check_house(house)
+    boundary = int(boundary)
+    state = load_prior_state(state_path, house, boundary,
+                             expect_prior_sha256=expect_prior_sha256)
+    settled = int(state["boundary"])
+    rp = report_path(state_path, boundary)
+    if settled == boundary and "last_report" in state:
+        return _already_settled(state, rp, boundary)
+    if settled >= boundary:
+        raise LaneDStateError("stale_boundary", f"lane D already settled through {settled}; "
+                              f"got {boundary}")
+    # rev6.18 A3 (F4): the public half, drawn and bound to the eval host's
+    # scores before anything else is read or written (fail closed).
+    pub = _public_half(cfg, public_indexes, public_scores, boundary_block_hash,
+                       int(cfg.horizon), sorted(forecasts))
+    pub_arr: dict[str, object] = {}
+
+    def pub_of(dg: str):
+        if pub is None:
+            return True
+        if dg not in pub_arr:
+            pub_arr[dg] = _public_arrays(pub, dg)
+        return pub_arr[dg]
+
+    # A report file without its state: a crash between the two writes. RV7
+    # B1: recovery ADOPTS it, never re-sweeps the bench. It is parsed
+    # strictly and checked (the settling validator's signature, the boundary,
+    # the prior state digest bound in its signed body) before anything else
+    # is read; a refusal calls no bench and writes nothing.
+    persisted = load_report_file(rp) if rp.exists() else None
+    prior_sha = state_digest(state)
+    if persisted is not None:
+        check_persisted_report(persisted,
+                               signer_ss58=str(getattr(signer, "hotkey", signer).ss58_address),
+                               boundary=boundary, prior_state_sha256=prior_sha, where=rp)
+    # W7c (rev6.11 (b); orchestrator decision 2026-11-23): a testnet state
+    # written by the old code may hold `confirm_pending` entries. Migrated
+    # after the prior digest is taken, so the receipt binds legacy -> migrated.
+    migrated = migrate_confirm_pending(state)
+    refresh_house(state, house)
+    king_before = _king_record(state["king"])
+    # rev6.23 (owner 2026-11-24): the crown bar decays with KING_D's tenure,
+    # the lane D settlements it has held the crown before this one (a house
+    # KING_D counts; a house refresh in place does not reset it). Absent in
+    # a state written before rev6.23: 0.
+    tenure = int(state.get(KING_TENURE_KEY, 0))
+    crown_bar = cfg.crown_bar(tenure)
+    phase = {"cfg": cfg, "boundary": boundary, "boundary_ts": boundary_ts,
+             "boundary_block_hash": boundary_block_hash, "max_channels": max_channels,
+             "armed_fields": armed_fields, "state": state, "entries": entries,
+             "uid_of": uid_of, "pub": pub, "crown_bar": crown_bar}
+    if pool_phase is None:
+        # The in-process reference path (tests, tools): the pools load here.
+        # The validator runs it only under the box pool budget
+        # (lane_d_inputs.BOX_POOL_BUDGET_BYTES); production judges on the
+        # eval host (W-OFFBOX, ``pool_phase``).
+        judged = _judge_pools(  # incident-ok: IR010 reference path, budget-guarded upstream
+            forecasts=forecasts, pools=_load_pools(  # incident-ok: IR010 same call
+                pool_dir, prior_pool_dirs, cfg), **phase)
+    else:
+        # W-OFFBOX (2026-11-28): the pools, windows, forecasts and scores stay
+        # on the lane D eval host; the box gets the judged record back.
+        judged = remote_judge(pool_phase, phase)
+        state = judged["state"]
+    skipped = judged["skipped"]
+    held, house_held = judged["held"], judged["house_held"]
+    seed, rows, windows_out = judged["seed"], judged["rows"], judged["windows_out"]
+    cohorts, verdicts, draws = judged["cohorts"], judged["verdicts"], judged["draws"]
+    candidates = judged["candidates"]
+    pub_scored = set(judged["pub_scored"])
+    h = int(cfg.horizon)
+    house_rec = state.get(HOUSE_ENTRY_KEY)
+    hd = str(state["house"]["digest"])
+
+    def skip(dg: str, reason: str, rec: dict | None = None) -> None:
+        (state["entries"][dg] if rec is None else rec)["reason"] = reason
+        if rec is not None and rec is house_rec:
+            return
+        skipped.append({"digest": dg, "reason": reason})
 
     # Held candidates (an earlier bench_hold) are re-gated with their first
     # clear, without a duel: no rows, no verdict this settlement.
@@ -1869,7 +2082,7 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     state[KING_TENURE_KEY] = 1 if passing else tenure + 1
     court = _court(state, cfg, uid_of)
     pay = {"share": float(cfg.share), "court_uids": [s["uid"] for s in court]}
-    pool_rec = _pool_record(pools, windows_out)
+    pool_rec = judged["pool_rec"]
     # The first-seen roots the frozen sets rely on: the union over the listed
     # snapshots, known once every cohort is judged, so each cohort takes it
     # here and the report's two root lists agree.

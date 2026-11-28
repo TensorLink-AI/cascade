@@ -38,6 +38,7 @@ def encode_frame(header: dict, arrays: dict | None = None) -> bytes:
 
 
 def decode_frame(data: bytes) -> tuple[dict, dict]:
+    # incident-ok: IR010 runs on the MarketCast GPU pod and decodes its own request
     with np.load(io.BytesIO(data), allow_pickle=False) as z:
         header = json.loads(str(z["h"][()]))
         arrays = {k[2:]: z[k] for k in z.files if k.startswith("a_")}

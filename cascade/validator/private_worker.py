@@ -93,6 +93,7 @@ def run_request(checkpoint, request, output, *, device="cuda", workers=1, qualif
     # The opt-in worker owns its process; avoid nested BLAS/torch pools.
     torch.set_num_threads(1)
     request_hash = file_hash(Path(request))
+    # incident-ok: IR010 runs on the operator GPU pod, not the box
     with np.load(request, allow_pickle=False) as data:
         metadata = json.loads(data["metadata"].tobytes())
         if metadata.get("schema") not in (SCHEMA, SCHEMA_QUANTILES, SCHEMA_QUANTILES_BATCHED):
@@ -159,6 +160,7 @@ def check_forecasts(path, request_hash, windows, num_samples, quantile_levels=No
     with zipfile.ZipFile(path) as archive:
         if sum(f.file_size for f in archive.infolist()) > max_bytes + (len(windows) + 1) * 4096:
             raise ValueError("private evaluation result exceeds its shape budget")
+    # incident-ok: IR010 runs on the operator GPU pod, not the box
     with np.load(path, allow_pickle=False) as data:
         expected = {"request_sha256"} | {f"s_{i}" for i in range(len(windows))}
         if len(data.files) != len(expected) or set(data.files) != expected:
@@ -182,6 +184,7 @@ def iter_forecasts(path, windows, num_samples, quantile_levels=None):
     """Yield each window's samples (or quantiles) in window order, read lazily
     from the NPZ (call :func:`check_forecasts` first). Same arrays, same order
     as :func:`read_forecasts` — only the peak memory differs."""
+    # incident-ok: IR010 runs on the operator GPU pod, not the box
     with np.load(path, allow_pickle=False) as data:
         for i, window in enumerate(windows):
             arr = data[f"s_{i}"]

@@ -244,3 +244,36 @@ control, so the reader must tolerate it.
 **Limits.** The check is per function and follows only plain `X = <call>`
 assignments. A reviewed exception (`validator_bench`'s stdlib-only
 `bench_identity` probe) carries an `incident-ok: IR009` comment.
+
+## IR010 — pool or checkpoint arrays loaded in the validator process
+
+**Incident.** 2026-11-28. The validator's off-thread lane D settlement step
+loaded every pinned `pool_d` snapshot into the validator process at once (13
+pins, about 1.7 GB on disk plus about 17 MB of JSON metadata each). The
+validator's RSS went from 1.05 GB to more than 3.65 GB on each step. The 7 GB
+box also runs the trainer and the intake, and it OOM-killed the validator at
+04:39 and 05:41, 22 to 35 s after `lane D: step for settlement … started`. No
+log line named the cause. W-OFFBOX moved the pool phase to the lane D eval
+host (`cascade.eval.lane_d_settle`). The step now logs its peak RSS and
+reports an ERROR over the box budget (`offthread_worker.STEP_RSS_BUDGET_BYTES`).
+
+**Rule.** In `cascade/validator/`, a call to a pool or checkpoint loader is a
+hit: `load_pool`, `load_pool_for`, `load_pool_series`, `_load_pools`,
+safetensors `load_file` / `safe_open`, or `np.load` / `numpy.load` /
+`torch.load`. Two shapes pass:
+
+- `np.load(..., mmap_mode="r")`, which pages the data in on demand;
+- a reviewed bounded load that carries
+  `# incident-ok: IR010 <why it is bounded>`, for example one cached file, a
+  loader whose callers are checked, or code that runs on a pod and not on the
+  box.
+
+**Fix.** Load and score on the eval host, or stream one file at a time with
+`mmap_mode` under a hard bound and a test that checks peak memory as the
+input grows (`tests/accept/w_offbox`).
+
+**Limits.** The check matches call names only. A load reached through another
+module (`cascade/eval/`, `cascade/pool/`) is not a hit. The step's runtime RSS
+log catches that case. The existing sites were allowlisted on 2026-11-28 with
+`baseline 2026-11-28` in their reasons. They each load one snapshot or one
+checkpoint pair, and each one should be reviewed.

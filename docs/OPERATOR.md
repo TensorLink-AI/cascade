@@ -3827,9 +3827,9 @@ publishes is Approve-tier.
 |---|---|---|
 | `cascade-laned-intake` | the box, loopback behind Caddy (`deploy/cascade-laned-intake.service`, `python -P -m cascade.lane_d`) | `POST /v1/lane-d/submit`, `POST /v1/lane-d/ready`, `GET /v1/lane-d/queue`; mints `presigned_multipart` upload grants and never logs one |
 | Vault | private bucket `cascade-lane-d-vault`, prefix `lane-d` (`[lane_d_ops] vault_bucket` / `vault_prefix`) | entries at `lane-d/<hotkey>/<digest>/`; never a shared bucket |
-| Launch eval host | `[lane_d_ops] eval_host` (empty until the S4 bring-up) | forecasts for the cohort, KING_D and the house at 4k–16k context |
+| Launch eval host | `[lane_d_ops] eval_host` (empty until the S4 bring-up) | holds a copy of the pinned `pool_d` snapshots; loads them, cuts the windows, forecasts the cohort, KING_D and the house at 4k–16k context, and scores and judges them (the settlement's pool phase, W-OFFBOX) |
 | `pool_d` builder | a dedicated small CPU VM | builds the private `pool_d` snapshots; never the box or a rented GPU pod |
-| Main validator | the box | scores forecasts against the `pool_d` targets, runs the bootstrap, signs the `lane-d-report/1` report and writes `lane_d_state.json` |
+| Main validator | the box | sends the pins and the state to the eval host, binds the judged record it returns to the pins, runs the bench gate, signs the `lane-d-report/1` report and writes `lane_d_state.json`; it loads no `pool_d` snapshot |
 
 **The eval host runs a qualified scoring environment (plan rev6.18 B5).**
 Any GPU may score lane D when its environment is a `qualified` entry of
@@ -3895,8 +3895,10 @@ approval (D16). Kings are published to the Hub, R2 and HF mirrors and kept.
 
 **Runbook, per settlement.** Refresh the house if lane A's king digest
 changed. Check that the newest `pool_d` snapshot is pinned (stale over about
-30 h is CRIT; entries stay pending). Forecasts run on the eval host,
-handshake first. The box scores, bootstraps and applies max-T. A candidate
+30 h is CRIT; entries stay pending) and copied to the eval host's
+`eval_pool_root`. After the handshake, the eval host loads the pins,
+forecasts, scores, bootstraps and applies max-T, and the box binds the
+result to its pins. A candidate
 gets the drawn gate suite on the bench host, behind lane A, paired against
 KING_D and the house. Then come the signed report, `lane_d_state.json` and
 the receipt digests. Faults hold entries at no cost: an eval host or vault
@@ -3914,6 +3916,33 @@ trainer (no legs in flight).
 `[lane_d] max_coldkey_unresolved_settlements` settlements. Alerts reach a
 webhook only when `/etc/cascade-ops.env` is filled; otherwise they reach only
 `alerts.jsonl`.
+
+### Lane D pool phase on the eval host (W-OFFBOX)
+
+On 2026-11-28 the validator was OOM-killed at 04:39 and 05:41. Its lane D
+step had loaded all 13 pinned `pool_d` snapshots (about 1.7 GB on disk) into
+the validator process on the 7 GB box. The pool phase now runs on the eval
+host. Set `eval_pool_root` in the `--lane-d-inputs` TOML to the host's copy of
+the snapshots (`<root>/<snapshot>/`, the same directory names as the box's
+pins). The box then sends one `settle` request per settlement
+(`python -P -m cascade.eval.lane_d_forecasts settle`, bounded on the host at
+`eval_timeout_seconds` per needed digest and serialised on the cache lock).
+The host re-hashes every pin, so a missing or stale copy refuses the
+settlement (`pool_unavailable` / `pool_digest_mismatch`, nothing written). It
+never guesses.
+
+Keep the host's copy current from the box with
+`rsync -a --delete <box pool_d root>/ <host>:<eval_pool_root>/` after each pin
+sync. Use the host's pinned known_hosts. rsync streams the files and loads
+nothing into memory. `eval_score_cache_dir` (optional) is the host's B6
+score cache.
+
+Without `eval_pool_root`, the box loads the pins itself, but only up to
+`box_pool_budget_bytes` (default 64 MiB on disk). Above that the settlement
+is refused before any pin is read. Each step logs `rss start / peak (+growth)`,
+and growth over 512 MiB is logged as an ERROR. The lint rule IR010 flags any
+new pool or checkpoint load in `cascade/validator/`. The published report is
+byte-identical either way (`tests/accept/w_offbox`).
 
 ### Lane D public half: warm the mirror before raising `public_weight`
 

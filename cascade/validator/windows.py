@@ -336,7 +336,7 @@ class WindowSource(Protocol):
     def windows_for_round(
         self, round_seed: int | str, n_windows: int, *, block: int | None = None
     ) -> list[EvalWindow]:
-        ...
+        """The round's eval windows (a Protocol method: no body)."""
 
 
 @dataclass(frozen=True)
@@ -633,6 +633,7 @@ def shared_ladder_windows_for_round(
         )
     from .calibration import load_pool_series
 
+    # incident-ok: IR010 baseline 2026-11-28: lane A eval windows from one snapshot
     series, _ids, metadata = load_pool_series(Path(pool_dir))
     return shared_ladder_windows(
         series, metadata, horizons=horizons, n_windows=n_windows,
@@ -736,6 +737,7 @@ def ladder_windows_for_round(
     # Runtime import: calibration imports this module at load time.
     from .calibration import load_pool_series
 
+    # incident-ok: IR010 baseline 2026-11-28: lane A eval windows from one snapshot
     series, _ids, metadata = load_pool_series(Path(pool_dir))
     return ladder_windows(
         series, metadata, horizons=horizons, n_windows=n_windows,

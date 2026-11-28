@@ -617,6 +617,47 @@ def check_ir009(rel: str, text: str) -> list[tuple[int, str]]:
     return sorted(hits.items())
 
 
+# ── IR010: in-process pool / checkpoint array loads in the validator ──────────
+
+IR010_LOADERS = {"load_pool", "load_pool_for", "load_pool_series", "_load_pools",
+                 "load_file", "safe_open"}
+IR010_ARRAY_MODULES = {"np", "numpy", "torch"}
+
+
+def _ir010_mmap(call: ast.Call) -> bool:
+    """``np.load(..., mmap_mode=<not None>)``: bounded (pages in on demand)."""
+    return any(k.arg == "mmap_mode" and not (isinstance(k.value, ast.Constant)
+                                             and k.value.value is None)
+               for k in call.keywords)
+
+
+def check_ir010(rel: str, text: str) -> list[tuple[int, str]]:
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return []
+    hits: dict[int, str] = {}
+    for c in ast.walk(tree):
+        if not isinstance(c, ast.Call):
+            continue
+        f = c.func
+        name = f.attr if isinstance(f, ast.Attribute) else f.id if isinstance(f, ast.Name) else ""
+        if name in IR010_LOADERS:
+            what = f"{name}()"
+        elif (name == "load" and isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name)
+              and f.value.id in IR010_ARRAY_MODULES and not _ir010_mmap(c)):
+            what = f"{f.value.id}.load()"
+        else:
+            continue
+        hits[c.lineno] = (
+            f"{what} loads pool / checkpoint arrays into the validator process: the "
+            "2026-11-28 lane D step loaded all 13 pinned pool_d snapshots and the 7 GB box "
+            "OOM-killed the validator twice. Do the load on the eval host (W-OFFBOX "
+            "lane_d_settle), stream one file with np.load(mmap_mode='r') under a hard bound, "
+            "or allowlist a reviewed bounded load")
+    return sorted(hits.items())
+
+
 # ── the rule table ─────────────────────────────────────────────────────────────
 
 RULES: tuple[Rule, ...] = (
@@ -675,6 +716,15 @@ RULES: tuple[Rule, ...] = (
          "(`.splitlines()[-1]`), or use `lane_b_offload.pod_reply_json`",
          ("cascade/*.py", "scripts/*.py"),
          check_file=check_ir009),
+    Rule("IR010", "pool / checkpoint arrays loaded in the validator process",
+         "2026-11-28: the lane D settlement step loaded all 13 pinned pool_d snapshots "
+         "(~1.7 GB on disk, RSS 1.05 -> 3.65+ GB) into the validator; the 7 GB box OOM-killed "
+         "it at 04:39 and 05:41",
+         "load and score on the eval host (cascade.eval.lane_d_settle), or read one file "
+         "with `np.load(..., mmap_mode='r')` under a hard bound; a reviewed bounded load "
+         "carries `# incident-ok: IR010 <why it is bounded>`",
+         ("cascade/validator/*.py",),
+         check_file=check_ir010),
 )
 RULE_IDS = {r.id for r in RULES}
 

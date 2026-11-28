@@ -623,6 +623,7 @@ def main(argv: list[str] | None = None) -> int:
         from .pool import load_pool
 
         log.info("loading static eval pool %s …", runner.cfg.eval.window_pool)
+        # incident-ok: IR010 baseline 2026-11-28: the lane A private eval pool (one snapshot)
         window_source = load_pool(runner.cfg, cache_dir=args.cache_dir)
     log.info("validator up: netuid=%s manifest_bucket=%s — polling for rounds",
              runner.cfg.netuid, runner.cfg.storage.manifest_bucket)

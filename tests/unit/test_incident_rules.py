@@ -408,3 +408,55 @@ def test_cli_exit_codes(tmp_path, capsys):
     (tmp_path / "deploy" / "x.sh").write_text("git add deploy/x.sh\n")
     assert cir.main(["--root", str(tmp_path), "deploy/x.sh"]) == 0
     assert cir.main(["--list"]) == 0
+
+
+# ── IR010 pool / checkpoint arrays loaded in the validator process ─────────────
+
+# The pre-W-OFFBOX inputs source (cascade/validator/lane_d_inputs.py at b85cdc89):
+# every pinned pool_d snapshot loaded into the validator process.
+IR010_PRE_OFFBOX = '''\
+class LaneDInputsSource:
+    def _pools(self, boundary):
+        out = []
+        for pin in self._pool(boundary):
+            pool = load_pool_for(Path(pin["dir"]), self.cfg.lane_d)
+            out.append(pool)
+        return out
+'''
+
+
+def test_ir010_flags_the_pre_offbox_pool_load(tmp_path):
+    files = {"cascade/validator/lane_d_inputs.py": IR010_PRE_OFFBOX}
+    assert hits(tmp_path, files, "IR010") == [
+        ("IR010", "cascade/validator/lane_d_inputs.py", 5)]
+    for call in ("np.load(p)", "numpy.load(p, allow_pickle=False)", "torch.load(p)",
+                 "load_file(p)", "_load_pools(a, b, c)", "load_pool_series(d)"):
+        text = f"def f(p, a, b, c, d):\n    return {call}\n"
+        assert hits(tmp_path, {"cascade/validator/y.py": text}, "IR010") == [
+            ("IR010", "cascade/validator/y.py", 2)], call
+
+
+@pytest.mark.parametrize("rel,text", [
+    # a memory-mapped read pages in on demand
+    ("cascade/validator/x.py", "def f(p):\n    return np.load(p, mmap_mode='r')\n"),
+    # the eval host side is not the validator box
+    ("cascade/eval/lane_d_settle.py", IR010_PRE_OFFBOX),
+    # a definition is not a load; json.load is not an array load
+    ("cascade/validator/x.py", "def load_pool(d):\n    return json.load(open(d))\n"),
+])
+def test_ir010_passes_mmap_eval_host_and_non_array_loads(tmp_path, rel, text):
+    assert hits(tmp_path, {rel: text}, "IR010") == []
+
+
+def test_ir010_mmap_none_is_still_a_hit(tmp_path):
+    text = "def f(p):\n    return np.load(p, mmap_mode=None)\n"
+    assert hits(tmp_path, {"cascade/validator/x.py": text}, "IR010") == [
+        ("IR010", "cascade/validator/x.py", 2)]
+
+
+def test_ir010_allowlist(tmp_path):
+    text = IR010_PRE_OFFBOX.replace(
+        "            pool = load_pool_for(",
+        "            # incident-ok: IR010 one snapshot under the box budget\n"
+        "            pool = load_pool_for(")
+    assert hits(tmp_path, {"cascade/validator/x.py": text}, "IR010") == []

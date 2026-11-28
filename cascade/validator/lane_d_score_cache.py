@@ -95,6 +95,7 @@ class ScoreCache:
         if not p.is_file():
             return None
         try:
+            # incident-ok: IR010 one cached quantile file (one digest, context, horizon)
             with np.load(p, allow_pickle=False) as z:
                 ids = [str(x) for x in z["window_ids"]]
                 q = np.asarray(z["quantiles"], dtype=np.float64)
