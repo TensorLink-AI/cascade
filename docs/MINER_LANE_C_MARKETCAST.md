@@ -230,6 +230,30 @@ OOM would fail again. This applies to lane C fine-tunes and lane B experts.
 An OOM where another process filled the GPU is an infrastructure fault and
 is retried as before.
 
+### Data range: the sample-geometry check
+
+Every training series spans `[data.start, data.end + 1 day)` on its bar
+grid, and the leg draws each sample's end uniformly over that span (16 tries
+per sample). Real bars exist only where the recorder has them, so a range
+that starts long before a bank's recorded history is mostly empty. For
+example, the 15m bank starts 2026-09-25, so a recipe from 2024-01-01 has
+about 3 % finite 15m blocks. A batch of 6 then misses about 6 % of the time,
+and the leg fails with `could not cut a <suite>/15mx96 training sample` long
+before it finishes. `context_length` does not cause this, because the context
+is cut to whatever history comes before each sample. The date range does.
+
+At fund time the intake reads the public bar index (`cascade lane-c data`,
+first and last recorded bar per asset and timeframe). It estimates the chance
+that your leg hits a batch it cannot cut, using the sampler's own weights,
+your `batch` and your `steps`. At 1 % or more the fund is refused (400
+`recipe_data_range_uncuttable`). The reply names the horizon, its bank `timeframe`, where
+that bar's history starts, and `fits_from_start`, the earliest `data.start`
+that brings the chance under 1 %. Move `data.start` there, or drop that bar
+from `data.frequencies` / `horizon_mix`. Bars with no recorded history in
+your range (for example 1m or 5m before the embargo) are dropped by the
+sampler and do not count against you. If the index is unavailable, the check
+is skipped and logged.
+
 ## What gets you refused
 
 - **Recipe limits:** learning rate above `max_lr` (1e-3), more than

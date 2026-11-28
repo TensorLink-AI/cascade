@@ -91,3 +91,8 @@ cascade/funding/mkt_fit.py
 cascade/eval/timestral_adapter.py
 cascade/trainer/marketcast_leg.py
 cascade/trainer/worker.py
+# 2026-11-28 MarketCast sample geometry (5Cu2sxndK8Dw "could not cut a
+# high/15mx96 training sample" after 32 min of paid prep: data.start 2024-01-01
+# vs a 15m bank recorded from 2026-09-25): the intake's fund-time check of a
+# recipe's cuttable samples over the public bar index's recorded history.
+cascade/funding/mkt_geom.py

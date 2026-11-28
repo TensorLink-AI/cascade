@@ -166,6 +166,56 @@ def mkt_recipe_fetcher(cache_dir: Path, *, hub=None):
     return fetch
 
 
+def mkt_history_fetcher(storage, *, ttl_seconds: float = 3600.0, http_get=None, clock=None):
+    """2026-11-28: ``fetch_mkt_history() -> dict`` for the intake's MarketCast
+    sample-geometry check: the public post-embargo bar index
+    (:mod:`cascade.shared.marketcast_public` ``index.json``, ~0.2 MB,
+    anonymous: the HF dataset, then the Hippius mirror), parsed and cached
+    for ``ttl_seconds`` (it changes once a day). Raises when no source
+    serves it and nothing is cached (the intake then skips the check)."""
+    import threading
+    import time
+    import urllib.request
+
+    from ..shared.marketcast_public import (
+        HF_REPO,
+        HIPPIUS_PREFIX,
+        INDEX_NAME,
+        hippius_public_url,
+        parse_index,
+    )
+
+    def _get(url: str) -> bytes:
+        with urllib.request.urlopen(url, timeout=20) as r:  # noqa: S310 — public https
+            return r.read()
+
+    get = http_get or _get
+    now = clock or time.monotonic
+    urls = [f"https://huggingface.co/datasets/{HF_REPO}/resolve/main/{INDEX_NAME}",
+            hippius_public_url(str(getattr(storage, "s3_endpoint", "") or "https://s3.hippius.com"),
+                               str(getattr(storage, "manifest_bucket", "") or ""),
+                               f"{HIPPIUS_PREFIX}/{INDEX_NAME}")]
+    lock = threading.Lock()
+    cache: dict = {}
+
+    def fetch() -> dict:
+        with lock:
+            if cache and now() - cache["t"] < ttl_seconds:
+                return cache["index"]
+            errors = []
+            for u in urls:
+                try:
+                    cache.update(index=parse_index(get(u)), t=now())
+                    return cache["index"]
+                except Exception as e:  # noqa: BLE001 — public endpoints, try the next
+                    errors.append(f"{u}: {e}")
+            if cache:
+                return cache["index"]      # stale beats none (a day's lag is harmless)
+            raise OSError("bar history index unavailable: " + "; ".join(errors))
+
+    return fetch
+
+
 def withdrawn_clears_approvals(queue_path: Path):
     """``hotkey -> None``: drop the hotkey's PENDING or APPROVED-but-unlaunched
     operator make-good request for this queue (``work_root/operator_approvals
@@ -817,12 +867,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                  lane_a_until, "" if head_block is not None
                  else " — INERT: no chain head under --trust-refs")
 
-    fetch_mkt_recipe = None
+    fetch_mkt_recipe = fetch_mkt_history = None
     if cfg is not None:
         from ..shared.hippius import HubConfig
 
         fetch_mkt_recipe = mkt_recipe_fetcher(Path(args.queue_path).parent / "_mkt_recipes",
                                               hub=HubConfig.from_storage(cfg.storage))
+        fetch_mkt_history = mkt_history_fetcher(cfg.storage)
     intake = FundingIntake(
         # Entry TTL tracks the key TTL by construction here; the trainer's
         # [round] funded_entry_ttl_hours must be set to the same value.
@@ -845,6 +896,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         # 2026-11-27: the MarketCast recipe's GPU memory fit check at fund time
         fetch_mkt_recipe=fetch_mkt_recipe,
         mkt_cfg=(cfg.marketcast if cfg is not None else None),
+        # 2026-11-28: the recipe's sample geometry vs the recorded bar history
+        fetch_mkt_history=fetch_mkt_history,
         # WB23: the reference steps of the lane B base contract cap the steps
         # a train_hours fund fixes (the validator's consensus cap). The lane B
         # queue itself is wired by ``lanes.apply`` (EffectiveLanes, #874).
