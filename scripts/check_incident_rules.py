@@ -622,6 +622,12 @@ def check_ir009(rel: str, text: str) -> list[tuple[int, str]]:
 IR010_LOADERS = {"load_pool", "load_pool_for", "load_pool_series", "_load_pools",
                  "load_file", "safe_open"}
 IR010_ARRAY_MODULES = {"np", "numpy", "torch"}
+# W-MKTOFF (2026-11-28 10:54): the MarketCast judge's window / covariate
+# materialisers — one mkt:market entry's covariate rows were ~16 GB on the box.
+# A hit in the MarketCast validator modules only (the judge runs on the pod).
+IR010_MKT_JUDGE = {"target_windows", "snapshot_windows", "cut_windows", "window_covariates",
+                   "build_covariates", "_covariate_rows"}
+IR010_MKT_GLOBS = ("cascade/validator/marketcast*.py", "cascade/validator/mkt_*.py")
 
 
 def _ir010_mmap(call: ast.Call) -> bool:
@@ -644,6 +650,14 @@ def check_ir010(rel: str, text: str) -> list[tuple[int, str]]:
         name = f.attr if isinstance(f, ast.Attribute) else f.id if isinstance(f, ast.Name) else ""
         if name in IR010_LOADERS:
             what = f"{name}()"
+        elif name in IR010_MKT_JUDGE and _matches(rel, IR010_MKT_GLOBS):
+            hits[c.lineno] = (
+                f"{name}() materialises MarketCast windows / covariate rows in the validator "
+                "process: on 2026-11-28 one mkt:market entry's covariate rows (~30k windows x "
+                "19 float64 rows x 4096 steps, ~16 GB) OOM-killed the validator at 10:54. "
+                "Judge on the MarketCast pod (mkt_offload.PodJudge / mkt_worker judge_*), or "
+                "allowlist a call that runs there or under MKT_BOX_JUDGE_CAP_BYTES")
+            continue
         elif (name == "load" and isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name)
               and f.value.id in IR010_ARRAY_MODULES and not _ir010_mmap(c)):
             what = f"{f.value.id}.load()"
@@ -719,7 +733,8 @@ RULES: tuple[Rule, ...] = (
     Rule("IR010", "pool / checkpoint arrays loaded in the validator process",
          "2026-11-28: the lane D settlement step loaded all 13 pinned pool_d snapshots "
          "(~1.7 GB on disk, RSS 1.05 -> 3.65+ GB) into the validator; the 7 GB box OOM-killed "
-         "it at 04:39 and 05:41",
+         "it at 04:39 and 05:41; at 10:54 the MarketCast judge's covariate rows (~16 GB for "
+         "one mkt:market entry) did it again",
          "load and score on the eval host (cascade.eval.lane_d_settle), or read one file "
          "with `np.load(..., mmap_mode='r')` under a hard bound; a reviewed bounded load "
          "carries `# incident-ok: IR010 <why it is bounded>`",

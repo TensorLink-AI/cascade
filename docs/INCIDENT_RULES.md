@@ -268,9 +268,31 @@ safetensors `load_file` / `safe_open`, or `np.load` / `numpy.load` /
   loader whose callers are checked, or code that runs on a pod and not on the
   box.
 
+**Incident (W-MKTOFF).** 2026-11-28, 10:54. The validator's MarketCast
+publish run judged lane C entry `5Cu2sx…` (`mkt:market`, ten covariates) in
+the validator process while only its forecasts ran on the MarketCast pod.
+`_covariate_rows` (`cascade/validator/marketcast.py`) built every window's
+covariate rows before the first forecast: about 30k windows (58 assets x 9
+horizons x 48, plus forward windows) x 19 float64 rows (context, 7 past, 9
+known) x 4096 steps, about 16 GB, plus the snapshot's bars (~0.44 GB). The
+kernel killed the validator at anon-rss 5.39 GB, 16 minutes after the
+fine-tune's upload, with no log line between. W-MKTOFF moved the whole judge
+(windows, covariates, forecasts, scores, the near-duplicate and holder tests)
+to the pod (`mkt_offload.PodJudge`, the worker's `judge_*` ops); the box
+uploads the snapshot, verifies the replies and publishes. Each round logs its
+RSS and an ERROR over `MKT_ROUND_RSS_BUDGET_BYTES`; an in-process judge whose
+estimate (`box_judge_bytes`) exceeds `MKT_BOX_JUDGE_CAP_BYTES` is refused.
+
+**Rule (MarketCast judge).** In `cascade/validator/marketcast*.py` and
+`cascade/validator/mkt_*.py`, a call to a window or covariate materialiser is
+a hit too: `target_windows`, `snapshot_windows`, `cut_windows`,
+`window_covariates`, `build_covariates`, `_covariate_rows`. The reviewed
+sites carry `# incident-ok: IR010 the judge: on the MarketCast pod
+(mkt_worker), in-process only under MKT_BOX_JUDGE_CAP_BYTES`.
+
 **Fix.** Load and score on the eval host, or stream one file at a time with
 `mmap_mode` under a hard bound and a test that checks peak memory as the
-input grows (`tests/accept/w_offbox`).
+input grows (`tests/accept/w_offbox`, `tests/accept/w_mktoff`).
 
 **Limits.** The check matches call names only. A load reached through another
 module (`cascade/eval/`, `cascade/pool/`) is not a hit. The step's runtime RSS
